@@ -120,6 +120,18 @@ jobs:
         working-directory: src-rust
         run: cargo build --release --locked --package claurst --target ${{ matrix.target }}
 
+      - name: Create Cross.toml for cross-compilation
+        if: matrix.cross
+        working-directory: src-rust
+        run: |
+          cat > Cross.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          pre-build = [
+            "apt-get update",
+            "apt-get install -y libasound2-dev libssl-dev pkg-config"
+          ]
+          EOF
+
       - name: Build release binary (cross)
         if: matrix.cross
         working-directory: src-rust
