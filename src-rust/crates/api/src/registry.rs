@@ -12,8 +12,8 @@ use crate::client::ClientConfig;
 use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
-    AnthropicProvider, AzureProvider, BedrockProvider, CohereProvider, CopilotProvider,
-    GoogleProvider, OpenAiProvider,
+    AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
+    CopilotProvider, GoogleProvider, OpenAiProvider,
 };
 
 /// Registry of all available LLM providers.
@@ -33,6 +33,11 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
         "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
+        "codex" => {
+            // The Codex provider is OAuth-based; the `key` field is not used.
+            // Load from the stored token file instead.
+            CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+        }
         "cohere" => Some(Arc::new(CohereProvider::new(key))),
         "groq" => Some(Arc::new(p::groq().with_api_key(key))),
         "mistral" => Some(Arc::new(p::mistral().with_api_key(key))),
@@ -203,6 +208,15 @@ impl ProviderRegistry {
         self
     }
 
+    /// Register [`CodexProvider`] if stored Codex OAuth tokens are available in
+    /// `~/.claurst/codex_tokens.json`.  Returns `&mut self` for builder chaining.
+    pub fn with_codex_if_configured(&mut self) -> &mut Self {
+        if let Some(p) = CodexProvider::from_stored() {
+            self.register(Arc::new(p));
+        }
+        self
+    }
+
     /// Register [`CohereProvider`] if `COHERE_API_KEY` is set in the environment.
     /// Returns `&mut self` for builder chaining.
     pub fn with_cohere_if_key_set(&mut self) -> &mut Self {
@@ -224,6 +238,7 @@ impl ProviderRegistry {
             .with_azure_if_configured()
             .with_bedrock_if_configured()
             .with_copilot_if_configured()
+            .with_codex_if_configured()
             .with_cohere_if_key_set()
             .with_available_providers();
         registry

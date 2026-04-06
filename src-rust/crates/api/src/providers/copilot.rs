@@ -273,6 +273,12 @@ impl CopilotProvider {
         }
     }
 
+    /// Public re-export so other providers (e.g. `CodexProvider`) can reuse
+    /// the same Responses-API message translation without duplicating the logic.
+    pub fn to_responses_input_pub(request: &ProviderRequest) -> Vec<Value> {
+        Self::to_responses_input(request)
+    }
+
     fn to_responses_input(request: &ProviderRequest) -> Vec<Value> {
         let mut input = Vec::new();
 
