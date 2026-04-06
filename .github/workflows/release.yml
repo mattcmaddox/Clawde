@@ -92,8 +92,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Linux native: install system libraries for ALSA (voice feature) and OpenSSL.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+
       # Linux ARM64: use cross for reliable cross-compilation (handles
-      # sysroot, OpenSSL, pkg-config automatically via Docker).
+      # sysroot, OpenSSL, pkg-config, ALSA automatically via Docker).
       - name: Install cross (aarch64-linux)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
