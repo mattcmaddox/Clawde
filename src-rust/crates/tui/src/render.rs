@@ -393,7 +393,23 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // One blank separator row above the status/input area when status is active,
     // matching the visual breathing room in the TS layout.
     let separator_height: u16 = if status_visible { 1 } else { 0 };
-    let status_height: u16 = if status_visible { 1 } else { 0 };
+    let status_height: u16 = if status_visible {
+        if app.is_streaming {
+            // The spinner row is always a short single line.
+            1
+        } else if let Some(text) = app.status_message.as_deref() {
+            // Measure how many terminal rows the message needs so that long
+            // error strings (e.g. "Error: overloaded_error (529): …") wrap
+            // instead of overflowing the input area.  Cap at 3 lines.
+            let usable_width = size.width.max(1) as usize;
+            let char_count = text.chars().count();
+            ((char_count + usable_width - 1) / usable_width).max(1).min(3) as u16
+        } else {
+            1
+        }
+    } else {
+        0
+    };
     let suggestions_height = if prompt_focused && !app.prompt_input.suggestions.is_empty() {
         app.prompt_input.suggestions.len().min(5) as u16
     } else {
@@ -1771,7 +1787,11 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Build spans for a text string with a right-to-left glimmer sweep, matching
@@ -1979,7 +1999,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let right_spans: Vec<Span> = {
         let mut parts: Vec<Span> = Vec::new();
 
-        // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning
+        // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning.
+        //    When an update is available and context is below 85%, show the update notification
+        //    instead to keep the status bar uncluttered.
         if app.context_window_size > 0 {
             let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
             let left_pct = 100u64.saturating_sub(used_pct);
@@ -1988,20 +2010,33 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 parts.push(Span::raw("  "));
             }
 
-            if used_pct >= 95 {
-                // Critical: red, urge /compact now
+            if used_pct >= 85 {
+                // High usage — always show context window info regardless of update status.
+                if used_pct >= 95 {
+                    parts.push(Span::styled(
+                        format!("{}% context used — /compact now", used_pct),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    parts.push(Span::styled(
+                        format!("{}% until auto-compact", left_pct),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            } else if let Some(ref version) = app.update_available {
+                // Update available and context is fine — show update nudge in bottom-right.
                 parts.push(Span::styled(
-                    format!("{}% context used — /compact now", used_pct),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    format!("⬆ v{} available  Run: /update", version),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ));
             } else if used_pct >= 70 {
-                // Warning: show "N% until auto-compact" in yellow
+                // 70–84%: mild warning.
                 parts.push(Span::styled(
                     format!("{}% until auto-compact", left_pct),
                     Style::default().fg(Color::Yellow),
                 ));
             } else {
-                // Normal: dim green percentage
+                // Normal: dim display.
                 let used_k = app.context_used_tokens / 1000;
                 let total_k = app.context_window_size / 1000;
                 parts.push(Span::styled(
@@ -2134,7 +2169,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 parts.push(Span::raw("  "));
             }
             parts.push(Span::styled(
-                format!("↑ v{} available — /upgrade", version),
+                format!("⬆ v{} available — /update", version),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ));
         }

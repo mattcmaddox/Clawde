@@ -393,7 +393,7 @@ fn command_category(name: &str) -> &'static str {
         | "voice" | "statusline" | "output-style" | "keybindings"
         | "privacy-settings" | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
-        "status" | "doctor" | "terminal-setup" | "version" | "upgrade"
+        "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
         "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review"
@@ -5403,12 +5403,13 @@ impl SlashCommand for VoiceCommand {
 
 #[async_trait]
 impl SlashCommand for UpgradeCommand {
-    fn name(&self) -> &str { "upgrade" }
-    fn description(&self) -> &str { "Check for updates and show upgrade options" }
+    fn name(&self) -> &str { "update" }
+    fn aliases(&self) -> Vec<&str> { vec!["upgrade"] }
+    fn description(&self) -> &str { "Check for updates and download the latest release" }
     fn help(&self) -> &str {
-        "Usage: /upgrade\n\n\
+        "Usage: /update\n\n\
          Checks GitHub releases for the latest version of Claurst.\n\
-         If a newer version is available, shows the upgrade command."
+         If a newer version is available, shows where to download it."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -5463,9 +5464,9 @@ impl SlashCommand for UpgradeCommand {
                          Current version:  v{current}\n\
                          Latest version:   v{tag}\n\
                          Release page:     {url}\n\n\
-                         To upgrade (npm):\n\
-                           npm install -g @anthropic-ai/claude-code@latest\n\n\
-                         To upgrade (cargo):\n\
+                         Download the latest release:\n\
+                           {url}\n\n\
+                         Or build from source:\n\
                            cargo install claurst --force"
                     ))
                 }

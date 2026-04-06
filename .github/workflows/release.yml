@@ -26,6 +26,8 @@ jobs:
     name: Preflight checks
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Must be on main branch
         run: |
@@ -36,7 +38,7 @@ jobs:
 
       - name: Tag must not already exist
         run: |
-          if git rev-parse "refs/tags/${{ inputs.version }}" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ inputs.version }}" >/dev/null 2>&1; then
             echo "::error::Tag ${{ inputs.version }} already exists"
             exit 1
           fi
@@ -169,6 +171,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -216,6 +220,36 @@ jobs:
           echo "Release assets:"
           ls -lh release/
 
+      - name: Generate release notes
+        shell: bash
+        run: |
+          CURRENT_TAG="${{ inputs.version }}"
+          PREVIOUS_TAG="$(git tag --sort=-v:refname | grep -vxF "$CURRENT_TAG" | head -n 1 || true)"
+          {
+            echo "# Claurst ${CURRENT_TAG}"
+            echo
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              echo "## Changes since ${PREVIOUS_TAG}"
+              echo
+              echo "Compare: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${{ github.sha }}"
+              echo
+              COMMITS="$(git log --no-merges --pretty=format:'- %s (%h)' "${PREVIOUS_TAG}..${{ github.sha }}")"
+            else
+              echo "## Changes in this release"
+              echo
+              COMMITS="$(git log --no-merges --pretty=format:'- %s (%h)' "${{ github.sha }}")"
+            fi
+
+            if [[ -n "$COMMITS" ]]; then
+              echo "$COMMITS"
+            else
+              echo "- No non-merge commits found in the release range."
+            fi
+          } > release-notes.md
+
+          echo "Generated release notes:"
+          cat release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -224,5 +258,5 @@ jobs:
           name: Claurst ${{ inputs.version }}
           draft: false
           prerelease: false
-          generate_release_notes: true
+          body_path: release-notes.md
           files: release/*

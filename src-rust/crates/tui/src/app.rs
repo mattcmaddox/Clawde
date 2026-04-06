@@ -498,31 +498,84 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
     false
 }
 
+/// Map a character to its QWERTY Latin keyboard-position equivalent.
+///
+/// When a modifier key (Ctrl, Alt) is held together with a non-ASCII character
+/// (e.g. Cyrillic С on a Ukrainian/Russian layout), the char produced by
+/// crossterm is the non-Latin glyph rather than the Latin letter that occupies
+/// the same physical key.  Keybinding strings are always written as Latin
+/// letters (`ctrl+c`, `alt+b`, …), so the lookup fails.
+///
+/// This function converts the reported character to the Latin letter that sits
+/// at the same physical QWERTY position, covering the standard Russian JCUKEN
+/// and Ukrainian layouts which share the same physical-key→Latin mapping.
+/// For characters outside any known mapping the original (lowercased) char is
+/// returned unchanged — this is always safe since unrecognised chars just
+/// produce no keybinding match.
+fn layout_to_latin(c: char) -> String {
+    // Standard Russian/Ukrainian JCUKEN → QWERTY position mapping.
+    // Both upper- and lower-case Cyrillic variants are covered by
+    // converting to lowercase first.
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped: Option<char> = match lower {
+        // Row 1
+        'й' => Some('q'), 'ц' => Some('w'), 'у' => Some('e'),
+        'к' => Some('r'), 'е' => Some('t'), 'н' => Some('y'),
+        'г' => Some('u'), 'ш' => Some('i'), 'щ' => Some('o'),
+        'з' => Some('p'),
+        // Row 2
+        'ф' => Some('a'), 'ы' => Some('s'), 'в' => Some('d'),
+        'а' => Some('f'), 'п' => Some('g'), 'р' => Some('h'),
+        'о' => Some('j'), 'л' => Some('k'), 'д' => Some('l'),
+        // Row 3
+        'я' => Some('z'), 'ч' => Some('x'), 'с' => Some('c'),
+        'м' => Some('v'), 'и' => Some('b'), 'т' => Some('n'),
+        'ь' => Some('m'),
+        // Ukrainian-specific letters on standard positions
+        'і' => Some('s'), 'ї' => Some(']'), 'є' => Some('\''),
+        _ => None,
+    };
+    mapped.unwrap_or(lower).to_string()
+}
+
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+
     let normalized_key = match key.code {
         KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Esc => "escape".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::PageDown => "pagedown".to_string(),
-        KeyCode::PageUp => "pageup".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::BackTab => "tab".to_string(),
+        KeyCode::Delete    => "delete".to_string(),
+        KeyCode::Down      => "down".to_string(),
+        KeyCode::End       => "end".to_string(),
+        KeyCode::Enter     => "enter".to_string(),
+        KeyCode::Esc       => "escape".to_string(),
+        KeyCode::Home      => "home".to_string(),
+        KeyCode::Left      => "left".to_string(),
+        KeyCode::PageDown  => "pagedown".to_string(),
+        KeyCode::PageUp    => "pageup".to_string(),
+        KeyCode::Right     => "right".to_string(),
+        KeyCode::Tab       => "tab".to_string(),
+        KeyCode::Up        => "up".to_string(),
+        KeyCode::BackTab   => "tab".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Char(c) => {
+            // For modifier-key combos (Ctrl/Alt + letter), normalize to the
+            // ASCII Latin key at the same physical QWERTY position.  This
+            // makes shortcuts like Ctrl+C work regardless of the active
+            // keyboard layout (Ukrainian, Russian, Greek, …).
+            if (ctrl || alt) && !c.is_ascii() {
+                layout_to_latin(c)
+            } else {
+                c.to_lowercase().to_string()
+            }
+        }
         _ => return None,
     };
 
     Some(ParsedKeystroke {
         key: normalized_key,
-        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-        alt: key.modifiers.contains(KeyModifiers::ALT),
+        ctrl,
+        alt,
         shift: key.modifiers.contains(KeyModifiers::SHIFT),
         meta: key.modifiers.contains(KeyModifiers::SUPER),
     })
@@ -3300,6 +3353,17 @@ impl App {
         }
 
         match key.code {
+            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
+            KeyCode::Esc if self.is_streaming => {
+                self.is_streaming = false;
+                self.spinner_verb = None;
+                self.streaming_text.clear();
+                self.streaming_thinking.clear();
+                self.tool_use_blocks.clear();
+                self.status_message = Some("Cancelled.".to_string());
+                self.complete_current_turn_snapshot(true);
+            }
+
             // ---- Quit / cancel ----------------------------------------
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // If text is selected, copy it to clipboard instead of quitting.
@@ -4130,6 +4194,14 @@ impl App {
             "sendMessage" => {
                 // Ctrl+M: Send message (alternative to Enter)
                 !self.is_streaming
+            }
+            "newline" => {
+                // Shift+Enter: insert a literal newline into the prompt.
+                if !self.is_streaming {
+                    self.prompt_input.insert_newline();
+                    self.refresh_prompt_input();
+                }
+                false
             }
             "indent" => {
                 // Tab: cycle agent mode when prompt is empty, accept
