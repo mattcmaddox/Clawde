@@ -13,7 +13,7 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, GoogleProvider, OpenAiProvider,
+    CopilotProvider, GoogleProvider, MinimaxProvider, OpenAiProvider,
 };
 
 /// Registry of all available LLM providers.
@@ -30,6 +30,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "anthropic" => Some(Arc::new(AnthropicProvider::from_config(
             ClientConfig { api_key: key, ..Default::default() },
         ))),
+        "minimax" => Some(Arc::new(MinimaxProvider::new(key))),
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
         "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
@@ -339,6 +340,10 @@ impl ProviderRegistry {
         }
         if std::env::var("HF_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::huggingface()));
+        }
+        if std::env::var("MINIMAX_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
+            self.register(Arc::new(MinimaxProvider::new(key)));
         }
         if std::env::var("NVIDIA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::nvidia()));
