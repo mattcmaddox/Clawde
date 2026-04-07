@@ -476,11 +476,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
     }
-    // Linux / X11
+    // Linux / Wayland / X11
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &["wl-copy", "xclip -selection clipboard", "xsel --clipboard --input"] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 if let Ok(mut child) = std::process::Command::new(prog)
