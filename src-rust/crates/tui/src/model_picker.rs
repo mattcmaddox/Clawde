@@ -332,6 +332,14 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("google/gemini-2.5-pro", "Gemini 2.5 Pro", "via OpenRouter"),
             model_entry("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B", "via OpenRouter"),
         ],
+        "codex" | "openai-codex" => vec![
+            model_entry("gpt-5.2-codex", "GPT-5.2 Codex", "OAuth-backed Codex default"),
+            model_entry("gpt-5.1-codex", "GPT-5.1 Codex", "Previous Codex generation"),
+            model_entry("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini", "Smaller Codex model"),
+            model_entry("gpt-5.1-codex-max", "GPT-5.1 Codex Max", "Larger Codex model"),
+            model_entry("gpt-5.4", "GPT-5.4", "General frontier model via Codex auth"),
+            model_entry("gpt-5.2", "GPT-5.2", "General model via Codex auth"),
+        ],
         "github-copilot" => vec![
             model_entry("claude-sonnet-4.6", "Claude Sonnet 4.6", "via Copilot"),
             model_entry("claude-sonnet-4.5", "Claude Sonnet 4.5", "via Copilot"),
@@ -410,6 +418,8 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         "xai" => "xai/grok-2".to_string(),
         "openrouter" => "openrouter/anthropic/claude-sonnet-4".to_string(),
         "github-copilot" => "github-copilot/gpt-4o".to_string(),
+        "codex" => "codex/gpt-5.2-codex".to_string(),
+        "openai-codex" => "openai-codex/gpt-5.2-codex".to_string(),
         "cohere" => "cohere/command-r-plus".to_string(),
         "perplexity" => "perplexity/sonar-pro".to_string(),
         "togetherai" | "together-ai" => "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),

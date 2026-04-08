@@ -253,6 +253,8 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "stepfun"
             | "fireworks"
             | "ollama"
+            | "codex"
+            | "openai-codex"
             | "lmstudio"
             | "lm-studio"
             | "llamacpp"
@@ -880,7 +882,7 @@ pub async fn run_query_loop(
                     "anthropic", "openai", "google", "groq", "mistral",
                     "deepseek", "xai", "cohere", "perplexity", "cerebras",
                     "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "ollama", "lmstudio",
+                    "venice", "github-copilot", "codex", "openai-codex", "ollama", "lmstudio",
                     "llamacpp", "azure", "amazon-bedrock", "huggingface",
                     "nvidia", "fireworks", "sambanova",
                 ];

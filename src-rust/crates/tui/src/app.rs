@@ -1502,6 +1502,7 @@ impl App {
                 "xai",
                 "openrouter",
                 "github-copilot",
+                "codex",
                 "cohere",
                 "perplexity",
                 "togetherai",
@@ -2721,7 +2722,7 @@ impl App {
                                 self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("github-copilot".to_string());
                             }
-                            "openai-codex" => {
+                            "codex" | "openai-codex" => {
                                 // OpenAI Codex: browser OAuth flow (spawned by main loop)
                                 self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
                                 self.device_auth_pending = Some("openai-codex".to_string());

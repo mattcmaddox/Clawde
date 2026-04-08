@@ -34,7 +34,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
         "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
-        "codex" => {
+        "codex" | "openai-codex" => {
             // The Codex provider is OAuth-based; the `key` field is not used.
             // Load from the stored token file instead.
             CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
@@ -84,6 +84,9 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
         "lmstudio" | "lm-studio" => return Some(Arc::new(p::lm_studio())),
         // "llama-server" is the binary name for the modern llama.cpp server.
         "llamacpp" | "llama-cpp" | "llama-server" => return Some(Arc::new(p::llama_cpp())),
+        "codex" | "openai-codex" => {
+            return CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
+        }
         _ => {}
     }
 

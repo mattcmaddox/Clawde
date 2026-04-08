@@ -2613,7 +2613,7 @@ async fn run_interactive(
                         )).await;
                     });
                 }
-                "openai-codex" => {
+                "codex" | "openai-codex" => {
                     let tx2 = device_auth_tx.clone();
                     // Keep the dialog in WaitingForCode until GotBrowserUrl arrives.
                     // (set_browser_url() transitions it to BrowserAuth with the URL.)
