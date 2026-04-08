@@ -3314,7 +3314,7 @@ impl App {
                     | crate::prompt_input::VimMode::VisualBlock
             )
         {
-            use crate::image_paste::{read_clipboard_image, read_clipboard_text};
+            use crate::image_paste::{read_clipboard_image, read_clipboard_text, read_primary_text};
             if let Some(img) = read_clipboard_image() {
                 let label = img.label.clone();
                 let dims = img.dimensions;
@@ -3325,7 +3325,7 @@ impl App {
                     format!("Image attached: {}", label)
                 };
                 self.notifications.push(NotificationKind::Info, msg, Some(3));
-            } else if let Some(text) = read_clipboard_text() {
+            } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
                 self.prompt_input.paste(&text);
             }
             return false;
@@ -4681,6 +4681,33 @@ impl App {
                     );
                 } else {
                     self.dismiss_context_menu();
+                }
+            }
+
+            // ---- Primary-selection paste into the prompt ---------------
+            MouseEventKind::Down(MouseButton::Middle) => {
+                let input_area = self.last_input_area.get();
+                let in_input = input_area.width > 0 && input_area.height > 0
+                    && mouse_event.row >= input_area.y
+                    && mouse_event.row < input_area.y.saturating_add(input_area.height)
+                    && mouse_event.column >= input_area.x
+                    && mouse_event.column < input_area.x.saturating_add(input_area.width);
+
+                if in_input {
+                    self.focus = FocusTarget::Input;
+                    self.clear_selection();
+                    if !matches!(
+                        self.prompt_input.vim_mode,
+                        crate::prompt_input::VimMode::Normal
+                            | crate::prompt_input::VimMode::Visual
+                            | crate::prompt_input::VimMode::VisualBlock
+                    ) {
+                        if let Some(text) = crate::image_paste::read_primary_text()
+                            .or_else(crate::image_paste::read_clipboard_text)
+                        {
+                            self.prompt_input.paste(&text);
+                        }
+                    }
                 }
             }
 

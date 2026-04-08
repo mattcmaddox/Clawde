@@ -779,7 +779,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
     } else {
+        let auth_store = claurst_core::AuthStore::load();
+        let has_saved_credentials = !auth_store.credentials.is_empty()
+            || claurst_core::oauth_config::get_codex_tokens().is_some();
         let has_credentials = !api_key.is_empty()
+            || has_saved_credentials
             || config.provider.as_deref().is_some_and(|p| p != "anthropic");
         run_interactive(
             config,
