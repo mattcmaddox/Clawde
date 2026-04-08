@@ -941,7 +941,7 @@ pub async fn run_query_loop(
                 let runtime_provider =
                     claurst_api::registry::runtime_provider_for(&provider_id_str);
 
-                let mut registry_provider = if runtime_provider.is_some() {
+                let registry_provider = if runtime_provider.is_some() {
                     // Fresh auth_store key available — use it instead of the
                     // (possibly stale) registry entry.
                     None
@@ -949,16 +949,24 @@ pub async fn run_query_loop(
                     registry.get(&pid).cloned()
                 };
 
-                // If the user supplied --api-base for a local provider (Ollama, LM Studio,
+                let mut provider = runtime_provider.or(registry_provider);
+
+                // If the user supplied api_base for a local provider (Ollama, LM Studio,
                 // llama.cpp), rebuild the provider with the override URL.  These providers
-                // are always pre-registered with a hardcoded default URL, so without this
-                // the --api-base flag would be silently ignored.
+                // are always constructed with a hardcoded default URL, so without this
+                // the api_base setting would be silently ignored.
                 if let Some(override_base) = tool_ctx.config.provider_configs
                     .get(&provider_id_str)
                     .and_then(|pc| pc.api_base.as_deref())
                 {
                     use claurst_api::providers::openai_compat_providers;
-                    let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
+                    let trimmed = override_base.trim_end_matches('/');
+                    // Avoid double /v1 suffix: only append if not already present.
+                    let base_url = if trimmed.ends_with("/v1") {
+                        trimmed.to_string()
+                    } else {
+                        format!("{}/v1", trimmed)
+                    };
                     let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
                         match provider_id_str.as_str() {
                             "ollama" => Some(std::sync::Arc::new(
@@ -967,17 +975,15 @@ pub async fn run_query_loop(
                             "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
                                 openai_compat_providers::lm_studio().with_base_url(base_url),
                             )),
-                            "llamacpp" | "llama-cpp" => Some(std::sync::Arc::new(
+                            "llamacpp" | "llama-cpp" | "llama-server" => Some(std::sync::Arc::new(
                                 openai_compat_providers::llama_cpp().with_base_url(base_url),
                             )),
                             _ => None,
                         };
                     if overridden.is_some() {
-                        registry_provider = overridden;
+                        provider = overridden;
                     }
                 }
-
-                let provider = runtime_provider.or(registry_provider);
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
