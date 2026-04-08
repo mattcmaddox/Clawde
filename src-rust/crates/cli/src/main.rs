@@ -1605,6 +1605,7 @@ async fn run_interactive(
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.connect_dialog.visible
                         || app.key_input_dialog.visible
+                        || app.custom_provider_dialog.visible
                         || app.device_auth_dialog.visible
                         || app.command_palette.visible
                         || app.model_picker.visible

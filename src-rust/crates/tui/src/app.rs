@@ -213,6 +213,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
@@ -798,6 +799,8 @@ pub struct App {
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
+    /// Custom provider dialog for URL + API key input.
+    pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -1197,6 +1200,7 @@ impl App {
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
+            custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
@@ -1475,6 +1479,16 @@ impl App {
         self.open_model_picker_for_provider(&provider_id, Some(picker_title));
     }
 
+    fn persist_custom_provider_base_url(&self, base_url: &str) {
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        let entry = settings.providers.entry("custom-openai".to_string()).or_default();
+        entry.api_base = Some(base_url.to_string());
+        entry.enabled = true;
+        let config = entry.clone();
+        settings.config.provider_configs.insert("custom-openai".to_string(), config);
+        let _ = settings.save_sync();
+    }
+
     fn persist_provider_and_model(&self) {
         let mut settings = Settings::load_sync().unwrap_or_default();
         settings.provider = self.config.provider.clone();
@@ -1712,6 +1726,7 @@ impl App {
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
+        self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
         self.model_picker_fetch_pending = false;
@@ -1997,6 +2012,7 @@ impl App {
         self.connect_dialog.close();
         self.command_palette.close();
         self.key_input_dialog.close();
+        self.custom_provider_dialog.close();
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
@@ -2684,6 +2700,44 @@ impl App {
             return false;
         }
 
+        // Custom provider dialog (URL + API key for OpenAI-compatible providers)
+        if self.custom_provider_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.custom_provider_dialog.close();
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.custom_provider_dialog.move_next_field();
+                }
+                KeyCode::Up => {
+                    self.custom_provider_dialog.move_prev_field();
+                }
+                KeyCode::Enter => {
+                    if self.custom_provider_dialog.can_submit() {
+                        let provider_id = self.custom_provider_dialog.provider_id.clone();
+                        let provider_name = self.custom_provider_dialog.provider_name.clone();
+                        let (base_url, api_key) = self.custom_provider_dialog.take_values();
+                        self.persist_custom_provider_base_url(&base_url);
+                        self.auth_store.set(
+                            &provider_id,
+                            claurst_core::StoredCredential::ApiKey { key: api_key },
+                        );
+                        self.activate_provider(provider_id, provider_name, "Connected to");
+                    } else {
+                        self.custom_provider_dialog.move_next_field();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.custom_provider_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    self.custom_provider_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
@@ -2709,6 +2763,13 @@ impl App {
                                 // Anthropic: use API key from console.anthropic.com
                                 // (OAuth requires a registered app which Claurst doesn't have)
                                 self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
+                            }
+                            "custom-openai" => {
+                                let current_url = Settings::load_sync()
+                                    .ok()
+                                    .and_then(|settings| settings.providers.get("custom-openai").and_then(|p| p.api_base.clone()));
+                                self.custom_provider_dialog
+                                    .open(selected.id.clone(), selected.title.clone(), current_url);
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow
