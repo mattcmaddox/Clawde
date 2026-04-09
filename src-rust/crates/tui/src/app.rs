@@ -1484,8 +1484,6 @@ impl App {
         let entry = settings.providers.entry("custom-openai".to_string()).or_default();
         entry.api_base = Some(base_url.to_string());
         entry.enabled = true;
-        let config = entry.clone();
-        settings.config.provider_configs.insert("custom-openai".to_string(), config);
         let _ = settings.save_sync();
     }
 
