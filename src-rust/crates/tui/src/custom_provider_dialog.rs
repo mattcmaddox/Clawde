@@ -85,7 +85,7 @@ impl CustomProviderDialogState {
     }
 
     pub fn can_submit(&self) -> bool {
-        !self.url_input.trim().is_empty() && !self.api_key_input.is_empty()
+        !self.url_input.trim().is_empty()
     }
 
     pub fn take_values(&mut self) -> (String, String) {
@@ -144,7 +144,7 @@ pub fn render_custom_provider_dialog(
         state.url_input.clone()
     };
 
-        let masked_key = if state.api_key_input.is_empty() {
+    let masked_key = if state.api_key_input.is_empty() {
         "paste your API key here...".to_string()
     } else {
         let chars: Vec<char> = state.api_key_input.chars().collect();
@@ -159,7 +159,7 @@ pub fn render_custom_provider_dialog(
     let confirm_hint = if state.can_submit() {
         " enter confirm"
     } else {
-        " fill both fields"
+        " fill URL field"
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
