@@ -11,6 +11,8 @@ use claurst_core::provider_id::ProviderId;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
+const DEFAULT_CUSTOM_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
+
 // ---------------------------------------------------------------------------
 // Local / self-hosted providers (no API key required)
 // ---------------------------------------------------------------------------
@@ -68,6 +70,18 @@ pub fn llama_cpp() -> OpenAiCompatProvider {
 // Remote / cloud providers (API key required)
 // ---------------------------------------------------------------------------
 /// Custom OpenAI-compatible provider supplied by the user.
+pub fn custom_openai_with_url(base_url: impl Into<String>) -> OpenAiCompatProvider {
+    let key = std::env::var("CUSTOM_OPENAI_API_KEY").unwrap_or_default();
+
+    OpenAiCompatProvider::new(
+        "custom-openai",
+        "Custom OpenAI-Compatible",
+        base_url.into(),
+    )
+    .with_api_key(key)
+}
+
+/// Custom OpenAI-compatible provider supplied by the user.
 pub fn custom_openai() -> OpenAiCompatProvider {
     let settings = Settings::load_sync().unwrap_or_default();
     let base_url = settings
@@ -75,11 +89,9 @@ pub fn custom_openai() -> OpenAiCompatProvider {
         .get("custom-openai")
         .and_then(|config| config.api_base.as_deref())
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or("http://localhost:11434/v1");
-    let key = std::env::var("CUSTOM_OPENAI_API_KEY").unwrap_or_default();
+        .unwrap_or(DEFAULT_CUSTOM_OPENAI_BASE_URL);
 
-    OpenAiCompatProvider::new("custom-openai", "Custom OpenAI-Compatible", base_url)
-        .with_api_key(key)
+    custom_openai_with_url(base_url)
 }
 
 /// DeepSeek — supports reasoning output via `reasoning_content` field.
