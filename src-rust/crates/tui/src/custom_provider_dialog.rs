@@ -63,7 +63,10 @@ impl CustomProviderDialogState {
     }
 
     pub fn move_prev_field(&mut self) {
-        self.move_next_field();
+                self.active_field = match self.active_field {
+            CustomProviderField::Url => CustomProviderField::ApiKey,
+            CustomProviderField::ApiKey => CustomProviderField::Url,
+        };
     }
 
     pub fn insert_char(&mut self, c: char) {
