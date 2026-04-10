@@ -173,13 +173,16 @@ impl ModelRegistry {
         }
     }
 
+    // Z.AI pricing per docs.z.ai/guides/overview/pricing — USD per 1M tokens.
+    // cost_cache_write is None because cached input storage is currently a
+    // limited-time free promotion; update when promotion ends.
     fn add_zai_models(&mut self) {
         let pid = ProviderId::new(ProviderId::ZAI);
-        for (id, name, ctx, out, reasoning) in [
-            ("glm-5.1",     "GLM-5.1",      200_000u32, 128_000u32, true),
-            ("glm-5",       "GLM-5",        200_000,    128_000,    true),
-            ("glm-5-turbo", "GLM-5-Turbo",  200_000,    128_000,    true),
-            ("glm-4.7",     "GLM-4.7",      200_000,    128_000,    true),
+        for (id, name, ctx, out, cost_in, cost_out, cost_cache_read) in [
+            ("glm-5.1",     "GLM-5.1",      200_000u32, 128_000u32, 1.4f64,  4.4f64, 0.26f64),
+            ("glm-5",       "GLM-5",        200_000,    128_000,    1.0,     3.2,    0.20),
+            ("glm-5-turbo", "GLM-5-Turbo",  200_000,    128_000,    1.2,     4.0,    0.24),
+            ("glm-4.7",     "GLM-4.7",      200_000,    128_000,    0.6,     2.2,    0.11),
         ] {
             self.insert(ModelEntry {
                 info: ModelInfo {
@@ -189,12 +192,12 @@ impl ModelRegistry {
                     context_window: ctx,
                     max_output_tokens: out,
                 },
-                cost_input: None,
-                cost_output: None,
-                cost_cache_read: None,
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: Some(cost_cache_read),
                 cost_cache_write: None,
                 tool_calling: true,
-                reasoning,
+                reasoning: true,
                 vision: false,
                 family: Some("glm".to_string()),
                 status: "active".to_string(),
