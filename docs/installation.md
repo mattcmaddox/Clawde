@@ -135,7 +135,7 @@ claurst --version
 A successful installation prints the version string, for example:
 
 ```
-claude 0.0.8
+claude 0.0.9
 ```
 
 To confirm the binary is the one you installed:

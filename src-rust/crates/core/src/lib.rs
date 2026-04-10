@@ -10,10 +10,6 @@ pub use provider_id::{ProviderId, ModelId};
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
-// Session sharing — HTTP upload to a share endpoint + local text export.
-pub mod session_share;
-pub use session_share::{share_session, export_session_text};
-
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
@@ -625,6 +621,82 @@ pub mod config {
 
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
+    pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
+        match provider_id {
+            "anthropic" => &["ANTHROPIC_API_KEY"],
+            "openai" => &["OPENAI_API_KEY"],
+            "google" | "google-vertex" => &["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+            "github-copilot" => &["GITHUB_TOKEN"],
+            "groq" => &["GROQ_API_KEY"],
+            "cerebras" => &["CEREBRAS_API_KEY"],
+            "sambanova" => &["SAMBANOVA_API_KEY"],
+            "deepseek" => &["DEEPSEEK_API_KEY"],
+            "mistral" => &["MISTRAL_API_KEY"],
+            "openrouter" => &["OPENROUTER_API_KEY"],
+            "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
+            "perplexity" => &["PERPLEXITY_API_KEY"],
+            "cohere" => &["COHERE_API_KEY"],
+            "xai" => &["XAI_API_KEY"],
+            "deepinfra" => &["DEEPINFRA_API_KEY"],
+            "azure" => &["AZURE_API_KEY"],
+            "gitlab" => &["GITLAB_TOKEN"],
+            "huggingface" => &["HF_TOKEN"],
+            "nvidia" => &["NVIDIA_API_KEY"],
+            "alibaba" | "qwen" => &["DASHSCOPE_API_KEY"],
+            "venice" => &["VENICE_API_KEY"],
+            "moonshot" | "moonshotai" => &["MOONSHOT_API_KEY"],
+            "zhipu" | "zhipuai" => &["ZHIPU_API_KEY"],
+            "zai" => &["ZAI_API_KEY"],
+            "siliconflow" => &["SILICONFLOW_API_KEY"],
+            "nebius" => &["NEBIUS_API_KEY"],
+            "novita" => &["NOVITA_API_KEY"],
+            "minimax" => &["MINIMAX_API_KEY"],
+            "ovhcloud" => &["OVHCLOUD_API_KEY"],
+            "scaleway" => &["SCALEWAY_API_KEY"],
+            "vultr" | "vultr-ai" => &["VULTR_API_KEY"],
+            "baseten" => &["BASETEN_API_KEY"],
+            "friendli" => &["FRIENDLI_TOKEN"],
+            "upstage" => &["UPSTAGE_API_KEY"],
+            "stepfun" => &["STEPFUN_API_KEY"],
+            "fireworks" => &["FIREWORKS_API_KEY"],
+            "cloudflare" | "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
+                &["CLOUDFLARE_API_TOKEN"]
+            }
+            "vercel" => &["AI_GATEWAY_API_KEY"],
+            "helicone" => &["HELICONE_API_KEY"],
+            "sap" | "sap-ai-core" => &["AICORE_SERVICE_KEY"],
+            _ => &[],
+        }
+    }
+
+    pub fn primary_api_key_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        api_key_env_vars_for_provider(provider_id).first().copied()
+    }
+
+    pub fn api_base_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some("ANTHROPIC_BASE_URL"),
+            "openai" => Some("OPENAI_BASE_URL"),
+            "minimax" => Some("MINIMAX_BASE_URL"),
+            "ollama" => Some("OLLAMA_HOST"),
+            "lmstudio" | "lm-studio" => Some("LM_STUDIO_HOST"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("LLAMA_CPP_HOST"),
+            _ => None,
+        }
+    }
+
+    pub fn default_api_base_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
+            "openai" => Some("https://api.openai.com"),
+            "minimax" => Some("https://api.minimax.io/anthropic"),
+            "ollama" => Some("http://localhost:11434"),
+            "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
+            _ => None,
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AgentDefinition {
         /// Display name / description
@@ -864,11 +936,6 @@ pub mod config {
         /// Skill-discovery configuration (copied from Settings on load).
         #[serde(default)]
         pub skills: SkillsConfig,
-        /// Optional URL for the session-share service.  When set, `/share`
-        /// POSTs the session to this endpoint and returns the resulting URL.
-        /// When absent, `/share` falls back to a local Markdown export.
-        #[serde(default, rename = "shareEndpoint")]
-        pub share_endpoint: Option<String>,
         /// Managed agent (manager-executor) configuration.
         #[serde(default)]
         pub managed_agents: Option<ManagedAgentConfig>,
@@ -1062,6 +1129,17 @@ pub mod config {
     }
 
     impl Config {
+        pub fn selected_provider_id(&self) -> &str {
+            self.provider
+                .as_deref()
+                .or_else(|| {
+                    self.model
+                        .as_deref()
+                        .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+                })
+                .unwrap_or("anthropic")
+        }
+
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
@@ -1130,11 +1208,48 @@ pub mod config {
                 .filter(|prompt| !prompt.trim().is_empty())
         }
 
-        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
-        pub fn resolve_api_key(&self) -> Option<String> {
+        pub fn resolve_provider_api_key(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            let top_level_key = if provider_id == self.selected_provider_id() {
+                self.api_key.clone()
+            } else {
+                None
+            };
+
+            top_level_key
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    provider_cfg
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
+        }
+
+        pub fn resolve_anthropic_api_key(&self) -> Option<String> {
             self.api_key
                 .clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    self.provider_configs
+                        .get("anthropic")
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| {
+                    api_key_env_vars_for_provider("anthropic")
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+        }
+
+        /// Resolve the API key for the active provider.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.resolve_provider_api_key(self.selected_provider_id())
         }
 
         /// Async variant: also checks `~/.claurst/oauth_tokens.json`.
@@ -1143,11 +1258,18 @@ pub mod config {
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
         /// Silently attempts token refresh when the access token is expired.
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
-            // Highest priority: explicit api_key or env var
-            if let Some(key) = self.resolve_api_key() {
+            if self.selected_provider_id() != "anthropic" {
+                return self.resolve_api_key().map(|key| (key, false));
+            }
+
+            self.resolve_anthropic_auth_async().await
+        }
+
+        pub async fn resolve_anthropic_auth_async(&self) -> Option<(String, bool)> {
+            if let Some(key) = self.resolve_anthropic_api_key() {
                 return Some((key, false));
             }
-            // Fall back to saved OAuth tokens
+
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
             // If expired and we have a refresh token, attempt silent refresh.
@@ -1204,10 +1326,32 @@ pub mod config {
             }
         }
 
-        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            provider_cfg
+                .and_then(|provider| provider.api_base.clone())
+                .filter(|base| !base.is_empty())
+                .or_else(|| {
+                    api_base_env_var_for_provider(provider_id)
+                        .and_then(|name| std::env::var(name).ok())
+                        .filter(|base| !base.is_empty())
+                })
+                .or_else(|| default_api_base_for_provider(provider_id).map(str::to_owned))
+        }
+
+        pub fn resolve_anthropic_api_base(&self) -> String {
+            self.resolve_provider_api_base("anthropic")
+                .unwrap_or_else(|| crate::constants::ANTHROPIC_API_BASE.to_string())
+        }
+
+        /// Resolve the API base URL for the active provider.
         pub fn resolve_api_base(&self) -> String {
-            std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
+            self.resolve_provider_api_base(self.selected_provider_id())
+                .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
     }
 
@@ -1402,7 +1546,6 @@ pub mod config {
                     for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
                     SkillsConfig { paths, urls }
                 },
-                share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
             };
             Self {

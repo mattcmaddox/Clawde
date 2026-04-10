@@ -6,7 +6,7 @@ use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::{EffortLevel, ModelPickerState, is_fast_mode_model};
+use crate::model_picker::{EffortLevel, ModelPickerState};
 use crate::session_browser::SessionBrowserState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
@@ -2813,7 +2813,7 @@ impl App {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && !is_fast_mode_model(&model_id) {
+                        if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
                             self.fast_mode = false;
                         }
                         if let Some(e) = effort {

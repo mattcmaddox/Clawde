@@ -226,7 +226,7 @@ impl CodexProvider {
     ) -> reqwest::RequestBuilder {
         let builder = builder
             .bearer_auth(token)
-            .header("User-Agent", "claurst/0.0.8");
+            .header("User-Agent", "claurst/0.0.9");
 
         if let Some(id) = account_id {
             builder.header("ChatGPT-Account-Id", id)
