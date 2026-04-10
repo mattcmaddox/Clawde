@@ -85,6 +85,7 @@ impl ModelRegistry {
         self.add_anthropic_models();
         self.add_openai_models();
         self.add_google_models();
+        self.add_zai_models();
     }
 
     fn add_anthropic_models(&mut self) {
@@ -172,6 +173,35 @@ impl ModelRegistry {
         }
     }
 
+    fn add_zai_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::ZAI);
+        for (id, name, ctx, out, reasoning) in [
+            ("glm-5.1",     "GLM-5.1",      200_000u32, 128_000u32, true),
+            ("glm-5",       "GLM-5",        200_000,    128_000,    true),
+            ("glm-5-turbo", "GLM-5-Turbo",  200_000,    128_000,    true),
+            ("glm-4.7",     "GLM-4.7",      200_000,    128_000,    true),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_write: None,
+                tool_calling: true,
+                reasoning,
+                vision: false,
+                family: Some("glm".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
     fn insert(&mut self, entry: ModelEntry) {
         let key = format!("{}/{}", entry.info.provider_id, entry.info.id);
         self.entries.insert(key, entry);
@@ -231,6 +261,8 @@ impl ModelRegistry {
             Some("cohere")
         } else if model_name.starts_with("sonar") {
             Some("perplexity")
+        } else if model_name.starts_with("glm-") {
+            Some("zai")
         } else {
             None
         };
@@ -296,6 +328,8 @@ impl ModelRegistry {
             "command-r-plus",
             "llama-3.3-70b",
             "sonar-pro",
+            "glm-5.1",
+            "glm-5-turbo",
         ];
 
         // Score each model: lower is better.
@@ -350,6 +384,7 @@ impl ModelRegistry {
             "command-r",
             "llama-3.3-8b",
             "sonar",
+            "glm-5-turbo",
         ];
 
         models.sort_by(|a, b| {
