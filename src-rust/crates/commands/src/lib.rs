@@ -669,7 +669,10 @@ impl SlashCommand for ModelCommand {
                 format!("Switched to {}", model_str)
             };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(model_str);
+            new_config.model = Some(model_str.clone());
+            if let Some((provider, _)) = model_str.split_once('/') {
+                new_config.provider = Some(provider.to_string());
+            }
             CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
@@ -807,8 +810,18 @@ impl SlashCommand for ConfigCommand {
             "model" => {
                 let mut new_config = ctx.config.clone();
                 new_config.model = Some(value.to_string());
+                let inferred_provider = value
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string());
+                if let Some(ref provider) = inferred_provider {
+                    new_config.provider = Some(provider.clone());
+                }
                 if let Err(err) = save_settings_mutation(|settings| {
                     settings.config.model = Some(value.to_string());
+                    if let Some(ref provider) = inferred_provider {
+                        settings.provider = Some(provider.clone());
+                        settings.config.provider = Some(provider.clone());
+                    }
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }

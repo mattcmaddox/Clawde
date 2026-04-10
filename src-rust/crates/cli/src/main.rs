@@ -779,7 +779,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
     } else {
+        let auth_store = claurst_core::AuthStore::load();
+        let has_saved_credentials = !auth_store.credentials.is_empty()
+            || claurst_core::oauth_config::get_codex_tokens().is_some();
         let has_credentials = !api_key.is_empty()
+            || has_saved_credentials
             || config.provider.as_deref().is_some_and(|p| p != "anthropic");
         run_interactive(
             config,
@@ -964,6 +968,14 @@ async fn refresh_provider_runtime_state(
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
     })
+}
+
+fn normalize_provider_from_model(config: &mut Config) {
+    if let Some(model) = config.model.as_deref() {
+        if let Some((provider, _)) = model.split_once('/') {
+            config.provider = Some(provider.to_string());
+        }
+    }
 }
 
 /// Filter the tool list based on the agent's access level.
@@ -1861,38 +1873,50 @@ async fn run_interactive(
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
-                                    cmd_ctx.config = new_cfg.clone();
-                                    tool_ctx.config = new_cfg.clone();
-                                    app.config = new_cfg.clone();
-                                    // Sync model name shown in the TUI header.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
+                                    let mut applied_cfg = new_cfg;
+                                    normalize_provider_from_model(&mut applied_cfg);
+                                    cmd_ctx.config = applied_cfg.clone();
+                                    tool_ctx.config = applied_cfg.clone();
+                                    app.config = applied_cfg.clone();
+                                    // Sync model/provider shown in the TUI header.
+                                    if let Some(ref model) = applied_cfg.model {
+                                        app.set_model(model.clone());
                                     }
                                     // Sync fast_mode visual indicator.
-                                    app.fast_mode = new_cfg.model
+                                    app.fast_mode = applied_cfg.model
                                         .as_deref()
                                         .map(|m| m.contains("haiku"))
                                         .unwrap_or(false);
                                     // Sync plan_mode visual indicator.
                                     app.plan_mode = matches!(
-                                        new_cfg.permission_mode,
+                                        applied_cfg.permission_mode,
                                         claurst_core::config::PermissionMode::Plan
+                                    );
+                                    session.model = claurst_api::effective_model_for_config(
+                                        &cmd_ctx.config,
+                                        &model_registry,
                                     );
                                     app.status_message =
                                         Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
-                                    cmd_ctx.config = new_cfg.clone();
-                                    tool_ctx.config = new_cfg.clone();
-                                    // Sync model name + fast_mode visual indicator.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
+                                    let mut applied_cfg = new_cfg;
+                                    normalize_provider_from_model(&mut applied_cfg);
+                                    cmd_ctx.config = applied_cfg.clone();
+                                    tool_ctx.config = applied_cfg.clone();
+                                    // Sync model/provider + fast_mode visual indicator.
+                                    if let Some(ref model) = applied_cfg.model {
+                                        app.set_model(model.clone());
                                         app.fast_mode = model.contains("haiku");
                                     } else {
                                         // model reset to None means fast mode off.
                                         app.fast_mode = false;
                                     }
-                                    app.config = new_cfg;
+                                    app.config = applied_cfg.clone();
+                                    session.model = claurst_api::effective_model_for_config(
+                                        &cmd_ctx.config,
+                                        &model_registry,
+                                    );
                                     app.status_message = Some(msg);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
@@ -2613,7 +2637,7 @@ async fn run_interactive(
                         )).await;
                     });
                 }
-                "openai-codex" => {
+                "codex" | "openai-codex" => {
                     let tx2 = device_auth_tx.clone();
                     // Keep the dialog in WaitingForCode until GotBrowserUrl arrives.
                     // (set_browser_url() transitions it to BrowserAuth with the URL.)

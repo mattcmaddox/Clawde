@@ -1502,6 +1502,7 @@ impl App {
                 "xai",
                 "openrouter",
                 "github-copilot",
+                "codex",
                 "cohere",
                 "perplexity",
                 "togetherai",
@@ -2721,7 +2722,7 @@ impl App {
                                 self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("github-copilot".to_string());
                             }
-                            "openai-codex" => {
+                            "codex" | "openai-codex" => {
                                 // OpenAI Codex: browser OAuth flow (spawned by main loop)
                                 self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
                                 self.device_auth_pending = Some("openai-codex".to_string());
@@ -3313,7 +3314,7 @@ impl App {
                     | crate::prompt_input::VimMode::VisualBlock
             )
         {
-            use crate::image_paste::{read_clipboard_image, read_clipboard_text};
+            use crate::image_paste::{read_clipboard_image, read_clipboard_text, read_primary_text};
             if let Some(img) = read_clipboard_image() {
                 let label = img.label.clone();
                 let dims = img.dimensions;
@@ -3324,9 +3325,16 @@ impl App {
                     format!("Image attached: {}", label)
                 };
                 self.notifications.push(NotificationKind::Info, msg, Some(3));
-            } else if let Some(text) = read_clipboard_text() {
+            } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
                 self.prompt_input.paste(&text);
+                self.refresh_prompt_input();
             }
+            return false;
+        }
+
+        // ---- Shift+Insert — selection/clipboard paste fallback -------------
+        if key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let _ = self.paste_primary_into_prompt();
             return false;
         }
 
@@ -4543,6 +4551,37 @@ impl App {
         }
     }
 
+    fn prompt_can_accept_selection_paste(&self) -> bool {
+        !self.is_streaming
+            && self.permission_request.is_none()
+            && !self.history_search_overlay.visible
+            && self.history_search.is_none()
+            && !matches!(
+                self.prompt_input.vim_mode,
+                crate::prompt_input::VimMode::Normal
+                    | crate::prompt_input::VimMode::Visual
+                    | crate::prompt_input::VimMode::VisualBlock
+            )
+    }
+
+    fn paste_primary_into_prompt(&mut self) -> bool {
+        if !self.prompt_can_accept_selection_paste() {
+            return false;
+        }
+
+        if let Some(text) = crate::image_paste::read_primary_text()
+            .or_else(crate::image_paste::read_clipboard_text)
+        {
+            self.focus = FocusTarget::Input;
+            self.clear_selection();
+            self.prompt_input.paste(&text);
+            self.refresh_prompt_input();
+            return true;
+        }
+
+        false
+    }
+
     /// Process mouse events (trackpad scroll, text selection, etc.).
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
@@ -4681,6 +4720,11 @@ impl App {
                 } else {
                     self.dismiss_context_menu();
                 }
+            }
+
+            // ---- Primary-selection paste into the prompt ---------------
+            MouseEventKind::Down(MouseButton::Middle) => {
+                let _ = self.paste_primary_into_prompt();
             }
 
             // ---- Text selection / focus routing -------------------------
