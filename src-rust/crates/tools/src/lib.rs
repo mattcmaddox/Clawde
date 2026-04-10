@@ -220,6 +220,8 @@ pub struct ToolContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: claurst_core::config::Config,
+    /// Managed agent (manager-executor) configuration, if active.
+    pub managed_agent_config: Option<claurst_core::ManagedAgentConfig>,
 }
 
 impl ToolContext {
@@ -532,6 +534,7 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            managed_agent_config: None,
         };
 
         // Absolute paths pass through unchanged
@@ -560,6 +563,7 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            managed_agent_config: None,
         };
 
         // Relative paths get joined with working_dir

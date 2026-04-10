@@ -12,6 +12,7 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
+pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
@@ -121,6 +122,8 @@ pub struct QueryConfig {
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
+    /// Managed agent (manager-executor) configuration.
+    pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
 }
 
 impl Default for QueryConfig {
@@ -146,6 +149,7 @@ impl Default for QueryConfig {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 }
@@ -161,6 +165,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -181,6 +186,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -683,6 +689,14 @@ pub async fn run_query_loop(
     } else {
         config.model.clone()
     };
+
+    // If managed-agent mode is active, override the model to the manager model.
+    if let Some(ref ma_config) = config.managed_agents {
+        if ma_config.enabled && !ma_config.manager_model.is_empty() {
+            effective_model = ma_config.manager_model.clone();
+        }
+    }
+
     let mut used_fallback = false;
     // How many automatic retries remain when a stream stalls (no data for 45s).
     let mut retries_left: u32 = 2;
@@ -792,6 +806,17 @@ pub async fn run_query_loop(
                     patched.system_prompt = Some(match &config.system_prompt {
                         Some(existing) => format!("{}\n\n{}", agent_prompt, existing),
                         None => agent_prompt.clone(),
+                    });
+                }
+            }
+
+            // If managed-agent mode is active, append orchestration instructions.
+            if let Some(ref ma_config) = config.managed_agents {
+                if ma_config.enabled {
+                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    patched.append_system_prompt = Some(match &patched.append_system_prompt {
+                        Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
+                        None => ma_prompt,
                     });
                 }
             }
@@ -2121,6 +2146,7 @@ mod tests {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 

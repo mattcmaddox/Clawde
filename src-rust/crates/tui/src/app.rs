@@ -935,6 +935,10 @@ pub struct App {
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
     pub update_available: Option<String>,
+    /// Cost breakdown for managed agent sessions: (manager_usd, executors_usd, total_usd).
+    pub managed_agent_cost_breakdown: Option<(f64, f64, f64)>,
+    /// Whether managed agent mode is currently active.
+    pub managed_agents_active: bool,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1298,6 +1302,8 @@ impl App {
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
+            managed_agent_cost_breakdown: None,
+            managed_agents_active: false,
         }
     }
 
@@ -2194,6 +2200,9 @@ impl App {
                 turns_completed: 0,
                 is_coordinator: false,
                 last_output: Some(status.clone()),
+                agent_role: crate::agents_view::AgentRole::Normal,
+                model_name: None,
+                cost_usd: 0.0,
             })
             .collect();
     }
