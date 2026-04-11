@@ -1227,6 +1227,11 @@ pub mod config {
                         .and_then(|provider| provider.api_key.clone())
                         .filter(|key| !key.is_empty())
                 })
+                .or_else(|| {
+                    api_key_env_vars_for_provider(provider_id)
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
                 .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
         }
 

@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use claurst_api::client::ClientConfig;
-use claurst_api::AnthropicClient;
+use claurst_api::{AnthropicClient, ModelRegistry, ProviderRegistry};
 use claurst_core::types::Message;
 use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use dashmap::DashMap;
@@ -126,6 +126,39 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
 
 pub struct AgentTool;
 
+fn build_model_registry() -> ModelRegistry {
+    let mut registry = ModelRegistry::new();
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let cache_path = cache_dir.join("claurst").join("models_dev.json");
+        registry.load_cache(&cache_path);
+    }
+    registry
+}
+
+fn resolve_subagent_model(params: &AgentInput, ctx: &ToolContext) -> String {
+    let base_model = params
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            ctx.managed_agent_config.as_ref()
+                .map(|c| c.executor_model.clone())
+                .filter(|m| !m.is_empty())
+        })
+        .unwrap_or_else(|| ctx.config.effective_model().to_string());
+
+    if base_model.contains('/') {
+        base_model
+    } else {
+        let provider_id = ctx.config.selected_provider_id();
+        if provider_id != "anthropic" {
+            format!("{}/{}", provider_id, base_model)
+        } else {
+            base_model
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentInput {
     /// Short description of the agent's task (used for logging).
@@ -226,27 +259,26 @@ impl Tool for AgentTool {
 
         info!(description = %params.description, "Spawning sub-agent");
 
-        // Resolve API key from environment.
-        let api_key = match std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-        {
-            Some(k) => k,
-            None => {
-                return ToolResult::error(
-                    "ANTHROPIC_API_KEY not set - cannot spawn sub-agent".to_string(),
-                )
-            }
-        };
-
-        // Dedicated Anthropic client for the sub-agent.
+        let anthropic_key = ctx.config.resolve_anthropic_api_key().unwrap_or_default();
+        let anthropic_base = ctx.config.resolve_anthropic_api_base();
         let client = match AnthropicClient::new(ClientConfig {
-            api_key,
+            api_key: anthropic_key.clone(),
+            api_base: anthropic_base,
             ..Default::default()
         }) {
             Ok(c) => Arc::new(c),
             Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
         };
+
+        let provider_registry = ProviderRegistry::from_config(
+            &ctx.config,
+            ClientConfig {
+                api_key: anthropic_key,
+                api_base: ctx.config.resolve_anthropic_api_base(),
+                ..Default::default()
+            },
+        );
+        let model_registry = Arc::new(build_model_registry());
 
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
@@ -261,16 +293,8 @@ impl Tool for AgentTool {
                 .collect()
         };
 
-        // Resolve model: explicit override > managed config executor model > default.
-        let model = params
-            .model
-            .filter(|m| !m.is_empty())
-            .or_else(|| {
-                ctx.managed_agent_config.as_ref()
-                    .map(|c| c.executor_model.clone())
-                    .filter(|m| !m.is_empty())
-            })
-            .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
+        // Resolve model: explicit override > managed config executor model > provider default.
+        let model = resolve_subagent_model(&params, ctx);
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
             let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
@@ -374,10 +398,10 @@ impl Tool for AgentTool {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
-            provider_registry: None,
+            provider_registry: Some(Arc::new(provider_registry)),
             agent_name: None,
             agent_definition: None,
-            model_registry: None,
+            model_registry: Some(model_registry),
             managed_agents: None,
         };
         // -----------------------------------------------------------------------
@@ -546,22 +570,11 @@ pub fn init_team_swarm_runner() {
          ctx: Arc<claurst_tools::ToolContext>| {
             // We must return a Pin<Box<dyn Future<...> + Send>>.
             Box::pin(async move {
-                // Resolve API key.
-                let api_key = match std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-                {
-                    Some(k) => k,
-                    None => {
-                        return format!(
-                            "[Agent '{}' failed: ANTHROPIC_API_KEY not set]",
-                            description
-                        )
-                    }
-                };
-
+                let anthropic_key = ctx.config.resolve_anthropic_api_key().unwrap_or_default();
+                let anthropic_base = ctx.config.resolve_anthropic_api_base();
                 let client = match claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
-                    api_key,
+                    api_key: anthropic_key.clone(),
+                    api_base: anthropic_base,
                     ..Default::default()
                 }) {
                     Ok(c) => Arc::new(c),
@@ -572,6 +585,16 @@ pub fn init_team_swarm_runner() {
                         )
                     }
                 };
+
+                let provider_registry = ProviderRegistry::from_config(
+                    &ctx.config,
+                    claurst_api::client::ClientConfig {
+                        api_key: anthropic_key,
+                        api_base: ctx.config.resolve_anthropic_api_base(),
+                        ..Default::default()
+                    },
+                );
+                let model_registry = Arc::new(build_model_registry());
 
                 // Build the tool list, filtering to the allowlist if provided.
                 let all = claurst_tools::all_tools();
@@ -586,7 +609,19 @@ pub fn init_team_swarm_runner() {
                             .collect()
                     };
 
-                let model = claurst_core::constants::DEFAULT_MODEL.to_string();
+                let model = resolve_subagent_model(
+                    &AgentInput {
+                        description: description.clone(),
+                        prompt: prompt.clone(),
+                        tools: tools.clone(),
+                        system_prompt: system.clone(),
+                        max_turns,
+                        model: None,
+                        isolation: None,
+                        run_in_background: false,
+                    },
+                    &ctx,
+                );
 
                 let system_prompt = system.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
@@ -602,6 +637,8 @@ pub fn init_team_swarm_runner() {
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    provider_registry: Some(Arc::new(provider_registry)),
+                    model_registry: Some(model_registry),
                     ..Default::default()
                 };
 

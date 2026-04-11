@@ -579,6 +579,15 @@ impl ModelPickerState {
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
         let filtered = self.filtered_models();
+        let custom = self.filter.trim();
+        if filtered.is_empty() {
+            if custom.is_empty() {
+                return None;
+            }
+            let id = custom.to_string();
+            self.close();
+            return Some((id, None));
+        }
         let entry = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
         let effort = if model_supports_effort(&id) { Some(self.effort_level) } else { None };
@@ -865,6 +874,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
+        if !state.filter.trim().is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                " Press Enter to use custom model",
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            )]));
+        }
     } else {
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
@@ -1069,14 +1084,14 @@ mod tests {
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
-    // 9. confirm() on empty filter list returns None.
+    // 9. confirm() on empty filter list uses custom model when filter is set.
     #[test]
     fn confirm_empty_filter_returns_none() {
         let mut p = make_picker_with_current("claude-opus-4-6");
         p.filter = "zzznomatch999".to_string();
         p.selected_idx = 0;
         let result = p.confirm();
-        assert!(result.is_none());
+        assert_eq!(result.map(|(id, _)| id), Some("zzznomatch999".to_string()));
     }
 
     // 10. close() clears filter and hides overlay.

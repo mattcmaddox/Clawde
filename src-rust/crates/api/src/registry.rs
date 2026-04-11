@@ -16,6 +16,38 @@ use crate::providers::{
     CopilotProvider, GoogleProvider, MinimaxProvider, OpenAiProvider,
 };
 
+fn normalize_openai_compat_base(override_base: &str) -> String {
+    let trimmed = override_base.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{}/v1", trimmed)
+    }
+}
+
+fn normalize_openai_base(override_base: &str) -> String {
+    let trimmed = override_base.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.trim_end_matches("/v1").to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn resolve_provider_api_base(
+    config: &claurst_core::config::Config,
+    provider_id: &str,
+) -> Option<String> {
+    let base = config.resolve_provider_api_base(provider_id)?;
+    if provider_id == "openai" {
+        Some(normalize_openai_base(&base))
+    } else if crate::providers::openai_compat_providers::provider_for_id(provider_id).is_some() {
+        Some(normalize_openai_compat_base(&base))
+    } else {
+        Some(base)
+    }
+}
+
 /// Registry of all available LLM providers.
 /// Holds `Arc<dyn LlmProvider>` for each registered provider.
 pub struct ProviderRegistry {
@@ -25,6 +57,10 @@ pub struct ProviderRegistry {
 
 fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
+
+    if let Some(provider) = p::provider_for_id(provider_id) {
+        return Some(Arc::new(provider.with_api_key(key)));
+    }
 
     match provider_id {
         "anthropic" => Some(Arc::new(AnthropicProvider::from_config(
@@ -40,34 +76,6 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
             CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         }
         "cohere" => Some(Arc::new(CohereProvider::new(key))),
-        "groq" => Some(Arc::new(p::groq().with_api_key(key))),
-        "mistral" => Some(Arc::new(p::mistral().with_api_key(key))),
-        "deepseek" => Some(Arc::new(p::deepseek().with_api_key(key))),
-        "xai" => Some(Arc::new(p::xai().with_api_key(key))),
-        "openrouter" => Some(Arc::new(p::openrouter().with_api_key(key))),
-        "togetherai" | "together-ai" => Some(Arc::new(p::together_ai().with_api_key(key))),
-        "perplexity" => Some(Arc::new(p::perplexity().with_api_key(key))),
-        "cerebras" => Some(Arc::new(p::cerebras().with_api_key(key))),
-        "deepinfra" => Some(Arc::new(p::deepinfra().with_api_key(key))),
-        "venice" => Some(Arc::new(p::venice().with_api_key(key))),
-        "huggingface" => Some(Arc::new(p::huggingface().with_api_key(key))),
-        "nvidia" => Some(Arc::new(p::nvidia().with_api_key(key))),
-        "siliconflow" => Some(Arc::new(p::siliconflow().with_api_key(key))),
-        "sambanova" => Some(Arc::new(p::sambanova().with_api_key(key))),
-        "moonshot" | "moonshotai" => Some(Arc::new(p::moonshot().with_api_key(key))),
-        "zhipu" | "zhipuai" => Some(Arc::new(p::zhipu().with_api_key(key))),
-        "zai" => Some(Arc::new(p::zai().with_api_key(key))),
-        "qwen" => Some(Arc::new(p::qwen().with_api_key(key))),
-        "nebius" => Some(Arc::new(p::nebius().with_api_key(key))),
-        "novita" => Some(Arc::new(p::novita().with_api_key(key))),
-        "ovhcloud" => Some(Arc::new(p::ovhcloud().with_api_key(key))),
-        "scaleway" => Some(Arc::new(p::scaleway().with_api_key(key))),
-        "vultr" | "vultr-ai" => Some(Arc::new(p::vultr_ai().with_api_key(key))),
-        "baseten" => Some(Arc::new(p::baseten().with_api_key(key))),
-        "friendli" => Some(Arc::new(p::friendli().with_api_key(key))),
-        "upstage" => Some(Arc::new(p::upstage().with_api_key(key))),
-        "stepfun" => Some(Arc::new(p::stepfun().with_api_key(key))),
-        "fireworks" => Some(Arc::new(p::fireworks().with_api_key(key))),
         _ => None,
     }
 }
@@ -82,9 +90,7 @@ pub fn provider_from_config(
     }
 
     let api_key = config.resolve_provider_api_key(provider_id);
-    let api_base = config
-        .resolve_provider_api_base(provider_id)
-        .filter(|base| !base.is_empty());
+    let api_base = resolve_provider_api_base(config, provider_id).filter(|base| !base.is_empty());
 
     use crate::providers;
 
