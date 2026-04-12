@@ -62,6 +62,7 @@ pub fn ollama() -> OpenAiCompatProvider {
             "prompt too long".to_string(),
             "exceeded.*context length".to_string(),
         ],
+        no_api_key_required: true,
         ..Default::default()
     })
 }
@@ -75,6 +76,7 @@ pub fn lm_studio() -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(ProviderId::LM_STUDIO, "LM Studio", base_url).with_quirks(
         ProviderQuirks {
             overflow_patterns: vec!["greater than the context length".to_string()],
+            no_api_key_required: true,
             ..Default::default()
         },
     )
@@ -89,6 +91,7 @@ pub fn llama_cpp() -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(ProviderId::LLAMA_CPP, "llama.cpp", base_url).with_quirks(
         ProviderQuirks {
             overflow_patterns: vec!["exceeds the available context size".to_string()],
+            no_api_key_required: true,
             ..Default::default()
         },
     )
