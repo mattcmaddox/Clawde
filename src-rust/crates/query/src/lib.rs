@@ -979,37 +979,17 @@ pub async fn run_query_loop(
 
                 let mut provider = runtime_provider.or(registry_provider);
 
-                // If the user supplied api_base for a local provider (Ollama, LM Studio,
-                // llama.cpp), rebuild the provider with the override URL.  These providers
-                // are always constructed with a hardcoded default URL, so without this
-                // the api_base setting would be silently ignored.
-                if let Some(override_base) = tool_ctx.config.provider_configs
-                    .get(&provider_id_str)
-                    .and_then(|pc| pc.api_base.as_deref())
-                {
-                    use claurst_api::providers::openai_compat_providers;
-                    let trimmed = override_base.trim_end_matches('/');
-                    // Avoid double /v1 suffix: only append if not already present.
-                    let base_url = if trimmed.ends_with("/v1") {
-                        trimmed.to_string()
-                    } else {
-                        format!("{}/v1", trimmed)
-                    };
-                    let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
-                        match provider_id_str.as_str() {
-                            "ollama" => Some(std::sync::Arc::new(
-                                openai_compat_providers::ollama().with_base_url(base_url),
-                            )),
-                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
-                                openai_compat_providers::lm_studio().with_base_url(base_url),
-                            )),
-                            "llamacpp" | "llama-cpp" | "llama-server" => Some(std::sync::Arc::new(
-                                openai_compat_providers::llama_cpp().with_base_url(base_url),
-                            )),
-                            _ => None,
-                        };
-                    if overridden.is_some() {
-                        provider = overridden;
+                // Rebuild providers using the unified base resolver so overrides
+                // from settings/env/defaults are applied consistently.
+                if let Some(_) = claurst_api::registry::resolve_provider_api_base(
+                    &tool_ctx.config,
+                    &provider_id_str,
+                ) {
+                    if let Some(overridden) = claurst_api::registry::provider_from_config(
+                        &tool_ctx.config,
+                        &provider_id_str,
+                    ) {
+                        provider = Some(overridden);
                     }
                 }
                 if let Some(provider) = provider {
