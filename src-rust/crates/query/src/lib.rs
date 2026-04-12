@@ -905,12 +905,25 @@ pub async fn run_query_loop(
                 // Check whether `p` is a known provider or just a model
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
-                    "anthropic", "openai", "google", "groq", "mistral",
-                    "deepseek", "xai", "cohere", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "codex", "openai-codex", "ollama", "lmstudio",
-                    "llamacpp", "azure", "amazon-bedrock", "huggingface",
-                    "nvidia", "fireworks", "sambanova",
+                    // Native (non-OpenAI-compat) providers
+                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
+                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
+                    // Local / self-hosted
+                    "ollama",
+                    "lmstudio", "lm-studio",
+                    "llamacpp", "llama-cpp", "llama-server",
+                    // OpenAI-compat cloud providers
+                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
+                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
+                    "huggingface", "nvidia", "fireworks", "sambanova",
+                    // Additional OpenAI-compat providers
+                    "qwen", "siliconflow",
+                    "moonshot", "moonshotai",
+                    "zhipu", "zhipuai",
+                    "zai",
+                    "nebius", "novita", "ovhcloud", "scaleway",
+                    "vultr", "vultr-ai",
+                    "baseten", "friendli", "upstage", "stepfun",
                 ];
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
