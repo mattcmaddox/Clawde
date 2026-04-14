@@ -35,6 +35,27 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 
 ## Getting Started
 
+### Devcontainer setup
+
+After cloning this repository, open it in VS Code and use Reopen in Container to start the development environment.
+
+Prerequisites:
+- Docker installed on your host machine: https://www.docker.com/products/docker-desktop/
+
+GPG and SSH forwarding is enabled in the devcontainer, given you have it set up on your host machine. Follow [this guide](https://code.visualstudio.com/remote/advancedcontainers/sharing-git-credentials) if you need help with that.
+
+### Devcontainer features
+
+- Base image: `rust:1-bullseye`.
+- Preinstalled build dependencies: `gnupg2`, `libasound2-dev`, `libxdo-dev`, and `pkg-config`.
+- Devcontainer features enabled: `common-utils` (with `vscode` user `uid/gid 1000` and Zsh install disabled), `git`, and `docker-outside-of-docker` (`moby: false`).
+- Runs as `vscode` user by default.
+- Persistent Cargo caches via named volumes for `/usr/local/cargo/registry` and `/usr/local/cargo/git`.
+- Binds local `.claurst` into `/home/vscode/.claurst` for local settings/session history access.
+- Sets `GNUPGHOME=/home/vscode/.gnupg` and prepends `src-rust/target/debug` and `src-rust/target/release` to `PATH`.
+- Post-create setup creates and permissions `.gnupg`, and fixes ownership for `/usr/local/cargo`.
+- VS Code setting `terminal.integrated.inheritEnv` is enabled.
+
 ### Download a release binary
 
 Grab the latest binary for your platform from [**GitHub Releases**](https://github.com/kuberwastaken/claurst/releases):
