@@ -63,6 +63,19 @@ pub struct ProviderQuirks {
     /// reasoning / thinking text.  `None` means the provider does not expose
     /// reasoning output.  Example: `Some("reasoning_content")` for DeepSeek.
     pub reasoning_field: Option<String>,
+
+    /// Hard cap on `max_tokens` sent to this provider.  When the request
+    /// carries a higher value it is silently clamped down to this limit.
+    /// Use this for providers whose models have a lower output ceiling than
+    /// the default we request (e.g. DeepSeek Chat caps at 8 192).
+    pub max_tokens_cap: Option<u32>,
+
+    /// Set to `true` for providers that never require an API key (e.g.
+    /// Ollama, LM Studio, llama.cpp).  When `true`, `health_check()` will
+    /// always attempt a live network probe regardless of whether the base URL
+    /// points to a local or remote host, instead of short-circuiting with
+    /// "No API key configured".
+    pub no_api_key_required: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +281,13 @@ impl OpenAiCompatProvider {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
+        let max_tokens = match self.quirks.max_tokens_cap {
+            Some(cap) => request.max_tokens.min(cap),
+            None => request.max_tokens,
+        };
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": false,
         });
@@ -342,9 +359,13 @@ impl OpenAiCompatProvider {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
+        let max_tokens = match self.quirks.max_tokens_cap {
+            Some(cap) => request.max_tokens.min(cap),
+            None => request.max_tokens,
+        };
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": true,
         });
@@ -740,19 +761,24 @@ impl LlmProvider for OpenAiCompatProvider {
         // Providers that need an API key but have none configured are
         // immediately unavailable without making a network call.
         if self.has_no_key() {
-            // Local providers (Ollama, LM Studio, llama.cpp) have no key by
-            // design.  For remote providers the key will be None only if the
-            // env var was missing or empty; report that clearly.
+            // Providers that never require an API key (Ollama, LM Studio,
+            // llama.cpp) should always proceed to the live health probe,
+            // regardless of whether the base URL is local or remote.  This
+            // allows remote/VPS-hosted instances to be used without a key.
             //
-            // We distinguish by whether the base_url is a localhost address.
-            let is_local = self.base_url.contains("localhost")
-                || self.base_url.contains("127.0.0.1")
-                || self.base_url.contains("::1");
+            // For all other providers a missing key means the env var was
+            // absent or empty; report that without making a network call,
+            // distinguishing only by URL when the quirk is not set.
+            if !self.quirks.no_api_key_required {
+                let is_local = self.base_url.contains("localhost")
+                    || self.base_url.contains("127.0.0.1")
+                    || self.base_url.contains("::1");
 
-            if !is_local {
-                return Ok(ProviderStatus::Unavailable {
-                    reason: "No API key configured".to_string(),
-                });
+                if !is_local {
+                    return Ok(ProviderStatus::Unavailable {
+                        reason: "No API key configured".to_string(),
+                    });
+                }
             }
         }
 

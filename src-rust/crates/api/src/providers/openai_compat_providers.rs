@@ -11,7 +11,42 @@ use claurst_core::provider_id::ProviderId;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
-const DEFAULT_CUSTOM_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
+pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
+    match provider_id {
+        "ollama" => Some(ollama()),
+        "lmstudio" | "lm-studio" => Some(lm_studio()),
+        "llamacpp" | "llama-cpp" | "llama-server" => Some(llama_cpp()),
+        "deepseek" => Some(deepseek()),
+        "groq" => Some(groq()),
+        "xai" => Some(xai()),
+        "deepinfra" => Some(deepinfra()),
+        "cerebras" => Some(cerebras()),
+        "togetherai" | "together-ai" => Some(together_ai()),
+        "perplexity" => Some(perplexity()),
+        "venice" => Some(venice()),
+        "qwen" => Some(qwen()),
+        "mistral" => Some(mistral()),
+        "openrouter" => Some(openrouter()),
+        "sambanova" => Some(sambanova()),
+        "huggingface" => Some(huggingface()),
+        "nvidia" => Some(nvidia()),
+        "siliconflow" => Some(siliconflow()),
+        "moonshot" | "moonshotai" => Some(moonshot()),
+        "zhipu" | "zhipuai" => Some(zhipu()),
+        "zai" => Some(zai()),
+        "nebius" => Some(nebius()),
+        "novita" => Some(novita()),
+        "ovhcloud" => Some(ovhcloud()),
+        "scaleway" => Some(scaleway()),
+        "vultr" | "vultr-ai" => Some(vultr_ai()),
+        "baseten" => Some(baseten()),
+        "friendli" => Some(friendli()),
+        "upstage" => Some(upstage()),
+        "stepfun" => Some(stepfun()),
+        "fireworks" => Some(fireworks()),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Local / self-hosted providers (no API key required)
@@ -20,31 +55,29 @@ const DEFAULT_CUSTOM_OPENAI_BASE_URL: &str = "http://localhost:11434/v1";
 /// Ollama — local inference server.
 /// Reads `OLLAMA_HOST` for the base URL; defaults to `http://localhost:11434`.
 pub fn ollama() -> OpenAiCompatProvider {
-    let host = std::env::var("OLLAMA_HOST")
-        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
     let base_url = format!("{}/v1", host.trim_end_matches('/'));
-    OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", base_url).with_quirks(
-        ProviderQuirks {
-            overflow_patterns: vec![
-                "prompt too long".to_string(),
-                "exceeded.*context length".to_string(),
-            ],
-            ..Default::default()
-        },
-    )
+    OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", base_url).with_quirks(ProviderQuirks {
+        overflow_patterns: vec![
+            "prompt too long".to_string(),
+            "exceeded.*context length".to_string(),
+        ],
+        no_api_key_required: true,
+        ..Default::default()
+    })
 }
 
 /// LM Studio — local OpenAI-compatible server.
 /// Reads `LM_STUDIO_HOST` for the base URL; defaults to `http://localhost:1234`.
 pub fn lm_studio() -> OpenAiCompatProvider {
-    let host = std::env::var("LM_STUDIO_HOST")
-        .unwrap_or_else(|_| "http://localhost:1234".to_string());
+    let host =
+        std::env::var("LM_STUDIO_HOST").unwrap_or_else(|_| "http://localhost:1234".to_string());
     let base_url = format!("{}/v1", host.trim_end_matches('/'));
     OpenAiCompatProvider::new(ProviderId::LM_STUDIO, "LM Studio", base_url).with_quirks(
         ProviderQuirks {
-            overflow_patterns: vec![
-                "greater than the context length".to_string(),
-            ],
+            overflow_patterns: vec!["greater than the context length".to_string()],
+            no_api_key_required: true,
             ..Default::default()
         },
     )
@@ -53,14 +86,13 @@ pub fn lm_studio() -> OpenAiCompatProvider {
 /// llama.cpp — lightweight C++ inference server.
 /// Reads `LLAMA_CPP_HOST` for the base URL; defaults to `http://localhost:8080`.
 pub fn llama_cpp() -> OpenAiCompatProvider {
-    let host = std::env::var("LLAMA_CPP_HOST")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let host =
+        std::env::var("LLAMA_CPP_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let base_url = format!("{}/v1", host.trim_end_matches('/'));
     OpenAiCompatProvider::new(ProviderId::LLAMA_CPP, "llama.cpp", base_url).with_quirks(
         ProviderQuirks {
-            overflow_patterns: vec![
-                "exceeds the available context size".to_string(),
-            ],
+            overflow_patterns: vec!["exceeds the available context size".to_string()],
+            no_api_key_required: true,
             ..Default::default()
         },
     )
@@ -89,7 +121,7 @@ pub fn custom_openai() -> OpenAiCompatProvider {
         .get("custom-openai")
         .and_then(|config| config.api_base.as_deref())
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or(DEFAULT_CUSTOM_OPENAI_BASE_URL);
+        .unwrap_or("http://localhost:11434/v1");
 
     custom_openai_with_url(base_url)
 }
@@ -108,6 +140,8 @@ pub fn deepseek() -> OpenAiCompatProvider {
         reasoning_field: Some("reasoning_content".to_string()),
         overflow_patterns: vec!["maximum context length is".to_string()],
         include_usage_in_stream: true,
+        // DeepSeek Chat rejects max_tokens > 8192.
+        max_tokens_cap: Some(8192),
         ..Default::default()
     })
 }
@@ -118,9 +152,7 @@ pub fn groq() -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(ProviderId::GROQ, "Groq", "https://api.groq.com/openai/v1")
         .with_api_key(key)
         .with_quirks(ProviderQuirks {
-            overflow_patterns: vec![
-                "reduce the length of the messages".to_string(),
-            ],
+            overflow_patterns: vec!["reduce the length of the messages".to_string()],
             include_usage_in_stream: true,
             ..Default::default()
         })
@@ -326,6 +358,19 @@ pub fn zhipu() -> OpenAiCompatProvider {
     .with_api_key(key)
 }
 
+/// Z.AI (Zhipu) — current-generation GLM models (GLM-5.1, GLM-5, GLM-5-Turbo, GLM-4.7, etc.).
+/// Uses the Z.AI international endpoint per docs.z.ai.
+/// Reads `ZAI_API_KEY`.
+pub fn zai() -> OpenAiCompatProvider {
+    let key = std::env::var("ZAI_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::ZAI,
+        "Z.AI",
+        "https://api.z.ai/api/coding/paas/v4",
+    )
+    .with_api_key(key)
+}
+
 /// Nebius — Llama / Qwen hosting.  Reads `NEBIUS_API_KEY`.
 pub fn nebius() -> OpenAiCompatProvider {
     let key = std::env::var("NEBIUS_API_KEY").unwrap_or_default();
@@ -417,12 +462,8 @@ pub fn upstage() -> OpenAiCompatProvider {
 /// StepFun — Step models.  Reads `STEPFUN_API_KEY`.
 pub fn stepfun() -> OpenAiCompatProvider {
     let key = std::env::var("STEPFUN_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::STEPFUN,
-        "StepFun",
-        "https://api.stepfun.com/v1",
-    )
-    .with_api_key(key)
+    OpenAiCompatProvider::new(ProviderId::STEPFUN, "StepFun", "https://api.stepfun.com/v1")
+        .with_api_key(key)
 }
 
 /// Fireworks AI — fast inference.  Reads `FIREWORKS_API_KEY`.
