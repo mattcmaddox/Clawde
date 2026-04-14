@@ -120,13 +120,26 @@ pub fn model_family_description(id: &str) -> String {
 // Provider grouping helpers
 // ---------------------------------------------------------------------------
 
+/// Format context window tokens for display in the model picker.
+pub fn format_context_window(context_window: u32) -> String {
+    if context_window >= 1_000_000 {
+        if context_window % 1_000_000 == 0 {
+            format!("{}M context", context_window / 1_000_000)
+        } else {
+            format!("{:.1}M context", context_window as f64 / 1_000_000.0)
+        }
+    } else {
+        format!("{}K context", context_window / 1000)
+    }
+}
+
 /// Format a model display line with optional context window and cost info.
 ///
 /// Example: `"gpt-4o  128K ctx  $5.00/M"`
 pub fn format_model_line(model_str: &str, context_window: Option<u32>, cost_per_1m: Option<f64>) -> String {
     let mut parts = vec![model_str.to_string()];
     if let Some(ctx) = context_window {
-        parts.push(format!("{}K ctx", ctx / 1000));
+        parts.push(format_context_window(ctx).replace(" context", " ctx"));
     }
     if let Some(cost) = cost_per_1m {
         if cost == 0.0 {
@@ -245,10 +258,9 @@ pub fn models_for_provider_from_registry(
         entries
             .iter()
             .map(|e| {
-                let ctx_k = e.info.context_window / 1000;
                 let cost_str = match (e.cost_input, e.cost_output) {
-                    (Some(ci), Some(co)) => format!("{}K ctx | ${:.2}/${:.2} per M", ctx_k, ci, co),
-                    _ => format!("{}K ctx", ctx_k),
+                    (Some(ci), Some(co)) => format!("{} | ${:.2}/${:.2} per M", format_context_window(e.info.context_window), ci, co),
+                    _ => format_context_window(e.info.context_window),
                 };
                 ModelEntry {
                     id: e.info.id.to_string(),

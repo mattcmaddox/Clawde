@@ -32,7 +32,6 @@ use claurst_core::keybindings::{
 };
 use claurst_core::types::{ContentBlock, Message, Role};
 use claurst_query::QueryEvent;
-use claurst_tools;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Color;
@@ -5138,82 +5137,6 @@ impl App {
         loop {
             self.frame_count = self.frame_count.wrapping_add(1);
 
-            // Sync cost/token counters from the shared tracker
-            self.cost_usd = self.cost_tracker.total_cost_usd();
-            self.token_count = self.cost_tracker.total_tokens() as u32;
-
-            // Expire old notifications
-            self.notifications.tick();
-            self.memory_update_notification.tick();
-
-            // Drain background model-fetch results (non-blocking).
-            if let Some(ref mut rx) = self.model_fetch_rx {
-                match rx.try_recv() {
-                    Ok(Ok(entries)) => {
-                        let provider = self
-                            .config
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| "anthropic".to_string());
-                        let provider_prefix = format!("{}/", provider);
-                        let current = self
-                            .model_name
-                            .strip_prefix(&provider_prefix)
-                            .unwrap_or(self.model_name.as_str())
-                            .to_string();
-                        self.model_picker.set_models(entries);
-                        // Re-apply the current-model highlight so it stays accurate.
-                        for m in &mut self.model_picker.models {
-                            m.is_current = m.id == current;
-                        }
-                        self.model_fetch_rx = None;
-                    }
-                    Ok(Err(()))
-                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        self.model_picker.loading_models = false;
-                        self.model_fetch_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-
-            // Spawn async provider model-list fetch when requested.
-            if self.model_picker_fetch_pending {
-                self.model_picker_fetch_pending = false;
-                let provider_id_str = self.config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
-                if let Some(ref registry) = self.provider_registry {
-                    let pid = claurst_core::ProviderId::new(&provider_id_str);
-                    if let Some(provider) = registry.get(&pid) {
-                        let provider = provider.clone();
-                        let (tx, rx) = tokio::sync::mpsc::channel(1);
-                        self.model_fetch_rx = Some(rx);
-                        self.model_picker.loading_models = true;
-                        tokio::spawn(async move {
-                            match provider.list_models().await {
-                                Ok(models) => {
-                                    let entries: Vec<crate::model_picker::ModelEntry> = models
-                                        .into_iter()
-                                        .map(|m| {
-                                            let ctx_k = m.context_window / 1000;
-                                            crate::model_picker::ModelEntry {
-                                                id: m.id.to_string(),
-                                                display_name: m.name.clone(),
-                                                description: format!("{}K context", ctx_k),
-                                                is_current: false,
-                                            }
-                                        })
-                                        .collect();
-                                    let _ = tx.send(Ok(entries)).await;
-                                }
-                                Err(_) => {
-                                    let _ = tx.send(Err(())).await;
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-
             // Drain background session-list results.
             if let Some(ref mut rx) = self.session_list_rx {
                 match rx.try_recv() {
@@ -5316,11 +5239,6 @@ impl App {
                         }
                     }
                 }
-            }
-
-            // Refresh task list if the overlay is visible (every frame for live updates)
-            if self.tasks_overlay.visible {
-                self.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
             }
 
             // Draw the frame

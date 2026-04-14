@@ -1018,7 +1018,12 @@ impl LlmProvider for CodexProvider {
                 id: ModelId::new(*id),
                 provider_id: self.id.clone(),
                 name: name.to_string(),
-                context_window: 128_000,
+                context_window: match *id {
+                    "gpt-5.4" | "gpt-5-codex" | "gpt-5-mini" => 400_000,
+                    "gpt-4.1" => 128_000,
+                    "o4-mini" => 200_000,
+                    _ => 128_000,
+                },
                 max_output_tokens: 32_768,
             })
             .collect();
