@@ -6,6 +6,7 @@
 // variable is absent or empty the provider is still constructed but
 // `health_check()` will return `ProviderStatus::Unavailable`.
 
+use claurst_core::Settings;
 use claurst_core::provider_id::ProviderId;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
@@ -100,6 +101,30 @@ pub fn llama_cpp() -> OpenAiCompatProvider {
 // ---------------------------------------------------------------------------
 // Remote / cloud providers (API key required)
 // ---------------------------------------------------------------------------
+/// Custom OpenAI-compatible provider supplied by the user.
+pub fn custom_openai_with_url(base_url: impl Into<String>) -> OpenAiCompatProvider {
+    let key = std::env::var("CUSTOM_OPENAI_API_KEY").unwrap_or_default();
+
+    OpenAiCompatProvider::new(
+        "custom-openai",
+        "Custom OpenAI-Compatible",
+        base_url.into(),
+    )
+    .with_api_key(key)
+}
+
+/// Custom OpenAI-compatible provider supplied by the user.
+pub fn custom_openai() -> OpenAiCompatProvider {
+    let settings = Settings::load_sync().unwrap_or_default();
+    let base_url = settings
+        .providers
+        .get("custom-openai")
+        .and_then(|config| config.api_base.as_deref())
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or("http://localhost:11434/v1");
+
+    custom_openai_with_url(base_url)
+}
 
 /// DeepSeek — supports reasoning output via `reasoning_content` field.
 /// Reads `DEEPSEEK_API_KEY`.

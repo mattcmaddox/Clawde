@@ -378,6 +378,9 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("gpt-4o", "GPT-4o (Azure)", "128K context"),
             model_entry("gpt-4o-mini", "GPT-4o mini (Azure)", "128K context"),
         ],
+        "custom-openai" => vec![
+            model_entry("default", "Default model", "OpenAI-compatible endpoint"),
+        ],
         "amazon-bedrock" => vec![
             model_entry("anthropic.claude-sonnet-4-6-v1", "Claude Sonnet 4.6 (Bedrock)", "200K context"),
             model_entry("anthropic.claude-haiku-4-5-20251001-v1", "Claude Haiku 4.5 (Bedrock)", "200K context"),

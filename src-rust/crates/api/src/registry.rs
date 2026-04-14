@@ -76,6 +76,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
             CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         }
         "cohere" => Some(Arc::new(CohereProvider::new(key))),
+        "custom-openai" => Some(Arc::new(p::custom_openai().with_api_key(key))),
         _ => None,
     }
 }
