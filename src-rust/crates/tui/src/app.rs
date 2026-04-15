@@ -4,6 +4,7 @@ use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
 use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
+use crate::import_config_dialog::ImportConfigDialogState;
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
 use crate::model_picker::{EffortLevel, ModelPickerState};
@@ -64,6 +65,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
+    ("import-config", "Import CLAUDE.md and settings.json from ~/.claude"),
     ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
     ("install-slack-app", "Install the Claurst Slack integration"),
@@ -101,7 +103,7 @@ fn help_command_category(name: &str) -> &'static str {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" => {
+        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
@@ -205,6 +207,33 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "zai" => "z.ai/manage-apikey/apikey-list",
         _ => "the provider's website",
     }
+}
+
+
+fn import_config_picker_items() -> Vec<SelectItem> {
+    vec![
+        SelectItem {
+            id: "claude-md".into(),
+            title: "CLAUDE.md".into(),
+            description: "导入 ~/.claude/CLAUDE.md".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "settings".into(),
+            title: "settings.json".into(),
+            description: "导入 ~/.claude/settings.json".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "both".into(),
+            title: "Both".into(),
+            description: "同时导入 CLAUDE.md 与 settings.json".into(),
+            category: "Import".into(),
+            badge: Some("SAFE".into()),
+        },
+    ]
 }
 
 fn provider_picker_items() -> Vec<SelectItem> {
@@ -825,6 +854,10 @@ pub struct App {
     pub auth_store: claurst_core::AuthStore,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// Import-config source picker (/import-config command).
+    pub import_config_picker: DialogSelectState,
+    /// Import-config preview and confirmation dialog.
+    pub import_config_dialog: ImportConfigDialogState,
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
     /// Whether Claurst was launched from the user's home directory.
@@ -1225,6 +1258,8 @@ impl App {
             session_list_rx: None,
             auth_store: claurst_core::AuthStore::load(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
+            import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
@@ -1328,6 +1363,72 @@ impl App {
     #[cfg(not(feature = "token_budget"))]
     fn load_token_budget() -> Option<u32> {
         None
+    }
+
+    pub fn open_import_config_picker(&mut self) {
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_picker.open();
+    }
+
+    fn import_selection_from_picker(id: &str) -> Option<claurst_core::ImportSelection> {
+        match id {
+            "claude-md" => Some(claurst_core::ImportSelection::ClaudeMd),
+            "settings" => Some(claurst_core::ImportSelection::Settings),
+            "both" => Some(claurst_core::ImportSelection::Both),
+            _ => None,
+        }
+    }
+
+    fn open_import_config_preview(&mut self, selection: claurst_core::ImportSelection) {
+        match claurst_core::build_import_preview(selection) {
+            Ok(preview) => {
+                self.import_config_dialog.open(preview);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+            }
+        }
+    }
+
+    fn perform_import_config(&mut self) {
+        let Some(selection) = self.import_config_dialog.selection else {
+            self.import_config_dialog.close();
+            return;
+        };
+        match claurst_core::execute_import(selection) {
+            Ok(result) => {
+                let paths = claurst_core::ImportPaths::detect();
+                let new_settings = Settings::load_sync().unwrap_or_default();
+                let new_config = new_settings.effective_config();
+                let result_message = claurst_core::summarize_import_result(&result, &paths);
+                let imported_mcp = result.imported_fields.iter().any(|f| f == "mcpServers");
+                self.config = new_config.clone();
+                self.model_name = self.config.effective_model().to_string();
+                self.cost_tracker.set_model(&self.model_name);
+                self.refresh_context_window_size();
+                self.context_used_tokens = 0;
+                self.has_credentials = self.config.resolve_api_key().is_some();
+                self.auth_store = claurst_core::AuthStore::load();
+                self.plan_mode = matches!(
+                    self.config.permission_mode,
+                    claurst_core::config::PermissionMode::Plan
+                );
+                self.output_style = match self.config.output_style.as_deref() {
+                    Some("stream") => "stream".to_string(),
+                    Some("verbose") => "verbose".to_string(),
+                    _ => "auto".to_string(),
+                };
+                if imported_mcp {
+                    self.pending_mcp_reconnect = true;
+                }
+                self.status_message = Some(result_message);
+                self.import_config_dialog.close();
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+                self.import_config_dialog.close();
+            }
+        }
     }
 
     fn current_user_turn_index(&self) -> Option<usize> {
@@ -1737,6 +1838,8 @@ impl App {
         self.model_registry = claurst_api::ModelRegistry::new();
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
         self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
@@ -1814,6 +1917,10 @@ impl App {
             }
             "hooks" => {
                 self.hooks_config_menu.open();
+                true
+            }
+            "import-config" => {
+                self.open_import_config_picker();
                 true
             }
             "connect" => {
@@ -2023,6 +2130,8 @@ impl App {
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.connect_dialog.close();
+        self.import_config_picker.close();
+        self.import_config_dialog.close();
         self.command_palette.close();
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
@@ -2812,6 +2921,43 @@ impl App {
                 }
                 KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
                 KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config source picker
+        if self.import_config_picker.visible {
+            match key.code {
+                KeyCode::Esc => { self.import_config_picker.close(); }
+                KeyCode::Home => { self.import_config_picker.move_home(); }
+                KeyCode::End => { self.import_config_picker.move_end(); }
+                KeyCode::Up => { self.import_config_picker.move_up(); }
+                KeyCode::Down => { self.import_config_picker.move_down(); }
+                KeyCode::PageUp => { self.import_config_picker.page_up(); }
+                KeyCode::PageDown => { self.import_config_picker.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.import_config_picker.selected().cloned() {
+                        self.import_config_picker.close();
+                        if let Some(selection) = Self::import_selection_from_picker(&selected.id) {
+                            self.open_import_config_preview(selection);
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.import_config_picker.filter_pop(); }
+                KeyCode::Char(c) => { self.import_config_picker.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config preview dialog
+        if self.import_config_dialog.visible {
+            match key.code {
+                KeyCode::Esc => self.import_config_dialog.close(),
+                KeyCode::Enter => self.perform_import_config(),
                 _ => {}
             }
             return false;
@@ -3727,6 +3873,8 @@ impl App {
             KeyContext::DiffDialog
         } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
             KeyContext::Select
+        } else if self.import_config_dialog.visible {
+            KeyContext::Confirmation
         } else if self.settings_screen.visible {
             KeyContext::Settings
         } else if self.theme_screen.visible {
@@ -4692,6 +4840,8 @@ impl App {
         // Key-input and device-auth stay outside this gate so their visible text
         // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
+            || self.import_config_picker.visible
+            || self.import_config_dialog.visible
             || self.command_palette.visible
             || self.model_picker.visible
             || self.export_dialog.visible
@@ -4706,6 +4856,8 @@ impl App {
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
                         self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.import_config_picker.visible {
+                        self.import_config_picker.contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
                         self.command_palette.contains(mouse_event.column, mouse_event.row)
                     } else {
@@ -4719,6 +4871,8 @@ impl App {
                         // Click inside a DialogSelect — select the clicked item
                         if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.import_config_picker.visible {
+                            self.import_config_picker.handle_mouse_click(mouse_event.row);
                         } else if self.command_palette.visible {
                             self.command_palette.handle_mouse_click(mouse_event.row);
                         }
@@ -4732,10 +4886,12 @@ impl App {
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
                     if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_up(); }
                     else if self.command_palette.visible { self.command_palette.move_up(); }
                 }
                 MouseEventKind::ScrollDown => {
                     if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_down(); }
                     else if self.command_palette.visible { self.command_palette.move_down(); }
                 }
                 _ => {}
