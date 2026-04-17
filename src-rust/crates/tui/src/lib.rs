@@ -109,6 +109,8 @@ pub mod onboarding_dialog;
 pub mod dialog_select;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
+/// Modal dialog for entering custom provider URL + API key.
+pub mod custom_provider_dialog;
 /// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
 pub mod device_auth_dialog;
 /// Push-to-talk voice capture and Whisper transcription.
@@ -146,6 +148,7 @@ pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_
 pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
 pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
 pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
+pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 
 // ---------------------------------------------------------------------------

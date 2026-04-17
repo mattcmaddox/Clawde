@@ -13,15 +13,13 @@
 //   - `isolation: "worktree"` — run the agent in a dedicated git worktree so
 //     file edits don't conflict with the parent checkout or sibling agents.
 //   - `run_in_background: true` — fire-and-forget; returns agent_id immediately.
-//     Use poll_background_agent() to check completion status.
+//     Use the `monitor` tool to check completion status/output.
 
 use async_trait::async_trait;
 use claurst_api::client::ClientConfig;
 use claurst_api::{AnthropicClient, ModelRegistry, ProviderRegistry};
 use claurst_core::types::Message;
 use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
-use dashmap::DashMap;
-use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -31,40 +29,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{run_query_loop, QueryConfig, QueryOutcome};
-
-// ---------------------------------------------------------------------------
-// Background agent registry
-// ---------------------------------------------------------------------------
-
-/// Registry of in-flight background agents.
-/// Maps agent_id -> oneshot receiver that resolves to the agent's final output.
-static BACKGROUND_AGENTS: Lazy<DashMap<String, tokio::sync::oneshot::Receiver<String>>> =
-    Lazy::new(DashMap::new);
-
-/// Poll a background agent's result.
-///
-/// Returns `None` if still running, `Some(result_text)` when done (or errored).
-/// After returning `Some`, the entry is removed from the registry.
-pub fn poll_background_agent(agent_id: &str) -> Option<String> {
-    if let Some(mut entry) = BACKGROUND_AGENTS.get_mut(agent_id) {
-        match entry.try_recv() {
-            Ok(result) => {
-                drop(entry);
-                BACKGROUND_AGENTS.remove(agent_id);
-                Some(result)
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
-            Err(_) => {
-                // Sender dropped - treat as agent error/cancellation.
-                drop(entry);
-                BACKGROUND_AGENTS.remove(agent_id);
-                Some("[Agent error or cancelled]".to_string())
-            }
-        }
-    } else {
-        None
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Worktree isolation helpers
@@ -243,8 +207,8 @@ impl Tool for AgentTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "If true, the agent starts immediately and this call returns an \
-                                    agent_id without waiting for completion. Poll with poll_background_agent \
-                                    to retrieve the result. Default: false."
+                                    agent_id without waiting for completion. Use the monitor tool \
+                                    with action=status/output and task_id=agent_id. Default: false."
                 }
             },
             "required": ["description", "prompt"]
@@ -408,8 +372,12 @@ impl Tool for AgentTool {
         // Background mode: spawn and return agent_id immediately.
         // -----------------------------------------------------------------------
         if params.run_in_background {
-            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-            BACKGROUND_AGENTS.insert(agent_id.clone(), rx);
+            let mut task = claurst_core::tasks::BackgroundTask::new(format!(
+                "subagent: {}",
+                params.description
+            ));
+            task.id = agent_id.clone();
+            let _ = claurst_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
             let agent_tools_bg: Vec<Box<dyn Tool>> = claurst_tools::all_tools()
@@ -446,13 +414,33 @@ impl Tool for AgentTool {
                     remove_worktree(&root, &wt).await;
                 }
 
+                // Respect a prior external cancellation mark from monitor cancel.
+                let cancelled = matches!(
+                    claurst_core::tasks::global_registry()
+                        .get(&agent_id_bg)
+                        .map(|t| t.status),
+                    Some(claurst_core::tasks::TaskStatus::Cancelled)
+                );
+
                 let result_text = format_outcome(outcome);
+                claurst_core::tasks::global_registry().append_output(&agent_id_bg, &result_text);
+
+                if !cancelled {
+                    let status = if result_text.starts_with("[Agent error:")
+                        || result_text.starts_with("[Agent stopped:")
+                    {
+                        claurst_core::tasks::TaskStatus::Failed(result_text.clone())
+                    } else {
+                        claurst_core::tasks::TaskStatus::Completed
+                    };
+                    claurst_core::tasks::global_registry().update_status(&agent_id_bg, status);
+                }
+
                 debug!(
                     agent_id = %agent_id_bg,
                     description = %description_bg,
                     "Background agent completed"
                 );
-                let _ = tx.send(result_text);
             });
 
             return ToolResult::success(
@@ -460,7 +448,7 @@ impl Tool for AgentTool {
                     "agent_id": agent_id,
                     "status": "running",
                     "message": format!(
-                        "Agent '{}' started in background. Use poll_background_agent with agent_id '{}' to check status.",
+                        "Agent '{}' started in background. Use monitor with action=status/output and task_id='{}'.",
                         params.description, agent_id
                     )
                 })

@@ -1588,6 +1588,7 @@ async fn run_interactive(
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.connect_dialog.visible
                         || app.key_input_dialog.visible
+                        || app.custom_provider_dialog.visible
                         || app.device_auth_dialog.visible
                         || app.command_palette.visible
                         || app.model_picker.visible
@@ -2549,6 +2550,88 @@ async fn run_interactive(
                     Err(_) => break,
                 }
             }
+        }
+
+        // Sync cost/token counters and expire transient UI state.
+        app.cost_usd = app.cost_tracker.total_cost_usd();
+        app.token_count = app.cost_tracker.total_tokens() as u32;
+        app.notifications.tick();
+        app.memory_update_notification.tick();
+
+        // Drain background model-fetch results (non-blocking).
+        if let Some(ref mut rx) = app.model_fetch_rx {
+            match rx.try_recv() {
+                Ok(Ok(entries)) => {
+                    let provider = app
+                        .config
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "anthropic".to_string());
+                    let provider_prefix = format!("{}/", provider);
+                    let current = app
+                        .model_name
+                        .strip_prefix(&provider_prefix)
+                        .unwrap_or(app.model_name.as_str())
+                        .to_string();
+                    app.model_picker.set_models(entries);
+                    for m in &mut app.model_picker.models {
+                        m.is_current = m.id == current;
+                    }
+                    app.model_picker.loading_models = false;
+                    app.model_fetch_rx = None;
+                }
+                Ok(Err(()))
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.model_picker.loading_models = false;
+                    app.model_fetch_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Spawn async provider model-list fetch when requested.
+        if app.model_picker_fetch_pending {
+            app.model_picker_fetch_pending = false;
+            let provider_id_str = app
+                .config
+                .provider
+                .clone()
+                .unwrap_or_else(|| "anthropic".to_string());
+            if let Some(ref registry) = app.provider_registry {
+                let pid = claurst_core::ProviderId::new(&provider_id_str);
+                if let Some(provider) = registry.get(&pid) {
+                    let provider = provider.clone();
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    app.model_fetch_rx = Some(rx);
+                    app.model_picker.loading_models = true;
+                    tokio::spawn(async move {
+                        match provider.list_models().await {
+                            Ok(models) => {
+                                let entries: Vec<claurst_tui::model_picker::ModelEntry> = models
+                                    .into_iter()
+                                    .map(|m| claurst_tui::model_picker::ModelEntry {
+                                        id: m.id.to_string(),
+                                        display_name: m.name.clone(),
+                                        description: claurst_tui::model_picker::format_context_window(
+                                            m.context_window,
+                                        ),
+                                        is_current: false,
+                                    })
+                                    .collect();
+                                let _ = tx.send(Ok(entries)).await;
+                            }
+                            Err(_) => {
+                                let _ = tx.send(Err(())).await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Refresh task list if the overlay is visible.
+        if app.tasks_overlay.visible {
+            app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
         }
 
         // Check if the background update task has reported a result.
