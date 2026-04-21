@@ -142,7 +142,13 @@ impl Tool for PowerShellTool {
                     params.description.as_deref().unwrap_or(&params.command)
                 );
                 let details = risk_explanation(PsRiskLevel::High, &params.command);
-                if let Err(e) = ctx.check_permission_with_details(self.name(), &desc, &details, false) {
+                if let Err(e) = ctx.check_permission_with_details_and_path(
+                    self.name(),
+                    &desc,
+                    &details,
+                    std::path::PathBuf::from(&params.command),
+                    false,
+                ) {
                     return ToolResult::error(e.to_string());
                 }
             }
@@ -164,7 +170,13 @@ impl Tool for PowerShellTool {
                         params.description.as_deref().unwrap_or(&params.command)
                     );
                     let details = risk_explanation(PsRiskLevel::Medium, &params.command);
-                    if let Err(e) = ctx.check_permission_with_details(self.name(), &desc, &details, false) {
+                    if let Err(e) = ctx.check_permission_with_details_and_path(
+                        self.name(),
+                        &desc,
+                        &details,
+                        std::path::PathBuf::from(&params.command),
+                        false,
+                    ) {
                         return ToolResult::error(e.to_string());
                     }
                 }
@@ -174,7 +186,12 @@ impl Tool for PowerShellTool {
                 // Standard (non-risk-gated) permission check — honours bypass
                 // and plan-mode rules, but does not show a dialog.
                 let desc = params.description.as_deref().unwrap_or(&params.command);
-                if let Err(e) = ctx.check_permission(self.name(), desc, false) {
+                if let Err(e) = ctx.check_permission_for_path(
+                    self.name(),
+                    desc,
+                    std::path::PathBuf::from(&params.command),
+                    false,
+                ) {
                     return ToolResult::error(e.to_string());
                 }
             }

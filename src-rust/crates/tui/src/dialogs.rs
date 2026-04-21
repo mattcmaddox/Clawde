@@ -122,14 +122,15 @@ impl PermissionRequest {
     pub fn bash(
         tool_use_id: String,
         tool_name: String,
+        description: String,
         reason: String,
         command: String,
         suggested_prefix: Option<String>,
     ) -> Self {
-        let (description, danger_explanation) = if let Some(nl) = reason.find('\n') {
-            (reason[..nl].to_string(), reason[nl + 1..].to_string())
+        let danger_explanation = if let Some(nl) = reason.find('\n') {
+            reason[nl + 1..].to_string()
         } else {
-            (reason, String::new())
+            String::new()
         };
 
         let options = Self::bash_options(suggested_prefix.as_deref());
@@ -147,6 +148,31 @@ impl PermissionRequest {
             kind,
             selected_option: 0,
             options,
+        }
+    }
+
+    pub fn powershell(
+        tool_use_id: String,
+        tool_name: String,
+        description: String,
+        reason: String,
+        command: String,
+    ) -> Self {
+        let danger_explanation = if let Some(nl) = reason.find('\n') {
+            reason[nl + 1..].to_string()
+        } else {
+            String::new()
+        };
+
+        Self {
+            tool_use_id,
+            tool_name,
+            description,
+            danger_explanation,
+            input_preview: Some(command),
+            kind: PermissionDialogKind::Generic,
+            selected_option: 0,
+            options: Self::default_options(),
         }
     }
 
@@ -1247,6 +1273,7 @@ mod tests {
             "id-bash-1".to_string(),
             "Bash".to_string(),
             "Wants to run a command".to_string(),
+            "Wants to run a command".to_string(),
             "ls -la".to_string(),
             None,
         );
@@ -1264,6 +1291,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "id-bash-2".to_string(),
             "Bash".to_string(),
+            "Wants to run git command".to_string(),
             "Wants to run git command".to_string(),
             "git status".to_string(),
             Some("git ".to_string()),
@@ -1340,6 +1368,7 @@ mod tests {
         let mut pr = PermissionRequest::bash(
             "id".to_string(),
             "Bash".to_string(),
+            "desc".to_string(),
             "desc".to_string(),
             "git push".to_string(),
             Some("git ".to_string()),

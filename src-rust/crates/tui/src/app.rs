@@ -5599,6 +5599,7 @@ mod tests {
             "tu-1".to_string(),
             "Bash".to_string(),
             "wants to run".to_string(),
+            "wants to run".to_string(),
             "git status".to_string(),
             Some("git".to_string()),
         );
@@ -5631,6 +5632,7 @@ mod tests {
             "tu-2".to_string(),
             "Bash".to_string(),
             "wants to run".to_string(),
+            "wants to run".to_string(),
             "cargo build".to_string(),
             Some("cargo".to_string()),
         );
@@ -5661,6 +5663,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-3".to_string(),
             "Bash".to_string(),
+            "wants to run".to_string(),
             "wants to run".to_string(),
             "npm install".to_string(),
             Some("npm".to_string()),
