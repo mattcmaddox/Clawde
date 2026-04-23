@@ -366,10 +366,17 @@ impl Tool for BashTool {
         };
 
         // Permission check
-        let desc = params.description.as_deref().unwrap_or(&params.command);
+        let reason = params
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("This will execute a shell command.")
+            .to_string();
+
         if let Err(e) = ctx.check_permission_for_path(
             self.name(),
-            desc,
+            &reason,
             std::path::PathBuf::from(&params.command),
             false,
         ) {

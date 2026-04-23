@@ -1259,7 +1259,6 @@ fn permission_request_from_core(
         ("Bash", Some(command)) => claurst_tui::dialogs::PermissionRequest::bash(
             tool_use_id,
             tool_name,
-            pending.request.description.clone(),
             reason,
             command,
             None,
@@ -1267,7 +1266,6 @@ fn permission_request_from_core(
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
             tool_use_id,
             tool_name,
-            pending.request.description.clone(),
             reason,
             command,
         ),

@@ -61,17 +61,12 @@ fn risk_explanation(level: PsRiskLevel, command: &str) -> String {
              Command: {}",
             command
         ),
-        PsRiskLevel::High => format!(
-            "PowerShell wants to run a HIGH-risk command:\n  {}\n\n\
-             This may modify system-wide security policy, the registry (HKLM), \
-             user accounts, or firewall rules.",
-            command
-        ),
-        PsRiskLevel::Medium => format!(
-            "PowerShell wants to run a MEDIUM-risk command:\n  {}\n\n\
-             This may delete files, control services, or make network requests.",
-            command
-        ),
+        PsRiskLevel::High => {
+            "[High risk] This may modify system-wide security policy, the registry (HKLM), user accounts, or firewall rules.".to_string()
+        }
+        PsRiskLevel::Medium => {
+            "[Medium risk] This may delete files, control services, or make network requests.".to_string()
+        }
         PsRiskLevel::Low => String::new(), // never shown
     }
 }
@@ -185,10 +180,17 @@ impl Tool for PowerShellTool {
             PsRiskLevel::Low => {
                 // Standard (non-risk-gated) permission check — honours bypass
                 // and plan-mode rules, but does not show a dialog.
-                let desc = params.description.as_deref().unwrap_or(&params.command);
+                let reason = params
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("This will execute a PowerShell command.")
+                    .to_string();
+
                 if let Err(e) = ctx.check_permission_for_path(
                     self.name(),
-                    desc,
+                    &reason,
                     std::path::PathBuf::from(&params.command),
                     false,
                 ) {

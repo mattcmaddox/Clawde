@@ -2045,13 +2045,7 @@ pub mod permissions {
         level: PermissionLevel,
     ) -> String {
         match level {
-            PermissionLevel::Execute => {
-                let cmd = path.unwrap_or(description);
-                format!(
-                    "Bash wants to run: `{}`\nThis will execute a shell command.",
-                    cmd
-                )
-            }
+            PermissionLevel::Execute => description.to_string(),
             PermissionLevel::Write => {
                 let target = path.unwrap_or(description);
                 let extra = if target.contains("/etc/") || target.contains("\\etc\\") {
@@ -2747,9 +2741,19 @@ pub mod permissions {
         #[test]
         fn format_reason_bash() {
             let s =
-                format_permission_reason("Bash", "ls -la", None, PermissionLevel::Execute);
-            assert!(s.contains("Bash wants to run"));
-            assert!(s.contains("ls -la"));
+                format_permission_reason("Bash", "This will execute a shell command.", None, PermissionLevel::Execute);
+            assert_eq!(s, "This will execute a shell command.");
+        }
+
+        #[test]
+        fn format_reason_powershell() {
+            let s = format_permission_reason(
+                "PowerShell",
+                "[High risk] This may modify system-wide security policy.",
+                None,
+                PermissionLevel::Execute,
+            );
+            assert_eq!(s, "[High risk] This may modify system-wide security policy.");
         }
 
         #[test]
