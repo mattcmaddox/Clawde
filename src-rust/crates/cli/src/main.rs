@@ -1256,13 +1256,20 @@ fn permission_request_from_core(
     let tool_use_id = pending.tool_use_id.clone();
 
     match (tool_name.as_str(), pending.request.path.clone()) {
-        ("Bash", Some(command)) => claurst_tui::dialogs::PermissionRequest::bash(
-            tool_use_id,
-            tool_name,
-            reason,
-            command,
-            None,
-        ),
+        ("Bash", Some(command)) => {
+            let suggested_prefix = command
+                .split_whitespace()
+                .next()
+                .filter(|prefix| !prefix.is_empty())
+                .map(|prefix| format!("{} ", prefix));
+            claurst_tui::dialogs::PermissionRequest::bash(
+                tool_use_id,
+                tool_name,
+                reason,
+                command,
+                suggested_prefix,
+            )
+        },
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
             tool_use_id,
             tool_name,
@@ -2270,19 +2277,31 @@ async fn run_interactive(
                     break;
                 };
 
-                let reevaluated = tool_ctx
-                    .permission_manager
-                    .as_ref()
-                    .and_then(|manager| manager.lock().ok())
-                    .map(|manager| {
-                        manager.evaluate(
-                            &pending.request.tool_name,
-                            &pending.request.description,
-                            pending.request.path.as_deref(),
-                            pending.request.working_dir.as_deref(),
-                            &pending.request.allowed_roots,
-                        )
-                    });
+                let prefix_allowed = pending.request.tool_name == "Bash"
+                    && pending
+                        .request
+                        .path
+                        .as_deref()
+                        .map(|command| app.bash_command_allowed_by_prefix(command))
+                        .unwrap_or(false);
+
+                let reevaluated = if prefix_allowed {
+                    Some(claurst_core::permissions::PermissionDecision::Allow)
+                } else {
+                    tool_ctx
+                        .permission_manager
+                        .as_ref()
+                        .and_then(|manager| manager.lock().ok())
+                        .map(|manager| {
+                            manager.evaluate(
+                                &pending.request.tool_name,
+                                &pending.request.description,
+                                pending.request.path.as_deref(),
+                                pending.request.working_dir.as_deref(),
+                                &pending.request.allowed_roots,
+                            )
+                        })
+                };
 
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
