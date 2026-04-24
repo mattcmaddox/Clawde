@@ -36,7 +36,7 @@ use claurst_core::{
     constants::APP_VERSION,
     context::ContextBuilder,
     cost::CostTracker,
-    permissions::{AutoPermissionHandler, InteractivePermissionHandler},
+    permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
 use async_trait::async_trait;
 use claurst_core::types::ToolDefinition;
@@ -76,7 +76,12 @@ impl Tool for McpToolWrapper {
         self.tool_def.input_schema.clone()
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let desc = format!("Run MCP tool {}", self.tool_def.name);
+        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
+            return ToolResult::error(e.to_string());
+        }
+
         // Strip the server-name prefix to get the bare tool name.
         let prefix = format!("{}_", self.server_name);
         let bare_name = self
@@ -588,18 +593,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Build tools
-    // Interactive mode uses InteractivePermissionHandler which allows writes in Default mode
-    // (the user is watching the TUI so they can intervene). Headless/print mode uses
-    // AutoPermissionHandler which denies writes in Default mode for safety.
+    let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
+        config.permission_mode.clone(),
+        &settings,
+    )));
+
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
-        Arc::new(AutoPermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
+        Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
     } else {
-        Arc::new(InteractivePermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
+        Arc::new(InteractivePermissionHandler::with_manager(permission_manager.clone()))
     };
     let cost_tracker = CostTracker::new();
     // Use --session-id if provided, otherwise generate a fresh UUID.
@@ -615,6 +617,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
+    let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
+
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
         permission_mode: config.permission_mode.clone(),
@@ -628,6 +632,8 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         managed_agent_config: config.managed_agents.clone(),
         completion_notifier: None,
+        pending_permissions: Some(pending_permissions.clone()),
+        permission_manager: Some(permission_manager.clone()),
     };
 
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
@@ -1245,6 +1251,53 @@ async fn run_headless(
 // Interactive REPL mode
 // ---------------------------------------------------------------------------
 
+fn permission_request_from_core(
+    pending: &claurst_tools::PendingPermissionRequest,
+) -> claurst_tui::dialogs::PermissionRequest {
+    let reason = pending.reason.clone();
+    let tool_name = pending.request.tool_name.clone();
+    let tool_use_id = pending.tool_use_id.clone();
+
+    match (tool_name.as_str(), pending.request.path.clone()) {
+        ("Bash", Some(command)) => {
+            let suggested_prefix = command
+                .split_whitespace()
+                .next()
+                .filter(|prefix| !prefix.is_empty())
+                .map(|prefix| format!("{} ", prefix));
+            claurst_tui::dialogs::PermissionRequest::bash(
+                tool_use_id,
+                tool_name,
+                reason,
+                command,
+                suggested_prefix,
+            )
+        },
+        ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
+            tool_use_id,
+            tool_name,
+            reason,
+            command,
+        ),
+        ("Read", Some(path)) => claurst_tui::dialogs::PermissionRequest::file_read(
+            tool_use_id,
+            tool_name,
+            reason,
+            path,
+        ),
+        (_, Some(path)) if matches!(tool_name.as_str(), "Write" | "Edit" | "NotebookEdit") => {
+            claurst_tui::dialogs::PermissionRequest::file_write(tool_use_id, tool_name, reason, path)
+        }
+        _ => claurst_tui::dialogs::PermissionRequest::from_reason(
+            tool_use_id,
+            tool_name,
+            reason,
+            pending.request.path.clone(),
+        ),
+    }
+}
+
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -1313,7 +1366,11 @@ async fn run_interactive(
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
     }
-    tool_ctx.config = live_config.clone();
+    let pending_permissions = tool_ctx
+        .pending_permissions
+        .clone()
+        .unwrap_or_else(|| Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default())));
+
 
     // Set up terminal
     let mut terminal = setup_terminal()?;
@@ -2135,10 +2192,84 @@ async fn run_interactive(
                         current_query = Some((handle, msgs_arc));
                         continue;
                     }
+                    if let Some(pr) = app.permission_request.as_mut() {
+                        if claurst_tui::dialogs::handle_permission_key(pr, key) {
+                            let tool_use_id = pr.tool_use_id.clone();
+                            let selected_option = pr.selected_option;
+                            let selected_key = pr.options.get(selected_option).map(|o| o.key);
+                            let should_record_bash_prefix = selected_key == Some('P');
+                            let selected_path = pending_permissions
+                                .lock()
+                                .waiting
+                                .get(&tool_use_id)
+                                .and_then(|p| p.request.path.clone());
+                            let bash_prefix = if should_record_bash_prefix {
+                                match &pr.kind {
+                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
+                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
+                                        if first_word.is_empty() { None } else { Some(first_word) }
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            app.permission_request = None;
+
+                            if let Some(prefix) = bash_prefix {
+                                app.bash_prefix_allowlist.insert(prefix);
+                            }
+
+                            if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                                let decision = match selected_key {
+                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                    _ => claurst_core::permissions::PermissionDecision::Allow,
+                                };
+
+                                if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                    if let Ok(mut manager) = manager.lock() {
+                                        match selected_key {
+                                            Some('Y') => {
+                                                if let Some(path) = selected_path.as_deref() {
+                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
+                                                } else {
+                                                    manager.add_session_allow(&pending.request.tool_name);
+                                                }
+                                            }
+                                            Some('p') => {
+                                                let mut settings = match claurst_core::config::Settings::load_sync() {
+                                                    Ok(s) => s,
+                                                    Err(_) => claurst_core::config::Settings::default(),
+                                                };
+                                                if let Some(path) = selected_path.as_deref() {
+                                                    let pattern = format!("{}*", path);
+                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                } else {
+                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+
+                                if let Some(tx) = pending.decision_tx.take() {
+                                    let _ = tx.send(decision);
+                                }
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
 
                     app.handle_key_event(key);
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
+                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                        if let Ok(mut manager) = manager.lock() {
+                            manager.mode = tool_ctx.config.permission_mode.clone();
+                        }
+                    }
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
                     }
@@ -2175,6 +2306,55 @@ async fn run_interactive(
                     // Terminal resize - will be handled on next draw
                 }
                 _ => {}
+            }
+        }
+
+        if app.permission_request.is_none() {
+            loop {
+                let next_pending = pending_permissions.lock().queue.pop_front();
+                let Some(mut pending) = next_pending else {
+                    break;
+                };
+
+                let prefix_allowed = pending.request.tool_name == "Bash"
+                    && pending
+                        .request
+                        .path
+                        .as_deref()
+                        .map(|command| app.bash_command_allowed_by_prefix(command))
+                        .unwrap_or(false);
+
+                let reevaluated = if prefix_allowed {
+                    Some(claurst_core::permissions::PermissionDecision::Allow)
+                } else {
+                    tool_ctx
+                        .permission_manager
+                        .as_ref()
+                        .and_then(|manager| manager.lock().ok())
+                        .map(|manager| {
+                            manager.evaluate(
+                                &pending.request.tool_name,
+                                &pending.request.description,
+                                pending.request.path.as_deref(),
+                                pending.request.working_dir.as_deref(),
+                                &pending.request.allowed_roots,
+                            )
+                        })
+                };
+
+                match reevaluated {
+                    Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
+                        let tool_use_id = pending.tool_use_id.clone();
+                        app.permission_request = Some(permission_request_from_core(&pending));
+                        pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                        break;
+                    }
+                    Some(decision) => {
+                        if let Some(tx) = pending.decision_tx.take() {
+                            let _ = tx.send(decision);
+                        }
+                    }
+                }
             }
         }
 

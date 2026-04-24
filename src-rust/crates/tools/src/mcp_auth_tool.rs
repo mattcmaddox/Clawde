@@ -58,6 +58,14 @@ impl Tool for McpAuthTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Authenticate MCP server {}", params.server_name),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
+
         let manager = match &ctx.mcp_manager {
             Some(m) => m,
             None => {

@@ -5632,7 +5632,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-1".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "git status".to_string(),
             Some("git".to_string()),
         );
@@ -5664,7 +5664,7 @@ mod tests {
         let mut pr = PermissionRequest::bash(
             "tu-2".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "cargo build".to_string(),
             Some("cargo".to_string()),
         );
@@ -5695,7 +5695,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-3".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "npm install".to_string(),
             Some("npm".to_string()),
         );
