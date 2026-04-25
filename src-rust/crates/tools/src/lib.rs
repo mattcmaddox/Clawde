@@ -251,7 +251,7 @@ pub struct ToolContext {
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: claurst_core::config::Config,
     /// Managed agent (manager-executor) configuration, if active.
-    pub managed_agent_config: Option<claurst_core::ManagedAgentConfig>,
+    pub managed_agent_config: Option<claurst_core::config::ManagedAgentConfig>,
     /// Optional notifier for injecting completion messages into the next agent turn.
     /// Set when the query loop has a command queue wired up.
     pub completion_notifier: Option<CompletionNotifier>,

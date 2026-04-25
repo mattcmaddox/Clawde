@@ -376,6 +376,36 @@ fn build_provider_options(
                 "textVerbosity".to_string(),
                 serde_json::json!("low"),
             );
+
+            // DeepSeek V4 thinking mode: map effort level to thinking/reasoning_effort params.
+            // DeepSeek docs: thinking={"type":"enabled/disabled"}, reasoning_effort="high"|"max"
+            // low/medium are mapped to "high" by the API; xhigh mapped to "max".
+            if provider_id == "deepseek" {
+                match effort_level {
+                    None
+                    | Some(claurst_core::effort::EffortLevel::Medium)
+                    | Some(claurst_core::effort::EffortLevel::High) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "enabled"}),
+                        );
+                        options.insert("reasoningEffort".to_string(), serde_json::json!("high"));
+                    }
+                    Some(claurst_core::effort::EffortLevel::Max) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "enabled"}),
+                        );
+                        options.insert("reasoningEffort".to_string(), serde_json::json!("max"));
+                    }
+                    Some(claurst_core::effort::EffortLevel::Low) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "disabled"}),
+                        );
+                    }
+                }
+            }
         }
     }
 
