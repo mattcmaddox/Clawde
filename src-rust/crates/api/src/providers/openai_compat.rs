@@ -241,7 +241,121 @@ impl OpenAiCompatProvider {
             Self::apply_fix_tool_user_sequence(&mut messages);
         }
 
+        // For providers with a reasoning field (e.g. DeepSeek's
+        // "reasoning_content"), inject reasoning text back into assistant
+        // messages that contain tool calls. Non-tool-call turns omit the
+        // field to save tokens.
+        if let Some(ref field) = self.quirks.reasoning_field {
+            Self::inject_reasoning_for_tool_turns(
+                &mut messages,
+                &request.messages,
+                field,
+            );
+            // DeepSeek rejects `content: null` on assistant messages — it
+            // requires either a non-null content (even "") or tool_calls.
+            Self::ensure_content_not_null(&mut messages);
+        }
+
         messages
+    }
+
+    /// For providers that expose a reasoning field, inject the reasoning
+    /// text into assistant messages that contain tool calls.
+    ///
+    /// DeepSeek's thinking mode requires `reasoning_content` to be sent back
+    /// on turns where tool calls occurred. Turns without tool calls omit it —
+    /// the API ignores it anyway and skipping saves tokens.
+    fn inject_reasoning_for_tool_turns(
+        json_messages: &mut Vec<Value>,
+        original_messages: &[claurst_core::types::Message],
+        field: &str,
+    ) {
+        use claurst_core::types::{MessageContent, Role};
+
+        // Collect reasoning texts from assistant messages that have both
+        // Thinking blocks and ToolUse blocks, preserving order.
+        let reasoning_texts: Vec<String> = original_messages
+            .iter()
+            .filter_map(|msg| {
+                if msg.role != Role::Assistant {
+                    return None;
+                }
+                let blocks = match &msg.content {
+                    MessageContent::Blocks(b) => b,
+                    _ => return None,
+                };
+                let has_tool_use = blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+                if !has_tool_use {
+                    return None;
+                }
+                let thinking: Vec<&str> = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking.join(""))
+                }
+            })
+            .collect();
+
+        if reasoning_texts.is_empty() {
+            return;
+        }
+
+        // Inject into JSON messages: for each assistant message that carries
+        // tool_calls, add the reasoning field from the collected texts.
+        let mut reasoning_idx = 0;
+        for msg in json_messages.iter_mut() {
+            if reasoning_idx >= reasoning_texts.len() {
+                break;
+            }
+            let is_assistant =
+                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            let has_tool_calls = msg
+                .get("tool_calls")
+                .and_then(|tc| tc.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if is_assistant && has_tool_calls {
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.insert(
+                        field.to_string(),
+                        Value::String(reasoning_texts[reasoning_idx].clone()),
+                    );
+                }
+                reasoning_idx += 1;
+            }
+        }
+    }
+
+    /// Replace `content: null` with `content: ""` on all assistant messages.
+    ///
+    /// DeepSeek's API rejects assistant messages that have `content: null`
+    /// (it treats null as absent and then complains that neither content nor
+    /// tool_calls is set).  Replacing with an empty string satisfies the
+    /// validation while preserving semantics.
+    fn ensure_content_not_null(messages: &mut Vec<Value>) {
+        for msg in messages.iter_mut() {
+            let is_assistant =
+                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            if !is_assistant {
+                continue;
+            }
+            if let Some(obj) = msg.as_object_mut() {
+                if let Some(content) = obj.get("content") {
+                    if content.is_null() {
+                        obj.insert("content".to_string(), Value::String(String::new()));
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve the temperature to use: request value takes priority, then
