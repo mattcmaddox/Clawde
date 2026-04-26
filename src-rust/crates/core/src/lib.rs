@@ -1154,7 +1154,7 @@ pub mod config {
                 Some("google") => "gemini-2.5-flash",
                 Some("groq") => "llama-3.3-70b-versatile",
                 Some("cerebras") => "llama-3.3-70b",
-                Some("deepseek") => "deepseek-chat",
+                Some("deepseek") => "deepseek-v4-pro",
                 Some("mistral") => "mistral-large-latest",
                 Some("xai") => "grok-2",
                 Some("openrouter") => "anthropic/claude-sonnet-4",
