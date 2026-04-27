@@ -70,10 +70,10 @@ pub enum PreviewAction {
 impl PreviewAction {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Import => "导入",
-            Self::Replace => "覆盖",
-            Self::Keep => "保留",
-            Self::Skip => "跳过",
+            Self::Import => "Import",
+            Self::Replace => "Replace",
+            Self::Keep => "Keep",
+            Self::Skip => "Skip",
         }
     }
 }
@@ -174,21 +174,21 @@ pub fn execute_import(selection: ImportSelection) -> Result<ImportExecutionResul
 }
 
 pub fn summarize_import_result(result: &ImportExecutionResult, paths: &ImportPaths) -> String {
-    let mut lines = vec!["已完成配置导入。".to_string()];
+    let mut lines = vec!["Config import completed.".to_string()];
 
     if result.wrote_claude_md {
-        lines.push(format!("- 已写入 CLAUDE.md：{}", paths.target_claude_md.display()));
+        lines.push(format!("- Wrote CLAUDE.md: {}", paths.target_claude_md.display()));
     }
     if result.wrote_settings {
-        lines.push(format!("- 已写入 settings.json：{}", paths.target_settings_json.display()));
+        lines.push(format!("- Wrote settings.json: {}", paths.target_settings_json.display()));
     }
     if !result.imported_fields.is_empty() {
-        lines.push(format!("- 已导入字段：{}", result.imported_fields.join("、")));
+        lines.push(format!("- Imported fields: {}", result.imported_fields.join(", ")));
     }
     if !result.skipped_fields.is_empty() {
-        lines.push(format!("- 已跳过字段：{}", result.skipped_fields.join("、")));
+        lines.push(format!("- Skipped fields: {}", result.skipped_fields.join(", ")));
     }
-    lines.push("建议重新打开设置页；若导入了 mcpServers，请等待本会话自动重连 MCP。CLAUDE.md 变更建议在新会话中确认。".to_string());
+    lines.push("Reopen settings to review changes. If mcpServers were imported, wait for this session to reconnect MCP automatically. Review CLAUDE.md changes in a new session.".to_string());
     lines.join("\n")
 }
 
@@ -206,7 +206,7 @@ fn prepare_import(selection: ImportSelection) -> Result<PreparedImport> {
 
     if selection.include_claude_md() {
         let content = std::fs::read_to_string(&paths.source_claude_md).with_context(|| {
-            format!("读取源 CLAUDE.md 失败：{}", paths.source_claude_md.display())
+            format!("Failed to read source CLAUDE.md: {}", paths.source_claude_md.display())
         })?;
         let excerpt = build_excerpt(&content, 8, 500);
         preview.claude_md = Some(ClaudeMdPreview {
@@ -227,13 +227,13 @@ fn prepare_import(selection: ImportSelection) -> Result<PreparedImport> {
     if selection.include_settings() {
         let source_text = std::fs::read_to_string(&paths.source_settings_json).with_context(|| {
             format!(
-                "读取源 settings.json 失败：{}",
+                "Failed to read source settings.json: {}",
                 paths.source_settings_json.display()
             )
         })?;
         let source_value: Value = serde_json::from_str(&source_text).with_context(|| {
             format!(
-                "解析源 settings.json 失败：{}",
+                "Failed to parse source settings.json: {}",
                 paths.source_settings_json.display()
             )
         })?;
@@ -286,7 +286,7 @@ fn map_settings_preview(
 ) -> Result<SettingsPreviewOutcome> {
     let source_obj = source
         .as_object()
-        .ok_or_else(|| anyhow!("源 settings.json 顶层必须是 JSON 对象"))?;
+        .ok_or_else(|| anyhow!("source settings.json must be a JSON object"))?;
 
     let mut preview_fields = Vec::new();
     let mut imported_fields = Vec::new();
@@ -300,7 +300,7 @@ fn map_settings_preview(
         preview_fields.push(PreviewField {
             name: "model".to_string(),
             action: PreviewAction::Skip,
-            reason: Some("model 设置不导入，保持当前会话与默认模型不变".to_string()),
+            reason: Some("model is not imported to keep the current session and default model unchanged".to_string()),
         });
         skipped_fields.push("model".to_string());
         skipped_count += 1;
@@ -308,7 +308,7 @@ fn map_settings_preview(
         preview_fields.push(PreviewField {
             name: "model".to_string(),
             action: PreviewAction::Keep,
-            reason: Some("源文件未提供该字段".to_string()),
+            reason: Some("source file does not provide this field".to_string()),
         });
         kept_count += 1;
     }
@@ -397,7 +397,7 @@ fn map_settings_preview(
             continue;
         }
         if let Some(reason) = &field.reason {
-            if reason == "源文件未提供该字段" {
+            if reason == "source file does not provide this field" {
                 kept_count += 1;
             }
         }
@@ -449,7 +449,7 @@ fn map_scalar_field<F>(
         None => preview_fields.push(PreviewField {
             name: name.to_string(),
             action: PreviewAction::Keep,
-            reason: Some("源文件未提供该字段".to_string()),
+            reason: Some("source file does not provide this field".to_string()),
         }),
     }
 }
@@ -497,7 +497,7 @@ fn map_theme_field(
                 preview_fields.push(PreviewField {
                     name: "theme".to_string(),
                     action: PreviewAction::Skip,
-                    reason: Some("主题值无法映射到当前程序".to_string()),
+                    reason: Some("theme value cannot be mapped to the current program".to_string()),
                 });
                 skipped_fields.push("theme".to_string());
                 *skipped_count += 1;
@@ -506,7 +506,7 @@ fn map_theme_field(
         None => preview_fields.push(PreviewField {
             name: "theme".to_string(),
             action: PreviewAction::Keep,
-            reason: Some("源文件未提供该字段".to_string()),
+            reason: Some("source file does not provide this field".to_string()),
         }),
     }
 }
@@ -526,7 +526,7 @@ fn map_mcp_servers_field(
         preview_fields.push(PreviewField {
             name: "mcpServers".to_string(),
             action: PreviewAction::Keep,
-            reason: Some("源文件未提供该字段".to_string()),
+            reason: Some("source file does not provide this field".to_string()),
         });
         return;
     };
@@ -537,7 +537,7 @@ fn map_mcp_servers_field(
             preview_fields.push(PreviewField {
                 name: "mcpServers".to_string(),
                 action: PreviewAction::Skip,
-                reason: Some("mcpServers 结构与当前程序不兼容".to_string()),
+                reason: Some("mcpServers structure is incompatible with the current program".to_string()),
             });
             skipped_fields.push("mcpServers".to_string());
             *skipped_count += 1;
@@ -582,7 +582,7 @@ fn map_hooks_field(
         preview_fields.push(PreviewField {
             name: "hooks".to_string(),
             action: PreviewAction::Keep,
-            reason: Some("源文件未提供该字段".to_string()),
+            reason: Some("source file does not provide this field".to_string()),
         });
         return;
     };
@@ -593,7 +593,7 @@ fn map_hooks_field(
             preview_fields.push(PreviewField {
                 name: "hooks".to_string(),
                 action: PreviewAction::Skip,
-                reason: Some("hooks 结构与当前程序不兼容".to_string()),
+                reason: Some("hooks structure is incompatible with the current program".to_string()),
             });
             skipped_fields.push("hooks".to_string());
             *skipped_count += 1;
@@ -625,14 +625,14 @@ fn map_hooks_field(
 
 fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
     let Some(obj) = value.as_object() else {
-        return Err(anyhow!("mcpServers 必须是对象"));
+        return Err(anyhow!("mcpServers must be an object"));
     };
 
     let mut servers = Vec::new();
     for (name, entry) in obj {
         let entry_obj = entry
             .as_object()
-            .ok_or_else(|| anyhow!("mcpServers.{name} 必须是对象"))?;
+            .ok_or_else(|| anyhow!("mcpServers.{name} must be an object"))?;
         let command = entry_obj
             .get("command")
             .and_then(Value::as_str)
@@ -642,7 +642,7 @@ fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
             .and_then(Value::as_str)
             .map(ToString::to_string);
         if command.is_none() && url.is_none() {
-            return Err(anyhow!("mcpServers.{name} 缺少 command/url"));
+            return Err(anyhow!("mcpServers.{name} is missing command/url"));
         }
         let args = entry_obj
             .get("args")
@@ -685,19 +685,19 @@ fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
 
 fn parse_hooks(value: &Value) -> Result<HashMap<HookEvent, Vec<HookEntry>>> {
     let Some(obj) = value.as_object() else {
-        return Err(anyhow!("hooks 必须是对象"));
+        return Err(anyhow!("hooks must be an object"));
     };
     let mut out = HashMap::new();
     for (event_name, event_value) in obj {
         let event = parse_hook_event(event_name)?;
         let entries = event_value
             .as_array()
-            .ok_or_else(|| anyhow!("hooks.{event_name} 必须是数组"))?;
+            .ok_or_else(|| anyhow!("hooks.{event_name} must be an array"))?;
         let mut hook_entries = Vec::new();
         for entry in entries {
             let entry_obj = entry
                 .as_object()
-                .ok_or_else(|| anyhow!("hooks.{event_name}[] 必须是对象"))?;
+                .ok_or_else(|| anyhow!("hooks.{event_name}[] must be an object"))?;
             let matcher = entry_obj
                 .get("matcher")
                 .and_then(Value::as_str)
@@ -706,15 +706,15 @@ fn parse_hooks(value: &Value) -> Result<HashMap<HookEvent, Vec<HookEntry>>> {
             let hooks = entry_obj
                 .get("hooks")
                 .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks 必须是数组"))?;
+                .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks must be an array"))?;
             for hook in hooks {
                 let hook_obj = hook
                     .as_object()
-                    .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks[] 必须是对象"))?;
+                    .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks[] must be an object"))?;
                 let command = hook_obj
                     .get("command")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("hooks.{event_name} hook 缺少 command"))?
+                    .ok_or_else(|| anyhow!("hooks.{event_name} hook is missing command"))?
                     .to_string();
                 hook_entries.push(HookEntry {
                     command,
@@ -736,22 +736,22 @@ fn parse_hook_event(name: &str) -> Result<HookEvent> {
         "PostModelTurn" => Ok(HookEvent::PostModelTurn),
         "UserPromptSubmit" => Ok(HookEvent::UserPromptSubmit),
         "Notification" => Ok(HookEvent::Notification),
-        _ => Err(anyhow!("不支持的 hooks 事件：{name}")),
+        _ => Err(anyhow!("unsupported hooks event: {name}")),
     }
 }
 
 fn skip_reason_for_key(key: &str) -> &'static str {
     match key {
-        "env" => "包含敏感环境变量，第一版默认不自动导入",
-        "ANTHROPIC_AUTH_TOKEN" | "apiKey" | "providers" => "认证与 provider 凭据不自动迁移",
-        "enabledPlugins" => "插件配置结构与当前程序不一致",
-        "disabledMcpServers" => "当前程序没有对应字段",
-        "extraKnownMarketplaces" => "当前程序没有对应字段",
-        "skipAutoPermissionPrompt" => "当前程序没有对应字段",
-        "autoDreamEnabled" => "当前程序没有对应字段",
-        "codemossProviderId" => "当前程序没有对应字段",
-        "effortLevel" => "当前程序未提供稳定持久化映射",
-        _ => "当前程序不支持该字段",
+        "env" => "contains sensitive environment variables and is not imported automatically",
+        "ANTHROPIC_AUTH_TOKEN" | "apiKey" | "providers" => "auth and provider credentials are not migrated automatically",
+        "enabledPlugins" => "plugin config structure differs from the current program",
+        "disabledMcpServers" => "the current program has no matching field",
+        "extraKnownMarketplaces" => "the current program has no matching field",
+        "skipAutoPermissionPrompt" => "the current program has no matching field",
+        "autoDreamEnabled" => "the current program has no matching field",
+        "codemossProviderId" => "the current program has no matching field",
+        "effortLevel" => "the current program has no stable persistence mapping",
+        _ => "the current program does not support this field",
     }
 }
 

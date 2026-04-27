@@ -53,7 +53,7 @@ pub fn render_import_config_dialog(
     if let Some(subtitle_area) = modal_header_line_area(layout.header_area, 1) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
-                " 预览将从 ~/.claude 导入的内容；Enter 确认，Esc 取消。",
+                " Preview the content to import from ~/.claude; Enter to confirm, Esc to cancel.",
                 Style::default().fg(CLAURST_MUTED),
             )])),
             subtitle_area,
@@ -63,13 +63,13 @@ pub fn render_import_config_dialog(
     let mut lines: Vec<Line<'static>> = vec![];
     if let Some(doc) = &preview.claude_md {
         lines.push(section_title("CLAUDE.md"));
-        lines.push(path_row("源", &doc.plan.source_path.display().to_string()));
-        lines.push(path_row("目标", &doc.plan.target_path.display().to_string()));
+        lines.push(path_row("Source", &doc.plan.source_path.display().to_string()));
+        lines.push(path_row("Target", &doc.plan.target_path.display().to_string()));
         lines.push(meta_row(&format!(
-            "{} 行，{} 字符，{}",
+            "{} lines, {} chars, {}",
             doc.line_count,
             doc.char_count,
-            if doc.plan.target_exists { "确认后覆盖目标文件" } else { "将新建目标文件" }
+            if doc.plan.target_exists { "will overwrite the target file" } else { "will create the target file" }
         )));
         for line in doc.excerpt.lines() {
             lines.push(Line::from(vec![Span::styled(
@@ -82,10 +82,10 @@ pub fn render_import_config_dialog(
 
     if let Some(settings) = &preview.settings {
         lines.push(section_title("settings.json"));
-        lines.push(path_row("源", &settings.plan.source_path.display().to_string()));
-        lines.push(path_row("目标", &settings.plan.target_path.display().to_string()));
+        lines.push(path_row("Source", &settings.plan.source_path.display().to_string()));
+        lines.push(path_row("Target", &settings.plan.target_path.display().to_string()));
         lines.push(meta_row(&format!(
-            "导入 {} 项，覆盖 {} 项，保留 {} 项，跳过 {} 项",
+            "Import {}, replace {}, keep {}, skip {} fields",
             settings.imported_count,
             settings.replaced_count,
             settings.kept_count,
@@ -120,7 +120,7 @@ pub fn render_import_config_dialog(
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            " Enter 导入  ·  Esc 取消",
+            " Enter to import  ·  Esc to cancel",
             Style::default().fg(CLAURST_MUTED).add_modifier(Modifier::ITALIC),
         )])),
         layout.footer_area,

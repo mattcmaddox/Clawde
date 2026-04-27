@@ -388,10 +388,9 @@ pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: 
     };
     let total_lines = lines.len() as u16;
     let visible = body_area.height;
-    let scroll_y = if total_lines <= visible {
-        0u16
-    } else if selected_item_line + 3 >= visible {
-        (selected_item_line + 3).saturating_sub(visible)
+    let max_scroll = total_lines.saturating_sub(visible);
+    let scroll_y = if selected_item_line + 3 >= visible {
+        (selected_item_line + 3).saturating_sub(visible).min(max_scroll)
     } else {
         0
     };
@@ -559,6 +558,52 @@ mod tests {
                 render_dialog_select(frame, &state, frame.area());
             })
             .unwrap();
+    }
+
+    #[test]
+    fn render_keeps_short_list_items_visible_when_selection_moves_down() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let items = vec![
+            SelectItem {
+                id: "claude-md".into(),
+                title: "CLAUDE.md".into(),
+                description: "Import ~/.claude/CLAUDE.md".into(),
+                category: "Import".into(),
+                badge: None,
+            },
+            SelectItem {
+                id: "settings".into(),
+                title: "settings.json".into(),
+                description: "Import ~/.claude/settings.json".into(),
+                category: "Import".into(),
+                badge: None,
+            },
+            SelectItem {
+                id: "both".into(),
+                title: "Both".into(),
+                description: "Import both CLAUDE.md and settings.json".into(),
+                category: "Import".into(),
+                badge: Some("SAFE".into()),
+            },
+        ];
+        let mut state = DialogSelectState::new("Import config", items);
+        state.open();
+        state.move_down();
+        state.move_down();
+
+        terminal
+            .draw(|frame| {
+                render_dialog_select(frame, &state, frame.area());
+            })
+            .unwrap();
+
+        let visible_items = state
+            .row_to_item
+            .borrow()
+            .iter()
+            .map(|(_, idx)| *idx)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_items, vec![0, 1, 2]);
     }
 
     #[test]
