@@ -1673,6 +1673,8 @@ async fn run_interactive(
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.connect_dialog.visible
+                        || app.import_config_picker.visible
+                        || app.import_config_dialog.visible
                         || app.key_input_dialog.visible
                         || app.custom_provider_dialog.visible
                         || app.device_auth_dialog.visible
@@ -1816,6 +1818,11 @@ async fn run_interactive(
                                     app.hooks_config_menu.open();
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
+                                }
+                                Some(CommandResult::OpenImportConfigOverlay) => {
+                                    app.open_import_config_picker();
+                                    app.status_message =
+                                        Some("Select what to import from ~/.claude.".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;

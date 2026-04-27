@@ -117,6 +117,8 @@ pub mod device_auth_dialog;
 pub mod voice_capture;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
 pub mod tasks_overlay;
+/// Import-config preview and confirmation dialog.
+pub mod import_config_dialog;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 
@@ -142,6 +144,7 @@ pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, rend
 pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
 pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
 pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
+pub use import_config_dialog::{ImportConfigDialogState, render_import_config_dialog};
 pub use session_branching::{SessionBranchingState, BranchBrowserMode, BranchInfo, render_session_branching};
 pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
 pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};

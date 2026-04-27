@@ -18,6 +18,7 @@ use crate::overage_upsell::render_overage_upsell;
 use crate::voice_mode_notice::render_voice_mode_notice;
 use crate::desktop_upsell_startup::render_desktop_upsell_startup;
 use crate::memory_update_notification::render_memory_update_notification;
+use crate::import_config_dialog::render_import_config_dialog;
 use crate::invalid_config_dialog::render_invalid_config_dialog;
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
 use crate::onboarding_dialog::render_onboarding_dialog;
@@ -108,9 +109,12 @@ fn is_modal_open(app: &App) -> bool {
         || app.voice_mode_notice.visible
         || app.memory_update_notification.visible
         || app.desktop_upsell.visible
+        || app.import_config_dialog.visible
         || app.invalid_config_dialog.visible
         || app.bypass_permissions_dialog.visible
         || app.onboarding_dialog.visible
+        || app.import_config_picker.visible
+        || app.import_config_dialog.visible
         || app.connect_dialog.visible
         || app.key_input_dialog.visible
         || app.custom_provider_dialog.visible
@@ -567,6 +571,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_desktop_upsell_startup(&app.desktop_upsell, size, frame.buffer_mut());
     }
 
+    // Import-config preview dialog
+    if app.import_config_dialog.visible {
+        render_import_config_dialog(frame, &app.import_config_dialog, size);
+    }
+
     // Invalid config/settings dialog (shown when settings.json or AGENTS.md is malformed)
     if app.invalid_config_dialog.visible {
         render_invalid_config_dialog(frame, &app.invalid_config_dialog, size);
@@ -580,6 +589,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // First-launch onboarding dialog (shown after bypass dialog, below elicitation)
     if app.onboarding_dialog.visible {
         render_onboarding_dialog(frame, &app.onboarding_dialog, size);
+    }
+
+    // Import-config source picker
+    if app.import_config_picker.visible {
+        render_dialog_select(frame, &app.import_config_picker, size);
     }
 
     // Connect-a-provider dialog (/connect command)

@@ -72,6 +72,7 @@ pub use types::{
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
 pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -3572,6 +3573,7 @@ pub mod feature_gates;
 pub mod tips;
 pub mod remote_settings;
 pub mod settings_sync;
+pub mod import_config;
 pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;

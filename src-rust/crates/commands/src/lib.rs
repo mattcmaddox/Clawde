@@ -77,6 +77,8 @@ pub enum CommandResult {
     /// Open the hooks configuration browser overlay in the TUI.
     /// Falls back to a text listing in non-TUI contexts.
     OpenHooksOverlay,
+    /// Open the import-config overlay in the TUI.
+    OpenImportConfigOverlay,
     /// Clear saved provider auth, model selection, and model caches, then
     /// rebuild the live runtime state.
     RefreshProviderState,
@@ -209,6 +211,7 @@ pub struct NormalCommand;
 pub struct InitCommand;
 pub struct ReviewCommand;
 pub struct HooksCommand;
+pub struct ImportConfigCommand;
 pub struct McpCommand;
 pub struct PermissionsCommand;
 pub struct PlanCommand;
@@ -480,7 +483,7 @@ fn command_category(name: &str) -> &'static str {
         | "release-notes" => "System",
         "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review"
-        | "security-review" => "Project",
+        | "security-review" | "import-config" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
         "session" | "resume" | "remote-control" | "remote-env"
         | "teleport" => "Sessions & Remote",
@@ -2716,6 +2719,25 @@ fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+// ---- /import-config ------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ImportConfigCommand {
+    fn name(&self) -> &str { "import-config" }
+    fn description(&self) -> &str { "Import CLAUDE.md and settings.json from ~/.claude" }
+    fn help(&self) -> &str {
+        "Usage: /import-config\n\
+         Import user-level Claude Code configuration from ~/.claude:\n\
+           - ~/.claude/CLAUDE.md\n\
+           - ~/.claude/settings.json\n\n\
+         This command opens an interactive import dialog with preview and confirmation."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        CommandResult::OpenImportConfigOverlay
+    }
 }
 
 // ---- /hooks --------------------------------------------------------------
@@ -7984,6 +8006,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(InitCommand),
         Box::new(ReviewCommand),
         Box::new(HooksCommand),
+        Box::new(ImportConfigCommand),
         Box::new(McpCommand),
         Box::new(PermissionsCommand),
         Box::new(PlanCommand),
@@ -8490,6 +8513,14 @@ mod tests {
         let cmd = find_command("web-setup").unwrap();
         let result = cmd.execute("", &mut ctx).await;
         assert!(matches!(result, CommandResult::Message(_)));
+    }
+
+    #[tokio::test]
+    async fn test_import_config_command_opens_overlay() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("import-config").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        assert!(matches!(result, CommandResult::OpenImportConfigOverlay));
     }
 
     #[test]
