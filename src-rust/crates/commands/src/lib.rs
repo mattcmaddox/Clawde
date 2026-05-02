@@ -5464,10 +5464,20 @@ impl SlashCommand for VoiceCommand {
     fn name(&self) -> &str { "voice" }
     fn description(&self) -> &str { "Toggle voice input mode on/off" }
     fn help(&self) -> &str {
-        "Usage: /voice [on|off]\n\n\
-         Enables or disables voice input (hold-to-talk).\n\
-         Voice requires a Claude.ai subscription with the voice scope enabled.\n\
-         Setting is persisted to ~/.claurst/ui-settings.json."
+        "Usage: /voice [on|off|status]\n\n\
+         Enables or disables voice input (push-to-talk).\n\
+         Setting is persisted to ~/.claurst/ui-settings.json.\n\n\
+         Transcription is performed via a Whisper-compatible API.\n\
+         Set one of these env vars for the API key:\n\
+           OPENAI_API_KEY   — OpenAI Whisper (default endpoint)\n\
+           ANTHROPIC_API_KEY — used as a fallback key\n\n\
+         To use a local Whisper server instead of OpenAI:\n\
+           export WHISPER_ENDPOINT_URL=http://localhost:8080/v1/audio/transcriptions\n\
+           export OPENAI_API_KEY=any-value  (local servers often ignore the key)\n\n\
+         On Linux, ALSA must be set up: sudo apt install libasound2-dev\n\
+         Check available devices with: arecord -l\n\n\
+         Controls:\n\
+           Alt+V — start recording; Alt+V or Esc — stop and transcribe"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -5478,9 +5488,27 @@ impl SlashCommand for VoiceCommand {
             "on" | "enable" | "enabled" | "true" | "1" => true,
             "off" | "disable" | "disabled" | "false" | "0" => false,
             "" => !currently_enabled, // toggle
+            "status" => {
+                let state = if currently_enabled { "enabled" } else { "disabled" };
+                let endpoint = std::env::var("WHISPER_ENDPOINT_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1/audio/transcriptions (default)".to_string());
+                let key_source = if std::env::var("OPENAI_API_KEY").is_ok() {
+                    "OPENAI_API_KEY"
+                } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "(none — transcription will fail)"
+                };
+                return CommandResult::Message(format!(
+                    "Voice mode: {}\n\
+                     Endpoint:   {}\n\
+                     API key:    {}",
+                    state, endpoint, key_source
+                ));
+            }
             other => {
                 return CommandResult::Error(format!(
-                    "Unknown argument '{}'. Use: /voice [on|off]",
+                    "Unknown argument '{}'. Use: /voice [on|off|status]",
                     other
                 ))
             }
@@ -5489,15 +5517,26 @@ impl SlashCommand for VoiceCommand {
         match mutate_ui_settings(|s| s.voice_enabled = Some(enable)) {
             Ok(_) => {
                 if enable {
-                    CommandResult::Message(
-                        "Voice recording activated (Alt+V to toggle).\n\
-                         Hold the configured hold-to-talk key to record.\n\
-                         Voice mode requires a Claude.ai account with voice scope."
-                            .to_string(),
-                    )
+                    let endpoint = std::env::var("WHISPER_ENDPOINT_URL")
+                        .unwrap_or_else(|_| "OpenAI Whisper (default)".to_string());
+                    let key_hint = if std::env::var("OPENAI_API_KEY").is_ok()
+                        || std::env::var("ANTHROPIC_API_KEY").is_ok()
+                    {
+                        String::new()
+                    } else {
+                        "\nWarning: no OPENAI_API_KEY found — transcription will fail. \
+                         Set OPENAI_API_KEY or WHISPER_ENDPOINT_URL for a local server."
+                            .to_string()
+                    };
+                    CommandResult::Message(format!(
+                        "Voice recording activated.\n\
+                         Press Alt+V to start recording; Alt+V or Esc to stop and transcribe.\n\
+                         Endpoint: {}{}",
+                        endpoint, key_hint
+                    ))
                 } else {
                     CommandResult::Message(
-                        "Voice recording deactivated (Alt+V to toggle).".to_string(),
+                        "Voice recording deactivated.".to_string(),
                     )
                 }
             }
