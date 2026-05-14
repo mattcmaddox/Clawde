@@ -1072,6 +1072,12 @@ pub mod config {
         /// Managed agent (manager-executor) configuration.
         #[serde(default)]
         pub managed_agents: Option<ManagedAgentConfig>,
+        /// When true, releasing a drag selection automatically copies it to
+        /// the system clipboard. Defaults to `false` — users opt in by
+        /// setting `"autoCopyOnHighlight": true` in
+        /// `~/.claurst/settings.json`.
+        #[serde(default, rename = "autoCopyOnHighlight")]
+        pub auto_copy_on_highlight: bool,
     }
 
     /// A user-defined slash command template.
@@ -1601,6 +1607,7 @@ pub mod config {
                     SkillsConfig { paths, urls }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
+                auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
             }
         }
     }
