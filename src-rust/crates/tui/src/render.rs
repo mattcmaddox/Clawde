@@ -1832,6 +1832,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             InputMode::Default
         },
         app.accent_color,
+        app.settings_screen.cursor_blink_enabled,
     );
 }
 

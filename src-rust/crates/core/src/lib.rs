@@ -962,6 +962,9 @@ pub mod config {
         /// Set via `--auto-commits` flag or `"autoCommits": true` in settings.json.
         #[serde(default, rename = "autoCommits", skip_serializing_if = "Option::is_none")]
         pub auto_commits: Option<bool>,
+        /// Enable cursor blinking in the chat prompt. Defaults to false (disabled).
+        #[serde(default, rename = "cursorBlinkEnabled", skip_serializing_if = "is_false")]
+        pub cursor_blink_enabled: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1155,6 +1158,10 @@ pub mod config {
             color: Some("green".to_string()),
         });
         m
+    }
+
+    fn is_false(b: &bool) -> bool {
+        !b
     }
 
     impl Config {
@@ -1583,6 +1590,7 @@ pub mod config {
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
+                cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
             };
             Self {
                 config: merged_config,

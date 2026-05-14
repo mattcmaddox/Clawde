@@ -2599,6 +2599,7 @@ pub fn render_prompt_input(
     focused: bool,
     mode: InputMode,
     accent_override: Color,
+    cursor_blink_enabled: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2643,16 +2644,18 @@ pub fn render_prompt_input(
         .width
         .saturating_sub(prefix_width)
         .saturating_sub(right_pad) as usize;
-    let cursor_blink_on = {
+    let cursor_visible = if cursor_blink_enabled {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         (ms / 530) % 2 == 0
+    } else {
+        true
     };
     // Render cursor as an overlay so its blink state never shifts the
     // underlying text (issue #149: cursor blink shifted the prompt).
-    let show_cursor = focused && cursor_blink_on;
+    let show_cursor = focused && cursor_visible;
 
     // Use the raw text — no inline cursor character — so layout is stable.
     let display_text: String = if state.text.is_empty() {
