@@ -2173,9 +2173,12 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open settings on KeyBindings tab
-                self.settings_screen.open();
-                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                // Open the keybindings.json file in the external editor
+                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
+
+                if let Err(e) = open_file_externally(&keybindings_path) {
+                    eprintln!("Failed to open keybindings file: {}", e);
+                }
                 true
             }
             "help" => {
@@ -6074,6 +6077,50 @@ impl App {
         }
 
         self.status_message = Some("No previous errors found.".to_string());
+    }
+}
+
+// Helper function to open a file in the user's external editor
+fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Try to open with the system's default application
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // Fallback for other systems: try common editors in order
+        for editor in &["nano", "vi", "vim", "emacs"] {
+            match std::process::Command::new(editor)
+                .arg(path)
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+        Err("No suitable editor found".into())
     }
 }
 
