@@ -63,6 +63,10 @@ pub struct SettingsScreen {
     pub auto_copy_enabled: bool,
     pub show_cwd: bool,
     pub show_git_branch: bool,
+    pub compact_threshold: String,
+    pub auto_commits: bool,
+    pub output_format: String,
+    pub disable_claude_mds: bool,
 }
 
 impl SettingsScreen {
@@ -88,6 +92,10 @@ impl SettingsScreen {
             auto_copy_enabled: false,
             show_cwd: false,
             show_git_branch: false,
+            compact_threshold: "95".to_string(),
+            auto_commits: false,
+            output_format: "text".to_string(),
+            disable_claude_mds: false,
         }
     }
 
@@ -113,6 +121,10 @@ impl SettingsScreen {
         self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
         self.show_cwd = read_setting_bool(&self.settings_snapshot, "showCwd", false);
         self.show_git_branch = read_setting_bool(&self.settings_snapshot, "showGitBranch", false);
+        self.compact_threshold = read_setting_string(&self.settings_snapshot, "compactThreshold", "95");
+        self.auto_commits = read_setting_bool(&self.settings_snapshot, "autoCommits", false);
+        self.output_format = read_setting_string(&self.settings_snapshot, "outputFormat", "text");
+        self.disable_claude_mds = read_setting_bool(&self.settings_snapshot, "disableClaudeMds", false);
     }
 
     pub fn close(&mut self) {
@@ -178,6 +190,12 @@ impl SettingsScreen {
                     } else {
                         Some(value.clone())
                     };
+                }
+                "compact_threshold" => {
+                    if let Ok(n) = value.parse::<f32>() {
+                        config.compact_threshold = n;
+                        self.compact_threshold = value.clone();
+                    }
                 }
                 _ => {}
             }
@@ -343,6 +361,36 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Display the current git branch in the footer.",
             kind: SettingKind::Bool,
             value: if screen.show_git_branch { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "compact_threshold",
+            label: "Auto-compact threshold",
+            description: "Context usage % at which to trigger auto-compact (0-100).",
+            kind: SettingKind::Number,
+            value: screen.compact_threshold.clone(),
+        },
+        SettingsEntry {
+            key: "auto_commits",
+            label: "Auto-commits",
+            description: "Automatically snapshot changes to git via shadow-git.",
+            kind: SettingKind::Bool,
+            value: if screen.auto_commits { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "output_format",
+            label: "Output format",
+            description: "How responses are formatted: text, JSON, or streaming JSON.",
+            kind: SettingKind::Enum {
+                options: vec!["text", "json", "streamjson"],
+            },
+            value: screen.output_format.clone(),
+        },
+        SettingsEntry {
+            key: "disable_claude_mds",
+            label: "Disable CLAUDE.md",
+            description: "Ignore CLAUDE.md files in projects (use defaults instead).",
+            kind: SettingKind::Bool,
+            value: if screen.disable_claude_mds { "true" } else { "false" }.to_string(),
         },
     ]
 }
@@ -672,6 +720,14 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                         screen.show_git_branch = new_value;
                         save_setting_bool("showGitBranch", new_value);
                     }
+                    "auto_commits" => {
+                        screen.auto_commits = new_value;
+                        save_setting_bool("autoCommits", new_value);
+                    }
+                    "disable_claude_mds" => {
+                        screen.disable_claude_mds = new_value;
+                        save_setting_bool("disableClaudeMds", new_value);
+                    }
                     _ => {}
                 }
             }
@@ -684,6 +740,10 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     "output_style" => {
                         screen.output_style = new_value.to_string();
                         save_setting_string("outputStyle", new_value);
+                    }
+                    "output_format" => {
+                        screen.output_format = new_value.to_string();
+                        save_setting_string("outputFormat", new_value);
                     }
                     _ => {}
                 }
@@ -714,10 +774,10 @@ mod tests {
     }
 
     #[test]
-    fn all_entries_returns_twelve_settings() {
+    fn all_entries_returns_sixteen_settings() {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
-        assert_eq!(entries.len(), 12, "Should have 12 editable settings");
+        assert_eq!(entries.len(), 16, "Should have 16 editable settings");
     }
 
     #[test]
