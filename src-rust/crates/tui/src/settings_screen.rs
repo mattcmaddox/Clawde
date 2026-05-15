@@ -61,6 +61,8 @@ pub struct SettingsScreen {
     pub verbose: bool,
     pub cursor_blink_enabled: bool,
     pub auto_copy_enabled: bool,
+    pub show_cwd: bool,
+    pub show_git_branch: bool,
 }
 
 impl SettingsScreen {
@@ -84,6 +86,8 @@ impl SettingsScreen {
             verbose: false,
             cursor_blink_enabled: false,
             auto_copy_enabled: false,
+            show_cwd: false,
+            show_git_branch: false,
         }
     }
 
@@ -107,6 +111,8 @@ impl SettingsScreen {
         self.verbose = self.settings_snapshot.config.verbose;
         self.cursor_blink_enabled = read_setting_bool(&self.settings_snapshot, "cursorBlinkEnabled", false);
         self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
+        self.show_cwd = read_setting_bool(&self.settings_snapshot, "showCwd", false);
+        self.show_git_branch = read_setting_bool(&self.settings_snapshot, "showGitBranch", false);
     }
 
     pub fn close(&mut self) {
@@ -323,6 +329,20 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Automatically copy highlighted text to clipboard.",
             kind: SettingKind::Bool,
             value: if screen.auto_copy_enabled { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "show_cwd",
+            label: "Show current directory",
+            description: "Display the current working directory in the footer.",
+            kind: SettingKind::Bool,
+            value: if screen.show_cwd { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "show_git_branch",
+            label: "Show git branch",
+            description: "Display the current git branch in the footer.",
+            kind: SettingKind::Bool,
+            value: if screen.show_git_branch { "true" } else { "false" }.to_string(),
         },
     ]
 }
@@ -644,6 +664,14 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                         screen.settings_snapshot.auto_copy_on_highlight = new_value;
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "show_cwd" => {
+                        screen.show_cwd = new_value;
+                        save_setting_bool("showCwd", new_value);
+                    }
+                    "show_git_branch" => {
+                        screen.show_git_branch = new_value;
+                        save_setting_bool("showGitBranch", new_value);
+                    }
                     _ => {}
                 }
             }
@@ -686,10 +714,10 @@ mod tests {
     }
 
     #[test]
-    fn all_entries_returns_ten_settings() {
+    fn all_entries_returns_twelve_settings() {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
-        assert_eq!(entries.len(), 10, "Should have 10 editable settings");
+        assert_eq!(entries.len(), 12, "Should have 12 editable settings");
     }
 
     #[test]

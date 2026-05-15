@@ -1081,6 +1081,12 @@ pub mod config {
         /// `~/.claurst/settings.json`.
         #[serde(default, rename = "autoCopyOnHighlight")]
         pub auto_copy_on_highlight: bool,
+        /// Whether to show current working directory in footer. Defaults to true.
+        #[serde(default = "default_true", rename = "showCwd")]
+        pub show_cwd: bool,
+        /// Whether to show git branch in footer. Defaults to true.
+        #[serde(default = "default_true", rename = "showGitBranch")]
+        pub show_git_branch: bool,
     }
 
     /// A user-defined slash command template.
