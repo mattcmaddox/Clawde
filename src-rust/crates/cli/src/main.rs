@@ -134,8 +134,8 @@ struct Cli {
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
     permission_mode: CliPermissionMode,
 
-    /// Resume a previous session by ID
-    #[arg(long = "resume")]
+    /// Resume a previous session by ID (omit ID to resume the most recent session)
+    #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
     /// Maximum number of agentic turns
@@ -1600,6 +1600,22 @@ async fn run_interactive(
     let mut client = client;
     let mut model_registry = model_registry;
     let mut tool_ctx = tool_ctx;
+    let resume_id = if resume_id.as_deref() == Some("__last__") {
+        let sessions = claurst_core::history::list_sessions().await;
+        match sessions.first() {
+            Some(last) => {
+                println!("Resuming most recent session: {}", last.id);
+                Some(last.id.clone())
+            }
+            None => {
+                eprintln!("No previous sessions found to resume.");
+                None
+            }
+        }
+    } else {
+        resume_id
+    };
+
     let mut session = if let Some(ref id) = resume_id {
         match claurst_core::history::load_session(id).await {
             Ok(session) => {
