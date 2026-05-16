@@ -982,6 +982,10 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+    /// Cache of row -> rendered text within the selectable area, refreshed
+    /// each frame. Used by double/triple-click word and paragraph detection
+    /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
+    pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
     /// When true, releasing a drag selection automatically copies it to clipboard.
     pub auto_copy_selection: bool,
 
@@ -1388,6 +1392,7 @@ impl App {
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_row_text: RefCell::new(std::collections::HashMap::new()),
             auto_copy_selection: auto_copy_on_highlight,
             last_click_time: None,
             last_click_position: None,
@@ -3840,7 +3845,9 @@ impl App {
             }
 
             // ---- Quit / cancel ----------------------------------------
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
+            // (issue #149 follow-up).
+            KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // If text is selected, copy it to clipboard instead of quitting.
                 let sel_text = self.selection_text.borrow().clone();
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
@@ -4058,6 +4065,18 @@ impl App {
             }
 
             // ---- Submit ------------------------------------------------
+            // Shift+Enter / Alt+Enter / Ctrl+Enter insert a literal newline
+            // so users can compose multi-line prompts before sending
+            // (issue #149 follow-up).
+            KeyCode::Enter
+                if !self.is_streaming
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.prompt_input.insert_newline();
+                self.refresh_prompt_input();
+            }
             KeyCode::Enter if !self.is_streaming => {
                 // If a slash-command suggestion is selected, accept it instead of submitting.
                 if !self.prompt_input.suggestions.is_empty()
@@ -4092,19 +4111,35 @@ impl App {
             }
 
             // ---- Input history navigation ------------------------------
+            // For multi-line / wrapped prompts: Up/Down move the cursor by
+            // one visual row first, only falling through to history recall
+            // when the cursor is already on the first/last visual row
+            // (issue #149 follow-up).
             KeyCode::Up => {
                 if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
                     self.prompt_input.suggestion_prev();
-                } else if !self.prompt_input.history.is_empty() {
-                    self.prompt_input.history_up();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_up(width);
+                    if !moved && !self.prompt_input.history.is_empty() {
+                        self.prompt_input.history_up();
+                    }
                 }
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
                 if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
                     self.prompt_input.suggestion_next();
-                } else if self.prompt_input.history_pos.is_some() {
-                    self.prompt_input.history_down();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_down(width);
+                    if !moved && self.prompt_input.history_pos.is_some() {
+                        self.prompt_input.history_down();
+                    }
                 }
                 self.refresh_prompt_input();
             }
@@ -4900,21 +4935,78 @@ impl App {
         }
     }
 
-    /// Find word boundaries for the character at (col, row) in the selection text.
-    /// Returns (start_col, end_col) for the word containing the given position.
-    fn find_word_boundaries(&self, col: u16, _row: u16) -> Option<(u16, u16)> {
-        // Get the current selection text to determine word boundaries
-        let text = self.selection_text.borrow();
-        if text.is_empty() {
+    /// Find word boundaries for the character at (col, row) in the rendered
+    /// transcript buffer. Returns absolute (start_col, end_col) for the word
+    /// containing the click. A "word" is a run of non-whitespace characters.
+    fn find_word_boundaries(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let line = cache.get(&row)?;
+        if line.is_empty() {
             return None;
         }
+        let selectable_area = self.last_selectable_area.get();
+        if col < selectable_area.x {
+            return None;
+        }
+        let local = (col - selectable_area.x) as usize;
+        let chars: Vec<char> = line.chars().collect();
+        if local >= chars.len() {
+            return None;
+        }
+        let is_word = |c: char| !c.is_whitespace();
+        if !is_word(chars[local]) {
+            return None;
+        }
+        let mut start = local;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = local;
+        while end + 1 < chars.len() && is_word(chars[end + 1]) {
+            end += 1;
+        }
+        Some((selectable_area.x + start as u16, selectable_area.x + end as u16))
+    }
 
-        // For simplicity, we'll find the word based on whitespace and punctuation
-        // In a full implementation, we'd map visual positions back to text offsets
-        // For now, return a reasonable range around the click position
-        let start = col.saturating_sub(10).max(0);
-        let end = col.saturating_add(10);
-        Some((start, end))
+    /// Find paragraph boundaries (run of non-blank rows) around `row` and
+    /// return (start_row, end_row, end_col) where end_col is the trimmed end
+    /// of the last row's content. Used by triple-click selection so a
+    /// "paragraph" — a contiguous block of text rows — is selected as a unit
+    /// instead of a single visual row.
+    fn find_paragraph_boundaries(&self, row: u16) -> Option<(u16, u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let selectable_area = self.last_selectable_area.get();
+        if selectable_area.width == 0 || selectable_area.height == 0 {
+            return None;
+        }
+        let row_text = cache.get(&row)?;
+        if row_text.trim().is_empty() {
+            return None;
+        }
+        let max_row = selectable_area
+            .y
+            .saturating_add(selectable_area.height)
+            .saturating_sub(1);
+        let mut start = row;
+        while start > selectable_area.y {
+            let prev = start - 1;
+            if cache.get(&prev).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = row;
+        while end < max_row {
+            let next = end + 1;
+            if cache.get(&next).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            end = next;
+        }
+        let last_text = cache.get(&end)?;
+        let trimmed = last_text.trim_end();
+        let end_col = selectable_area.x + trimmed.chars().count().saturating_sub(1) as u16;
+        Some((start, end, end_col))
     }
 
     /// Find line boundaries for the row containing the click.
@@ -5439,15 +5531,24 @@ impl App {
                     if self.is_double_click(current_pos) {
                         self.click_count += 1;
                         if self.click_count >= 3 {
-                            // Triple-click: select entire line
-                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
-                            self.selection_focus = Some((
-                                selectable_area
-                                    .x
-                                    .saturating_add(selectable_area.width)
-                                    .saturating_sub(1),
-                                current_pos.1,
-                            ));
+                            // Triple-click: select the paragraph (run of
+                            // non-blank rows) containing the click. Falls back
+                            // to a single line if no paragraph is detected.
+                            if let Some((start_row, end_row, end_col)) =
+                                self.find_paragraph_boundaries(current_pos.1)
+                            {
+                                self.selection_anchor = Some((selectable_area.x, start_row));
+                                self.selection_focus = Some((end_col, end_row));
+                            } else {
+                                self.selection_anchor = Some((selectable_area.x, current_pos.1));
+                                self.selection_focus = Some((
+                                    selectable_area
+                                        .x
+                                        .saturating_add(selectable_area.width)
+                                        .saturating_sub(1),
+                                    current_pos.1,
+                                ));
+                            }
                             self.click_count = 0; // Reset for next click sequence
                         } else {
                             // Double-click: select word

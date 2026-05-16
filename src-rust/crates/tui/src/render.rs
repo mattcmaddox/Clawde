@@ -425,7 +425,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     } else {
         0
     };
-    let prompt_height = input_height(&app.prompt_input) + 1; // +1 for model/mode status line
+    // The prompt body width is the terminal width minus the prompt prefix
+    // ("> ") and the right-margin padding used inside `render_prompt_input`.
+    // Keep this in sync with prefix_width=2 + right_pad=2 there.
+    let prompt_text_width = size.width.saturating_sub(4);
+    let prompt_height = input_height(&app.prompt_input, prompt_text_width) + 1; // +1 for model/mode status line
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -694,7 +698,44 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // ---- Text selection highlight (topmost post-pass) ---------------------
     apply_selection_highlight(frame, app);
+    cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
+}
+
+/// Snapshot the rendered text of every row inside the selectable area into
+/// `app.last_row_text` so that subsequent double/triple-clicks can locate
+/// word and paragraph boundaries (issue #149 follow-up).
+fn cache_selectable_row_text(frame: &mut Frame, app: &App) {
+    let selectable_area = app.last_selectable_area.get();
+    if selectable_area.width == 0 || selectable_area.height == 0 {
+        app.last_row_text.borrow_mut().clear();
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let max_row = selectable_area
+        .y
+        .saturating_add(selectable_area.height)
+        .saturating_sub(1);
+    let max_col = selectable_area
+        .x
+        .saturating_add(selectable_area.width)
+        .saturating_sub(1);
+    let mut cache = app.last_row_text.borrow_mut();
+    cache.clear();
+    for row in selectable_area.y..=max_row {
+        let mut s = String::new();
+        for col in selectable_area.x..=max_col {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                let sym = cell.symbol();
+                if sym.is_empty() || sym == "\0" {
+                    s.push(' ');
+                } else {
+                    s.push_str(sym);
+                }
+            }
+        }
+        cache.insert(row, s);
+    }
 }
 
 /// Post-render pass: invert colours on selected cells and extract the
@@ -1007,13 +1048,15 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     if content_height > visible_height {
         use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-        // Use max_scroll+1 as the content length so position=max_scroll
-        // maps to the very bottom of the track (so the thumb visibly meets
-        // the bottom arrow when scrolled all the way down — issue #149).
-        let track_len = (max_scroll + 1).max(1);
-        let mut scrollbar_state = ScrollbarState::new(track_len)
-            .position(scroll)
-            .viewport_content_length(1);
+        // Issue #149 follow-up: passing `viewport_content_length(1)` made
+        // ratatui place a 1-row thumb on a track sized to `max_scroll`, which
+        // produced asymmetric gaps between the thumb and the up/down arrows
+        // at the extremes. Using the actual `content_height` and
+        // `visible_height` lets ratatui compute a proportional thumb that
+        // sits flush with the arrows at both ends.
+        let mut scrollbar_state = ScrollbarState::new(content_height as usize)
+            .position((scroll as usize).min(content_height as usize))
+            .viewport_content_length(visible_height as usize);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_style(Style::default().fg(app.accent_color))
@@ -2056,19 +2099,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // During streaming show "esc to interrupt"; otherwise "? for shortcuts" when idle
-        if spans.is_empty() {
-            if app.is_streaming {
-                spans.push(Span::styled(
-                    "esc interrupt",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            } else if app.prompt_input.text.is_empty() {
-                spans.push(Span::styled(
-                    "? shortcuts",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
+        // During streaming show "esc to interrupt". The "? shortcuts" hint is
+        // rendered in the top-right status bar (see render_prompt area), so do
+        // not duplicate it here (issue #149 follow-up).
+        if spans.is_empty() && app.is_streaming {
+            spans.push(Span::styled(
+                "esc interrupt",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         spans

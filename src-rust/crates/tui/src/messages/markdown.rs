@@ -287,8 +287,35 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
     let mut current_line = String::new();
     let mut current_width = 0usize;
 
+    let push_long_word = |word: &str, result: &mut Vec<String>, current_line: &mut String, current_width: &mut usize| {
+        // Hard-break a word that on its own exceeds `width` (e.g. URLs).
+        if !current_line.is_empty() {
+            result.push(std::mem::take(current_line));
+            *current_width = 0;
+        }
+        let mut chunk = String::new();
+        let mut chunk_w = 0usize;
+        for ch in word.chars() {
+            let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+            if chunk_w + cw > width && !chunk.is_empty() {
+                result.push(std::mem::take(&mut chunk));
+                chunk_w = 0;
+            }
+            chunk.push(ch);
+            chunk_w += cw;
+        }
+        if !chunk.is_empty() {
+            *current_line = chunk;
+            *current_width = chunk_w;
+        }
+    };
+
     for word in text.split_whitespace() {
         let word_w = UnicodeWidthStr::width(word);
+        if word_w > width {
+            push_long_word(word, &mut result, &mut current_line, &mut current_width);
+            continue;
+        }
         if current_width == 0 {
             current_line.push_str(word);
             current_width = word_w;

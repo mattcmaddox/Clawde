@@ -187,12 +187,12 @@ fn restore_terminal_cleanup() -> io::Result<()> {
     )?;
 
     #[cfg(target_os = "windows")]
-    execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        PopKeyboardEnhancementFlags,
-    )?;
+    {
+        // Pop may fail on legacy Windows conhost where the push was a no-op;
+        // do it best-effort so cleanup never errors out the process.
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    }
 
     Ok(())
 }
@@ -238,15 +238,20 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     )?;
 
     #[cfg(target_os = "windows")]
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-        ),
-    )?;
+    {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        // Kitty keyboard protocol is unsupported on legacy Windows conhost;
+        // best-effort — modern Windows Terminal accepts it, conhost returns
+        // "Keyboard progressive enhancement not implemented for the legacy
+        // Windows API" which we ignore so the TUI can still start.
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+        );
+    }
 
     set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);

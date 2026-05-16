@@ -419,10 +419,16 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         }
     }
 
-    // Linux
+    // Linux — try Wayland (wl-copy) first, then fall back to X11 utilities.
+    // Issue #149 follow-up: wl-copy was missing from this code path so RMB →
+    // Copy reported "failed to copy to clipboard" on Wayland sessions.
     #[cfg(target_os = "linux")]
     {
-        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &[
+            "wl-copy",
+            "xclip -selection clipboard",
+            "xsel --clipboard --input",
+        ] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Ok(mut child) = std::process::Command::new(parts[0])
                 .args(&parts[1..])

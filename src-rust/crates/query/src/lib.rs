@@ -1256,14 +1256,14 @@ pub async fn run_query_loop(
                     let combined_thinking = thinking_chunks.join("");
                     if !combined_thinking.is_empty() {
                         content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking,
+                            thinking: combined_thinking.clone(),
                             signature: String::new(),
                         });
                     }
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text });
+                        content_blocks.push(ContentBlock::Text { text: combined_text.clone() });
                     }
 
                     // Reconstruct tool-use blocks (sorted by index for determinism).
@@ -1345,6 +1345,35 @@ pub async fn run_query_loop(
                     }
 
                     // End turn — notify TUI and return.
+                    // Issue #149 follow-up: providers occasionally end the
+                    // turn after a tool round without emitting any text or
+                    // tool calls, which left the user staring at a blank
+                    // screen ("agent randomly stops"). Surface a placeholder
+                    // so the user always sees *some* assistant output and
+                    // knows the turn really ended.
+                    if combined_text.is_empty() && combined_thinking.is_empty() {
+                        let placeholder = format!(
+                            "(no response — model ended the turn with stop_reason \"{}\")",
+                            stop_str
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Stream(
+                                AnthropicStreamEvent::ContentBlockDelta {
+                                    index: 0,
+                                    delta: claurst_api::streaming::ContentDelta::TextDelta { text: placeholder.clone() },
+                                },
+                            ));
+                        }
+                        if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
+                            assistant_msg.content
+                        {
+                            blocks.push(ContentBlock::Text { text: placeholder.clone() });
+                        }
+                        if let Some(last) = messages.last_mut() {
+                            *last = assistant_msg.clone();
+                        }
+                    }
+
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::TurnComplete {
                             stop_reason: stop_str.clone(),
