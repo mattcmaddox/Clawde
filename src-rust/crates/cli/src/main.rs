@@ -1608,8 +1608,8 @@ async fn run_interactive(
                 Some(last.id.clone())
             }
             None => {
-                eprintln!("No previous sessions found to resume.");
-                None
+                eprintln!("claurst: no previous sessions found to resume.");
+                std::process::exit(1)
             }
         }
     } else {
