@@ -1600,6 +1600,7 @@ async fn run_interactive(
     let mut client = client;
     let mut model_registry = model_registry;
     let mut tool_ctx = tool_ctx;
+    let mut resume_warning: Option<String> = None;
     let resume_id = if resume_id.as_deref() == Some("__last__") {
         let sessions = claurst_core::history::list_sessions().await;
         match sessions.first() {
@@ -1608,8 +1609,8 @@ async fn run_interactive(
                 Some(last.id.clone())
             }
             None => {
-                eprintln!("claurst: no previous sessions found to resume.");
-                std::process::exit(1)
+                resume_warning = Some("No previous sessions found, starting new session.".into());
+                None
             }
         }
     } else {
@@ -1664,6 +1665,9 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if let Some(warning) = resume_warning {
+        app.status_message = Some(warning);
+    }
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
         use claurst_tui::EffortLevel as TuiEL;
