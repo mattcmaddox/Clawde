@@ -1631,7 +1631,7 @@ async fn run_interactive(
                 session
             }
             Err(e) => {
-                eprintln!("Warning: could not load session {}: {}", id, e);
+                resume_warning = Some(format!("Could not load session {}: {}. Starting new session.", id, e));
                 let mut session =
                     claurst_core::history::ConversationSession::new(
                         claurst_api::effective_model_for_config(&config, &model_registry),
