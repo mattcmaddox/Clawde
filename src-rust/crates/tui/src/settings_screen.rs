@@ -60,6 +60,13 @@ pub struct SettingsScreen {
     pub terminal_progress_bar: bool,
     pub verbose: bool,
     pub cursor_blink_enabled: bool,
+    pub auto_copy_enabled: bool,
+    pub show_cwd: bool,
+    pub show_git_branch: bool,
+    pub compact_threshold: String,
+    pub auto_commits: bool,
+    pub output_format: String,
+    pub disable_claude_mds: bool,
 }
 
 impl SettingsScreen {
@@ -82,6 +89,13 @@ impl SettingsScreen {
             terminal_progress_bar: true,
             verbose: false,
             cursor_blink_enabled: false,
+            auto_copy_enabled: false,
+            show_cwd: false,
+            show_git_branch: false,
+            compact_threshold: "95".to_string(),
+            auto_commits: false,
+            output_format: "text".to_string(),
+            disable_claude_mds: false,
         }
     }
 
@@ -96,14 +110,25 @@ impl SettingsScreen {
         self.visible = true;
 
         // Wire real settings from snapshot
-        self.auto_compact = read_setting_bool(&self.settings_snapshot, "autoCompact", false);
-        self.notifications = read_setting_bool(&self.settings_snapshot, "notifications", true);
-        self.show_turn_duration = read_setting_bool(&self.settings_snapshot, "showTurnDuration", false);
-        self.output_style = read_setting_string(&self.settings_snapshot, "outputStyle", "default");
-        self.reduce_motion = read_setting_bool(&self.settings_snapshot, "reduceMotion", false);
-        self.terminal_progress_bar = read_setting_bool(&self.settings_snapshot, "terminalProgressBar", true);
+        self.auto_compact = self.settings_snapshot.auto_compact;
+        self.notifications = self.settings_snapshot.notifications;
+        self.show_turn_duration = self.settings_snapshot.show_turn_duration;
+        self.output_style = self.settings_snapshot.config.output_style.clone().unwrap_or_else(|| "default".to_string());
+        self.reduce_motion = self.settings_snapshot.reduce_motion;
+        self.terminal_progress_bar = self.settings_snapshot.terminal_progress_bar;
         self.verbose = self.settings_snapshot.config.verbose;
-        self.cursor_blink_enabled = read_setting_bool(&self.settings_snapshot, "cursorBlinkEnabled", false);
+        self.cursor_blink_enabled = self.settings_snapshot.config.cursor_blink_enabled;
+        self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
+        self.show_cwd = self.settings_snapshot.show_cwd;
+        self.show_git_branch = self.settings_snapshot.show_git_branch;
+        self.compact_threshold = self.settings_snapshot.config.compact_threshold.to_string();
+        self.auto_commits = self.settings_snapshot.config.auto_commits.unwrap_or(false);
+        self.output_format = match &self.settings_snapshot.config.output_format {
+            claurst_core::config::OutputFormat::Text => "text".to_string(),
+            claurst_core::config::OutputFormat::Json => "json".to_string(),
+            claurst_core::config::OutputFormat::StreamJson => "stream_json".to_string(),
+        };
+        self.disable_claude_mds = self.settings_snapshot.config.disable_claude_mds;
     }
 
     pub fn close(&mut self) {
@@ -170,6 +195,12 @@ impl SettingsScreen {
                         Some(value.clone())
                     };
                 }
+                "compact_threshold" => {
+                    if let Ok(n) = value.parse::<f32>() {
+                        config.compact_threshold = n;
+                        self.compact_threshold = value.clone();
+                    }
+                }
                 _ => {}
             }
         }
@@ -182,62 +213,6 @@ impl SettingsScreen {
 impl Default for SettingsScreen {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Settings I/O helpers
-// ---------------------------------------------------------------------------
-
-fn read_setting_bool(_settings: &Settings, key: &str, default: bool) -> bool {
-    let path = claurst_core::config::Settings::config_dir().join("settings.json");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(b) = val.get(key).and_then(|v| v.as_bool()) {
-                return b;
-            }
-        }
-    }
-    default
-}
-
-fn read_setting_string(_settings: &Settings, key: &str, default: &str) -> String {
-    let path = claurst_core::config::Settings::config_dir().join("settings.json");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(s) = val.get(key).and_then(|v| v.as_str()) {
-                return s.to_string();
-            }
-        }
-    }
-    default.to_string()
-}
-
-fn save_setting_bool(key: &str, value: bool) {
-    let path = claurst_core::config::Settings::config_dir().join("settings.json");
-    let mut val: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert(key.to_string(), serde_json::Value::Bool(value));
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&val) {
-        let _ = std::fs::write(&path, json);
-    }
-}
-
-fn save_setting_string(key: &str, value: &str) {
-    let path = claurst_core::config::Settings::config_dir().join("settings.json");
-    let mut val: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
-    }
-    if let Ok(json) = serde_json::to_string_pretty(&val) {
-        let _ = std::fs::write(&path, json);
     }
 }
 
@@ -313,6 +288,57 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Enable cursor blinking in the chat prompt.",
             kind: SettingKind::Bool,
             value: if screen.cursor_blink_enabled { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "auto_copy_enabled",
+            label: "Auto-copy on highlight",
+            description: "Automatically copy highlighted text to clipboard.",
+            kind: SettingKind::Bool,
+            value: if screen.auto_copy_enabled { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "show_cwd",
+            label: "Show current directory",
+            description: "Display the current working directory in the footer.",
+            kind: SettingKind::Bool,
+            value: if screen.show_cwd { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "show_git_branch",
+            label: "Show git branch",
+            description: "Display the current git branch in the footer.",
+            kind: SettingKind::Bool,
+            value: if screen.show_git_branch { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "compact_threshold",
+            label: "Auto-compact threshold",
+            description: "Context usage % at which to trigger auto-compact (0-100).",
+            kind: SettingKind::Number,
+            value: screen.compact_threshold.clone(),
+        },
+        SettingsEntry {
+            key: "auto_commits",
+            label: "Auto-commits",
+            description: "Automatically snapshot changes to git via shadow-git.",
+            kind: SettingKind::Bool,
+            value: if screen.auto_commits { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "output_format",
+            label: "Output format",
+            description: "How responses are formatted: text, JSON, or streaming JSON.",
+            kind: SettingKind::Enum {
+                options: vec!["text", "json", "streamjson"],
+            },
+            value: screen.output_format.clone(),
+        },
+        SettingsEntry {
+            key: "disable_claude_mds",
+            label: "Disable CLAUDE.md",
+            description: "Ignore CLAUDE.md files in projects (use defaults instead).",
+            kind: SettingKind::Bool,
+            value: if screen.disable_claude_mds { "true" } else { "false" }.to_string(),
         },
     ]
 }
@@ -602,23 +628,28 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                 match entry.key {
                     "auto_compact" => {
                         screen.auto_compact = new_value;
-                        save_setting_bool("autoCompact", new_value);
+                        screen.settings_snapshot.auto_compact = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     "notifications" => {
                         screen.notifications = new_value;
-                        save_setting_bool("notifications", new_value);
+                        screen.settings_snapshot.notifications = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     "show_turn_duration" => {
                         screen.show_turn_duration = new_value;
-                        save_setting_bool("showTurnDuration", new_value);
+                        screen.settings_snapshot.show_turn_duration = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     "reduce_motion" => {
                         screen.reduce_motion = new_value;
-                        save_setting_bool("reduceMotion", new_value);
+                        screen.settings_snapshot.reduce_motion = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     "terminal_progress_bar" => {
                         screen.terminal_progress_bar = new_value;
-                        save_setting_bool("terminalProgressBar", new_value);
+                        screen.settings_snapshot.terminal_progress_bar = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     "verbose" => {
                         screen.verbose = new_value;
@@ -627,7 +658,33 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     }
                     "cursor_blink_enabled" => {
                         screen.cursor_blink_enabled = new_value;
-                        save_setting_bool("cursorBlinkEnabled", new_value);
+                        screen.settings_snapshot.config.cursor_blink_enabled = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "auto_copy_enabled" => {
+                        screen.auto_copy_enabled = new_value;
+                        screen.settings_snapshot.auto_copy_on_highlight = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "show_cwd" => {
+                        screen.show_cwd = new_value;
+                        screen.settings_snapshot.show_cwd = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "show_git_branch" => {
+                        screen.show_git_branch = new_value;
+                        screen.settings_snapshot.show_git_branch = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "auto_commits" => {
+                        screen.auto_commits = new_value;
+                        screen.settings_snapshot.config.auto_commits = if new_value { Some(true) } else { None };
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "disable_claude_mds" => {
+                        screen.disable_claude_mds = new_value;
+                        screen.settings_snapshot.config.disable_claude_mds = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
                 }
@@ -640,7 +697,17 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                 match entry.key {
                     "output_style" => {
                         screen.output_style = new_value.to_string();
-                        save_setting_string("outputStyle", new_value);
+                        screen.settings_snapshot.config.output_style = Some(new_value.to_string());
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "output_format" => {
+                        screen.output_format = new_value.to_string();
+                        screen.settings_snapshot.config.output_format = match new_value {
+                            "json" => claurst_core::config::OutputFormat::Json,
+                            "stream_json" => claurst_core::config::OutputFormat::StreamJson,
+                            _ => claurst_core::config::OutputFormat::Text,
+                        };
+                        let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
                 }
@@ -671,10 +738,10 @@ mod tests {
     }
 
     #[test]
-    fn all_entries_returns_nine_settings() {
+    fn all_entries_returns_sixteen_settings() {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
-        assert_eq!(entries.len(), 9, "Should have 9 editable settings");
+        assert_eq!(entries.len(), 16, "Should have 16 editable settings");
     }
 
     #[test]

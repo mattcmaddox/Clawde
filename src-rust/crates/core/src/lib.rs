@@ -1081,6 +1081,27 @@ pub mod config {
         /// `~/.claurst/settings.json`.
         #[serde(default, rename = "autoCopyOnHighlight")]
         pub auto_copy_on_highlight: bool,
+        /// Whether to show current working directory in footer. Defaults to true.
+        #[serde(default = "default_true", rename = "showCwd")]
+        pub show_cwd: bool,
+        /// Whether to show git branch in footer. Defaults to true.
+        #[serde(default = "default_true", rename = "showGitBranch")]
+        pub show_git_branch: bool,
+        /// Whether to enable desktop notifications. Defaults to true.
+        #[serde(default = "default_true", rename = "notifications")]
+        pub notifications: bool,
+        /// Whether to show turn duration in output. Defaults to false.
+        #[serde(default, rename = "showTurnDuration")]
+        pub show_turn_duration: bool,
+        /// Whether to reduce motion in UI. Defaults to false.
+        #[serde(default, rename = "reduceMotion")]
+        pub reduce_motion: bool,
+        /// Whether to show terminal progress bars. Defaults to true.
+        #[serde(default = "default_true", rename = "terminalProgressBar")]
+        pub terminal_progress_bar: bool,
+        /// Whether to enable auto-compact. Defaults to true.
+        #[serde(default = "default_true", rename = "autoCompact")]
+        pub auto_compact: bool,
     }
 
     /// A user-defined slash command template.
@@ -1616,6 +1637,13 @@ pub mod config {
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
                 auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
+                notifications: over.notifications || base.notifications,
+                show_turn_duration: over.show_turn_duration || base.show_turn_duration,
+                reduce_motion: over.reduce_motion || base.reduce_motion,
+                terminal_progress_bar: over.terminal_progress_bar || base.terminal_progress_bar,
+                show_cwd: over.show_cwd || base.show_cwd,
+                show_git_branch: over.show_git_branch || base.show_git_branch,
+                auto_compact: over.auto_compact || base.auto_compact,
             }
         }
     }

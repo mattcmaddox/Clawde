@@ -894,6 +894,10 @@ pub struct App {
     pub pr_url: Option<String>,
     /// PR review state: "approved", "changes_requested", "review_required", etc.
     pub pr_state: Option<String>,
+    /// Current working directory path.
+    pub current_dir: Option<String>,
+    /// Current git branch name.
+    pub git_branch: Option<String>,
     /// Count of in-progress background tasks (drives the footer pill).
     pub background_task_count: usize,
     /// Background task status text shown in footer pill.
@@ -982,8 +986,6 @@ pub struct App {
     /// each frame. Used by double/triple-click word and paragraph detection
     /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
     pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
-    /// When true, releasing a drag selection automatically copies it to clipboard.
-    pub auto_copy_selection: bool,
 
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
@@ -1180,9 +1182,6 @@ impl App {
         let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
-        let auto_copy_on_highlight = Settings::load_sync()
-            .map(|s| s.auto_copy_on_highlight)
-            .unwrap_or(false);
         Self {
             config,
             cost_tracker,
@@ -1329,6 +1328,12 @@ impl App {
             pr_number: None,
             pr_url: None,
             pr_state: None,
+            current_dir: std::env::current_dir().ok().and_then(|p| {
+                p.to_str().map(|s| s.to_string())
+            }),
+            git_branch: claurst_core::git_utils::get_repo_root(
+                std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
+            ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
@@ -1388,7 +1393,6 @@ impl App {
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
-            auto_copy_selection: auto_copy_on_highlight,
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
@@ -5584,7 +5588,7 @@ impl App {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
                     self.clear_selection();
-                } else if self.auto_copy_selection {
+                } else if self.settings_screen.auto_copy_enabled {
                     // Auto-copy finalized selection to clipboard.
                     let sel_text = self.selection_text.borrow().clone();
                     if !sel_text.is_empty() {
