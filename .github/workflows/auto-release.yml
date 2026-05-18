@@ -1,0 +1,306 @@
+name: Auto Release (commit marker)
+
+# Two flows, both driven by markers in the head commit message:
+#
+#   --release vMAJOR.MINOR.PATCH
+#       Cut a brand-new release.  The requested tag must be strictly greater
+#       (semver) than the highest existing tag, and must not already exist.
+#       Stamps the version across Cargo.toml/lock, npm, README, docs, and the
+#       ACP registry, commits the bump as github-actions[bot] with [skip ci],
+#       then dispatches .github/workflows/release.yml.
+#
+#   --patch     (restricted to kuberwastaken)
+#       Patch the currently-shipped release in place.  Reads the version from
+#       src-rust/Cargo.toml, builds a bullet from the commit subject + sha,
+#       then dispatches .github/workflows/patch-release.yml with that bullet
+#       so the patch-release workflow can prepend a `## 🩹 Patches` section to
+#       the existing release body without otherwise touching the notes.
+#       Restricted to a single actor because patches force-move a published
+#       tag — that's a maintainer-only operation.
+#
+# Pushes to main from this workflow use the default GITHUB_TOKEN.  If branch
+# protection blocks bot pushes to main, either grant the GitHub Actions bot
+# the bypass, or supply a PAT in a secret and replace `secrets.GITHUB_TOKEN`
+# in the checkout step + git push below.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  auto-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 0. Skip our own bump commits ──────────────────────────────────
+      # Defence in depth — the bump commit also carries [skip ci], but if
+      # someone removes that marker the author check still stops the loop.
+      - name: Skip bot commits
+        id: actor
+        env:
+          AUTHOR_NAME: ${{ github.event.head_commit.author.name }}
+          AUTHOR_EMAIL: ${{ github.event.head_commit.author.email }}
+        run: |
+          if [[ "$AUTHOR_NAME" == "github-actions[bot]" \
+             || "$AUTHOR_EMAIL" == *"github-actions[bot]"* ]]; then
+            echo "Head commit was made by github-actions[bot] — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 1. Parse the marker ───────────────────────────────────────────
+      - name: Look for --release marker
+        id: marker
+        if: steps.actor.outputs.skip != 'true'
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          TAG="$(printf '%s' "$MSG" \
+                  | grep -oE -- '--release[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+' \
+                  | head -1 \
+                  | awk '{print $2}' || true)"
+          if [[ -z "$TAG" ]]; then
+            echo "No --release marker in head commit message — nothing to do."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Found release marker: $TAG"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Checkout with full tag history (needed for forward-only check) ─
+      - uses: actions/checkout@v4
+        if: steps.marker.outputs.found == 'true'
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 3. Forward-only enforcement ───────────────────────────────────
+      # Two guards:
+      #   a) The exact tag must not already exist (anywhere — local or remote).
+      #   b) `sort -V` must rank the requested tag strictly above the current
+      #      highest `vX.Y.Z` tag.  This catches `v0.1.0` after `v0.1.1` has
+      #      shipped, etc.
+      - name: Forward-only check
+        if: steps.marker.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.marker.outputs.tag }}"
+
+          git fetch --tags --force --quiet
+
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists — releases are forward-only."
+            exit 1
+          fi
+
+          LATEST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1 || true)"
+          if [[ -n "$LATEST" ]]; then
+            HIGHER="$(printf '%s\n%s\n' "$LATEST" "$TAG" | sort -V | tail -1)"
+            if [[ "$HIGHER" != "$TAG" || "$LATEST" == "$TAG" ]]; then
+              echo "::error::Requested $TAG is not strictly newer than current latest $LATEST."
+              echo "::error::Releases are forward-only — bump the requested version."
+              exit 1
+            fi
+            echo "Forward bump OK: $LATEST → $TAG"
+          else
+            echo "No prior tags found — treating as first release."
+          fi
+
+      # ── 4. Run the bump script ────────────────────────────────────────
+      - name: Set up Python
+        if: steps.marker.outputs.found == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Stamp version across all sources
+        if: steps.marker.outputs.found == 'true'
+        run: python scripts/bump-version.py "${{ steps.marker.outputs.tag }}"
+
+      # ── 5. Commit & push the bump ─────────────────────────────────────
+      # `[skip ci]` in the commit message prevents this workflow (and every
+      # other on-push workflow) from re-triggering on the bump commit.
+      - name: Commit version bump
+        if: steps.marker.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "No file changes — every canonical source already at ${{ steps.marker.outputs.tag }}."
+          else
+            git add -A
+            git commit -m "chore(release): stamp ${{ steps.marker.outputs.tag }} [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      # ── 6. Hand off to the existing release workflow ──────────────────
+      # `workflow_dispatch` triggered via the API IS allowed to run even when
+      # invoked under GITHUB_TOKEN (unlike push/PR events), so no PAT needed.
+      - name: Dispatch release.yml
+        if: steps.marker.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f version="${{ steps.marker.outputs.tag }}"
+          echo "Dispatched release.yml for ${{ steps.marker.outputs.tag }}."
+
+      - name: Summary
+        if: steps.marker.outputs.found == 'true'
+        run: |
+          {
+            echo "## Auto-release dispatched"
+            echo
+            echo "- Tag: \`${{ steps.marker.outputs.tag }}\`"
+            echo "- Version stamped into Cargo.toml/lock, npm, README, docs, ACP registry."
+            echo "- Bump committed to main as \`github-actions[bot]\` (\`[skip ci]\`)."
+            echo "- Release pipeline dispatched — watch the Release workflow for build/publish progress."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── --patch flow ────────────────────────────────────────────────────────
+  # Restricted to a single actor: github.actor is the GitHub username that
+  # pushed the commit (i.e. the user whose token was used).  This is the
+  # right knob — head_commit.author.name can be set to anything in a local
+  # `git config user.name`, so authorship alone is spoofable; github.actor
+  # is not.
+  auto-patch:
+    runs-on: ubuntu-latest
+    if: github.actor == 'kuberwastaken'
+
+    steps:
+      - name: Skip bot commits
+        id: actor
+        env:
+          AUTHOR_NAME: ${{ github.event.head_commit.author.name }}
+          AUTHOR_EMAIL: ${{ github.event.head_commit.author.email }}
+        run: |
+          if [[ "$AUTHOR_NAME" == "github-actions[bot]" \
+             || "$AUTHOR_EMAIL" == *"github-actions[bot]"* ]]; then
+            echo "Head commit was made by github-actions[bot] — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Word-boundary match so `--patch` in a longer string (e.g. a quoted
+      # filename or a URL fragment) doesn't accidentally trigger.  Also
+      # explicitly exits if the commit ALSO carries `--release` — release
+      # wins, patch is silent, no double-dispatch.
+      - name: Look for --patch marker
+        id: marker
+        if: steps.actor.outputs.skip != 'true'
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$MSG" | grep -qE -- '(^|[[:space:]])--release[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "Commit also carries --release marker — letting auto-release handle it; patch skipped."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$MSG" | grep -qE -- '(^|[[:space:]])--patch([[:space:]]|$)'; then
+            echo "No --patch marker in head commit message — nothing to do."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Found --patch marker."
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.marker.outputs.found == 'true'
+
+      # Build the patch bullet:
+      #   * tag       — taken from Cargo.toml; patch-release.yml's preflight
+      #                 will refuse if the matching release does not exist.
+      #   * subject   — head-commit subject line, with the `--patch` token
+      #                 stripped, used as the human-readable description.
+      #   * commit    — SHA-linked back to the patch commit so readers can
+      #                 jump from the release page straight to the fix.
+      - name: Compose patch bullet
+        id: bullet
+        if: steps.marker.outputs.found == 'true'
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION="$(grep '^version' src-rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          if [[ -z "$CARGO_VERSION" ]]; then
+            echo "::error::Could not read version from src-rust/Cargo.toml"
+            exit 1
+          fi
+          TAG="v${CARGO_VERSION}"
+
+          # First line, minus the `--patch` token (with surrounding spaces).
+          SUBJECT="$(printf '%s' "$MSG" | head -n 1)"
+          DESC="$(printf '%s' "$SUBJECT" \
+                   | sed -E 's/[[:space:]]*--patch[[:space:]]*/ /g; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+          if [[ -z "$DESC" ]]; then
+            DESC="(patch — see commit)"
+          fi
+
+          SHORT="${SHA:0:7}"
+          BULLET="- ${DESC} ([\`${SHORT}\`](https://github.com/${REPO}/commit/${SHA}))"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Multi-line-safe output:
+          {
+            echo "bullet<<__EOF__"
+            printf '%s\n' "$BULLET"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Will patch $TAG with:"
+          echo "  $BULLET"
+
+      # Pass the bullet via env var, not via `${{ }}` directly in the shell
+      # command — the bullet contains backticks (for the short-SHA code span)
+      # and inlining it would trigger bash command substitution.  Routing
+      # through env means bash sees the value as data after one expansion.
+      - name: Dispatch patch-release.yml
+        if: steps.marker.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.bullet.outputs.tag }}
+          PATCH_BULLET: ${{ steps.bullet.outputs.bullet }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh workflow run patch-release.yml \
+            --repo "$REPO" \
+            --ref main \
+            -f version="$TAG" \
+            -f patch_note="$PATCH_BULLET"
+          echo "Dispatched patch-release.yml for $TAG."
+
+      - name: Summary
+        if: steps.marker.outputs.found == 'true'
+        env:
+          TAG: ${{ steps.bullet.outputs.tag }}
+          PATCH_BULLET: ${{ steps.bullet.outputs.bullet }}
+        run: |
+          {
+            echo "## Auto-patch dispatched"
+            echo
+            echo "- Target release: \`$TAG\`"
+            echo "- Patch bullet:"
+            echo "  > $PATCH_BULLET"
+            echo "- Binaries will be rebuilt and tag force-moved by the Patch Release workflow."
+            echo "- Release body will gain a new bullet under \`## 🩹 Patches\` at the top — every other section is preserved."
+          } >> "$GITHUB_STEP_SUMMARY"

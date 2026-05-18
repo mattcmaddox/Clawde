@@ -25,6 +25,11 @@ on:
         description: 'Existing tag to amend (e.g., v0.1.0)'
         required: true
         type: string
+      patch_note:
+        description: 'Optional markdown bullet to prepend under "## 🩹 Patches". Leave blank to skip body edit.'
+        required: false
+        type: string
+        default: ''
 
 # Don't race patches on the same tag.  Also don't race with a regular release
 # of the same tag (concurrency groups share the same name shape).
@@ -278,6 +283,20 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
+      # Prepend the patch bullet to the release body, idempotent: if a
+      # `## 🩹 Patches` section already exists, subsequent bullets stack into
+      # the same list at the top instead of creating duplicate sections.
+      # Skipped when no patch_note was provided (e.g. manual asset-only
+      # re-upload from the Actions UI).
+      - name: Append patch note to release body
+        if: inputs.patch_note != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.version }}
+          PATCH_BULLET: ${{ inputs.patch_note }}
+        run: python3 scripts/append-patch-note.py
+
       - name: Summary
         run: |
           {
@@ -285,7 +304,11 @@ jobs:
             echo
             echo "- Tag force-moved to commit \`${{ github.sha }}\`."
             echo "- 5 binary archives + install scripts rebuilt and re-uploaded."
-            echo "- Release title, body, contributors, and Full Changelog link unchanged."
+            if [[ -n "${{ inputs.patch_note }}" ]]; then
+              echo "- Release body received a new bullet under \`## 🩹 Patches\` at the top."
+            else
+              echo "- Release title, body, contributors, and Full Changelog link unchanged."
+            fi
             echo
             echo "Anyone who installs fresh from \`releases/latest/download/…\` will pick up the patched build."
             echo "Existing installs are **not** auto-updated — users must reinstall or run \`claurst upgrade --force\`."

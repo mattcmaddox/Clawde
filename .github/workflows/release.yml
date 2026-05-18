@@ -297,24 +297,60 @@ jobs:
               || true
           )"
 
-          # ── Compose final body ─────────────────────────────────────────
-          {
-            cat pr-notes.md
+          # ── Pass 3: split pr-notes.md into its three logical sections ──
+          # GitHub's generate-notes returns one blob containing, in order:
+          #   1. Category headings (✨ Features, 🐛 Fixes, …) + Other Changes
+          #   2. "## New Contributors" list
+          #   3. "**Full Changelog**: …compare link"
+          # We want to re-order the final body as:
+          #   Direct commits → Other changes → New Contributors → Full Changelog
+          # so split on the two well-known anchors.  awk keeps this portable
+          # and avoids shelling out to a heredoc-python in the workflow.
+          awk '
+            BEGIN { section = "categories" }
+            /^## New Contributors[[:space:]]*$/ { section = "contributors"; next }
+            /^\*\*Full Changelog\*\*:/         { section = "changelog" }
+            { print > (section ".md") }
+          ' pr-notes.md
+          # Ensure all three files exist even when empty so the composition
+          # block below doesn't fail under `set -e`.
+          touch categories.md contributors.md changelog.md
 
-            if [[ -n "$DIRECT_COMMITS" ]]; then
-              # Spacer only when pr-notes already has content — avoids
-              # leading blank lines on a first-release.
-              if [[ -s pr-notes.md ]]; then
-                echo
-                echo
-              fi
-              echo "## 🛠 Direct commits"
-              echo
-              echo "Work pushed to \`main\` outside of pull requests in this release:"
-              echo
-              echo "$DIRECT_COMMITS"
+          # ── Compose final body in the requested order ──────────────────
+          # Direct commits first, then everything carried over from the PR
+          # categorisation, then New Contributors, then the Full Changelog
+          # footer link.  Blank-line spacers are emitted only between
+          # sections that have content, so a release with (say) no direct
+          # commits doesn't get a leading blank line.
+          : > release-notes.md
+          first=1
+          append_section() {
+            local body="$1"
+            [[ -z "$body" ]] && return 0
+            if [[ $first -eq 0 ]]; then
+              { echo; echo; } >> release-notes.md
             fi
-          } > release-notes.md
+            printf '%s\n' "$body" >> release-notes.md
+            first=0
+          }
+
+          if [[ -n "$DIRECT_COMMITS" ]]; then
+            append_section "$(printf '## 🛠 Direct commits\n\nWork pushed to `main` outside of pull requests in this release:\n\n%s' "$DIRECT_COMMITS")"
+          fi
+
+          # `categories.md` already carries its own per-section `##` headings
+          # (e.g. `## ✨ Features`) emitted by GitHub's generator, so we pipe
+          # it through verbatim — no extra wrapper heading needed.
+          CATEGORIES="$(sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' categories.md)"
+          append_section "$CATEGORIES"
+
+          CONTRIBUTORS="$(sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' contributors.md)"
+          if [[ -n "$CONTRIBUTORS" ]]; then
+            append_section "$(printf '## New Contributors\n\n%s' "$CONTRIBUTORS")"
+          fi
+
+          CHANGELOG="$(sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' changelog.md)"
+          append_section "$CHANGELOG"
 
           echo "── Final release notes ──────────────────────────────"
           cat release-notes.md

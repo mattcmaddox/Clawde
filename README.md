@@ -197,6 +197,7 @@ For more info on how to configure Claurst, [head over to our docs](https://claur
 ## Contributing
 
 Claurst is built for the community, by the community and we'd love your help making it better.
+Please see and include AGENTS.md for project-specific rules (for both humans and agents).
 
 [Open an issue](https://github.com/Kuberwastaken/claurst/issues/new) for bugs, ideas, or questions, or [Raise a PR](https://github.com/Kuberwastaken/claurst/pulls/new) to fix bugs, add features, or improve documentation.
 
