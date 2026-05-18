@@ -21,6 +21,7 @@ use crate::memory_update_notification::render_memory_update_notification;
 use crate::import_config_dialog::render_import_config_dialog;
 use crate::invalid_config_dialog::render_invalid_config_dialog;
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
+use crate::file_injection_dialog::render_file_injection_dialog;
 use crate::ask_user_dialog::render_ask_user_dialog;
 use crate::onboarding_dialog::render_onboarding_dialog;
 use crate::dialog_select::render_dialog_select;
@@ -585,6 +586,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Bypass-permissions confirmation dialog (topmost — rendered last so it sits above all)
     if app.bypass_permissions_dialog.visible {
         render_bypass_permissions_dialog(frame, &app.bypass_permissions_dialog, size);
+    }
+
+    // File injection warning dialog (shown when oversized/binary files detected)
+    if app.file_injection_dialog.visible {
+        render_file_injection_dialog(frame, &app.file_injection_dialog, size);
     }
 
     // AskUserQuestion dialog — renders above bypass-permissions so the model's

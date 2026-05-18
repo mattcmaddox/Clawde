@@ -638,6 +638,14 @@ pub mod config {
         true
     }
 
+    fn default_file_autocomplete_limit() -> usize {
+        15
+    }
+
+    fn default_file_injection_max_size() -> usize {
+        100  // 100 KB
+    }
+
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
     pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
@@ -965,6 +973,23 @@ pub mod config {
         /// Enable cursor blinking in the chat prompt. Defaults to false (disabled).
         #[serde(default, rename = "cursorBlinkEnabled", skip_serializing_if = "is_false")]
         pub cursor_blink_enabled: bool,
+        /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
+        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
+        pub file_autocomplete_limit: usize,
+        /// Whether to show hidden files in file autocomplete. Defaults to false.
+        #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
+        pub file_autocomplete_show_hidden_files: bool,
+        /// Whether @ file references are automatically injected into message context. Defaults to true.
+        /// When true: @file auto-injects file contents into your message before sending.
+        /// When false: @ is just autocomplete and reference (no auto-injection).
+        /// Note: This only affects user messages. @include in CLAUDE.md/AGENTS.md always injects with no size limits.
+        #[serde(default = "default_true", rename = "fileInjectionEnabled")]
+        pub file_injection_enabled: bool,
+        /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
+        /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
+        /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
+        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
+        pub file_injection_max_size: usize,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1102,6 +1127,23 @@ pub mod config {
         /// Whether to enable auto-compact. Defaults to true.
         #[serde(default = "default_true", rename = "autoCompact")]
         pub auto_compact: bool,
+        /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
+        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
+        pub file_autocomplete_limit: usize,
+        /// Whether to show hidden files in file autocomplete. Defaults to false.
+        #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
+        pub file_autocomplete_show_hidden_files: bool,
+        /// Whether @ file references are automatically injected into message context. Defaults to true.
+        /// When true: @file auto-injects file contents into your message before sending.
+        /// When false: @ is just autocomplete and reference (no auto-injection).
+        /// Note: This only affects user messages. @include in CLAUDE.md/AGENTS.md always injects with no size limits.
+        #[serde(default = "default_true", rename = "fileInjectionEnabled")]
+        pub file_injection_enabled: bool,
+        /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
+        /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
+        /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
+        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
+        pub file_injection_max_size: usize,
     }
 
     /// A user-defined slash command template.
@@ -1513,6 +1555,11 @@ pub mod config {
                     config.skills.urls.push(u.clone());
                 }
             }
+            // Copy file autocomplete and injection settings.
+            config.file_autocomplete_limit = self.file_autocomplete_limit;
+            config.file_autocomplete_show_hidden_files = self.file_autocomplete_show_hidden_files;
+            config.file_injection_enabled = self.file_injection_enabled;
+            config.file_injection_max_size = self.file_injection_max_size;
             config
         }
 
@@ -1612,6 +1659,10 @@ pub mod config {
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
+                file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
+                file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
+                file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
+                file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
             };
             Self {
                 config: merged_config,
@@ -1644,6 +1695,10 @@ pub mod config {
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
                 auto_compact: over.auto_compact || base.auto_compact,
+                file_autocomplete_limit: if over.file_autocomplete_limit != 0 { over.file_autocomplete_limit } else { base.file_autocomplete_limit },
+                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
+                file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
+                file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
             }
         }
     }
