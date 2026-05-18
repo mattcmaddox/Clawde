@@ -134,8 +134,8 @@ struct Cli {
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
     permission_mode: CliPermissionMode,
 
-    /// Resume a previous session by ID
-    #[arg(long = "resume")]
+    /// Resume a previous session by ID (omit ID to resume the most recent session)
+    #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
     /// Maximum number of agentic turns
@@ -1600,6 +1600,23 @@ async fn run_interactive(
     let mut client = client;
     let mut model_registry = model_registry;
     let mut tool_ctx = tool_ctx;
+    let mut resume_warning: Option<String> = None;
+    let resume_id = if resume_id.as_deref() == Some("__last__") {
+        let sessions = claurst_core::history::list_sessions().await;
+        match sessions.first() {
+            Some(last) => {
+                println!("Resuming most recent session: {}", last.id);
+                Some(last.id.clone())
+            }
+            None => {
+                resume_warning = Some("No previous sessions found, starting new session.".into());
+                None
+            }
+        }
+    } else {
+        resume_id
+    };
+
     let mut session = if let Some(ref id) = resume_id {
         match claurst_core::history::load_session(id).await {
             Ok(session) => {
@@ -1614,7 +1631,7 @@ async fn run_interactive(
                 session
             }
             Err(e) => {
-                eprintln!("Warning: could not load session {}: {}", id, e);
+                resume_warning = Some(format!("Could not load session {}: {}. Starting new session.", id, e));
                 let mut session =
                     claurst_core::history::ConversationSession::new(
                         claurst_api::effective_model_for_config(&config, &model_registry),
@@ -1648,6 +1665,9 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if let Some(warning) = resume_warning {
+        app.status_message = Some(warning);
+    }
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
         use claurst_tui::EffortLevel as TuiEL;

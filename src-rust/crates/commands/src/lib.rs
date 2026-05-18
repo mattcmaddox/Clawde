@@ -1224,23 +1224,14 @@ impl SlashCommand for ResumeCommand {
             if sessions.is_empty() {
                 return CommandResult::Message("No previous sessions found.".to_string());
             }
-            let mut output = String::from("Recent sessions:\n\n");
-            for (i, session) in sessions.iter().take(10).enumerate() {
-                let title = session
-                    .title
-                    .as_deref()
-                    .unwrap_or("(untitled)");
-                let id_short = &session.id[..session.id.len().min(8)];
-                output.push_str(&format!(
-                    "  {}. {} - {} ({} messages)\n",
-                    i + 1,
-                    id_short,
-                    title,
-                    session.messages.len()
-                ));
+            let last = &sessions[0];
+            match claurst_core::history::load_session(&last.id).await {
+                Ok(session) => CommandResult::ResumeSession(session),
+                Err(e) => CommandResult::Error(format!(
+                    "Failed to load session {}: {}",
+                    last.id, e
+                )),
             }
-            output.push_str("\nUse /resume <id> to resume a session.");
-            CommandResult::Message(output)
         } else {
             match claurst_core::history::load_session(args.trim()).await {
                 Ok(session) => CommandResult::ResumeSession(session),
