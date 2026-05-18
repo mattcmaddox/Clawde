@@ -581,6 +581,54 @@ fn layout_to_latin(c: char) -> String {
     mapped.unwrap_or(lower).to_string()
 }
 
+/// Apply shift transformation to a character based on standard US QWERTY layout.
+/// Handles both ASCII lowercase letters and number/symbol keys.
+///
+/// **Why this exists**: Terminals that support the kitty keyboard protocol send
+/// unshifted characters with modifier flags instead of pre-shifted characters
+/// (e.g., Shift+1 arrives as '1' + SHIFT instead of '!'). This function normalizes
+/// them to the expected shifted characters.
+///
+/// **Keyboard layout limitation**: This only works correctly for US QWERTY keyboards.
+/// Other layouts (AZERTY, QWERTZ, etc.) have different shift mappings. For non-US
+/// layouts, we rely on the terminal to send the correctly shifted character, which
+/// most modern terminals do (especially with kitty protocol enabled).
+fn normalize_char_with_shift(c: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return c;
+    }
+
+    if c.is_ascii_lowercase() {
+        return c.to_ascii_uppercase();
+    }
+
+    // Map unshifted number/symbol keys to their shifted equivalents (US QWERTY)
+    match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '\\' => '|',
+        '`' => '~',
+        _ => c,
+    }
+}
+
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt  = key.modifiers.contains(KeyModifiers::ALT);
@@ -836,6 +884,9 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// Whether the bypass-permissions dialog has been shown this session.
     pub bypass_permissions_dialog_shown: bool,
+    /// File injection warning dialog.
+    /// Shown when oversized or binary files are detected in @refs.
+    pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
@@ -894,6 +945,10 @@ pub struct App {
     pub pr_url: Option<String>,
     /// PR review state: "approved", "changes_requested", "review_required", etc.
     pub pr_state: Option<String>,
+    /// Current working directory path.
+    pub current_dir: Option<String>,
+    /// Current git branch name.
+    pub git_branch: Option<String>,
     /// Count of in-progress background tasks (drives the footer pill).
     pub background_task_count: usize,
     /// Background task status text shown in footer pill.
@@ -982,8 +1037,6 @@ pub struct App {
     /// each frame. Used by double/triple-click word and paragraph detection
     /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
     pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
-    /// When true, releasing a drag selection automatically copies it to clipboard.
-    pub auto_copy_selection: bool,
 
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
@@ -1180,9 +1233,6 @@ impl App {
         let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
-        let auto_copy_on_highlight = Settings::load_sync()
-            .map(|s| s.auto_copy_on_highlight)
-            .unwrap_or(false);
         Self {
             config,
             cost_tracker,
@@ -1283,6 +1333,7 @@ impl App {
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
+            file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
@@ -1329,6 +1380,12 @@ impl App {
             pr_number: None,
             pr_url: None,
             pr_state: None,
+            current_dir: std::env::current_dir().ok().and_then(|p| {
+                p.to_str().map(|s| s.to_string())
+            }),
+            git_branch: claurst_core::git_utils::get_repo_root(
+                std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
+            ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
@@ -1388,7 +1445,6 @@ impl App {
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
-            auto_copy_selection: auto_copy_on_highlight,
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
@@ -2173,9 +2229,12 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open settings on KeyBindings tab
-                self.settings_screen.open();
-                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                // Open the keybindings.json file in the external editor
+                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
+
+                if let Err(e) = open_file_externally(&keybindings_path) {
+                    eprintln!("Failed to open keybindings file: {}", e);
+                }
                 true
             }
             "help" => {
@@ -2813,6 +2872,33 @@ impl App {
             return false;
         }
 
+        // File injection dialog: shown when oversized files are detected in @refs.
+        if self.file_injection_dialog.visible {
+            match key.code {
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    self.file_injection_dialog.selected = 0; // InjectAll
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.file_injection_dialog.selected = 1; // SkipOversized
+                }
+                KeyCode::Esc => {
+                    self.file_injection_dialog.selected = 2; // Abort
+                    self.file_injection_dialog.confirm();
+                    // Restore input to prompt when aborting
+                    if let Some(input) = &self.file_injection_dialog.pending_input {
+                        self.set_prompt_text(input.clone());
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.file_injection_dialog.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.file_injection_dialog.select_next(),
+                KeyCode::Enter => {
+                    self.file_injection_dialog.confirm();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Onboarding dialog: shown on first launch, dismissed with Enter/→/Esc.
         if self.onboarding_dialog.visible {
             match key.code {
@@ -2927,6 +3013,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.ask_user_dialog.push_char(c);
                 }
                 KeyCode::Backspace => {
@@ -2971,6 +3058,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3015,6 +3103,7 @@ impl App {
                     self.free_mode_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3053,6 +3142,7 @@ impl App {
                     self.custom_provider_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3647,6 +3737,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char(c) => {
+                    let c = normalize_char_with_shift(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
                 }
@@ -3959,18 +4050,7 @@ impl App {
             // ---- Text entry (allowed while streaming so users can queue
             // the next message; submission queues via Enter at the CLI layer).
             KeyCode::Char(c) => {
-                // Crossterm normally delivers the already-shifted character
-                // (e.g. SHIFT+1 → '!'). On terminals that emit the unshifted
-                // key with SHIFT modifier set, we still need to uppercase
-                // ASCII letters so SHIFT+a → 'A'. Don't try to map other
-                // unshifted chars — the layout is locale dependent.
-                let c = if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && c.is_ascii_lowercase()
-                {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                };
+                let c = normalize_char_with_shift(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
@@ -4250,6 +4330,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let ch = normalize_char_with_shift(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
                 _ => {}
@@ -4388,6 +4469,7 @@ impl App {
                 self.history_search_overlay.toggle_pin();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = normalize_char_with_shift(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -4459,6 +4541,7 @@ impl App {
                 self.refresh_global_search();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = normalize_char_with_shift(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
             }
@@ -5581,7 +5664,7 @@ impl App {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
                     self.clear_selection();
-                } else if self.auto_copy_selection {
+                } else if self.settings_screen.auto_copy_enabled {
                     // Auto-copy finalized selection to clipboard.
                     let sel_text = self.selection_text.borrow().clone();
                     if !sel_text.is_empty() {
@@ -6077,6 +6160,50 @@ impl App {
     }
 }
 
+// Helper function to open a file in the user's external editor
+fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Try to open with the system's default application
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // Fallback for other systems: try common editors in order
+        for editor in &["nano", "vi", "vim", "emacs"] {
+            match std::process::Command::new(editor)
+                .arg(path)
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+        Err("No suitable editor found".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6095,6 +6222,80 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    // ---- normalize_char_with_shift tests ----
+
+    #[test]
+    fn test_normalize_char_no_shift_returns_unchanged() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::NONE), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::NONE), '1');
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::NONE), '!');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_uppercase_letters() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::SHIFT), 'A');
+        assert_eq!(normalize_char_with_shift('z', KeyModifiers::SHIFT), 'Z');
+        assert_eq!(normalize_char_with_shift('m', KeyModifiers::SHIFT), 'M');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_numbers() {
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('2', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('3', KeyModifiers::SHIFT), '#');
+        assert_eq!(normalize_char_with_shift('4', KeyModifiers::SHIFT), '$');
+        assert_eq!(normalize_char_with_shift('5', KeyModifiers::SHIFT), '%');
+        assert_eq!(normalize_char_with_shift('6', KeyModifiers::SHIFT), '^');
+        assert_eq!(normalize_char_with_shift('7', KeyModifiers::SHIFT), '&');
+        assert_eq!(normalize_char_with_shift('8', KeyModifiers::SHIFT), '*');
+        assert_eq!(normalize_char_with_shift('9', KeyModifiers::SHIFT), '(');
+        assert_eq!(normalize_char_with_shift('0', KeyModifiers::SHIFT), ')');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_symbols() {
+        assert_eq!(normalize_char_with_shift('-', KeyModifiers::SHIFT), '_');
+        assert_eq!(normalize_char_with_shift('=', KeyModifiers::SHIFT), '+');
+        assert_eq!(normalize_char_with_shift('[', KeyModifiers::SHIFT), '{');
+        assert_eq!(normalize_char_with_shift(']', KeyModifiers::SHIFT), '}');
+        assert_eq!(normalize_char_with_shift(';', KeyModifiers::SHIFT), ':');
+        assert_eq!(normalize_char_with_shift('\'', KeyModifiers::SHIFT), '"');
+        assert_eq!(normalize_char_with_shift(',', KeyModifiers::SHIFT), '<');
+        assert_eq!(normalize_char_with_shift('.', KeyModifiers::SHIFT), '>');
+        assert_eq!(normalize_char_with_shift('/', KeyModifiers::SHIFT), '?');
+        assert_eq!(normalize_char_with_shift('\\', KeyModifiers::SHIFT), '|');
+        assert_eq!(normalize_char_with_shift('`', KeyModifiers::SHIFT), '~');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_already_shifted_chars_unchanged() {
+        // Characters that don't have shift equivalents remain unchanged
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('@', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('A', KeyModifiers::SHIFT), 'A');
+    }
+
+    #[test]
+    fn test_normalize_char_other_modifiers_ignored() {
+        // CTRL or ALT without SHIFT should not shift the character
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::ALT), '1');
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL | KeyModifiers::ALT), 'a');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_with_other_modifiers() {
+        // SHIFT + CTRL should still apply shift transformation
+        assert_eq!(
+            normalize_char_with_shift('a', KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+            'A'
+        );
+        assert_eq!(
+            normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
+            '!'
+        );
     }
 
     #[test]
