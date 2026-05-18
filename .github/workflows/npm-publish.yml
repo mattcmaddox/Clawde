@@ -40,6 +40,11 @@ jobs:
           node-version: '24'
           package-manager-cache: false
 
+      - name: Set up npm
+        run: |
+          npm install -g npm@latest
+          npm --version
+
       - name: Resolve version
         id: version
         run: |
@@ -111,4 +116,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ''
           NPM_TOKEN: ''
-        run: npm publish --access public
+        run: npm publish --access public --provenance
