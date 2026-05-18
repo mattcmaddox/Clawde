@@ -1070,6 +1070,30 @@ impl NamedCommand for UltraplanCommand {
 }
 
 // ---------------------------------------------------------------------------
+// stats — persisted session analytics
+//
+// Reuses the existing `StatsCommand` struct (which already implements the
+// slash form for the *current* session). The `NamedCommand` form reads
+// JSONL transcripts on disk and produces aggregated views. Logic lives in
+// `crate::stats`.
+// ---------------------------------------------------------------------------
+
+impl NamedCommand for crate::StatsCommand {
+    fn name(&self) -> &str { "stats" }
+    fn description(&self) -> &str {
+        "Aggregate token / cost / tool stats across saved sessions"
+    }
+    fn usage(&self) -> &str {
+        "claurst stats [summary|sessions|tools|daily|session <id>] \
+         [--days N] [--top N] [--all-projects] [--json]"
+    }
+
+    fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
+        crate::stats::run(args, ctx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1089,6 +1113,7 @@ pub fn all_named_commands() -> Vec<Box<dyn NamedCommand>> {
         Box::new(RemoteSetupCommand),
         Box::new(StickersCommand),
         Box::new(UltraplanCommand),
+        Box::new(crate::StatsCommand),
     ]
 }
 

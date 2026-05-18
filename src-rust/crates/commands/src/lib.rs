@@ -8757,6 +8757,13 @@ pub async fn execute_command(
 pub mod named_commands;
 
 // ---------------------------------------------------------------------------
+// Stats analytics (persisted transcript aggregation) — backs `claurst stats`.
+// The current-session `/stats` slash command lives above; this module reads
+// JSONL transcripts on disk.
+// ---------------------------------------------------------------------------
+pub mod stats;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
