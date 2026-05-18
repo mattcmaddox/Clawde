@@ -207,12 +207,22 @@ fn title_case_mode(mode: &str) -> String {
 }
 
 fn render_attachment_chip(kind: &str, label: String) -> Line<'static> {
+    render_attachment_chip_colored(kind, label, CLAUDE_ORANGE, Color::Black)
+}
+
+fn render_file_chip(label: String) -> Line<'static> {
+    // Use a steel-blue badge with white text for file injections — distinct from
+    // the orange img/doc chips and readable on dark terminal backgrounds.
+    render_attachment_chip_colored("file", label, Color::Rgb(51, 102, 170), Color::White)
+}
+
+fn render_attachment_chip_colored(kind: &str, label: String, badge_bg: Color, badge_fg: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} ", kind),
             Style::default()
-                .fg(Color::Black)
-                .bg(CLAUDE_ORANGE)
+                .fg(badge_fg)
+                .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -285,6 +295,98 @@ pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>>
     )
 }
 
+/// Segments of a potentially file-injected text block.
+enum TextSegment {
+    Plain(String),
+    FileBlock(String), // path attribute value
+}
+
+/// Normalize `@token` references in user text when those files were already shown
+/// as chips. Replaces `@long/absolute/path/file.rs` with just `@file.rs` so the
+/// text stays readable ("Delete @file.rs" still makes sense) without showing the
+/// full path noise.
+fn normalize_at_tokens(
+    text: &str,
+    injected: &std::collections::HashSet<String>,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+        let trailing: &str = &word[trimmed.len()..];
+
+        if trimmed.starts_with('@') && trimmed.len() > 1 {
+            let mut path_part = trimmed[1..].to_string();
+            // Strip trailing punctuation (same logic as parse_at_refs)
+            while path_part.len() > 0 && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+                path_part.pop();
+            }
+            let punct_suffix = &trimmed[1 + path_part.len()..];
+
+            let basename = std::path::Path::new(&path_part)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_part.clone());
+
+            let matches = injected.iter().any(|p| {
+                p == &path_part
+                    || std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().as_ref() == path_part.as_str()).unwrap_or(false)
+                    || p.ends_with(&format!("/{}", path_part))
+            });
+
+            if matches && basename != path_part {
+                // Shorten to just the filename
+                result.push('@');
+                result.push_str(&basename);
+                result.push_str(punct_suffix);
+                result.push_str(trailing);
+                continue;
+            }
+        }
+        result.push_str(word);
+    }
+    result
+}
+
+/// Split text that may contain `<file path="...">...</file>` injection blocks
+/// into alternating Plain and FileBlock segments.
+fn extract_file_segments(text: &str) -> Vec<TextSegment> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    const OPEN: &str = "<file path=\"";
+    const CLOSE: &str = "</file>";
+
+    while let Some(start) = remaining.find(OPEN) {
+        if start > 0 {
+            result.push(TextSegment::Plain(remaining[..start].to_string()));
+        }
+        let after = &remaining[start + OPEN.len()..];
+        if let Some(path_end) = after.find('"') {
+            let path = after[..path_end].to_string();
+            let after_open_tag = &remaining[start..];
+            if let Some(close_pos) = after_open_tag.find(CLOSE) {
+                let consumed = start + close_pos + CLOSE.len();
+                // skip one trailing newline if present
+                let consumed = if remaining[consumed..].starts_with('\n') { consumed + 1 } else { consumed };
+                result.push(TextSegment::FileBlock(path));
+                remaining = &remaining[consumed..];
+            } else {
+                result.push(TextSegment::Plain(remaining[start..].to_string()));
+                remaining = "";
+                break;
+            }
+        } else {
+            result.push(TextSegment::Plain(remaining[start..].to_string()));
+            remaining = "";
+            break;
+        }
+    }
+
+    if !remaining.is_empty() {
+        result.push(TextSegment::Plain(remaining.to_string()));
+    }
+    result
+}
+
 pub fn render_transcript_user_message(
     msg: &Message,
     meta: Option<&TurnMetadata>,
@@ -308,6 +410,24 @@ pub fn render_transcript_user_message(
     let mut lines = Vec::new();
     let mut pending_text = String::new();
 
+    // Collect the absolute paths of every injected file so we can strip the
+    // corresponding @token references from the user's original text block.
+    let injected_paths: std::collections::HashSet<String> = msg.content_blocks()
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                if text.contains("<file path=\"") { Some(text) } else { None }
+            } else {
+                None
+            }
+        })
+        .flat_map(|text| {
+            extract_file_segments(text).into_iter().filter_map(|s| {
+                if let TextSegment::FileBlock(p) = s { Some(p) } else { None }
+            })
+        })
+        .collect();
+
     let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
         if buffer.is_empty() {
             return;
@@ -322,10 +442,44 @@ pub fn render_transcript_user_message(
     for block in msg.content_blocks() {
         match block {
             ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
+                if text.contains("<file path=\"") {
+                    flush_text(&mut pending_text, &mut lines);
+                    for segment in extract_file_segments(&text) {
+                        match segment {
+                            TextSegment::FileBlock(path) => {
+                                let label = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or(path);
+                                lines.push(render_file_chip(label));
+                            }
+                            TextSegment::Plain(t) => {
+                                if !t.trim().is_empty() {
+                                    if !pending_text.is_empty() {
+                                        pending_text.push('\n');
+                                    }
+                                    pending_text.push_str(&t);
+                                }
+                            }
+                        }
+                    }
+                } else if !injected_paths.is_empty() {
+                    // Shorten @long/path/file.rs → @file.rs since the chips already
+                    // show the full path context.
+                    let cleaned = normalize_at_tokens(&text, &injected_paths);
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        if !pending_text.is_empty() {
+                            pending_text.push('\n');
+                        }
+                        pending_text.push_str(trimmed);
+                    }
+                } else {
+                    if !pending_text.is_empty() {
+                        pending_text.push('\n');
+                    }
+                    pending_text.push_str(&text);
                 }
-                pending_text.push_str(&text);
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut pending_text, &mut lines);
