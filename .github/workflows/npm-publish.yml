@@ -7,6 +7,9 @@ on:
         description: 'Version to publish (e.g., v0.1.1). Must already exist as a GitHub Release.'
         required: true
         type: string
+  workflow_run:
+    workflows: ['Release']
+    types: [completed]
 
 permissions:
   contents: read
@@ -14,11 +17,22 @@ permissions:
 
 jobs:
   npm-publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
-    name: Publish claurst@${{ inputs.version }} to npm
+    name: Publish claurst to npm
 
     steps:
       - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
+
+      - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_run'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -27,10 +41,64 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
 
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="$(grep '^version' src-rust/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid npm publish version: $VERSION"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing claurst@$VERSION"
+
+      - name: Verify GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ steps.version.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null
+
+      - name: Verify trusted publisher identity
+        working-directory: npm
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const repo = process.env.GITHUB_REPOSITORY;
+          const [owner, repoName] = repo.split('/');
+          const workflowRef = process.env.GITHUB_WORKFLOW_REF || '';
+          const workflowFile = path.basename(workflowRef.split('@')[0]);
+          const repositoryUrl = typeof pkg.repository === 'string'
+            ? pkg.repository
+            : pkg.repository && pkg.repository.url;
+          const expectedRepositoryUrl = `git+https://github.com/${repo}.git`;
+
+          console.log('Expected npm Trusted Publisher configuration:');
+          console.log(`  Organization or user: ${owner}`);
+          console.log(`  Repository: ${repoName}`);
+          console.log(`  Workflow filename: ${workflowFile}`);
+          console.log('  Environment name: (empty)');
+
+          if (repositoryUrl !== expectedRepositoryUrl) {
+            console.error(`::error::npm/package.json repository.url must be ${expectedRepositoryUrl} for trusted publishing; found ${repositoryUrl || '(missing)'}`);
+            process.exit(1);
+          }
+          NODE
+
       - name: Set npm package version
         run: |
-          VERSION="${{ inputs.version }}"
-          VERSION="${VERSION#v}"
+          VERSION="${{ steps.version.outputs.version }}"
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('npm/package.json', 'utf8'));
@@ -41,4 +109,4 @@ jobs:
 
       - name: Publish to npm
         working-directory: npm
-        run: npm publish --access public --provenance
+        run: npm publish --access public
