@@ -135,6 +135,10 @@ pub mod import_config_dialog;
 pub mod session_branching;
 /// Model-initiated question dialog (AskUserQuestion tool).
 pub mod ask_user_dialog;
+/// File injection utilities for parsing @file references.
+pub mod file_injection;
+/// File injection warning dialog (shown when oversized files detected).
+pub mod file_injection_dialog;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
@@ -168,6 +172,8 @@ pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
 pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
 pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_dialog};
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
+pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
+pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)

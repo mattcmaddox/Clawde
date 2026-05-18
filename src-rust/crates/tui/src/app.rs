@@ -836,6 +836,9 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// Whether the bypass-permissions dialog has been shown this session.
     pub bypass_permissions_dialog_shown: bool,
+    /// File injection warning dialog.
+    /// Shown when oversized or binary files are detected in @refs.
+    pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
@@ -1282,6 +1285,7 @@ impl App {
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
+            file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
@@ -2814,6 +2818,33 @@ impl App {
                     } else {
                         self.should_quit = true;
                     }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // File injection dialog: shown when oversized files are detected in @refs.
+        if self.file_injection_dialog.visible {
+            match key.code {
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    self.file_injection_dialog.selected = 0; // InjectAll
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.file_injection_dialog.selected = 1; // SkipOversized
+                }
+                KeyCode::Esc => {
+                    self.file_injection_dialog.selected = 2; // Abort
+                    self.file_injection_dialog.confirm();
+                    // Restore input to prompt when aborting
+                    if let Some(input) = &self.file_injection_dialog.pending_input {
+                        self.set_prompt_text(input.clone());
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.file_injection_dialog.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.file_injection_dialog.select_next(),
+                KeyCode::Enter => {
+                    self.file_injection_dialog.confirm();
                 }
                 _ => {}
             }

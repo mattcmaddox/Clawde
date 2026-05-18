@@ -1907,6 +1907,20 @@ async fn run_interactive(
         app.tick_rustle_pose();
         app.notifications.tick();
 
+        // Process file injection dialog outcome (if any)
+        if let Some((outcome, pending_input, _pending_imgs)) = app.file_injection_dialog.take_outcome() {
+            use claurst_tui::FileInjectionOutcome;
+
+            if matches!(outcome, FileInjectionOutcome::Abort) {
+                // Abort: input already restored to prompt by app.rs handler
+                continue;
+            }
+
+            // InjectAll or SkipOversized: restore input to prompt for resubmission
+            // Images attached when dialog was shown are discarded; user can re-attach if needed
+            app.set_prompt_text(pending_input);
+        }
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -1991,6 +2005,7 @@ async fn run_interactive(
                         || app.model_picker.visible
                         || app.onboarding_dialog.visible
                         || app.bypass_permissions_dialog.visible
+                        || app.file_injection_dialog.visible
                         || app.ask_user_dialog.visible
                         || app.settings_screen.visible
                         || app.export_dialog.visible
@@ -2425,32 +2440,99 @@ async fn run_interactive(
                             .await;
                         }
 
-                        // Regular user message (with optional image attachments)
+                        // Regular user message (with optional image attachments + file injection)
                         let pending_imgs = app.prompt_input.clear_images();
-                        let user_msg = if pending_imgs.is_empty() {
-                            claurst_core::types::Message::user(input.clone())
-                        } else {
-                            let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
-                                .iter()
-                                .filter_map(|img| {
-                                    claurst_tui::image_paste::encode_image_base64(&img.path)
-                                        .map(|b64| claurst_core::types::ContentBlock::Image {
+
+                        // Check for file injection if enabled
+                        if config.file_injection_enabled {
+                            use claurst_tui::file_injection::parse_at_refs;
+
+                            let (within_limit, oversized) = parse_at_refs(&input, &tool_ctx.working_dir, config.file_injection_max_size);
+
+                            if !oversized.is_empty() {
+                                // Show dialog with oversized files
+                                let oversized_summaries: Vec<(String, usize, String)> = oversized
+                                    .iter()
+                                    .map(|f| {
+                                        let issue_str = match &f.issue {
+                                            Some(claurst_tui::AtFileIssue::TooLarge(kb)) => format!("TooLarge: {} KB", kb),
+                                            Some(claurst_tui::AtFileIssue::Binary) => "Binary".to_string(),
+                                            Some(claurst_tui::AtFileIssue::Unreadable(e)) => e.clone(),
+                                            None => "Unknown".to_string(),
+                                        };
+                                        (f.path.display().to_string(), f.size_kb, issue_str)
+                                    })
+                                    .collect();
+
+                                app.file_injection_dialog.show(input.clone(), pending_imgs, oversized_summaries);
+                                continue;
+                            }
+
+                            // No oversized files: inject within-limit files and send
+                            let file_prefix = claurst_tui::file_injection::build_file_blocks(&within_limit);
+
+                            let user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
+                                let mut blocks: Vec<claurst_core::types::ContentBlock> = Vec::new();
+
+                                // Add file blocks if there's any file content
+                                if !file_prefix.is_empty() {
+                                    blocks.push(claurst_core::types::ContentBlock::Text { text: file_prefix });
+                                }
+
+                                // Add image blocks
+                                for img in &pending_imgs {
+                                    if let Some(b64) = claurst_tui::image_paste::encode_image_base64(&img.path) {
+                                        blocks.push(claurst_core::types::ContentBlock::Image {
                                             source: claurst_core::types::ImageSource {
                                                 source_type: "base64".to_string(),
                                                 media_type: Some("image/png".to_string()),
                                                 data: Some(b64),
                                                 url: None,
                                             },
-                                        })
-                                })
-                                .collect();
-                            blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
-                            claurst_core::types::Message::user_blocks(blocks)
-                        };
-                        messages.push(user_msg.clone());
-                        app.push_message(user_msg);
-                        session.messages = messages.clone();
-                        session.updated_at = chrono::Utc::now();
+                                        });
+                                    }
+                                }
+
+                                // Add the original input text
+                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+
+                                claurst_core::types::Message::user_blocks(blocks)
+                            } else {
+                                claurst_core::types::Message::user(input.clone())
+                            };
+
+                            messages.push(user_msg.clone());
+                            app.push_message(user_msg);
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        } else {
+                            // File injection disabled: send as-is
+                            let user_msg = if pending_imgs.is_empty() {
+                                claurst_core::types::Message::user(input.clone())
+                            } else {
+                                let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
+                                    .iter()
+                                    .filter_map(|img| {
+                                        claurst_tui::image_paste::encode_image_base64(&img.path)
+                                            .map(|b64| claurst_core::types::ContentBlock::Image {
+                                                source: claurst_core::types::ImageSource {
+                                                    source_type: "base64".to_string(),
+                                                    media_type: Some("image/png".to_string()),
+                                                    data: Some(b64),
+                                                    url: None,
+                                                },
+                                            })
+                                    })
+                                    .collect();
+                                blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
+                                claurst_core::types::Message::user_blocks(blocks)
+                            };
+
+                            messages.push(user_msg.clone());
+                            app.push_message(user_msg);
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        }
 
                         // Update terminal title from session title or first message
                         if session.title.is_some() {

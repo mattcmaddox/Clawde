@@ -67,6 +67,10 @@ pub struct SettingsScreen {
     pub auto_commits: bool,
     pub output_format: String,
     pub disable_claude_mds: bool,
+    pub file_injection_enabled: bool,
+    pub file_autocomplete_limit: String,
+    pub file_autocomplete_show_hidden_files: bool,
+    pub file_injection_max_size: String,
 }
 
 impl SettingsScreen {
@@ -96,6 +100,10 @@ impl SettingsScreen {
             auto_commits: false,
             output_format: "text".to_string(),
             disable_claude_mds: false,
+            file_injection_enabled: true,
+            file_autocomplete_limit: "15".to_string(),
+            file_autocomplete_show_hidden_files: false,
+            file_injection_max_size: "100".to_string(),
         }
     }
 
@@ -129,6 +137,10 @@ impl SettingsScreen {
             claurst_core::config::OutputFormat::StreamJson => "stream_json".to_string(),
         };
         self.disable_claude_mds = self.settings_snapshot.config.disable_claude_mds;
+        self.file_injection_enabled = self.settings_snapshot.config.file_injection_enabled;
+        self.file_autocomplete_limit = self.settings_snapshot.config.file_autocomplete_limit.to_string();
+        self.file_autocomplete_show_hidden_files = self.settings_snapshot.config.file_autocomplete_show_hidden_files;
+        self.file_injection_max_size = self.settings_snapshot.config.file_injection_max_size.to_string();
     }
 
     pub fn close(&mut self) {
@@ -201,6 +213,18 @@ impl SettingsScreen {
                         self.compact_threshold = value.clone();
                     }
                 }
+                "fileAutocompleteLimit" => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        config.file_autocomplete_limit = n;
+                        self.file_autocomplete_limit = value.clone();
+                    }
+                }
+                "fileInjectionMaxSize" => {
+                    if let Ok(n) = value.parse::<usize>() {
+                        config.file_injection_max_size = n;
+                        self.file_injection_max_size = value.clone();
+                    }
+                }
                 _ => {}
             }
         }
@@ -221,7 +245,7 @@ impl Default for SettingsScreen {
 // ---------------------------------------------------------------------------
 
 fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
-    vec![
+    let mut entries = vec![
         SettingsEntry {
             key: "max_tokens",
             label: "Max Tokens",
@@ -340,7 +364,41 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             kind: SettingKind::Bool,
             value: if screen.disable_claude_mds { "true" } else { "false" }.to_string(),
         },
-    ]
+        SettingsEntry {
+            key: "fileInjectionEnabled",
+            label: "File injection (@)",
+            description: "Auto-inject @file references into message context.",
+            kind: SettingKind::Bool,
+            value: if screen.file_injection_enabled { "true" } else { "false" }.to_string(),
+        },
+    ];
+
+    // Only show these if file injection is enabled
+    if screen.file_injection_enabled {
+        entries.push(SettingsEntry {
+            key: "fileAutocompleteLimit",
+            label: "File autocomplete limit",
+            description: "Max suggestions shown in @ autocomplete (type more to narrow results).",
+            kind: SettingKind::Number,
+            value: screen.file_autocomplete_limit.clone(),
+        });
+        entries.push(SettingsEntry {
+            key: "fileAutocompleteShowHiddenFiles",
+            label: "Show hidden files",
+            description: "Include hidden files (.) in @ autocomplete.",
+            kind: SettingKind::Bool,
+            value: if screen.file_autocomplete_show_hidden_files { "true" } else { "false" }.to_string(),
+        });
+        entries.push(SettingsEntry {
+            key: "fileInjectionMaxSize",
+            label: "File injection max size",
+            description: "Max file size to auto-inject (KB, 0=no limit).",
+            kind: SettingKind::Number,
+            value: screen.file_injection_max_size.clone(),
+        });
+    }
+
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +742,16 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     "disable_claude_mds" => {
                         screen.disable_claude_mds = new_value;
                         screen.settings_snapshot.config.disable_claude_mds = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "fileInjectionEnabled" => {
+                        screen.file_injection_enabled = new_value;
+                        screen.settings_snapshot.config.file_injection_enabled = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "fileAutocompleteShowHiddenFiles" => {
+                        screen.file_autocomplete_show_hidden_files = new_value;
+                        screen.settings_snapshot.config.file_autocomplete_show_hidden_files = new_value;
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
