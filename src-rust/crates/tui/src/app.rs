@@ -2090,6 +2090,7 @@ impl App {
                 self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
                 self.turn_metadata.clear();
+                self.cost_usd = 0.0;
                 self.invalidate_transcript();
                 self.status_message = Some("Conversation cleared.".to_string());
                 true
