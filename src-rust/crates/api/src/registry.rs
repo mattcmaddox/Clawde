@@ -13,7 +13,8 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeProvider, GoogleProvider, MinimaxProvider, OpenAiProvider,
+    CopilotProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
+    OpenAiProvider,
 };
 
 fn normalize_openai_compat_base(override_base: &str) -> String {
@@ -84,25 +85,49 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 }
 
-/// Build a [`FreeProvider`] by reading both upstream keys from the auth store.
+/// Build a [`FreeProvider`] by walking [`FREE_CATALOG`] and pulling any keys
+/// the user has stored in the auth store. Each catalog entry whose upstream
+/// has a key becomes one link in the fallback chain.
 ///
-/// Returns `None` only if *both* keys are missing — a single key is enough to
-/// run (one upstream just stays unauthenticated and will hand off via the
-/// internal fallback).
+/// Returns `None` only if *no* catalog entry has a configured key — a single
+/// key is enough to run, and more is better.
 pub fn build_free_provider() -> Option<Arc<dyn LlmProvider>> {
     let auth_store = claurst_core::AuthStore::load();
-    let zen_key = auth_store
-        .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
-        .or_else(|| auth_store.api_key_for(claurst_core::ProviderId::OPENCODE_GO))
-        .unwrap_or_default();
-    let or_key = auth_store
-        .api_key_for(claurst_core::ProviderId::OPENROUTER)
-        .unwrap_or_default();
+    let mut chain: Vec<FreeEntry> = Vec::new();
 
-    if zen_key.is_empty() && or_key.is_empty() {
+    for upstream in FREE_CATALOG {
+        let key = match upstream.id {
+            // OpenCode Zen and Go share `OPENCODE_API_KEY`; accept either slot.
+            "opencode-zen" => auth_store
+                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
+                .or_else(|| auth_store.api_key_for(claurst_core::ProviderId::OPENCODE_GO)),
+            other => auth_store.api_key_for(other),
+        }
+        .filter(|k| !k.trim().is_empty());
+
+        let Some(key) = key else {
+            continue;
+        };
+
+        let provider: Option<Arc<dyn LlmProvider>> = match upstream.id {
+            "google" => Some(Arc::new(GoogleProvider::new(key))),
+            "cohere" => Some(Arc::new(CohereProvider::new(key))),
+            id => crate::providers::openai_compat_providers::provider_for_id(id)
+                .map(|p| Arc::new(p.with_api_key(key)) as Arc<dyn LlmProvider>),
+        };
+
+        if let Some(provider) = provider {
+            chain.push(FreeEntry {
+                upstream: *upstream,
+                provider,
+            });
+        }
+    }
+
+    if chain.is_empty() {
         return None;
     }
-    Some(Arc::new(FreeProvider::with_keys(zen_key, or_key)) as Arc<dyn LlmProvider>)
+    Some(Arc::new(FreeProvider::new(chain)) as Arc<dyn LlmProvider>)
 }
 
 pub fn provider_from_config(

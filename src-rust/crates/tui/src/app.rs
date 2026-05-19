@@ -3066,28 +3066,26 @@ impl App {
             return false;
         }
 
-        // "Free" composite-provider setup dialog (collects Zen + OpenRouter keys)
+        // "Free" composite-provider setup dialog (collects any subset of the
+        // free-tier upstream keys; min 1 to enable, more = better).
         if self.free_mode_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
                     self.free_mode_dialog.close();
                 }
-                KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
-                    self.free_mode_dialog.switch_field();
+                KeyCode::Tab | KeyCode::Down => {
+                    self.free_mode_dialog.move_next();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.free_mode_dialog.move_prev();
                 }
                 KeyCode::Enter => {
                     if self.free_mode_dialog.can_submit() {
-                        let (zen_key, or_key) = self.free_mode_dialog.take_values();
-                        if !zen_key.is_empty() {
+                        let values = self.free_mode_dialog.take_values();
+                        for (provider_id, key) in values {
                             self.auth_store.set(
-                                claurst_core::ProviderId::OPENCODE_ZEN,
-                                claurst_core::StoredCredential::ApiKey { key: zen_key },
-                            );
-                        }
-                        if !or_key.is_empty() {
-                            self.auth_store.set(
-                                claurst_core::ProviderId::OPENROUTER,
-                                claurst_core::StoredCredential::ApiKey { key: or_key },
+                                provider_id,
+                                claurst_core::StoredCredential::ApiKey { key },
                             );
                         }
                         self.activate_provider(
@@ -3096,7 +3094,7 @@ impl App {
                             "Connected to",
                         );
                     } else {
-                        self.free_mode_dialog.switch_field();
+                        self.free_mode_dialog.move_next();
                     }
                 }
                 KeyCode::Backspace => {
@@ -3171,20 +3169,28 @@ impl App {
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
-                            // "Free" composite mode — collects two keys (Zen + OpenRouter)
-                            // with a warning about context-management caveats.
+                            // "Free" composite mode — collects any subset of the
+                            // free-tier upstreams (min 1; more = better availability).
                             "free" => {
-                                let zen_existing = self
-                                    .auth_store
-                                    .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
-                                    .or_else(|| {
-                                        self.auth_store
-                                            .api_key_for(claurst_core::ProviderId::OPENCODE_GO)
-                                    });
-                                let or_existing = self
-                                    .auth_store
-                                    .api_key_for(claurst_core::ProviderId::OPENROUTER);
-                                self.free_mode_dialog.open(zen_existing, or_existing);
+                                let existing: Vec<(&'static str, String)> = claurst_api::FREE_CATALOG
+                                    .iter()
+                                    .filter_map(|upstream| {
+                                        let key = match upstream.id {
+                                            "opencode-zen" => self
+                                                .auth_store
+                                                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
+                                                .or_else(|| {
+                                                    self.auth_store.api_key_for(
+                                                        claurst_core::ProviderId::OPENCODE_GO,
+                                                    )
+                                                }),
+                                            other => self.auth_store.api_key_for(other),
+                                        };
+                                        key.filter(|k| !k.is_empty())
+                                            .map(|k| (upstream.id, k))
+                                    })
+                                    .collect();
+                                self.free_mode_dialog.open(&existing);
                             }
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com

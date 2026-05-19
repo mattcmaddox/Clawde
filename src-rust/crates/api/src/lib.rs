@@ -97,8 +97,9 @@ pub use providers::{
     ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
 };
 
-// Composite "Free" provider (Zen primary + OpenRouter free fallback).
-pub use providers::FreeProvider;
+// Composite "Free" provider — stacks many free-tier upstreams behind one
+// `free/auto` model id.
+pub use providers::{FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
 
 // Phase 2D re-exports — Cohere native provider.
 pub use providers::CohereProvider;

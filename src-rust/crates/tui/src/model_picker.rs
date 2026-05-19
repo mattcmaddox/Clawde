@@ -366,45 +366,26 @@ fn codex_provider_models() -> Vec<ModelEntry> {
 }
 
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
+/// Always shows `free/auto` first; one pin entry per catalog upstream so the
+/// user can target a specific provider when they need to.
 fn free_provider_models() -> Vec<ModelEntry> {
-    vec![
-        ModelEntry {
-            id: "free/auto".to_string(),
-            display_name: "Auto (Zen \u{2192} OpenRouter)".to_string(),
-            description: "200K ctx | $0.00/$0.00 per M".to_string(),
+    let mut entries = vec![ModelEntry {
+        id: "free/auto".to_string(),
+        display_name: "Auto (round-robin across configured providers)".to_string(),
+        description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
+        is_current: false,
+    }];
+
+    for upstream in claurst_api::FREE_CATALOG {
+        entries.push(ModelEntry {
+            id: format!("{}/{}", upstream.id, upstream.default_model),
+            display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
+            description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
-        },
-        ModelEntry {
-            id: "zen/minimax-m2.5-free".to_string(),
-            display_name: "MiniMax M2.5 (Free, via Zen)".to_string(),
-            description: "200K ctx | $0.00 per M".to_string(),
-            is_current: false,
-        },
-        ModelEntry {
-            id: "zen/big-pickle".to_string(),
-            display_name: "Big Pickle (Free, via Zen)".to_string(),
-            description: "128K ctx | $0.00 per M".to_string(),
-            is_current: false,
-        },
-        ModelEntry {
-            id: "zen/ring-2.6-1t-free".to_string(),
-            display_name: "Ring 2.6 1T (Free, via Zen)".to_string(),
-            description: "128K ctx | $0.00 per M".to_string(),
-            is_current: false,
-        },
-        ModelEntry {
-            id: "zen/nemotron-3-super-free".to_string(),
-            display_name: "Nemotron 3 Super (Free, via Zen)".to_string(),
-            description: "128K ctx | $0.00 per M".to_string(),
-            is_current: false,
-        },
-        ModelEntry {
-            id: "openrouter/free".to_string(),
-            display_name: "OpenRouter Free Router".to_string(),
-            description: "200K ctx | random free model · $0.00 per M".to_string(),
-            is_current: false,
-        },
-    ]
+        });
+    }
+
+    entries
 }
 
 /// State for the /model picker overlay.

@@ -25,7 +25,7 @@ pub use openai_compat_providers::{
 };
 
 pub mod free;
-pub use free::FreeProvider;
+pub use free::{catalog_entry, FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
 
 pub mod cohere;
 pub use cohere::CohereProvider;
