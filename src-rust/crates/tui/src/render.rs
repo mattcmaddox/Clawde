@@ -1028,23 +1028,30 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     list.render(msg_area, frame.buffer_mut());
 
-    // Scrollbar: show only when content overflows the viewport.
+    // Scrollbar: thin vertical strip flush with the right edge — no arrow
+    // caps, no visible track, muted thumb color. Mirrors Windows Terminal /
+    // most modern terminal scrollbars rather than ratatui's chunky default.
     if content_height > visible_height {
         use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-        // Issue #149 follow-up: passing `viewport_content_length(1)` made
-        // ratatui place a 1-row thumb on a track sized to `max_scroll`, which
-        // produced asymmetric gaps between the thumb and the up/down arrows
-        // at the extremes. Using the actual `content_height` and
-        // `visible_height` lets ratatui compute a proportional thumb that
-        // sits flush with the arrows at both ends.
-        let mut scrollbar_state = ScrollbarState::new(content_height as usize)
-            .position((scroll as usize).min(content_height as usize))
+        // ratatui 0.29's Scrollbar maps `position` over `content_length - 1`,
+        // not over a 0..=max_scroll range. Passing `content_height` directly
+        // makes the thumb top out at `content / (content + viewport)` of the
+        // track when fully scrolled — i.e. it never reaches the bottom.
+        // Fix: tell ratatui the content length is the number of distinct
+        // scroll positions (`max_scroll + 1`), keeping `viewport_content_length`
+        // for the proportional thumb size.
+        let content_len = max_scroll + 1;
+        let mut scrollbar_state = ScrollbarState::new(content_len)
+            .position(scroll.min(max_scroll))
             .viewport_content_length(visible_height as usize);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_style(Style::default().fg(app.accent_color))
-            .track_style(Style::default().fg(Color::Rgb(40, 40, 50)));
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("\u{2590}") // ▐ right half block — thin vertical strip
+            .thumb_style(Style::default().fg(Color::Rgb(110, 110, 130)));
 
         frame.render_stateful_widget(scrollbar, msg_area, &mut scrollbar_state);
     }
