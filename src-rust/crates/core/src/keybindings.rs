@@ -170,13 +170,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+h", "openHelp", KeyContext::Global),
 
         // ========== CHAT / INPUT CONTEXT ==========
+        // Message submission
         ("enter", "submit", KeyContext::Chat),
-        ("up", "historyPrev", KeyContext::Chat),
-        ("down", "historyNext", KeyContext::Chat),
-        ("shift+tab", "reverseIndent", KeyContext::Chat),
-        ("pageup", "scrollUp", KeyContext::Chat),
-        ("pagedown", "scrollDown", KeyContext::Chat),
-        ("tab", "indent", KeyContext::Chat),
+        ("ctrl+m", "sendMessage", KeyContext::Chat),
+
+        // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
         // Fallback for terminals that do not support the kitty keyboard protocol
         // (e.g. Terminal.app, older iTerm2, Windows Terminal, or SSH sessions).
@@ -188,41 +186,62 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // fallback is not needed there. Keep it as a compatibility belt-and-braces
         // for terminals that do not support the protocol.
         ("ctrl+j", "newline", KeyContext::Chat),
+
+        // Line start/end navigation
         ("home", "goLineStart", KeyContext::Chat),
-        ("end", "goLineEnd", KeyContext::Chat),
         ("cmd+left", "goLineStart", KeyContext::Chat),
+        ("end", "goLineEnd", KeyContext::Chat),
         ("cmd+right", "goLineEnd", KeyContext::Chat),
+        ("ctrl+e", "goLineEnd", KeyContext::Chat),
+
+        // Word navigation
         ("ctrl+left", "moveWordBackward", KeyContext::Chat),
         ("ctrl+right", "moveWordForward", KeyContext::Chat),
 
-        // Text Editing (Emacs-style) + app shortcuts
-        ("ctrl+a", "openModelPicker", KeyContext::Chat),
-        ("ctrl+e", "goLineEnd", KeyContext::Chat),
-        ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
-        ("ctrl+k", "openCommandPalette", KeyContext::Chat),
-        ("ctrl+u", "killToStart", KeyContext::Chat),
+        // Word deletion
         ("ctrl+w", "killWord", KeyContext::Chat),
-        ("alt+d", "deleteWord", KeyContext::Chat),
         ("alt+backspace", "killWord", KeyContext::Chat),
+        ("alt+d", "deleteWord", KeyContext::Chat),
 
-        // New Text Editing & Navigation
-        ("ctrl+m", "sendMessage", KeyContext::Chat),
+        // Character/line deletion
+        ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
+        ("ctrl+u", "killToStart", KeyContext::Chat),
         ("ctrl+l", "clearLine", KeyContext::Chat),
-        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
-        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
+
+        // History navigation
+        ("up", "historyPrev", KeyContext::Chat),
+        ("ctrl+o", "historyPrev", KeyContext::Chat),
+        ("down", "historyNext", KeyContext::Chat),
+        ("ctrl+i", "historyNext", KeyContext::Chat),
+
+        // Message navigation
         ("alt+left", "previousMessage", KeyContext::Chat),
         ("alt+right", "nextMessage", KeyContext::Chat),
-        ("ctrl+o", "historyPrev", KeyContext::Chat),
-        ("ctrl+i", "historyNext", KeyContext::Chat),
+
+        // Error/issue navigation
+        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
+        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
 
         // Searching
         ("ctrl+f", "findInMessage", KeyContext::Chat),
         ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
-        ("ctrl+g", "goToLine", KeyContext::Chat),
         ("f3", "findNext", KeyContext::Chat),
         ("ctrl+]", "findNext", KeyContext::Chat),
         ("shift+f3", "findPrev", KeyContext::Chat),
         ("ctrl+[", "findPrev", KeyContext::Chat),
+        ("ctrl+g", "goToLine", KeyContext::Chat),
+
+        // Indentation
+        ("tab", "indent", KeyContext::Chat),
+        ("shift+tab", "reverseIndent", KeyContext::Chat),
+
+        // Scrolling
+        ("pageup", "scrollUp", KeyContext::Chat),
+        ("pagedown", "scrollDown", KeyContext::Chat),
+
+        // App shortcuts
+        ("ctrl+a", "openModelPicker", KeyContext::Chat),
+        ("ctrl+k", "openCommandPalette", KeyContext::Chat),
 
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
@@ -241,10 +260,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "pageDown", KeyContext::Help),
 
         // ========== HISTORY SEARCH ==========
-        ("enter", "select", KeyContext::HistorySearch),
-        ("escape", "cancel", KeyContext::HistorySearch),
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
+        ("enter", "select", KeyContext::HistorySearch),
+        ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
 
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
@@ -260,20 +279,20 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
+        ("k", "prevMessage", KeyContext::MessageSelector),
+        ("j", "nextMessage", KeyContext::MessageSelector),
         ("enter", "select", KeyContext::MessageSelector),
         ("escape", "cancel", KeyContext::MessageSelector),
-        ("j", "nextMessage", KeyContext::MessageSelector),
-        ("k", "prevMessage", KeyContext::MessageSelector),
 
         // ========== THEME & MODEL PICKERS ==========
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
+        ("k", "prev", KeyContext::ThemePicker),
+        ("j", "next", KeyContext::ThemePicker),
         ("pageup", "pageUp", KeyContext::ThemePicker),
         ("pagedown", "pageDown", KeyContext::ThemePicker),
         ("enter", "select", KeyContext::ThemePicker),
         ("escape", "cancel", KeyContext::ThemePicker),
-        ("j", "next", KeyContext::ThemePicker),
-        ("k", "prev", KeyContext::ThemePicker),
 
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
@@ -285,22 +304,22 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
+        ("a", "acceptDiff", KeyContext::DiffDialog),
+        ("enter", "acceptDiff", KeyContext::DiffDialog),
+        ("r", "rejectDiff", KeyContext::DiffDialog),
+        ("escape", "rejectDiff", KeyContext::DiffDialog),
         ("pageup", "pageUp", KeyContext::DiffDialog),
         ("pagedown", "pageDown", KeyContext::DiffDialog),
-        ("enter", "acceptDiff", KeyContext::DiffDialog),
-        ("escape", "rejectDiff", KeyContext::DiffDialog),
-        ("r", "rejectDiff", KeyContext::DiffDialog),
-        ("a", "acceptDiff", KeyContext::DiffDialog),
 
         // ========== MODAL SELECT (Generic) ==========
         ("up", "prev", KeyContext::Select),
         ("down", "next", KeyContext::Select),
+        ("k", "prev", KeyContext::Select),
+        ("j", "next", KeyContext::Select),
         ("pageup", "pageUp", KeyContext::Select),
         ("pagedown", "pageDown", KeyContext::Select),
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
-        ("j", "next", KeyContext::Select),
-        ("k", "prev", KeyContext::Select),
         ("/", "search", KeyContext::Select),
 
         // ========== PLUGIN & ATTACHMENTS ==========
