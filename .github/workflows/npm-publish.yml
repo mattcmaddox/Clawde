@@ -15,6 +15,18 @@ permissions:
   contents: read
   id-token: write
 
+# Belt-and-suspenders: release.yml dispatches us explicitly because
+# `workflow_run` is unreliable when the upstream `Release` run was itself
+# triggered by a GITHUB_TOKEN workflow_dispatch. If both paths happen to
+# fire for the same release, this static concurrency group serializes them
+# — the first one publishes, the second waits and then no-ops (or errors
+# benignly at `npm publish` because the version is already on the registry).
+# Releases are version-monotonic so blanket serialisation is safe; there
+# isn't a scenario where two concurrent publishes should both succeed.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
 jobs:
   npm-publish:
     if: >-

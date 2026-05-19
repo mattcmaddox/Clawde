@@ -15,6 +15,10 @@ concurrency:
 
 permissions:
   contents: write
+  # `actions: write` is needed for the final step that dispatches
+  # npm-publish.yml via `gh workflow run`. Without it, `gh workflow run`
+  # gets a 403 from the GitHub API.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -364,3 +368,24 @@ jobs:
           prerelease: false
           body_path: release-notes.md
           files: release/*
+
+      # Explicit hand-off to npm-publish.yml.
+      #
+      # We can't rely solely on the `workflow_run` trigger in npm-publish.yml
+      # because this Release workflow is itself triggered by a workflow
+      # dispatch from auto-release.yml's GITHUB_TOKEN, and GitHub's
+      # automatic-token rules don't list `workflow_run` as an exception to
+      # the "events from GITHUB_TOKEN don't create new workflow runs" rule.
+      # In practice that means the workflow_run chain silently no-ops on
+      # auto-cut releases. Dispatching directly here makes the publish step
+      # deterministic — the workflow_run trigger stays as a manual-release
+      # fallback.
+      - name: Dispatch npm-publish.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run npm-publish.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f version="${{ inputs.version }}"
+          echo "Dispatched npm-publish.yml for ${{ inputs.version }}."
