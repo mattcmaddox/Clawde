@@ -3,6 +3,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tracing::warn;
 
 /// All keybinding contexts
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -324,9 +325,31 @@ pub struct UserBinding {
 
 impl UserKeybindings {
     pub fn from_json_str(content: &str) -> Self {
-        serde_json::from_str(content)
+        let mut kb = serde_json::from_str(content)
             .or_else(|_| Self::from_block_config(content))
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Warn about and filter out non-rebindable keys
+        let original_len = kb.bindings.len();
+        kb.bindings.retain(|binding| {
+            let normalized = binding.chord.to_lowercase();
+            if NON_REBINDABLE.iter().any(|protected| normalized == *protected) {
+                warn!("Cannot rebind protected key '{}' in keybindings.json", binding.chord);
+                return false;
+            }
+            true
+        });
+
+        if kb.bindings.len() < original_len {
+            let filtered_count = original_len - kb.bindings.len();
+            warn!(
+                "Filtered out {} protected keybinding(s). Protected keys: {}",
+                filtered_count,
+                NON_REBINDABLE.join(", ")
+            );
+        }
+
+        kb
     }
 
     pub fn load(config_dir: &Path) -> Self {
