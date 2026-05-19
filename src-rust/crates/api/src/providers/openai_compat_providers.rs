@@ -21,7 +21,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "xai" => Some(xai()),
         "deepinfra" => Some(deepinfra()),
         "cerebras" => Some(cerebras()),
-        "togetherai" | "together-ai" => Some(together_ai()),
+        "together-ai" => Some(together_ai()),
         "perplexity" => Some(perplexity()),
         "venice" => Some(venice()),
         "qwen" => Some(qwen()),
@@ -40,12 +40,13 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "scaleway" => Some(scaleway()),
         "vultr" | "vultr-ai" => Some(vultr_ai()),
         "baseten" => Some(baseten()),
+        "crof" => Some(crof()),
         "friendli" => Some(friendli()),
         "upstage" => Some(upstage()),
         "stepfun" => Some(stepfun()),
         "fireworks" => Some(fireworks()),
-        "opencode-go" | "opencode_go" => Some(opencode_go()),
-        "opencode-zen" | "opencode_zen" => Some(opencode_zen()),
+        "opencode-go" => Some(opencode_go()),
+        "opencode-zen" => Some(opencode_zen()),
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
@@ -509,6 +510,22 @@ pub fn opencode_zen() -> OpenAiCompatProvider {
         ProviderId::OPENCODE_ZEN,
         "OpenCode Zen",
         "https://opencode.ai/zen/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// Crof.ai — OpenAI-compatible endpoint for model routing.
+/// Reads `CROF_API_KEY` for authentication.
+pub fn crof() -> OpenAiCompatProvider {
+    let key = std::env::var("CROF_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::CROF,
+        "Crof.ai",
+        "https://api.crof.ai/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {

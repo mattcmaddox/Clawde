@@ -42,6 +42,7 @@ impl ProviderId {
     pub const DEEPINFRA: &'static str = "deepinfra";
     pub const CEREBRAS: &'static str = "cerebras";
     pub const COHERE: &'static str = "cohere";
+    pub const CROF: &'static str = "crof";
     pub const TOGETHER_AI: &'static str = "together-ai";
     pub const PERPLEXITY: &'static str = "perplexity";
     pub const OPENROUTER: &'static str = "openrouter";
