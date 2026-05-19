@@ -806,6 +806,8 @@ pub struct App {
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
     pub notifications: NotificationQueue,
+    /// Scroll offset for error modal text (in lines).
+    pub error_modal_scroll_offset: usize,
     /// Plugin hint banners.
     pub plugin_hints: Vec<PluginHintBanner>,
     /// Optional session title shown in the status bar.
@@ -1020,6 +1022,8 @@ pub struct App {
     pub last_selectable_area: Cell<ratatui::layout::Rect>,
     /// The prompt input area from the last render frame (used for focus routing).
     pub last_input_area: Cell<ratatui::layout::Rect>,
+    /// The footer's right column area (where tips are shown) from the last render.
+    pub footer_right_column_area: Cell<ratatui::layout::Rect>,
     /// Which area of the TUI currently has keyboard focus.
     pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
@@ -1306,6 +1310,7 @@ impl App {
             rewind_flow: RewindFlowOverlay::new(),
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
+            error_modal_scroll_offset: 0,
             plugin_hints: Vec::new(),
             session_title: None,
             remote_session_url: None,
@@ -1446,6 +1451,7 @@ impl App {
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
+            footer_right_column_area: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
@@ -1664,6 +1670,8 @@ impl App {
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+        self.dismiss_error_notifications();
+
         let cache_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("claurst")
@@ -1998,6 +2006,7 @@ impl App {
 
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
+        self.dismiss_error_notifications();
         match cmd {
             "config" | "settings" => {
                 self.settings_screen.open();
@@ -2286,6 +2295,58 @@ impl App {
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
+    }
+
+    pub fn any_modal_open(&self) -> bool {
+        self.permission_request.is_some()
+            || self.rewind_flow.visible
+            || self.tasks_overlay.visible
+            || self.help_overlay.visible
+            || self.show_help
+            || self.history_search_overlay.visible
+            || self.history_search.is_some()
+            || self.settings_screen.visible
+            || self.theme_screen.visible
+            || self.stats_dialog.visible
+            || self.mcp_view.visible
+            || self.agents_menu.visible
+            || self.diff_viewer.visible
+            || self.global_search.visible
+            || self.feedback_survey.visible
+            || self.memory_file_selector.visible
+            || self.hooks_config_menu.visible
+            || self.overage_upsell.visible
+            || self.voice_mode_notice.visible
+            || self.memory_update_notification.visible
+            || self.desktop_upsell.visible
+            || self.import_config_dialog.visible
+            || self.invalid_config_dialog.visible
+            || self.bypass_permissions_dialog.visible
+            || self.ask_user_dialog.visible
+            || self.onboarding_dialog.visible
+            || self.import_config_picker.visible
+            || self.connect_dialog.visible
+            || self.key_input_dialog.visible
+            || self.custom_provider_dialog.visible
+            || self.free_mode_dialog.visible
+            || self.device_auth_dialog.visible
+            || self.command_palette.visible
+            || self.elicitation.visible
+            || self.model_picker.visible
+            || self.session_browser.visible
+            || self.session_branching.visible
+            || self.export_dialog.visible
+            || self.context_viz.visible
+            || self.mcp_approval.visible
+            || self.file_injection_dialog.visible
+            || self.context_menu_state.is_some()
+    }
+
+    fn dismiss_error_notifications(&mut self) {
+        while self.notifications.current_is_error() {
+            self.notifications.dismiss_current();
+        }
+        self.error_modal_scroll_offset = 0;
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -2843,7 +2904,14 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
-        if self.global_search.open {
+        // Dismiss error modal with Esc
+        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
+            self.dismiss_error_notifications();
+            return false;
+        }
+
+
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -3582,21 +3650,21 @@ impl App {
             return false;
         }
 
-        if self.diff_viewer.open {
+        if self.diff_viewer.visible {
             self.handle_diff_viewer_key(key);
             return false;
         }
 
-        if self.agents_menu.open {
+        if self.agents_menu.visible {
             self.handle_agents_menu_key(key);
             return false;
         }
 
-        if self.mcp_view.open {
+        if self.mcp_view.visible {
             return self.handle_mcp_view_key(key);
         }
 
-        if self.stats_dialog.open {
+        if self.stats_dialog.visible {
             self.handle_stats_dialog_key(key);
             return false;
         }
@@ -3637,7 +3705,7 @@ impl App {
             return self.handle_history_search_overlay_key(key);
         }
 
-        if self.global_search.open {
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -4199,6 +4267,8 @@ impl App {
                     self.refresh_prompt_input();
                     return false;
                 }
+                // Auto-dismiss all error notifications when user sends a message
+                self.dismiss_error_notifications();
                 // New user input: snap back to bottom.
                 self.auto_scroll = true;
                 self.new_messages_while_scrolled = 0;
@@ -4289,9 +4359,9 @@ impl App {
     }
 
     fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.open {
+        if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
+        } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
         } else if self.import_config_dialog.visible {
             KeyContext::Confirmation
@@ -5541,7 +5611,7 @@ impl App {
             || self.model_picker.visible
             || self.export_dialog.visible
             || self.settings_screen.visible
-            || self.stats_dialog.open
+            || self.stats_dialog.visible
             || self.context_viz.visible
             || self.session_browser.visible;
 
@@ -5824,6 +5894,14 @@ impl App {
 
     /// Process a query event from the agentic loop.
     pub fn handle_query_event(&mut self, event: QueryEvent) {
+        // Auto-dismiss error modal when assistant responds
+        match &event {
+            QueryEvent::Stream(_) | QueryEvent::TurnComplete { .. } => {
+                self.dismiss_error_notifications();
+            }
+            _ => {}
+        }
+
         match event {
             QueryEvent::Stream(stream_evt) => {
                 if !self.is_streaming {
@@ -5971,7 +6049,7 @@ impl App {
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
-                self.status_message = Some(err_msg);
+                self.notifications.push(NotificationKind::Error, err_msg, None);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
                 // Push a notification for context window warnings (notification + threshold tracking).
@@ -6210,6 +6288,8 @@ impl App {
                             return Ok(None);
                         }
                         if should_submit {
+                            // Dismiss any active error modal when the user sends a message
+                            self.dismiss_error_notifications();
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
@@ -6445,7 +6525,7 @@ mod tests {
     fn test_mcp_subcommand_is_not_intercepted() {
         let mut app = make_app();
         assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
     }
 
     #[test]

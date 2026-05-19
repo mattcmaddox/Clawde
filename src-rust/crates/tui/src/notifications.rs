@@ -89,6 +89,10 @@ impl NotificationQueue {
         }
     }
 
+    pub fn current_is_error(&self) -> bool {
+        self.current().map_or(false, |n| n.kind == NotificationKind::Error)
+    }
+
     /// Return `true` if there are no active notifications.
     pub fn is_empty(&self) -> bool {
         self.notifications.is_empty()
@@ -314,6 +318,7 @@ mod tests {
             id: "x".to_string(),
             kind: NotificationKind::Info,
             message: "gone".to_string(),
+            pushed_at: Instant::now(),
             expires_at: Some(Instant::now() - std::time::Duration::from_secs(1)),
             dismissible: true,
         });

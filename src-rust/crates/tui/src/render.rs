@@ -39,7 +39,7 @@ use crate::messages::{
     render_thinking_live_content,
     RenderContext,
 };
-use crate::notifications::render_notification_banner;
+use crate::notifications::{render_notification_banner, Notification, NotificationKind};
 use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay, render_rewind_flow,
     CLAURST_ACCENT,
@@ -89,47 +89,92 @@ fn spinner_color(app: &App) -> Color {
 }
 
 fn is_modal_open(app: &App) -> bool {
-    app.permission_request.is_some()
-        || app.rewind_flow.visible
-        || app.tasks_overlay.visible
-        || app.help_overlay.visible
-        || app.show_help
-        || app.history_search_overlay.visible
-        || app.history_search.is_some()
-        || app.settings_screen.visible
-        || app.theme_screen.visible
-        || app.stats_dialog.open
-        || app.mcp_view.open
-        || app.agents_menu.open
-        || app.diff_viewer.open
-        || app.global_search.open
-        || app.feedback_survey.visible
-        || app.memory_file_selector.visible
-        || app.hooks_config_menu.visible
-        || app.overage_upsell.visible
-        || app.voice_mode_notice.visible
-        || app.memory_update_notification.visible
-        || app.desktop_upsell.visible
-        || app.import_config_dialog.visible
-        || app.invalid_config_dialog.visible
-        || app.bypass_permissions_dialog.visible
-        || app.ask_user_dialog.visible
-        || app.onboarding_dialog.visible
-        || app.import_config_picker.visible
-        || app.import_config_dialog.visible
-        || app.connect_dialog.visible
-        || app.key_input_dialog.visible
-        || app.custom_provider_dialog.visible
-        || app.free_mode_dialog.visible
-        || app.device_auth_dialog.visible
-        || app.command_palette.visible
-        || app.elicitation.visible
-        || app.model_picker.visible
-        || app.session_browser.visible
-        || app.session_branching.visible
-        || app.export_dialog.visible
-        || app.context_viz.visible
-        || app.mcp_approval.visible
+    app.any_modal_open()
+}
+
+// -----------------------------------------------------------------------
+// Error modal rendering
+// -----------------------------------------------------------------------
+
+/// Render an error modal dialog with wrapped content.
+fn render_error_modal(frame: &mut Frame, area: Rect, notification: &Notification, _scroll_offset: usize, footer_area: Rect, is_welcome_screen: bool) {
+    // When the footer anchor is inside the welcome box (y < WELCOME_BOX_HEIGHT), or explicitly on
+    // the welcome screen, center the modal so it doesn't awkwardly overlap the welcome box.
+    let anchored_in_welcome_box = footer_area.width > 0 && footer_area.y < WELCOME_BOX_HEIGHT;
+    let modal_area = if is_welcome_screen || anchored_in_welcome_box {
+        let modal_width = (area.width * 2 / 3).max(40).min(area.width);
+        let modal_height = (area.height / 3).max(8).min(area.height.saturating_sub(2));
+        Rect {
+            x: area.x + (area.width.saturating_sub(modal_width)) / 2,
+            y: area.y + (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        }
+    } else if footer_area.width > 0 {
+        let desired_height = (area.height / 3).max(8)
+            .min(area.height.saturating_sub(footer_area.y));
+        Rect {
+            x: footer_area.x,
+            y: footer_area.y,
+            width: footer_area.width,
+            height: desired_height,
+        }
+    } else {
+        let modal_width = area.width / 2;
+        let modal_height = area.height.saturating_sub(4);
+        Rect {
+            x: area.x + modal_width,
+            y: area.y,
+            width: modal_width,
+            height: modal_height,
+        }
+    };
+
+    frame.render_widget(Clear, modal_area);
+
+    let modal_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .style(Style::default().fg(Color::Red));
+    frame.render_widget(modal_block, modal_area);
+
+    let header_bg_area = Rect {
+        x: modal_area.x + 1,
+        y: modal_area.y + 1,
+        width: modal_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let header_style = Style::default().bg(Color::Rgb(60, 15, 15)).fg(Color::Red);
+    let header_para = Paragraph::new("  ⚠ Error  ")
+        .style(header_style.add_modifier(Modifier::BOLD));
+    frame.render_widget(header_para, header_bg_area);
+
+    let sep_area = Rect {
+        x: modal_area.x + 1,
+        y: modal_area.y + 2,
+        width: modal_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let sep_line = Paragraph::new(Line::from(Span::styled(
+        "─".repeat(sep_area.width as usize),
+        Style::default().fg(Color::Rgb(80, 20, 20)),
+    )));
+    frame.render_widget(sep_line, sep_area);
+
+    // Chrome: border(1) + header(1) + sep(1) + blank(1) + border(1) = 5 rows
+    let body_start_y = modal_area.y + 4;
+    let body_height = modal_area.height.saturating_sub(5).max(1);
+    let body_area = Rect {
+        x: modal_area.x + 2,
+        y: body_start_y,
+        width: modal_area.width.saturating_sub(4),
+        height: body_height,
+    };
+
+    let body_para = Paragraph::new(notification.message.as_str())
+        .style(Style::default().fg(Color::Rgb(220, 220, 220)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body_para, body_area);
 }
 
 // -----------------------------------------------------------------------
@@ -493,24 +538,24 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_theme_screen(frame, &app.theme_screen, size);
     }
 
-    if app.stats_dialog.open {
+    if app.stats_dialog.visible {
         render_stats_dialog(&app.stats_dialog, size, frame.buffer_mut());
     }
 
-    if app.mcp_view.open {
+    if app.mcp_view.visible {
         render_mcp_view(&app.mcp_view, size, frame.buffer_mut());
     }
 
-    if app.agents_menu.open {
+    if app.agents_menu.visible {
         render_agents_menu(&app.agents_menu, size, frame.buffer_mut());
     }
 
-    if app.diff_viewer.open {
+    if app.diff_viewer.visible {
         let mut state = app.diff_viewer.clone();
         render_diff_dialog(&mut state, size, frame.buffer_mut());
     }
 
-    if app.global_search.open {
+    if app.global_search.visible {
         render_global_search(&app.global_search, size, frame.buffer_mut());
     }
 
@@ -679,10 +724,22 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
+    // Always show error modals on top of everything (highest priority)
+    if let Some(notif) = app.notifications.current() {
+        if notif.kind == NotificationKind::Error {
+            let is_welcome_screen = app.messages.is_empty()
+                && app.streaming_text.is_empty()
+                && app.streaming_thinking.is_empty()
+                && app.tool_use_blocks.is_empty();
+            render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
+            return; // Don't render other overlays/notifications when error modal is showing
+        }
+    }
+
     let modal_active = is_modal_open(app);
 
-    // Notification banner stays out of the way when a modal owns the screen.
-    if !modal_active && !app.notifications.is_empty() {
+    // Render non-error notifications as toast banners (unless another modal is open)
+    if !modal_active && app.notifications.current().is_some() {
         render_notification_banner(frame, &app.notifications, size);
     }
 
@@ -970,7 +1027,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let lines = render_message_items(app, msg_area.width);
 
     // Highlight search matches in transcript when global search is active
-    let lines = if app.global_search.open && !app.global_search.query.is_empty() {
+    let lines = if app.global_search.visible && !app.global_search.query.is_empty() {
         let query_lc = app.global_search.query.to_lowercase();
         lines.into_iter().map(|mut item| {
             if item.search_text.to_lowercase().contains(query_lc.as_str()) {
@@ -1458,6 +1515,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(right_w),
         ])
         .split(inner);
+
+    // Store the right column area for error modal positioning
+    app.footer_right_column_area.set(h_chunks[2]);
 
     // Draw vertical divider in accent color
     let divider_lines: Vec<Line> = (0..inner.height)
