@@ -167,6 +167,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+j", "newline", KeyContext::Chat),
         ("home", "goLineStart", KeyContext::Chat),
         ("end", "goLineEnd", KeyContext::Chat),
+        ("cmd+left", "goLineStart", KeyContext::Chat),
+        ("cmd+right", "goLineEnd", KeyContext::Chat),
 
         // Text Editing (Emacs-style) + app shortcuts
         ("ctrl+a", "openModelPicker", KeyContext::Chat),

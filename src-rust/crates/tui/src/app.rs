@@ -4093,7 +4093,9 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Left => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = 0;
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_backward();
                 } else {
                     self.prompt_input.move_left();
@@ -4101,7 +4103,9 @@ impl App {
                 self.sync_legacy_prompt_fields();
             }
             KeyCode::Right => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_forward();
                 } else {
                     self.prompt_input.move_right();
