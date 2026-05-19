@@ -265,21 +265,6 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ]));
     }
 
-    // Home-directory warning: shown when Claurst is launched from $HOME.
-    if app.home_dir_warning {
-        lines.push(Line::from(vec![
-            Span::styled(" note ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                truncate_end(
-                    "You have launched Claurst in your home directory. \
-                     For the best experience, launch it in a project directory instead.",
-                    max_width,
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    }
-
     // Additional directories (from --add-dir)
     for dir in &app.config.additional_dirs {
         lines.push(Line::from(vec![
@@ -1804,18 +1789,12 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             ])
         };
 
+        // `?` opens the shortcuts overlay which already lists Ctrl+A / Ctrl+K
+        // and friends — surfacing them again here is redundant clutter.
         let right_hint = if app.has_credentials {
-            let mut hint = vec![Span::styled("Ctrl+A model", Style::default().fg(dim))];
-            hint.push(Span::styled(" · ", Style::default().fg(dim)));
-            hint.push(Span::styled("Ctrl+K commands", Style::default().fg(dim)));
-            // Always show the ? shortcut hint — previously hidden while
-            // typing or streaming, but users want it visible at all times
-            // (issue #149 follow-up).
-            hint.push(Span::styled(" · ", Style::default().fg(dim)));
-            hint.push(Span::styled("? shortcuts", Style::default().fg(dim)));
-            Line::from(hint)
+            Line::from(vec![Span::styled("? shortcuts", Style::default().fg(dim))])
         } else {
-            Line::from(vec![Span::styled("Ctrl+K commands", Style::default().fg(dim))])
+            Line::from(Vec::<Span>::new())
         };
 
         frame.render_widget(Paragraph::new(vec![left_line]), chunks[0]);
