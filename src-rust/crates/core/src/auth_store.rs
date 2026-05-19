@@ -122,9 +122,26 @@ impl AuthStore {
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
             "zai" => "ZAI_API_KEY",
+            "opencode-zen" | "opencode_zen" | "opencode-go" | "opencode_go" => "OPENCODE_API_KEY",
+            "sambanova" => "SAMBANOVA_API_KEY",
+            "qwen" => "QWEN_API_KEY",
+            "moonshot" | "moonshotai" => "MOONSHOT_API_KEY",
+            "zhipu" | "zhipuai" => "ZHIPU_API_KEY",
+            "nebius" => "NEBIUS_API_KEY",
+            "novita" => "NOVITA_API_KEY",
+            "baseten" => "BASETEN_API_KEY",
+            "friendli" => "FRIENDLI_API_KEY",
+            "upstage" => "UPSTAGE_API_KEY",
+            "stepfun" => "STEPFUN_API_KEY",
+            "fireworks" => "FIREWORKS_API_KEY",
+            "ollama" | "lm-studio" | "llama-cpp" => "", // No API key required
             _ => return None,
         };
-        std::env::var(env_var).ok().filter(|k| !k.is_empty())
+        if env_var.is_empty() {
+            None
+        } else {
+            std::env::var(env_var).ok().filter(|k| !k.is_empty())
+        }
     }
 }
 
