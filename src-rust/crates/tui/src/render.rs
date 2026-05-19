@@ -71,7 +71,9 @@ const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', 
 const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
                             '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
-const WELCOME_BOX_HEIGHT: u16 = 12;
+const WELCOME_BOX_HEIGHT: u16 = 9;
+const STATUS_THINKING: &str = "thinking";
+const STATUS_THINKING_ELLIPSIS: &str = "thinking\u{2026}";
 
 fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
@@ -474,7 +476,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Length(status_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(size);
 
@@ -1451,26 +1453,10 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 
 /// Render the two-column orange round-bordered welcome box (matches TS LogoV2).
 fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
-    // Shorten cwd: replace $USERPROFILE/$HOME prefix with ~
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .ok();
-            if let Some(h) = home {
-                let hs = p.display().to_string();
-                if hs.starts_with(&h) {
-                    return Some(format!("~{}", &hs[h.len()..]));
-                }
-            }
-            Some(p.display().to_string())
-        })
-        .unwrap_or_else(|| ".".to_string());
 
     // --- Box dimensions ---
     // The box should be at most the full area width, and a fixed height.
-    let box_width = area.width.min(area.width);
+    let box_width = area.width;
     let box_height: u16 = WELCOME_BOX_HEIGHT;
     if area.height < box_height || box_width < 30 {
         // Too small: fall back to a single line
@@ -1550,28 +1536,6 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
     }
-    left_lines.push(Line::from(""));
-    // Only show model line if credentials are configured
-    if app.has_credentials {
-        let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
-            if provider == "anthropic" {
-                model.to_string()
-            } else {
-                format!("{} [{}]", model, provider)
-            }
-        } else {
-            app.model_name.clone()
-        };
-        left_lines.push(Line::from(Span::styled(
-            format!("{} \u{00b7} API Usage", model_display),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    left_lines.push(Line::from(Span::styled(
-        cwd,
-        Style::default().fg(Color::DarkGray),
-    )));
-
     frame.render_widget(Paragraph::new(left_lines).wrap(Wrap { trim: false }), h_chunks[0]);
 
     // --- Right column ---
@@ -1865,15 +1829,29 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         // `?` opens the shortcuts overlay which already lists Ctrl+A / Ctrl+K
         // and friends — surfacing them again here is redundant clutter.
         let right_hint = if app.has_credentials {
-            Line::from(vec![Span::styled("? shortcuts", Style::default().fg(dim))])
+            Line::from(vec![
+                Span::styled("? shortcuts", Style::default().fg(dim)),
+            ])
         } else {
             Line::from(Vec::<Span>::new())
         };
 
-        frame.render_widget(Paragraph::new(vec![left_line]), chunks[0]);
+        let left_padded = Rect {
+            x: chunks[0].x + 1,
+            y: chunks[0].y,
+            width: chunks[0].width.saturating_sub(1),
+            height: chunks[0].height,
+        };
+        let right_padded = Rect {
+            x: chunks[1].x,
+            y: chunks[1].y,
+            width: chunks[1].width.saturating_sub(1),
+            height: chunks[1].height,
+        };
+        frame.render_widget(Paragraph::new(vec![left_line]), left_padded);
         frame.render_widget(
             Paragraph::new(vec![right_hint]).alignment(Alignment::Right),
-            chunks[1],
+            right_padded,
         );
     }
 
@@ -1901,8 +1879,8 @@ fn should_render_status_row(app: &App) -> bool {
         .map(|status| {
             let trimmed = status.trim();
             !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("thinking")
-                && !trimmed.eq_ignore_ascii_case("thinking…")
+                && !trimmed.eq_ignore_ascii_case(STATUS_THINKING)
+                && !trimmed.eq_ignore_ascii_case(STATUS_THINKING_ELLIPSIS)
         })
         .unwrap_or(false);
 
@@ -1930,8 +1908,8 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             .filter(|s| {
                 let t = s.trim();
                 !t.is_empty()
-                    && !t.eq_ignore_ascii_case("thinking")
-                    && !t.eq_ignore_ascii_case("thinking…")
+                    && !t.eq_ignore_ascii_case(STATUS_THINKING)
+                    && !t.eq_ignore_ascii_case(STATUS_THINKING_ELLIPSIS)
             })
             .or_else(|| app.spinner_verb.as_deref())
             .unwrap_or("Thinking");
@@ -2021,6 +1999,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
+
+    // Use only the first line of the footer area, leaving bottom padding
+    let footer_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
 
     // Left side: ordered pills — voice > PR badge > background task > vim > hint
     let left_spans: Vec<Span> = if app.voice_recording {
@@ -2409,13 +2395,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let gap = (area.width as usize).saturating_sub(left_len + right_len);
+    let gap = (footer_area.width.saturating_sub(2) as usize).saturating_sub(left_len + right_len);
 
     let mut spans = left_spans;
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(right_spans);
 
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+    // Add padding: 1 char on each side
+    let padded_area = Rect {
+        x: footer_area.x + 1,
+        y: footer_area.y,
+        width: footer_area.width.saturating_sub(2),
+        height: footer_area.height,
+    };
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {

@@ -2150,20 +2150,20 @@ impl App {
                     // Try xclip/xsel/pbcopy/clip.exe for clipboard; fall back to notification.
                     let copied = try_copy_to_clipboard(&text);
                     if copied {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             "Copied to clipboard.".to_string(),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Last response: {} chars (clipboard unavailable)", text.len()),
                             Some(5),
                         );
                     }
                 } else {
-                    self.notifications.push(
+                    self.push_notification(
                         NotificationKind::Warning,
                         "No assistant message to copy.".to_string(),
                         Some(3),
@@ -2569,6 +2569,15 @@ impl App {
 
     /// Push a synthetic system annotation into the conversation pane.
     /// It will appear after the current last message.
+    /// Push a notification and, for Error-kind notifications, reset the error
+    /// modal scroll offset so a newly arrived error is always shown from the top.
+    pub fn push_notification(&mut self, kind: NotificationKind, msg: String, duration_secs: Option<u64>) {
+        if kind == NotificationKind::Error {
+            self.error_modal_scroll_offset = 0;
+        }
+        self.notifications.push(kind, msg, duration_secs);
+    }
+
     pub fn push_system_message(&mut self, text: String, style: SystemMessageStyle) {
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
@@ -2608,21 +2617,21 @@ impl App {
         // Only escalate — never repeat a threshold already shown.
         if pct >= 100 && self.token_warning_threshold_shown < 100 {
             self.token_warning_threshold_shown = 100;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window full. Running auto-compact\u{2026}".to_string(),
                 None,
             );
         } else if pct >= 95 && self.token_warning_threshold_shown < 95 {
             self.token_warning_threshold_shown = 95;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window 95% full! Run /compact now.".to_string(),
                 None, // persistent until dismissed
             );
         } else if pct >= 80 && self.token_warning_threshold_shown < 80 {
             self.token_warning_threshold_shown = 80;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Warning,
                 "Context window 80% full. Consider /compact.".to_string(),
                 Some(30),
@@ -3137,14 +3146,14 @@ impl App {
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
                     if let Some(text) = crate::image_paste::read_clipboard_text() {
                         if text.is_empty() {
-                            self.notifications.push(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                            self.push_notification(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
                         } else {
                             for ch in text.chars() {
                                 self.key_input_dialog.insert_char(ch);
                             }
                         }
                     } else {
-                        self.notifications.push(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
                     }
                 }
                 KeyCode::Char(c) => {
@@ -3561,13 +3570,13 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(path) = self.perform_export() {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Exported to {}", path),
                             Some(4),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Export failed: could not write file.".to_string(),
                             Some(4),
@@ -3892,7 +3901,7 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
                     "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
                     None,
@@ -3911,7 +3920,7 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
                     "Transcribing\u{2026}".to_string(),
                     Some(10),
@@ -3960,7 +3969,7 @@ impl App {
                 } else {
                     format!("Image attached: {}", label)
                 };
-                self.notifications.push(NotificationKind::Info, msg, Some(3));
+                self.push_notification(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
                 self.handle_paste_data(text);
                 self.refresh_prompt_input();
@@ -4031,7 +4040,7 @@ impl App {
                     self.selection_focus = None;
                     *self.selection_text.borrow_mut() = String::new();
                     if copied {
-                        self.notifications.push(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
                 } else if self.is_streaming {
                     // Cancel streaming.
@@ -4632,7 +4641,7 @@ impl App {
                         self.messages.truncate(idx);
                         // Remove system annotations placed after the truncation point.
                         self.system_annotations.retain(|a| a.after_index <= idx);
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Success,
                             format!("Rewound to message #{}", idx),
                             Some(4),
@@ -4702,7 +4711,7 @@ impl App {
         }
 
         // Start new sequence (or show message for wrong key)
-        self.notifications.push(NotificationKind::Info, exit_message(key_char).to_string(), Some(2));
+        self.push_notification(NotificationKind::Info, exit_message(key_char).to_string(), Some(2));
         self.last_exit_key_warning = Some(std::time::Instant::now());
         self.exit_key_sequence_start = Some(key_char);
     }
@@ -4735,7 +4744,7 @@ impl App {
                         self.exit_key_sequence_start = None;
                     } else {
                         // First press or timeout expired: show exit confirmation.
-                        self.notifications.push(NotificationKind::Info, "Press Ctrl+C again to exit".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Info, "Press Ctrl+C again to exit".to_string(), Some(2));
                         self.last_exit_key_warning = Some(std::time::Instant::now());
                         self.exit_key_sequence_start = Some('c');
                     }
@@ -5380,13 +5389,13 @@ impl App {
 
                 if let Some(text) = text {
                     if crate::message_copy::copy_to_clipboard(&text) {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Copied {} chars to clipboard.", text.len()),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Failed to copy to clipboard.".to_string(),
                             Some(3),
@@ -5465,7 +5474,7 @@ impl App {
                     .to_string();
                 let img = PastedImage { path, label: label.clone(), dimensions: None };
                 self.prompt_input.add_image(img);
-                self.notifications.push(
+                self.push_notification(
                     crate::notifications::NotificationKind::Info,
                     format!("Image attached: {}", label),
                     Some(3),
@@ -5867,7 +5876,7 @@ impl App {
                     if !sel_text.is_empty() {
                         let copied = crate::image_paste::write_clipboard_text(&sel_text);
                         if copied {
-                            self.notifications.push(
+                            self.push_notification(
                                 NotificationKind::Info,
                                 "Copied to clipboard".to_string(),
                                 Some(1),
@@ -6049,7 +6058,7 @@ impl App {
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
-                self.notifications.push(NotificationKind::Error, err_msg, None);
+                self.push_notification(NotificationKind::Error, err_msg, None);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
                 // Push a notification for context window warnings (notification + threshold tracking).
@@ -6063,7 +6072,7 @@ impl App {
                     }
                     TokenWarningState::Warning if self.token_warning_threshold_shown < 80 => {
                         self.token_warning_threshold_shown = 80;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
                             Some(30),
@@ -6071,7 +6080,7 @@ impl App {
                     }
                     TokenWarningState::Critical if self.token_warning_threshold_shown < 95 => {
                         self.token_warning_threshold_shown = 95;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Error,
                             format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
                             None,
@@ -6193,7 +6202,7 @@ impl App {
                         VoiceEvent::Error(msg) => {
                             self.voice_recording = false;
                             self.voice_event_rx = None;
-                            self.notifications.push(
+                            self.push_notification(
                                 NotificationKind::Warning,
                                 format!("Voice: {}", msg),
                                 Some(8),
