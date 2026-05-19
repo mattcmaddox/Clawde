@@ -4898,10 +4898,6 @@ impl App {
                 }
                 false
             }
-            "sendMessage" => {
-                // Ctrl+M: Send message (alternative to Enter)
-                !self.is_streaming
-            }
             "newline" => {
                 // Shift+Enter: insert a literal newline into the prompt.
                 if !self.is_streaming {

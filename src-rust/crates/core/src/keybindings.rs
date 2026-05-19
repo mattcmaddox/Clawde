@@ -151,7 +151,6 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 /// - **Alt+←/Alt+→**: Navigate to previous/next message in transcript
 /// - **Ctrl+. (Ctrl+>)**: Jump to next error/issue in messages
 /// - **Ctrl+Shift+.**: Jump to previous error/issue
-/// - **Ctrl+M**: Send message (alternative to Enter)
 /// - **Shift+Tab**: Reverse indent/unindent in input (cycle permission mode)
 /// - **Ctrl+H**: Delete character before cursor (Chat context, Emacs-style)
 /// - **Alt+H**: Open help (alternative to F1)
@@ -172,7 +171,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
         ("enter", "submit", KeyContext::Chat),
-        ("ctrl+m", "sendMessage", KeyContext::Chat),
 
         // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
@@ -849,7 +847,7 @@ mod tests {
 
         // Check Phase 1 keybinding actions exist
         assert!(actions.contains(&"clearLine".to_string()), "clearLine action not found");
-        assert!(actions.contains(&"sendMessage".to_string()), "sendMessage action not found");
+        assert!(actions.contains(&"submit".to_string()), "submit action not found");
         assert!(actions.contains(&"jumpToNextError".to_string()), "jumpToNextError action not found");
         assert!(actions.contains(&"jumpToPreviousError".to_string()), "jumpToPreviousError action not found");
         assert!(actions.contains(&"previousMessage".to_string()), "previousMessage action not found");
