@@ -1,8 +1,11 @@
-// WARNING: The OAuth client IDs in this module are registered to Anthropic's Claude Code CLI.
-// They will not work for Claurst. This module is preserved for reference but disabled.
-// Users should authenticate via API key (/connect → Anthropic → paste key).
-//
 // OAuth 2.0 PKCE login flow for the Claurst CLI.
+//
+// Uses the Claude Code client ID and impersonates Claude Code at request time
+// (see `claurst_core::oauth_config` for the impersonation constants and
+// `claurst_api::AnthropicClient::apply_oauth_stealth` for how they're applied).
+// Claude Pro/Max tokens used through Claurst draw from the account's "extra
+// usage" pool, not subscription quota — users should be aware of this before
+// switching from API-key auth.
 //
 // Implements the same flow as the TypeScript OAuthService + authLogin():
 // 1. Generate PKCE code_verifier / code_challenge / state

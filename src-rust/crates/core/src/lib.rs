@@ -3496,9 +3496,10 @@ pub mod oauth {
 
     // ---- Production OAuth endpoints & constants ----
 
-    // NOTE: This client ID is registered to Anthropic's official Claude Code CLI.
-    // It will NOT work for Claurst. Users should use an API key from console.anthropic.com.
-    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Anthropic's — will not work for Claurst
+    // Claude Code client ID, used in stealth-impersonation mode (see
+    // `claurst_core::oauth_config` for the matching request-time headers and
+    // system-prompt prefix wired into `claurst_api::AnthropicClient`).
+    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
