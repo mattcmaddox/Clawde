@@ -120,7 +120,9 @@
 
   function renderMessage(m) {
     var div = document.createElement('div');
-    div.className = 'msg ' + (m.role || '');
+    var classes = ['msg', m.role || ''];
+    if (isToolOnlyMessage(m)) classes.push('tool-only');
+    div.className = classes.join(' ').trim();
     var role = document.createElement('div');
     role.className = 'role ' + (m.role || '');
     role.textContent = m.role || 'message';
@@ -130,6 +132,35 @@
     div.appendChild(body);
     renderContent(body, m.content);
     return div;
+  }
+
+  // A message is "tool-only" when every block in its content is a tool call,
+  // tool result, or thinking block — i.e. there is no prose, image, or other
+  // user-visible content. When the toggle hides those blocks we also hide the
+  // whole row so we don't leave behind a blank user/assistant stub.
+  function isToolOnlyMessage(m) {
+    var content = m && m.content;
+    if (typeof content === 'string') return false;
+    if (!Array.isArray(content) || content.length === 0) return false;
+    return content.every(isHiddenByToolToggle);
+  }
+
+  function isHiddenByToolToggle(block) {
+    if (!block || typeof block !== 'object') return false;
+    switch (block.type) {
+      case 'tool_use':
+      case 'tool_result':
+      case 'thinking':
+      case 'redacted_thinking':
+        return true;
+      case 'text':
+        // Empty/whitespace-only text blocks contribute nothing visible, so
+        // treat them as "no content" too — otherwise a turn that's just a
+        // tool call + an empty trailing text frame would still render blank.
+        return !(block.text && block.text.trim().length > 0);
+      default:
+        return false;
+    }
   }
 
   function renderContent(parent, content) {

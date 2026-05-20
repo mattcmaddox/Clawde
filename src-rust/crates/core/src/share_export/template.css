@@ -183,6 +183,12 @@ nav {
 #messages.hide-tools details.thinking {
   display: none;
 }
+/* Messages whose entire content was tool calls / tool results / thinking
+   would otherwise render as an empty role-only stub when the toggle hides
+   their body — collapse the whole row instead. */
+#messages.hide-tools .msg.tool-only {
+  display: none;
+}
 
 /* Messages container */
 #messages { padding: 0; }
