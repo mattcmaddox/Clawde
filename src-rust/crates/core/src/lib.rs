@@ -34,6 +34,8 @@ pub mod format_utils;
 pub mod crypto_utils;
 pub mod status_notices;
 pub mod auto_mode;
+pub mod spinner;
+pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sample_completion_verb};
 
 // Remote session sync and cloud session API (T3-1, T3-2).
 pub mod remote_session;
