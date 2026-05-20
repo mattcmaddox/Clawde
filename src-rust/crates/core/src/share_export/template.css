@@ -1,170 +1,343 @@
 :root {
-  --bg: #1a1a1f;
-  --card-bg: #23232b;
-  --text: #e6e6ea;
-  --muted: #8a8a96;
-  --accent: #6b9bff;
-  --user-bg: #2a3548;
-  --assistant-bg: #23232b;
-  --tool-bg: #1e2228;
-  --thinking-bg: #1a1a22;
-  --border: #33333d;
-  --code-bg: #161618;
-  --error-bg: #3a1c1c;
-  --error-border: #b04040;
-  --error-fg: #f0c4c4;
+  --bg: #030303;
+  --surface: #0a0a0a;
+  --surface-2: rgba(255, 255, 255, 0.02);
+  --surface-border: rgba(255, 255, 255, 0.12);
+  --crosshair: rgba(255, 255, 255, 0.4);
+  --text-primary: #ffffff;
+  --text-secondary: #a3a3a3;
+  --text-muted: #525252;
+  --accent: #e91e63;
+  --accent-hover: #ff2a76;
+  --accent-shy: rgba(233, 30, 99, 0.2);
+  --error: #ff5f56;
+  --error-shy: rgba(255, 95, 86, 0.12);
+  --font-mono: 'JetBrains Mono', monospace;
+  color-scheme: dark;
 }
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
+
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+html { font-size: 90%; }
 body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
-  font-size: 15px;
-  line-height: 1.55;
+  background-color: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  line-height: 1.65;
+  min-height: 100vh;
 }
-a { color: var(--accent); }
-#header {
-  max-width: 880px;
+
+::selection { background-color: var(--accent-shy); color: var(--text-primary); }
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-hover); }
+* { scrollbar-width: thin; scrollbar-color: var(--accent) transparent; }
+
+a { color: var(--accent); text-decoration: none; transition: color 0.2s; }
+a:hover { color: var(--accent-hover); }
+
+/* Backdrops */
+.bg-grid {
+  position: fixed; inset: 0; z-index: -2; pointer-events: none;
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+.bg-glow {
+  position: fixed; top: 0vw; left: 20vw; width: 60vw; height: 60vh;
+  background: radial-gradient(ellipse at center, var(--accent-shy) 0%, transparent 70%);
+  opacity: 0.15; z-index: -1; pointer-events: none; filter: blur(100px);
+}
+
+/* Page container with thin vertical borders, like the landing page */
+.page {
+  max-width: 920px;
   margin: 0 auto;
-  padding: 32px 24px 16px;
-  border-bottom: 1px solid var(--border);
+  border-left: 1px solid var(--surface-border);
+  border-right: 1px solid var(--surface-border);
+  min-height: 100vh;
+  position: relative;
 }
-#header h1 {
-  margin: 0 0 8px 0;
-  font-size: 20px;
-  font-weight: 600;
+
+/* Grid sections with corner crosshair sprites */
+.grid-section {
+  border-bottom: 1px solid var(--surface-border);
+  position: relative;
+}
+.grid-section.top-border { border-top: 1px solid var(--surface-border); }
+.grid-section::after, .grid-section::before,
+.grid-section.top-border .cross-top-left, .grid-section.top-border .cross-top-right {
+  content: '';
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  background:
+    linear-gradient(var(--crosshair), var(--crosshair)) center/1px 100% no-repeat,
+    linear-gradient(var(--crosshair), var(--crosshair)) center/100% 1px no-repeat;
+  z-index: 10;
+}
+.grid-section::before { bottom: -5px; left: -5px; }
+.grid-section::after { bottom: -5px; right: -5px; }
+.cross-top-left { top: -5px; left: -5px; }
+.cross-top-right { top: -5px; right: -5px; }
+
+/* Nav */
+nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.5rem 2rem;
+}
+.nav-left { display: flex; align-items: center; gap: 0.8rem; }
+.nav-logo { width: 28px; height: 28px; }
+.nav-brand { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.05em; }
+.nav-tag {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* Hero: session title + metadata strip */
+.hero-body {
+  padding: 2rem 2rem 1.5rem;
+}
+.hero-title {
+  font-size: clamp(1.4rem, 3.5vw, 1.9rem);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  line-height: 1.25;
+  margin-bottom: 0.85rem;
   word-break: break-word;
 }
-#header .meta {
-  color: var(--muted);
-  font-size: 13px;
+.hero-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 16px;
+  gap: 0.4rem 1.2rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
 }
-#messages {
-  max-width: 880px;
-  margin: 0 auto;
-  padding: 16px 24px 80px;
+.hero-meta span { display: inline-flex; align-items: center; gap: 0.45rem; }
+.hero-meta .pip {
+  width: 4px; height: 4px; background: var(--accent); border-radius: 50%; display: inline-block;
 }
+
+/* Messages container */
+#messages { padding: 0; }
+
+/* Per-message card */
 .msg {
-  margin: 16px 0;
-  padding: 14px 18px;
-  border-radius: 8px;
-  background: var(--card-bg);
-  border: 1px solid var(--border);
+  padding: 1.3rem 2rem;
+  border-bottom: 1px solid var(--surface-border);
+  position: relative;
 }
-.msg.user { background: var(--user-bg); }
+.msg:last-child { border-bottom: none; }
+.msg.user { background: rgba(233, 30, 99, 0.04); }
+.msg.user::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
 .msg .role {
-  font-size: 12px;
-  color: var(--muted);
+  font-size: 0.7rem;
+  color: var(--text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-bottom: 8px;
+  letter-spacing: 0.12em;
+  margin-bottom: 0.6rem;
   font-weight: 600;
 }
 .msg .role.user { color: var(--accent); }
+
+.msg .body {
+  font-size: 0.92rem;
+  color: var(--text-primary);
+  line-height: 1.7;
+  word-wrap: break-word;
+}
+.msg .body p { margin: 0.5em 0; }
 .msg .body p:first-child { margin-top: 0; }
 .msg .body p:last-child { margin-bottom: 0; }
-.msg .body pre {
-  background: var(--code-bg);
-  padding: 12px;
-  border-radius: 6px;
-  overflow-x: auto;
-  font-size: 13px;
-  line-height: 1.45;
+.msg .body h1, .msg .body h2, .msg .body h3, .msg .body h4 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 1.2em 0 0.5em;
+  color: var(--text-primary);
 }
+.msg .body h1 { font-size: 1.15rem; }
+.msg .body h2 { font-size: 1.05rem; }
+.msg .body h3 { font-size: 0.98rem; }
+.msg .body h4 { font-size: 0.92rem; color: var(--text-secondary); }
+.msg .body a { color: var(--accent); border-bottom: 1px dotted rgba(233, 30, 99, 0.4); }
+.msg .body a:hover { color: var(--accent-hover); border-bottom-color: var(--accent-hover); }
+.msg .body strong { font-weight: 600; color: var(--text-primary); }
+.msg .body em { color: var(--text-secondary); }
+.msg .body ul, .msg .body ol { padding-left: 1.5em; margin: 0.5em 0; }
+.msg .body li { margin: 0.2em 0; }
+
+/* Inline code */
 .msg .body code {
-  background: var(--code-bg);
-  padding: 2px 5px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--surface-border);
+  padding: 1px 6px;
   border-radius: 3px;
-  font-size: 13px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+  font-family: var(--font-mono);
+  color: var(--accent);
+}
+
+/* Code blocks — terminal-style box from the landing page */
+.msg .body pre {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--surface-border);
+  border-radius: 6px;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  margin: 0.7em 0;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  backdrop-filter: blur(10px);
 }
 .msg .body pre code {
-  padding: 0;
   background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: inherit;
 }
+
+/* Tool calls / tool results / thinking — collapsible details */
 details.tool-call, details.tool-result, details.thinking {
-  margin-top: 10px;
-  border: 1px solid var(--border);
+  margin: 0.7em 0;
+  border: 1px solid var(--surface-border);
   border-radius: 6px;
-  background: var(--tool-bg);
-  font-size: 13px;
+  background: rgba(0, 0, 0, 0.35);
+  font-size: 0.82rem;
 }
-details.tool-call > summary,
-details.tool-result > summary,
-details.thinking > summary {
+details > summary {
   cursor: pointer;
-  padding: 8px 12px;
-  color: var(--muted);
+  padding: 0.55rem 0.9rem;
+  color: var(--text-secondary);
   user-select: none;
   list-style: none;
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
-details.tool-call > summary::-webkit-details-marker,
-details.tool-result > summary::-webkit-details-marker,
-details.thinking > summary::-webkit-details-marker { display: none; }
+details > summary::-webkit-details-marker { display: none; }
+details[open] > summary { border-bottom: 1px solid var(--surface-border); }
+details.tool-call > summary::before {
+  content: '▸'; color: var(--accent); margin-right: 0.1rem;
+  transition: transform 0.15s;
+}
+details.tool-call[open] > summary::before { transform: rotate(90deg); }
 details.tool-call > summary .tool-name {
   color: var(--accent);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 500;
 }
-details.tool-call > .body,
-details.tool-result > .body,
-details.thinking > .body {
-  padding: 0 12px 10px;
-  border-top: 1px solid var(--border);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
+details.tool-result > summary::before {
+  content: '↳'; color: var(--text-muted); margin-right: 0.1rem;
 }
-details.tool-call pre,
-details.tool-result pre,
-details.thinking pre {
+details.tool-result.error { border-color: var(--error); }
+details.tool-result.error > summary { color: var(--error); }
+details.thinking { background: rgba(255, 255, 255, 0.015); font-style: italic; }
+details.thinking > summary::before {
+  content: '◈'; color: var(--text-muted); margin-right: 0.1rem;
+}
+
+details > .body {
+  padding: 0.7rem 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+details > .body pre {
   white-space: pre-wrap;
   word-break: break-word;
-  margin: 8px 0 0 0;
+  margin: 0;
   max-height: 480px;
   overflow-y: auto;
   background: transparent;
+  border: none;
   padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
 }
-details.thinking { background: var(--thinking-bg); font-style: italic; }
-details.tool-result.error { border-color: var(--error-border); }
+
+/* Local shell command output (! command) — terminal style */
 .local-cmd {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 13px;
-  background: var(--tool-bg);
-  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--surface-border);
   border-radius: 6px;
-  margin-top: 10px;
+  padding: 0.7rem 0.9rem;
+  margin: 0.7em 0;
   white-space: pre-wrap;
   word-break: break-word;
+  color: var(--text-primary);
+  line-height: 1.55;
 }
-.local-cmd .prompt { color: var(--accent); font-weight: bold; margin-right: 6px; }
+.local-cmd .prompt {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 0.6rem;
+  user-select: none;
+}
+
+/* Slash/skill command invocations */
 .user-cmd {
   color: var(--accent);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  margin: 0.4em 0;
 }
+
+/* System API errors */
 .api-error {
-  background: var(--error-bg);
-  border: 1px solid var(--error-border);
-  color: var(--error-fg);
-  padding: 10px 12px;
+  background: var(--error-shy);
+  border: 1px solid var(--error);
+  color: #ffd5d2;
+  padding: 0.7rem 0.9rem;
   border-radius: 6px;
-  margin-top: 10px;
+  font-size: 0.82rem;
+  margin: 0.7em 0;
 }
-img.attachment { max-width: 100%; border-radius: 6px; margin: 8px 0; display: block; }
-#footer {
+
+/* Image attachments */
+img.attachment {
+  max-width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--surface-border);
+  margin: 0.6em 0;
+  display: block;
+}
+
+/* Footer — same 3-col grid as the landing page */
+.footer-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+.footer-item {
+  padding: 1rem 0.6rem;
   text-align: center;
-  padding: 20px;
-  color: var(--muted);
-  font-size: 12px;
-  border-top: 1px solid var(--border);
+  border-right: 1px solid var(--surface-border);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: background 0.2s, color 0.2s;
 }
-#footer a { text-decoration: none; }
-@media (max-width: 640px) {
-  #header { padding: 20px 16px 12px; }
-  #messages { padding: 12px 16px 60px; }
-  .msg { padding: 12px 14px; }
+.footer-item:last-child { border-right: none; }
+a.footer-item:hover { color: #fff; background: var(--accent-hover); }
+
+@media (max-width: 720px) {
+  nav { padding: 1rem; }
+  .hero-body { padding: 1.5rem 1rem 1.25rem; }
+  .msg { padding: 1rem 1rem; }
+  .footer-row { font-size: 0.7rem; }
 }

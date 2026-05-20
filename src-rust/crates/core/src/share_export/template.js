@@ -38,25 +38,37 @@
   var title = meta.title || ('Session ' + (meta.session_id || ''));
   document.title = title + ' — Claurst Session';
 
-  var header = document.getElementById('header');
-  var exported = meta.exported_at ? new Date(meta.exported_at).toLocaleString() : '';
-  var h1 = document.createElement('h1');
-  h1.textContent = title;
-  header.appendChild(h1);
-  var metaDiv = document.createElement('div');
-  metaDiv.className = 'meta';
-  var bits = [];
-  if (meta.model) bits.push(meta.model);
-  bits.push(messages.length + ' message' + (messages.length === 1 ? '' : 's'));
-  if (meta.working_dir) bits.push(meta.working_dir);
-  if (exported) bits.push(exported);
-  if (meta.app_version) bits.push('claurst ' + meta.app_version);
-  bits.forEach(function (b) {
-    var s = document.createElement('span');
-    s.textContent = b;
-    metaDiv.appendChild(s);
-  });
-  header.appendChild(metaDiv);
+  var hero = document.getElementById('hero');
+  if (hero) {
+    var heroBody = document.createElement('div');
+    heroBody.className = 'hero-body';
+    var h1 = document.createElement('h1');
+    h1.className = 'hero-title';
+    h1.textContent = title;
+    heroBody.appendChild(h1);
+
+    var exported = meta.exported_at ? new Date(meta.exported_at).toLocaleString() : '';
+    var metaDiv = document.createElement('div');
+    metaDiv.className = 'hero-meta';
+    var bits = [];
+    if (meta.model) bits.push(meta.model);
+    bits.push(messages.length + ' message' + (messages.length === 1 ? '' : 's'));
+    if (meta.working_dir) bits.push(meta.working_dir);
+    if (exported) bits.push(exported);
+    if (meta.app_version) bits.push('claurst ' + meta.app_version);
+    bits.forEach(function (b) {
+      var s = document.createElement('span');
+      var pip = document.createElement('span');
+      pip.className = 'pip';
+      s.appendChild(pip);
+      var label = document.createElement('span');
+      label.textContent = b;
+      s.appendChild(label);
+      metaDiv.appendChild(s);
+    });
+    heroBody.appendChild(metaDiv);
+    hero.appendChild(heroBody);
+  }
 
   var msgsEl = document.getElementById('messages');
   messages.forEach(function (m) { msgsEl.appendChild(renderMessage(m)); });
