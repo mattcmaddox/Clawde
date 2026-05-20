@@ -38,6 +38,17 @@
   var title = meta.title || ('Session ' + (meta.session_id || ''));
   document.title = title + ' — Claurst Session';
 
+  var msgsEl = document.getElementById('messages');
+
+  // Tool-call visibility preference, persisted across reloads. Default: shown.
+  var TOOLS_PREF_KEY = 'claurst.share.showTools';
+  var showTools = true;
+  try {
+    var stored = localStorage.getItem(TOOLS_PREF_KEY);
+    if (stored === '0') showTools = false;
+  } catch (_) { /* localStorage may be unavailable in sandboxed contexts */ }
+  applyShowTools(showTools);
+
   var hero = document.getElementById('hero');
   if (hero) {
     var heroBody = document.createElement('div');
@@ -67,11 +78,45 @@
       metaDiv.appendChild(s);
     });
     heroBody.appendChild(metaDiv);
+
+    // Tool-call visibility toggle. Tool calls, tool results and thinking
+    // blocks are shown by default; this lets the reader hide them for a
+    // cleaner prompts/responses-only view.
+    var controls = document.createElement('div');
+    controls.className = 'hero-controls';
+    var toolToggle = document.createElement('label');
+    toolToggle.className = 'toggle';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = showTools;
+    cb.addEventListener('change', function () {
+      showTools = cb.checked;
+      applyShowTools(showTools);
+      try { localStorage.setItem(TOOLS_PREF_KEY, showTools ? '1' : '0'); } catch (_) {}
+    });
+    toolToggle.appendChild(cb);
+    var swatch = document.createElement('span');
+    swatch.className = 'toggle-swatch';
+    toolToggle.appendChild(swatch);
+    var lbl = document.createElement('span');
+    lbl.className = 'toggle-label';
+    lbl.textContent = 'Show tool calls & thinking';
+    toolToggle.appendChild(lbl);
+    controls.appendChild(toolToggle);
+    heroBody.appendChild(controls);
+
     hero.appendChild(heroBody);
   }
 
-  var msgsEl = document.getElementById('messages');
   messages.forEach(function (m) { msgsEl.appendChild(renderMessage(m)); });
+
+  function applyShowTools(on) {
+    if (on) {
+      msgsEl.classList.remove('hide-tools');
+    } else {
+      msgsEl.classList.add('hide-tools');
+    }
+  }
 
   function renderMessage(m) {
     var div = document.createElement('div');
@@ -193,6 +238,7 @@
   function renderToolCall(block) {
     var d = document.createElement('details');
     d.className = 'tool-call';
+    d.open = true;
     var s = document.createElement('summary');
     
     var badge = document.createElement('span');
@@ -219,7 +265,7 @@
     var isError = !!block.is_error;
     var d = document.createElement('details');
     d.className = 'tool-result' + (isError ? ' error' : '');
-    d.open = isError;
+    d.open = true;
     var s = document.createElement('summary');
     
     var badge = document.createElement('span');
