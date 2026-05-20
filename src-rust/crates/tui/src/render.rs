@@ -2271,10 +2271,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 if !parts.is_empty() {
                     parts.push(Span::raw("  "));
                 }
-                let display_dir = if dir.starts_with(std::env::var("HOME").as_deref().unwrap_or("")) {
-                    dir.replace(std::env::var("HOME").as_deref().unwrap_or(""), "~")
-                } else {
-                    dir.clone()
+                // Use dirs::home_dir() so this works on Windows (where $HOME
+                // is unset and the home is $USERPROFILE). Guard against an
+                // empty home string: `str::replace("", "~")` inserts "~"
+                // between every character, producing the infamous
+                // `~X~:~\~B~i~g~g~e~r~…` output.
+                let home = dirs::home_dir()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty());
+                let display_dir = match home {
+                    Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
+                    _ => dir.clone(),
                 };
                 parts.push(Span::styled(
                     display_dir,
