@@ -53,6 +53,8 @@ pub mod app;
 pub mod input;
 /// All ratatui rendering logic.
 pub mod render;
+/// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
+pub mod osc8;
 /// Permission dialogs and confirmation dialogs.
 pub mod dialogs;
 /// Notification / banner system.

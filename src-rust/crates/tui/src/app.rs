@@ -6078,8 +6078,24 @@ impl App {
                 }
             }
 
-            // Draw the frame
-            terminal.draw(|f| render::render_app(f, self))?;
+            // Draw the frame, and immediately scan the *just-rendered*
+            // buffer for URL runs. ratatui swaps its two buffers at the
+            // end of draw(), so by the time draw() returns,
+            // `terminal.current_buffer_mut()` points at the empty next-frame
+            // slot. `CompletedFrame.buffer` is the one we actually want.
+            let osc8_hits = {
+                let completed = terminal.draw(|f| render::render_app(f, self))?;
+                crate::osc8::scan_buffer_for_urls(completed.buffer)
+            };
+
+            // Post-paint OSC 8 overlay: re-emit URL cells wrapped in
+            // hyperlink escapes so terminals that support OSC 8 (Windows
+            // Terminal, iTerm2, WezTerm, Kitty, Konsole, VS Code, …) make
+            // them Ctrl/Cmd-clickable. Failure is non-fatal — we never want
+            // an overlay glitch to kill the TUI.
+            if let Err(err) = crate::osc8::emit_hits(&osc8_hits) {
+                tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
+            }
 
             // Replay a key that was saved by try_detect_paste_burst in a
             // previous iteration (e.g. a modifier key that terminated a burst).
