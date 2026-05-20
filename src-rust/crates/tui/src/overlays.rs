@@ -415,7 +415,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     )));
     for (key, desc) in &[
         ("F1 / ?",          "Toggle help"),
-        ("Ctrl+A",          "Model picker"),
+        ("Ctrl+Shift+A",    "Model picker"),
         ("Ctrl+K",          "Command palette"),
         ("Ctrl+C",          "Cancel / quit"),
         ("Ctrl+D",          "Quit (empty input)"),

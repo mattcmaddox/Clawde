@@ -145,7 +145,7 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 ///
 /// # Standard Keybindings (Phase 1 Implementation)
 /// - **Ctrl+L**: Clear current input line (like bash) [Chat context only due to conflict]
-/// - **Ctrl+A**: Open the model picker
+/// - **Ctrl+Shift+A**: Open the model picker
 /// - **Ctrl+K**: Open the command palette
 /// - **Ctrl+U**: Kill input from cursor to start of line (Emacs-style)
 /// - **Alt+←/Alt+→**: Navigate to previous/next message in transcript
@@ -190,6 +190,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Line start/end navigation
         ("home", "goLineStart", KeyContext::Chat),
         ("cmd+left", "goLineStart", KeyContext::Chat),
+        ("ctrl+a", "goLineStart", KeyContext::Chat),
         ("end", "goLineEnd", KeyContext::Chat),
         ("cmd+right", "goLineEnd", KeyContext::Chat),
         ("ctrl+e", "goLineEnd", KeyContext::Chat),
@@ -240,7 +241,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "scrollDown", KeyContext::Chat),
 
         // App shortcuts
-        ("ctrl+a", "openModelPicker", KeyContext::Chat),
+        ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
 
         // ========== CONFIRMATION DIALOGS ==========
@@ -456,7 +457,7 @@ impl UserKeybindings {
             })
             .collect();
         Ok(Self {
-            schema_version: KEYBINDINGS_SCHEMA_VERSION,
+            schema_version: 0,
             bindings,
         })
     }
@@ -475,6 +476,22 @@ impl UserKeybindings {
         let mut user_customizations: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         for binding in &self.bindings {
+            // Migration: remove old bindings that have changed in defaults
+            // This distinguishes between "user customized" and "old default that changed"
+
+            // Old: ctrl+a -> openModelPicker (moved to ctrl+shift+a)
+            if binding.chord == "ctrl+a" && binding.action.as_deref() == Some("openModelPicker") {
+                continue;
+            }
+
+            // Old: tab -> togglePreview in Chat context (changed to indent)
+            if binding.chord == "tab"
+                && binding.context.as_deref() == Some("Chat")
+                && binding.action.as_deref() == Some("togglePreview")
+            {
+                continue;
+            }
+
             user_customizations
                 .insert(binding.chord.clone(), binding.action.clone());
         }
@@ -713,12 +730,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings_map_ctrl_a_and_ctrl_k_to_app_shortcuts() {
+    fn test_default_bindings_map_ctrl_shift_a_and_ctrl_k_to_app_shortcuts() {
         let bindings = default_bindings();
 
-        let ctrl_a = bindings.iter().find(|b| {
+        let ctrl_shift_a = bindings.iter().find(|b| {
             b.chord.len() == 1
                 && b.chord[0].ctrl
+                && b.chord[0].shift
                 && b.chord[0].key == "a"
                 && b.context == KeyContext::Chat
         });
@@ -729,7 +747,7 @@ mod tests {
                 && b.context == KeyContext::Chat
         });
 
-        assert_eq!(ctrl_a.and_then(|b| b.action.as_deref()), Some("openModelPicker"));
+        assert_eq!(ctrl_shift_a.and_then(|b| b.action.as_deref()), Some("openModelPicker"));
         assert_eq!(
             ctrl_k.and_then(|b| b.action.as_deref()),
             Some("openCommandPalette")
@@ -846,5 +864,58 @@ mod tests {
             "Expected at least 40 keybindings, found {}",
             actions.len()
         );
+    }
+
+    #[test]
+    fn test_old_format_keybindings_get_upgraded() {
+        let old_format_json = r#"{
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": {
+                        "ctrl+shift+a": "openModelPicker",
+                        "ctrl+e": "goLineEnd"
+                    }
+                }
+            ]
+        }"#;
+
+        let mut kb = UserKeybindings::from_json_str(old_format_json);
+        assert_eq!(kb.schema_version, 0, "Old format should start at version 0");
+
+        kb.smart_merge_with_defaults();
+
+        assert_eq!(kb.schema_version, 1, "Should be upgraded to version 1");
+        assert!(
+            kb.bindings.iter().any(|b| b.chord == "meta+left"),
+            "meta+left (cmd+left) should be added from defaults after merge"
+        );
+        assert!(
+            kb.bindings.iter().any(|b| b.chord == "ctrl+shift+a" && b.action.as_deref() == Some("openModelPicker")),
+            "User customization (ctrl+shift+a -> openModelPicker) should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_cmd_left_resolves_to_go_line_start() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        // Create a keystroke for CMD+Left (SUPER modifier + left arrow)
+        let keystroke = ParsedKeystroke {
+            key: "left".to_string(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            meta: true,
+        };
+
+        let result = resolver.process(keystroke, &KeyContext::Chat);
+        match result {
+            KeybindingResult::Action(action) => {
+                assert_eq!(action, "goLineStart", "CMD+Left should map to goLineStart");
+            }
+            other => panic!("Expected Action(\"goLineStart\"), got {:?}", other),
+        }
     }
 }
