@@ -1,0 +1,258 @@
+(function () {
+  var dataEl = document.getElementById('session-data');
+  if (!dataEl) return;
+
+  var payload;
+  try {
+    var raw = atob((dataEl.textContent || '').trim());
+    var decoded = decodeURIComponent(Array.prototype.map.call(raw, function (c) {
+      return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+    }).join(''));
+    payload = JSON.parse(decoded);
+  } catch (e) {
+    document.getElementById('messages').innerHTML =
+      '<p style="color:#f88">Failed to load session data: ' + escapeHtml(String(e)) + '</p>';
+    return;
+  }
+
+  var meta = payload.meta || {};
+  var messages = payload.messages || [];
+
+  if (window.marked && window.hljs) {
+    marked.setOptions({
+      highlight: function (code, lang) {
+        try {
+          if (lang && hljs.getLanguage(lang)) {
+            return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+          }
+          return hljs.highlightAuto(code).value;
+        } catch (_) {
+          return code;
+        }
+      },
+      breaks: true,
+      gfm: true
+    });
+  }
+
+  var title = meta.title || ('Session ' + (meta.session_id || ''));
+  document.title = title + ' — Claurst Session';
+
+  var header = document.getElementById('header');
+  var exported = meta.exported_at ? new Date(meta.exported_at).toLocaleString() : '';
+  var h1 = document.createElement('h1');
+  h1.textContent = title;
+  header.appendChild(h1);
+  var metaDiv = document.createElement('div');
+  metaDiv.className = 'meta';
+  var bits = [];
+  if (meta.model) bits.push(meta.model);
+  bits.push(messages.length + ' message' + (messages.length === 1 ? '' : 's'));
+  if (meta.working_dir) bits.push(meta.working_dir);
+  if (exported) bits.push(exported);
+  if (meta.app_version) bits.push('claurst ' + meta.app_version);
+  bits.forEach(function (b) {
+    var s = document.createElement('span');
+    s.textContent = b;
+    metaDiv.appendChild(s);
+  });
+  header.appendChild(metaDiv);
+
+  var msgsEl = document.getElementById('messages');
+  messages.forEach(function (m) { msgsEl.appendChild(renderMessage(m)); });
+
+  function renderMessage(m) {
+    var div = document.createElement('div');
+    div.className = 'msg ' + (m.role || '');
+    var role = document.createElement('div');
+    role.className = 'role ' + (m.role || '');
+    role.textContent = m.role || 'message';
+    div.appendChild(role);
+    var body = document.createElement('div');
+    body.className = 'body';
+    div.appendChild(body);
+    renderContent(body, m.content);
+    return div;
+  }
+
+  function renderContent(parent, content) {
+    if (typeof content === 'string') {
+      parent.insertAdjacentHTML('beforeend', renderMarkdown(content));
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    content.forEach(function (block) { renderBlock(parent, block); });
+  }
+
+  function renderBlock(parent, block) {
+    if (!block || typeof block !== 'object') return;
+    switch (block.type) {
+      case 'text':
+        parent.insertAdjacentHTML('beforeend', renderMarkdown(block.text || ''));
+        break;
+      case 'image':
+        if (block.source) {
+          var img = document.createElement('img');
+          img.className = 'attachment';
+          if (block.source.data) {
+            var mt = block.source.media_type || 'image/png';
+            img.src = 'data:' + mt + ';base64,' + block.source.data;
+          } else if (block.source.url) {
+            img.src = block.source.url;
+          }
+          parent.appendChild(img);
+        }
+        break;
+      case 'tool_use':
+        parent.appendChild(renderToolCall(block));
+        break;
+      case 'tool_result':
+        parent.appendChild(renderToolResult(block));
+        break;
+      case 'thinking':
+        parent.appendChild(renderThinking(block.thinking || ''));
+        break;
+      case 'redacted_thinking':
+        parent.appendChild(renderThinking('[redacted thinking]'));
+        break;
+      case 'user_local_command_output':
+        parent.appendChild(renderLocalCmd(block.command || '', block.output || ''));
+        break;
+      case 'user_command': {
+        var d = document.createElement('div');
+        d.className = 'user-cmd';
+        d.textContent = '▸ ' + (block.name || '') + (block.args ? ' ' + block.args : '');
+        parent.appendChild(d);
+        break;
+      }
+      case 'user_memory_input': {
+        var d2 = document.createElement('div');
+        d2.className = 'user-cmd';
+        d2.textContent = '# ' + (block.key || '') + ': ' + (block.value || '');
+        parent.appendChild(d2);
+        break;
+      }
+      case 'system_api_error': {
+        var er = document.createElement('div');
+        er.className = 'api-error';
+        er.textContent = block.message || '';
+        parent.appendChild(er);
+        break;
+      }
+      case 'collapsed_read_search': {
+        var cr = document.createElement('div');
+        cr.className = 'user-cmd';
+        var more = block.n_hidden ? ' (+ ' + block.n_hidden + ' more)' : '';
+        cr.textContent = '▸ ' + (block.tool_name || 'tool') + ' ' +
+          (Array.isArray(block.paths) ? block.paths.join(', ') : '') + more;
+        parent.appendChild(cr);
+        break;
+      }
+      case 'task_assignment': {
+        var ta = document.createElement('details');
+        ta.className = 'tool-call';
+        ta.open = true;
+        var s = document.createElement('summary');
+        s.innerHTML = '▸ <span class="tool-name">task</span> ' + escapeHtml(block.subject || '');
+        ta.appendChild(s);
+        var b = document.createElement('div'); b.className = 'body';
+        var pre = document.createElement('pre');
+        pre.textContent = (block.id ? '[' + block.id + ']\n' : '') + (block.description || '');
+        b.appendChild(pre);
+        ta.appendChild(b);
+        parent.appendChild(ta);
+        break;
+      }
+      case 'document': {
+        var note = document.createElement('div');
+        note.style.color = 'var(--muted)';
+        note.textContent = '[document: ' + (block.title || 'untitled') + ']';
+        parent.appendChild(note);
+        break;
+      }
+      default: {
+        var pre2 = document.createElement('pre');
+        pre2.textContent = JSON.stringify(block, null, 2);
+        parent.appendChild(pre2);
+      }
+    }
+  }
+
+  function renderToolCall(block) {
+    var d = document.createElement('details');
+    d.className = 'tool-call';
+    var s = document.createElement('summary');
+    s.innerHTML = '▸ <span class="tool-name">' + escapeHtml(block.name || 'tool') + '</span>';
+    d.appendChild(s);
+    var b = document.createElement('div'); b.className = 'body';
+    var pre = document.createElement('pre');
+    try { pre.textContent = JSON.stringify(block.input || {}, null, 2); }
+    catch (_) { pre.textContent = String(block.input); }
+    b.appendChild(pre);
+    d.appendChild(b);
+    return d;
+  }
+
+  function renderToolResult(block) {
+    var isError = !!block.is_error;
+    var d = document.createElement('details');
+    d.className = 'tool-result' + (isError ? ' error' : '');
+    d.open = isError;
+    var s = document.createElement('summary');
+    s.textContent = isError ? '✗ tool result (error)' : '↳ tool result';
+    d.appendChild(s);
+    var b = document.createElement('div'); b.className = 'body';
+    var text;
+    var c = block.content;
+    if (typeof c === 'string') {
+      text = c;
+    } else if (Array.isArray(c)) {
+      text = c.map(function (x) { return (x && x.text) ? x.text : JSON.stringify(x); }).join('\n');
+    } else {
+      text = JSON.stringify(c, null, 2);
+    }
+    var pre = document.createElement('pre');
+    pre.textContent = text;
+    b.appendChild(pre);
+    d.appendChild(b);
+    return d;
+  }
+
+  function renderThinking(text) {
+    var d = document.createElement('details');
+    d.className = 'thinking';
+    var s = document.createElement('summary');
+    s.textContent = '💭 thinking';
+    d.appendChild(s);
+    var b = document.createElement('div'); b.className = 'body';
+    var pre = document.createElement('pre');
+    pre.textContent = text;
+    b.appendChild(pre);
+    d.appendChild(b);
+    return d;
+  }
+
+  function renderLocalCmd(cmd, output) {
+    var div = document.createElement('div');
+    div.className = 'local-cmd';
+    var p = document.createElement('span');
+    p.className = 'prompt';
+    p.textContent = '!';
+    div.appendChild(p);
+    div.appendChild(document.createTextNode(cmd + '\n' + output));
+    return div;
+  }
+
+  function renderMarkdown(text) {
+    if (window.marked) {
+      try { return marked.parse(text || ''); } catch (_) { return '<p>' + escapeHtml(text) + '</p>'; }
+    }
+    return '<p>' + escapeHtml(text) + '</p>';
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+    });
+  }
+})();

@@ -28,13 +28,12 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 
 > [!NOTE]
 > **Recent Updates:**
+>
+> - **/share support:** Use `/share` to share chat sessions with others via unlisted GitHub Gists. `[EXPERIMENTAL]`
+>
 > - **Free Mode:** Try out Free in '/connect' to get a great agentic coding experience in Claurst for absolutely free (or as good as free gets you :P). `[EXPERIMENTAL]`
 >
 > - **/goal support:** Try out `/goal <objective>` to see claurst keep working an objective, spanning multiple turns instead of stopping after one normal turn. `[EXPERIMENTAL]`
->
-> - **Managed Agents Preview:** Run `/managed-agents` to create a better agentic loop with a Manager-Executor relation and dramatically improved performance for fractions of the cost from running a larger model. Choose from 6 pre-built templates or build your own.`[EXPERIMENTAL]`
->
-> - Speech modes: Try `/rocky` and `/caveman` to hear the difference! `/normal` to go back.
 
 ---
 

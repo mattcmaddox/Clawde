@@ -1,0 +1,170 @@
+:root {
+  --bg: #1a1a1f;
+  --card-bg: #23232b;
+  --text: #e6e6ea;
+  --muted: #8a8a96;
+  --accent: #6b9bff;
+  --user-bg: #2a3548;
+  --assistant-bg: #23232b;
+  --tool-bg: #1e2228;
+  --thinking-bg: #1a1a22;
+  --border: #33333d;
+  --code-bg: #161618;
+  --error-bg: #3a1c1c;
+  --error-border: #b04040;
+  --error-fg: #f0c4c4;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+}
+a { color: var(--accent); }
+#header {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 24px 16px;
+  border-bottom: 1px solid var(--border);
+}
+#header h1 {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+  font-weight: 600;
+  word-break: break-word;
+}
+#header .meta {
+  color: var(--muted);
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+#messages {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 16px 24px 80px;
+}
+.msg {
+  margin: 16px 0;
+  padding: 14px 18px;
+  border-radius: 8px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+}
+.msg.user { background: var(--user-bg); }
+.msg .role {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+.msg .role.user { color: var(--accent); }
+.msg .body p:first-child { margin-top: 0; }
+.msg .body p:last-child { margin-bottom: 0; }
+.msg .body pre {
+  background: var(--code-bg);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.msg .body code {
+  background: var(--code-bg);
+  padding: 2px 5px;
+  border-radius: 3px;
+  font-size: 13px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.msg .body pre code {
+  padding: 0;
+  background: transparent;
+}
+details.tool-call, details.tool-result, details.thinking {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--tool-bg);
+  font-size: 13px;
+}
+details.tool-call > summary,
+details.tool-result > summary,
+details.thinking > summary {
+  cursor: pointer;
+  padding: 8px 12px;
+  color: var(--muted);
+  user-select: none;
+  list-style: none;
+}
+details.tool-call > summary::-webkit-details-marker,
+details.tool-result > summary::-webkit-details-marker,
+details.thinking > summary::-webkit-details-marker { display: none; }
+details.tool-call > summary .tool-name {
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+details.tool-call > .body,
+details.tool-result > .body,
+details.thinking > .body {
+  padding: 0 12px 10px;
+  border-top: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+details.tool-call pre,
+details.tool-result pre,
+details.thinking pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 8px 0 0 0;
+  max-height: 480px;
+  overflow-y: auto;
+  background: transparent;
+  padding: 0;
+}
+details.thinking { background: var(--thinking-bg); font-style: italic; }
+details.tool-result.error { border-color: var(--error-border); }
+.local-cmd {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  background: var(--tool-bg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-top: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.local-cmd .prompt { color: var(--accent); font-weight: bold; margin-right: 6px; }
+.user-cmd {
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  margin-top: 8px;
+}
+.api-error {
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  color: var(--error-fg);
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-top: 10px;
+}
+img.attachment { max-width: 100%; border-radius: 6px; margin: 8px 0; display: block; }
+#footer {
+  text-align: center;
+  padding: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+}
+#footer a { text-decoration: none; }
+@media (max-width: 640px) {
+  #header { padding: 20px 16px 12px; }
+  #messages { padding: 12px 16px 60px; }
+  .msg { padding: 12px 14px; }
+}

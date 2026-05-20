@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claurst Session Viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background: #1a1a1f;
+    color: #e6e6ea;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  #status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    padding: 24px;
+    text-align: center;
+    box-sizing: border-box;
+  }
+  #status .inner { max-width: 520px; }
+  #status h1 { font-size: 18px; margin: 0 0 8px 0; font-weight: 600; }
+  #status p { color: #8a8a96; margin: 6px 0; line-height: 1.5; }
+  #status a, #status code { color: #6b9bff; }
+  #status code {
+    background: #23232b;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+  }
+  iframe#viewer {
+    display: none;
+    border: 0;
+    width: 100%;
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+<div id="status" role="status" aria-live="polite">
+  <div class="inner">
+    <h1 id="status-title">Loading session…</h1>
+    <p id="status-detail">Fetching gist contents from GitHub.</p>
+  </div>
+</div>
+<iframe id="viewer" title="Claurst session" sandbox="allow-scripts allow-popups allow-same-origin"></iframe>
+<script>
+(async function () {
+  var status = document.getElementById('status');
+  var titleEl = document.getElementById('status-title');
+  var detailEl = document.getElementById('status-detail');
+  var viewer = document.getElementById('viewer');
+
+  function fail(title, html) {
+    titleEl.textContent = title;
+    detailEl.innerHTML = html;
+  }
+
+  var id = (location.hash || '').replace(/^#/, '').trim();
+  if (!id) {
+    fail(
+      'No session selected',
+      'Append a gist id to the URL, e.g. <code>/session/#&lt;gist-id&gt;</code>.'
+    );
+    return;
+  }
+  if (!/^[a-f0-9]{6,}$/i.test(id)) {
+    fail('Invalid gist id', 'The fragment after <code>#</code> does not look like a GitHub gist id.');
+    return;
+  }
+
+  try {
+    var res = await fetch('https://api.github.com/gists/' + encodeURIComponent(id), {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (res.status === 404) {
+      fail('Gist not found', 'The link may be wrong, or the gist may have been deleted.');
+      return;
+    }
+    if (res.status === 403) {
+      fail(
+        'Rate-limited by GitHub',
+        'Wait a minute and refresh — anonymous GitHub API calls are rate-limited.'
+      );
+      return;
+    }
+    if (!res.ok) {
+      fail('Unable to load gist', 'GitHub returned status ' + res.status + '.');
+      return;
+    }
+    var gist = await res.json();
+    var files = gist.files || {};
+    var htmlFile = null;
+    var names = Object.keys(files);
+    for (var i = 0; i < names.length; i++) {
+      var f = files[names[i]];
+      if (f && f.filename && /\.html?$/i.test(f.filename)) { htmlFile = f; break; }
+    }
+    if (!htmlFile) {
+      fail('Not a Claurst session', 'No HTML file was found in this gist.');
+      return;
+    }
+    var content = htmlFile.content || '';
+    if (htmlFile.truncated && htmlFile.raw_url) {
+      var r2 = await fetch(htmlFile.raw_url);
+      if (r2.ok) content = await r2.text();
+    }
+    viewer.srcdoc = content;
+    viewer.style.display = 'block';
+    status.style.display = 'none';
+  } catch (e) {
+    fail('Network error', String(e && e.message ? e.message : e));
+  }
+})();
+</script>
+</body>
+</html>

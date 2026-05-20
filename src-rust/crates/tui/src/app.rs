@@ -70,6 +70,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("insights", "Generate a session analysis report with conversation statistics"),
     ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
+    ("links", "Open URLs from this session in your browser"),
     ("login", "Log in to Claurst"),
     ("logout", "Log out of Claurst"),
     ("managed-agents", "Configure manager-executor managed agent system"),
@@ -90,6 +91,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
+    ("share", "Upload the current session as a secret gist and get a shareable URL"),
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
@@ -103,7 +105,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 fn help_command_category(name: &str) -> &'static str {
     match name {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
-        "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
