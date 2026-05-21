@@ -3767,9 +3767,11 @@ impl App {
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
-                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
+                KeybindingResult::Pending => return false,
                 KeybindingResult::NoMatch if had_pending_chord => return false,
-                KeybindingResult::NoMatch => {}
+                KeybindingResult::Unbound | KeybindingResult::NoMatch => {
+                    // Fall through to hardcoded keybinding handlers
+                }
             }
         } else {
             self.keybindings.cancel_chord();
@@ -4091,7 +4093,9 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Left => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = 0;
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_backward();
                 } else {
                     self.prompt_input.move_left();
@@ -4099,7 +4103,9 @@ impl App {
                 self.sync_legacy_prompt_fields();
             }
             KeyCode::Right => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.prompt_input.move_word_forward();
                 } else {
                     self.prompt_input.move_right();
@@ -4891,10 +4897,6 @@ impl App {
                     self.refresh_prompt_input();
                 }
                 false
-            }
-            "sendMessage" => {
-                // Ctrl+M: Send message (alternative to Enter)
-                !self.is_streaming
             }
             "newline" => {
                 // Shift+Enter: insert a literal newline into the prompt.

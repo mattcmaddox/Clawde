@@ -346,7 +346,7 @@ fn render_keybindings_page(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("  Navigation", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
         kb("PgUp/PgDn", "scroll transcript"),
         kb("Ctrl+K", "command palette"),
-        kb("Ctrl+A", "model picker"),
+        kb("Ctrl+Shift+A", "model picker"),
         Line::from(""),
         Line::from(Span::styled("  Permissions", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
         kb("y", "allow tool once"),
