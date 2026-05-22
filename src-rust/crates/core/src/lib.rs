@@ -1558,11 +1558,22 @@ pub mod config {
                     config.skills.urls.push(u.clone());
                 }
             }
-            // Copy file autocomplete and injection settings.
-            config.file_autocomplete_limit = self.file_autocomplete_limit;
-            config.file_autocomplete_show_hidden_files = self.file_autocomplete_show_hidden_files;
-            config.file_injection_enabled = self.file_injection_enabled;
-            config.file_injection_max_size = self.file_injection_max_size;
+            // Copy file autocomplete and injection settings from the top-level Settings
+            // fields, but only when they were explicitly set (differ from their defaults).
+            // If they're at defaults, the nested "config" section value (already in `config`
+            // via the clone above) takes precedence.
+            if self.file_autocomplete_limit != default_file_autocomplete_limit() {
+                config.file_autocomplete_limit = self.file_autocomplete_limit;
+            }
+            if self.file_autocomplete_show_hidden_files {
+                config.file_autocomplete_show_hidden_files = true;
+            }
+            if self.file_injection_enabled != default_true() {
+                config.file_injection_enabled = self.file_injection_enabled;
+            }
+            if self.file_injection_max_size != default_file_injection_max_size() {
+                config.file_injection_max_size = self.file_injection_max_size;
+            }
             config
         }
 

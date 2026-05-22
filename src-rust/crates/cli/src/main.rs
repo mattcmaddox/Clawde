@@ -1947,7 +1947,7 @@ async fn run_interactive(
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)
-        if let Some((outcome, pending_input, _pending_imgs)) = app.file_injection_dialog.take_outcome() {
+        if let Some((outcome, pending_input, pending_imgs)) = app.file_injection_dialog.take_outcome() {
             use claurst_tui::FileInjectionOutcome;
 
             if matches!(outcome, FileInjectionOutcome::Abort) {
@@ -1955,9 +1955,14 @@ async fn run_interactive(
                 continue;
             }
 
-            // InjectAll or SkipOversized: restore input to prompt for resubmission
-            // Images attached when dialog was shown are discarded; user can re-attach if needed
+            // InjectAll: bypass size limit on resubmission, restore stashed input+images,
+            // then synthesize Enter to send immediately.
+            app.file_injection_force = true;
+            for img in pending_imgs {
+                app.prompt_input.add_image(img);
+            }
             app.set_prompt_text(pending_input);
+            app.pending_auto_submit = true;
         }
 
         // Draw the UI
@@ -2052,6 +2057,18 @@ async fn run_interactive(
                         continue;
                     }
                     if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
+                        // If a file-ref suggestion is active, accept it instead of submitting.
+                        if !app.prompt_input.suggestions.is_empty()
+                            && app.prompt_input.suggestion_index.is_some()
+                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
+                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                                .unwrap_or(false)
+                        {
+                            app.prompt_input.accept_suggestion();
+                            app.prompt_input.insert_char(' ');
+                            app.refresh_prompt_input();
+                            continue;
+                        }
                         // If a slash-command suggestion is active, accept and execute immediately.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some()
@@ -2430,7 +2447,7 @@ async fn run_interactive(
                         }
 
                         // Fire UserPromptSubmit hook (non-blocking)
-                        if !config.hooks.is_empty() {
+                        if !cmd_ctx.config.hooks.is_empty() {
                             let hook_ctx = claurst_core::hooks::HookContext {
                                 event: "UserPromptSubmit".to_string(),
                                 tool_name: None,
@@ -2440,7 +2457,7 @@ async fn run_interactive(
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
                             claurst_core::hooks::run_hooks(
-                                &config.hooks,
+                                &cmd_ctx.config.hooks,
                                 claurst_core::config::HookEvent::UserPromptSubmit,
                                 &hook_ctx,
                                 &tool_ctx.working_dir,
@@ -2452,27 +2469,46 @@ async fn run_interactive(
                         let pending_imgs = app.prompt_input.clear_images();
 
                         // Check for file injection if enabled
-                        if config.file_injection_enabled {
+                        if app.config.file_injection_enabled {
                             use claurst_tui::file_injection::parse_at_refs;
 
-                            let (within_limit, oversized) = parse_at_refs(&input, &tool_ctx.working_dir, config.file_injection_max_size);
+                            // file_injection_force is set when user chose "inject anyways" in the
+                            // warning dialog — pass limit 0 so all files are treated as within
+                            // limit. Also drop any directory refs silently on force re-submit so
+                            // they don't loop back to the directory warning.
+                            let was_force = app.file_injection_force;
+                            let effective_limit = if app.file_injection_force {
+                                app.file_injection_force = false;
+                                0
+                            } else {
+                                app.config.file_injection_max_size
+                            };
+                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
+                            if was_force {
+                                oversized.retain(|f| !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                            }
 
                             if !oversized.is_empty() {
-                                // Show dialog with oversized files
-                                let oversized_summaries: Vec<(String, usize, String)> = oversized
+                                // Show either the directory warning or the file warning, never both.
+                                // Directories take precedence: if any are present, show only those.
+                                let has_dirs = oversized.iter().any(|f| matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
+                                let oversized_summaries: Vec<(String, usize, claurst_tui::AtFileIssue)> = oversized
                                     .iter()
-                                    .map(|f| {
-                                        let issue_str = match &f.issue {
-                                            Some(claurst_tui::AtFileIssue::TooLarge(kb)) => format!("TooLarge: {} KB", kb),
-                                            Some(claurst_tui::AtFileIssue::Binary) => "Binary".to_string(),
-                                            Some(claurst_tui::AtFileIssue::Unreadable(e)) => e.clone(),
-                                            None => "Unknown".to_string(),
-                                        };
-                                        (f.path.display().to_string(), f.size_kb, issue_str)
+                                    .filter(|f| {
+                                        let is_dir = matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory));
+                                        if has_dirs { is_dir } else { !is_dir }
                                     })
+                                    .filter_map(|f| f.issue.clone().map(|issue| (f.path.display().to_string(), f.size_kb, issue)))
                                     .collect();
 
-                                app.file_injection_dialog.show(input.clone(), pending_imgs, oversized_summaries);
+                                app.file_injection_dialog.show(
+                                    input.clone(),
+                                    pending_imgs,
+                                    oversized_summaries,
+                                    app.config.file_injection_max_size,
+                                    Some(tool_ctx.working_dir.clone()),
+                                );
+                                app.set_prompt_text(input);
                                 continue;
                             }
 
