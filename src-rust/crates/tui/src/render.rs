@@ -429,7 +429,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     );
 
     let prompt_focused =
-        !app.is_streaming && app.permission_request.is_none() && !app.history_search_overlay.visible;
+        app.permission_request.is_none() && !app.history_search_overlay.visible;
     // Suggestions popup tracks whether the prompt accepts input, not whether
     // it is the focused widget. Text entry is allowed during streaming so the
     // user can queue the next message, so the typeahead popup must follow
