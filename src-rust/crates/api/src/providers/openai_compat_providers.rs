@@ -134,6 +134,8 @@ pub fn custom_openai() -> OpenAiCompatProvider {
 }
 
 /// DeepSeek V4 — supports reasoning output via `reasoning_content` field.
+/// V4 models require reasoning_content to be echoed back on subsequent turns
+/// in multi-turn conversations with tool calls.
 /// Reads `DEEPSEEK_API_KEY`.
 pub fn deepseek() -> OpenAiCompatProvider {
     let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
@@ -145,6 +147,7 @@ pub fn deepseek() -> OpenAiCompatProvider {
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         reasoning_field: Some("reasoning_content".to_string()),
+        requires_reasoning_roundtrip: true,
         overflow_patterns: vec!["maximum context length is".to_string()],
         include_usage_in_stream: true,
         max_tokens_cap: None,
