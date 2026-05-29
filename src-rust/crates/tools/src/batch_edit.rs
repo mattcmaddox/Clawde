@@ -9,6 +9,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tracing::debug;
 
 pub struct BatchEditTool;
@@ -90,15 +91,10 @@ impl Tool for BatchEditTool {
         }
 
         // Permission check (one check covers the whole batch).
-        let description = params
-            .description
-            .as_deref()
-            .unwrap_or("batch file edits");
-        if let Err(e) = ctx.check_permission(
-            self.name(),
-            &format!("BatchEdit: {}", description),
-            false,
-        ) {
+        let description = params.description.as_deref().unwrap_or("batch file edits");
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("BatchEdit: {}", description), false)
+        {
             return ToolResult::error(e.to_string());
         }
 
@@ -109,25 +105,41 @@ impl Tool for BatchEditTool {
         // (resolved_path_string, original_content, new_content)
         let mut prepared: Vec<(String, String, String)> = Vec::with_capacity(params.edits.len());
         let mut pre_check_errors: Vec<String> = Vec::new();
+        let mut path_content: HashMap<String, String> = HashMap::new();
 
         for (i, edit) in params.edits.iter().enumerate() {
             let path = ctx.resolve_path(&edit.file_path);
             debug!(path = %path.display(), index = i, "BatchEdit pre-check");
 
-            let content = match tokio::fs::read_to_string(&path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    pre_check_errors.push(format!(
-                        "Edit {}: cannot read {}: {}",
-                        i,
-                        path.display(),
-                        e
-                    ));
-                    continue;
+            if edit.old_string.is_empty() {
+                pre_check_errors.push(format!("Edit {}: old_string must not be empty", i));
+                continue;
+            }
+
+            let original = if let Some(content) = path_content.get(&path.display().to_string()) {
+                // use cached edited content if available
+                content.clone()
+            } else {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        pre_check_errors.push(format!(
+                            "Edit {}: cannot read {}: {}",
+                            i,
+                            path.display(),
+                            e
+                        ));
+                        continue;
+                    }
                 }
             };
 
-            let count = content.matches(&edit.old_string).count();
+            // Normalize Windows CRLF line endings so matching behavior is stable
+            let content = original.replace("\r\n", "\n");
+            let old_string = edit.old_string.replace("\r\n", "\n");
+            let new_string = edit.new_string.replace("\r\n", "\n");
+
+            let count = content.matches(&old_string).count();
             if count == 0 {
                 pre_check_errors.push(format!(
                     "Edit {}: old_string not found in {}",
@@ -146,8 +158,10 @@ impl Tool for BatchEditTool {
                 continue;
             }
 
-            let new_content = content.replacen(&edit.old_string, &edit.new_string, 1);
-            prepared.push((path.display().to_string(), content, new_content));
+            let new_content = content.replacen(&old_string, &new_string, 1);
+            prepared.push((path.display().to_string(), original, new_content.clone()));
+            // update path_content so future edits see the new content
+            path_content.insert(path.display().to_string(), new_content);
         }
 
         if !pre_check_errors.is_empty() {
@@ -158,17 +172,32 @@ impl Tool for BatchEditTool {
             ));
         }
 
+        let edit_count = prepared.len();
+        let unique_files: std::collections::HashSet<&str> =
+            prepared.iter().map(|(p, _, _)| p.as_str()).collect();
+        let file_count = unique_files.len();
+
         // ----------------------------------------------------------------
         // Phase 2: write all files; roll back on any failure
         // ----------------------------------------------------------------
 
-        let mut written: Vec<(String, String)> = Vec::new(); // (path, original) for rollback
+        // merge file writes into a single transaction
+        let mut by_file_writing: HashMap<String, (String, String)> = HashMap::new();
+        for (path_str, original, new_content) in prepared.into_iter() {
+            by_file_writing
+                .entry(path_str.clone())
+                .and_modify(|v| v.1 = new_content.clone()) // only update new_content
+                .or_insert((original, new_content));
+        }
+        let unique_writings = by_file_writing
+            .into_iter()
+            .map(|(path_str, (original, new_content))| (path_str, original, new_content))
+            .collect::<Vec<_>>();
 
-        for (path_str, original, new_content) in &prepared {
+        for (i, (path_str, original, new_content)) in unique_writings.iter().enumerate() {
             let path = std::path::Path::new(path_str);
             match tokio::fs::write(path, new_content).await {
                 Ok(()) => {
-                    written.push((path_str.clone(), original.clone()));
                     ctx.record_file_change(
                         path.to_path_buf(),
                         original.as_bytes(),
@@ -179,17 +208,26 @@ impl Tool for BatchEditTool {
                 Err(e) => {
                     // Attempt rollback of already-written files.
                     let mut rollback_errors: Vec<String> = Vec::new();
-                    for (rb_path, rb_original) in &written {
-                        if let Err(re) = std::fs::write(rb_path, rb_original) {
+
+                    // rollback in reverse order to preserve original file state
+                    for (rb_path, rb_original, rb_new_content) in unique_writings[0..i].iter().rev()
+                    {
+                        if let Err(re) = tokio::fs::write(rb_path, rb_original).await {
                             rollback_errors.push(format!("  rollback {}: {}", rb_path, re));
+                        } else {
+                            let rb_path = std::path::Path::new(rb_path);
+                            ctx.record_file_change(
+                                rb_path.to_path_buf(),
+                                rb_new_content.as_bytes(),
+                                rb_original.as_bytes(),
+                                self.name(),
+                            );
                         }
                     }
 
                     let mut msg = format!(
                         "BatchEdit failed while writing {} ({}). Rolled back {} file(s).",
-                        path_str,
-                        e,
-                        written.len()
+                        path_str, e, i
                     );
                     if !rollback_errors.is_empty() {
                         msg.push_str(&format!(
@@ -206,11 +244,6 @@ impl Tool for BatchEditTool {
         // Build success response
         // ----------------------------------------------------------------
 
-        let unique_files: std::collections::HashSet<&str> =
-            prepared.iter().map(|(p, _, _)| p.as_str()).collect();
-        let file_count = unique_files.len();
-        let edit_count = prepared.len();
-
         let summary = format!(
             "BatchEdit applied {} edit{} across {} file{}.",
             edit_count,
@@ -222,7 +255,7 @@ impl Tool for BatchEditTool {
         ToolResult::success(summary).with_metadata(json!({
             "edits_applied": edit_count,
             "files_modified": file_count,
-            "files": prepared.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+            "files": unique_writings.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
         }))
     }
 }
