@@ -4,7 +4,7 @@
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 pub struct FileEditTool;
@@ -68,18 +68,21 @@ impl Tool for FileEditTool {
 
         // Validate old != new
         if params.old_string == params.new_string {
-            return ToolResult::error(
-                "old_string and new_string must be different".to_string(),
-            );
+            return ToolResult::error("old_string and new_string must be different".to_string());
+        }
+
+        if params.old_string.is_empty() {
+            return ToolResult::error("old_string must not be empty".to_string());
         }
 
         let path = ctx.resolve_path(&params.file_path);
         debug!(path = %path.display(), "Editing file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
+        if let Err(e) = ctx.check_permission_for_path(
             self.name(),
             &format!("Edit {}", path.display()),
+            path.clone(),
             false,
         ) {
             return ToolResult::error(e.to_string());
@@ -89,16 +92,18 @@ impl Tool for FileEditTool {
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::error(format!(
-                    "Failed to read file {}: {}",
-                    path.display(),
-                    e
-                ))
+                return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
             }
         };
 
+        // Normalize Windows CRLF line endings so matching behavior is stable
+        // across platforms and consistent with the TypeScript tool.
+        let content = content.replace("\r\n", "\n");
+        let old_string = params.old_string.replace("\r\n", "\n");
+        let new_string = params.new_string.replace("\r\n", "\n");
+
         // Count occurrences
-        let count = content.matches(&params.old_string).count();
+        let count = content.matches(&old_string).count();
 
         if count == 0 {
             return ToolResult::error(format!(
@@ -120,19 +125,15 @@ impl Tool for FileEditTool {
 
         // Perform replacement
         let new_content = if params.replace_all {
-            content.replace(&params.old_string, &params.new_string)
+            content.replace(&old_string, &new_string)
         } else {
             // Replace only the first occurrence
-            content.replacen(&params.old_string, &params.new_string, 1)
+            content.replacen(&old_string, &new_string, 1)
         };
 
         // Write back
         if let Err(e) = tokio::fs::write(&path, &new_content).await {
-            return ToolResult::error(format!(
-                "Failed to write file {}: {}",
-                path.display(),
-                e
-            ));
+            return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
         }
 
         ctx.record_file_change(
