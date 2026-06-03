@@ -3834,6 +3834,46 @@ pub mod oauth {
         }
         u.to_string()
     }
+
+    /// Active OAuth account `(account_uuid, has_premium)` from
+    /// `/api/oauth/profile`. `has_premium` (Claude Max or extra-usage) gates the
+    /// `context-1m` / `mid-conversation-system` betas. Falls back to the token's
+    /// stored `account_uuid` if the profile call fails; `None` if no token.
+    pub async fn current_anthropic_account_meta() -> Option<(String, bool)> {
+        let tokens = OAuthTokens::load().await?;
+        let token = tokens.access_token.clone();
+        let stored_uuid = tokens.account_uuid.clone();
+
+        let fetched = async {
+            let cfg = crate::oauth_config::get_oauth_config();
+            let url = format!("{}/api/oauth/profile", cfg.base_api_url);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("content-type", "application/json")
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: serde_json::Value = resp.json().await.ok()?;
+            let uuid = v["account"]["uuid"].as_str()?.to_string();
+            let has_max = v["account"]["has_claude_max"].as_bool().unwrap_or(false);
+            let has_extra = v["organization"]["has_extra_usage_enabled"]
+                .as_bool()
+                .unwrap_or(false);
+            Some((uuid, has_max || has_extra))
+        }
+        .await;
+
+        fetched.or_else(|| stored_uuid.map(|u| (u, false)))
+    }
 }
 
 // Re-export OAuthTokens at crate root for convenience

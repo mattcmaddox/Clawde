@@ -30,7 +30,12 @@ async-trait = "0.1"
 async-stream = "0.3"
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "stream", "native-tls-vendored", "multipart", "form", "query"], default-features = false }
+# rustls (pas native-tls/openssl) pour cohabiter avec wreq/BoringSSL sans conflit
+# de symboles (openssl-sys ↔ boring-sys). aws-lc-rs préfixe ses symboles.
+reqwest = { version = "0.13", features = ["json", "stream", "rustls", "multipart", "form", "query"], default-features = false }
+# wreq = client BoringSSL avec impersonation TLS (profil Bun) — chemin Anthropic uniquement.
+wreq = { version = "=6.0.0-rc.29", features = ["json", "stream"] }
+wreq-util = "=3.0.0-rc.12"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -94,7 +99,7 @@ nix = { version = "0.29", features = ["process", "signal", "user"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls-vendored"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }

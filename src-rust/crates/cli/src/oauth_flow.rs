@@ -108,12 +108,14 @@ pub async fn run_oauth_login_flow_with_label(
     try_open_browser(&automatic_url);
 
     // 5. Wait for auth code (automatic callback OR manual paste)
-    let auth_code =
+    let (auth_code, is_manual) =
         wait_for_auth_code_impl(listener, &state).await.context("OAuth callback failed")?;
-    debug!("OAuth auth code received");
+    debug!("OAuth auth code received (manual={})", is_manual);
 
-    // 6. Exchange code for tokens
-    let token_resp = exchange_code_for_tokens(&auth_code, &state, &code_verifier, port, false)
+    // 6. Exchange code for tokens. The redirect_uri must match the one used in
+    // the authorize step: loopback for the callback path, MANUAL_REDIRECT_URL
+    // for the pasted-code path.
+    let token_resp = exchange_code_for_tokens(&auth_code, &state, &code_verifier, port, is_manual)
         .await
         .context("Token exchange failed")?;
 
@@ -433,10 +435,13 @@ pub async fn refresh_oauth_token(tokens: &OAuthTokens) -> anyhow::Result<OAuthTo
 
 /// Wait for the OAuth authorization code from either the browser redirect (automatic)
 /// or manual paste by the user.  Races the two with a 120-second timeout.
+/// Returns `(auth_code, is_manual)`. `is_manual` is true when the code came from
+/// the pasted-code fallback (which authorized against `MANUAL_REDIRECT_URL`),
+/// so the caller can pick the matching `redirect_uri` for the token exchange.
 async fn wait_for_auth_code_impl(
     listener: TcpListener,
     expected_state: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, bool)> {
     let expected_state_clone = expected_state.to_string();
     let (cb_tx, cb_rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
 
@@ -457,10 +462,18 @@ async fn wait_for_auth_code_impl(
 
     tokio::select! {
         result = cb_rx => {
-            result.unwrap_or_else(|_| Err(anyhow::anyhow!("Callback server dropped")))
+            // Loopback callback: code came clean from the query string and was
+            // authorized against the localhost redirect_uri.
+            result
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Callback server dropped")))
+                .map(|code| (code, false))
         }
         code = paste_rx => {
-            code.map_err(|_| anyhow::anyhow!("Stdin closed unexpectedly"))
+            // Manual paste: the page hands back "<code>#<state>"; keep only the
+            // code part. This path authorized against MANUAL_REDIRECT_URL.
+            let raw = code.map_err(|_| anyhow::anyhow!("Stdin closed unexpectedly"))?;
+            let code_only = raw.split('#').next().unwrap_or(&raw).trim().to_string();
+            Ok((code_only, true))
         }
         _ = tokio::time::sleep(Duration::from_secs(120)) => {
             bail!("Authentication timed out after 120 seconds")
