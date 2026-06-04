@@ -54,11 +54,83 @@ pub const MINIMUM_SCOPES: &[&str] = &[CLAUDE_AI_INFERENCE_SCOPE, CLAUDE_AI_PROFI
 /// User-Agent advertised to Anthropic's API on OAuth-authenticated requests.
 /// Must match a Claude Code version the server still accepts; bump when
 /// Anthropic invalidates the current value.
-pub const CLAUDE_CODE_VERSION_FOR_OAUTH: &str = "2.1.75";
+pub const CLAUDE_CODE_VERSION_FOR_OAUTH: &str = "2.1.162";
 
-/// `anthropic-beta` flags that must be present on every OAuth-authenticated
-/// request. Without these the API server rejects subscription tokens.
-pub const OAUTH_BETA_FLAGS: &[&str] = &["claude-code-20250219", "oauth-2025-04-20"];
+/// `anthropic-beta` flags for OAuth requests, in the exact order the official
+/// `claude` sends on a Pro account. The first two are required for the server to
+/// accept subscription tokens; the rest are additive capability flags. Max /
+/// extra-usage accounts get two more (`OAUTH_BETA_FLAGS_MAX_EXTRA`); sending
+/// `context-1m` on Pro-without-credits triggers a 429.
+pub const OAUTH_BETA_FLAGS: &[&str] = &[
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+    "afk-mode-2026-01-31",
+    "extended-cache-ttl-2025-04-11",
+    "cache-diagnosis-2026-04-07",
+];
+
+/// Betas added on Max / extra-usage accounts, inserted after
+/// `prompt-caching-scope-2026-01-05` to keep the official ordering.
+pub const OAUTH_BETA_FLAGS_MAX_EXTRA: &[&str] =
+    &["context-1m-2025-08-07", "mid-conversation-system-2026-04-07"];
+
+/// Build the `anthropic-beta` flag list matching the official client for the
+/// account's tier. `has_premium` = account has 1M-context / extra-usage
+/// entitlement (Max or extra-usage enabled).
+pub fn oauth_beta_flags(has_premium: bool) -> Vec<&'static str> {
+    if !has_premium {
+        return OAUTH_BETA_FLAGS.to_vec();
+    }
+    let mut v = Vec::with_capacity(OAUTH_BETA_FLAGS.len() + 2);
+    for &f in OAUTH_BETA_FLAGS {
+        v.push(f);
+        if f == "prompt-caching-scope-2026-01-05" {
+            v.extend_from_slice(OAUTH_BETA_FLAGS_MAX_EXTRA);
+        }
+    }
+    v
+}
+
+/// User-Agent for OAuth requests: `claude-cli/<version> (external, cli)`.
+pub fn claude_code_user_agent() -> String {
+    format!("claude-cli/{CLAUDE_CODE_VERSION_FOR_OAUTH} (external, cli)")
+}
+
+/// Salt baked into the official bundle (a minified JS var), used in the
+/// `cc_version` client hash. Re-extracted and bumped per release by
+/// `claude-re/scripts/update-claude-code.sh`. See `findings/CCH-NATIVE.md`.
+pub const CLAUDE_CODE_BILLING_SALT: &str = "59cf53e54c78";
+
+/// The official CLI's real client hash: the `cc_version` suffix, i.e.
+/// `sha256(SALT + text[4] + text[7] + text[20] + VERSION)[..3]`, where `text`
+/// is the first user (non-meta) message. (`cch` itself is always literal
+/// `00000`.) See `findings/CCH-NATIVE.md`.
+pub fn claude_code_cc_version_suffix(first_user_text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let chars: Vec<char> = first_user_text.chars().collect();
+    // Out-of-range index -> "0", matching JS `H[z] || "0"`.
+    let pick = |z: usize| chars.get(z).map_or_else(|| "0".to_string(), |c| c.to_string());
+    let k = format!("{}{}{}", pick(4), pick(7), pick(20));
+    let input = format!("{CLAUDE_CODE_BILLING_SALT}{k}{CLAUDE_CODE_VERSION_FOR_OAUTH}");
+    hex::encode(Sha256::digest(input.as_bytes()))[..3].to_string()
+}
+
+/// The `x-anthropic-billing-header` block (`system[0]`): `cc_version` + client
+/// hash suffix, `cc_entrypoint=cli`, and the literal `cch=00000` (the CLI never
+/// computes a cch). See `findings/CCH-NATIVE.md`.
+pub fn claude_code_billing_header(first_user_text: &str) -> String {
+    let suffix = claude_code_cc_version_suffix(first_user_text);
+    format!(
+        "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION_FOR_OAUTH}.{suffix}; cc_entrypoint=cli; cch=00000;"
+    )
+}
 
 /// System-prompt prefix that must appear as the first system block on every
 /// OAuth-authenticated request. Anthropic's gate refuses requests whose system
@@ -102,10 +174,21 @@ pub struct OAuthConfig {
 // `claurst_api::client::AnthropicClient` and is required for these tokens to
 // be honoured by the API.
 //
-// Billing note: tokens minted by a Pro/Max subscription draw from the
-// account's "extra usage" pool when used by a third-party client — they do
-// not consume subscription quota. Users should be aware of this before
-// switching from API-key auth.
+// Billing note (verified live 2026-06-03, Claude Pro account, extra-usage
+// disabled): a Pro/Max subscription token used through Claurst's impersonation
+// IS served and DRAWS FROM THE INTERACTIVE SUBSCRIPTION QUOTA — `oauth/usage`
+// `five_hour`/`seven_day` utilisation climbed (percentage, 0-100 scale) with
+// extra-usage off and `seven_day_oauth_apps` staying null. A side-by-side run of
+// the official `claude -p` (same token via CLAUDE_CODE_OAUTH_TOKEN) hit the same
+// buckets, i.e. Claurst is billed exactly like the official interactive client.
+// This CONTRADICTS the earlier assumption that third-party usage falls back to
+// the "extra usage" pool. The CCH was not even required (requests succeeded
+// without it). Caveats: (1) tested before Anthropic's 2026-06-15 dual-bucket
+// change, which routes `claude -p`/Agent-SDK/third-party usage to a separate
+// monthly API-rate credit — re-verify after that date; (2) advertising the
+// `context-1m` beta forces long-context requests onto extra-usage credits (429
+// "Usage credits are required for long context requests"), so it is omitted from
+// OAUTH_BETA_FLAGS.
 pub const PROD_OAUTH: OAuthConfig = OAuthConfig {
     base_api_url: "https://api.anthropic.com",
     // Routes through claude.com/cai/* for attribution, 307s to claude.ai in
@@ -544,5 +627,31 @@ mod tests {
         assert!(url.contains("state456"));
         assert!(url.contains("S256"));
         assert!(url.contains("localhost"));
+    }
+
+    /// Golden vector cross-checking the `b1q` port. `EXPECTED_SUFFIX` is
+    /// auto-maintained per version by `claude-re/scripts/update-claude-code.sh`
+    /// (independent shell `sha256`); first verified live for 2.1.161 (== `9f1`).
+    #[test]
+    fn test_cc_version_suffix_golden() {
+        // Chars at indices 4/7/20 are 'n', ' ', 'a'.
+        const GOLDEN_INPUT: &str = "Réponds uniquement par le mot: PROXYTEST";
+        const EXPECTED_SUFFIX: &str = "c4f"; // AUTO-MAINTAINED: cc_version suffix
+        assert_eq!(claude_code_cc_version_suffix(GOLDEN_INPUT), EXPECTED_SUFFIX);
+
+        let h = claude_code_billing_header(GOLDEN_INPUT);
+        assert_eq!(
+            h,
+            format!("x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION_FOR_OAUTH}.{EXPECTED_SUFFIX}; cc_entrypoint=cli; cch=00000;")
+        );
+        assert!(h.contains("cch=00000;"));
+    }
+
+    #[test]
+    fn test_cc_version_suffix_short_text_uses_zero_padding() {
+        // Indices 7 and 20 are out of range -> "0"; must not panic.
+        let s = claude_code_cc_version_suffix("abcd");
+        assert_eq!(s.len(), 3);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

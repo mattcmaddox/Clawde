@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
-pub mod cch;
+pub mod bun_tls;
 pub mod codex_adapter;
 
 // Provider-agnostic unified types (Phase 1A).
@@ -455,8 +455,11 @@ pub mod client {
 
     /// The main Anthropic API client.
     pub struct AnthropicClient {
-        http: reqwest::Client,
+        http: wreq::Client,
         config: ClientConfig,
+        /// Stable per-client session id; the official client reuses one id for
+        /// the whole session, in both the header and `metadata.user_id`.
+        session_id: String,
     }
 
     impl AnthropicClient {
@@ -475,58 +478,112 @@ pub mod client {
             self.config.use_bearer_auth
         }
 
-        /// Mutate the outgoing request so it looks like Claude Code when the
-        /// client is authenticated with an OAuth Bearer token:
-        ///
-        /// 1. Prepend the required `"You are Claude Code, …"` system block.
-        ///    Existing system content is preserved as a second block so the
-        ///    rest of Claurst's prompt assembly still reaches the model.
-        ///
-        /// No-op when `use_bearer_auth` is false (API-key flow).
+        /// First user (non-meta) message text — input to the `cc_version` client
+        /// hash. Mirrors the official `juA`: skips `<system-reminder>` blocks.
+        fn first_user_message_text(messages: &[ApiMessage]) -> String {
+            let is_meta = |s: &str| s.trim_start().starts_with("<system-reminder>");
+            for m in messages {
+                if m.role != "user" {
+                    continue;
+                }
+                match &m.content {
+                    serde_json::Value::String(s) if !is_meta(s) => return s.clone(),
+                    serde_json::Value::Array(blocks) => {
+                        for b in blocks {
+                            if b.get("type").and_then(|v| v.as_str()) != Some("text") {
+                                continue;
+                            }
+                            if let Some(text) = b.get("text").and_then(|v| v.as_str()) {
+                                if !is_meta(text) {
+                                    return text.to_string();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            String::new()
+        }
+
+        /// Make an OAuth request look like Claude Code: prepend the
+        /// `x-anthropic-billing-header` block (`system[0]`) then the
+        /// `"You are Claude Code…"` identity block (`system[1]`), and strip
+        /// Claurst's own attribution so the official identity is the only one the
+        /// server sees. No-op for API-key auth.
         fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
             if !self.config.use_bearer_auth {
                 return;
             }
 
-            let identity_block = SystemBlock {
+            let first_user_text = Self::first_user_message_text(&request.messages);
+            let text_block = |text: String| SystemBlock {
                 block_type: "text".to_string(),
-                text: claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string(),
+                text,
                 cache_control: None,
+            };
+            let billing_block =
+                text_block(claurst_core::oauth_config::claude_code_billing_header(&first_user_text));
+            let identity_block =
+                text_block(claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
+
+            // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
+            // the injected official identity must be the only one the server sees.
+            let strip_attr = |text: &str| -> String {
+                let t = text.trim_start();
+                if t.starts_with("You are Claurst") || t.starts_with("You are a Claude agent") {
+                    if let Some(i) = t.find("\n\n") {
+                        return t[i + 2..].to_string();
+                    }
+                    if let Some(i) = t.find('\n') {
+                        return t[i + 1..].to_string();
+                    }
+                    return String::new();
+                }
+                text.to_string()
             };
 
             request.system = match request.system.take() {
-                None => Some(SystemPrompt::Blocks(vec![identity_block])),
+                None => Some(SystemPrompt::Blocks(vec![billing_block, identity_block])),
                 Some(SystemPrompt::Text(existing)) => {
-                    let existing_block = SystemBlock {
-                        block_type: "text".to_string(),
-                        text: existing,
-                        cache_control: None,
-                    };
-                    Some(SystemPrompt::Blocks(vec![identity_block, existing_block]))
+                    let mut blocks = vec![billing_block, identity_block];
+                    let stripped = strip_attr(&existing);
+                    if !stripped.is_empty() {
+                        blocks.push(text_block(stripped));
+                    }
+                    Some(SystemPrompt::Blocks(blocks))
                 }
                 Some(SystemPrompt::Blocks(mut blocks)) => {
-                    // Avoid duplicating the identity block on retries / re-sends.
-                    let already_first = blocks.first().is_some_and(|b| {
-                        b.text == claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
-                    });
-                    if !already_first {
-                        blocks.insert(0, identity_block);
+                    let has_billing = blocks
+                        .first()
+                        .is_some_and(|b| b.text.starts_with("x-anthropic-billing-header:"));
+                    if !has_billing {
+                        if let Some(first) = blocks.first_mut() {
+                            first.text = strip_attr(&first.text);
+                        }
+                        let has_identity = blocks.first().is_some_and(|b| {
+                            b.text == claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
+                        });
+                        if !has_identity {
+                            blocks.insert(0, identity_block);
+                        }
+                        blocks.insert(0, billing_block);
                     }
                     Some(SystemPrompt::Blocks(blocks))
                 }
             };
         }
 
-        /// Build a new client.  Panics if `config.api_key` is empty.
+        /// Build a new client. Uses a `wreq`/BoringSSL client whose TLS
+        /// fingerprint matches Bun (the official client). An empty key is
+        /// allowed; validation is deferred to the first call.
         pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
-            // Allow empty key at construction — validation is deferred to
-            // the first API call, so non-Anthropic provider setups can still
-            // create this client without an Anthropic key configured.
-            let http = reqwest::Client::builder()
-                .timeout(config.request_timeout)
-                .build()?;
-
-            Ok(Self { http, config })
+            let http = crate::bun_tls::build_anthropic_client(config.request_timeout)?;
+            Ok(Self {
+                http,
+                config,
+                session_id: uuid::Uuid::new_v4().to_string(),
+            })
         }
 
         /// Convenience constructor that resolves the key from config/env.
@@ -610,7 +667,7 @@ pub mod client {
 
             let resp = self.send_with_retry(&body).await?;
             let status = resp.status();
-            let text = resp.text().await.map_err(ClaudeError::Http)?;
+            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -640,7 +697,7 @@ pub mod client {
                 .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
 
             let status = resp.status();
-            let text = resp.text().await.map_err(ClaudeError::Http)?;
+            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -718,7 +775,7 @@ pub mod client {
             let status = resp.status();
 
             if !status.is_success() {
-                let text = resp.text().await.map_err(ClaudeError::Http)?;
+                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 return Err(self.parse_api_error(status.as_u16(), &text));
             }
 
@@ -756,13 +813,15 @@ pub mod client {
                 .header("anthropic-version", &self.config.api_version)
                 .header("content-type", "application/json");
             if self.config.use_bearer_auth {
-                let ua = format!(
-                    "claude-cli/{}",
-                    claurst_core::oauth_config::CLAUDE_CODE_VERSION_FOR_OAUTH
-                );
                 req = req
-                    .header("anthropic-beta", claurst_core::oauth_config::OAUTH_BETA_FLAGS.join(","))
-                    .header("user-agent", ua)
+                    .header(
+                        "anthropic-beta",
+                        claurst_core::oauth_config::OAUTH_BETA_FLAGS.join(","),
+                    )
+                    .header(
+                        "user-agent",
+                        claurst_core::oauth_config::claude_code_user_agent(),
+                    )
                     .header("x-app", "cli")
                     .header("Authorization", format!("Bearer {}", &self.config.api_key));
             } else {
@@ -790,38 +849,105 @@ pub mod client {
         async fn send_with_retry(
             &self,
             body: &Value,
-        ) -> Result<reqwest::Response, ClaudeError> {
+        ) -> Result<wreq::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
-            // Serialize body to JSON string for CCH signing
-            let body_str = serde_json::to_string(body)
-                .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
-            let body_bytes = body_str.as_bytes();
+            let use_oauth = self.config.use_bearer_auth;
+            let session_id = self.session_id.clone();
+
+            // Active OAuth account, fetched once and cached for the process
+            // lifetime. `account_uuid` -> `metadata.user_id`; `has_premium`
+            // selects the account-tier `anthropic-beta` set.
+            let (account_uuid, has_premium): (String, bool) = if use_oauth {
+                use tokio::sync::OnceCell;
+                static CACHE: OnceCell<Option<(String, bool)>> = OnceCell::const_new();
+                CACHE
+                    .get_or_init(claurst_core::oauth::current_anthropic_account_meta)
+                    .await
+                    .clone()
+                    .unwrap_or_default()
+            } else {
+                (String::new(), false)
+            };
+
+            // On the OAuth path, inject `metadata.user_id`. There is no `cch`
+            // step: the interactive CLI sends a literal `cch=00000` and its real
+            // client hash rides in the `cc_version` suffix (set in
+            // `apply_oauth_stealth`). See `claude-re/findings/CCH-NATIVE.md`.
+            let body_str = if use_oauth {
+                let mut body_val = body.clone();
+                if let serde_json::Value::Object(map) = &mut body_val {
+                    let device_id = {
+                        use sha2::{Digest, Sha256};
+                        let user = std::env::var("USER")
+                            .or_else(|_| std::env::var("USERNAME"))
+                            .unwrap_or_default();
+                        let home = std::env::var("HOME")
+                            .or_else(|_| std::env::var("USERPROFILE"))
+                            .unwrap_or_default();
+                        let mut h = Sha256::new();
+                        h.update(user.as_bytes());
+                        h.update(b":");
+                        h.update(home.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    let user_id = serde_json::json!({
+                        "device_id": device_id,
+                        "account_uuid": account_uuid,
+                        "session_id": session_id,
+                    })
+                    .to_string();
+                    match map.get_mut("metadata") {
+                        Some(serde_json::Value::Object(m)) => {
+                            m.insert("user_id".to_string(), serde_json::Value::String(user_id));
+                        }
+                        _ => {
+                            map.insert(
+                                "metadata".to_string(),
+                                serde_json::json!({ "user_id": user_id }),
+                            );
+                        }
+                    }
+                }
+                serde_json::to_string(&body_val)
+            } else {
+                serde_json::to_string(body)
+            }
+            .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
+
+            // Account-tier `anthropic-beta` set (Pro vs Max), stable across retries.
+            let anthropic_beta = if use_oauth {
+                let mut s = claurst_core::oauth_config::oauth_beta_flags(has_premium).join(",");
+                if !self.config.beta_features.is_empty() {
+                    if !s.is_empty() {
+                        s.push(',');
+                    }
+                    s.push_str(&self.config.beta_features);
+                }
+                s
+            } else {
+                self.config.beta_features.clone()
+            };
+            // Map Rust's target triple onto the Stainless SDK's OS/arch labels.
+            let stainless_os = match std::env::consts::OS {
+                "macos" => "MacOS",
+                "linux" => "Linux",
+                "windows" => "Windows",
+                "freebsd" => "FreeBSD",
+                "openbsd" => "OpenBSD",
+                other => other,
+            };
+            let stainless_arch = match std::env::consts::ARCH {
+                "aarch64" => "arm64",
+                "x86_64" => "x64",
+                "x86" => "x32",
+                other => other,
+            };
 
             loop {
                 attempts += 1;
-
-                // Use Bearer auth for Claude.ai OAuth tokens; x-api-key for regular keys.
-                let use_oauth = self.config.use_bearer_auth;
-
-                // On the OAuth path we impersonate Claude Code: prepend the
-                // required beta flags, advertise `claude-cli/<ver>` as the
-                // user-agent, and drop the CCH billing header (the real
-                // Claude Code client sends it but the API does not require
-                // it for OAuth tokens, and emitting it would fingerprint
-                // mismatch against the impersonated UA).
-                let anthropic_beta = if use_oauth {
-                    let mut flags: Vec<&str> =
-                        claurst_core::oauth_config::OAUTH_BETA_FLAGS.to_vec();
-                    if !self.config.beta_features.is_empty() {
-                        flags.push(&self.config.beta_features);
-                    }
-                    flags.join(",")
-                } else {
-                    self.config.beta_features.clone()
-                };
 
                 let mut req = self
                     .http
@@ -832,31 +958,37 @@ pub mod client {
                     .header("accept", "text/event-stream");
 
                 if use_oauth {
-                    let ua = format!(
-                        "claude-cli/{}",
-                        claurst_core::oauth_config::CLAUDE_CODE_VERSION_FOR_OAUTH
-                    );
+                    // Official UA, `x-app` and Stainless telemetry headers so the
+                    // server treats this as a first-party request. The billing
+                    // header already rides in `system[0]` of the body.
                     req = req
-                        .header("user-agent", ua)
+                        .header(
+                            "user-agent",
+                            claurst_core::oauth_config::claude_code_user_agent(),
+                        )
                         .header("x-app", "cli")
+                        .header("anthropic-dangerous-direct-browser-access", "true")
+                        .header("x-stainless-lang", "js")
+                        .header("x-stainless-runtime", "node")
+                        .header("x-stainless-os", stainless_os)
+                        .header("x-stainless-arch", stainless_arch)
+                        .header("x-stainless-runtime-version", "v22.0.0")
+                        .header("x-stainless-package-version", "0.94.0")
+                        .header("x-stainless-retry-count", (attempts - 1).to_string())
+                        .header("x-stainless-timeout", "600")
+                        .header("x-claude-code-session-id", &session_id)
+                        .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
                         .header("Authorization", format!("Bearer {}", &self.config.api_key));
                 } else {
-                    // Compute CCH billing hash and attach on the API-key path
-                    // only — this is the codepath the official client uses
-                    // for direct API customers.
-                    let cch_hash = cch::compute_cch(body_bytes);
-                    let billing_header = format!(
-                        "cc_version=0.1; cc_entrypoint=claude_code; {}; cc_workload=claude_code;",
-                        cch_hash
-                    );
-                    req = req
-                        .header("x-anthropic-billing-header", billing_header)
-                        .header("x-api-key", &self.config.api_key);
+                    // API-key path: no `x-anthropic-billing-header` (it is a
+                    // Claude Code / subscription artefact, not emitted by the
+                    // direct-API SDK).
+                    req = req.header("x-api-key", &self.config.api_key);
                 }
 
                 let req = req.body(body_str.clone());
 
-                let resp = req.send().await.map_err(ClaudeError::Http)?;
+                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 let status = resp.status().as_u16();
 
                 // 200-299: success
@@ -917,7 +1049,7 @@ pub mod client {
 
         /// Read an SSE byte stream, parse frames, and emit `AnthropicStreamEvent`s.
         async fn process_sse_stream(
-            resp: reqwest::Response,
+            resp: wreq::Response,
             handler: Arc<dyn StreamHandler>,
             tx: mpsc::Sender<streaming::AnthropicStreamEvent>,
         ) -> Result<(), ClaudeError> {
@@ -928,7 +1060,7 @@ pub mod client {
             let mut leftover = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(ClaudeError::Http)?;
+                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 let text = String::from_utf8_lossy(&chunk);
 
                 // Prepend any leftover from the previous chunk
