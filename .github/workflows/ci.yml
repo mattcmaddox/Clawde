@@ -58,7 +58,10 @@ jobs:
 
       - name: Run tests
         working-directory: src-rust
-        run: cargo test --workspace --locked
+        # Run serially: a number of tests mutate process-global state (env vars
+        # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
+        # parallel execution, flaking non-deterministically across runners.
+        run: cargo test --workspace --locked -- --test-threads=1
 
       # Advisory for now: the codebase has pre-existing clippy warnings and
       # rustfmt drift. Flip continue-on-error off once they are cleaned up.
