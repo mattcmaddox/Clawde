@@ -90,15 +90,31 @@ impl Default for EffortLevel {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` for models that support extended thinking / effort levels.
+///
+/// Covers Claude's extended-thinking models and the GPT-5 reasoning family
+/// (incl. Codex / ChatGPT models like `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`),
+/// which honour OpenAI's `reasoning_effort` ladder. Lets the picker surface the
+/// ←/→ thinking-level selector for Codex the way opencode does.
 pub fn model_supports_effort(id: &str) -> bool {
     id.starts_with("claude-3-7")
         || id.starts_with("claude-opus-4")
         || id.starts_with("claude-sonnet-4")
+        || is_gpt5_reasoning_model(id)
 }
 
 /// Returns `true` for models that support the maximum effort tier.
+///
+/// For Claude this is Opus-only; for the GPT-5 family the top tier maps to
+/// OpenAI's `xhigh` ("extra high") reasoning effort on the Codex endpoint.
 pub fn model_supports_max_effort(id: &str) -> bool {
-    id.starts_with("claude-opus-4")
+    id.starts_with("claude-opus-4") || is_gpt5_reasoning_model(id)
+}
+
+/// Whether `id` is a GPT-5 reasoning model (`gpt-5*`), excluding the
+/// non-reasoning chat / pro snapshots that ignore `reasoning_effort`.
+fn is_gpt5_reasoning_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.starts_with("gpt-5") && !id.contains("-chat") && !id.contains("-pro")
 }
 
 /// Returns a short description string based on the model family inferred from
@@ -1160,6 +1176,20 @@ mod tests {
         assert!(model_supports_max_effort("claude-opus-4-6"));
         assert!(!model_supports_max_effort("claude-sonnet-4-6"));
         assert!(!model_supports_max_effort("claude-haiku-4-5"));
+    }
+
+    // 12b. GPT-5 codex/reasoning models expose the effort selector (incl. max).
+    #[test]
+    fn gpt5_codex_models_support_effort() {
+        for id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            assert!(model_supports_effort(id), "{id} should support effort");
+            assert!(model_supports_max_effort(id), "{id} should support max/xhigh");
+        }
+        // Non-reasoning chat / pro snapshots are excluded.
+        assert!(!model_supports_effort("gpt-5-chat-latest"));
+        assert!(!model_supports_effort("gpt-5.5-pro"));
+        // Non-gpt5 stays unaffected.
+        assert!(!model_supports_effort("gpt-4o"));
     }
 
     // 13. Non-effort models return None from effective_effort.

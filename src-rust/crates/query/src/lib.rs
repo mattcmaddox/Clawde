@@ -363,10 +363,33 @@ fn build_provider_options(
         let reasoning_effort = effort_level
             .map(reasoning_effort_for_level)
             .unwrap_or("medium");
+        // Codex (ChatGPT) accepts the full gpt-5 effort ladder including
+        // `xhigh`, so surface the top "Max" tier as "extra high" there —
+        // matching opencode — without changing the value sent to other
+        // OpenAI-compatible providers that may not accept it.
+        let reasoning_effort = if matches!(provider_id, "codex" | "openai-codex")
+            && effort_level == Some(claurst_core::effort::EffortLevel::Max)
+        {
+            "xhigh"
+        } else {
+            reasoning_effort
+        };
         options.insert(
             "reasoningEffort".to_string(),
             serde_json::json!(reasoning_effort),
         );
+
+        // Match opencode's gpt-5 defaults for the Codex (ChatGPT) endpoint:
+        // request an auto reasoning summary and carry encrypted reasoning state
+        // across stateless turns. Scoped to Codex so other OpenAI-compatible
+        // providers that ignore these fields are unaffected.
+        if matches!(provider_id, "codex" | "openai-codex") {
+            options.insert("reasoningSummary".to_string(), serde_json::json!("auto"));
+            options.insert(
+                "include".to_string(),
+                serde_json::json!(["reasoning.encrypted_content"]),
+            );
+        }
 
         if model_id.starts_with("gpt-5")
             && model_id.contains("gpt-5.")
@@ -2444,6 +2467,37 @@ mod tests {
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
         assert_eq!(options["usage"]["include"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_build_provider_options_codex_effort_ladder() {
+        // Codex maps the lower tiers like any OpenAI reasoning model...
+        for (level, expected) in [
+            (claurst_core::effort::EffortLevel::Low, "low"),
+            (claurst_core::effort::EffortLevel::Medium, "medium"),
+            (claurst_core::effort::EffortLevel::High, "high"),
+        ] {
+            let options = build_provider_options("openai-codex", "gpt-5.5", Some(level), None);
+            assert_eq!(options["reasoningEffort"], serde_json::json!(expected));
+        }
+        // ...but the top "Max" tier becomes "xhigh" (extra high) on Codex.
+        let options = build_provider_options(
+            "openai-codex",
+            "gpt-5.5",
+            Some(claurst_core::effort::EffortLevel::Max),
+            None,
+        );
+        assert_eq!(options["reasoningEffort"], serde_json::json!("xhigh"));
+        assert_eq!(options["reasoningSummary"], serde_json::json!("auto"));
+
+        // Other OpenAI-compatible providers keep "high" for Max (no xhigh).
+        let other = build_provider_options(
+            "openrouter",
+            "gpt-5.4",
+            Some(claurst_core::effort::EffortLevel::Max),
+            None,
+        );
+        assert_eq!(other["reasoningEffort"], serde_json::json!("high"));
     }
 
     #[test]
