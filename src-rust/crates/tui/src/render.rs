@@ -1640,50 +1640,105 @@ fn render_system_annotation_lines(
 
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+/// Per-tool glyph shown at the head of a tool block (opencode-style: the icon
+/// conveys the tool, the line then shows the primary argument). Falls back to
+/// the generic `~` for unmapped tools.
+fn tool_icon(normalized: &str) -> &'static str {
+    match normalized {
+        "bash" | "powershell" => "$",
+        "read" => "\u{2190}",                            // ←
+        "write" | "apply_patch" | "edit" => "\u{270E}",  // ✎
+        "glob" | "list" => "\u{2731}",                   // ✱
+        "grep" | "codesearch" => "\u{2315}",             // ⌕
+        "webfetch" => "\u{2197}",                        // ↗
+        "websearch" => "\u{2315}",                       // ⌕
+        "todowrite" | "todo_write" | "todo" => "\u{2630}", // ☰
+        "task" | "agent" => "\u{25B8}",                  // ▸
+        _ => "~",
+    }
+}
+
+/// Replace a leading home-directory prefix with `~` for compact display
+/// (mirrors pi's `shortenPath`). Works on Windows too via `dirs::home_dir`.
+fn shorten_home_path(s: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        let home = home.trim_end_matches(['/', '\\']);
+        if !home.is_empty() && s.starts_with(home) {
+            let rest = &s[home.len()..];
+            return format!("~{}", rest);
+        }
+    }
+    s.to_string()
+}
+
+/// Running-state verb shown (with shimmer) while a tool is in flight.
+fn tool_running_label(normalized: &str, fallback: &str) -> String {
+    match normalized {
+        "bash" | "powershell" => "Running command",
+        "read" => "Reading file",
+        "write" | "apply_patch" => "Writing file",
+        "edit" => "Editing file",
+        "glob" | "list" => "Listing files",
+        "grep" | "codesearch" => "Searching code",
+        "webfetch" => "Fetching page",
+        "websearch" => "Searching web",
+        "todowrite" | "todo_write" | "todo" => "Updating todos",
+        _ => fallback,
+    }
+    .to_string()
+}
+
 fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::ToolUseBlock, frame_count: u64) {
     let input_val: serde_json::Value =
         serde_json::from_str(&block.input_json).unwrap_or(serde_json::Value::Null);
     let normalized = block.name.to_ascii_lowercase();
     let running = block.status == ToolStatus::Running;
-    let mut summary = crate::messages::extract_tool_summary(&block.name, &input_val);
-    let title = if normalized == "task" || normalized == "agent" {
-        if let Some(description) = input_val.get("description").and_then(|value| value.as_str()) {
-            summary = description.to_string();
-        }
-        crate::messages::subagent_title(&input_val)
-    } else {
-        match (normalized.as_str(), running) {
-            ("bash" | "powershell", true) => "Running command".to_string(),
-            ("bash" | "powershell", false) => "Ran command".to_string(),
-            ("read", true) => "Reading file".to_string(),
-            ("read", false) => "Read file".to_string(),
-            ("write" | "apply_patch", true) => "Writing file".to_string(),
-            ("write" | "apply_patch", false) => "Wrote file".to_string(),
-            ("edit", true) => "Editing file".to_string(),
-            ("edit", false) => "Edited file".to_string(),
-            ("glob" | "list", true) => "Listing files".to_string(),
-            ("glob" | "list", false) => "Listed files".to_string(),
-            ("grep" | "codesearch", true) => "Searching code".to_string(),
-            ("grep" | "codesearch", false) => "Searched code".to_string(),
-            ("webfetch", true) => "Fetching page".to_string(),
-            ("webfetch", false) => "Fetched page".to_string(),
-            ("websearch", true) => "Searching web".to_string(),
-            ("websearch", false) => "Searched web".to_string(),
-            _ => block.name.clone(),
-        }
-    };
-
     let accent = if block.status == ToolStatus::Error {
         Color::Rgb(255, 140, 0)
     } else {
         CLAUDE_ORANGE
     };
-    let mut header_spans = vec![Span::styled("   ~ ".to_string(), Style::default().fg(accent))];
-    if running {
-        header_spans.extend(shimmer_spans(&title, frame_count));
+    let icon = tool_icon(&normalized);
+
+    // TodoWrite renders as a real checklist rather than a generic tool block.
+    if matches!(normalized.as_str(), "todowrite" | "todo_write" | "todo")
+        && render_todo_block(lines, &input_val, icon, accent, running, frame_count)
+    {
+        return;
+    }
+
+    // Primary argument shown on the header line (icon + arg), opencode-style.
+    let mut summary = crate::messages::extract_tool_summary(&block.name, &input_val);
+    let running_label = if normalized == "task" || normalized == "agent" {
+        if let Some(description) = input_val.get("description").and_then(|value| value.as_str()) {
+            summary = description.to_string();
+        }
+        crate::messages::subagent_title(&input_val)
     } else {
+        tool_running_label(&normalized, &block.name)
+    };
+
+    // Shorten home paths in path-bearing summaries.
+    if matches!(
+        normalized.as_str(),
+        "read" | "edit" | "write" | "apply_patch" | "glob" | "list"
+    ) {
+        summary = shorten_home_path(&summary);
+    }
+
+    let mut header_spans = vec![Span::styled(format!("   {} ", icon), Style::default().fg(accent))];
+    if running {
+        header_spans.extend(shimmer_spans(&running_label, frame_count));
+    } else {
+        // Show the primary argument; fall back to the tool name when there is none.
+        let primary = if summary.is_empty() {
+            block.name.clone()
+        } else {
+            summary
+        };
         header_spans.push(Span::styled(
-            title,
+            primary,
             Style::default()
                 .fg(if block.status == ToolStatus::Error { accent } else { Color::White })
                 .add_modifier(Modifier::BOLD),
@@ -1691,39 +1746,7 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     }
     lines.push(Line::from(header_spans));
 
-    if !summary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("     "),
-            Span::styled(summary, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    if normalized == "bash" || normalized == "powershell" {
-        let command = input_val
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        for (i, cmd_line) in command.lines().enumerate() {
-            if i >= 2 {
-                break;
-            }
-            let display: String = cmd_line.chars().take(160).collect();
-            let display = if cmd_line.chars().count() > 160 {
-                format!("{}\u{2026}", display)
-            } else {
-                display
-            };
-            lines.push(Line::from(vec![
-                Span::styled("     $ ".to_string(), Style::default().fg(Color::Green)),
-                Span::styled(
-                    display,
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-    }
-
-    // Output preview (done/error state)
+    // Output preview (done/error state) — home paths shortened, dimmed.
     if let Some(ref preview) = block.output_preview {
         let preview_style = match block.status {
             ToolStatus::Error => Style::default().fg(Color::Rgb(255, 140, 0)),
@@ -1743,11 +1766,95 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
             } else {
                 lines.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled(line_text.to_string(), preview_style),
+                    Span::styled(shorten_home_path(line_text), preview_style),
                 ]));
             }
         }
     }
+}
+
+/// Render a TodoWrite call as a checklist. Returns `false` (so the caller can
+/// fall back to the generic block) when the input carries no `todos` array.
+fn render_todo_block(
+    lines: &mut Vec<Line<'static>>,
+    input_val: &serde_json::Value,
+    icon: &str,
+    accent: Color,
+    running: bool,
+    frame_count: u64,
+) -> bool {
+    let Some(todos) = input_val.get("todos").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if todos.is_empty() {
+        return false;
+    }
+
+    fn status_of(t: &serde_json::Value) -> &str {
+        t.get("status").and_then(|s| s.as_str()).unwrap_or("pending")
+    }
+    let done = todos.iter().filter(|t| status_of(t) == "completed").count();
+    let total = todos.len();
+
+    // Header: ☰ Todos   <done>/<total>
+    let mut header = vec![Span::styled(format!("   {} ", icon), Style::default().fg(accent))];
+    if running {
+        header.extend(shimmer_spans("Updating todos", frame_count));
+    } else {
+        header.push(Span::styled(
+            "Todos".to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::styled(
+            format!("  {}/{} done", done, total),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header));
+
+    // Checklist items: ✓ done (green/dim) · • in-progress (orange) · ○ pending.
+    const MAX_ITEMS: usize = 12;
+    for t in todos.iter().take(MAX_ITEMS) {
+        let content = t
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        let (glyph, glyph_color, text_style) = match status_of(t) {
+            "completed" => (
+                "\u{2713}", // ✓
+                Color::Rgb(120, 200, 120),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            "in_progress" => (
+                "\u{2022}", // •
+                accent,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            _ => (
+                "\u{25CB}", // ○
+                Color::Rgb(150, 150, 150),
+                Style::default().fg(Color::Rgb(170, 170, 170)),
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("     {} ", glyph), Style::default().fg(glyph_color)),
+            Span::styled(content.to_string(), text_style),
+        ]));
+    }
+    if total > MAX_ITEMS {
+        lines.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(
+                format!("\u{2026} {} more", total - MAX_ITEMS),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    true
 }
 
 // -----------------------------------------------------------------------
@@ -2953,4 +3060,110 @@ pub fn render_teammate_header(
     }
 
     Line::from(spans)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — tool-block rendering (icon headers, path shortening, todo checklist)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tool_block_tests {
+    use super::*;
+    use crate::app::{ToolStatus, ToolUseBlock};
+
+    fn block(name: &str, status: ToolStatus, input: &str, preview: Option<&str>) -> ToolUseBlock {
+        ToolUseBlock {
+            id: "t".into(),
+            name: name.into(),
+            turn_index: None,
+            status,
+            output_preview: preview.map(|s| s.to_string()),
+            input_json: input.into(),
+        }
+    }
+
+    fn render(b: &ToolUseBlock) -> Vec<String> {
+        let mut lines = Vec::new();
+        render_tool_block_lines(&mut lines, b, 0);
+        lines.iter().map(flatten_line_text).collect()
+    }
+
+    #[test]
+    fn icons_are_per_tool() {
+        assert_eq!(tool_icon("bash"), "$");
+        assert_eq!(tool_icon("read"), "\u{2190}");
+        assert_eq!(tool_icon("glob"), "\u{2731}");
+        assert_eq!(tool_icon("todowrite"), "\u{2630}");
+        assert_eq!(tool_icon("something-unknown"), "~");
+    }
+
+    #[test]
+    fn shorten_home_replaces_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join("projects").join("x.yaml");
+            let shortened = shorten_home_path(&p.to_string_lossy());
+            assert!(shortened.starts_with("~"), "got {shortened:?}");
+            assert!(shortened.ends_with("x.yaml"));
+            assert!(!shortened.contains(home.to_string_lossy().as_ref()));
+        }
+        // A non-home path is left untouched.
+        assert_eq!(shorten_home_path("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn bash_header_is_icon_led_and_not_duplicated() {
+        let b = block(
+            "bash",
+            ToolStatus::Done,
+            r#"{"command":"python3 - <<'PY'\nfrom pathlib import Path"}"#,
+            Some("218183\nMarketing Outbound OS"),
+        );
+        let lines = render(&b);
+        // Header: "$ python3 - <<'PY'"
+        assert!(lines[0].contains('$'), "header should be icon-led: {:?}", lines[0]);
+        assert!(lines[0].contains("python3 - <<'PY'"), "header shows command: {:?}", lines[0]);
+        // The command must appear exactly once (no summary + $-line duplication).
+        let joined = lines.join("\n");
+        assert_eq!(joined.matches("python3 - <<'PY'").count(), 1, "no dup: {joined:?}");
+        // Output preview still shown.
+        assert!(joined.contains("218183"));
+    }
+
+    #[test]
+    fn read_header_shortens_home_path() {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join("FOLLOWUPS.md");
+            let input = format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy());
+            let b = block("read", ToolStatus::Done, &input, None);
+            let lines = render(&b);
+            assert!(lines[0].contains("\u{2190}"), "read icon: {:?}", lines[0]);
+            assert!(lines[0].contains("~"), "home shortened: {:?}", lines[0]);
+            assert!(!lines[0].contains(home.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn todo_renders_checklist_with_glyphs_and_counts() {
+        let b = block(
+            "TodoWrite",
+            ToolStatus::Done,
+            r#"{"todos":[
+                {"content":"Locate files","status":"completed"},
+                {"content":"Build importer","status":"in_progress"},
+                {"content":"Wire adapter","status":"pending"}
+            ]}"#,
+            Some("Todo list updated (3 total)"),
+        );
+        let lines = render(&b);
+        let joined = lines.join("\n");
+        // Header shows count, not the raw "Todo list updated (...)".
+        assert!(joined.contains("Todos"), "{joined:?}");
+        assert!(joined.contains("1/3 done"), "{joined:?}");
+        // Each status has its glyph + content.
+        assert!(joined.contains("\u{2713} Locate files"), "done glyph: {joined:?}");
+        assert!(joined.contains("\u{2022} Build importer"), "in-progress glyph: {joined:?}");
+        assert!(joined.contains("\u{25CB} Wire adapter"), "pending glyph: {joined:?}");
+        // The raw result-preview string must NOT leak into the checklist view.
+        assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
+    }
 }
