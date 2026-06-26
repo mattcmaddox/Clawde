@@ -3149,7 +3149,10 @@ mod tool_block_tests {
     fn read_header_shortens_home_path() {
         if let Some(home) = dirs::home_dir() {
             let path = home.join("FOLLOWUPS.md");
-            let input = format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy());
+            let input = serde_json::json!({
+                "file_path": path.to_string_lossy().to_string(),
+            })
+            .to_string();
             let b = block("read", ToolStatus::Done, &input, None);
             let lines = render(&b);
             assert!(lines[0].contains('<'), "read icon: {:?}", lines[0]);
