@@ -20,6 +20,95 @@ use tracing::debug;
 /// this marker is metadata (final pwd + env dump) rather than user-visible output.
 const SHELL_STATE_SENTINEL: &str = "__CC_SHELL_STATE__";
 
+/// Read one line from an optional line reader, mapping read errors / EOF to
+/// `None`. Used by the `tokio::select!` loop in [`drive_child`].
+async fn next_line<R>(reader: &mut Option<tokio::io::Lines<R>>) -> Option<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    match reader {
+        Some(lines) => lines.next_line().await.ok().flatten(),
+        None => None,
+    }
+}
+
+/// Pull any *already-buffered* lines from `reader` into `sink`, stopping at EOF,
+/// a read error, or after a short grace period with no new data.
+///
+/// Called after the direct child has exited: it must never block on pipe EOF,
+/// because a tool-spawned grandchild that detached into its own session can keep
+/// the pipe's write end open indefinitely (issue #184).
+async fn drain_buffered<R>(reader: &mut Option<tokio::io::Lines<R>>, sink: &mut Vec<String>)
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let Some(lines) = reader else { return };
+    // Loop ends on the first non-`Ok(Ok(Some))`: EOF, a read error, or no data
+    // within the grace window (a detached grandchild holding the pipe open).
+    while let Ok(Ok(Some(line))) =
+        tokio::time::timeout(Duration::from_millis(50), lines.next_line()).await
+    {
+        sink.push(line);
+    }
+}
+
+/// Drive a spawned child to completion: drain its stdout/stderr concurrently
+/// with waiting for it to exit, then return `(stdout_lines, stderr_lines,
+/// exit_code)`. `exit_code` is `None` when the wait hit `timeout_dur` (the
+/// child is killed in that case).
+///
+/// Reading concurrently with `wait()` avoids the classic pipe-buffer deadlock,
+/// and — crucially — we stop reading as soon as the *direct* child exits rather
+/// than waiting for pipe EOF. A grandchild that detached into a new session
+/// (`setsid` / `start_new_session`) inherits the pipe and would otherwise hold
+/// it open forever, hanging the tool long after the command finished (#184).
+async fn drive_child(
+    mut child: tokio::process::Child,
+    timeout_dur: Duration,
+) -> (Vec<String>, Vec<String>, Option<i32>) {
+    let mut out = child.stdout.take().map(|h| BufReader::new(h).lines());
+    let mut err = child.stderr.take().map(|h| BufReader::new(h).lines());
+    let mut stdout_lines = Vec::new();
+    let mut stderr_lines = Vec::new();
+
+    let outcome = tokio::time::timeout(timeout_dur, async {
+        loop {
+            tokio::select! {
+                // Drain output before observing the exit so the trailing
+                // shell-state block isn't lost when the child exits.
+                biased;
+                line = next_line(&mut out), if out.is_some() => match line {
+                    Some(l) => stdout_lines.push(l),
+                    None => out = None,
+                },
+                line = next_line(&mut err), if err.is_some() => match line {
+                    Some(l) => stderr_lines.push(l),
+                    None => err = None,
+                },
+                status = child.wait() => break status,
+            }
+        }
+    })
+    .await;
+
+    let status = match outcome {
+        Ok(status) => status,
+        Err(_) => {
+            // Timed out: kill the direct child (kill_on_drop covers the rest).
+            let _ = child.kill().await;
+            return (stdout_lines, stderr_lines, None);
+        }
+    };
+
+    // Direct child has exited; collect any buffered output without blocking on a
+    // detached grandchild still holding the pipe open.
+    drain_buffered(&mut out, &mut stdout_lines).await;
+    drain_buffered(&mut err, &mut stderr_lines).await;
+
+    let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+    (stdout_lines, stderr_lines, Some(code))
+}
+
 pub struct BashTool;
 
 #[derive(Debug, Deserialize)]
@@ -432,53 +521,26 @@ impl Tool for BashTool {
             build_wrapper_script(&params.command, &state, &ctx.working_dir)
         };
 
-        let mut child = match Command::new("bash")
+        let child = match Command::new("bash")
             .arg("-c")
             .arg(&script)
             .current_dir(&ctx.working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
+            // If this tool future is dropped (e.g. the turn is interrupted) the
+            // child must die with it rather than leak (#184).
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
         };
 
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        let (stdout_lines, stderr_lines, exit) = drive_child(child, timeout_dur).await;
 
-        let result = tokio::time::timeout(timeout_dur, async {
-            let mut stdout_lines = Vec::new();
-            let mut stderr_lines = Vec::new();
-
-            if let Some(stdout) = stdout_handle {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    stdout_lines.push(line);
-                }
-            }
-
-            if let Some(stderr) = stderr_handle {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    stderr_lines.push(line);
-                }
-            }
-
-            let status = child.wait().await;
-            (stdout_lines, stderr_lines, status)
-        })
-        .await;
-
-        match result {
-            Ok((stdout_lines, stderr_lines, status)) => {
-                let exit_code = status
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-
+        match exit {
+            Some(exit_code) => {
                 // Split stdout into user-visible output and the state block.
                 let sentinel_pos = stdout_lines
                     .iter()
@@ -554,10 +616,7 @@ impl Tool for BashTool {
                     ToolResult::success(output)
                 }
             }
-            Err(_) => {
-                let _ = child.kill().await;
-                ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
-            }
+            None => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),
         }
     }
 }
@@ -577,48 +636,25 @@ impl BashTool {
             state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
         };
 
-        let mut child = match Command::new("cmd")
+        let child = match Command::new("cmd")
             .arg("/C")
             .arg(command)
             .current_dir(&effective_cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
+            // Die with this tool future if the turn is interrupted (#184).
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
         };
 
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
+        let (stdout_lines, stderr_lines, exit) = drive_child(child, timeout_dur).await;
 
-        let result = tokio::time::timeout(timeout_dur, async {
-            let mut stdout_lines = Vec::new();
-            let mut stderr_lines = Vec::new();
-
-            if let Some(stdout) = stdout_handle {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    stdout_lines.push(line);
-                }
-            }
-            if let Some(stderr) = stderr_handle {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    stderr_lines.push(line);
-                }
-            }
-            let status = child.wait().await;
-            (stdout_lines, stderr_lines, status)
-        })
-        .await;
-
-        match result {
-            Ok((stdout_lines, stderr_lines, status)) => {
-                let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        match exit {
+            Some(exit_code) => {
                 let mut output = String::new();
                 if !stdout_lines.is_empty() {
                     output.push_str(&stdout_lines.join("\n"));
@@ -651,10 +687,7 @@ impl BashTool {
                     ToolResult::success(output)
                 }
             }
-            Err(_) => {
-                let _ = child.kill().await;
-                ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
-            }
+            None => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),
         }
     }
 }
@@ -704,5 +737,89 @@ mod tests {
         let input: BashInput =
             serde_json::from_str(r#"{"command":"echo hi"}"#).unwrap();
         assert!(!input.run_in_background);
+    }
+
+    /// Permission handler that allows everything — for exercising `execute`.
+    struct AllowAllHandler;
+
+    impl claurst_core::permissions::PermissionHandler for AllowAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+
+        fn request_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+    }
+
+    fn allow_all_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: std::sync::Arc::new(AllowAllHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "bash-test".to_string(),
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+        }
+    }
+
+    /// Regression test for #184: a tool command that spawns a child which
+    /// detaches into its own session (`setsid`) inherits the stdout pipe. The
+    /// foreground reader must stop once the *direct* child exits instead of
+    /// blocking on pipe EOF held open by the detached grandchild — otherwise the
+    /// tool (and the agent turn) hangs for the grandchild's full lifetime.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn foreground_does_not_hang_on_detached_grandchild() {
+        let tool = BashTool;
+        let ctx = allow_all_context();
+
+        // `setsid sleep 30` runs in a brand-new session but inherits our stdout
+        // pipe; `&` lets the wrapper shell return immediately without waiting.
+        let input = json!({
+            "command": "setsid sleep 30 & echo spawned",
+            "timeout": 120000u64,
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
+        let elapsed = started.elapsed();
+
+        let result = result.expect(
+            "execute hung waiting on the detached grandchild's pipe (regression of #184)",
+        );
+        assert!(
+            !result.is_error,
+            "command should have succeeded, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("spawned"),
+            "expected the parent command's output, got: {}",
+            result.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "execute should return promptly after the direct child exits, took {:?}",
+            elapsed
+        );
     }
 }
