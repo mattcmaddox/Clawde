@@ -268,7 +268,7 @@ pub fn models_for_provider_from_registry(
     // ("openai-codex"); without the alias a fresh Codex login lands on the
     // empty-registry fallback and the picker shows no models.
     if is_codex_provider(provider_id) {
-        return codex_provider_models();
+        return codex_provider_models(registry);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -365,22 +365,76 @@ fn is_codex_provider(provider_id: &str) -> bool {
     matches!(provider_id, "codex" | "openai-codex")
 }
 
-/// Curated Codex (ChatGPT-authenticated OpenAI) model list used by
-/// `models_for_provider_from_registry` because models.dev does not catalog
-/// these endpoints.
-fn codex_provider_models() -> Vec<ModelEntry> {
+/// Codex (ChatGPT-authenticated OpenAI) model list.
+///
+/// Mirrors opencode's `provider.models()` hook exactly: instead of hardcoding a
+/// list, it takes the models.dev `openai` catalog and keeps only the ids that
+/// [`codex_model_allowed`] admits (gpt-5.5 / gpt-5.4 / gpt-5.4-mini /
+/// gpt-5.3-codex-spark today, plus any future gpt-5.5+). Costs are zeroed
+/// (subscription billing) and the gpt-5.5 context window is pinned to the Codex
+/// 400K limit. Falls back to the curated [`CODEX_MODELS`] constant only if the
+/// catalog yields nothing (e.g. an empty/old snapshot).
+///
+/// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
+fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
+
+    let mut entries: Vec<&claurst_api::ModelEntry> = registry
+        .list_by_provider("openai")
+        .into_iter()
+        .filter(|e| codex_model_allowed(&e.info.id))
+        .collect();
+
+    if entries.is_empty() {
+        return codex_fallback_models();
+    }
+
+    // Newest release first, then by id for stability — matches the picker's
+    // ordering for other providers.
+    entries.sort_by(|a, b| {
+        let rd_a = a.release_date.as_deref().unwrap_or("");
+        let rd_b = b.release_date.as_deref().unwrap_or("");
+        rd_b.cmp(rd_a).then_with(|| (*a.info.id).cmp(&*b.info.id))
+    });
+
+    entries
+        .iter()
+        .map(|e| {
+            let id: &str = &e.info.id;
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(e.info.context_window);
+            ModelEntry {
+                id: id.to_string(),
+                display_name: e.info.name.clone(),
+                // Costs are zeroed under the ChatGPT subscription, so advertise
+                // "free" rather than the catalog's pay-as-you-go pricing.
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
+                is_current: false,
+            }
+        })
+        .collect()
+}
+
+/// Static fallback used when the models.dev `openai` catalog is unavailable.
+fn codex_fallback_models() -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
         .map(|(id, name)| {
-            let ctx = match *id {
-                "gpt-5.4" | "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.1-codex"
-                | "gpt-5.1-codex-mini" | "gpt-5.1-codex-max" => "400K ctx",
-                _ => "128K ctx",
-            };
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(400_000);
             ModelEntry {
                 id: id.to_string(),
                 display_name: name.to_string(),
-                description: format!("{} | ChatGPT-authenticated", ctx),
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
                 is_current: false,
             }
         })
@@ -1179,10 +1233,18 @@ mod tests {
             let models = models_for_provider_from_registry(pid, &registry);
             assert!(!models.is_empty(), "{pid} must yield Codex models");
             assert_ne!(models[0].id, "default", "{pid} must not fall back to default");
-            assert!(
-                models.iter().any(|m| m.id.contains("codex")),
-                "{pid} should expose at least one gpt-*-codex model"
-            );
+
+            let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+            // Opencode's exact allow-list (from the current snapshot).
+            assert!(ids.contains(&"gpt-5.5"), "{pid} must list gpt-5.5: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4"), "{pid} must list gpt-5.4: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4-mini"), "{pid} must list gpt-5.4-mini: {ids:?}");
+            // gpt-5.5 is the newest -> sorts first -> is the default highlight.
+            assert_eq!(models[0].id, "gpt-5.5", "{pid} newest model should sort first");
+            // Legacy / disallowed models must be gone.
+            for legacy in ["gpt-5.5-pro", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5.4-nano", "gpt-5"] {
+                assert!(!ids.contains(&legacy), "{pid} must not list {legacy}: {ids:?}");
+            }
         }
     }
 

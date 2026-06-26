@@ -282,6 +282,13 @@ impl CodexProvider {
             body["tools"] = json!(tools);
         }
 
+        // Apply reasoning effort / summary / verbosity exactly like the Copilot
+        // Responses path. The query layer already populates `reasoningEffort`
+        // (default "medium"), `reasoningSummary`, and `include` for gpt-5 Codex
+        // models — without this they were silently dropped and every request ran
+        // at the server default. Mirrors opencode's gpt-5 reasoning defaults.
+        CopilotProvider::apply_responses_provider_options_pub(&mut body, &request.provider_options);
+
         body
     }
 
@@ -893,19 +900,20 @@ impl LlmProvider for CodexProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        use claurst_core::codex_oauth::codex_limit_override;
         let models = CODEX_MODELS
             .iter()
-            .map(|(id, name)| ModelInfo {
-                id: ModelId::new(*id),
-                provider_id: self.id.clone(),
-                name: name.to_string(),
-                context_window: match *id {
-                    "gpt-5.4" | "gpt-5-codex" | "gpt-5-mini" => 400_000,
-                    "gpt-4.1" => 128_000,
-                    "o4-mini" => 200_000,
-                    _ => 128_000,
-                },
-                max_output_tokens: 32_768,
+            .map(|(id, name)| {
+                let (context_window, max_output_tokens) = codex_limit_override(id)
+                    .map(|(ctx, _, out)| (ctx, out))
+                    .unwrap_or((400_000, 128_000));
+                ModelInfo {
+                    id: ModelId::new(*id),
+                    provider_id: self.id.clone(),
+                    name: name.to_string(),
+                    context_window,
+                    max_output_tokens,
+                }
             })
             .collect();
         Ok(models)

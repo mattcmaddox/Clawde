@@ -279,6 +279,14 @@ impl CopilotProvider {
         Self::to_responses_input(request)
     }
 
+    /// Public re-export of the Responses-API provider-option mapping
+    /// (`reasoningEffort`/`reasoningSummary` -> `reasoning`, `textVerbosity` ->
+    /// `text.verbosity`, `include`) so `CodexProvider` applies reasoning effort
+    /// identically instead of dropping it.
+    pub fn apply_responses_provider_options_pub(body: &mut Value, provider_options: &Value) {
+        Self::apply_responses_provider_options(body, provider_options)
+    }
+
     fn to_responses_input(request: &ProviderRequest) -> Vec<Value> {
         let mut input = Vec::new();
 
