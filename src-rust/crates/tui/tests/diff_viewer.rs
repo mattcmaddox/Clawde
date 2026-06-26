@@ -28,8 +28,7 @@ fn parse_diff_returns_hunks() {
 #[test]
 fn parse_diff_has_added_lines() {
     let files = parse_unified_diff(SIMPLE_DIFF);
-    let added: Vec<_> = files
-        .iter()
+    let added: Vec<_> = files.iter()
         .flat_map(|f| f.hunks.iter())
         .flat_map(|h| h.lines.iter())
         .filter(|l| l.kind == DiffLineKind::Added)
@@ -42,8 +41,7 @@ fn parse_diff_has_added_lines() {
 #[test]
 fn parse_diff_has_removed_lines() {
     let files = parse_unified_diff(SIMPLE_DIFF);
-    let removed: Vec<_> = files
-        .iter()
+    let removed: Vec<_> = files.iter()
         .flat_map(|f| f.hunks.iter())
         .flat_map(|h| h.lines.iter())
         .filter(|l| l.kind == DiffLineKind::Removed)
@@ -56,8 +54,7 @@ fn parse_diff_has_removed_lines() {
 #[test]
 fn parse_diff_has_context_lines() {
     let files = parse_unified_diff(SIMPLE_DIFF);
-    let context: Vec<_> = files
-        .iter()
+    let context: Vec<_> = files.iter()
         .flat_map(|f| f.hunks.iter())
         .flat_map(|h| h.lines.iter())
         .filter(|l| l.kind == DiffLineKind::Context)

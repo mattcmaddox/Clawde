@@ -35,7 +35,11 @@ impl ImportConfigDialogState {
     }
 }
 
-pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialogState, area: Rect) {
+pub fn render_import_config_dialog(
+    frame: &mut Frame,
+    state: &ImportConfigDialogState,
+    area: Rect,
+) {
     if !state.visible {
         return;
     }
@@ -59,23 +63,13 @@ pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialog
     let mut lines: Vec<Line<'static>> = vec![];
     if let Some(doc) = &preview.claude_md {
         lines.push(section_title("CLAUDE.md"));
-        lines.push(path_row(
-            "Source",
-            &doc.plan.source_path.display().to_string(),
-        ));
-        lines.push(path_row(
-            "Target",
-            &doc.plan.target_path.display().to_string(),
-        ));
+        lines.push(path_row("Source", &doc.plan.source_path.display().to_string()));
+        lines.push(path_row("Target", &doc.plan.target_path.display().to_string()));
         lines.push(meta_row(&format!(
             "{} lines, {} chars, {}",
             doc.line_count,
             doc.char_count,
-            if doc.plan.target_exists {
-                "will overwrite the target file"
-            } else {
-                "will create the target file"
-            }
+            if doc.plan.target_exists { "will overwrite the target file" } else { "will create the target file" }
         )));
         for line in doc.excerpt.lines() {
             lines.push(Line::from(vec![Span::styled(
@@ -88,14 +82,8 @@ pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialog
 
     if let Some(settings) = &preview.settings {
         lines.push(section_title("settings.json"));
-        lines.push(path_row(
-            "Source",
-            &settings.plan.source_path.display().to_string(),
-        ));
-        lines.push(path_row(
-            "Target",
-            &settings.plan.target_path.display().to_string(),
-        ));
+        lines.push(path_row("Source", &settings.plan.source_path.display().to_string()));
+        lines.push(path_row("Target", &settings.plan.target_path.display().to_string()));
         lines.push(meta_row(&format!(
             "Import {}, replace {}, keep {}, skip {} fields",
             settings.imported_count,
@@ -105,12 +93,8 @@ pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialog
         )));
         for field in &settings.fields {
             let action_style = match field.action {
-                PreviewAction::Import => Style::default()
-                    .fg(CLAURST_ACCENT)
-                    .add_modifier(Modifier::BOLD),
-                PreviewAction::Replace => Style::default()
-                    .fg(CLAURST_ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                PreviewAction::Import => Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD),
+                PreviewAction::Replace => Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD),
                 PreviewAction::Keep => Style::default().fg(CLAURST_MUTED),
                 PreviewAction::Skip => Style::default().fg(CLAURST_MUTED),
             };
@@ -137,9 +121,7 @@ pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialog
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             " Enter to import  ·  Esc to cancel",
-            Style::default()
-                .fg(CLAURST_MUTED)
-                .add_modifier(Modifier::ITALIC),
+            Style::default().fg(CLAURST_MUTED).add_modifier(Modifier::ITALIC),
         )])),
         layout.footer_area,
     );
@@ -148,12 +130,7 @@ pub fn render_import_config_dialog(frame: &mut Frame, state: &ImportConfigDialog
 fn section_title(title: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(CLAURST_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title.to_string(), Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
     ])
 }
 

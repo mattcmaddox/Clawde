@@ -6,11 +6,11 @@
 //!
 //! Pull is server-wins: remote content overwrites local files unconditionally.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -125,12 +125,7 @@ pub struct TeamMemorySync {
 
 impl TeamMemorySync {
     pub fn new(api_base: String, repo: String, token: String, team_dir: PathBuf) -> Self {
-        Self {
-            api_base,
-            repo,
-            token,
-            team_dir,
-        }
+        Self { api_base, repo, token, team_dir }
     }
 
     // -----------------------------------------------------------------------
@@ -167,7 +162,11 @@ impl TeamMemorySync {
         }
 
         // Capture ETag before consuming the response body
-        if let Some(etag) = response.headers().get("etag").and_then(|v| v.to_str().ok()) {
+        if let Some(etag) = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+        {
             state.last_known_etag = Some(etag.to_string());
         }
 
@@ -222,7 +221,11 @@ impl TeamMemorySync {
         let changed: Vec<TeamMemoryEntry> = local_entries
             .into_iter()
             .filter(|entry| {
-                state.server_checksums.get(&entry.key).map(|s| s.as_str()) != Some(&entry.checksum)
+                state
+                    .server_checksums
+                    .get(&entry.key)
+                    .map(|s| s.as_str())
+                    != Some(&entry.checksum)
             })
             .collect();
 
@@ -283,7 +286,11 @@ impl TeamMemorySync {
         batches
     }
 
-    async fn upload_batch(&self, batch: Vec<TeamMemoryEntry>, state: &mut SyncState) -> Result<()> {
+    async fn upload_batch(
+        &self,
+        batch: Vec<TeamMemoryEntry>,
+        state: &mut SyncState,
+    ) -> Result<()> {
         let client = reqwest::Client::new();
         let url = format!(
             "{}/api/claude_code/team_memory?repo={}",
@@ -293,7 +300,10 @@ impl TeamMemorySync {
 
         let body = serde_json::json!({ "entries": batch });
 
-        let mut req = client.put(&url).bearer_auth(&self.token).json(&body);
+        let mut req = client
+            .put(&url)
+            .bearer_auth(&self.token)
+            .json(&body);
 
         if let Some(etag) = &state.last_known_etag {
             req = req.header("If-Match", etag);
@@ -308,7 +318,11 @@ impl TeamMemorySync {
 
         match status {
             200 | 201 | 204 => {
-                if let Some(etag) = response.headers().get("etag").and_then(|v| v.to_str().ok()) {
+                if let Some(etag) = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                {
                     state.last_known_etag = Some(etag.to_string());
                 }
                 // Update local checksum map to reflect uploaded state
@@ -362,11 +376,7 @@ impl TeamMemorySync {
                         .replace('\\', "/");
 
                     let checksum = content_checksum(&content);
-                    entries.push(TeamMemoryEntry {
-                        key,
-                        content,
-                        checksum,
-                    });
+                    entries.push(TeamMemoryEntry { key, content, checksum });
                 }
             }
         }
@@ -396,21 +406,12 @@ pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
     // Patterns ordered by likelihood of appearing in dev-team memory content.
     const PATTERNS: &[(&str, &str)] = &[
         // Cloud providers
-        (
-            r"(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}",
-            "AWS access key",
-        ),
+        (r"(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}", "AWS access key"),
         (r"AIza[\w-]{35}", "GCP API key"),
         // AI APIs
         (r"sk-ant-api03-[a-zA-Z0-9_\-]{93}AA", "Anthropic API key"),
-        (
-            r"sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA",
-            "Anthropic admin API key",
-        ),
-        (
-            r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}",
-            "OpenAI API key",
-        ),
+        (r"sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA", "Anthropic admin API key"),
+        (r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}", "OpenAI API key"),
         // Version control
         (r"ghp_[0-9a-zA-Z]{36}", "GitHub personal access token"),
         (r"github_pat_\w{82}", "GitHub fine-grained PAT"),
@@ -418,17 +419,11 @@ pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
         (r"gho_[0-9a-zA-Z]{36}", "GitHub OAuth token"),
         (r"glpat-[\w-]{20}", "GitLab PAT"),
         // Communication
-        (
-            r"xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*",
-            "Slack bot token",
-        ),
+        (r"xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*", "Slack bot token"),
         // Crypto / private keys
         (r"-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY", "Private key"),
         // Payments
-        (
-            r"(?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99}",
-            "Stripe secret key",
-        ),
+        (r"(?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99}", "Stripe secret key"),
         // NPM
         (r"npm_[a-zA-Z0-9]{36}", "NPM access token"),
     ];
@@ -439,9 +434,7 @@ pub fn scan_for_secrets(content: &str) -> Vec<SecretMatch> {
         // Lazily compile; the fn is not hot enough to warrant a static cache here
         if let Ok(re) = regex::Regex::new(pattern) {
             if re.is_match(content) {
-                findings.push(SecretMatch {
-                    label: label.to_string(),
-                });
+                findings.push(SecretMatch { label: label.to_string() });
             }
         }
     }
@@ -463,10 +456,7 @@ mod tests {
     #[test]
     fn test_checksum_format() {
         let cs = content_checksum("hello");
-        assert!(
-            cs.starts_with("sha256:"),
-            "checksum should start with sha256:"
-        );
+        assert!(cs.starts_with("sha256:"), "checksum should start with sha256:");
         assert_eq!(cs.len(), "sha256:".len() + 64, "sha256 hex is 64 chars");
     }
 
@@ -545,11 +535,7 @@ mod tests {
     fn entry(key: &str, size: usize) -> TeamMemoryEntry {
         let content = "x".repeat(size);
         let checksum = content_checksum(&content);
-        TeamMemoryEntry {
-            key: key.to_string(),
-            content,
-            checksum,
-        }
+        TeamMemoryEntry { key: key.to_string(), content, checksum }
     }
 
     #[test]
@@ -646,12 +632,8 @@ mod tests {
     #[tokio::test]
     async fn test_scan_local_files_finds_md() {
         let tmp = TempDir::new().unwrap();
-        tokio::fs::write(tmp.path().join("MEMORY.md"), "# Memory")
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("ignore.txt"), "not md")
-            .await
-            .unwrap();
+        tokio::fs::write(tmp.path().join("MEMORY.md"), "# Memory").await.unwrap();
+        tokio::fs::write(tmp.path().join("ignore.txt"), "not md").await.unwrap();
 
         let sync = TeamMemorySync::new(
             "https://example.com".to_string(),
@@ -667,15 +649,9 @@ mod tests {
     #[tokio::test]
     async fn test_scan_local_files_sorted() {
         let tmp = TempDir::new().unwrap();
-        tokio::fs::write(tmp.path().join("z.md"), "z")
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("a.md"), "a")
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("m.md"), "m")
-            .await
-            .unwrap();
+        tokio::fs::write(tmp.path().join("z.md"), "z").await.unwrap();
+        tokio::fs::write(tmp.path().join("a.md"), "a").await.unwrap();
+        tokio::fs::write(tmp.path().join("m.md"), "m").await.unwrap();
 
         let sync = TeamMemorySync::new(
             "https://example.com".to_string(),
@@ -692,9 +668,7 @@ mod tests {
     async fn test_scan_local_files_checksums_match() {
         let tmp = TempDir::new().unwrap();
         let content = "# Hello world";
-        tokio::fs::write(tmp.path().join("MEMORY.md"), content)
-            .await
-            .unwrap();
+        tokio::fs::write(tmp.path().join("MEMORY.md"), content).await.unwrap();
 
         let sync = TeamMemorySync::new(
             "https://example.com".to_string(),

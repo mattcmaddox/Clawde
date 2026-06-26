@@ -26,9 +26,7 @@ struct BriefInput {
     status: String,
 }
 
-fn default_status() -> String {
-    "normal".to_string()
-}
+fn default_status() -> String { "normal".to_string() }
 
 #[derive(Debug, Serialize)]
 struct AttachmentMeta {
@@ -39,9 +37,7 @@ struct AttachmentMeta {
 
 #[async_trait]
 impl Tool for BriefTool {
-    fn name(&self) -> &str {
-        "Brief"
-    }
+    fn name(&self) -> &str { "Brief" }
 
     fn description(&self) -> &str {
         "Send a formatted message to the user, optionally with file attachments. \
@@ -50,9 +46,7 @@ impl Tool for BriefTool {
          Use status=\"normal\" when replying to something the user just said."
     }
 
-    fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
-    }
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -134,7 +128,9 @@ impl Tool for BriefTool {
 // ---------------------------------------------------------------------------
 
 async fn resolve_attachment(path: &Path) -> Result<AttachmentMeta, String> {
-    let meta = tokio::fs::metadata(path).await.map_err(|e| e.to_string())?;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if !meta.is_file() {
         return Err("not a file".to_string());
@@ -144,12 +140,7 @@ async fn resolve_attachment(path: &Path) -> Result<AttachmentMeta, String> {
     let is_image = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| {
-            matches!(
-                e.to_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"
-            )
-        })
+        .map(|e| matches!(e.to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg"))
         .unwrap_or(false);
 
     Ok(AttachmentMeta {

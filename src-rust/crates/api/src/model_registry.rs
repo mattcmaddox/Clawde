@@ -65,9 +65,7 @@ pub enum ModelStatus {
 }
 
 impl Default for ModelStatus {
-    fn default() -> Self {
-        ModelStatus::Active
-    }
+    fn default() -> Self { ModelStatus::Active }
 }
 
 impl ModelStatus {
@@ -252,9 +250,7 @@ pub struct ModelEntry {
     pub experimental_modes: HashMap<String, ExperimentalMode>,
 }
 
-fn default_true() -> bool {
-    true
-}
+fn default_true() -> bool { true }
 
 impl ModelEntry {
     /// Whether this model accepts image input.  Derived from `modalities_input`.
@@ -424,9 +420,7 @@ mod md {
         pub headers: HashMap<String, String>,
     }
 
-    fn default_true() -> bool {
-        true
-    }
+    fn default_true() -> bool { true }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,17 +466,14 @@ fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
         let provider_id = remap_provider_id(&raw_provider_id).to_string();
         let pid = ProviderId::new(provider_id.clone());
 
-        out.providers.insert(
-            provider_id.clone(),
-            ProviderEntry {
-                id: pid.clone(),
-                name: p.name,
-                env: p.env,
-                api: p.api,
-                npm: p.npm,
-                doc: p.doc,
-            },
-        );
+        out.providers.insert(provider_id.clone(), ProviderEntry {
+            id: pid.clone(),
+            name: p.name,
+            env: p.env,
+            api: p.api,
+            npm: p.npm,
+            doc: p.doc,
+        });
 
         for (model_id, m) in p.models.into_iter() {
             let mid = ModelId::new(model_id.clone());
@@ -698,7 +689,9 @@ impl ModelRegistry {
 
         // Prefix match (handles version suffixes)
         for entry in self.entries.values() {
-            if (*entry.info.id).starts_with(model_name) || model_name.starts_with(&*entry.info.id) {
+            if (*entry.info.id).starts_with(model_name)
+                || model_name.starts_with(&*entry.info.id)
+            {
                 return Some(entry.info.provider_id.clone());
             }
         }
@@ -1009,7 +1002,12 @@ fn flagship_patterns_for(provider_id: &str) -> &'static [&'static str] {
         "mistral" => &["mistral-large", "codestral", "mistral-medium", "devstral"],
         "xai" => &["grok-4", "grok-3", "grok-2"],
         "cohere" => &["command-a", "command-r-plus", "command-r"],
-        "groq" => &["llama-3.3-70b", "llama-3.1-70b", "qwen", "deepseek-r1"],
+        "groq" => &[
+            "llama-3.3-70b",
+            "llama-3.1-70b",
+            "qwen",
+            "deepseek-r1",
+        ],
         "cerebras" => &["llama-3.3-70b", "qwen-3-235b", "zai-glm"],
         "perplexity" => &["sonar-pro", "sonar-reasoning", "sonar"],
         "openrouter" => &[
@@ -1046,15 +1044,13 @@ fn flagship_patterns_for(provider_id: &str) -> &'static [&'static str] {
 /// Substring patterns marking a model as the lightweight/cheap default.
 fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
     match provider_id {
-        "anthropic" | "amazon-bedrock" | "github-copilot" | "azure" => {
-            &["claude-haiku-4", "claude-haiku-3-5", "claude-haiku"]
-        }
-        "openai" => &["gpt-5-mini", "gpt-4o-mini", "o4-mini", "o3-mini"],
-        "google" => &[
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
+        "anthropic" | "amazon-bedrock" | "github-copilot" | "azure" => &[
+            "claude-haiku-4",
+            "claude-haiku-3-5",
+            "claude-haiku",
         ],
+        "openai" => &["gpt-5-mini", "gpt-4o-mini", "o4-mini", "o3-mini"],
+        "google" => &["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
         "deepseek" => &["deepseek-v4-flash", "deepseek-chat"],
         "mistral" => &["mistral-small", "mistral-nemo"],
         "xai" => &["grok-3-mini", "grok-2-mini"],
@@ -1134,10 +1130,7 @@ mod tests {
         let reg = ModelRegistry::new();
         let models = reg.list_by_provider("anthropic");
         let has_claude = models.iter().any(|m| (*m.info.id).starts_with("claude"));
-        assert!(
-            has_claude,
-            "anthropic should have at least one claude model"
-        );
+        assert!(has_claude, "anthropic should have at least one claude model");
     }
 
     #[test]
@@ -1154,8 +1147,7 @@ mod tests {
     #[test]
     fn modalities_drive_vision() {
         let reg = ModelRegistry::new();
-        if let Some(opus) = reg
-            .list_by_provider("anthropic")
+        if let Some(opus) = reg.list_by_provider("anthropic")
             .iter()
             .find(|m| (*m.info.id).contains("opus"))
         {

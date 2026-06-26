@@ -70,7 +70,10 @@ impl CohereProvider {
     /// Cohere v2 uses the same shape as OpenAI Chat Completions, so we reuse
     /// the OpenAI transformation helper.
     fn build_messages(&self, request: &ProviderRequest) -> Vec<Value> {
-        OpenAiProvider::to_openai_messages_pub(&request.messages, request.system_prompt.as_ref())
+        OpenAiProvider::to_openai_messages_pub(
+            &request.messages,
+            request.system_prompt.as_ref(),
+        )
     }
 
     /// Build the Cohere v2 tools array.  Same shape as OpenAI function tools.
@@ -83,11 +86,7 @@ impl CohereProvider {
         // Cohere error format: {"message": "..."}
         let message = serde_json::from_str::<Value>(body)
             .ok()
-            .and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-            })
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
             .unwrap_or_else(|| body.to_string());
 
         match status {
@@ -208,9 +207,7 @@ impl CohereProvider {
                 for item in content_arr {
                     if item.get("type").and_then(|t| t.as_str()) == Some("text") {
                         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            content_blocks.push(ContentBlock::Text {
-                                text: text.to_string(),
-                            });
+                            content_blocks.push(ContentBlock::Text { text: text.to_string() });
                         }
                     }
                 }
@@ -219,11 +216,7 @@ impl CohereProvider {
             // Tool calls
             if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tool_calls {
-                    let id = tc
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let name = tc
                         .get("function")
                         .and_then(|f| f.get("name"))
@@ -243,9 +236,7 @@ impl CohereProvider {
         }
 
         if content_blocks.is_empty() {
-            content_blocks.push(ContentBlock::Text {
-                text: String::new(),
-            });
+            content_blocks.push(ContentBlock::Text { text: String::new() });
         }
 
         Ok(ProviderResponse {
@@ -325,7 +316,9 @@ fn map_finish_reason(reason: &str) -> StopReason {
         "MAX_TOKENS" => StopReason::MaxTokens,
         "STOP_SEQUENCE" => StopReason::StopSequence,
         "TOOL_CALL" => StopReason::ToolUse,
-        "ERROR" | "ERROR_TOXIC" | "USER_CANCEL" => StopReason::Other(reason.to_string()),
+        "ERROR" | "ERROR_TOXIC" | "USER_CANCEL" => {
+            StopReason::Other(reason.to_string())
+        }
         other => StopReason::Other(other.to_string()),
     }
 }

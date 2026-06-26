@@ -37,11 +37,7 @@ pub struct Attachment {
 
 impl Attachment {
     pub fn new(kind: AttachmentKind, content: impl Into<String>) -> Self {
-        Self {
-            kind,
-            content: content.into(),
-            label: None,
-        }
+        Self { kind, content: content.into(), label: None }
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
@@ -75,11 +71,7 @@ pub fn get_attachments(ctx: &AttachmentContext<'_>) -> Vec<Attachment> {
         if !changed.is_empty() {
             let content = format!(
                 "Files changed since last turn:\n{}",
-                changed
-                    .iter()
-                    .map(|f| format!("  {}", f))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                changed.iter().map(|f| format!("  {}", f)).collect::<Vec<_>>().join("\n")
             );
             attachments.push(Attachment::new(AttachmentKind::ChangedFiles, content));
         }
@@ -163,11 +155,13 @@ pub fn get_changed_files(project_root: &Path, since_ms: u64) -> Vec<String> {
         .output();
 
     match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect(),
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect()
+        }
         _ => {
             // Fallback: scan for files modified since timestamp using mtime
             let since_secs = since_ms / 1000;

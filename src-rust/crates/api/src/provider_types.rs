@@ -10,7 +10,7 @@ use serde_json::Value;
 
 // Re-export ThinkingConfig and SystemPrompt from the api types module so
 // callers only need to import from this module.
-pub use crate::types::{SystemPrompt, ThinkingConfig};
+pub use crate::types::{ThinkingConfig, SystemPrompt};
 
 // ---------------------------------------------------------------------------
 // StopReason
@@ -140,19 +140,33 @@ pub enum StreamEvent {
     },
 
     /// Incremental text delta for an in-progress block.
-    TextDelta { index: usize, text: String },
+    TextDelta {
+        index: usize,
+        text: String,
+    },
 
     /// Incremental thinking / reasoning delta.
-    ThinkingDelta { index: usize, thinking: String },
+    ThinkingDelta {
+        index: usize,
+        thinking: String,
+    },
 
     /// Incremental delta for tool-call JSON arguments.
-    InputJsonDelta { index: usize, partial_json: String },
+    InputJsonDelta {
+        index: usize,
+        partial_json: String,
+    },
 
     /// Incremental delta for a cryptographic signature block.
-    SignatureDelta { index: usize, signature: String },
+    SignatureDelta {
+        index: usize,
+        signature: String,
+    },
 
     /// An in-progress content block is now complete.
-    ContentBlockStop { index: usize },
+    ContentBlockStop {
+        index: usize,
+    },
 
     /// Final message-level delta carrying the stop reason and updated usage.
     MessageDelta {
@@ -164,10 +178,16 @@ pub enum StreamEvent {
     MessageStop,
 
     /// A provider-level error occurred mid-stream.
-    Error { error_type: String, message: String },
+    Error {
+        error_type: String,
+        message: String,
+    },
 
     /// Incremental reasoning / scratchpad delta (alias used by some providers).
-    ReasoningDelta { index: usize, reasoning: String },
+    ReasoningDelta {
+        index: usize,
+        reasoning: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -245,10 +265,15 @@ pub enum ProviderStatus {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthMethod {
     /// A static API key sent as an HTTP header.
-    ApiKey { key: String, header: ApiKeyHeader },
+    ApiKey {
+        key: String,
+        header: ApiKeyHeader,
+    },
 
     /// A bearer token sent in the `Authorization` header.
-    Bearer { token: String },
+    Bearer {
+        token: String,
+    },
 
     /// AWS Signature V4 credentials for Amazon Bedrock.
     AwsCredentials {

@@ -58,7 +58,10 @@ impl TemplateRenderer {
                                 pos = start + replacement.len();
                             } else {
                                 // Variable not found, leave as-is and skip past it
-                                debug!("Template variable not found in context: {}", var_name);
+                                debug!(
+                                    "Template variable not found in context: {}",
+                                    var_name
+                                );
                                 pos = end + 2;
                             }
                         }
@@ -122,7 +125,8 @@ mod tests {
             "name": "Database",
             "description": "Query operations"
         });
-        let result = TemplateRenderer::render("Use {{name}} for {{description}}", &context);
+        let result =
+            TemplateRenderer::render("Use {{name}} for {{description}}", &context);
         assert_eq!(result, "Use Database for Query operations");
     }
 
@@ -134,8 +138,10 @@ mod tests {
                 "version": "1.0"
             }
         });
-        let result =
-            TemplateRenderer::render("Created by {{meta.author}} (v{{meta.version}})", &context);
+        let result = TemplateRenderer::render(
+            "Created by {{meta.author}} (v{{meta.version}})",
+            &context,
+        );
         assert_eq!(result, "Created by Alice (v1.0)");
     }
 
@@ -162,7 +168,10 @@ mod tests {
             "count": 42,
             "enabled": true
         });
-        let result = TemplateRenderer::render("Count: {{count}}, Enabled: {{enabled}}", &context);
+        let result = TemplateRenderer::render(
+            "Count: {{count}}, Enabled: {{enabled}}",
+            &context,
+        );
         assert_eq!(result, "Count: 42, Enabled: true");
     }
 

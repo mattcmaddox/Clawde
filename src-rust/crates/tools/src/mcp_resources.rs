@@ -25,9 +25,7 @@ struct ListMcpResourcesInput {
 
 #[async_trait]
 impl Tool for ListMcpResourcesTool {
-    fn name(&self) -> &str {
-        "ListMcpResources"
-    }
+    fn name(&self) -> &str { "ListMcpResources" }
 
     fn description(&self) -> &str {
         "List all resources available from connected MCP servers. \
@@ -35,9 +33,7 @@ impl Tool for ListMcpResourcesTool {
          Resources represent data that MCP servers expose (files, database records, etc.)."
     }
 
-    fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
-    }
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -110,18 +106,14 @@ struct ReadMcpResourceInput {
 
 #[async_trait]
 impl Tool for ReadMcpResourceTool {
-    fn name(&self) -> &str {
-        "ReadMcpResource"
-    }
+    fn name(&self) -> &str { "ReadMcpResource" }
 
     fn description(&self) -> &str {
         "Read a specific resource from an MCP server by URI. \
          Use ListMcpResources to discover available resource URIs."
     }
 
-    fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
-    }
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
 
     fn input_schema(&self) -> Value {
         json!({

@@ -41,7 +41,11 @@ pub async fn try_format_file(path: &str, ctx: &ToolContext) {
         }
 
         // Run with a 30-second timeout; silently ignore all errors.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cmd.output(),
+        )
+        .await;
 
         // Only apply the first matching formatter.
         break;

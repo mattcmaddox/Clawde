@@ -97,17 +97,16 @@ pub(crate) fn merge_bedrock_options(body: &mut Value, provider_options: &Value) 
 
     for (key, value) in options_obj {
         match key.as_str() {
-            "inferenceConfig"
-            | "toolConfig"
-            | "reasoningConfig"
-            | "additionalModelRequestFields" => match (body_obj.get_mut(key), value) {
-                (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
-                    merge_maps(target_obj, source_obj);
+            "inferenceConfig" | "toolConfig" | "reasoningConfig" | "additionalModelRequestFields" => {
+                match (body_obj.get_mut(key), value) {
+                    (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
+                        merge_maps(target_obj, source_obj);
+                    }
+                    _ => {
+                        body_obj.insert(key.clone(), value.clone());
+                    }
                 }
-                _ => {
-                    body_obj.insert(key.clone(), value.clone());
-                }
-            },
+            }
             _ => {
                 body_obj.insert(key.clone(), value.clone());
             }
@@ -155,10 +154,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            json!("high")
-        );
+        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], json!("high"));
         assert_eq!(body["cachedContent"], json!("abc"));
     }
 

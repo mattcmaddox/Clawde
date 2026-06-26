@@ -15,7 +15,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::ps_classifier::{classify_ps_command, PsRiskLevel};
+use claurst_core::ps_classifier::{PsRiskLevel, classify_ps_command};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Stdio;
@@ -38,9 +38,7 @@ struct PowerShellInput {
     require_confirmation: bool,
 }
 
-fn default_timeout() -> u64 {
-    120_000
-}
+fn default_timeout() -> u64 { 120_000 }
 
 // ---------------------------------------------------------------------------
 // Risk-label helpers (used in messages shown to the user)
@@ -49,9 +47,9 @@ fn default_timeout() -> u64 {
 fn risk_label(level: PsRiskLevel) -> &'static str {
     match level {
         PsRiskLevel::Critical => "Critical",
-        PsRiskLevel::High => "High",
-        PsRiskLevel::Medium => "Medium",
-        PsRiskLevel::Low => "Low",
+        PsRiskLevel::High     => "High",
+        PsRiskLevel::Medium   => "Medium",
+        PsRiskLevel::Low      => "Low",
     }
 }
 
@@ -79,18 +77,14 @@ fn risk_explanation(level: PsRiskLevel, command: &str) -> String {
 
 #[async_trait]
 impl Tool for PowerShellTool {
-    fn name(&self) -> &str {
-        "PowerShell"
-    }
+    fn name(&self) -> &str { "PowerShell" }
 
     fn description(&self) -> &str {
         "Execute a PowerShell command. Use for Windows-native operations, .NET APIs, \
          registry access, and Windows-specific system administration."
     }
 
-    fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::Execute
-    }
+    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Execute }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -207,10 +201,7 @@ impl Tool for PowerShellTool {
 
         // ── Step 3: execute ──────────────────────────────────────────────────
         let (exe, args) = if cfg!(windows) {
-            (
-                "powershell",
-                vec!["-NoProfile", "-NonInteractive", "-Command"],
-            )
+            ("powershell", vec!["-NoProfile", "-NonInteractive", "-Command"])
         } else {
             ("pwsh", vec!["-NoProfile", "-NonInteractive", "-Command"])
         };
@@ -259,23 +250,18 @@ impl Tool for PowerShellTool {
 
             let status = child.wait().await;
             (stdout_lines, stderr_lines, status)
-        })
-        .await;
+        }).await;
 
         match result {
             Ok((stdout_lines, stderr_lines, status)) => {
                 let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                 let mut output = stdout_lines.join("\n");
                 if !stderr_lines.is_empty() {
-                    if !output.is_empty() {
-                        output.push('\n');
-                    }
+                    if !output.is_empty() { output.push('\n'); }
                     output.push_str("STDERR:\n");
                     output.push_str(&stderr_lines.join("\n"));
                 }
-                if output.is_empty() {
-                    output = "(no output)".to_string();
-                }
+                if output.is_empty() { output = "(no output)".to_string(); }
 
                 // Truncate very long output (same limit as BashTool)
                 const MAX_OUTPUT_LEN: usize = 100_000;
@@ -292,20 +278,14 @@ impl Tool for PowerShellTool {
                 }
 
                 if exit_code != 0 {
-                    ToolResult::error(format!(
-                        "PowerShell exited with code {}\n{}",
-                        exit_code, output
-                    ))
+                    ToolResult::error(format!("PowerShell exited with code {}\n{}", exit_code, output))
                 } else {
                     ToolResult::success(output)
                 }
             }
             Err(_) => {
                 let _ = child.kill().await;
-                ToolResult::error(format!(
-                    "PowerShell command timed out after {}ms",
-                    timeout_ms
-                ))
+                ToolResult::error(format!("PowerShell command timed out after {}ms", timeout_ms))
             }
         }
     }
