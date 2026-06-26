@@ -1956,6 +1956,16 @@ async fn run_interactive(
         })
     };
     cmd_ctx.mcp_auth_runner = Some(mcp_auth_runner.clone());
+    // Tracks the transcript scroll position between frames. When it changes we
+    // force a full screen clear before the next draw: ratatui's incremental
+    // diff keeps an internal model of the terminal, but ambiguous/wide glyphs
+    // (`…`, `—`, `○`, …) that some terminals render two cells wide while
+    // unicode-width counts one desync that model from reality, leaving ghost
+    // fragments of scrolled-away lines. A physical clear (ESC[2J) on scroll
+    // resyncs them; it's only issued while actively scrolling, so motion hides
+    // any flash.
+    let mut last_scroll_offset = app.scroll_offset;
+    let mut last_auto_scroll = app.auto_scroll;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -1978,6 +1988,15 @@ async fn run_interactive(
             }
             app.set_prompt_text(pending_input);
             app.pending_auto_submit = true;
+        }
+
+        // If the transcript scrolled since the last frame, force a full screen
+        // clear so wide/ambiguous-glyph desync can't leave ghost fragments of
+        // scrolled-away lines (see note at the top of the loop).
+        if app.scroll_offset != last_scroll_offset || app.auto_scroll != last_auto_scroll {
+            let _ = terminal.clear();
+            last_scroll_offset = app.scroll_offset;
+            last_auto_scroll = app.auto_scroll;
         }
 
         // Draw the UI

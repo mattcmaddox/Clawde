@@ -379,3 +379,47 @@ mod tests {
         assert_eq!(row.trim_end(), "hi");
     }
 }
+
+#[cfg(test)]
+mod reset_probe {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend, text::Line, widgets::{Paragraph, Widget}};
+
+    struct Item(String);
+    impl VirtualItem for Item {
+        fn measure_height(&self, _w: u16) -> u16 { 1 }
+        fn render(&self, area: Rect, buf: &mut Buffer, _s: bool) {
+            Paragraph::new(Line::from(self.0.clone())).render(area, buf);
+        }
+        fn search_text(&self) -> String { self.0.clone() }
+    }
+    fn row0(t: &Terminal<TestBackend>) -> String {
+        let b = t.backend().buffer();
+        (0..b.area.width).map(|x| b.cell((x,0)).map(|c| c.symbol().to_string()).unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn does_terminal_draw_reset_between_frames() {
+        let mut t = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let area = Rect::new(0,0,20,1);
+        // Frame 1: long content
+        t.draw(|f| {
+            let mut l: VirtualList<Item> = VirtualList::new();
+            l.sticky_bottom = false;
+            l.set_items(vec![Item("LONGLINECONTENT1234".into())]);
+            l.scroll_offset = 0;
+            l.render(area, f.buffer_mut());
+        }).unwrap();
+        // Frame 2: SHORT content at the same row — if draw() resets, no ghost.
+        t.draw(|f| {
+            let mut l: VirtualList<Item> = VirtualList::new();
+            l.sticky_bottom = false;
+            l.set_items(vec![Item("hi".into())]);
+            l.scroll_offset = 0;
+            l.render(area, f.buffer_mut());
+        }).unwrap();
+        let r = row0(&t);
+        eprintln!("ROW0 AFTER FRAME2 = {:?}", r);
+        assert_eq!(r.trim_end(), "hi", "terminal.draw did NOT reset → ghost: {r:?}");
+    }
+}

@@ -1640,20 +1640,26 @@ fn render_system_annotation_lines(
 
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Per-tool glyph shown at the head of a tool block (opencode-style: the icon
-/// conveys the tool, the line then shows the primary argument). Falls back to
-/// the generic `~` for unmapped tools.
+/// Per-tool marker shown at the head of a tool block (the marker conveys the
+/// tool, the line then shows the primary argument). Falls back to the generic
+/// `~` for unmapped tools.
+///
+/// These are deliberately ASCII: many terminals render "pretty" Unicode glyphs
+/// (arrows, ✱, ☰, …) two cells wide while ratatui's layout counts them as one,
+/// which both breaks header alignment and desyncs the scroll redraw. ASCII is
+/// guaranteed one cell everywhere, and the shell-flavoured choices read well in
+/// context (`<` read, `>` write, `*` glob, `/` grep).
 fn tool_icon(normalized: &str) -> &'static str {
     match normalized {
         "bash" | "powershell" => "$",
-        "read" => "\u{2190}",                            // ←
-        "write" | "apply_patch" | "edit" => "\u{270E}",  // ✎
-        "glob" | "list" => "\u{2731}",                   // ✱
-        "grep" | "codesearch" => "\u{2315}",             // ⌕
-        "webfetch" => "\u{2197}",                        // ↗
-        "websearch" => "\u{2315}",                       // ⌕
-        "todowrite" | "todo_write" | "todo" => "\u{2630}", // ☰
-        "task" | "agent" => "\u{25B8}",                  // ▸
+        "read" => "<",
+        "write" | "apply_patch" | "edit" => ">",
+        "glob" | "list" => "*",
+        "grep" | "codesearch" => "/",
+        "webfetch" => "@",
+        "websearch" => "?",
+        "todowrite" | "todo_write" | "todo" => ":",
+        "task" | "agent" => "+",
         _ => "~",
     }
 }
@@ -1823,19 +1829,21 @@ fn render_todo_block(
         if content.is_empty() {
             continue;
         }
+        // ASCII checkboxes (markdown-style) so alignment holds on every
+        // terminal: [x] done, [>] in-progress, [ ] pending.
         let (glyph, glyph_color, text_style) = match status_of(t) {
             "completed" => (
-                "\u{2713}", // ✓
+                "[x]",
                 Color::Rgb(120, 200, 120),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             ),
             "in_progress" => (
-                "\u{2022}", // •
+                "[>]",
                 accent,
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             _ => (
-                "\u{25CB}", // ○
+                "[ ]",
                 Color::Rgb(150, 150, 150),
                 Style::default().fg(Color::Rgb(170, 170, 170)),
             ),
@@ -1849,7 +1857,7 @@ fn render_todo_block(
         lines.push(Line::from(vec![
             Span::raw("     "),
             Span::styled(
-                format!("\u{2026} {} more", total - MAX_ITEMS),
+                format!("... {} more", total - MAX_ITEMS),
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             ),
         ]));
@@ -3089,12 +3097,20 @@ mod tool_block_tests {
     }
 
     #[test]
-    fn icons_are_per_tool() {
+    fn icons_are_per_tool_and_ascii() {
         assert_eq!(tool_icon("bash"), "$");
-        assert_eq!(tool_icon("read"), "\u{2190}");
-        assert_eq!(tool_icon("glob"), "\u{2731}");
-        assert_eq!(tool_icon("todowrite"), "\u{2630}");
+        assert_eq!(tool_icon("read"), "<");
+        assert_eq!(tool_icon("write"), ">");
+        assert_eq!(tool_icon("glob"), "*");
+        assert_eq!(tool_icon("grep"), "/");
+        assert_eq!(tool_icon("todowrite"), ":");
         assert_eq!(tool_icon("something-unknown"), "~");
+        // All markers must be single-byte ASCII (guaranteed one terminal cell).
+        for t in ["bash", "read", "write", "glob", "grep", "webfetch", "websearch", "todo", "task", "x"] {
+            let icon = tool_icon(t);
+            assert_eq!(icon.len(), 1, "{t} icon {icon:?} must be 1 ASCII byte");
+            assert!(icon.is_ascii(), "{t} icon {icon:?} must be ASCII");
+        }
     }
 
     #[test]
@@ -3136,8 +3152,8 @@ mod tool_block_tests {
             let input = format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy());
             let b = block("read", ToolStatus::Done, &input, None);
             let lines = render(&b);
-            assert!(lines[0].contains("\u{2190}"), "read icon: {:?}", lines[0]);
-            assert!(lines[0].contains("~"), "home shortened: {:?}", lines[0]);
+            assert!(lines[0].contains('<'), "read icon: {:?}", lines[0]);
+            assert!(lines[0].contains('~'), "home shortened: {:?}", lines[0]);
             assert!(!lines[0].contains(home.to_string_lossy().as_ref()));
         }
     }
@@ -3159,10 +3175,10 @@ mod tool_block_tests {
         // Header shows count, not the raw "Todo list updated (...)".
         assert!(joined.contains("Todos"), "{joined:?}");
         assert!(joined.contains("1/3 done"), "{joined:?}");
-        // Each status has its glyph + content.
-        assert!(joined.contains("\u{2713} Locate files"), "done glyph: {joined:?}");
-        assert!(joined.contains("\u{2022} Build importer"), "in-progress glyph: {joined:?}");
-        assert!(joined.contains("\u{25CB} Wire adapter"), "pending glyph: {joined:?}");
+        // Each status has its ASCII checkbox + content.
+        assert!(joined.contains("[x] Locate files"), "done marker: {joined:?}");
+        assert!(joined.contains("[>] Build importer"), "in-progress marker: {joined:?}");
+        assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
     }
