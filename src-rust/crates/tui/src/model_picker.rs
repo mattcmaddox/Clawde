@@ -263,8 +263,11 @@ pub fn models_for_provider_from_registry(
         return free_provider_models();
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
-    // serve the curated CODEX_MODELS list so the picker isn't empty.
-    if provider_id == "codex" {
+    // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
+    // both the canonical id ("codex") and the connect-dialog alias
+    // ("openai-codex"); without the alias a fresh Codex login lands on the
+    // empty-registry fallback and the picker shows no models.
+    if is_codex_provider(provider_id) {
         return codex_provider_models();
     }
 
@@ -332,6 +335,16 @@ pub fn default_model_for_provider(
     if provider_id == "free" {
         return "free/auto".to_string();
     }
+    // Codex endpoints are not catalogued by models.dev, so the registry can
+    // never supply a default for them — pin the curated flagship Codex model,
+    // preserving whichever id alias ("codex" / "openai-codex") the caller used.
+    if is_codex_provider(provider_id) {
+        return format!(
+            "{}/{}",
+            provider_id,
+            claurst_core::codex_oauth::DEFAULT_CODEX_MODEL
+        );
+    }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
         if provider_id == "anthropic" {
             best
@@ -341,6 +354,15 @@ pub fn default_model_for_provider(
     } else {
         format!("{}/default", provider_id)
     }
+}
+
+/// Whether `provider_id` refers to the OpenAI Codex provider under either of
+/// its two id spellings: the canonical `"codex"` (used by `CodexProvider`,
+/// the model registry, and the runtime dispatch) or the `"openai-codex"`
+/// alias emitted by the /connect dialog's Codex entry. Both must resolve to
+/// the curated Codex catalog since models.dev does not list these endpoints.
+fn is_codex_provider(provider_id: &str) -> bool {
+    matches!(provider_id, "codex" | "openai-codex")
 }
 
 /// Curated Codex (ChatGPT-authenticated OpenAI) model list used by
@@ -1145,6 +1167,39 @@ mod tests {
             models.iter().any(|m| m.id.starts_with("gpt-") || m.id.starts_with("o3") || m.id.starts_with("o4")),
             "openai should expose at least one gpt/o-series model"
         );
+    }
+
+    // Codex login lands on the "openai-codex" provider id (the /connect alias).
+    // Both that alias and the canonical "codex" must yield the curated Codex
+    // catalog — never the empty-registry "default" placeholder.
+    #[test]
+    fn models_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let models = models_for_provider_from_registry(pid, &registry);
+            assert!(!models.is_empty(), "{pid} must yield Codex models");
+            assert_ne!(models[0].id, "default", "{pid} must not fall back to default");
+            assert!(
+                models.iter().any(|m| m.id.contains("codex")),
+                "{pid} should expose at least one gpt-*-codex model"
+            );
+        }
+    }
+
+    // default_model_for_provider must pin a real Codex flagship (not
+    // "<id>/default") for both id spellings, preserving the caller's prefix.
+    #[test]
+    fn default_model_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let m = default_model_for_provider(pid, &registry);
+            assert_eq!(
+                m,
+                format!("{}/{}", pid, claurst_core::codex_oauth::DEFAULT_CODEX_MODEL),
+                "{pid} default must pin the curated flagship Codex model"
+            );
+            assert!(!m.ends_with("/default"), "{pid} must not fall back to /default");
+        }
     }
 
     #[test]
