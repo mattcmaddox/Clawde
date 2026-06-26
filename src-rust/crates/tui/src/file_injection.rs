@@ -137,7 +137,7 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
 
 /// Build XML file blocks from a slice of resolved refs.
 /// Returns a string like:
-/// ```
+/// ```text
 /// <file path="src/main.rs">
 /// ...contents...
 /// </file>

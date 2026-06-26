@@ -1827,8 +1827,10 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         };
 
         // `?` opens the shortcuts overlay which already lists Ctrl+A / Ctrl+K
-        // and friends — surfacing them again here is redundant clutter.
-        let right_hint = if app.has_credentials {
+        // and friends — surfacing them again here is redundant clutter. It is
+        // also suppressed once the prompt has text, so the hint doesn't compete
+        // with what the user is typing (matches the footer contract).
+        let right_hint = if app.has_credentials && app.prompt_input.text.is_empty() {
             Line::from(vec![
                 Span::styled("? shortcuts", Style::default().fg(dim)),
             ])

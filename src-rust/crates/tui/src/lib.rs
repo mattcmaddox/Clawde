@@ -1310,6 +1310,12 @@ mod tests {
         let mut app = make_app();
         app.push_message(claurst_core::types::Message::user("hello".to_string()));
         app.push_message(claurst_core::types::Message::assistant("hi there".to_string()));
+        // Mode/model/duration moved to the status line, so the turn-metadata
+        // line (the ▣ glyph) now renders only for interrupted turns. Mark this
+        // turn interrupted to exercise that metadata path.
+        if let Some(meta) = app.turn_metadata.first_mut() {
+            meta.interrupted = true;
+        }
 
         terminal
             .draw(|frame| crate::render::render_app(frame, &app))
@@ -1324,8 +1330,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
+        // Turn metadata uses the ▣ glyph, never the legacy ◆.
         assert!(!rendered.contains("◆"));
-        assert!(rendered.contains("▣"));
+        assert!(rendered.contains("\u{25a3}"));
     }
 
     // ---- HistorySearch --------------------------------------------------
