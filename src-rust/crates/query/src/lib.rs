@@ -250,6 +250,7 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "zhipu"
             | "zai"
             | "qwen"
+            | "alibaba"
             | "nebius"
             | "novita"
             | "ovhcloud"
@@ -989,7 +990,7 @@ pub async fn run_query_loop(
                     "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
                     "huggingface", "nvidia", "fireworks", "sambanova",
                     // Additional OpenAI-compat providers
-                    "qwen", "siliconflow",
+                    "qwen", "alibaba", "siliconflow",
                     "moonshot", "moonshotai",
                     "zhipu", "zhipuai",
                     "zai",
@@ -2512,6 +2513,14 @@ mod tests {
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(10_000)
         );
+    }
+
+    #[test]
+    fn test_alibaba_is_openaiish_provider() {
+        // "alibaba" is an alias for "qwen" (Alibaba's DashScope backend);
+        // both must be treated as OpenAI-compatible providers.
+        assert!(is_openaiish_provider("alibaba"));
+        assert!(is_openaiish_provider("qwen"));
     }
 }
 

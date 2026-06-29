@@ -24,7 +24,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "together-ai" => Some(together_ai()),
         "perplexity" => Some(perplexity()),
         "venice" => Some(venice()),
-        "qwen" => Some(qwen()),
+        "qwen" | "alibaba" => Some(qwen()),
         "mistral" => Some(mistral()),
         "openrouter" => Some(openrouter()),
         "sambanova" => Some(sambanova()),
@@ -583,4 +583,20 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
         include_usage_in_stream: true,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::LlmProvider;
+
+    #[test]
+    fn alibaba_resolves_to_qwen_backend() {
+        // "alibaba" is an alias for "qwen" — Alibaba's DashScope is the
+        // OpenAI-compatible backend behind both ids.
+        let alibaba = provider_for_id("alibaba").expect("alibaba should resolve");
+        let qwen = provider_for_id("qwen").expect("qwen should resolve");
+        assert_eq!(alibaba.id(), qwen.id());
+        assert_eq!(alibaba.name(), qwen.name());
+    }
 }
