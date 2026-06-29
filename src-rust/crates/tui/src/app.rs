@@ -717,6 +717,16 @@ pub struct App {
     pub spinner_verb: Option<String>,
     pub should_exit: bool,
     pub show_help: bool,
+    /// Whether the terminal speaks the kitty keyboard protocol (progressive
+    /// keyboard enhancement is active). When `false` — e.g. Windows conhost /
+    /// CMD / legacy PowerShell and most default terminals — printable keys
+    /// arrive as their final, layout-correct character (Shift already applied),
+    /// so we must NOT re-apply a US-QWERTY shift map to them (issue #183: typing
+    /// `/` produced `?`). When `true`, the terminal reports the unshifted base
+    /// key plus a SHIFT modifier, so we normalize it ourselves. Defaults to
+    /// `true`; the run loop overwrites it with the detected value once the
+    /// terminal has been initialized.
+    pub kitty_keyboard_active: bool,
 
     // Extended state
     pub tool_use_blocks: Vec<ToolUseBlock>,
@@ -1217,6 +1227,7 @@ impl App {
             spinner_verb: None,
             should_exit: false,
             show_help: false,
+            kitty_keyboard_active: true,
             tool_use_blocks: Vec::new(),
             permission_request: None,
             frame_count: 0,
@@ -2863,6 +2874,64 @@ impl App {
         Self::persist_onboarding_complete()
     }
 
+    /// Resolve the character to insert for a printable key press, applying the
+    /// US-QWERTY shift map only when the kitty keyboard protocol is active.
+    ///
+    /// On terminals that do NOT speak the kitty protocol (Windows conhost / CMD
+    /// / legacy PowerShell and most default terminals) the character is already
+    /// final and layout-correct — Shift has been applied by the OS — so we pass
+    /// it through untouched. Re-shifting it here would double-shift and corrupt
+    /// input, e.g. turning a literal `/` (typed via Shift on many non-US
+    /// layouts) into `?` (issue #183).
+    fn shift_normalize(&self, c: char, modifiers: KeyModifiers) -> char {
+        if self.kitty_keyboard_active {
+            normalize_char_with_shift(c, modifiers)
+        } else {
+            c
+        }
+    }
+
+    /// Handle Enter while a typeahead popup is open. Accepts the highlighted
+    /// suggestion and returns whether the prompt should now be submitted.
+    ///
+    /// - Slash command: complete the highlighted command *and* run it in a
+    ///   single Enter — the popup acts as a command menu, so a second Enter to
+    ///   "run" it should not be required (issue #183). Returns `true`.
+    /// - File reference: complete the path, append a space, and keep editing so
+    ///   the user can continue the prompt. Returns `false`.
+    /// - History recall (or anything else): complete and keep editing so the
+    ///   recalled text isn't fired off unexpectedly. Returns `false`.
+    ///
+    /// Callers must only invoke this when a suggestion is actually selected.
+    fn accept_suggestion_for_submit(&mut self) -> bool {
+        use crate::prompt_input::TypeaheadSource;
+        let source = self
+            .prompt_input
+            .suggestion_index
+            .and_then(|i| self.prompt_input.suggestions.get(i))
+            .map(|s| s.source.clone());
+        match source {
+            Some(TypeaheadSource::SlashCommand) => {
+                self.prompt_input.accept_suggestion();
+                // Sync legacy mirror fields without recomputing suggestions, so
+                // the just-completed command isn't re-suggested behind the popup.
+                self.sync_legacy_prompt_fields();
+                true
+            }
+            Some(TypeaheadSource::FileRef) => {
+                self.prompt_input.accept_suggestion();
+                self.prompt_input.insert_char(' ');
+                self.refresh_prompt_input();
+                false
+            }
+            _ => {
+                self.prompt_input.accept_suggestion();
+                self.refresh_prompt_input();
+                false
+            }
+        }
+    }
+
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
@@ -3065,7 +3134,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.ask_user_dialog.push_char(c);
                 }
                 KeyCode::Backspace => {
@@ -3110,7 +3179,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3153,7 +3222,7 @@ impl App {
                     self.free_mode_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3192,7 +3261,7 @@ impl App {
                     self.custom_provider_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3795,7 +3864,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
                 }
@@ -4058,8 +4127,14 @@ impl App {
             }
             // With the kitty keyboard protocol, Shift+/ is reported as Char('/') with
             // SHIFT rather than Char('?'), so also accept that form for the help toggle.
+            // This MUST be gated on the kitty protocol being active: on terminals that
+            // don't speak it (Windows conhost / CMD / legacy PowerShell), a Char('/')
+            // carrying a SHIFT flag is just a literal slash typed on a layout where `/`
+            // is a shifted key — it must fall through to text entry so the user can
+            // actually start a slash command (issue #183).
             KeyCode::Char('/')
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if self.kitty_keyboard_active
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
                     && !self.is_streaming
                     && self.prompt_input.is_empty()
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4116,7 +4191,7 @@ impl App {
             // ---- Text entry (allowed while streaming so users can queue
             // the next message; submission queues via Enter at the CLI layer).
             KeyCode::Char(c) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
@@ -4215,18 +4290,15 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Enter if !self.is_streaming => {
-                // If a suggestion is selected, accept it instead of submitting.
+                // Fallback Enter handling for when the keybinding layer doesn't
+                // claim Enter (e.g. it's been unbound); the default path is the
+                // "submit" keybinding action. If a typeahead popup is open, let
+                // the shared helper decide whether to complete a suggestion or
+                // also run it (issue #183).
                 if !self.prompt_input.suggestions.is_empty()
                     && self.prompt_input.suggestion_index.is_some()
+                    && !self.accept_suggestion_for_submit()
                 {
-                    let is_file_ref = self.prompt_input.suggestions
-                        .get(self.prompt_input.suggestion_index.unwrap())
-                        .map_or(false, |s| s.source == crate::prompt_input::TypeaheadSource::FileRef);
-                    self.prompt_input.accept_suggestion();
-                    if is_file_ref {
-                        self.prompt_input.insert_char(' ');
-                    }
-                    self.refresh_prompt_input();
                     return false;
                 }
                 // Auto-dismiss all error notifications when user sends a message
@@ -4417,7 +4489,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let ch = normalize_char_with_shift(ch, key.modifiers);
+                    let ch = self.shift_normalize(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
                 _ => {}
@@ -4556,7 +4628,7 @@ impl App {
                 self.history_search_overlay.toggle_pin();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -4628,7 +4700,7 @@ impl App {
                 self.refresh_global_search();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
             }
@@ -4729,9 +4801,7 @@ impl App {
                     if !self.prompt_input.suggestions.is_empty()
                         && self.prompt_input.suggestion_index.is_some()
                     {
-                        self.prompt_input.accept_suggestion();
-                        self.refresh_prompt_input();
-                        false
+                        self.accept_suggestion_for_submit()
                     } else {
                         true
                     }
@@ -6481,6 +6551,99 @@ mod tests {
             normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
             '!'
         );
+    }
+
+    // ---- issue #183: slash command input & execution on Windows / non-kitty terminals ----
+
+    #[test]
+    fn test_slash_inserts_literal_slash_when_shift_flagged_on_non_kitty_terminal() {
+        // On terminals that don't speak the kitty protocol (Windows conhost / CMD
+        // / legacy PowerShell, and non-US layouts where `/` is a shifted key) the
+        // slash key can arrive as Char('/') carrying a SHIFT flag, with the
+        // character already final. We must insert a literal `/`, not re-shift it
+        // into `?` (issue #183).
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+        // Pre-fill so the empty-prompt `?`/`/` help shortcut is out of the picture.
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x/");
+    }
+
+    #[test]
+    fn test_slash_with_shift_flag_starts_command_not_help_on_non_kitty_terminal() {
+        // Empty prompt: pressing `/` (reported as Char('/') + SHIFT on a non-kitty
+        // terminal) must insert a literal slash so the user can start a command,
+        // NOT toggle the help overlay (issue #183 — "Cannot run any slash commands").
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert!(
+            !app.help_overlay.visible,
+            "a literal slash must not open the help overlay"
+        );
+        assert!(!app.show_help);
+        assert_eq!(app.prompt_input.text, "/");
+    }
+
+    #[test]
+    fn test_shift_slash_still_normalizes_to_question_under_kitty_protocol() {
+        // With the kitty protocol active, Shift+/ arrives as the unshifted base
+        // key Char('/') + SHIFT, so we DO apply the US-QWERTY shift map → `?`.
+        let mut app = make_app();
+        app.kitty_keyboard_active = true;
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x?");
+    }
+
+    #[test]
+    fn test_enter_runs_highlighted_slash_command_in_one_press() {
+        // Typing a slash command and pressing Enter should run it immediately
+        // rather than merely completing the text and waiting for a second Enter
+        // (issue #183 — "enter will not run the command").
+        let mut app = make_app();
+        for c in "/help".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            !app.prompt_input.suggestions.is_empty(),
+            "the slash-command popup should be open"
+        );
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit, "Enter should submit/run the highlighted command");
+        assert_eq!(app.prompt_input.text, "/help");
+        assert!(
+            app.prompt_input.suggestions.is_empty(),
+            "the popup should be dismissed after running"
+        );
+    }
+
+    #[test]
+    fn test_enter_completes_slash_prefix_then_runs() {
+        // Even from a unique prefix, Enter completes to the highlighted command
+        // and runs it in a single press.
+        let mut app = make_app();
+        for c in "/the".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit);
+        assert_eq!(app.prompt_input.text, "/theme");
     }
 
     #[test]
