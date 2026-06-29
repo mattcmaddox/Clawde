@@ -55,7 +55,7 @@ impl BedrockProvider {
             .unwrap_or_else(|_| "us-east-1".to_string());
 
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 

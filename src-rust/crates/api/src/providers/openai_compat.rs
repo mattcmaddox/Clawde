@@ -114,7 +114,7 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -866,7 +866,36 @@ impl LlmProvider for OpenAiCompatProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): some
+            // OpenAI-compatible providers begin a streamed tool call and then
+            // pause indefinitely before sending the arguments. Wrap each chunk
+            // read in a generous idle timeout so a stall surfaces as an error
+            // instead of hanging forever. Each chunk resets the timer, so
+            // slow-but-progressing local models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {

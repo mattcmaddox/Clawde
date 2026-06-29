@@ -595,6 +595,9 @@ async fn main() -> anyhow::Result<()> {
         (String::new(), false)
     };
 
+    // Apply the user-configured request timeout (issue #175) before building any
+    // client so the Anthropic client and all providers honour it.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
@@ -1230,6 +1233,8 @@ async fn refresh_provider_runtime_state(
         .resolve_anthropic_auth_async()
         .await
         .unwrap_or((String::new(), false));
+    // Apply the user-configured request timeout (issue #175) before rebuilding.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key,
         api_base: config.resolve_anthropic_api_base(),

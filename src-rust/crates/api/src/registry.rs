@@ -364,6 +364,12 @@ impl ProviderRegistry {
         config: &claurst_core::config::Config,
         anthropic_config: ClientConfig,
     ) -> Self {
+        // Apply the user-configured request timeout (issue #175) before any
+        // provider HTTP clients are built, so they all honour it. Uses the
+        // active provider's resolved value (per-provider override or global).
+        crate::set_request_timeout_secs(
+            config.resolve_request_timeout_secs(config.selected_provider_id()),
+        );
         let mut registry = Self::from_environment_with_auth_store(anthropic_config);
         let active_provider = config.selected_provider_id();
 

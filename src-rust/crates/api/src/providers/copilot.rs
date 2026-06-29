@@ -51,7 +51,7 @@ pub struct CopilotProvider {
 impl CopilotProvider {
     pub fn new(token: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 

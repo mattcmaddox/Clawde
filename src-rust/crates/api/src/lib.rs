@@ -97,6 +97,57 @@ pub use providers::{
     ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
 };
 
+// ---------------------------------------------------------------------------
+// Request timeout configuration (issue #175)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Default total request timeout in seconds when the user has not configured
+/// one. Kept in sync with [`claurst_core::config::DEFAULT_REQUEST_TIMEOUT_SECS`].
+pub use claurst_core::config::DEFAULT_REQUEST_TIMEOUT_SECS;
+
+/// Process-wide total request timeout (seconds) applied to provider HTTP
+/// clients that are constructed lazily without access to the user `Config`
+/// (OpenAI, OpenAI-compatible, Cohere, MiniMax, Copilot, Azure, Bedrock, …).
+///
+/// Set once at startup from the resolved configuration via
+/// [`set_request_timeout_secs`]; defaults to [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+/// A process-wide value is used because providers are built in many places via
+/// builder chains that do not thread the user `Config` through.
+static REQUEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_SECS);
+
+/// Override the process-wide request timeout. A value of `0` resets to
+/// [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Idempotent; safe to call multiple times.
+pub fn set_request_timeout_secs(secs: u64) {
+    let value = if secs == 0 { DEFAULT_REQUEST_TIMEOUT_SECS } else { secs };
+    REQUEST_TIMEOUT_SECS.store(value, Ordering::Relaxed);
+}
+
+/// Current process-wide request timeout in seconds.
+pub fn request_timeout_secs() -> u64 {
+    REQUEST_TIMEOUT_SECS.load(Ordering::Relaxed)
+}
+
+/// Current process-wide request timeout as a [`Duration`].
+pub fn request_timeout() -> Duration {
+    Duration::from_secs(request_timeout_secs())
+}
+
+/// Per-chunk idle timeout used to bound infinite mid-stream stalls (issue #185).
+///
+/// An OpenAI-compatible provider can begin a streamed tool call and then pause
+/// indefinitely before sending the tool arguments. The streaming loops wrap
+/// each `byte_stream.next()` in `tokio::time::timeout(stream_idle_timeout(), …)`
+/// so such stalls surface as a stream error instead of hanging forever.
+///
+/// The value is GENEROUS and never smaller than the configured request timeout,
+/// so legitimately slow-but-progressing local models (whose chunks reset the
+/// timer) are never cut off — the goal is only to bound true infinite stalls.
+pub fn stream_idle_timeout() -> Duration {
+    request_timeout().max(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+}
+
 // Composite "Free" provider — stacks many free-tier upstreams behind one
 // `free/auto` model id.
 pub use providers::{FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
@@ -446,7 +497,9 @@ pub mod client {
                 max_retries: 5,
                 initial_retry_delay: Duration::from_secs(1),
                 max_retry_delay: Duration::from_secs(60),
-                request_timeout: Duration::from_secs(600),
+                // Honour the process-wide configured timeout (issue #175);
+                // falls back to DEFAULT_REQUEST_TIMEOUT_SECS when unset.
+                request_timeout: crate::request_timeout(),
                 use_bearer_auth: false,
                 provider: Provider::Anthropic,
             }
@@ -975,7 +1028,10 @@ pub mod client {
                         .header("x-stainless-runtime-version", "v22.0.0")
                         .header("x-stainless-package-version", "0.94.0")
                         .header("x-stainless-retry-count", (attempts - 1).to_string())
-                        .header("x-stainless-timeout", "600")
+                        .header(
+                            "x-stainless-timeout",
+                            self.config.request_timeout.as_secs().to_string(),
+                        )
                         .header("x-claude-code-session-id", &session_id)
                         .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
                         .header("Authorization", format!("Bearer {}", &self.config.api_key));
@@ -1514,5 +1570,66 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Request timeout (#175) + stream idle timeout (#185)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_timeout_threads_through_to_client_config() {
+        // Reset to the default and confirm the generous 600s fallback.
+        set_request_timeout_secs(0);
+        assert_eq!(request_timeout_secs(), DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(request_timeout(), Duration::from_secs(600));
+
+        // An override threads through request_timeout() and ClientConfig::default.
+        set_request_timeout_secs(1800);
+        assert_eq!(request_timeout_secs(), 1800);
+        assert_eq!(
+            client::ClientConfig::default().request_timeout,
+            Duration::from_secs(1800)
+        );
+        // Idle timeout is generous and never smaller than the request timeout.
+        assert!(stream_idle_timeout() >= request_timeout());
+        assert_eq!(stream_idle_timeout(), Duration::from_secs(1800));
+
+        // A short request timeout still keeps a generous idle floor (#185:
+        // bound stalls without cutting off slow-but-progressing streams).
+        set_request_timeout_secs(60);
+        assert_eq!(
+            stream_idle_timeout(),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+
+        // Restore the default so we do not leak state into other tests.
+        set_request_timeout_secs(0);
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_elapses_instead_of_hanging() {
+        use futures::StreamExt;
+
+        // A byte stream that never yields models a provider that begins a
+        // streamed response and then pauses indefinitely (issue #185).
+        let mut stalled =
+            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+
+        // The exact construct used by the streaming loops: wrapping the chunk
+        // read in tokio::time::timeout must elapse rather than hang forever.
+        // A short duration keeps the test fast; production uses the generous
+        // stream_idle_timeout() value asserted below.
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
+        assert!(
+            result.is_err(),
+            "a stalled stream must hit the idle timeout, not hang"
+        );
+
+        // Invariants that hold for any configured value: the production idle
+        // timeout is finite, never below the request timeout, and never below
+        // the generous default floor.
+        assert!(stream_idle_timeout() >= request_timeout());
+        assert!(stream_idle_timeout() >= Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS));
     }
 }

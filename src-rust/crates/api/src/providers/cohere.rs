@@ -42,7 +42,7 @@ impl CohereProvider {
     /// Create a new CohereProvider with the given API key.
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 

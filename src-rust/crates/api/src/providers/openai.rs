@@ -51,7 +51,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -730,7 +730,34 @@ impl LlmProvider for OpenAiProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): wrap each chunk
+            // read in a generous idle timeout so a provider that pauses
+            // indefinitely surfaces an error instead of hanging. Each chunk
+            // resets the timer, so slow-but-progressing models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {

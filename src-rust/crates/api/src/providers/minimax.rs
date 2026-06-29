@@ -36,7 +36,7 @@ impl MinimaxProvider {
         headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
         let http_client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("MinimaxProvider: failed to build HTTP client");
 
