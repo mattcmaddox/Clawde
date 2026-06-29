@@ -152,8 +152,23 @@ impl OpenAiCompatProvider {
     }
 
     /// Override the base URL (e.g. from a user-supplied --api-base flag).
+    ///
+    /// When the provider uses Ollama's native API host (set by the `ollama()`
+    /// factory), keep it in sync with the new base URL.  Otherwise health
+    /// checks and native model discovery would keep targeting the original
+    /// (localhost) host even though chat completions go to the overridden
+    /// server.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.quirks.ollama_native_host.is_some() {
+            let native_host = self
+                .base_url
+                .trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .trim_end_matches('/')
+                .to_string();
+            self.quirks.ollama_native_host = Some(native_host);
+        }
         self
     }
 
@@ -1293,5 +1308,28 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn with_base_url_retargets_ollama_native_host() {
+        // Mirror the ollama() factory default: both the /v1 base URL and the
+        // native host point at localhost initially.
+        let provider = OpenAiCompatProvider::new("ollama", "Ollama", "http://localhost:11434/v1")
+            .with_quirks(ProviderQuirks {
+                no_api_key_required: true,
+                ollama_native_host: Some("http://localhost:11434".to_string()),
+                ..Default::default()
+            });
+
+        // Overriding the base URL with a configured remote api_base (as the
+        // registry does for `providers.ollama.api_base`) must also retarget the
+        // native host used by health_check() and native model discovery.
+        let provider = provider.with_base_url("http://192.0.2.10:11434/v1");
+
+        assert_eq!(provider.base_url, "http://192.0.2.10:11434/v1");
+        assert_eq!(
+            provider.quirks.ollama_native_host.as_deref(),
+            Some("http://192.0.2.10:11434"),
+        );
     }
 }
