@@ -1687,9 +1687,19 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
-        self.model_picker.loading_models = true;
         self.model_picker_provider_id = Some(provider_id.to_string());
-        self.model_picker_fetch_pending = true;
+        // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
+        // projection of the models.dev catalog — there is no live endpoint to
+        // discover from, so skip the background fetch entirely and treat the
+        // projection as final. Live-endpoint / curated-list providers still
+        // fetch their real model list to overlay onto the projection.
+        if crate::model_picker::provider_uses_catalog_projection(provider_id) {
+            self.model_picker.loading_models = false;
+            self.model_picker_fetch_pending = false;
+        } else {
+            self.model_picker.loading_models = true;
+            self.model_picker_fetch_pending = true;
+        }
 
         let provider_prefix = format!("{}/", provider_id);
         let current_model = if self.config.provider.as_deref() == Some(provider_id) {

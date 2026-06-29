@@ -372,6 +372,24 @@ pub fn default_model_for_provider(
     }
 }
 
+/// Whether the picker list for `provider_id` is a pure read-only projection of
+/// the models.dev catalog — i.e. the provider has **no** live model-discovery
+/// endpoint and its `discover_models()` is the empty trait default.
+///
+/// For these providers (Anthropic, OpenAI, Google) the displayed list must come
+/// from [`models_for_provider_from_registry`] and nothing else; the event loop
+/// skips the background discovery fetch entirely so a provider return value can
+/// never replace the catalog projection. This is what makes a fresh
+/// `claude-opus-*` point-release surface the instant the snapshot ships it.
+///
+/// Live-endpoint providers (Ollama/LM Studio/llama.cpp, Copilot, Azure, the
+/// openai-compatible gateways, …) and curated-list providers (Bedrock, Codex,
+/// free, Cohere, MiniMax) are intentionally excluded: they keep populating the
+/// picker from their `discover_models()` result.
+pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
+    matches!(provider_id, "anthropic" | "openai" | "google")
+}
+
 /// Whether `provider_id` refers to the OpenAI Codex provider under either of
 /// its two id spellings: the canonical `"codex"` (used by `CodexProvider`,
 /// the model registry, and the runtime dispatch) or the `"openai-codex"`
@@ -1250,6 +1268,49 @@ mod tests {
         assert!(
             models.iter().any(|m| m.id.starts_with("gpt-") || m.id.starts_with("o3") || m.id.starts_with("o4")),
             "openai should expose at least one gpt/o-series model"
+        );
+    }
+
+    // The picker list for a catalog-backed provider must be exactly the
+    // read-only registry projection (release_date DESC, then id) — no provider
+    // return value is allowed to become the displayed list. This is what makes
+    // a fresh claude-opus point-release surface the moment the snapshot ships.
+    #[test]
+    fn picker_list_equals_registry_projection_for_catalog_providers() {
+        let registry = claurst_api::ModelRegistry::new();
+
+        // Catalog-backed providers skip live discovery; live ones do not.
+        assert!(provider_uses_catalog_projection("anthropic"));
+        assert!(provider_uses_catalog_projection("openai"));
+        assert!(provider_uses_catalog_projection("google"));
+        assert!(!provider_uses_catalog_projection("ollama"));
+        assert!(!provider_uses_catalog_projection("github-copilot"));
+
+        for pid in ["anthropic", "openai"] {
+            let picker_ids: Vec<String> = models_for_provider_from_registry(pid, &registry)
+                .iter()
+                .map(|m| m.id.clone())
+                .collect();
+
+            let mut proj = registry.list_visible_by_provider(pid);
+            proj.sort_by(|a, b| {
+                let rd_a = a.release_date.as_deref().unwrap_or("");
+                let rd_b = b.release_date.as_deref().unwrap_or("");
+                rd_b.cmp(rd_a).then_with(|| (*a.info.id).cmp(&*b.info.id))
+            });
+            let proj_ids: Vec<String> = proj.iter().map(|e| e.info.id.to_string()).collect();
+
+            assert_eq!(picker_ids, proj_ids, "{pid} picker must equal catalog projection");
+        }
+
+        // Headline: the newest Opus is in the projected anthropic list.
+        let anthropic_ids: Vec<String> = models_for_provider_from_registry("anthropic", &registry)
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert!(
+            anthropic_ids.iter().any(|id| id == "claude-opus-4-8"),
+            "claude-opus-4-8 must appear in the projected list"
         );
     }
 

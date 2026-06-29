@@ -440,7 +440,7 @@ impl LlmProvider for MinimaxProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let minimax_id = ProviderId::new(ProviderId::MINIMAX);
         Ok(vec![
             ModelInfo {
@@ -449,6 +449,7 @@ impl LlmProvider for MinimaxProvider {
                 name: "MiniMax-M2.7".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 8192,
+                ..Default::default()
             },
         ])
     }

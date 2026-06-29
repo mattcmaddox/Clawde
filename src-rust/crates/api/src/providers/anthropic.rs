@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
 
 use crate::client::{AnthropicClient, ClientConfig};
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -319,33 +319,6 @@ impl LlmProvider for AnthropicProvider {
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let anthropic_id = ProviderId::new(ProviderId::ANTHROPIC);
-        Ok(vec![
-            ModelInfo {
-                id: ModelId::new("claude-opus-4-6"),
-                provider_id: anthropic_id.clone(),
-                name: "Claude Opus 4.6".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 32_000,
-            },
-            ModelInfo {
-                id: ModelId::new("claude-sonnet-4-6"),
-                provider_id: anthropic_id.clone(),
-                name: "Claude Sonnet 4.6".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 16_000,
-            },
-            ModelInfo {
-                id: ModelId::new("claude-haiku-4-5-20251001"),
-                provider_id: anthropic_id.clone(),
-                name: "Claude Haiku 4.5".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 8_096,
-            },
-        ])
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {

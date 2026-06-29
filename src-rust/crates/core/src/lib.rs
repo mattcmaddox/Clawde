@@ -1310,6 +1310,10 @@ pub mod config {
                 Some("togetherai") | Some("together-ai") => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 Some("perplexity") => "sonar-pro",
                 Some("cohere") => "command-r-plus",
+                // DashScope runs as "qwen" at runtime but is "alibaba" in the
+                // models.dev catalog; terminal fallback keeps a qwen id so an
+                // unconfigured Qwen provider never resolves to a claude-* model.
+                Some("qwen") | Some("alibaba") => "qwen3-max",
                 Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
                 Some("github-copilot") => "gpt-4o",
                 Some("ollama") => "llama3.2",

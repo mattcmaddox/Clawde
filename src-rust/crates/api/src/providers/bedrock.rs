@@ -763,7 +763,7 @@ impl LlmProvider for BedrockProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         Ok(vec![
             ModelInfo {
                 id: ModelId::new("anthropic.claude-opus-4-6"),
@@ -771,6 +771,7 @@ impl LlmProvider for BedrockProvider {
                 name: "Claude Opus 4.6 (Bedrock)".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 32_000,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("anthropic.claude-sonnet-4-6"),
@@ -778,6 +779,7 @@ impl LlmProvider for BedrockProvider {
                 name: "Claude Sonnet 4.6 (Bedrock)".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 16_000,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("anthropic.claude-haiku-4-5-20251001"),
@@ -785,6 +787,7 @@ impl LlmProvider for BedrockProvider {
                 name: "Claude Haiku 4.5 (Bedrock)".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 8_192,
+                ..Default::default()
             },
         ])
     }

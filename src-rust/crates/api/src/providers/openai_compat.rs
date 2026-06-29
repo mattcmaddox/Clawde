@@ -83,7 +83,7 @@ pub struct ProviderQuirks {
     /// "No API key configured".
     pub no_api_key_required: bool,
 
-    /// When set, `list_models()` uses Ollama's native `/api/tags` endpoint
+    /// When set, `discover_models()` uses Ollama's native `/api/tags` endpoint
     /// (and optionally `/api/show` for per-model metadata) instead of the
     /// OpenAI-compatible `/v1/models` endpoint.  The value is the Ollama host
     /// root (e.g. `"http://localhost:11434"`) so the native API can be called
@@ -575,7 +575,7 @@ impl OpenAiCompatProvider {
     /// Models are sorted with coding-oriented models first (names containing
     /// "code" or "coder"), then by parameter size descending, so the best
     /// local coding model naturally appears at the top.
-    async fn list_models_ollama_native(
+    async fn discover_models_ollama_native(
         &self,
         ollama_host: &str,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -637,6 +637,7 @@ impl OpenAiCompatProvider {
                     name: Self::ollama_display_name(name),
                     context_window,
                     max_output_tokens: max_output,
+                    ..Default::default()
                 },
                 is_coder,
                 param_size,
@@ -1173,12 +1174,12 @@ impl LlmProvider for OpenAiCompatProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Use Ollama native API when configured — provides richer metadata
         // (parameter size, quantization, actual context window) than the
         // generic OpenAI-compat /v1/models endpoint.
         if let Some(ref ollama_host) = self.quirks.ollama_native_host {
-            return self.list_models_ollama_native(ollama_host).await;
+            return self.discover_models_ollama_native(ollama_host).await;
         }
 
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
@@ -1236,6 +1237,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         _ => 128_000,
                     },
                     max_output_tokens: 16_384,
+                    ..Default::default()
                 })
             })
             .collect();

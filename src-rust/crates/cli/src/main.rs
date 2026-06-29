@@ -3362,7 +3362,14 @@ async fn run_interactive(
                         .strip_prefix(&provider_prefix)
                         .unwrap_or(app.model_name.as_str())
                         .to_string();
-                    app.model_picker.set_models(entries);
+                    // Only let a live-discovery result replace the list when it
+                    // actually returned models. An empty result — catalog-backed
+                    // provider (now the trait default), an unreachable endpoint,
+                    // or a missing entitlement — must never wipe the registry
+                    // projection set when the picker opened.
+                    if !entries.is_empty() {
+                        app.model_picker.set_models(entries);
+                    }
                     for m in &mut app.model_picker.models {
                         m.is_current = m.id == current;
                     }
@@ -3414,7 +3421,7 @@ async fn run_interactive(
                     app.model_fetch_rx = Some(rx);
                     app.model_picker.loading_models = true;
                     tokio::spawn(async move {
-                        match provider.list_models().await {
+                        match provider.discover_models().await {
                             Ok(models) => {
                                 let entries: Vec<claurst_tui::model_picker::ModelEntry> = models
                                     .into_iter()

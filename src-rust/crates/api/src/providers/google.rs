@@ -14,14 +14,14 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::error_handling::parse_error_response as parse_http_error;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -910,101 +910,32 @@ impl LlmProvider for GoogleProvider {
         Ok(Box::pin(stream))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let url = format!(
-            "{}/v1beta/models?key={}",
-            self.base_url, self.api_key
-        );
-
+    async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+        // Lightweight liveness probe: a models-listing GET on the live endpoint.
+        // (Model *listing* for the picker comes from the catalog, not here.)
+        let url = format!("{}/v1beta/models?key={}", self.base_url, self.api_key);
         let resp = self
             .http_client
             .get(&url)
             .header("x-goog-api-key", &self.api_key)
             .send()
-            .await
-            .map_err(|e| ProviderError::ServerError {
-                provider: self.id.clone(),
-                status: None,
-                message: e.to_string(),
-                is_retryable: true,
-            })?;
-
-        let status = resp.status().as_u16();
-        let body_text = resp.text().await.map_err(|e| ProviderError::ServerError {
-            provider: self.id.clone(),
-            status: Some(status),
-            message: e.to_string(),
-            is_retryable: true,
-        })?;
-
-        if status >= 400 {
-            return Err(self.parse_error_response(status, &body_text));
-        }
-
-        let body: Value =
-            serde_json::from_str(&body_text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models list JSON: {}", e),
-                status: Some(status),
-                body: Some(body_text.clone()),
-            })?;
-
-        let models_array = body
-            .get("models")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let provider_id = self.id.clone();
-        let models: Vec<ModelInfo> = models_array
-            .iter()
-            .filter_map(|m| {
-                let name = m.get("name").and_then(|n| n.as_str())?;
-                // Only include Gemini models (filter out palm, embedding, etc.)
-                if !name.starts_with("models/gemini-") {
-                    return None;
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => Ok(ProviderStatus::Healthy),
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let body = r.text().await.unwrap_or_default();
+                match self.parse_error_response(status, &body) {
+                    ProviderError::AuthFailed { message, .. } => {
+                        Err(ProviderError::AuthFailed {
+                            provider: self.id.clone(),
+                            message,
+                        })
+                    }
+                    e => Ok(ProviderStatus::Unavailable {
+                        reason: e.to_string(),
+                    }),
                 }
-                // Strip the "models/" prefix for the model ID.
-                let model_id = name.strip_prefix("models/").unwrap_or(name);
-                let display = m
-                    .get("displayName")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or(model_id)
-                    .to_string();
-                let input_limit = m
-                    .get("inputTokenLimit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(32_768) as u32;
-                let output_limit = m
-                    .get("outputTokenLimit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8_192) as u32;
-
-                Some(ModelInfo {
-                    id: ModelId::new(model_id),
-                    provider_id: provider_id.clone(),
-                    name: display,
-                    context_window: input_limit,
-                    max_output_tokens: output_limit,
-                })
-            })
-            .collect();
-
-        Ok(models)
-    }
-
-    async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
-        // Use list_models as a lightweight liveness check.
-        match self.list_models().await {
-            Ok(models) if !models.is_empty() => Ok(ProviderStatus::Healthy),
-            Ok(_) => Ok(ProviderStatus::Degraded {
-                reason: "No Gemini models returned".to_string(),
-            }),
-            Err(ProviderError::AuthFailed { message, .. }) => {
-                Err(ProviderError::AuthFailed {
-                    provider: self.id.clone(),
-                    message,
-                })
             }
             Err(e) => Ok(ProviderStatus::Unavailable {
                 reason: e.to_string(),

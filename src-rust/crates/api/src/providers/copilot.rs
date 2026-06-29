@@ -455,17 +455,17 @@ impl CopilotProvider {
     /// unreachable or returns empty data.
     fn hardcoded_models(provider_id: &ProviderId) -> Vec<ModelInfo> {
         vec![
-            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000 },
+            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000, ..Default::default() },
         ]
     }
 
@@ -1117,7 +1117,7 @@ impl LlmProvider for CopilotProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Try to fetch the live model list from the Copilot API.
         let url = format!("{}/models", Self::base_url());
         let builder = self.http_client.get(&url);
@@ -1197,6 +1197,7 @@ impl LlmProvider for CopilotProvider {
                                 name: name.to_string(),
                                 context_window: ctx,
                                 max_output_tokens: max_out,
+                                ..Default::default()
                             });
                         }
                     }

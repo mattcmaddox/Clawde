@@ -441,7 +441,7 @@ impl LlmProvider for AzureProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         Ok(vec![
             ModelInfo {
                 id: ModelId::new("gpt-4o"),
@@ -449,6 +449,7 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4o (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("gpt-4o-mini"),
@@ -456,6 +457,7 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4o Mini (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("gpt-4-turbo"),
@@ -463,6 +465,7 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4 Turbo (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_096,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("gpt-35-turbo"),
@@ -470,6 +473,7 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-3.5 Turbo (Azure)".to_string(),
                 context_window: 16_385,
                 max_output_tokens: 4_096,
+                ..Default::default()
             },
         ])
     }

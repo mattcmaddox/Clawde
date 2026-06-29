@@ -899,7 +899,7 @@ impl LlmProvider for CodexProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         use claurst_core::codex_oauth::codex_limit_override;
         let models = CODEX_MODELS
             .iter()
@@ -913,6 +913,7 @@ impl LlmProvider for CodexProvider {
                     name: name.to_string(),
                     context_window,
                     max_output_tokens,
+                    ..Default::default()
                 }
             })
             .collect();
