@@ -1699,6 +1699,12 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Gate input shift-normalization on whether the terminal speaks the kitty
+    // keyboard protocol (detected in setup_terminal). On terminals that don't —
+    // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
+    // arrive as their final character, so re-shifting them would corrupt input
+    // (issue #183: typing `/` produced `?`).
+    app.kitty_keyboard_active = claurst_tui::keyboard_enhancement_active();
     if let Some(warning) = resume_warning {
         app.status_message = Some(warning);
     }
@@ -2386,6 +2392,8 @@ async fn run_interactive(
                                         }
                                     }
                                     terminal = claurst_tui::setup_terminal()?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::StartLoginForProvider {
                                     provider,
@@ -2451,6 +2459,8 @@ async fn run_interactive(
                                         }
                                     }
                                     terminal = claurst_tui::setup_terminal()?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
