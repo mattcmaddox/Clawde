@@ -102,6 +102,9 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
             .collect(),
         url: config.url.as_deref().map(expand_env_vars),
         server_type: config.server_type.clone(),
+        // Preserve origin: expansion must not launder a project server into
+        // a trusted one.
+        origin: config.origin,
     }
 }
 
@@ -1458,6 +1461,7 @@ mod tests {
             },
             url: None,
             server_type: "stdio".to_string(),
+            origin: Default::default(),
         };
         let expanded = expand_server_config(&cfg);
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
@@ -1622,6 +1626,7 @@ mod tests {
                 env: HashMap::new(),
                 url: Some("https://example.com/mcp".to_string()),
                 server_type: "http".to_string(),
+                origin: Default::default(),
             },
         );
 

@@ -860,6 +860,7 @@ mod tests {
             env: HashMap::new(),
             url: Some(url),
             server_type: "sse".to_string(),
+            origin: Default::default(),
         }
     }
 

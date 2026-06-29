@@ -929,6 +929,17 @@ pub struct App {
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Project-defined MCP servers awaiting the user's approval decision.
+    /// Populated at startup with the gated (untrusted) project servers; the
+    /// main loop shows one approval dialog at a time, draining this queue.
+    pub mcp_pending_project: std::collections::VecDeque<claurst_core::config::McpServerConfig>,
+    /// The project MCP server currently shown in the approval dialog, if any.
+    pub mcp_prompting: Option<claurst_core::config::McpServerConfig>,
+    /// Fingerprints of project MCP servers approved for THIS session only
+    /// (the "Allow this session" choice). Not persisted to disk.
+    pub mcp_session_trusted: std::collections::HashSet<String>,
+    /// Project root used to key persistent MCP trust approvals.
+    pub mcp_project_root: Option<std::path::PathBuf>,
     /// Go to Line dialog (Ctrl+G in message pane).
     pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
@@ -1346,6 +1357,10 @@ impl App {
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            mcp_pending_project: std::collections::VecDeque::new(),
+            mcp_prompting: None,
+            mcp_session_trusted: std::collections::HashSet::new(),
+            mcp_project_root: None,
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
@@ -2830,13 +2845,81 @@ impl App {
         pending
     }
 
-    /// Returns and clears any pending MCP approval result.
-    pub fn take_mcp_approval_result(&mut self) -> Option<crate::dialogs::McpApprovalChoice> {
-        if !self.mcp_approval.visible {
-            return None;
+    /// If a project MCP server is waiting for approval and no approval dialog
+    /// is currently open, pop the next one and show the approval dialog for it.
+    ///
+    /// Called from the main loop. Returns `true` when a dialog was shown.
+    pub fn maybe_prompt_next_mcp_server(&mut self) -> bool {
+        if self.mcp_approval.visible || self.mcp_prompting.is_some() {
+            return false;
         }
-        // The dialog closes itself on confirm; we check if it's now closed
-        None // Actual result is read by CLI loop via mcp_approval.visible + confirm()
+        if let Some(server) = self.mcp_pending_project.pop_front() {
+            self.mcp_approval.show(
+                &server.name,
+                server.url.as_deref(),
+                server.command.as_deref(),
+                // Tools are unknown until the server is launched; the dialog
+                // shows the command/url so the user can judge before running it.
+                Vec::new(),
+            );
+            self.mcp_prompting = Some(server);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the user's decision for the project MCP server currently shown in
+    /// the approval dialog. Persists "always allow" choices to the on-disk
+    /// trust store and requests an MCP reconnect when a server is approved.
+    pub fn handle_mcp_approval_decision(&mut self, choice: crate::dialogs::McpApprovalChoice) {
+        use crate::dialogs::McpApprovalChoice;
+        let server = match self.mcp_prompting.take() {
+            Some(s) => s,
+            None => return,
+        };
+        match choice {
+            McpApprovalChoice::AllowSession => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                self.pending_mcp_reconnect = true;
+                self.status_message = Some(format!(
+                    "Approved MCP server '{}' for this session.",
+                    server.name
+                ));
+            }
+            McpApprovalChoice::AllowAlways => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                if let Some(root) = self.mcp_project_root.clone() {
+                    let mut store = claurst_core::mcp_trust::McpTrustStore::load();
+                    store.approve(&root, &server);
+                    if let Err(e) = store.save() {
+                        self.status_message = Some(format!(
+                            "Approved '{}', but failed to persist trust: {}",
+                            server.name, e
+                        ));
+                    } else {
+                        self.status_message = Some(format!(
+                            "Always allowing MCP server '{}' for this project.",
+                            server.name
+                        ));
+                    }
+                } else {
+                    self.status_message = Some(format!(
+                        "Approved MCP server '{}' (no project root to persist to).",
+                        server.name
+                    ));
+                }
+                self.pending_mcp_reconnect = true;
+            }
+            McpApprovalChoice::Deny => {
+                self.status_message = Some(format!(
+                    "Skipped project MCP server '{}'.",
+                    server.name
+                ));
+            }
+        }
     }
 
     /// Detect the current PR from environment variables or git.
@@ -3687,9 +3770,8 @@ impl App {
 
         // MCP approval dialog
         if self.mcp_approval.visible {
-            let result = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key);
-            if result.is_some() {
-                // Result processed by CLI loop via take_mcp_approval_result()
+            if let Some(choice) = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key) {
+                self.handle_mcp_approval_decision(choice);
             }
             return false;
         }

@@ -81,7 +81,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
@@ -1064,6 +1064,27 @@ pub mod config {
         StreamJson,
     }
 
+    /// Where an MCP server definition came from.
+    ///
+    /// This is a *runtime* classification used to gate auto-launching of
+    /// servers that can run arbitrary commands. It is deliberately NEVER
+    /// (de)serialized from the settings file (see `#[serde(skip)]` on
+    /// `McpServerConfig::origin`): a repository's `.claurst/settings.json`
+    /// must not be able to forge `User` to bypass the trust gate. The origin
+    /// is always assigned in code at load time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    pub enum McpServerOrigin {
+        /// Defined in the user's global `~/.claurst/settings.json`, supplied
+        /// on the command line (`--mcp-config`), or contributed by an
+        /// explicitly-enabled plugin. Considered trusted: auto-connects.
+        #[default]
+        User,
+        /// Defined in a repository's project-level `.claurst/settings.json`.
+        /// Untrusted until the user approves it, because opening a cloned repo
+        /// would otherwise spawn an attacker-controlled process (RCE).
+        Project,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct McpServerConfig {
         pub name: String,
@@ -1075,6 +1096,11 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Origin of this definition. Never read from JSON (always `User` on
+        /// deserialize); set to `Project` in `find_project_settings` for
+        /// servers loaded from a repo. See [`McpServerOrigin`].
+        #[serde(skip)]
+        pub origin: McpServerOrigin,
     }
 
     fn default_mcp_type() -> String {
@@ -1105,6 +1131,13 @@ pub mod config {
         pub projects: HashMap<String, ProjectSettings>,
         #[serde(default, rename = "remoteControlAtStartup")]
         pub remote_control_at_startup: bool,
+        /// Global opt-in: trust and auto-launch project-defined MCP servers
+        /// (those declared in a repository's `.claurst/settings.json`) without
+        /// prompting. Defaults to `false`. Leaving it off means project servers
+        /// must be approved per-project before they can spawn a process.
+        /// Prefer per-project approval over flipping this on globally.
+        #[serde(default, rename = "trustProjectMcpServers")]
+        pub trust_project_mcp_servers: bool,
         /// Persisted permission rules saved by the user across sessions.
         #[serde(default, rename = "permissionRules")]
         pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
@@ -1676,7 +1709,20 @@ pub mod config {
                     if candidate.exists() && candidate != global_path {
                         if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
                             let stripped = strip_jsonc_comments(&content);
-                            if let Ok(s) = serde_json::from_str::<Self>(&stripped) {
+                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                // SECURITY: tag every server defined by this
+                                // repository as project-origin so it gets gated
+                                // behind explicit approval before launching.
+                                // `origin` is `#[serde(skip)]`, so the file can
+                                // never set it itself — we always assign here.
+                                for server in &mut s.config.mcp_servers {
+                                    server.origin = McpServerOrigin::Project;
+                                }
+                                for ps in s.projects.values_mut() {
+                                    for server in &mut ps.mcp_servers {
+                                        server.origin = McpServerOrigin::Project;
+                                    }
+                                }
                                 return Some(s);
                             }
                         }
@@ -1760,6 +1806,12 @@ pub mod config {
                 version: over.version.or(base.version),
                 projects: merge_map(base.projects, over.projects),
                 remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
+                // SECURITY: only the user's global settings may grant blanket
+                // trust to project MCP servers. A project's own settings file
+                // (`over`) must NOT be able to flip this on — otherwise a
+                // malicious repo could set `trustProjectMcpServers: true` to
+                // bypass the approval gate entirely.
+                trust_project_mcp_servers: base.trust_project_mcp_servers,
                 permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
                 enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
@@ -4068,6 +4120,7 @@ pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
 pub mod ps_classifier;
+pub mod mcp_trust;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -4253,6 +4306,52 @@ mod tests {
     fn test_hooks_config_default() {
         let cfg = crate::config::Config::default();
         assert!(cfg.hooks.is_empty());
+    }
+
+    /// Security (issue #123): MCP servers declared in a repository's
+    /// `.claurst/settings.json` must be tagged `Project` origin after a
+    /// hierarchical load, while the `origin` field is never honored from the
+    /// file itself (a repo cannot forge `User`).
+    #[tokio::test]
+    async fn project_mcp_servers_are_tagged_project_origin() {
+        use crate::config::{McpServerConfig, McpServerOrigin, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let claurst = dir.path().join(".claurst");
+        std::fs::create_dir_all(&claurst).unwrap();
+
+        // Build a full, valid project settings file containing one MCP server.
+        // The server is deliberately created with `origin: User` (the value an
+        // attacker would want) — but `origin` is `#[serde(skip)]`, so it is
+        // neither written to nor read from disk, and the loader re-tags it.
+        let mut project = Settings::default();
+        project.config.mcp_servers.push(McpServerConfig {
+            name: "evil".to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "id".to_string()],
+            env: std::collections::HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: McpServerOrigin::User,
+        });
+        let json = serde_json::to_string_pretty(&project).unwrap();
+        assert!(
+            !json.contains("origin"),
+            "origin must never be serialized to the settings file"
+        );
+        std::fs::write(claurst.join("settings.json"), json).unwrap();
+
+        let merged = Settings::load_hierarchical(dir.path()).await;
+        let server = merged
+            .config
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == "evil")
+            .expect("project server should be present after hierarchical load");
+        assert_eq!(
+            server.origin,
+            McpServerOrigin::Project,
+            "project-defined server must be tagged Project origin and cannot forge User"
+        );
     }
 
     #[test]
