@@ -1368,10 +1368,31 @@ pub async fn run_query_loop(
                     // Reconstruct tool-use blocks (sorted by index for determinism).
                     let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
                     tc_indices.sort();
+                    // Tool calls whose accumulated JSON arguments failed to
+                    // parse. We still emit a tool_use block (so the assistant
+                    // message stays well-formed and every tool_use has a
+                    // matching tool_result), but we must NOT execute the tool
+                    // with empty/garbage input — instead we surface a tool
+                    // error to the model so it can retry (issue #215).
+                    let mut malformed_tool_calls: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for idx in tc_indices {
                         if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
-                            let input: serde_json::Value = serde_json::from_str(&json_str)
-                                .unwrap_or(serde_json::json!({}));
+                            let input = match parse_tool_args(&json_str) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(
+                                        provider = %provider_id_str,
+                                        tool = %name,
+                                        tool_id = %id,
+                                        error = %e,
+                                        "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
+                                    );
+                                    malformed_tool_calls.insert(id.clone());
+                                    // Placeholder input — this call is never executed.
+                                    serde_json::json!({})
+                                }
+                            };
                             content_blocks.push(ContentBlock::ToolUse { id, name, input });
                         }
                     }
@@ -1418,7 +1439,17 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
-                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                            let result = if malformed_tool_calls.contains(&tool_id) {
+                                // Never execute a tool whose arguments could not
+                                // be parsed — return an error the model can see
+                                // and recover from (issue #215).
+                                ToolResult::error(format!(
+                                    "Tool call '{}' was not executed: its arguments were malformed or truncated JSON. Retry the tool call with complete, valid JSON arguments.",
+                                    tool_name
+                                ))
+                            } else {
+                                execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await
+                            };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
                                     tool_name: tool_name.clone(),
@@ -2181,6 +2212,23 @@ pub async fn run_query_loop(
             }
         }
     }
+}
+
+/// Parse the accumulated JSON arguments of a streamed tool call.
+///
+/// Providers stream a tool call's arguments as a sequence of partial-JSON
+/// deltas which we concatenate into a single buffer. A well-behaved
+/// no-argument call yields an empty (or whitespace-only) buffer, which we
+/// map to an empty object. Any *non-empty* buffer that fails to parse is
+/// returned as an error rather than being silently replaced with `{}` — a
+/// truncated stream must never cause a tool (e.g. Edit/Write) to run with
+/// empty arguments (issue #215).
+fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error> {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(trimmed)
 }
 
 /// Execute a single tool invocation.
