@@ -4436,9 +4436,13 @@ impl App {
             }
 
             // ---- Submit ------------------------------------------------
-            // Shift+Enter / Alt+Enter / Ctrl+Enter insert a literal newline
-            // so users can compose multi-line prompts before sending
-            // (issue #149 follow-up).
+            // Fallback newline insertion for when the keybinding layer doesn't
+            // claim a modified Enter (e.g. Ctrl+Enter, or Shift/Alt+Enter after
+            // the user unbinds them): Shift+Enter / Alt+Enter / Ctrl+Enter
+            // insert a literal newline so users can compose multi-line prompts
+            // before sending (issue #149 / #224). The authoritative bindings
+            // live in claurst_core::keybindings (shift+enter, alt+enter, ctrl+j
+            // → newline; enter → submit) and are handled above at the resolver.
             KeyCode::Enter
                 if !self.is_streaming
                     && (key.modifiers.contains(KeyModifiers::SHIFT)
@@ -6887,6 +6891,87 @@ mod tests {
 
         assert!(should_submit);
         assert_eq!(app.prompt_input.text, "/theme");
+    }
+
+    // ---- Shift+Enter newline vs Enter submit (issue #224) ----
+
+    /// Feed some text then a modified Enter and return (submitted?, buffer).
+    fn type_then_modified_enter(mods: KeyModifiers) -> (bool, String) {
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, mods));
+        (submitted, app.prompt_input.text.clone())
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        // On kitty-capable terminals Shift+Enter arrives as Enter+SHIFT and must
+        // insert a literal newline, leaving the prompt multi-line and unsent.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::SHIFT);
+        assert!(!submitted, "Shift+Enter must not submit");
+        assert_eq!(text, "hi\n", "Shift+Enter should append a newline");
+        assert!(text.contains('\n'), "buffer should now be multi-line");
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_fallback() {
+        // Alt+Enter is a fallback for terminals that can't report Shift+Enter.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::ALT);
+        assert!(!submitted, "Alt+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline_fallback() {
+        // Ctrl+Enter is the Windows-Terminal-style fallback for newline.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::CONTROL);
+        assert!(!submitted, "Ctrl+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_fallback() {
+        // Ctrl+J (Char('j') + CONTROL) is the conventional legacy newline escape
+        // (pi binds insert-newline to shift+enter + ctrl+j). It must insert a
+        // newline, not the literal character 'j'.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(!submitted, "Ctrl+J must not submit");
+        assert_eq!(app.prompt_input.text, "hi\n", "Ctrl+J should insert a newline, not 'j'");
+    }
+
+    #[test]
+    fn bare_enter_submits_without_newline() {
+        // A plain Enter (no modifiers) submits and leaves the buffer untouched.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(submitted, "bare Enter should submit");
+        assert_eq!(app.prompt_input.text, "hi", "bare Enter must not insert a newline");
+        assert!(!app.prompt_input.text.contains('\n'));
+    }
+
+    #[test]
+    fn shift_enter_newline_composes_multiline_prompt() {
+        // Compose two lines with Shift+Enter between them, then submit with a
+        // bare Enter; the buffer keeps both lines and only the bare Enter sends.
+        let mut app = make_app();
+        for c in "line1".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        for c in "line2".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.prompt_input.text, "line1\nline2");
+        assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
     #[test]
