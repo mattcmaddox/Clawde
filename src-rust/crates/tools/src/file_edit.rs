@@ -96,14 +96,17 @@ impl Tool for FileEditTool {
             }
         };
 
-        // Normalize Windows CRLF line endings so matching behavior is stable
-        // across platforms and consistent with the TypeScript tool.
-        let content = content.replace("\r\n", "\n");
+        // Detect the file's original/dominant line ending BEFORE editing so we
+        // can re-apply it on write (#225).  Matching is done against an
+        // LF-normalized view so CRLF/LF differences never affect the match, but
+        // only the lines the edit actually changes are ever rewritten.
+        let eol = crate::line_endings::LineEnding::detect(&content);
+        let normalized = content.replace("\r\n", "\n");
         let old_string = params.old_string.replace("\r\n", "\n");
         let new_string = params.new_string.replace("\r\n", "\n");
 
         // Count occurrences
-        let count = content.matches(&old_string).count();
+        let count = normalized.matches(&old_string).count();
 
         if count == 0 {
             return ToolResult::error(format!(
@@ -123,13 +126,16 @@ impl Tool for FileEditTool {
             ));
         }
 
-        // Perform replacement
-        let new_content = if params.replace_all {
-            content.replace(&old_string, &new_string)
-        } else {
-            // Replace only the first occurrence
-            content.replacen(&old_string, &new_string, 1)
-        };
+        // Perform the replacement on the ORIGINAL bytes, preserving every
+        // untouched region's line endings and re-rendering inserted lines with
+        // the file's dominant line ending.
+        let (new_content, _replacements) = crate::line_endings::replace_preserving_eol(
+            &content,
+            &old_string,
+            &new_string,
+            eol,
+            params.replace_all,
+        );
 
         // Write back
         if let Err(e) = crate::write_atomic(&path, new_content.as_bytes()).await {
