@@ -450,6 +450,26 @@ fn record_prefix_cache_hit() {}
 #[inline(always)]
 fn record_prefix_cache_miss() {}
 
+/// Test-only: `(hits, misses)` for the committed-prefix cache.
+#[cfg(test)]
+fn prefix_cache_counts() -> (u64, u64) {
+    (
+        PREFIX_CACHE_HITS.with(|c| c.get()),
+        PREFIX_CACHE_MISSES.with(|c| c.get()),
+    )
+}
+
+/// Test-only: reset the render caches and counters so a test starts clean and
+/// is not affected by cache state left over from a previous render on this
+/// thread.
+#[cfg(test)]
+fn reset_render_caches() {
+    MESSAGE_LINES_CACHE.with(|c| *c.borrow_mut() = None);
+    COMPLETED_MSG_CACHE.with(|c| *c.borrow_mut() = None);
+    PREFIX_CACHE_HITS.with(|c| c.set(0));
+    PREFIX_CACHE_MISSES.with(|c| c.set(0));
+}
+
 // -----------------------------------------------------------------------
 // Top-level layout
 // -----------------------------------------------------------------------
@@ -3304,5 +3324,215 @@ mod tool_block_tests {
         terminal
             .draw(|frame| render_legacy_history_search(frame, &hs, &app, frame.area()))
             .unwrap();
+    }
+}
+
+/// Tests for the streaming transcript cache (issue #222): the committed prefix
+/// must be reused across streaming deltas, and streaming output must be
+/// byte-identical to a full (non-cached) rebuild.
+#[cfg(test)]
+mod stream_cache_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::types::Message;
+
+    const WIDTH: u16 = 80;
+
+    fn test_app() -> App {
+        App::new(Config::default(), CostTracker::new())
+    }
+
+    /// A per-item signature that captures the rendered spans+styles (via Debug)
+    /// plus all metadata, so equality means byte-identical rendering.
+    fn item_sig(item: &RenderedLineItem) -> (String, bool, Option<usize>, Option<u64>) {
+        (
+            format!("{:?}", item.line),
+            item.is_header,
+            item.message_index,
+            item.thinking_hash,
+        )
+    }
+
+    fn sigs(items: &[RenderedLineItem]) -> Vec<(String, bool, Option<usize>, Option<u64>)> {
+        items.iter().map(item_sig).collect()
+    }
+
+    fn joined_text(items: &[RenderedLineItem]) -> String {
+        items
+            .iter()
+            .map(|i| i.search_text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The completed-message items are reused (served from cache) across a
+    /// streaming delta, while the live tail updates.
+    #[test]
+    fn completed_prefix_reused_across_streaming_delta() {
+        let mut app = test_app();
+        // Turn 0 is fully committed; turn 1 is the live/streaming turn.
+        app.messages.push(Message::user("user one prompt"));
+        app.messages.push(Message::assistant("assistant one committed reply"));
+        app.messages.push(Message::user("user two prompt"));
+        app.is_streaming = true;
+        app.streaming_text = "streaming tail alpha".to_string();
+
+        reset_render_caches();
+
+        // First render: prefix is built fresh (a miss).
+        let render1 = render_message_items(&app, WIDTH);
+        assert_eq!(prefix_cache_counts(), (0, 1), "first render builds the prefix");
+
+        // A streaming delta arrives: only the live text grows. Real code bumps
+        // transcript_version on every delta — assert that does NOT evict the
+        // committed-prefix entry.
+        app.streaming_text.push_str(" beta");
+        app.invalidate_transcript();
+
+        let render2 = render_message_items(&app, WIDTH);
+        let (hits, misses) = prefix_cache_counts();
+        assert_eq!(
+            (hits, misses),
+            (1, 1),
+            "committed prefix served from cache after the delta (no rebuild)"
+        );
+
+        // The committed content is identical in both renders and appears before
+        // the live tail diverges.
+        let sig1 = sigs(&render1);
+        let sig2 = sigs(&render2);
+        let common = sig1
+            .iter()
+            .zip(sig2.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(common > 0, "some leading items must be identical");
+        let leading_text = joined_text(&render1[..common]);
+        assert!(
+            leading_text.contains("user one prompt")
+                && leading_text.contains("assistant one committed reply"),
+            "the reused prefix contains the whole committed turn: {leading_text:?}"
+        );
+        // The reused prefix must not contain any live tail content.
+        assert!(
+            !leading_text.contains("streaming tail alpha"),
+            "prefix must not include the live tail: {leading_text:?}"
+        );
+
+        // The live tail updated between renders.
+        let text1 = joined_text(&render1);
+        let text2 = joined_text(&render2);
+        assert!(text1.contains("streaming tail alpha"));
+        assert!(!text1.contains("streaming tail alpha beta"));
+        assert!(text2.contains("streaming tail alpha beta"), "tail rebuilt with the delta");
+    }
+
+    /// Streaming render (cached prefix + rebuilt tail) is byte-identical to a
+    /// full rebuild for a multi-message transcript — no ghosting, no missing or
+    /// stale content — both on the first (cold) frame and after a delta (warm).
+    #[test]
+    fn streaming_render_matches_full_rebuild() {
+        let mut app = test_app();
+        app.messages.push(Message::user("first user question"));
+        app.messages.push(Message::assistant("first assistant answer with **markdown**"));
+        app.messages.push(Message::user("second user question"));
+        app.messages.push(Message::assistant("second assistant answer"));
+        app.messages.push(Message::user("third user question"));
+        app.is_streaming = true;
+        app.streaming_thinking = "pondering the third answer".to_string();
+        app.streaming_text = "third answer so far".to_string();
+
+        reset_render_caches();
+
+        // Cold frame: streaming path vs a direct full rebuild.
+        let streamed_cold = render_message_items(&app, WIDTH);
+        let full_cold = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_cold),
+            sigs(&full_cold),
+            "cold streaming render must match a full rebuild"
+        );
+
+        // Warm frame: after a delta, the prefix is served from cache but the
+        // concatenation must still equal a full rebuild.
+        app.streaming_text.push_str(" plus more tokens");
+        app.invalidate_transcript();
+        let streamed_warm = render_message_items(&app, WIDTH);
+        let (hits, _) = prefix_cache_counts();
+        assert!(hits >= 1, "warm frame served the prefix from cache");
+        let full_warm = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_warm),
+            sigs(&full_warm),
+            "warm streaming render must match a full rebuild"
+        );
+    }
+
+    /// Swapping the transcript (session switch / fork / revert / compaction)
+    /// must NOT serve a stale committed prefix, even mid-stream.
+    #[test]
+    fn transcript_swap_does_not_ghost_stale_prefix() {
+        let mut app = test_app();
+        app.messages.push(Message::user("session A user"));
+        app.messages.push(Message::assistant("session A assistant reply"));
+        app.messages.push(Message::user("session A live turn"));
+        app.is_streaming = true;
+        app.streaming_text = "A tail".to_string();
+
+        reset_render_caches();
+        let render_a = render_message_items(&app, WIDTH);
+        assert!(joined_text(&render_a).contains("session A assistant reply"));
+
+        // Swap in a different transcript (new Vec) while still streaming. The
+        // prefix cache must be re-keyed by identity, so no session-A content
+        // leaks through.
+        app.messages = vec![
+            Message::user("session B user"),
+            Message::assistant("session B assistant reply"),
+            Message::user("session B live turn"),
+        ];
+        app.streaming_text = "B tail".to_string();
+        app.invalidate_transcript();
+
+        let render_b = render_message_items(&app, WIDTH);
+        let text_b = joined_text(&render_b);
+        assert!(text_b.contains("session B assistant reply"), "shows swapped content");
+        assert!(
+            !text_b.contains("session A"),
+            "no stale session-A content ghosts through: {text_b:?}"
+        );
+        // And the swapped render equals a full rebuild.
+        assert_eq!(sigs(&render_b), sigs(&build_all_items(&app, WIDTH)));
+    }
+
+    /// The last message toggling streaming -> completed moves cleanly into the
+    /// cached (non-streaming) set with identical content.
+    #[test]
+    fn streaming_to_completed_transition_is_clean() {
+        let mut app = test_app();
+        app.messages.push(Message::user("q1"));
+        app.messages.push(Message::assistant("a1 committed"));
+        app.messages.push(Message::user("q2"));
+        app.is_streaming = true;
+        app.streaming_text = "live answer body".to_string();
+
+        reset_render_caches();
+        let _streaming = render_message_items(&app, WIDTH);
+
+        // Commit the streamed message (as flush_streamed_assistant_message would)
+        // and end streaming.
+        app.messages.push(Message::assistant("live answer body"));
+        app.is_streaming = false;
+        app.streaming_text.clear();
+        app.invalidate_transcript();
+
+        let completed = render_message_items(&app, WIDTH);
+        // Non-streaming render equals a full rebuild (correct committed set).
+        assert_eq!(sigs(&completed), sigs(&build_all_items(&app, WIDTH)));
+        let text = joined_text(&completed);
+        assert!(text.contains("a1 committed"));
+        assert!(text.contains("live answer body"));
     }
 }
