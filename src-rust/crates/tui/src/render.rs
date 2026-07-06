@@ -1298,6 +1298,99 @@ fn append_turn_items(
     push_blank_item(items);
 }
 
+/// Append rendered items for the transcript messages in `[start, end)` to
+/// `items`, mirroring the single linear pass used by the full transcript build.
+///
+/// System annotations are emitted at the top of each landed index exactly as
+/// the full pass does; `emit_end_annotations` additionally flushes the
+/// annotations anchored at `end` (used when `end` is the true message count so
+/// trailing annotations are not lost).
+///
+/// Splitting the pass at a turn boundary is byte-identical to building the whole
+/// range in one shot: `range(0, k, false)` followed by `range(k, total, true)`
+/// produces exactly the same items as `range(0, total, true)` whenever `k` is an
+/// index the linear pass lands on (i.e. a turn's user index). This is what lets
+/// the streaming path serve the committed prefix from cache and rebuild only the
+/// live tail without any risk of ghosting.
+#[allow(clippy::too_many_arguments)]
+fn build_message_items_range(
+    app: &App,
+    width: u16,
+    ctx: &RenderContext,
+    turn_map: &std::collections::HashMap<usize, &TranscriptTurn<'_>>,
+    start: usize,
+    end: usize,
+    emit_end_annotations: bool,
+    items: &mut Vec<RenderedLineItem>,
+) {
+    let mut index = start;
+    while index < end {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+
+        let message = &app.messages[index];
+        if message.role == Role::User {
+            if let Some(&turn) = turn_map.get(&index) {
+                append_turn_items(items, turn, ctx, app.frame_count, app.accent_color);
+                index = turn.end_message_index + 1;
+                continue;
+            }
+        }
+
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
+        push_rendered_items_tagged(items, tagged, Some(index));
+        push_blank_item(items);
+        index += 1;
+    }
+
+    if emit_end_annotations {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == end) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+    }
+}
+
+/// Build the full transcript item list from scratch (no caching). Used for the
+/// non-streaming path, the streaming fallback, and as the correctness reference
+/// in tests.
+fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    // Build `tool_names` and the render context ONCE per rebuild and lend them
+    // to every message renderer (issue #222).
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
+        width,
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let mut items = Vec::new();
+    build_message_items_range(app, width, &ctx, &turn_map, 0, total, true, &mut items);
+
+    if total == 0 && !app.tool_use_blocks.is_empty() {
+        for block in &app.tool_use_blocks {
+            let mut lines = Vec::new();
+            render_tool_block_lines(&mut lines, block, app.frame_count);
+            push_rendered_items(&mut items, lines, None, false);
+            push_blank_item(&mut items);
+        }
+    }
+
+    items
+}
+
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let streaming = app.is_streaming
         || !app.streaming_text.is_empty()
@@ -1337,70 +1430,6 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    let build_items = || {
-        // Build `tool_names` and the render context ONCE per rebuild and lend
-        // them to every message renderer, instead of cloning a HashMap+HashSet
-        // for each assistant message (issue #222).
-        let tool_names = build_tool_names(&app.messages);
-        let ctx = RenderContext {
-            width,
-            highlight: true,
-            show_thinking: false,
-            tool_names: &tool_names,
-            expanded_thinking: &app.thinking_expanded,
-        };
-        let turns = build_transcript_turns(app);
-        let mut turn_map = std::collections::HashMap::new();
-        for turn in &turns {
-            turn_map.insert(turn.user_index, turn);
-        }
-
-        let mut items = Vec::new();
-        let total = app.messages.len();
-        let mut index = 0usize;
-        while index <= total {
-            for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
-                let mut lines = Vec::new();
-                render_system_annotation_lines(&mut lines, ann, width as usize);
-                push_rendered_items(&mut items, lines, None, false);
-            }
-
-            if index >= total {
-                break;
-            }
-
-            let message = &app.messages[index];
-            if message.role == Role::User {
-                if let Some(&turn) = turn_map.get(&index) {
-                    append_turn_items(
-                        &mut items,
-                        turn,
-                        &ctx,
-                        app.frame_count,
-                        app.accent_color,
-                    );
-                    index = turn.end_message_index + 1;
-                    continue;
-                }
-            }
-
-            let tagged = render_transcript_assistant_message_tagged(message, &ctx);
-            push_rendered_items_tagged(&mut items, tagged, Some(index));
-            push_blank_item(&mut items);
-            index += 1;
-        }
-
-        if total == 0 && !app.tool_use_blocks.is_empty() {
-            for block in &app.tool_use_blocks {
-                let mut lines = Vec::new();
-                render_tool_block_lines(&mut lines, block, app.frame_count);
-                push_rendered_items(&mut items, lines, None, false);
-                push_blank_item(&mut items);
-            }
-        }
-
-        items
-    };
     let completed_lines: Vec<RenderedLineItem> = if cacheable {
         if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
             cache
@@ -1411,7 +1440,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }) {
             lines
         } else {
-            let items = build_items();
+            let items = build_all_items(app, width);
             COMPLETED_MSG_CACHE.with(|cache| {
                 *cache.borrow_mut() = Some(CompletedMsgCache {
                     key: completed_key,
@@ -1421,7 +1450,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
             items
         }
     } else {
-        build_items()
+        build_all_items(app, width)
     };
 
     // If there is no live content, store in the full cache and return.
