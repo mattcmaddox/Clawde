@@ -905,6 +905,17 @@ pub async fn run_query_loop(
             }
         }
 
+        // Request-boundary invariant pass (issue #229 / MI-2). Compaction,
+        // max_tokens recovery, and the command-queue / pending-message drains
+        // above can each independently leave the history with a broken
+        // tool_use ↔ tool_result pairing (an orphan result, or a dangling
+        // tool_use) that the provider rejects with HTTP 400. Heal it here —
+        // the single choke point covering BOTH the legacy Anthropic path
+        // (`api_messages` below) and the modern provider path (`provider_messages`
+        // built later in the dispatch branch), since both derive from `messages`.
+        // sanitize_history is idempotent, so a well-formed history is untouched.
+        *messages = sanitize::sanitize_history(std::mem::take(messages));
+
         // Build API request
         let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
         let api_tools: Vec<ApiToolDefinition> = tools
