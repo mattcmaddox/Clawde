@@ -8245,19 +8245,23 @@ impl SlashCommand for RevertCommand {
         // Revert files.
         snap.revert(&patches).await;
 
-        // Truncate the session transcript at the target turn.
+        // Record the revert in the session transcript. NON-DESTRUCTIVE (#234):
+        // rather than truncating, point the active leaf at the turn *before* the
+        // target so the reverted turn (and everything after it) is retained on a
+        // sibling branch that can be returned to. `branch_before` only falls
+        // back to a destructive truncate for legacy/unchained transcripts.
         let project_root = claurst_core::git_utils::get_repo_root(&ctx.working_dir)
             .unwrap_or_else(|| ctx.working_dir.clone());
         let path = claurst_core::session_storage::transcript_path(&project_root, &ctx.session_id);
         if path.exists() {
-            if let Err(e) = claurst_core::session_storage::truncate_after(&path, &target_uuid).await {
-                return CommandResult::Error(format!("Reverted files but could not trim transcript: {e}"));
+            if let Err(e) = claurst_core::session_storage::branch_before(&path, &target_uuid).await {
+                return CommandResult::Error(format!("Reverted files but could not update transcript: {e}"));
             }
         }
 
         let file_count: usize = patches.iter().map(|p| p.files.len()).sum();
         CommandResult::Message(format!(
-            "Reverted {} file(s) changed during turn {}. Transcript trimmed.",
+            "Reverted {} file(s) changed during turn {}. Later turns kept on a branch.",
             file_count,
             &target_uuid[..target_uuid.len().min(8)],
         ))
