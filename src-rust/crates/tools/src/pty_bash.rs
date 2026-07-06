@@ -906,4 +906,146 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Execution tests (#220 / #184) — exercise the live PTY path end-to-end.
+    // -----------------------------------------------------------------------
+
+    /// Permission handler that allows everything — for exercising `execute`.
+    struct AllowAllHandler;
+
+    impl claurst_core::permissions::PermissionHandler for AllowAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+
+        fn request_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+    }
+
+    fn allow_all_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: std::sync::Arc::new(AllowAllHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "pty-bash-test".to_string(),
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+        }
+    }
+
+    /// #220: a command that exceeds its timeout must have its child KILLED, not
+    /// merely dropped. portable_pty does not kill the child on drop, so before
+    /// the fix a timed-out command left an orphaned process running to its
+    /// natural end. We time out a long `sleep` and then assert the process is
+    /// gone.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn timeout_kills_the_child() {
+        let tool = PtyBashTool;
+        let ctx = allow_all_context();
+
+        // A distinctive duration doubles as a searchable marker for the process.
+        let marker = "sleep 31337";
+        let input = json!({
+            "command": marker,
+            "timeout": 500u64, // ms — far shorter than the sleep
+        });
+
+        let started = std::time::Instant::now();
+        let result = tool.execute(input, &ctx).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_error,
+            "a timed-out command should be an error, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("timed out"),
+            "expected a timeout message, got: {}",
+            result.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "execute should return shortly after the 500ms timeout, took {:?}",
+            elapsed
+        );
+
+        // Give the kill a moment to propagate, then assert the sleep is gone.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(marker)
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&out.stdout);
+            let lingering: Vec<&str> = pids.split_whitespace().collect();
+            assert!(
+                lingering.is_empty(),
+                "timed-out child `{marker}` was not killed; still running (pids: {lingering:?})",
+            );
+        }
+    }
+
+    /// Regression test for #184: a tool command that spawns a child which
+    /// detaches into its own session (`setsid`) inherits the pty slave. The
+    /// read loop must stop once the *direct* child exits instead of blocking on
+    /// pty EOF held open by the detached grandchild — otherwise the tool (and the
+    /// agent turn) hangs for the grandchild's full lifetime.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn foreground_does_not_hang_on_detached_grandchild() {
+        let tool = PtyBashTool;
+        let ctx = allow_all_context();
+
+        // `setsid sleep 30` runs in a brand-new session but inherits the pty;
+        // `&` lets the wrapper shell return immediately without waiting.
+        let input = json!({
+            "command": "setsid sleep 30 & echo spawned",
+            "timeout": 120000u64,
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
+        let elapsed = started.elapsed();
+
+        let result = result.expect(
+            "execute hung waiting on the detached grandchild's pty (regression of #184)",
+        );
+        assert!(
+            !result.is_error,
+            "command should have succeeded, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("spawned"),
+            "expected the parent command's output, got: {}",
+            result.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "execute should return promptly after the direct child exits, took {:?}",
+            elapsed
+        );
+    }
 }

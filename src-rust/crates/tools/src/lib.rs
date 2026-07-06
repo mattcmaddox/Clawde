@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
-pub mod bash;
 pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
@@ -60,7 +59,6 @@ pub mod goal_complete;
 // Re-exports for convenience.
 pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
-pub use bash::BashTool;
 pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
@@ -163,8 +161,9 @@ pub enum PermissionLevel {
     /// Potentially dangerous (e.g., bypass sandbox).
     Dangerous,
     /// Unconditionally forbidden — the action must never be executed regardless
-    /// of permission mode.  Used by BashTool when the classifier identifies a
-    /// `Critical`-risk command (e.g. `rm -rf /`, fork-bomb, `dd if=…`).
+    /// of permission mode.  Used by the bash tool (`PtyBashTool`) when the
+    /// classifier identifies a `Critical`-risk command (e.g. `rm -rf /`,
+    /// fork-bomb, `dd if=…`).
     Forbidden,
 }
 
@@ -184,8 +183,8 @@ pub struct PendingPermissionStore {
 
 /// Persistent shell state shared across Bash tool invocations within one session.
 ///
-/// The `BashTool` reads and writes this state on every call so that `cd` and
-/// `export` commands persist across separate tool invocations, matching the
+/// The bash tool (`PtyBashTool`) reads and writes this state on every call so
+/// that `cd` and `export` commands persist across separate tool invocations, matching the
 /// mental model described in the tool description ("the working directory
 /// persists between commands").
 #[derive(Debug, Clone, Default)]
