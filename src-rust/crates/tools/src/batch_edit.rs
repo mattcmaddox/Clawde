@@ -207,7 +207,7 @@ impl Tool for BatchEditTool {
 
         for (i, (path_str, original, new_content)) in unique_writings.iter().enumerate() {
             let path = std::path::Path::new(path_str);
-            match tokio::fs::write(path, new_content).await {
+            match crate::write_atomic(path, new_content.as_bytes()).await {
                 Ok(()) => {
                     ctx.record_file_change(
                         path.to_path_buf(),
@@ -223,7 +223,10 @@ impl Tool for BatchEditTool {
                     // rollback in reverse order to preserve original file state
                     for (rb_path, rb_original, rb_new_content) in unique_writings[0..i].iter().rev()
                     {
-                        if let Err(re) = tokio::fs::write(rb_path, rb_original).await {
+                        if let Err(re) =
+                            crate::write_atomic(std::path::Path::new(rb_path), rb_original.as_bytes())
+                                .await
+                        {
                             rollback_errors.push(format!("  rollback {}: {}", rb_path, re));
                         } else {
                             let rb_path = std::path::Path::new(rb_path);
