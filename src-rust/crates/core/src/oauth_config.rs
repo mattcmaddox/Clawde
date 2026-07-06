@@ -431,8 +431,11 @@ pub fn save_codex_tokens_for_profile(
     let path = crate::accounts::codex_token_path(profile_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        crate::accounts::set_user_only_dir_perms(parent);
     }
     std::fs::write(&path, serde_json::to_string_pretty(tokens)?)?;
+    // Codex access + refresh tokens must not be world/group readable (#212).
+    crate::accounts::set_user_only_perms(&path);
     Ok(())
 }
 
