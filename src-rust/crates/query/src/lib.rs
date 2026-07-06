@@ -715,6 +715,33 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
 
 // Spinner verbs are imported from claurst_core::spinner
 
+/// Apply the outcome of a reactive-compact / context-collapse call to the live
+/// message list, preserving the conversation when compaction fails.
+///
+/// Fixes #213: the reactive paths used to `std::mem::take(messages)` before
+/// calling `compact::reactive_compact` / `compact::context_collapse`. That left
+/// `*messages` empty, and on ANY failure (API error, `Cancelled`, empty
+/// summary) the drained messages were never restored — silently destroying the
+/// live conversation. Here we only overwrite `*messages` when compaction
+/// returns `Ok`; on `Err` the original messages are left completely untouched,
+/// so a failed compaction can never wipe the session.
+///
+/// Returns `Ok(tokens_freed)` on success, or the original error on failure.
+fn apply_compact_result<E>(
+    messages: &mut Vec<Message>,
+    outcome: Result<compact::CompactResult, E>,
+) -> Result<u64, E> {
+    match outcome {
+        Ok(result) => {
+            let tokens_freed = result.tokens_freed;
+            *messages = result.messages;
+            Ok(tokens_freed)
+        }
+        // Failure: leave `*messages` untouched so the conversation survives.
+        Err(e) => Err(e),
+    }
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1656,51 +1683,43 @@ pub async fn run_query_loop(
                         "Compacting context... (emergency collapse)".to_string(),
                     ));
                 }
-                match compact::context_collapse(
-                    std::mem::take(messages),
-                    client,
-                    config,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        *messages = result.messages;
-                        info!(
-                            tokens_freed = result.tokens_freed,
-                            "Context-collapse complete"
-                        );
+                // Pass a clone so the live conversation survives a failed
+                // compaction; `*messages` is only overwritten on success (#213).
+                let outcome =
+                    compact::context_collapse(messages.clone(), client, config).await;
+                match apply_compact_result(messages, outcome) {
+                    Ok(tokens_freed) => {
+                        info!(tokens_freed, "Context-collapse complete");
                     }
                     Err(e) => {
-                        warn!(error = %e, "Context-collapse failed");
-                        // Put messages back on failure (mem::take drained them).
-                        // We can't recover them here — re-run auto-compact as fallback.
+                        // `*messages` is left untouched — the conversation is intact.
+                        warn!(error = %e, "Context-collapse failed; conversation preserved");
                     }
                 }
             } else if compact::should_compact(usage.input_tokens, context_limit) {
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
                 }
-                match compact::reactive_compact(
-                    std::mem::take(messages),
+                // Pass a clone so the live conversation survives a failed
+                // compaction; `*messages` is only overwritten on success (#213).
+                let outcome = compact::reactive_compact(
+                    messages.clone(),
                     client,
                     config,
                     cancel_token.clone(),
                     &[],
                 )
-                .await
-                {
-                    Ok(result) => {
-                        *messages = result.messages;
-                        info!(
-                            tokens_freed = result.tokens_freed,
-                            "Reactive compact complete"
-                        );
+                .await;
+                match apply_compact_result(messages, outcome) {
+                    Ok(tokens_freed) => {
+                        info!(tokens_freed, "Reactive compact complete");
                     }
+                    // `*messages` is left untouched on both failure arms below.
                     Err(claurst_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled");
+                        warn!("Reactive compact was cancelled; conversation preserved");
                     }
                     Err(e) => {
-                        warn!(error = %e, "Reactive compact failed");
+                        warn!(error = %e, "Reactive compact failed; conversation preserved");
                     }
                 }
             }
