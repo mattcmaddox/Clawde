@@ -157,6 +157,8 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
 
     tokio::spawn(async move {
         let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            // kill_on_drop: when the timeout drops this future the child must die
+            // with it, otherwise a timed-out background command leaks (#220).
             let child = if cfg!(windows) {
                 Command::new("cmd")
                     .arg("/C")
@@ -165,6 +167,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
+                    .kill_on_drop(true)
                     .spawn()
             } else {
                 Command::new("bash")
@@ -174,6 +177,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
+                    .kill_on_drop(true)
                     .spawn()
             };
 
@@ -316,6 +320,49 @@ enum PtyOutcome {
     Failed(String),
 }
 
+/// Guard that guarantees the PTY child is killed if the running future is
+/// dropped before the command completes — e.g. the turn is cancelled or the
+/// task is aborted mid-command. This is the PTY analogue of tokio's
+/// `kill_on_drop(true)`: portable_pty's child is NOT killed on drop, so without
+/// this a cancelled command would orphan its child (#220).
+///
+/// The guard is disarmed on normal completion and fired explicitly on timeout.
+#[cfg(unix)]
+struct PtyKillGuard {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl PtyKillGuard {
+    fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) -> Self {
+        Self { killer, armed: true }
+    }
+
+    /// The command finished on its own — there is nothing left to kill.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Kill the child now (timeout path) and disarm so `Drop` is a no-op.
+    fn kill_now(&mut self) {
+        if self.armed {
+            let _ = self.killer.kill();
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PtyKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Future dropped before completion (cancel / abort): don't leak the child.
+            let _ = self.killer.kill();
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn run_in_pty(
     script: &str,
@@ -355,10 +402,10 @@ async fn run_in_pty(
         Err(e) => return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e)),
     };
 
-    // A killer handle cloned from the child. This is how a timed-out command is
-    // explicitly KILLED (rather than merely dropped, which would orphan the
-    // child and leak it) (#220).
-    let mut killer = child.clone_killer();
+    // A killer handle cloned from the child. This is how a timed-out or
+    // cancelled command is explicitly KILLED (portable_pty does not kill on
+    // drop, so without this the child would orphan) (#220).
+    let killer = child.clone_killer();
 
     // Drop slave after spawn — once the child's controlling terminal is gone,
     // the master side will see EOF when the child exits.
@@ -400,13 +447,23 @@ async fn run_in_pty(
         (output, exit_code)
     });
 
+    // Kill-on-drop guard: if this future is dropped mid-command (turn cancelled)
+    // the guard fires and kills the child instead of leaking it (#220).
+    let mut guard = PtyKillGuard::new(killer);
+
     match tokio::time::timeout(timeout, read_handle).await {
-        Ok(Ok((output, exit_code))) => PtyOutcome::Completed(output, exit_code),
-        Ok(Err(e)) => PtyOutcome::Failed(format!("PTY read thread panicked: {}", e)),
+        Ok(Ok((output, exit_code))) => {
+            guard.disarm();
+            PtyOutcome::Completed(output, exit_code)
+        }
+        Ok(Err(e)) => {
+            guard.disarm();
+            PtyOutcome::Failed(format!("PTY read thread panicked: {}", e))
+        }
         Err(_) => {
             // Timed out: explicitly KILL the child so it can't linger as an
             // orphan (#220). The read thread then observes the exit and finishes.
-            let _ = killer.kill();
+            guard.kill_now();
             PtyOutcome::TimedOut
         }
     }
