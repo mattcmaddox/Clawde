@@ -748,6 +748,16 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
      you were doing. Pick up mid-thought if that is where the cut happened. \
      Break remaining work into smaller pieces.";
 
+/// Injected as the final user turn when `effective_max_turns` is reached. That
+/// turn runs with tools DISABLED (graceful degradation, mirroring opencode's
+/// max-steps `toolChoice:"none"` behaviour), so the model produces a plain-text
+/// wrap-up instead of the loop returning cold.
+const MAX_STEPS_DEGRADATION_MSG: &str =
+    "You have reached the maximum number of steps for this run, so tools are now \
+     disabled — do not attempt to call any tools. In plain text, briefly \
+     summarize what you accomplished, what remains unfinished, and exactly where \
+     you stopped, so the work can be resumed later.";
+
 /// Content stored in the synthetic `tool_result` for a tool that was abandoned
 /// mid-flight because the query loop was cancelled (issue #218). Every
 /// outstanding `tool_use` still receives a matching `tool_result` carrying this
@@ -835,6 +845,10 @@ pub async fn run_query_loop(
     let mut used_fallback = false;
     // How many automatic retries remain when a stream stalls (no data for 45s).
     let mut retries_left: u32 = 2;
+    // Max-steps graceful degradation (issue #230 / MI-3): set once the final
+    // tool-less summary turn has been dispatched so it can never re-trigger
+    // (anti-recursion guard).
+    let mut degradation_done = false;
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
     let effective_max_turns = config.agent_definition
@@ -873,24 +887,48 @@ pub async fn run_query_loop(
         tool_ctx
             .current_turn
             .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
-        if turn > effective_max_turns {
-            info!(turns = turn, "Max turns reached");
+        // Max-steps graceful degradation (issue #230 / MI-3). Rather than
+        // returning cold when the turn cap is hit, run ONE final turn with tools
+        // disabled that asks the model to summarize progress and its stopping
+        // point (mirrors opencode's max-steps `toolChoice:"none"` fallback).
+        // `degradation_done` is the anti-recursion guard: the summary turn is
+        // dispatched exactly once, and re-exceeding the cap afterwards returns
+        // cold. Applies to both goal and non-goal runs.
+        let degradation_turn = if turn > effective_max_turns {
+            if degradation_done {
+                info!(
+                    turns = turn,
+                    "Max turns reached after degradation summary — returning"
+                );
+                let last_msg = messages
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
+                return QueryOutcome::EndTurn {
+                    message: last_msg,
+                    usage: UsageInfo::default(),
+                };
+            }
+            degradation_done = true;
+            info!(
+                turns = turn,
+                max = effective_max_turns,
+                "Max turns reached — running final tool-less summary turn"
+            );
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(QueryEvent::Status(format!(
-                    "Reached maximum turn limit ({})",
+                    "Reached maximum turn limit ({}) — summarizing progress before stopping.",
                     effective_max_turns
                 )));
             }
-            // Return the last assistant message if any
-            let last_msg = messages
-                .last()
-                .cloned()
-                .unwrap_or_else(|| Message::assistant("Max turns reached."));
-            return QueryOutcome::EndTurn {
-                message: last_msg,
-                usage: UsageInfo::default(),
-            };
-        }
+            // Inject the summary request as the next user turn. Tools are
+            // disabled for this turn where `api_tools` / `provider_tools` are
+            // built below.
+            messages.push(Message::user(MAX_STEPS_DEGRADATION_MSG));
+            true
+        } else {
+            false
+        };
 
         // Continuation decision at `end_turn` (issue #230 / MI-3). Consults the
         // active continuation policy: `Continue` injects the follow-up message
@@ -901,6 +939,14 @@ pub async fn run_query_loop(
         // Defined as a macro because it must `continue`/`return` the loop.
         macro_rules! continue_or_end {
             ($assistant_msg:expr, $usage:expr) => {{
+                // The tool-less max-steps summary turn must never re-trigger
+                // continuation (anti-recursion): return its wrap-up directly.
+                if degradation_turn {
+                    return QueryOutcome::EndTurn {
+                        message: $assistant_msg,
+                        usage: $usage,
+                    };
+                }
                 let decision = continuation_policy.decide(&crate::continuation::TurnEndContext {
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
@@ -1006,10 +1052,16 @@ pub async fn run_query_loop(
 
         // Build API request
         let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
-        let api_tools: Vec<ApiToolDefinition> = tools
-            .iter()
-            .map(|t| ApiToolDefinition::from(&t.to_definition()))
-            .collect();
+        // Max-steps degradation: the final summary turn is dispatched with NO
+        // tool definitions so the model can only produce text (issue #230).
+        let api_tools: Vec<ApiToolDefinition> = if degradation_turn {
+            Vec::new()
+        } else {
+            tools
+                .iter()
+                .map(|t| ApiToolDefinition::from(&t.to_definition()))
+                .collect()
+        };
 
         // Verification nudge: if there are incomplete todos for this session
         // and the conversation has more than 2 turns, append a reminder.
@@ -1268,7 +1320,10 @@ pub async fn run_query_loop(
                         caps.tool_calling = model_entry.tool_calling;
                         caps.thinking = model_entry.reasoning;
                     }
-                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling {
+                    // Max-steps degradation (issue #230): dispatch the final
+                    // summary turn with no tools so the provider can only emit
+                    // text (opencode's `toolChoice:"none"` equivalent).
+                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
                         tools.iter().map(|t| t.to_definition()).collect()
                     } else {
                         Vec::new()
