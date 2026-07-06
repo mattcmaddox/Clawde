@@ -32,7 +32,8 @@ pub use compact::{
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
     compact_conversation, context_collapse, context_window_for_model, format_compact_summary,
     get_compact_prompt, group_messages_for_compact, micro_compact_if_needed,
-    reactive_compact, should_auto_compact, should_compact, should_context_collapse, snip_compact,
+    reactive_compact, resolve_context_window, should_auto_compact, should_compact,
+    should_context_collapse, snip_compact,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,

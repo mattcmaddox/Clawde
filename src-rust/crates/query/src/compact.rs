@@ -486,6 +486,11 @@ pub fn format_compact_summary(raw: &str) -> String {
 
 /// Return the effective context-window size in tokens for the given model.
 /// These are approximate; the API enforces the real limits server-side.
+///
+/// This is a Claude-centric heuristic and only recognises Anthropic models —
+/// every other provider collapses to the ~100k default. Prefer
+/// [`resolve_context_window`], which consults the models.dev-backed registry
+/// first and only falls back to this heuristic.
 pub fn context_window_for_model(model: &str) -> u64 {
     if model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4") {
         200_000
@@ -494,6 +499,63 @@ pub fn context_window_for_model(model: &str) -> u64 {
     } else {
         100_000
     }
+}
+
+/// Smallest registry context-window value we treat as real.
+///
+/// When models.dev omits a limit, `ModelRegistry` stores a `4096` placeholder
+/// (see `model_registry.rs`). Compacting a live session at ~3.7k tokens would
+/// be absurd, so any registry value below this threshold is treated as
+/// "unknown" and we fall back to the model-name heuristic instead.
+const MIN_PLAUSIBLE_REGISTRY_WINDOW: u64 = 8192;
+
+/// Look up a plausible context-window value in the registry for a given
+/// `(provider, model_id)` pair. Returns `None` when there is no entry or the
+/// stored window is an implausible placeholder.
+fn registry_context_window(
+    registry: &claurst_api::ModelRegistry,
+    provider: &str,
+    model_id: &str,
+) -> Option<u64> {
+    let window = registry.get(provider, model_id)?.info.context_window as u64;
+    (window >= MIN_PLAUSIBLE_REGISTRY_WINDOW).then_some(window)
+}
+
+/// Resolve the effective context window for the active provider + model.
+///
+/// The models.dev-backed [`claurst_api::ModelRegistry`] is the source of truth:
+/// it carries real per-model context windows for *every* provider (Gemini/GPT
+/// 1M windows, 32k local models, …), so we prefer it. We fall back to the
+/// Claude-only [`context_window_for_model`] heuristic only when the registry is
+/// absent, has no matching entry, or only holds a placeholder value.
+///
+/// `model` may be either a bare model id (`"gemini-3-pro"`) or a canonical
+/// `"provider/model"` string; both forms are handled.
+pub fn resolve_context_window(
+    registry: Option<&claurst_api::ModelRegistry>,
+    provider: &str,
+    model: &str,
+) -> u64 {
+    if let Some(registry) = registry {
+        // The registry is keyed by bare model id, so strip a matching
+        // `"<provider>/"` prefix if the caller passed a canonical string.
+        let stripped = model
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(model);
+        if let Some(window) = registry_context_window(registry, provider, stripped) {
+            return window;
+        }
+        // Fall back to interpreting the model string itself as
+        // `"provider/model"` (e.g. when no explicit provider was supplied).
+        if let Some((embedded_provider, embedded_model)) = model.split_once('/') {
+            if let Some(window) =
+                registry_context_window(registry, embedded_provider, embedded_model)
+            {
+                return window;
+            }
+        }
+    }
+    context_window_for_model(model)
 }
 
 /// Determine token-warning state given current input token count and model.
