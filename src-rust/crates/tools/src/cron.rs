@@ -523,7 +523,9 @@ async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), 
         .await
         .map_err(|e| e.to_string())?;
 
-    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+    crate::write_atomic(&path, json.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
