@@ -3315,6 +3315,329 @@ mod tests {
             "cancelling the parent's token must cancel the sub-agent's child token"
         );
     }
+
+    // ---- Issue #230 (MI-3): in-loop continuation + max-steps degradation -----
+
+    use std::sync::Mutex as StdMutex;
+
+    /// A provider double that records, per request, whether the tool set was
+    /// empty (i.e. tools were disabled — the max-steps degradation turn) and
+    /// replays a scripted response. Drives `run_query_loop` end-to-end.
+    struct RecordingProvider {
+        id: claurst_core::provider_id::ProviderId,
+        /// One entry per request: `true` when its tool set was empty.
+        tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
+        /// When true, always end the turn with text (ignores tools). Otherwise
+        /// emit a `tool_use` while tools are present and end the turn once
+        /// they're gone (so the degradation turn ends the loop).
+        always_end_turn: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for RecordingProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "recording-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            let tools_empty = request.tools.is_empty();
+            self.tools_empty_per_request
+                .lock()
+                .unwrap()
+                .push(tools_empty);
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let emit_tool_use = !self.always_end_turn && !tools_empty;
+
+            let events: Vec<Result<StreamEvent, claurst_api::ProviderError>> = if emit_tool_use {
+                let tool_id = uuid::Uuid::new_v4().to_string();
+                vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: tool_id,
+                            name: "noop_tool".to_string(),
+                            input: serde_json::json!({}),
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta {
+                        index: 0,
+                        partial_json: "{}".to_string(),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "Progress summary.".to_string(),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ]
+            };
+
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    fn noop_tools() -> Vec<Box<dyn Tool>> {
+        vec![Box::new(MockTool {
+            name: "noop_tool",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: Arc::new(AtomicBool::new(false)),
+        })]
+    }
+
+    /// Drive `run_query_loop` against the recording provider. Returns the
+    /// outcome, the per-request "tools were empty" record, and the final
+    /// message history.
+    async fn drive_loop_with_mock(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded.clone(),
+            always_end_turn,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+        let registry = Arc::new(registry);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "loop-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.max_turns = max_turns;
+        config.provider_registry = Some(registry);
+        config.continuation = continuation;
+
+        let cost = claurst_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = vec![Message::user("start")];
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let recorded = recorded.lock().unwrap().clone();
+        (outcome, recorded, messages)
+    }
+
+    /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
+    /// turn — the default `StopPolicy` never continues the loop.
+    #[tokio::test]
+    async fn non_goal_turn_stops_after_one_turn() {
+        let (outcome, recorded, _msgs) = drive_loop_with_mock(
+            true,
+            5,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "a completed turn must yield EndTurn"
+        );
+        assert_eq!(
+            recorded.len(),
+            1,
+            "a non-goal end_turn must stop after exactly one request/turn, got {:?}",
+            recorded
+        );
+    }
+
+    /// (c) Hitting `effective_max_turns` runs ONE final turn with tools disabled
+    /// (graceful degradation) rather than returning cold: the last request has
+    /// an empty tool set and the loop then ends.
+    #[tokio::test]
+    async fn max_steps_runs_tool_less_summary_turn_then_ends() {
+        // max_turns = 2: turns 1 & 2 are tool_use turns, turn 3 exceeds the cap
+        // and triggers the tool-less summary turn.
+        let (outcome, recorded, msgs) = drive_loop_with_mock(
+            false,
+            2,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the loop must end after the degradation summary turn"
+        );
+        assert_eq!(
+            recorded.len(),
+            3,
+            "expected 2 tool turns + 1 degradation turn, got {:?}",
+            recorded
+        );
+        assert!(
+            *recorded.last().unwrap(),
+            "the final (summary) turn must be dispatched with tools DISABLED: {:?}",
+            recorded
+        );
+        assert!(
+            recorded[..recorded.len() - 1].iter().all(|&empty| !empty),
+            "only the degradation turn disables tools: {:?}",
+            recorded
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.get_all_text().contains("maximum number of steps")),
+            "the tool-less summary prompt must be injected into the history"
+        );
+    }
+
+    /// (b) The goal continuation guards, exercised against an in-memory store:
+    /// an active goal within its guards continues (recording the turn), while
+    /// the soft-budget and runaway guards each stop with the same paused
+    /// outcome as before.
+    #[test]
+    fn goal_policy_continues_while_active_and_stops_on_guards() {
+        use crate::goal_loop::{decide_goal_continuation, GoalContinuation, StopReason};
+
+        let store =
+            claurst_core::GoalStore::open(std::path::Path::new(":memory:")).expect("open store");
+
+        // Active goal, guards allow → continue with the goal continuation message.
+        store.set_goal("live", "ship the feature", None).unwrap();
+        match decide_goal_continuation(&store, "live", 0, 1) {
+            GoalContinuation::Continue { message } => {
+                assert!(
+                    message.contains("Goal continuation"),
+                    "unexpected continuation message: {}",
+                    message
+                );
+            }
+            _ => panic!("an active goal within its guards must continue"),
+        }
+        // The turn was recorded in the store.
+        assert_eq!(store.get_goal("live").unwrap().turns_used, 1);
+
+        // Soft token budget tripped → budget-limited (paused) outcome.
+        store.set_goal("budget", "big task", Some(100)).unwrap();
+        match decide_goal_continuation(&store, "budget", 500, 1) {
+            GoalContinuation::Stop {
+                reason: StopReason::BudgetLimited,
+            } => {}
+            _ => panic!("an over-budget goal must stop budget-limited"),
+        }
+        assert_eq!(
+            store.get_goal("budget").unwrap().status,
+            claurst_core::GoalStatus::BudgetLimited,
+            "over-budget goal must be persisted as budget-limited"
+        );
+
+        // Runaway guard tripped → paused outcome (same as the cross-turn design).
+        store.set_goal("runaway", "endless", None).unwrap();
+        for _ in 0..claurst_core::MAX_GOAL_TURNS {
+            store.record_turn("runaway", 0).unwrap();
+        }
+        match decide_goal_continuation(&store, "runaway", 0, 1) {
+            GoalContinuation::Stop {
+                reason: StopReason::RunawayGuard { turns_used },
+            } => {
+                assert_eq!(turns_used, claurst_core::MAX_GOAL_TURNS);
+            }
+            _ => panic!("a runaway goal must pause"),
+        }
+        assert_eq!(
+            store.get_goal("runaway").unwrap().status,
+            claurst_core::GoalStatus::Paused,
+            "runaway goal must be persisted as paused"
+        );
+    }
 }
 
 /// Stream handler that forwards events to an unbounded channel.
