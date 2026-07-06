@@ -156,7 +156,7 @@ impl Tool for NotebookEditTool {
                     Ok(s) => s,
                     Err(e) => return ToolResult::error(format!("Failed to serialize notebook: {}", e)),
                 };
-                if let Err(e) = tokio::fs::write(&path, &updated).await {
+                if let Err(e) = crate::write_atomic(&path, updated.as_bytes()).await {
                     return ToolResult::error(format!("Failed to write notebook: {}", e));
                 }
                 ctx.record_file_change(
