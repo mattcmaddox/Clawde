@@ -117,21 +117,6 @@ fn is_gpt5_reasoning_model(id: &str) -> bool {
     id.starts_with("gpt-5") && !id.contains("-chat") && !id.contains("-pro")
 }
 
-/// Returns a short description string based on the model family inferred from
-/// the model ID.  Used when converting API model entries to `ModelEntry`.
-pub fn model_family_description(id: &str) -> String {
-    let lower = id.to_lowercase();
-    if lower.contains("opus") {
-        "Most capable — best for complex reasoning and analysis".to_string()
-    } else if lower.contains("sonnet") {
-        "Balanced performance and speed — great for coding tasks".to_string()
-    } else if lower.contains("haiku") {
-        "Fast and efficient — ideal for quick completions".to_string()
-    } else {
-        "AI model".to_string()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Provider grouping helpers
 // ---------------------------------------------------------------------------
@@ -523,12 +508,20 @@ pub struct ModelPickerState {
 // ---------------------------------------------------------------------------
 
 impl ModelPickerState {
-    /// Create a new picker with the default model list (not yet visible).
+    /// Create a new picker (not yet visible).
+    ///
+    /// The model list starts empty; it is populated purely from the
+    /// models.dev-backed [`ModelRegistry`](claurst_api::ModelRegistry) via
+    /// [`set_models`](Self::set_models) (see
+    /// `models_for_provider_from_registry`) each time the picker opens for a
+    /// provider. There is deliberately no hardcoded fallback list — a hardcoded
+    /// Claude list previously clobbered the registry and hid newly-shipped
+    /// models (#228).
     pub fn new() -> Self {
         Self {
             visible: false,
             selected_idx: 0,
-            models: Self::default_models(),
+            models: Vec::new(),
             title: "Select model".to_string(),
             filter: String::new(),
             effort_level: EffortLevel::Normal,
@@ -709,105 +702,6 @@ impl ModelPickerState {
         if count > 0 && self.selected_idx >= count {
             self.selected_idx = count - 1;
         }
-    }
-
-    /// Fetch the list of available models from the Anthropic API and convert
-    /// them to `ModelEntry` values.
-    ///
-    /// On success, models are sorted newest-first (by `created_at` descending).
-    /// On any error, returns `default_models()` as a fallback so the picker is
-    /// never left empty.
-    pub async fn fetch_models(client: &claurst_api::AnthropicClient) -> Vec<ModelEntry> {
-        match client.fetch_available_models().await {
-            Ok(available) => {
-                if available.is_empty() {
-                    return Self::default_models();
-                }
-
-                let mut entries: Vec<(i64, ModelEntry)> = available
-                    .into_iter()
-                    .map(|m| {
-                        let display = m
-                            .display_name
-                            .clone()
-                            .unwrap_or_else(|| m.id.clone());
-                        let description = model_family_description(&m.id);
-                        let ts = m.created_at.unwrap_or(0);
-                        (ts, ModelEntry {
-                            id: m.id,
-                            display_name: display,
-                            description,
-                            is_current: false,
-                        })
-                    })
-                    .collect();
-
-                // Sort newest-first.
-                entries.sort_by(|a, b| b.0.cmp(&a.0));
-                entries.into_iter().map(|(_, e)| e).collect()
-            }
-            Err(_) => Self::default_models(),
-        }
-    }
-
-    /// Hardcoded list of Claude models available as of 2025.
-    pub fn default_models() -> Vec<ModelEntry> {
-        vec![
-            ModelEntry {
-                id: "claude-opus-4-6".to_string(),
-                display_name: "Claude Opus 4.6".to_string(),
-                description: "Most capable model — best for complex reasoning and analysis".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-sonnet-4-6".to_string(),
-                display_name: "Claude Sonnet 4.6".to_string(),
-                description: "Balanced performance and speed — great for coding tasks".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-haiku-4-5-20251001".to_string(),
-                display_name: "Claude Haiku 4.5 (2025-10-01)".to_string(),
-                description: "Fast and efficient — ideal for quick completions".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-opus-4-5".to_string(),
-                display_name: "Claude Opus 4.5".to_string(),
-                description: "Previous Opus generation — powerful multimodal reasoning".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-sonnet-4-5".to_string(),
-                display_name: "Claude Sonnet 4.5".to_string(),
-                description: "Previous Sonnet generation — solid coding and writing".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-haiku-4-5".to_string(),
-                display_name: "Claude Haiku 4.5".to_string(),
-                description: "Previous Haiku generation — lightweight and responsive".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-7-sonnet-20250219".to_string(),
-                display_name: "Claude 3.7 Sonnet (2025-02-19)".to_string(),
-                description: "Sonnet 3.7 with enhanced instruction following".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-5-sonnet-20241022".to_string(),
-                display_name: "Claude 3.5 Sonnet (2024-10-22)".to_string(),
-                description: "Highly capable 3.5 Sonnet — reliable and well-tested".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-5-haiku-20241022".to_string(),
-                display_name: "Claude 3.5 Haiku (2024-10-22)".to_string(),
-                description: "Fast 3.5 Haiku — great for high-throughput pipelines".to_string(),
-                is_current: false,
-            },
-        ]
     }
 }
 
@@ -1047,27 +941,93 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 mod tests {
     use super::*;
 
-    fn make_picker_with_current(current: &str) -> ModelPickerState {
+    /// A small, controlled model list used to exercise the picker's selection /
+    /// filter / effort behaviour independently of both the (now-removed)
+    /// hardcoded list and the exact contents of the bundled registry snapshot.
+    /// In production this list comes from `set_models(models_for_provider_from_registry(..))`.
+    fn sample_models() -> Vec<ModelEntry> {
+        vec![
+            ModelEntry {
+                id: "claude-opus-4-6".to_string(),
+                display_name: "Claude Opus 4.6".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+            ModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                display_name: "Claude Sonnet 4.6".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+            ModelEntry {
+                id: "claude-haiku-4-5".to_string(),
+                display_name: "Claude Haiku 4.5".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+        ]
+    }
+
+    /// A picker seeded with `sample_models()` — the unit-test analogue of the
+    /// registry-projection seeding that happens when the picker opens.
+    fn make_picker() -> ModelPickerState {
         let mut p = ModelPickerState::new();
+        p.set_models(sample_models());
+        p
+    }
+
+    fn make_picker_with_current(current: &str) -> ModelPickerState {
+        let mut p = make_picker();
         p.open(current);
         p
     }
 
-    // 1. Default model list is non-empty and contains expected IDs.
+    // 1. A model newly added to the registry surfaces in the picker immediately.
+    //    The picker list is a pure projection of the models.dev registry, not a
+    //    hardcoded set — regression guard for #228 ("latest model won't show").
     #[test]
-    fn default_models_are_populated() {
-        let models = ModelPickerState::default_models();
-        assert!(!models.is_empty(), "default model list must not be empty");
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"claude-sonnet-4-6"));
-        assert!(ids.contains(&"claude-opus-4-6"));
-        assert!(ids.contains(&"claude-3-5-haiku-20241022"));
+    fn newly_added_registry_model_surfaces_in_picker() {
+        let mut registry = claurst_api::ModelRegistry::new();
+
+        // A fabricated future id that cannot already be in the bundled snapshot.
+        let novel_id = "claude-opus-9-9-20991231";
+        assert!(
+            registry.get("anthropic", novel_id).is_none(),
+            "fixture id must not already exist in the snapshot"
+        );
+
+        // Inject it exactly as the background refresh does: a models.dev-format
+        // catalog fragment merged in via load_cache.
+        let json = format!(
+            r#"{{"anthropic":{{"id":"anthropic","name":"Anthropic","models":{{"{novel_id}":{{"id":"{novel_id}","name":"Claude Opus 9.9","release_date":"2099-12-31","limit":{{"context":200000,"output":64000}}}}}}}}}}"#
+        );
+        let path = std::env::temp_dir().join(format!(
+            "claurst_picker_{}_{}.json",
+            std::process::id(),
+            novel_id
+        ));
+        std::fs::write(&path, json).expect("write temp catalog");
+        registry.load_cache(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let picker = models_for_provider_from_registry("anthropic", &registry);
+        let novel = picker.iter().find(|m| m.id == novel_id);
+        assert!(
+            novel.is_some(),
+            "a model added to the registry must surface in the picker"
+        );
+        assert_eq!(novel.unwrap().display_name, "Claude Opus 9.9");
+        // Newest release_date sorts to the top of the projection.
+        assert_eq!(
+            picker[0].id, novel_id,
+            "the freshest model must sort to the top of the picker"
+        );
     }
 
     // 2. open() marks exactly one model as current.
     #[test]
     fn open_marks_current_model() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("claude-sonnet-4-6");
         let current_count = p.models.iter().filter(|m| m.is_current).count();
         assert_eq!(current_count, 1);
@@ -1093,7 +1053,7 @@ mod tests {
     // 3. open() with an unknown model ID marks none as current and sets idx=0.
     #[test]
     fn open_unknown_model_selects_first() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("unknown-model");
         assert_eq!(p.selected_idx, 0);
         assert!(p.models.iter().all(|m| !m.is_current));
@@ -1223,7 +1183,7 @@ mod tests {
     // 14. render_model_picker does not panic for a default-area call.
     #[test]
     fn render_does_not_panic() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("claude-sonnet-4-6");
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
