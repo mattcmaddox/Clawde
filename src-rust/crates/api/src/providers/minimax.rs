@@ -15,7 +15,7 @@ use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
 use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
 
@@ -217,103 +217,57 @@ impl LlmProvider for MinimaxProvider {
 
         let mut id = String::from("unknown");
         let mut model = String::new();
-        let mut text_parts: Vec<(usize, String)> = Vec::new();
-        let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = UsageInfo::default();
 
-        let mut tool_buffers: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new();
+        // Accumulate every content block keyed by its stream index — captures
+        // thinking/signature/reasoning deltas and preserves interleave order via
+        // a single ordered pass, instead of appending non-text blocks with
+        // usize::MAX. Same-class fix as the Anthropic aggregator. See issue #217.
+        let mut blocks = StreamBlockAccumulator::new();
 
         use futures::StreamExt;
         while let Some(result) = stream.next().await {
             match result {
                 Err(e) => return Err(e),
-                Ok(evt) => match evt {
-                    StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: msg_model,
-                        usage: msg_usage,
-                    } => {
-                        id = msg_id;
-                        model = msg_model;
-                        usage = msg_usage;
-                    }
-                    StreamEvent::ContentBlockStart {
-                        index,
-                        content_block,
-                    } => match content_block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push((index, text));
-                        }
-                        ContentBlock::ToolUse {
-                            id: tool_id,
-                            name,
-                            input: _,
+                Ok(evt) => {
+                    blocks.on_event(&evt);
+                    match evt {
+                        StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: msg_model,
+                            usage: msg_usage,
                         } => {
-                            tool_buffers.insert(index, (tool_id, name, String::new()));
+                            id = msg_id;
+                            model = msg_model;
+                            usage = msg_usage;
                         }
-                        other => {
-                            content_blocks.push(other);
+                        StreamEvent::MessageDelta {
+                            stop_reason: sr,
+                            usage: delta_usage,
+                        } => {
+                            if let Some(r) = sr {
+                                stop_reason = r;
+                            }
+                            if let Some(u) = delta_usage {
+                                usage.output_tokens += u.output_tokens;
+                            }
                         }
-                    },
-                    StreamEvent::TextDelta { index, text } => {
-                        if let Some(entry) = text_parts.iter_mut().find(|(i, _)| *i == index) {
-                            entry.1.push_str(&text);
-                        }
-                    }
-                    StreamEvent::InputJsonDelta {
-                        index,
-                        partial_json,
-                    } => {
-                        if let Some((_, _, buf)) = tool_buffers.get_mut(&index) {
-                            buf.push_str(&partial_json);
-                        }
-                    }
-                    StreamEvent::ContentBlockStop { index } => {
-                        if let Some((tool_id, name, json_buf)) = tool_buffers.remove(&index) {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(serde_json::Value::Object(Default::default()));
-                            content_blocks.push(ContentBlock::ToolUse {
-                                id: tool_id,
-                                name,
-                                input,
+                        StreamEvent::MessageStop => break,
+                        StreamEvent::Error { error_type, message } => {
+                            return Err(ProviderError::StreamError {
+                                provider: self.id.clone(),
+                                message: format!("[{}] {}", error_type, message),
+                                partial_response: None,
                             });
                         }
+                        _ => {}
                     }
-                    StreamEvent::MessageDelta {
-                        stop_reason: sr,
-                        usage: delta_usage,
-                    } => {
-                        if let Some(r) = sr {
-                            stop_reason = r;
-                        }
-                        if let Some(u) = delta_usage {
-                            usage.output_tokens += u.output_tokens;
-                        }
-                    }
-                    StreamEvent::MessageStop => break,
-                    StreamEvent::Error { error_type, message } => {
-                        return Err(ProviderError::StreamError {
-                            provider: self.id.clone(),
-                            message: format!("[{}] {}", error_type, message),
-                            partial_response: None,
-                        });
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
-        text_parts.sort_by_key(|(i, _)| *i);
-        let mut all_blocks: Vec<(usize, ContentBlock)> = text_parts
-            .into_iter()
-            .map(|(i, text)| (i, ContentBlock::Text { text }))
-            .collect();
-        for block in content_blocks {
-            all_blocks.push((usize::MAX, block));
-        }
-        let final_content: Vec<ContentBlock> = all_blocks.into_iter().map(|(_, b)| b).collect();
+        let final_content: Vec<ContentBlock> = blocks.finish();
 
         Ok(ProviderResponse {
             id,
