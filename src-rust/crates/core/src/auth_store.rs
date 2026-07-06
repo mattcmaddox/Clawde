@@ -72,6 +72,7 @@ impl AuthStore {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            crate::accounts::set_user_only_dir_perms(parent);
         }
         let json = match serde_json::to_string_pretty(self) {
             Ok(j) => j,
@@ -79,6 +80,10 @@ impl AuthStore {
         };
         let tmp = path.with_file_name(format!(".auth.json.claurst-tmp-{}", std::process::id()));
         if std::fs::write(&tmp, &json).is_ok() {
+            // auth.json holds API keys + OAuth tokens. Lock the temp file to
+            // 0o600 *before* the rename so the live credential file is never
+            // even momentarily world/group readable (issue #212).
+            crate::accounts::set_user_only_perms(&tmp);
             if std::fs::rename(&tmp, &path).is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
