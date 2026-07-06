@@ -2423,6 +2423,61 @@ mod tests {
         }
     }
 
+    // ---- parse_tool_args tests (issue #215) ---------------------------------
+
+    #[test]
+    fn test_parse_tool_args_valid_object() {
+        // A complete JSON object parses to the same value.
+        let v = parse_tool_args("{\"a\":1}").expect("valid JSON should parse");
+        assert_eq!(v, serde_json::json!({ "a": 1 }));
+
+        let v = parse_tool_args("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
+            .expect("valid JSON should parse");
+        assert_eq!(v["path"], "/tmp/x");
+        assert_eq!(v["content"], "hi");
+    }
+
+    #[test]
+    fn test_parse_tool_args_empty_is_empty_object() {
+        // No-argument tool calls arrive as an empty (or whitespace-only)
+        // buffer and must map to `{}` so the happy path still works.
+        assert_eq!(parse_tool_args("").unwrap(), serde_json::json!({}));
+        assert_eq!(parse_tool_args("   ").unwrap(), serde_json::json!({}));
+        assert_eq!(parse_tool_args("\n\t ").unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_parse_tool_args_truncated_is_error_not_empty_object() {
+        // The core of issue #215: a truncated/malformed stream must surface
+        // an error, NOT silently become `{}` (which would run Edit/Write with
+        // empty arguments).
+        assert!(
+            parse_tool_args("{\"a\":").is_err(),
+            "truncated JSON must be an error"
+        );
+        assert!(
+            parse_tool_args("{\"path\": \"/etc/passwd").is_err(),
+            "truncated string value must be an error"
+        );
+        assert!(
+            parse_tool_args("{not json}").is_err(),
+            "invalid JSON must be an error"
+        );
+
+        // Regression guard: the failing cases must never resolve to `{}`.
+        for bad in ["{\"a\":", "{\"path\": \"/etc/passwd", "{not json}"] {
+            let resolved = parse_tool_args(bad).unwrap_or(serde_json::json!({}));
+            // The OLD buggy behavior turned these into `{}`; assert we now
+            // *detect* the error rather than relying on that fallback.
+            assert!(
+                parse_tool_args(bad).is_err(),
+                "expected error for {:?}, but got {}",
+                bad,
+                resolved
+            );
+        }
+    }
+
     // ---- build_system_prompt tests ------------------------------------------
 
     #[test]
