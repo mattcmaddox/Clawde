@@ -390,12 +390,25 @@ struct MessageLinesCache {
     lines: Vec<RenderedLineItem>,
 }
 
-/// Cache key for completed messages only (no ptr — len change = new message).
+/// Cache key for the *committed prefix* served during streaming: all messages
+/// before the live (actively-streaming) turn.
+///
+/// Deliberately keyed by message/annotation identity — NOT by
+/// `transcript_version`, which bumps on every streaming token and would churn
+/// the entry away each frame (issue #222). During streaming the committed
+/// messages do not change, so `messages_ptr`/`messages_len` stay stable and the
+/// prefix is a cache hit every frame; when the committed set changes (a turn
+/// completes, session switch/fork/revert/compaction) the pointer, length, or
+/// `prefix_len` shifts and the entry is rebuilt. `prefix_len` is the number of
+/// committed messages that precede the live turn, so growing the transcript by
+/// one turn re-keys the prefix cleanly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CompletedMsgCacheKey {
     width: u16,
-    transcript_version: u64,
+    prefix_len: usize,
+    messages_ptr: usize,
     messages_len: usize,
+    annotations_ptr: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
 }
@@ -408,9 +421,34 @@ struct CompletedMsgCache {
 
 thread_local! {
     static MESSAGE_LINES_CACHE: RefCell<Option<MessageLinesCache>> = const { RefCell::new(None) };
-    /// Stores rendered lines for committed messages only; valid even during streaming.
+    /// Stores rendered lines for the committed prefix (all messages before the
+    /// live turn); valid and reused across streaming deltas.
     static COMPLETED_MSG_CACHE: RefCell<Option<CompletedMsgCache>> = const { RefCell::new(None) };
 }
+
+// Instrumentation so tests can prove the committed prefix is served from cache
+// (a hit) rather than rebuilt on every streaming frame. Compiled out of release
+// builds.
+#[cfg(test)]
+thread_local! {
+    static PREFIX_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PREFIX_CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_prefix_cache_hit() {
+    PREFIX_CACHE_HITS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(test)]
+fn record_prefix_cache_miss() {
+    PREFIX_CACHE_MISSES.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_hit() {}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_miss() {}
 
 // -----------------------------------------------------------------------
 // Top-level layout
@@ -1401,6 +1439,13 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         .any(|block| block.status == ToolStatus::Running);
     let cacheable = !streaming && !has_running_tool_blocks;
 
+    if !cacheable {
+        // Live content is on screen. Instead of re-rendering the whole backlog
+        // every frame (the O(messages^2) hot path from issue #222), serve the
+        // committed prefix from cache and rebuild only the live tail.
+        return render_streaming_items(app, width);
+    }
+
     // Fast path: nothing live — use the full-result cache (ptr-stable check).
     let full_key = MessageLinesCacheKey {
         width,
@@ -1411,60 +1456,98 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    if cacheable {
-        if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == full_key)
-                .map(|c| c.lines.clone())
-        }) {
-            return lines;
-        }
+    if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == full_key)
+            .map(|c| c.lines.clone())
+    }) {
+        return lines;
     }
 
-    let completed_key = CompletedMsgCacheKey {
+    let items = build_all_items(app, width);
+    MESSAGE_LINES_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(MessageLinesCache {
+            key: full_key,
+            lines: items.clone(),
+        });
+    });
+    items
+}
+
+/// Render the transcript while there is live content on screen.
+///
+/// The only part of the transcript that changes between streaming frames is the
+/// last turn (its live text/thinking and any running tool blocks). Every earlier
+/// turn is already committed and byte-identical to a full rebuild, so we serve
+/// that committed prefix from `COMPLETED_MSG_CACHE` and rebuild only the live
+/// tail. Because `build_message_items_range` splits the exact same linear pass
+/// at a turn boundary, `prefix ++ tail` is identical to `build_all_items` — no
+/// ghosting, no missing content.
+fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
         width,
-        transcript_version: app.transcript_version.get(),
-        messages_len: app.messages.len(),
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+
+    // The live tail is the last turn; its user index is the prefix boundary.
+    // Without a turn (e.g. tool-blocks-only welcome state) there is no stable
+    // prefix to reuse, so fall back to a full rebuild.
+    let split_idx = match turns.last() {
+        Some(last) => last.user_index,
+        None => return build_all_items(app, width),
+    };
+
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let prefix_key = CompletedMsgCacheKey {
+        width,
+        prefix_len: split_idx,
+        messages_ptr: app.messages.as_ptr() as usize,
+        messages_len: total,
+        annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    let completed_lines: Vec<RenderedLineItem> = if cacheable {
-        if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == completed_key)
-                .map(|c| c.lines.clone())
-        }) {
-            lines
-        } else {
-            let items = build_all_items(app, width);
-            COMPLETED_MSG_CACHE.with(|cache| {
-                *cache.borrow_mut() = Some(CompletedMsgCache {
-                    key: completed_key,
-                    lines: items.clone(),
-                });
-            });
-            items
-        }
-    } else {
-        build_all_items(app, width)
-    };
 
-    // If there is no live content, store in the full cache and return.
-    if cacheable {
-        MESSAGE_LINES_CACHE.with(|cache| {
-            *cache.borrow_mut() = Some(MessageLinesCache {
-                key: full_key,
-                lines: completed_lines.clone(),
+    // Committed prefix: messages before the live turn. Stable across streaming
+    // deltas, so keyed by identity (not `transcript_version`) and served from
+    // cache every frame after the first.
+    let mut items = if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == prefix_key)
+            .map(|c| c.lines.clone())
+    }) {
+        record_prefix_cache_hit();
+        lines
+    } else {
+        record_prefix_cache_miss();
+        let mut prefix = Vec::new();
+        build_message_items_range(app, width, &ctx, &turn_map, 0, split_idx, false, &mut prefix);
+        COMPLETED_MSG_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(CompletedMsgCache {
+                key: prefix_key,
+                lines: prefix.clone(),
             });
         });
-        return completed_lines;
-    }
+        prefix
+    };
 
-    completed_lines
+    // Live tail: the actively-streaming turn, rebuilt fresh every frame.
+    build_message_items_range(app, width, &ctx, &turn_map, split_idx, total, true, &mut items);
+    items
 }
 
 // â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
