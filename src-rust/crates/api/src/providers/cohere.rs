@@ -386,6 +386,9 @@ impl LlmProvider for CohereProvider {
         let provider_id = self.id.clone();
         let model_name = request.model.clone();
 
+        // TODO(#228): Cohere streams newline-delimited Cohere-shaped JSON (not the
+        // OpenAI `data:` SSE format), so it wants its own `protocol` decoder rather
+        // than `OpenAiChatDecoder`.
         let s = stream! {
             use futures::StreamExt;
 

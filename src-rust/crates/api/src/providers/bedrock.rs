@@ -658,6 +658,11 @@ impl LlmProvider for BedrockProvider {
         let resp = self.send_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): this AWS event-stream framing + Converse event decode is the
+        // **BedrockConverse** wire protocol; it should move into a
+        // `protocol::bedrock_converse` decoder (its binary framing means it does
+        // not share the SSE byte-line decoder the other protocols use).
+        //
         // Bedrock Converse streaming uses the AWS event-stream binary framing
         // (`vnd.amazon.eventstream`). Each message on the wire is:
         //

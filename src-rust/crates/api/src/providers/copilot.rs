@@ -900,6 +900,11 @@ impl LlmProvider for CopilotProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): Copilot speaks the OpenAI-Chat wire format and could reuse
+        // `protocol::openai_chat::OpenAiChatDecoder`, except it surfaces reasoning
+        // as `ReasoningDelta { index: 0 }` (no dedicated Thinking block). Migrate
+        // once that decoder gains a "simple reasoning" mode; keeping this loop is
+        // behavior-preserving until then.
         let s = stream! {
             use futures::StreamExt;
 

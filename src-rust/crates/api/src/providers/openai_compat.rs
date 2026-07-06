@@ -9,10 +9,9 @@ use std::pin::Pin;
 use async_stream::stream;
 use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
-use claurst_core::types::{ContentBlock, UsageInfo};
+use claurst_core::types::ContentBlock;
 use futures::Stream;
 use serde_json::{json, Value};
-use tracing::debug;
 
 use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
@@ -851,23 +850,13 @@ impl LlmProvider for OpenAiCompatProvider {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
-            // Shared byte-buffering decoder (#228): complete lines only, so a
-            // multibyte codepoint straddling a chunk boundary is never corrupted.
-            let mut decoder = crate::SseByteDecoder::new();
-
-            let mut message_started = false;
-            let mut message_id = String::from("unknown");
-            let mut model_name = String::new();
-            // Dedicated index for the Thinking content block emitted when a
-            // provider streams a `reasoning_content` field (DeepSeek V4, etc.).
-            // Chosen to avoid colliding with text (index 0) or tool calls
-            // (1 + tc_index).
-            const THINKING_BLOCK_INDEX: usize = usize::MAX - 100;
-            let mut thinking_open = false;
-            let mut tool_call_buffers: std::collections::HashMap<
-                usize,
-                (String, String, String),
-            > = std::collections::HashMap::new();
+            // Byte-buffering line decoder (#228): complete UTF-8 lines only, so
+            // a multibyte codepoint straddling a chunk boundary is never lost.
+            let mut byte_decoder = crate::SseByteDecoder::new();
+            // Sans-IO OpenAI-Chat protocol decoder (#228): owns all message /
+            // reasoning / tool-call / finish-reason decoding for this wire
+            // format (extracted from this loop into `protocol::openai_chat`).
+            let mut chat_decoder = crate::OpenAiChatDecoder::new(reasoning_field);
 
             // Bound infinite mid-stream stalls (issue #185): some
             // OpenAI-compatible providers begin a streamed tool call and then
@@ -911,251 +900,24 @@ impl LlmProvider for OpenAiCompatProvider {
                     }
                 };
 
-                for line in decoder.push(&chunk) {
-                    let line = line.trim_end_matches('\r').trim();
-
-                    if line.is_empty() || line.starts_with(':') {
-                        continue;
+                for line in byte_decoder.push(&chunk) {
+                    let mut events = Vec::new();
+                    let stop = chat_decoder.feed_line(&line, &mut events);
+                    for event in events {
+                        yield Ok(event);
                     }
-
-                    let data = if let Some(rest) = line.strip_prefix("data:") {
-                        rest.trim()
-                    } else {
-                        continue;
-                    };
-
-                    if data == "[DONE]" {
-                        yield Ok(StreamEvent::MessageStop);
+                    if stop {
                         return;
-                    }
-
-                    let chunk_json: Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!("Failed to parse SSE chunk: {}: {}", e, data);
-                            continue;
-                        }
-                    };
-
-                    if !message_started {
-                        if let Some(id) = chunk_json.get("id").and_then(|v| v.as_str()) {
-                            message_id = id.to_string();
-                        }
-                        if let Some(m) = chunk_json.get("model").and_then(|v| v.as_str()) {
-                            model_name = m.to_string();
-                        }
-                        yield Ok(StreamEvent::MessageStart {
-                            id: message_id.clone(),
-                            model: model_name.clone(),
-                            usage: UsageInfo::default(),
-                        });
-                        yield Ok(StreamEvent::ContentBlockStart {
-                            index: 0,
-                            content_block: ContentBlock::Text { text: String::new() },
-                        });
-                        message_started = true;
-                    }
-
-                    let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
-                        Some(c) => c,
-                        None => {
-                            if let Some(usage_val) = chunk_json.get("usage") {
-                                let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
-                                yield Ok(StreamEvent::MessageDelta {
-                                    stop_reason: None,
-                                    usage: Some(usage),
-                                });
-                            }
-                            continue;
-                        }
-                    };
-
-                    let choice = match choices.first() {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    let delta = match choice.get("delta") {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                    // Reasoning / thinking extraction.
-                    // Check the provider-specific field first (e.g. DeepSeek's
-                    // "reasoning_content"), then fall back to common field names
-                    // used by other providers (Copilot "reasoning_text", generic
-                    // "reasoning", etc.).  This allows reasoning traces to show
-                    // for any provider that emits them without needing explicit
-                    // per-provider configuration.
-                    {
-                        const COMMON_REASONING_FIELDS: &[&str] = &[
-                            "reasoning_content",  // DeepSeek
-                            "reasoning_text",     // GitHub Copilot
-                            "reasoning",          // Generic / future
-                        ];
-                        let fields_to_check: Vec<&str> = if let Some(ref f) = reasoning_field {
-                            // Provider-specific field first, then common ones
-                            let mut v = vec![f.as_str()];
-                            for common in COMMON_REASONING_FIELDS {
-                                if *common != f.as_str() {
-                                    v.push(common);
-                                }
-                            }
-                            v
-                        } else {
-                            COMMON_REASONING_FIELDS.to_vec()
-                        };
-                        for field in &fields_to_check {
-                            if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
-                                if !reasoning.is_empty() {
-                                    // Open a dedicated Thinking block on first
-                                    // reasoning delta so the accumulator has a
-                                    // partial to append into (see
-                                    // StreamAccumulator::on_event).  Without
-                                    // this start event the reasoning deltas
-                                    // would be dropped and the completed
-                                    // assistant message would not carry any
-                                    // ContentBlock::Thinking — which is what
-                                    // DeepSeek V4 thinking mode requires the
-                                    // client to echo back on subsequent turns.
-                                    if !thinking_open {
-                                        yield Ok(StreamEvent::ContentBlockStart {
-                                            index: THINKING_BLOCK_INDEX,
-                                            content_block: ContentBlock::Thinking {
-                                                thinking: String::new(),
-                                                signature: String::new(),
-                                            },
-                                        });
-                                        thinking_open = true;
-                                    }
-                                    yield Ok(StreamEvent::ReasoningDelta {
-                                        index: THINKING_BLOCK_INDEX,
-                                        reasoning: reasoning.to_string(),
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Text content delta
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                        if !content.is_empty() {
-                            // Close any open thinking block before visible text
-                            // starts streaming, so the blocks land in order in
-                            // the final message: [Thinking, Text, ToolUse...].
-                            if thinking_open {
-                                yield Ok(StreamEvent::ContentBlockStop {
-                                    index: THINKING_BLOCK_INDEX,
-                                });
-                                thinking_open = false;
-                            }
-                            yield Ok(StreamEvent::TextDelta {
-                                index: 0,
-                                text: content.to_string(),
-                            });
-                        }
-                    }
-
-                    // Tool call deltas
-                    if let Some(tool_calls) =
-                        delta.get("tool_calls").and_then(|t| t.as_array())
-                    {
-                        // Close any open thinking block before tool calls
-                        // start (same ordering guarantee as for text above).
-                        if thinking_open {
-                            yield Ok(StreamEvent::ContentBlockStop {
-                                index: THINKING_BLOCK_INDEX,
-                            });
-                            thinking_open = false;
-                        }
-                        for tc in tool_calls {
-                            let tc_index = tc
-                                .get("index")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as usize;
-                            if let Some(tc_id) =
-                                tc.get("id").and_then(|v| v.as_str())
-                            {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let block_index = 1 + tc_index;
-                                tool_call_buffers.insert(
-                                    block_index,
-                                    (tc_id.to_string(), name.clone(), String::new()),
-                                );
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: block_index,
-                                    content_block: ContentBlock::ToolUse {
-                                        id: tc_id.to_string(),
-                                        name,
-                                        input: json!({}),
-                                    },
-                                });
-                            }
-                            if let Some(args_frag) = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !args_frag.is_empty() {
-                                    let block_index = 1 + tc_index;
-                                    if let Some((_, _, buf)) =
-                                        tool_call_buffers.get_mut(&block_index)
-                                    {
-                                        buf.push_str(args_frag);
-                                    }
-                                    yield Ok(StreamEvent::InputJsonDelta {
-                                        index: block_index,
-                                        partial_json: args_frag.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // finish_reason
-                    if let Some(finish_reason) =
-                        choice.get("finish_reason").and_then(|v| v.as_str())
-                    {
-                        if !finish_reason.is_empty() && finish_reason != "null" {
-                            // Flush any still-open thinking block first so it
-                            // is finalized into the assistant message.
-                            if thinking_open {
-                                yield Ok(StreamEvent::ContentBlockStop {
-                                    index: THINKING_BLOCK_INDEX,
-                                });
-                                thinking_open = false;
-                            }
-                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                            let mut tc_indices: Vec<usize> =
-                                tool_call_buffers.keys().cloned().collect();
-                            tc_indices.sort();
-                            for idx in tc_indices {
-                                yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                            }
-
-                            let stop_reason =
-                                OpenAiProvider::map_finish_reason_pub(finish_reason);
-
-                            let usage_val = chunk_json.get("usage");
-                            let usage = usage_val.map(|u| OpenAiProvider::parse_usage_pub(Some(u)));
-
-                            yield Ok(StreamEvent::MessageDelta {
-                                stop_reason: Some(stop_reason),
-                                usage,
-                            });
-                        }
                     }
                 }
             }
 
-            if message_started {
-                yield Ok(StreamEvent::MessageStop);
+            // Byte stream ended: flush a trailing MessageStop if content began
+            // but no explicit `[DONE]` sentinel arrived.
+            let mut tail = Vec::new();
+            chat_decoder.finish(&mut tail);
+            for event in tail {
+                yield Ok(event);
             }
         };
 

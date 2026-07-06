@@ -239,6 +239,11 @@ impl LlmProvider for AzureProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): Azure OpenAI speaks the OpenAI-Chat wire format but does no
+        // reasoning extraction at all. Migrate to
+        // `protocol::openai_chat::OpenAiChatDecoder` once it can be configured to
+        // skip reasoning (the current decoder always extracts it) so the switch
+        // stays behavior-preserving.
         let s = stream! {
             use futures::StreamExt;
 

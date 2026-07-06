@@ -36,6 +36,10 @@ pub mod auth;
 pub mod stream_parser;
 pub mod transform;
 
+// Wire-format protocol layer (#228): request-building + stream decoding owned
+// once per wire format, shared across the providers that speak it.
+pub mod protocol;
+
 // Provider registry (Phase 1C).
 pub mod registry;
 
@@ -67,6 +71,9 @@ pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
 pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
 pub use transform::MessageTransformer;
+
+// #228 protocol layer re-exports.
+pub use protocol::{LineStreamDecoder, OpenAiChatDecoder};
 
 // Phase 1C re-exports — provider registry.
 pub use registry::ProviderRegistry;
@@ -1103,6 +1110,17 @@ pub mod client {
             }
         }
 
+        // TODO(#228): this SSE loop + `frame_to_event` below are the decode half
+        // of the **AnthropicMessages** wire protocol. They should be hoisted into
+        // a sans-IO `protocol::anthropic_messages` decoder (mirroring
+        // `protocol::openai_chat::OpenAiChatDecoder`) and shared with
+        // `providers::anthropic::AnthropicProvider`, collapsing the two Anthropic
+        // stacks. Remaining step / risk: this path decodes into the Anthropic-typed
+        // `AnthropicStreamEvent` consumed by `StreamHandler`/`StreamAccumulator`
+        // and the TUI, whereas the protocol decoders emit the provider-agnostic
+        // `provider_types::StreamEvent`; unifying requires either a decoder generic
+        // over its output event or migrating those consumers. Deferred to keep the
+        // TUI and all tests green.
         /// Read an SSE byte stream, parse frames, and emit `AnthropicStreamEvent`s.
         async fn process_sse_stream(
             resp: wreq::Response,

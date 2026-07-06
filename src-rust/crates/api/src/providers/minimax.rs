@@ -326,6 +326,9 @@ impl LlmProvider for MinimaxProvider {
         }
 
         let provider_id_inner = provider_id.clone();
+        // TODO(#228): MiniMax streams the **Anthropic** messages wire format
+        // (decoded via `map_anthropic_event`), so it belongs to the future
+        // `AnthropicMessages` protocol — not `OpenAiChatDecoder`.
         let s = stream! {
             let byte_stream = resp.bytes_stream();
             // Shared byte-buffering decoder (#228): complete lines only, so a

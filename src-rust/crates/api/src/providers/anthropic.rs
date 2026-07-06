@@ -242,6 +242,14 @@ impl LlmProvider for AnthropicProvider {
         })
     }
 
+    // TODO(#228): `AnthropicProvider` is a thin adapter over the legacy
+    // `AnthropicClient` (crate::client, in lib.rs): it delegates SSE decoding to
+    // `client.create_message_stream` and then maps the Anthropic-typed
+    // `AnthropicStreamEvent`s to `StreamEvent` via `map_stream_event`. These are
+    // the two Anthropic stacks #228 wants collapsed under one `AnthropicMessages`
+    // protocol (see the matching TODO on `AnthropicClient::process_sse_stream`).
+    // Not done in this pass because `AnthropicClient` is a public type the TUI and
+    // other crates depend on directly — deferring keeps everything green.
     async fn create_message_stream(
         &self,
         request: ProviderRequest,

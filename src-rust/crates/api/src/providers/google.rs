@@ -693,6 +693,9 @@ impl LlmProvider for GoogleProvider {
         let model_clone = model.clone();
         let byte_stream = resp.bytes_stream();
 
+        // TODO(#228): Gemini has its own SSE JSON shape (candidates/parts); this
+        // decode belongs in a `protocol::gemini` decoder, alongside the
+        // OpenAI-Chat and AnthropicMessages protocols.
         let stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
             let text_block_index: usize = 0;
