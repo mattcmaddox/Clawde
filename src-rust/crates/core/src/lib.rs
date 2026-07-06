@@ -4939,4 +4939,80 @@ mod tests {
                 "Preset {} executor_model must be provider/model", preset.name);
         }
     }
+
+    // ---- Background task cancellation (issue #219) --------------------------
+
+    /// Cancelling a task must signal the cancellation token attached to it, not
+    /// merely relabel its status. Without this, a "cancelled" background agent
+    /// keeps running and editing files.
+    #[test]
+    fn registry_cancel_signals_attached_token() {
+        use tokio_util::sync::CancellationToken;
+
+        let registry = tasks::TaskRegistry::new();
+        let id = registry.register(tasks::BackgroundTask::new("cancellable task"));
+
+        let token = CancellationToken::new();
+        registry.set_cancel_token(&id, token.clone());
+        assert!(!token.is_cancelled());
+
+        registry.cancel(&id);
+
+        assert!(
+            token.is_cancelled(),
+            "cancel() must signal the attached cancellation token"
+        );
+        assert_eq!(
+            registry.get(&id).unwrap().status,
+            tasks::TaskStatus::Cancelled
+        );
+    }
+
+    /// A running work loop that holds the registered token (as the background
+    /// sub-agent's `run_query_loop` does) must actually stop when the task is
+    /// cancelled through the registry.
+    #[tokio::test]
+    async fn spawned_loop_observes_registry_cancellation() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let registry = tasks::TaskRegistry::new();
+        let mut task = tasks::BackgroundTask::new("bg loop");
+        let id = task.id.clone();
+        let token = CancellationToken::new();
+        // Attach at registration, exactly as the background spawn does.
+        task.cancel_token = Some(token.clone());
+        registry.register(task);
+
+        // Stand-in for run_query_loop: keep "working" until the shared token is
+        // signalled, mirroring the real loop's between-turn cancellation check.
+        let loop_token = token.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if loop_token.is_cancelled() {
+                    return "cancelled";
+                }
+                tokio::select! {
+                    _ = loop_token.cancelled() => return "cancelled",
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        });
+
+        // Let the loop start spinning, then cancel via the registry.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        registry.cancel(&id);
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("loop must stop promptly after cancellation")
+            .expect("loop task must not panic");
+
+        assert_eq!(reason, "cancelled");
+        assert!(token.is_cancelled());
+        assert_eq!(
+            registry.get(&id).unwrap().status,
+            tasks::TaskStatus::Cancelled
+        );
+    }
 }
