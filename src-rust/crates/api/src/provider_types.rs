@@ -462,3 +462,132 @@ pub enum ApiKeyHeader {
     /// A custom header name.
     Custom(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for issue #217. The non-streaming aggregators used by
+    /// the Anthropic and MiniMax providers delegate to `StreamBlockAccumulator`.
+    /// It must (a) fold `ThinkingDelta`/`SignatureDelta` into the thinking block
+    /// rather than dropping them, and (b) preserve the model's interleave order
+    /// (thinking-first), instead of appending non-text blocks last.
+    #[test]
+    fn stream_block_accumulator_keeps_thinking_signature_and_order() {
+        let mut acc = StreamBlockAccumulator::new();
+
+        // Block 0: a signed thinking block, streamed as thinking-then-signature.
+        acc.on_event(&StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        });
+        acc.on_event(&StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "Let me ".into(),
+        });
+        acc.on_event(&StreamEvent::ThinkingDelta {
+            index: 0,
+            thinking: "reason.".into(),
+        });
+        acc.on_event(&StreamEvent::SignatureDelta {
+            index: 0,
+            signature: "sig-".into(),
+        });
+        acc.on_event(&StreamEvent::SignatureDelta {
+            index: 0,
+            signature: "abc123".into(),
+        });
+        acc.on_event(&StreamEvent::ContentBlockStop { index: 0 });
+
+        // Block 1: visible text.
+        acc.on_event(&StreamEvent::ContentBlockStart {
+            index: 1,
+            content_block: ContentBlock::Text {
+                text: String::new(),
+            },
+        });
+        acc.on_event(&StreamEvent::TextDelta {
+            index: 1,
+            text: "Hello world".into(),
+        });
+        acc.on_event(&StreamEvent::ContentBlockStop { index: 1 });
+
+        // Block 2: a tool call, streamed as partial JSON.
+        acc.on_event(&StreamEvent::ContentBlockStart {
+            index: 2,
+            content_block: ContentBlock::ToolUse {
+                id: "tool_1".into(),
+                name: "get_weather".into(),
+                input: Value::Null,
+            },
+        });
+        acc.on_event(&StreamEvent::InputJsonDelta {
+            index: 2,
+            partial_json: r#"{"city":"#.into(),
+        });
+        acc.on_event(&StreamEvent::InputJsonDelta {
+            index: 2,
+            partial_json: r#""Paris"}"#.into(),
+        });
+        acc.on_event(&StreamEvent::ContentBlockStop { index: 2 });
+
+        let blocks = acc.finish();
+        assert_eq!(blocks.len(), 3, "all three blocks survive");
+
+        // Order preserved: thinking → text → tool_use. The old aggregator
+        // appended non-text blocks last (usize::MAX), so thinking would have
+        // landed *after* the text block.
+        match &blocks[0] {
+            ContentBlock::Thinking { thinking, signature } => {
+                assert_eq!(thinking, "Let me reason.", "thinking text captured");
+                assert_eq!(signature, "sig-abc123", "signature preserved verbatim");
+            }
+            other => panic!("expected Thinking block first, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+            other => panic!("expected Text block second, got {other:?}"),
+        }
+        match &blocks[2] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "tool_1");
+                assert_eq!(name, "get_weather");
+                assert_eq!(
+                    input.get("city").and_then(Value::as_str),
+                    Some("Paris"),
+                    "tool_use JSON assembled from partial deltas"
+                );
+            }
+            other => panic!("expected ToolUse block third, got {other:?}"),
+        }
+    }
+
+    /// The `ReasoningDelta` alias (used by some providers) must also land in the
+    /// thinking block rather than being dropped.
+    #[test]
+    fn stream_block_accumulator_folds_reasoning_delta_into_thinking() {
+        let mut acc = StreamBlockAccumulator::new();
+        acc.on_event(&StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        });
+        acc.on_event(&StreamEvent::ReasoningDelta {
+            index: 0,
+            reasoning: "scratch pad".into(),
+        });
+        acc.on_event(&StreamEvent::ContentBlockStop { index: 0 });
+
+        let blocks = acc.finish();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlock::Thinking { thinking, .. } => assert_eq!(thinking, "scratch pad"),
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+    }
+}
