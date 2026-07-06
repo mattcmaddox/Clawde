@@ -715,6 +715,12 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
      you were doing. Pick up mid-thought if that is where the cut happened. \
      Break remaining work into smaller pieces.";
 
+/// Content stored in the synthetic `tool_result` for a tool that was abandoned
+/// mid-flight because the query loop was cancelled (issue #218). Every
+/// outstanding `tool_use` still receives a matching `tool_result` carrying this
+/// text so the message history stays well-formed.
+const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
+
 // Spinner verbs are imported from claurst_core::spinner
 
 /// Apply the outcome of a reactive-compact / context-collapse call to the live
@@ -2144,36 +2150,56 @@ pub async fn run_query_loop(
                     .collect();
 
                 // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<ToolResult> =
-                    futures::future::join_all(exec_futures).await;
+                // But race the batch against the loop's cancel token (issue #218):
+                // on cancellation we abandon any in-flight tools promptly instead
+                // of blocking until the slowest one finishes, and synthesize a
+                // cancelled ToolResult for EVERY tool so each tool_use still gets a
+                // matching tool_result and the message history stays well-formed.
+                let mut batch_cancelled = false;
+                let exec_results: Vec<ToolResult> = tokio::select! {
+                    results = futures::future::join_all(exec_futures) => results,
+                    _ = tool_ctx.cancel_token.cancelled() => {
+                        batch_cancelled = true;
+                        prepared
+                            .iter()
+                            .map(|_| ToolResult::error(TOOL_CANCELLED_MSG))
+                            .collect()
+                    }
+                };
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
+                // When the batch was cancelled we skip the awaiting PostToolUse
+                // hooks (they run external commands and would defeat the point of
+                // returning promptly) but still emit ToolEnd + build every result
+                // block so the conversation and TUI stay consistent.
                 let mut result_blocks: Vec<ContentBlock> =
                     Vec::with_capacity(prepared.len());
                 for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
-                    let hooks = &tool_ctx.config.hooks;
-                    let post_ctx = claurst_core::hooks::HookContext {
-                        event: "PostToolUse".to_string(),
-                        tool_name: Some(p.name.clone()),
-                        tool_input: Some(p.input.clone()),
-                        tool_output: Some(result.content.clone()),
-                        is_error: Some(result.is_error),
-                        session_id: Some(tool_ctx.session_id.clone()),
-                    };
-                    claurst_core::hooks::run_hooks(
-                        hooks,
-                        claurst_core::config::HookEvent::PostToolUse,
-                        &post_ctx,
-                        &tool_ctx.working_dir,
-                    )
-                    .await;
+                    if !batch_cancelled {
+                        let hooks = &tool_ctx.config.hooks;
+                        let post_ctx = claurst_core::hooks::HookContext {
+                            event: "PostToolUse".to_string(),
+                            tool_name: Some(p.name.clone()),
+                            tool_input: Some(p.input.clone()),
+                            tool_output: Some(result.content.clone()),
+                            is_error: Some(result.is_error),
+                            session_id: Some(tool_ctx.session_id.clone()),
+                        };
+                        claurst_core::hooks::run_hooks(
+                            hooks,
+                            claurst_core::config::HookEvent::PostToolUse,
+                            &post_ctx,
+                            &tool_ctx.working_dir,
+                        )
+                        .await;
 
-                    claurst_plugins::run_global_post_tool_hook(
-                        &p.name,
-                        &p.input,
-                        &result.content,
-                        result.is_error,
-                    );
+                        claurst_plugins::run_global_post_tool_hook(
+                            &p.name,
+                            &p.input,
+                            &result.content,
+                            result.is_error,
+                        );
+                    }
 
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
@@ -2191,8 +2217,15 @@ pub async fn run_query_loop(
                     });
                 }
 
-                // Append tool results as a user message
+                // Append tool results as a user message so the history remains
+                // valid (every tool_use is answered) even on cancellation.
                 messages.push(Message::user_blocks(result_blocks));
+
+                // If the batch was abandoned due to cancellation, stop the loop
+                // now rather than sending the (cancelled) results back to the model.
+                if batch_cancelled {
+                    return QueryOutcome::Cancelled;
+                }
 
                 // Continue the loop to send results back to the model
                 continue;
