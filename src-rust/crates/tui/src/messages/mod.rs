@@ -1452,9 +1452,14 @@ fn truncate_user_prompt_text(text: &str) -> String {
         return text.to_string();
     }
 
-    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
-    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
-    let tail = &text[tail_start..];
+    // The *_CHARS constants count characters, not bytes. Slice by chars so a
+    // multibyte codepoint straddling the cut never panics (#221).
+    let head: String = text.chars().take(TRUNCATE_USER_PROMPT_HEAD_CHARS).collect();
+    let tail: String = {
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+        text.chars().skip(skip).collect()
+    };
     let hidden_lines = text
         .chars()
         .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
@@ -2637,5 +2642,20 @@ mod tests {
         let a_text: Vec<_> = a.iter().map(|l| line_text(l)).collect();
         let b_text: Vec<_> = b.iter().map(|l| line_text(l)).collect();
         assert_eq!(a_text, b_text);
+    }
+
+    #[test]
+    fn truncate_user_prompt_text_handles_multibyte_over_limit() {
+        // >10K chars of a 3-byte codepoint. Pre-fix, the *_CHARS constants were
+        // used as BYTE offsets, slicing mid-codepoint (2500 % 3 == 1) (#221).
+        let text = "\u{2705}".repeat(11_000); // ✅ (3 bytes), 11K chars > 10K limit
+        let out = truncate_user_prompt_text(&text);
+        assert!(out.starts_with('\u{2705}'));
+        assert!(out.contains("lines"));
+        assert!(out.chars().count() < text.chars().count());
+
+        // Mixed multibyte content around both cut points must also be safe.
+        let mixed = "😀é✅ん".repeat(3_000);
+        let _ = truncate_user_prompt_text(&mixed); // no panic == pass
     }
 }
