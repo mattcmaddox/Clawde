@@ -65,7 +65,7 @@ pub use provider_error::ProviderError;
 // Phase 1B re-exports — provider abstraction traits.
 pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
 pub use transform::MessageTransformer;
 
 // Phase 1C re-exports — provider registry.
@@ -1112,30 +1112,16 @@ pub mod client {
             use sse_parser::SseLineParser;
 
             let mut parser = SseLineParser::new();
+            // Shared byte-buffering decoder (#228): buffers raw bytes and only
+            // decodes complete lines, so a multibyte codepoint split across a
+            // network chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                let text = String::from_utf8_lossy(&chunk);
 
-                // Prepend any leftover from the previous chunk
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                // Split into lines.  If the chunk doesn't end with a newline
-                // the last piece is an incomplete line – stash it.
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
                         if let Some(event) =

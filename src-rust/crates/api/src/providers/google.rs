@@ -701,7 +701,11 @@ impl LlmProvider for GoogleProvider {
                 std::collections::HashMap::new();
             let mut emitted_message_start = false;
             let message_id = format!("gemini-{}", uuid_v4_simple());
-            let mut line_buf = String::new();
+            // Shared byte-buffering decoder (#228): buffers raw bytes and only
+            // decodes complete lines. Previously a non-UTF8 chunk — which is
+            // exactly what a multibyte codepoint split across a chunk boundary
+            // looks like — was skipped entirely, dropping data.
+            let mut decoder = crate::SseByteDecoder::new();
             let mut tool_name_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
 
@@ -718,20 +722,9 @@ impl LlmProvider for GoogleProvider {
                     }
                 };
 
-                let chunk_str = match std::str::from_utf8(&chunk) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        warn!("Google SSE: non-UTF8 chunk, skipping");
-                        continue;
-                    }
-                };
-
-                line_buf.push_str(chunk_str);
-
                 // Process complete lines.
-                while let Some(newline_pos) = line_buf.find('\n') {
-                    let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
-                    line_buf = line_buf[newline_pos + 1..].to_string();
+                for line in decoder.push(&chunk) {
+                    let line = line.trim_end_matches('\r');
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         let data = data.trim();

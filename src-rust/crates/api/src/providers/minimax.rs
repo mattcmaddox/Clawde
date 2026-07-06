@@ -328,7 +328,9 @@ impl LlmProvider for MinimaxProvider {
         let provider_id_inner = provider_id.clone();
         let s = stream! {
             let byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Shared byte-buffering decoder (#228): complete lines only, so a
+            // multibyte codepoint straddling a chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
 
             use futures::StreamExt;
             let mut stream = std::pin::pin!(byte_stream);
@@ -336,21 +338,7 @@ impl LlmProvider for MinimaxProvider {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        let combined = if leftover.is_empty() {
-                            text.to_string()
-                        } else {
-                            let mut s = std::mem::take(&mut leftover);
-                            s.push_str(&text);
-                            s
-                        };
-
-                        let mut lines: Vec<&str> = combined.split('\n').collect();
-                        if !combined.ends_with('\n') {
-                            leftover = lines.pop().unwrap_or("").to_string();
-                        }
-
-                        for line in lines {
+                        for line in decoder.push(&chunk) {
                             let line = line.trim_end_matches('\r').trim();
                             if line.is_empty() {
                                 continue;
