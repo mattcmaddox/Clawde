@@ -207,35 +207,57 @@ impl Tool for EnterWorktreeTool {
                     original_head,
                 });
 
-                // Run optional post-create command in the new worktree directory
+                // Run optional post-create command in the new worktree directory.
+                //
+                // Security (#210): the post_create_command is model-supplied and
+                // was previously run via raw `sh -c` behind only the generic
+                // "create a git worktree" prompt — the command itself was never
+                // gated or surfaced. Gate it specifically here: classify it,
+                // hard-block Critical-risk commands, and prompt with the ACTUAL
+                // command text so the user sees exactly what will run.
                 let post_create_output = if let Some(cmd) = params.post_create_command {
-                    let shell_result = if cfg!(target_os = "windows") {
-                        tokio::process::Command::new("cmd")
-                            .args(["/C", &cmd])
-                            .current_dir(&worktree_path)
-                            .output()
-                            .await
+                    let risk = claurst_core::bash_classifier::classify_bash_command(&cmd);
+                    if risk == claurst_core::bash_classifier::BashRiskLevel::Critical {
+                        format!(
+                            "\nPost-create command '{}' was BLOCKED: classified as Critical risk \
+                             and never executed. Re-create the worktree without it, or run a safer command.",
+                            cmd
+                        )
+                    } else if let Err(e) = ctx.check_permission(
+                        self.name(),
+                        &format!("Run post-create command in the new worktree: {}", cmd),
+                        false,
+                    ) {
+                        format!("\nPost-create command '{}' was not run: {}", cmd, e)
                     } else {
-                        tokio::process::Command::new("sh")
-                            .args(["-c", &cmd])
-                            .current_dir(&worktree_path)
-                            .output()
-                            .await
-                    };
-                    match shell_result {
-                        Ok(out) if out.status.success() => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            format!("\nPost-create command '{}' completed successfully.{}",
-                                cmd,
-                                if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
-                            )
+                        let shell_result = if cfg!(target_os = "windows") {
+                            tokio::process::Command::new("cmd")
+                                .args(["/C", &cmd])
+                                .current_dir(&worktree_path)
+                                .output()
+                                .await
+                        } else {
+                            tokio::process::Command::new("sh")
+                                .args(["-c", &cmd])
+                                .current_dir(&worktree_path)
+                                .output()
+                                .await
+                        };
+                        match shell_result {
+                            Ok(out) if out.status.success() => {
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                format!("\nPost-create command '{}' completed successfully.{}",
+                                    cmd,
+                                    if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
+                                )
+                            }
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                format!("\nPost-create command '{}' exited with error.\nStderr: {}",
+                                    cmd, stderr.trim())
+                            }
+                            Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
                         }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            format!("\nPost-create command '{}' exited with error.\nStderr: {}",
-                                cmd, stderr.trim())
-                        }
-                        Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
                     }
                 } else {
                     String::new()
