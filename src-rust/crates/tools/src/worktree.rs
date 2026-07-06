@@ -464,3 +464,99 @@ async fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String>
         Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+
+    /// Handler that allows worktree creation but denies (via `Ask`) any request
+    /// whose description mentions the post-create command.
+    struct DenyPostCreateHandler;
+    impl PermissionHandler for DenyPostCreateHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            if request.description.contains("post-create command") {
+                PermissionDecision::Ask { reason: "denied in test".to_string() }
+            } else {
+                PermissionDecision::Allow
+            }
+        }
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    async fn init_git_repo(dir: &std::path::Path) {
+        run_git(dir, &["init"]).await.expect("git init");
+        run_git(dir, &["config", "user.email", "t@example.com"]).await.expect("git config email");
+        run_git(dir, &["config", "user.name", "Test"]).await.expect("git config name");
+        std::fs::write(dir.join("README.md"), b"hi").unwrap();
+        run_git(dir, &["add", "."]).await.expect("git add");
+        run_git(dir, &["commit", "-m", "init"]).await.expect("git commit");
+    }
+
+    async fn reset_session() {
+        *WORKTREE_SESSION.write().await = None;
+    }
+
+    /// A Critical-classified post_create_command is BLOCKED and never executed,
+    /// while the worktree itself is still created.
+    #[tokio::test]
+    async fn worktree_post_create_critical_command_is_blocked() {
+        reset_session().await;
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path()).await;
+
+        // `dd if=…` is classified Critical, yet writing /dev/null → marker is a
+        // harmless no-op if it ever ran — so this test is regression-safe.
+        let marker = tmp.path().join("critical_ran");
+        let cmd = format!("dd if=/dev/null of={}", marker.display());
+
+        let ctx = allow_all_context(tmp.path().to_path_buf());
+        let result = EnterWorktreeTool
+            .execute(json!({ "post_create_command": cmd }), &ctx)
+            .await;
+
+        assert!(!result.is_error, "worktree creation should still succeed");
+        assert!(
+            result.content.contains("BLOCKED"),
+            "Critical post-create command must be reported as blocked: {}",
+            result.content
+        );
+        assert!(!marker.exists(), "Critical post-create command must NOT run");
+        reset_session().await;
+    }
+
+    /// A (non-Critical) post_create_command is not executed when permission is
+    /// denied; the worktree is still created.
+    #[tokio::test]
+    async fn worktree_post_create_command_denied_is_not_run() {
+        reset_session().await;
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path()).await;
+
+        let marker = tmp.path().join("denied_ran");
+        let cmd = format!("touch {}", marker.display());
+
+        let mut ctx = allow_all_context(tmp.path().to_path_buf());
+        ctx.permission_handler = Arc::new(DenyPostCreateHandler);
+
+        let result = EnterWorktreeTool
+            .execute(json!({ "post_create_command": cmd }), &ctx)
+            .await;
+
+        assert!(!result.is_error, "worktree creation should still succeed");
+        assert!(
+            result.content.contains("was not run"),
+            "denied post-create command must be reported as not run: {}",
+            result.content
+        );
+        assert!(!marker.exists(), "denied post-create command must NOT run");
+        reset_session().await;
+    }
+}

@@ -2824,6 +2824,169 @@ mod tests {
             "messages must be replaced with the compacted result on success"
         );
     }
+
+    // ---- Central permission backstop (issue #210) ---------------------------
+    //
+    // These tests pin the `execute_tool` backstop contract:
+    //  (a) a non-self-gating tool at a gated level is DENIED (never executes)
+    //      when the handler denies;
+    //  (b) a self-gating tool is NOT gated centrally (no double-prompt) — its
+    //      execute() runs even though the handler would deny;
+    //  (c) a ReadOnly / None tool is never gated centrally.
+
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// Permission handler that denies everything (returns `Ask`, which in a
+    /// non-interactive context surfaces as a hard denial).
+    struct DenyAllHandler;
+    impl claurst_core::permissions::PermissionHandler for DenyAllHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Ask {
+                reason: "denied by test handler".to_string(),
+            }
+        }
+        fn request_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    /// A configurable mock tool that records whether its `execute()` ran.
+    struct MockTool {
+        name: &'static str,
+        level: PermissionLevel,
+        self_gates: bool,
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str { self.name }
+        fn description(&self) -> &str { "mock tool for backstop tests" }
+        fn permission_level(&self) -> PermissionLevel { self.level }
+        fn self_gates(&self) -> bool { self.self_gates }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            self.ran.store(true, AtomicOrdering::SeqCst);
+            ToolResult::success("mock ran")
+        }
+    }
+
+    fn deny_all_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/workspace"),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(DenyAllHandler),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "backstop-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+        }
+    }
+
+    /// (a) A tool that does NOT self-gate and requires a gated level (Execute)
+    /// is blocked by the central backstop when the handler denies — and its
+    /// `execute()` never runs.
+    #[tokio::test]
+    async fn backstop_denies_non_self_gating_gated_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockExec",
+            level: PermissionLevel::Execute,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let ctx = deny_all_context();
+
+        let result = execute_tool("MockExec", &serde_json::json!({}), &tools, &ctx).await;
+
+        assert!(result.is_error, "central backstop must block a denied tool");
+        assert!(
+            !ran.load(AtomicOrdering::SeqCst),
+            "execute() must NOT run when the backstop denies"
+        );
+    }
+
+    /// (b) A self-gating tool is NOT gated by the central backstop (no double
+    /// prompt): even with a deny-all handler, its `execute()` still runs
+    /// because the central gate is skipped for self-gaters.
+    #[tokio::test]
+    async fn backstop_skips_self_gating_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSelfGated",
+            level: PermissionLevel::Execute,
+            self_gates: true,
+            ran: ran.clone(),
+        })];
+        let ctx = deny_all_context();
+
+        let result = execute_tool("MockSelfGated", &serde_json::json!({}), &tools, &ctx).await;
+
+        assert!(
+            !result.is_error,
+            "self-gating tool must not be blocked by the central backstop"
+        );
+        assert_eq!(result.content, "mock ran");
+        assert!(
+            ran.load(AtomicOrdering::SeqCst),
+            "self-gating tool's execute() must run (central gate skipped)"
+        );
+    }
+
+    /// (c) ReadOnly and None tools are never gated centrally, so they run even
+    /// under a deny-all handler.
+    #[tokio::test]
+    async fn backstop_skips_read_only_and_none_tools() {
+        for level in [PermissionLevel::ReadOnly, PermissionLevel::None] {
+            let ran = Arc::new(AtomicBool::new(false));
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+                name: "MockSafe",
+                level,
+                self_gates: false,
+                ran: ran.clone(),
+            })];
+            let ctx = deny_all_context();
+
+            let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+
+            assert!(
+                !result.is_error,
+                "{:?} tool must not be gated centrally",
+                level
+            );
+            assert!(
+                ran.load(AtomicOrdering::SeqCst),
+                "{:?} tool's execute() must run",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn backstop_permission_level_gating_matrix() {
+        assert!(!permission_level_is_gated(PermissionLevel::None));
+        assert!(!permission_level_is_gated(PermissionLevel::ReadOnly));
+        assert!(permission_level_is_gated(PermissionLevel::Write));
+        assert!(permission_level_is_gated(PermissionLevel::Execute));
+        assert!(permission_level_is_gated(PermissionLevel::Dangerous));
+        assert!(permission_level_is_gated(PermissionLevel::Forbidden));
+    }
 }
 
 /// Stream handler that forwards events to an unbounded channel.
