@@ -305,26 +305,38 @@ fn strip_ansi(s: &str) -> String {
 // Unix PTY execution
 // ---------------------------------------------------------------------------
 
+/// Outcome of a single foreground PTY run.
+#[cfg(unix)]
+enum PtyOutcome {
+    /// The command finished; carries (raw PTY output, exit code).
+    Completed(String, i32),
+    /// The command exceeded its timeout. The child has been KILLED (#220).
+    TimedOut,
+    /// The PTY could not be set up / the command could not be spawned.
+    Failed(String),
+}
+
 #[cfg(unix)]
 async fn run_in_pty(
     script: &str,
     working_dir: &str,
     env_vars: &HashMap<String, String>,
     timeout: Duration,
-) -> Result<(String, i32), String> {
+) -> PtyOutcome {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::Read;
 
     let pty_system = native_pty_system();
 
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 50,
-            cols: 220,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Failed to open PTY: {}", e))?;
+    let pair = match pty_system.openpty(PtySize {
+        rows: 50,
+        cols: 220,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => return PtyOutcome::Failed(format!("Failed to open PTY: {}", e)),
+    };
 
     let mut cmd = CommandBuilder::new("bash");
     cmd.args(["-c", script]);
@@ -332,25 +344,33 @@ async fn run_in_pty(
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
     apply_restored_env(&mut cmd, env_vars);
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("Failed to spawn in PTY: {}", e))?;
+    let child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => return PtyOutcome::Failed(format!("Failed to spawn in PTY: {}", e)),
+    };
 
-    // Grab the reader *before* dropping slave so the fd stays valid
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
+    // Grab the reader *before* dropping slave so the fd stays valid.
+    let reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e)),
+    };
+
+    // A killer handle cloned from the child. This is how a timed-out command is
+    // explicitly KILLED (rather than merely dropped, which would orphan the
+    // child and leak it) (#220).
+    let mut killer = child.clone_killer();
 
     // Drop slave after spawn — once the child's controlling terminal is gone,
     // the master side will see EOF when the child exits.
     drop(pair.slave);
-    // Keep master alive until after reading is done.
-    let _master = pair.master;
+    // Keep master alive (inside the read thread) until reading is done.
+    let master = pair.master;
 
-    // Read all PTY output in a blocking thread (portable_pty reader is sync)
+    // Read all PTY output in a blocking thread (portable_pty reader is sync) and
+    // reap the child there so we can return its exit code.
     let read_handle = tokio::task::spawn_blocking(move || {
+        let mut child = child;
+        let mut reader = reader;
         let mut output = String::new();
         let mut buf = [0u8; 4096];
         const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -370,20 +390,26 @@ async fn run_in_pty(
                 Err(_) => break,
             }
         }
-        output
+
+        let exit_code = match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => -1,
+        };
+        // Keep the master fd alive until reading + reaping is complete.
+        drop(master);
+        (output, exit_code)
     });
 
-    let raw_output = tokio::time::timeout(timeout, read_handle)
-        .await
-        .map_err(|_| "Command timed out".to_string())?
-        .map_err(|e| format!("PTY read thread panicked: {}", e))?;
-
-    let exit_code = match child.wait() {
-        Ok(status) => status.exit_code() as i32,
-        Err(_) => -1,
-    };
-
-    Ok((raw_output, exit_code))
+    match tokio::time::timeout(timeout, read_handle).await {
+        Ok(Ok((output, exit_code))) => PtyOutcome::Completed(output, exit_code),
+        Ok(Err(e)) => PtyOutcome::Failed(format!("PTY read thread panicked: {}", e)),
+        Err(_) => {
+            // Timed out: explicitly KILL the child so it can't linger as an
+            // orphan (#220). The read thread then observes the exit and finishes.
+            let _ = killer.kill();
+            PtyOutcome::TimedOut
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,14 +633,12 @@ impl Tool for PtyBashTool {
                 (script, restored_env, wd)
             };
 
-            let result = tokio::time::timeout(
-                timeout_dur,
-                run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur),
-            )
-            .await;
+            // run_in_pty owns the timeout so it can KILL the child when it fires
+            // (a bare outer timeout would just drop the future and orphan it) (#220).
+            let outcome = run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur).await;
 
-            match result {
-                Ok(Ok((raw_output, exit_code))) => {
+            match outcome {
+                PtyOutcome::Completed(raw_output, exit_code) => {
                     // Strip ANSI escape codes from PTY output
                     let cleaned = strip_ansi(&raw_output);
 
@@ -662,8 +686,12 @@ impl Tool for PtyBashTool {
 
                     truncate_output(output, exit_code)
                 }
-                Ok(Err(e)) => ToolResult::error(format!("PTY execution failed: {}", e)),
-                Err(_) => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),
+                PtyOutcome::Failed(e) => {
+                    ToolResult::error(format!("PTY execution failed: {}", e))
+                }
+                PtyOutcome::TimedOut => {
+                    ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+                }
             }
         }
     }
