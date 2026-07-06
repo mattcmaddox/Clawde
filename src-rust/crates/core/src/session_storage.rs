@@ -266,8 +266,17 @@ pub fn transcript_dir_in(config_dir: &Path, project_root: &Path) -> PathBuf {
 }
 
 /// Returns the full path to a session's JSONL transcript file.
-pub fn transcript_path(project_root: &Path, session_id: &str) -> PathBuf {
-    transcript_dir(project_root).join(format!("{}.jsonl", session_id))
+///
+/// # Errors
+/// Returns `crate::ClaudeError::Other` if `session_id` contains path components
+/// (`/`, `\`, or `..`) that could be used for directory traversal (issue #204).
+pub fn transcript_path(project_root: &Path, session_id: &str) -> crate::Result<PathBuf> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err(crate::ClaudeError::Other(
+            "session_id contains illegal characters".into(),
+        ));
+    }
+    Ok(transcript_dir(project_root).join(format!("{}.jsonl", session_id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1202,7 @@ mod tests {
     #[test]
     fn transcript_path_encoding_is_reversible() {
         let root = Path::new("/Users/alice/my-project");
-        let path = transcript_path(root, "test-session");
+        let path = transcript_path(root, "test-session").unwrap();
         // The directory component after "projects/" should decode back to the root.
         let encoded_dir = path
             .parent()

@@ -115,7 +115,10 @@ impl SlashCommand for RevertCommand {
         // back to a destructive truncate for legacy/unchained transcripts.
         let project_root = claurst_core::git_utils::get_repo_root(&ctx.working_dir)
             .unwrap_or_else(|| ctx.working_dir.clone());
-        let path = claurst_core::session_storage::transcript_path(&project_root, &ctx.session_id);
+        let path = match claurst_core::session_storage::transcript_path(&project_root, &ctx.session_id) {
+            Ok(p) => p,
+            Err(e) => return CommandResult::Error(format!("Invalid session ID: {e}")),
+        };
         if path.exists() {
             if let Err(e) = claurst_core::session_storage::branch_before(&path, &target_uuid).await {
                 return CommandResult::Error(format!("Reverted files but could not update transcript: {e}"));

@@ -11,9 +11,19 @@ use tracing::debug;
 // Session-aware persistence helpers
 // ---------------------------------------------------------------------------
 
+/// Validate that `session_id` is a plain filename — no path separators or
+/// `..` components that could be used for directory traversal (issue #204).
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err("session_id contains illegal characters".into());
+    }
+    Ok(())
+}
+
 /// Returns the path to the persisted todo list for `session_id`.
-pub fn todos_path(session_id: &str) -> PathBuf {
-    todos_dir().join(format!("{}.json", session_id))
+pub fn todos_path(session_id: &str) -> anyhow::Result<PathBuf> {
+    validate_session_id(session_id).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(todos_dir().join(format!("{}.json", session_id)))
 }
 
 /// Directory holding persisted todo lists (`<claurst home>/todos`).
@@ -22,14 +32,21 @@ fn todos_dir() -> PathBuf {
 }
 
 /// Load the persisted todo list for `session_id`. Returns an empty vec if the
-/// file does not exist or cannot be parsed.
+/// file does not exist, cannot be parsed, or if `session_id` contains illegal
+/// path characters (issue #204).
 pub fn load_todos(session_id: &str) -> Vec<Value> {
     load_todos_in(&todos_dir(), session_id)
 }
 
 /// Like [`load_todos`] but reads from an explicit todos directory. Lets tests
 /// run hermetically without depending on a writable HOME.
+///
+/// Returns an empty vec when `session_id` contains illegal path characters
+/// (issue #204).
 pub fn load_todos_in(dir: &Path, session_id: &str) -> Vec<Value> {
+    if validate_session_id(session_id).is_err() {
+        return vec![];
+    }
     let path = dir.join(format!("{}.json", session_id));
     std::fs::read_to_string(&path)
         .ok()
@@ -44,7 +61,13 @@ pub fn save_todos(session_id: &str, todos: &[Value]) {
 
 /// Like [`save_todos`] but writes into an explicit todos directory. Lets tests
 /// run hermetically without depending on a writable HOME.
+///
+/// Silently returns when `session_id` contains illegal path characters
+/// (issue #204).
 pub fn save_todos_in(dir: &Path, session_id: &str, todos: &[Value]) {
+    if validate_session_id(session_id).is_err() {
+        return;
+    }
     let path = dir.join(format!("{}.json", session_id));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -356,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_todos_path_contains_session_id() {
-        let path = todos_path("my-session-123");
+        let path = todos_path("my-session-123").unwrap();
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("my-session-123"),
