@@ -1094,6 +1094,11 @@ pub struct App {
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
     pub last_render_scroll_offset: Cell<u16>,
+    /// Maximum `scroll_offset` (lines above the bottom) from the last render.
+    /// Written by the renderer, which is the only place the full content height
+    /// is known; read back on the next scroll event to clamp `scroll_offset` so
+    /// scrolling up past the top can't inflate it unboundedly (#223).
+    pub last_max_scroll: Cell<usize>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -1474,6 +1479,7 @@ impl App {
             message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
+            last_max_scroll: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
@@ -2678,6 +2684,22 @@ impl App {
         }
         self.refresh_prompt_input();
         input
+    }
+
+    /// Scroll the transcript up by `amount` lines and disable auto-follow.
+    ///
+    /// `scroll_offset` counts lines above the bottom (0 = pinned to the newest
+    /// content). It is clamped to `last_max_scroll` — the maximum meaningful
+    /// offset from the last render — so scrolling up past the top of the
+    /// transcript can't inflate it unboundedly. Without the clamp, an over-scroll
+    /// would leave `scroll_offset` far above `max_scroll`, and the user would
+    /// have to press Down that many times before the view moved (#223).
+    fn scroll_up_by(&mut self, amount: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(amount)
+            .min(self.last_max_scroll.get());
+        self.auto_scroll = false;
     }
 
     /// Compute the number of lines to scroll per wheel/trackpad event.
@@ -4450,8 +4472,7 @@ impl App {
             // ---- Message boundary navigation (Alt+Up/Alt+Down) ----------
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump up by ~20 lines (approximate message boundary).
-                self.scroll_offset = self.scroll_offset.saturating_add(20);
-                self.auto_scroll = false;
+                self.scroll_up_by(20);
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump down by ~20 lines (approximate message boundary).
@@ -4499,9 +4520,8 @@ impl App {
 
             // ---- Scroll ------------------------------------------------
             KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                // Scrolling up disables auto-follow.
-                self.auto_scroll = false;
+                // Scrolling up disables auto-follow (handled by scroll_up_by).
+                self.scroll_up_by(10);
             }
             KeyCode::PageDown => {
                 let new_off = self.scroll_offset.saturating_sub(10);
@@ -5011,8 +5031,7 @@ impl App {
                 false
             }
             "scrollUp" => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.auto_scroll = false;
+                self.scroll_up_by(10);
                 false
             }
             "scrollDown" => {
@@ -5113,8 +5132,7 @@ impl App {
             }
             "previousMessage" => {
                 // Alt+←: Navigate to previous message in transcript
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
-                self.auto_scroll = false;
+                self.scroll_up_by(5);
                 false
             }
             "nextMessage" => {
@@ -5847,8 +5865,7 @@ impl App {
                 // Don't consume Ctrl+Scroll — let the terminal handle zoom.
                 if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
                     let step = self.scroll_step();
-                    self.scroll_offset = self.scroll_offset.saturating_add(step);
-                    self.auto_scroll = false;
+                    self.scroll_up_by(step);
                 }
             }
             MouseEventKind::ScrollDown => {

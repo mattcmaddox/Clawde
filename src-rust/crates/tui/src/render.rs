@@ -1116,6 +1116,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let content_height = lines.len() as u16;
     let visible_height = msg_area.height;  // no borders, full height available
     let max_scroll = content_height.saturating_sub(visible_height) as usize;
+    // Publish the max meaningful scroll offset so the next scroll event can
+    // clamp `scroll_offset` against it (the content height is only known here,
+    // at render time). Prevents unbounded inflation when scrolling past the top
+    // (#223).
+    app.last_max_scroll.set(max_scroll);
     // scroll_offset counts lines above the bottom (0 = at bottom).
     // ratatui scroll() takes an absolute top-row index, so convert:
     //   top_row = max_scroll - scroll_offset  (clamped to [0, max_scroll])
