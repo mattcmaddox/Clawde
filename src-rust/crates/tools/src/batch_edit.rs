@@ -270,3 +270,37 @@ impl Tool for BatchEditTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+
+    /// #225: a multi-edit batch on a CRLF file keeps CRLF throughout; only the
+    /// edited lines change.
+    #[tokio::test]
+    async fn batch_edit_crlf_file_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        let original = "alpha\r\nbeta\r\ngamma\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = BatchEditTool
+            .execute(
+                json!({
+                    "edits": [
+                        { "file_path": path.to_string_lossy(), "old_string": "alpha", "new_string": "ALPHA" },
+                        { "file_path": path.to_string_lossy(), "old_string": "gamma", "new_string": "GAMMA" }
+                    ]
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "batch edit failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "ALPHA\r\nbeta\r\nGAMMA\r\n");
+        assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
+    }
+}

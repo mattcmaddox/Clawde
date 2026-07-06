@@ -167,3 +167,63 @@ impl Tool for FileEditTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+
+    /// #225: editing a CRLF file must keep CRLF; only the edited line changes.
+    #[tokio::test]
+    async fn edit_crlf_file_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        let original = "line one\r\nline two\r\nline three\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "line two",
+                    "new_string": "LINE TWO",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        // Only the target changed; every other line kept its CRLF.
+        assert_eq!(after, "line one\r\nLINE TWO\r\nline three\r\n");
+        // No line ending was flipped to a bare LF.
+        assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
+    }
+
+    /// #225: an LF file must stay LF (no stray CR introduced).
+    #[tokio::test]
+    async fn edit_lf_file_stays_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lf.txt");
+        let original = "line one\nline two\nline three\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "line two",
+                    "new_string": "LINE TWO",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "line one\nLINE TWO\nline three\n");
+        assert!(!after.contains('\r'), "LF file gained a CR: {:?}", after);
+    }
+}

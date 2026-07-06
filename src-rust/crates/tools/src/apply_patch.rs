@@ -531,4 +531,27 @@ mod tests {
         assert_eq!(fps[0].path, "a.rs");
         assert_eq!(fps[1].path, "b.rs");
     }
+
+    /// #225: applying a patch to a CRLF file must keep CRLF, not collapse the
+    /// whole file to LF (str::lines() strips the `\r`).
+    #[tokio::test]
+    async fn apply_patch_crlf_file_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = "one\r\ntwo\r\nthree\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        // Patch content itself uses LF (as a real unified diff would); the
+        // target file's CRLF endings must survive the round-trip.
+        let patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let res = ApplyPatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await;
+        assert!(!res.is_error, "apply patch failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "one\r\nTWO\r\nthree\r\n");
+        assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
+    }
 }

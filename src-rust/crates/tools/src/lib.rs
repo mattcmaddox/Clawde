@@ -27,6 +27,8 @@ pub mod apply_patch;
 pub mod batch_edit;
 pub mod file_edit;
 pub mod line_endings;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
 pub mod glob_tool;
