@@ -208,6 +208,44 @@ download_and_install() {
         exit 1
     fi
 
+    # ----- Verify checksum (supply-chain integrity) -----
+    # Fetch SHA256SUMS from the same release and verify the archive before we
+    # extract and run it.  Older releases may not ship SHA256SUMS — in that
+    # case we warn and continue so existing installs keep working.  But if the
+    # file IS present and the hash does NOT match, we abort hard.
+    local sums_url="https://github.com/${REPO}/releases/download/v${specific_version}/SHA256SUMS"
+    if curl -fsSL -o "$tmp_dir/SHA256SUMS" "$sums_url" 2>/dev/null; then
+        # sha256sum emits "<hash>  <filename>" (two spaces); awk collapses the
+        # whitespace so $1=hash, $2=bare filename.  Match on the bare archive
+        # name (not the full temp path).
+        local expected actual
+        expected=$(awk -v f="$archive" '$2 == f {print $1}' "$tmp_dir/SHA256SUMS" | head -n 1)
+        if [[ -z "$expected" ]]; then
+            print_message warning "Warning: no checksum listed for ${archive} in SHA256SUMS - skipping verification."
+        else
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual=$(sha256sum "$tmp_dir/$archive" | awk '{print $1}')
+            elif command -v shasum >/dev/null 2>&1; then
+                actual=$(shasum -a 256 "$tmp_dir/$archive" | awk '{print $1}')
+            else
+                actual=""
+            fi
+            if [[ -z "$actual" ]]; then
+                print_message warning "Warning: no sha256sum/shasum tool available - skipping checksum verification."
+            elif [[ "$actual" != "$expected" ]]; then
+                print_message error "Checksum verification FAILED for ${archive}"
+                print_message info "  expected: $expected"
+                print_message info "  actual:   $actual"
+                print_message info "The download may be corrupted or tampered with. Aborting."
+                exit 1
+            else
+                print_message info "${MUTED}Checksum verified.${NC}"
+            fi
+        fi
+    else
+        print_message warning "Warning: could not fetch SHA256SUMS for v${specific_version} - skipping checksum verification."
+    fi
+
     print_message info "${MUTED}Extracting...${NC}"
     tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
 
