@@ -239,6 +239,20 @@ jobs:
           echo "Release assets:"
           ls -lh release/
 
+      # Generate SHA256 checksums covering every asset in release/ so the
+      # install scripts can verify download integrity (supply-chain
+      # protection).  We write SHA256SUMS to a temp path OUTSIDE release/
+      # first so it never hashes itself, then move it in.  Because the
+      # gh-release step publishes `files: release/*`, SHA256SUMS ships
+      # automatically alongside the archives.
+      - name: Generate SHA256SUMS
+        run: |
+          cd release
+          sha256sum * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          echo "── SHA256SUMS ──────────────────────────────────────"
+          cat SHA256SUMS
+
       # Build release notes in two passes:
       #   1. Pull GitHub's auto-generated notes via the API — this gives us
       #      the "What's Changed" PR list with @author mentions, the
