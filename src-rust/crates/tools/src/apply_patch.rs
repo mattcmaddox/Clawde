@@ -427,7 +427,7 @@ impl Tool for ApplyPatchTool {
         // ----------------------------------------------------------------
 
         for (path, original_bytes, new_content) in &to_write {
-            if let Err(e) = tokio::fs::write(path, new_content).await {
+            if let Err(e) = crate::write_atomic(path, new_content.as_bytes()).await {
                 return ToolResult::error(format!(
                     "Failed to write {}: {}",
                     path.display(),
