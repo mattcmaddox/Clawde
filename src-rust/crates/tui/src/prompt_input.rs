@@ -3568,6 +3568,53 @@ mod tests {
         assert_eq!(counter, 2);
     }
 
+    #[test]
+    fn paste_contents_evicted_on_submit() {
+        // #223: every large paste stored its body in `paste_contents` but the
+        // map was never pruned, so it grew for the App's lifetime. Submitting
+        // (take → clear) must reclaim the stored bodies.
+        let mut s = PromptInputState::new();
+        let block_a = "alpha line\n".repeat(50);
+        let block_b = "beta line\n".repeat(60);
+        let block_c = "gamma line\n".repeat(70);
+
+        s.paste(&block_a);
+        s.paste(" and then "); // small — inlined, no counter bump, not stored
+        s.paste(&block_b);
+        s.paste(&block_c);
+
+        // Three large pastes were stored, keyed by the incrementing counter.
+        assert_eq!(s.paste_contents.len(), 3, "each large paste should be stored");
+
+        // Before eviction the submitted text still expands correctly: every
+        // placeholder in the buffer maps back to its original body.
+        assert!(s.text.contains("#1]") && s.text.contains("#2]") && s.text.contains("#3]"));
+        assert_eq!(s.paste_contents.get(&1), Some(&block_a));
+        assert_eq!(s.paste_contents.get(&2), Some(&block_b));
+        assert_eq!(s.paste_contents.get(&3), Some(&block_c));
+
+        // Submit. The taken text keeps its placeholders (expansion is not
+        // broken), but the stored bodies are reclaimed.
+        let taken = s.take();
+        assert!(taken.contains("[Pasted ~"), "placeholders survive the take");
+        assert!(s.paste_contents.is_empty(), "paste_contents must be emptied on submit (#223)");
+        assert!(s.text.is_empty());
+
+        // A fresh paste after submit starts clean and bounded.
+        s.paste(&block_a);
+        assert_eq!(s.paste_contents.len(), 1);
+    }
+
+    #[test]
+    fn paste_contents_evicted_on_cancel() {
+        // Discarding the buffer (Esc / clear) must also reclaim stored pastes.
+        let mut s = PromptInputState::new();
+        s.paste(&"discard me\n".repeat(40));
+        assert_eq!(s.paste_contents.len(), 1);
+        s.clear();
+        assert!(s.paste_contents.is_empty(), "clear() must reclaim stored pastes (#223)");
+    }
+
     // ---- compute_typeahead ---------------------------------------------
 
     // Helper constants for tests

@@ -6656,12 +6656,59 @@ mod tests {
     #[test]
     fn mouse_events_processed_when_capture_enabled() {
         // Default config leaves mouse capture on, so a scroll wheel event
-        // should move the scroll offset.
+        // should move the scroll offset — provided there is content to scroll
+        // over (a render must have established a non-zero max_scroll).
         let mut app = make_app();
         assert!(app.config.mouse_capture_enabled());
         assert_eq!(app.scroll_offset, 0);
+        app.last_max_scroll.set(50);
         app.handle_mouse_event(scroll_up_event());
         assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
+        assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
+    }
+
+    // ---- scroll_offset clamping (issue #223) ----
+
+    #[test]
+    fn scroll_up_offset_clamped_to_max_scroll() {
+        let mut app = make_app();
+        // A render established that the transcript is 5 lines taller than the
+        // viewport, so scroll_offset can meaningfully range over 0..=5.
+        app.last_max_scroll.set(5);
+
+        // Scroll up far past the top, many times.
+        for _ in 0..50 {
+            app.scroll_up_by(10);
+        }
+
+        // Without the clamp scroll_offset would be 500; it must stay at
+        // max_scroll so the offset can't inflate unboundedly (#223).
+        assert_eq!(
+            app.scroll_offset, 5,
+            "scroll_offset must not inflate past max_scroll"
+        );
+        assert!(!app.auto_scroll, "scrolling up disables auto-follow");
+
+        // Because it was clamped, a single Down step moves the view
+        // immediately instead of burning through hundreds of wasted presses.
+        let before = app.scroll_offset;
+        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        assert!(
+            app.scroll_offset < before,
+            "a single Down moves the view once scroll_offset is clamped"
+        );
+    }
+
+    #[test]
+    fn scroll_up_no_op_when_nothing_to_scroll() {
+        // When content fits the viewport (max_scroll == 0) scrolling up is a
+        // no-op rather than silently inflating scroll_offset.
+        let mut app = make_app();
+        app.last_max_scroll.set(0);
+        for _ in 0..20 {
+            app.scroll_up_by(10);
+        }
+        assert_eq!(app.scroll_offset, 0, "no scroll room means no offset growth");
     }
 
     #[test]

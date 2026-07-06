@@ -1028,6 +1028,9 @@ mod tests {
     #[test]
     fn test_page_scroll() {
         let mut app = make_app();
+        // A render must have established a scrollable range; otherwise a
+        // scroll-up is correctly a no-op (offset is clamped to max_scroll, #223).
+        app.last_max_scroll.set(100);
         app.handle_key_event(key(KeyCode::PageUp));
         assert_eq!(app.scroll_offset, 10);
         app.handle_key_event(key(KeyCode::PageDown));
