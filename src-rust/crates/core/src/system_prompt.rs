@@ -740,6 +740,75 @@ mod tests {
     }
 
     #[test]
+    fn test_no_enabled_set_emits_all_tool_guidelines() {
+        // enabled_tools = None (default) → every per-tool block is emitted.
+        let prompt = build_system_prompt(&default_opts());
+        assert!(prompt.contains("Bash commands time out"));
+        assert!(prompt.contains("prefer the Grep tool"));
+        assert!(prompt.contains("prefer the Glob tool"));
+        assert!(prompt.contains("Read a file with the Read tool"));
+        assert!(prompt.contains("Use WebSearch"));
+        // General guidance is always present.
+        assert!(prompt.contains("Parallelize independent tool calls"));
+    }
+
+    #[test]
+    fn test_conditional_tool_guidelines_only_enabled() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string(), "Edit".to_string()]),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+
+        // Guidance for enabled tools is present.
+        assert!(
+            prompt.contains("Read a file with the Read tool"),
+            "Read guideline should be emitted"
+        );
+        assert!(
+            prompt.contains("targeted string replacements with Edit"),
+            "Edit guideline should be emitted"
+        );
+
+        // Guidance for tools NOT in the enabled set is omitted.
+        assert!(
+            !prompt.contains("Bash commands time out"),
+            "Bash guideline must be omitted when Bash is not enabled"
+        );
+        assert!(
+            !prompt.contains("prefer the Grep tool"),
+            "Grep guideline must be omitted when Grep is not enabled"
+        );
+        assert!(
+            !prompt.contains("prefer the Glob tool"),
+            "Glob guideline must be omitted when Glob is not enabled"
+        );
+        assert!(
+            !prompt.contains("Use WebSearch"),
+            "WebSearch guideline must be omitted when WebSearch is not enabled"
+        );
+
+        // General, tool-agnostic guidance stays regardless of the enabled set.
+        assert!(prompt.contains("## Tool use guidelines"));
+        assert!(prompt.contains("Parallelize independent tool calls"));
+    }
+
+    #[test]
+    fn test_empty_enabled_set_omits_all_tool_specific_guidelines() {
+        // Some(empty) is an *explicit* empty set → no per-tool blocks at all,
+        // but the general guidance still renders.
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec![]),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(prompt.contains("## Tool use guidelines"));
+        assert!(prompt.contains("Parallelize independent tool calls"));
+        assert!(!prompt.contains("Bash commands time out"));
+        assert!(!prompt.contains("Read a file with the Read tool"));
+    }
+
+    #[test]
     fn test_clear_section_cache() {
         // Populate cache then clear it — should not panic.
         {
