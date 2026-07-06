@@ -48,7 +48,7 @@ use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
-use claurst_tools::{Tool, ToolContext, ToolResult};
+use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -2246,6 +2246,28 @@ fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(trimmed)
 }
 
+/// Whether a `PermissionLevel` must be gated by the central backstop.
+///
+/// Only `None` and `ReadOnly` are exempt; every other level (`Write`,
+/// `Execute`, `Dangerous`, `Forbidden`) represents a side-effecting action that
+/// the backstop must confirm before it runs.
+fn permission_level_is_gated(level: PermissionLevel) -> bool {
+    !matches!(level, PermissionLevel::None | PermissionLevel::ReadOnly)
+}
+
+/// Synthesize a human-readable permission description for a tool that does not
+/// gate itself, surfacing the tool name and a truncated preview of its input so
+/// the user can see what is about to run.
+fn synthesize_permission_description(name: &str, input: &Value) -> String {
+    let rendered = serde_json::to_string(input).unwrap_or_default();
+    let preview: String = rendered.chars().take(200).collect();
+    if preview.is_empty() || preview == "{}" || preview == "null" {
+        format!("Run tool '{}'", name)
+    } else {
+        format!("Run tool '{}' with input: {}", name, preview)
+    }
+}
+
 /// Execute a single tool invocation.
 async fn execute_tool(
     name: &str,
@@ -2258,6 +2280,20 @@ async fn execute_tool(
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");
+            // Central permission backstop (issue #210): if a tool does not gate
+            // itself (`self_gates() == false`) and requires a gated permission
+            // level, prompt here BEFORE executing. On denial, return a blocked
+            // result WITHOUT running the tool. Tools that already prompt
+            // internally opt out via `self_gates() == true` (no double-prompt),
+            // and read-only / no-permission tools are skipped. This makes a tool
+            // that forgets to gate itself secure by default.
+            if !tool.self_gates() && permission_level_is_gated(tool.permission_level()) {
+                let description = synthesize_permission_description(name, input);
+                if let Err(e) = ctx.check_permission(name, &description, false) {
+                    warn!(tool = name, "Tool blocked by central permission backstop");
+                    return ToolResult::error(e.to_string());
+                }
+            }
             tool.execute(input.clone(), ctx).await
         }
         None => {
