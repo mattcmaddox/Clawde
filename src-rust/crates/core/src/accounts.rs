@@ -122,6 +122,7 @@ impl AccountRegistry {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            set_user_only_dir_perms(parent);
         }
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json)?;
@@ -278,15 +279,34 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Tighten permissions on credential files (best-effort, Unix-only).
+/// Tighten permissions on a credential/session file so only the owner can
+/// read or write it (mode `0o600`). Best-effort and Unix-only; a no-op on
+/// other platforms (Windows ACLs are out of scope). Shared across modules
+/// that persist tokens, credentials, or session transcripts (issue #212).
 #[allow(unused_variables)]
-fn set_user_only_perms(path: &std::path::Path) {
+pub(crate) fn set_user_only_perms(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = std::fs::metadata(path) {
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
+/// Tighten permissions on a directory that holds credentials/session data so
+/// only the owner can traverse or list it (mode `0o700`). Best-effort and
+/// Unix-only; a no-op on other platforms (issue #212).
+#[allow(unused_variables)]
+pub(crate) fn set_user_only_dir_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
             let _ = std::fs::set_permissions(path, perms);
         }
     }
