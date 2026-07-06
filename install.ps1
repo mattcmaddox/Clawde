@@ -136,6 +136,54 @@ function Download-And-Install($desiredVersion, $arch) {
         exit 1
     }
 
+    # ----- Verify checksum (supply-chain integrity) -----
+    # Fetch SHA256SUMS from the same release and verify the archive before we
+    # extract and run it.  Older releases may not ship SHA256SUMS: warn and
+    # continue so existing installs keep working.  If it IS present and the
+    # hash does NOT match, abort hard.
+    $sumsUrl = "https://github.com/$Repo/releases/download/v$desiredVersion/SHA256SUMS"
+    $sumsPath = Join-Path $tmpRoot 'SHA256SUMS'
+    $haveSums = $false
+    try {
+        $oldPref2 = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsPath
+        $ProgressPreference = $oldPref2
+        $haveSums = $true
+    } catch {
+        Write-Warn "Could not fetch SHA256SUMS for v$desiredVersion - skipping checksum verification."
+    }
+
+    if ($haveSums) {
+        # SHA256SUMS lines look like "<hash>  <filename>" (two spaces). Split on
+        # whitespace into at most 2 parts and match on the bare archive name.
+        $expected = $null
+        foreach ($line in (Get-Content $sumsPath)) {
+            $parts = $line.Trim() -split '\s+', 2
+            if ($parts.Count -eq 2 -and $parts[1].Trim().TrimStart('*') -eq $archive) {
+                $expected = $parts[0].Trim()
+                break
+            }
+        }
+        if ([string]::IsNullOrEmpty($expected)) {
+            Write-Warn "No checksum listed for $archive in SHA256SUMS - skipping verification."
+        } else {
+            # Get-FileHash returns uppercase hex; sha256sum emits lowercase, so
+            # compare case-insensitively.
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash
+            if ($actual -ieq $expected) {
+                Write-Muted "Checksum verified."
+            } else {
+                Write-Err "Checksum verification FAILED for $archive"
+                Write-Info "  expected: $expected"
+                Write-Info "  actual:   $actual"
+                Write-Info "The download may be corrupted or tampered with. Aborting."
+                Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
+                exit 1
+            }
+        }
+    }
+
     Write-Muted "Extracting..."
     try {
         Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
