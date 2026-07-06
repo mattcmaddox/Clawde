@@ -2541,6 +2541,92 @@ mod tests {
         assert!(is_openaiish_provider("alibaba"));
         assert!(is_openaiish_provider("qwen"));
     }
+
+    // ---- apply_compact_result / #213 data-loss guard ------------------------
+
+    fn sample_conversation() -> Vec<Message> {
+        vec![
+            Message::user("initial user request"),
+            Message::assistant("assistant reply with important context"),
+            Message::user("follow-up question"),
+            Message::assistant("second assistant reply"),
+        ]
+    }
+
+    fn texts(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(|m| m.get_all_text()).collect()
+    }
+
+    #[test]
+    fn failed_compaction_preserves_messages() {
+        // Regression test for #213: a failed compaction must NOT wipe the
+        // conversation. Previously the reactive path drained `messages` with
+        // std::mem::take and never restored them on error.
+        let mut messages = sample_conversation();
+        let before = texts(&messages);
+
+        // Simulate a failed reactive_compact / context_collapse (API error,
+        // Cancelled, empty summary all map to Err here).
+        let outcome: Result<compact::CompactResult, ClaudeError> =
+            Err(ClaudeError::Cancelled);
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert!(result.is_err(), "helper must surface the compaction error");
+        assert_eq!(
+            messages.len(),
+            before.len(),
+            "messages must not be emptied on failed compaction"
+        );
+        assert_eq!(
+            texts(&messages),
+            before,
+            "message contents must be identical after failed compaction"
+        );
+    }
+
+    #[test]
+    fn failed_compaction_with_generic_error_preserves_messages() {
+        // The helper is generic over the error type; any Err leaves messages
+        // untouched.
+        let mut messages = sample_conversation();
+        let before = texts(&messages);
+
+        let outcome: Result<compact::CompactResult, &str> = Err("empty summary");
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert_eq!(result, Err("empty summary"));
+        assert_eq!(texts(&messages), before);
+    }
+
+    #[test]
+    fn successful_compaction_replaces_messages() {
+        // On success the compacted result replaces the live messages and the
+        // freed-token count is returned.
+        let mut messages = sample_conversation();
+        let compacted = vec![
+            Message::user("[summary of earlier conversation]"),
+            Message::user("follow-up question"),
+        ];
+        let expected = texts(&compacted);
+
+        let outcome: Result<compact::CompactResult, ClaudeError> = Ok(compact::CompactResult {
+            messages: compacted,
+            summary: "[summary of earlier conversation]".to_string(),
+            tokens_freed: 4_096,
+        });
+        let result = apply_compact_result(&mut messages, outcome);
+
+        assert_eq!(
+            result.unwrap(),
+            4_096,
+            "tokens_freed must be surfaced on success"
+        );
+        assert_eq!(
+            texts(&messages),
+            expected,
+            "messages must be replaced with the compacted result on success"
+        );
+    }
 }
 
 /// Stream handler that forwards events to an unbounded channel.
