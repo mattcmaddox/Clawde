@@ -4139,6 +4139,7 @@ pub mod tasks {
     use once_cell::sync::Lazy;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     /// Current status of a background task.
@@ -4178,6 +4179,11 @@ pub mod tasks {
         pub output: Vec<String>,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
+        /// Cancellation token for the task's in-process work loop. Signalling it
+        /// stops the running loop (e.g. a background sub-agent). Not persisted —
+        /// it holds no meaningful state across (de)serialization.
+        #[serde(skip)]
+        pub cancel_token: Option<CancellationToken>,
     }
 
     impl BackgroundTask {
@@ -4191,6 +4197,7 @@ pub mod tasks {
                 completed_at: None,
                 output: Vec::new(),
                 pid: None,
+                cancel_token: None,
             }
         }
 
@@ -4256,8 +4263,25 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Completed);
         }
 
-        /// Mark a task as `Cancelled`.  No-op if unknown or already terminal.
+        /// Attach a cancellation token to a task so it can later be signalled by
+        /// [`TaskRegistry::cancel`].  No-op if the ID is unknown.
+        pub fn set_cancel_token(&self, id: &str, token: CancellationToken) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.cancel_token = Some(token);
+            }
+        }
+
+        /// Mark a task as `Cancelled` and signal its cancellation token (if any)
+        /// so the running work loop actually stops.  No-op if unknown or already
+        /// terminal.
         pub fn cancel(&self, id: &str) {
+            // Clone the token out from under the shard guard, then signal it once
+            // the guard has been dropped — never hold a DashMap lock across other
+            // registry operations (or any `.await`).
+            let token = self.tasks.get(id).and_then(|e| e.cancel_token.clone());
+            if let Some(token) = token {
+                token.cancel();
+            }
             self.update_status(id, TaskStatus::Cancelled);
         }
 
