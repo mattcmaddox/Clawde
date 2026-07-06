@@ -377,6 +377,12 @@ impl Tool for AgentTool {
                 params.description
             ));
             task.id = agent_id.clone();
+            // Cancellation token shared between the registry and the spawned
+            // sub-agent loop: signalling it via TaskRegistry::cancel (e.g. from a
+            // monitor cancel) actually stops the loop instead of only relabeling
+            // the task (issue #219).
+            let cancel = CancellationToken::new();
+            task.cancel_token = Some(cancel.clone());
             let _ = claurst_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
@@ -394,7 +400,6 @@ impl Tool for AgentTool {
             let agent_id_bg = agent_id.clone();
 
             tokio::spawn(async move {
-                let cancel = CancellationToken::new();
                 let mut messages = vec![Message::user(prompt_bg)];
                 let outcome = run_query_loop(
                     client_bg.as_ref(),
