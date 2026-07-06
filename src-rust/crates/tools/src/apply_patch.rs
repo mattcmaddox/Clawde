@@ -342,7 +342,13 @@ impl Tool for ApplyPatchTool {
                 String::new()
             };
 
-            // Split into lines (keep newlines for join later).
+            // Detect the file's dominant line ending BEFORE editing so we can
+            // rejoin with it instead of collapsing everything to LF (#225).
+            // `str::lines()` strips both `\n` and `\r\n`, so a CRLF file would
+            // otherwise be silently rewritten to LF throughout.
+            let eol = crate::line_endings::LineEnding::detect(&original_content);
+
+            // Split into lines (line endings are re-applied on join below).
             let mut lines: Vec<String> = original_content
                 .lines()
                 .map(|l| l.to_string())
@@ -378,10 +384,11 @@ impl Tool for ApplyPatchTool {
             let new_content = if lines.is_empty() {
                 String::new()
             } else {
-                // Re-join with newlines; preserve trailing newline if original had one.
-                let mut s = lines.join("\n");
+                // Re-join with the file's original line ending; preserve a
+                // trailing newline if the original had one.
+                let mut s = lines.join(eol.as_str());
                 if original_content.ends_with('\n') || original_content.is_empty() {
-                    s.push('\n');
+                    s.push_str(eol.as_str());
                 }
                 s
             };
