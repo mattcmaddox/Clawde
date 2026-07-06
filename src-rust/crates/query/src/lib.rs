@@ -764,6 +764,15 @@ pub async fn run_query_loop(
     cancel_token: tokio_util::sync::CancellationToken,
     mut pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
+    // Rebind the tool context to carry the loop's actual cancel token so the
+    // parallel tool executor — and any tools or sub-agents that read
+    // `ctx.cancel_token` — observe the same cancellation signal that drives this
+    // loop (issue #218). Callers construct the context with a placeholder token;
+    // making the loop authoritative here means a parent cancel reaches tools.
+    let mut loop_ctx = tool_ctx.clone();
+    loop_ctx.cancel_token = cancel_token.clone();
+    let tool_ctx = &loop_ctx;
+
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
     // Tracks how many consecutive max_tokens recoveries we've attempted so
@@ -2896,6 +2905,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 

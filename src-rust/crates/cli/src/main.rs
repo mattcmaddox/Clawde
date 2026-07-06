@@ -731,6 +731,9 @@ async fn main() -> anyhow::Result<()> {
         pending_permissions: Some(pending_permissions.clone()),
         permission_manager: Some(permission_manager.clone()),
         user_question_tx: if is_non_interactive { None } else { Some(user_question_tx) },
+        // Placeholder token; `run_query_loop` rebinds it to the loop's actual
+        // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
+        cancel_token: tokio_util::sync::CancellationToken::new(),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.

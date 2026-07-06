@@ -44,5 +44,6 @@ pub(crate) fn allow_all_context(working_dir: PathBuf) -> ToolContext {
         pending_permissions: None,
         permission_manager: None,
         user_question_tx: None,
+        cancel_token: tokio_util::sync::CancellationToken::new(),
     }
 }

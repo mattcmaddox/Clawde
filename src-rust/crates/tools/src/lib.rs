@@ -303,6 +303,12 @@ pub struct ToolContext {
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
+    /// Cancellation token for the owning query loop (issue #218). The parallel
+    /// tool executor selects on this to abandon in-flight tools when the user
+    /// cancels, and long-running tools may observe it to bail out early. Defaults
+    /// to a fresh disconnected token; `run_query_loop` rebinds it to the loop's
+    /// actual token so cancellation propagates into tools and sub-agents.
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl ToolContext {
@@ -647,6 +653,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
