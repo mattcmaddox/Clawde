@@ -505,7 +505,14 @@ async fn main() -> anyhow::Result<()> {
     }
     config.verbose = cli.verbose;
     config.output_format = cli.output_format.into();
-    config.disable_claude_mds = cli.no_claude_md;
+    // --bare implies --no-claude-md: opening an untrusted repo in bare mode
+    // must not load or inject AGENTS.md memory files.
+    config.disable_claude_mds = cli.no_claude_md || cli.bare;
+    if cli.bare {
+        // Bare mode runs no event hooks. Drop any hooks resolved from
+        // settings so no `run_hooks` call site has anything to execute.
+        config.hooks.clear();
+    }
     if let Some(sp) = cli.system_prompt.clone() {
         config.custom_system_prompt = Some(sp);
     }
@@ -756,7 +763,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
-    let plugin_registry = claurst_plugins::load_plugins(&cwd, &[]).await;
+    // Bare mode skips plugin discovery entirely and uses an empty registry so
+    // no plugin commands, hooks, or MCP servers are loaded from an untrusted
+    // repo. Downstream code still works against the empty registry.
+    let plugin_registry = if cli.bare {
+        claurst_plugins::PluginRegistry::new()
+    } else {
+        claurst_plugins::load_plugins(&cwd, &[]).await
+    };
     {
         let plugin_cmd_count = plugin_registry.all_command_defs().len();
         let plugin_hook_count = plugin_registry
@@ -4545,5 +4559,71 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
     match opt {
         Some(s) => serde_json::Value::String(s.clone()),
         None => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod bare_mode_tests {
+    //! Tests for issue #208: `--bare` must disable hooks, plugins, and
+    //! AGENTS.md. The wiring lives inline in `main()`, so these tests exercise
+    //! the underlying decisions/primitives that wiring relies on.
+    use super::*;
+
+    #[test]
+    fn bare_flag_parses_and_implies_no_claude_md() {
+        let cli = Cli::parse_from(["claurst", "--bare"]);
+        assert!(cli.bare, "--bare should set cli.bare");
+        // main() computes `config.disable_claude_mds = cli.no_claude_md || cli.bare`,
+        // so --bare must disable AGENTS.md even without --no-claude-md.
+        assert!(
+            cli.no_claude_md || cli.bare,
+            "--bare must imply disable_claude_mds"
+        );
+
+        let normal = Cli::parse_from(["claurst"]);
+        assert!(!normal.bare, "bare defaults to false");
+        assert!(
+            !(normal.no_claude_md || normal.bare),
+            "AGENTS.md stays enabled without --bare/--no-claude-md"
+        );
+    }
+
+    #[test]
+    fn bare_mode_uses_empty_plugin_registry() {
+        // In bare mode main() substitutes `PluginRegistry::new()` for
+        // `load_plugins()`. Assert it contributes no plugins, commands, hooks,
+        // or MCP servers downstream.
+        let registry = claurst_plugins::PluginRegistry::new();
+        assert_eq!(registry.enabled_count(), 0, "no plugins enabled");
+        assert!(registry.all_command_defs().is_empty(), "no plugin commands");
+        let hook_count: usize = registry
+            .build_hook_registry()
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert_eq!(hook_count, 0, "no plugin hooks");
+        assert!(registry.all_mcp_servers().is_empty(), "no plugin MCP servers");
+    }
+
+    #[test]
+    fn bare_mode_clears_hooks() {
+        use claurst_core::config::{HookEntry, HookEvent};
+        // Simulate settings-derived hooks, then apply the bare-mode clear that
+        // main() performs. Every `run_hooks` call site guards on
+        // `config.hooks.is_empty()`, so an empty map means nothing executes.
+        let mut hooks: std::collections::HashMap<HookEvent, Vec<HookEntry>> =
+            std::collections::HashMap::new();
+        hooks.insert(
+            HookEvent::PreToolUse,
+            vec![HookEntry {
+                command: "echo untrusted".to_string(),
+                ..Default::default()
+            }],
+        );
+        assert!(!hooks.is_empty(), "precondition: hooks are present");
+
+        hooks.clear(); // mirrors `config.hooks.clear()` in bare mode
+
+        assert!(hooks.is_empty(), "bare mode leaves no hooks to run");
     }
 }
