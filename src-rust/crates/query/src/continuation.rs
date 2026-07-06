@@ -66,6 +66,41 @@ impl ContinuationPolicy for StopPolicy {
     }
 }
 
+/// Goal-driven continuation policy (the `/goal` feature).
+///
+/// Reuses the existing `goal_loop` guards verbatim — the runaway turn cap, the
+/// soft token budget, and the per-turn continuation message. While the session
+/// has an active goal and its guards allow, the loop continues with the goal
+/// continuation message injected as the next user turn; otherwise it stops and
+/// surfaces the same paused / budget-limited / runaway note as before.
+///
+/// This policy relocates only WHERE the decision is made (in-loop, per turn),
+/// not the guards themselves: it delegates to
+/// [`crate::goal_loop::check_and_continue_goal`], which opens the default goal
+/// store and applies the identical logic the CLI post-loop path used to run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GoalPolicy;
+
+impl ContinuationPolicy for GoalPolicy {
+    fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision {
+        use crate::goal_loop::GoalContinuation;
+        match crate::goal_loop::check_and_continue_goal(
+            ctx.session_id,
+            ctx.total_tokens_used,
+            ctx.turn_elapsed_secs,
+        ) {
+            GoalContinuation::Continue { message } => ContinuationDecision::Continue { message },
+            // Paused / budget / runaway / complete: stop, surfacing the same
+            // user-facing note the CLI used to print.
+            GoalContinuation::Stop { reason } => ContinuationDecision::Stop {
+                note: reason.user_message(),
+            },
+            // No goal set for this session: behave exactly like `StopPolicy`.
+            GoalContinuation::NoGoal => ContinuationDecision::Stop { note: None },
+        }
+    }
+}
+
 /// Selects which continuation policy `run_query_loop` uses for a run.
 ///
 /// Stored on `QueryConfig` so callers opt in per invocation. Subagents,
@@ -75,6 +110,8 @@ pub enum ContinuationMode {
     /// Stop after the turn completes (default, non-goal behaviour).
     #[default]
     Default,
+    /// Goal-driven autonomous continuation (the `/goal` feature).
+    Goal,
 }
 
 impl ContinuationMode {
@@ -82,6 +119,7 @@ impl ContinuationMode {
     pub fn policy(self) -> Box<dyn ContinuationPolicy> {
         match self {
             ContinuationMode::Default => Box::new(StopPolicy),
+            ContinuationMode::Goal => Box::new(GoalPolicy),
         }
     }
 }

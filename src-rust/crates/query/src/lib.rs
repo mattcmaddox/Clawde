@@ -28,7 +28,10 @@ pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
-pub use goal_loop::{GoalContinuation, StopReason, check_and_continue_goal, mark_goal_complete};
+pub use goal_loop::{
+    GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
+    mark_goal_complete,
+};
 pub use skill_prefetch::{
     SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
@@ -1043,6 +1046,25 @@ pub async fn run_query_loop(
                     patched.append_system_prompt = Some(match &config.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
+                    });
+                }
+            }
+
+            // Goal system-prompt addendum (issue #230 / MI-3). Applied fresh
+            // each turn (goal state — turns used, elapsed — changes over the
+            // run) whenever goal continuation mode is active and a live goal
+            // exists for this session. This relocates the addendum injection
+            // from the CLI into the loop so continuation turns get it too.
+            // GoalStore access here is fully synchronous (no lock held across
+            // an `.await`).
+            if matches!(config.continuation, crate::continuation::ContinuationMode::Goal) {
+                if let Some(goal) = claurst_core::GoalStore::open_default()
+                    .and_then(|s| s.get_active_goal(&tool_ctx.session_id))
+                {
+                    let addendum = claurst_core::goal_system_prompt_addendum(&goal);
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                        Some(existing) => format!("{}\n{}", existing, addendum),
+                        None => addendum,
                     });
                 }
             }
