@@ -554,4 +554,26 @@ mod tests {
         assert_eq!(after, "one\r\nTWO\r\nthree\r\n");
         assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
     }
+
+    /// #226: ApplyPatch writes through `write_atomic`. A successful patch must
+    /// leave the file with the right content and NO `.claurst-tmp-*` scratch
+    /// file lingering in the directory.
+    #[tokio::test]
+    async fn apply_patch_writes_atomically_no_tmp_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.txt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let patch = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n";
+        let res = ApplyPatchTool.execute(json!({ "patch": patch }), &ctx).await;
+        assert!(!res.is_error, "apply patch failed: {}", res.content);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nrust\n");
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
+        assert!(!tmp_left, "atomic write must not leave a temp file behind");
+    }
 }

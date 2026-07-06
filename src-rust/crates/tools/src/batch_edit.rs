@@ -306,4 +306,41 @@ mod tests {
         assert_eq!(after, "ALPHA\r\nbeta\r\nGAMMA\r\n");
         assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
     }
+
+    /// #226: BatchEdit writes (and its rollback path) go through `write_atomic`.
+    /// A successful multi-file batch must land the right content in every file
+    /// and leave no `.claurst-tmp-*` scratch file behind. Because each file is
+    /// swapped in atomically via rename, a mid-write crash can never leave one
+    /// of these files partially written — so the rollback only ever has to
+    /// restore fully-written files, never repair a torn one.
+    #[tokio::test]
+    async fn batch_edit_writes_atomically_no_tmp_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "one\n").unwrap();
+        std::fs::write(&b, "two\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = BatchEditTool
+            .execute(
+                json!({
+                    "edits": [
+                        { "file_path": a.to_string_lossy(), "old_string": "one", "new_string": "ONE" },
+                        { "file_path": b.to_string_lossy(), "old_string": "two", "new_string": "TWO" }
+                    ]
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "batch edit failed: {}", res.content);
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ONE\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "TWO\n");
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
+        assert!(!tmp_left, "atomic write must not leave a temp file behind");
+    }
 }

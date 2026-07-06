@@ -852,4 +852,59 @@ mod tests {
         assert!(!def.description.is_empty());
         assert!(def.input_schema.is_object());
     }
+
+    // ---- write_atomic tests -------------------------------------------------
+    //
+    // `write_atomic` is the single atomic-write path that ApplyPatch, BatchEdit,
+    // NotebookEdit and the cron store (#226) all route through. These tests pin
+    // its contract: it writes the exact bytes and never leaves a temp file
+    // behind on success — the guarantee that makes those tools crash-safe.
+
+    /// Count the `.claurst-tmp-*` scratch files left in `dir`.
+    fn count_atomic_tmp_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".claurst-tmp-")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn write_atomic_writes_content_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+
+        // Fresh file.
+        write_atomic(&path, b"hello\nworld\n").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after create");
+
+        // Overwrite an existing file (the crash-truncation scenario #226 fixes).
+        write_atomic(&path, b"replaced").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after overwrite");
+    }
+
+    /// The executable bit (and other permissions) must survive an atomic
+    /// overwrite, since we rename a fresh temp file over the destination.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_atomic_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&path, b"#!/bin/sh\necho hi\n").await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
 }
