@@ -185,9 +185,17 @@ fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
 }
 
 /// Build the bash wrapper script that:
-/// 1. Restores saved cwd and env vars.
+/// 1. Restores the saved cwd.
 /// 2. Runs the user command.
 /// 3. Prints the sentinel + final pwd + `env` dump so we can persist state.
+///
+/// SECURITY (#211): restored env vars are deliberately NOT written into this
+/// script. The script is passed as an argv element to `bash -c "<script>"`, so
+/// anything embedded here (e.g. `export AWS_SECRET_ACCESS_KEY='…'`) would be
+/// visible to any local user via `ps auxww` / `/proc/<pid>/cmdline`. Restored
+/// vars are instead injected into the child's ENVIRONMENT via
+/// `Command::envs(&state.env_vars)` at spawn time, so their values never appear
+/// on a command line.
 ///
 /// On Windows we skip the wrapping (cmd.exe is a different shell).
 fn build_wrapper_script(
@@ -203,21 +211,9 @@ fn build_wrapper_script(
     // Escape the cwd for single-quote embedding
     let cwd_escaped: String = effective_cwd.to_string_lossy().replace('\'', "'\\''" );
 
-    // Build export lines for persisted env vars
-    let mut export_lines = String::new();
-    for (k, v) in &state.env_vars {
-        // Escape single quotes in value
-        let v_escaped: String = v.replace('\'', "'\\''");
-        export_lines.push_str(&format!("export {}='{}'\n", k, v_escaped));
-    }
-
-    // We use `env -0` + `awk` to safely dump env vars after the command
-    // finishes without being confused by multi-line values.
-    // If `env -0` is unavailable we fall back to a simpler printenv.
     format!(
         r#"set -e
 cd '{cwd}'
-{exports}
 set +e
 {user_cmd}
 __CC_EXIT_CODE=$?
@@ -227,7 +223,6 @@ env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true
 exit $__CC_EXIT_CODE
 "#,
         cwd = cwd_escaped,
-        exports = export_lines,
         user_cmd = command,
         sentinel = SHELL_STATE_SENTINEL,
     )
@@ -515,16 +510,21 @@ impl Tool for BashTool {
             return self.execute_windows(&params.command, ctx, &shell_state_arc, timeout_dur, timeout_ms).await;
         }
 
-        // Build a wrapper script that restores and then captures shell state.
-        let script = {
+        // Build a wrapper script that restores cwd + captures shell state, and
+        // clone the restored env vars so they can be injected into the child's
+        // ENVIRONMENT (never its argv) — see build_wrapper_script / #211.
+        let (script, restored_env) = {
             let state = shell_state_arc.lock();
-            build_wrapper_script(&params.command, &state, &ctx.working_dir)
+            let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
+            (script, state.env_vars.clone())
         };
 
         let child = match Command::new("bash")
             .arg("-c")
             .arg(&script)
             .current_dir(&ctx.working_dir)
+            // Restored shell vars reach the child via its environment, not argv (#211).
+            .envs(&restored_env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -737,6 +737,47 @@ mod tests {
         let input: BashInput =
             serde_json::from_str(r#"{"command":"echo hi"}"#).unwrap();
         assert!(!input.run_in_background);
+    }
+
+    /// #211: restored env values (secrets) must never be baked into the wrapper
+    /// script. That script is passed as an argv element to `bash -c "<script>"`,
+    /// so any embedded `export KEY='value'` would be readable by any local user
+    /// via `ps auxww` / `/proc/<pid>/cmdline`. The values are instead delivered
+    /// to the child through `Command::envs(&state.env_vars)` (its environment).
+    #[test]
+    fn wrapper_script_never_embeds_restored_env_values() {
+        let mut state = ShellState::new();
+        state
+            .env_vars
+            .insert("SECRET".to_string(), "topsecret".to_string());
+        state
+            .env_vars
+            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "aws-argv-leak".to_string());
+
+        let base = PathBuf::from("/tmp");
+        let script = build_wrapper_script("echo hi", &state, &base);
+
+        // Secret VALUES must not appear anywhere in the script string / argv.
+        assert!(
+            !script.contains("topsecret"),
+            "secret value leaked into wrapper script (argv):\n{script}"
+        );
+        assert!(
+            !script.contains("aws-argv-leak"),
+            "AWS secret leaked into wrapper script (argv):\n{script}"
+        );
+        // No re-exported lines for restored vars either.
+        assert!(
+            !script.contains("export SECRET="),
+            "restored var was re-exported into the script (argv):\n{script}"
+        );
+        assert!(
+            !script.contains("export AWS_SECRET_ACCESS_KEY="),
+            "restored var was re-exported into the script (argv):\n{script}"
+        );
+
+        // The env map the tool hands to `Command::envs` is where the value lives.
+        assert_eq!(state.env_vars.get("SECRET").map(String::as_str), Some("topsecret"));
     }
 
     /// Permission handler that allows everything — for exercising `execute`.
