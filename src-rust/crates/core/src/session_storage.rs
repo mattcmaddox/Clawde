@@ -63,6 +63,14 @@ pub enum TranscriptEntry {
     /// without rewriting the entire file.
     #[serde(rename = "tombstone")]
     Tombstone(TombstoneEntry),
+    /// Marks the active tip ("leaf") of the session tree — the entry the active
+    /// branch ends at. Written append-only whenever the active branch changes
+    /// (e.g. after a non-destructive revert/rewind). The LAST `leaf` entry in
+    /// the file wins; earlier leaf pointers are superseded. Sessions written
+    /// before #234 have no `leaf` entry and default to "leaf = last message"
+    /// (identical linear behavior) — see [`active_branch_messages`].
+    #[serde(rename = "leaf")]
+    Leaf(LeafEntry),
     /// Any other entry type we do not need to inspect — round-tripped verbatim.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -196,6 +204,22 @@ pub struct LastPromptEntry {
 pub struct TombstoneEntry {
     /// UUID of the entry being deleted.
     pub deleted_uuid: String,
+}
+
+/// Points the session's active tip at a specific entry uuid (issue #234).
+///
+/// Appended, never rewritten, so that history is retained: pointing the leaf at
+/// an *earlier* entry keeps every later entry on disk as a sibling branch that
+/// can be returned to (by appending a newer leaf pointing back at it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeafEntry {
+    /// UUID (entry-level `uuid`) of the entry that is the current active tip.
+    ///
+    /// `None` (field absent) resets the active branch to empty — before any
+    /// message — mirroring pi's nullable leaf pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf_uuid: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +662,105 @@ pub fn messages_from_transcript(entries: &[TranscriptEntry]) -> Vec<Message> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Session tree — active leaf / branch reconstruction (issue #234)
+// ---------------------------------------------------------------------------
+
+/// Return the most-recently-appended `leaf` entry in the transcript, if any.
+///
+/// The last leaf wins, so callers see the *current* active tip even after
+/// several non-destructive reverts.
+pub fn last_leaf(entries: &[TranscriptEntry]) -> Option<&LeafEntry> {
+    entries.iter().rev().find_map(|e| match e {
+        TranscriptEntry::Leaf(l) => Some(l),
+        _ => None,
+    })
+}
+
+/// Reconstruct the chain-participant entries (user/assistant) on the ACTIVE
+/// branch, in root→leaf order.
+///
+/// * **No `leaf` entry** → chain participants in *file order*, identical to the
+///   pre-#234 linear behavior. This is the back-compat guarantee: old sessions
+///   load exactly as they did before, regardless of their `parentUuid` fields.
+/// * **`leaf` present** → the active branch is reconstructed by walking
+///   `parentUuid` links from the leaf back to the root, so entries on abandoned
+///   sibling branches are excluded (they remain on disk).
+/// * **reset leaf** (`leafUuid` absent/null) → empty branch.
+/// * **dangling leaf** (points at a uuid not present, e.g. tombstoned) → safe
+///   fallback to file order.
+pub fn active_branch_entries(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
+    let leaf = match last_leaf(entries) {
+        // Back-compat: no leaf pointer → linear file order.
+        None => return entries.iter().filter(|e| e.is_chain_participant()).collect(),
+        Some(l) => l,
+    };
+
+    // Reset leaf → empty active branch.
+    let leaf_uuid = match leaf.leaf_uuid.as_deref() {
+        None => return Vec::new(),
+        Some(u) => u,
+    };
+
+    // Index every entry that carries an (entry-level) uuid so we can follow the
+    // parent chain. Keep the first occurrence for any given uuid.
+    let mut by_uuid: std::collections::HashMap<&str, &TranscriptEntry> =
+        std::collections::HashMap::new();
+    for e in entries {
+        if let Some(u) = e.uuid() {
+            by_uuid.entry(u).or_insert(e);
+        }
+    }
+
+    if !by_uuid.contains_key(leaf_uuid) {
+        // Dangling leaf → safe fallback to file order.
+        return entries.iter().filter(|e| e.is_chain_participant()).collect();
+    }
+
+    // Walk parentUuid links from the leaf back toward the root.
+    let mut chain: Vec<&TranscriptEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut cursor = Some(leaf_uuid);
+    while let Some(uuid) = cursor {
+        if !seen.insert(uuid) {
+            break; // cycle guard
+        }
+        let entry = match by_uuid.get(uuid) {
+            Some(e) => *e,
+            None => break, // broken chain — stop at the last reachable entry
+        };
+        chain.push(entry);
+        cursor = match entry {
+            TranscriptEntry::User(m)
+            | TranscriptEntry::Assistant(m)
+            | TranscriptEntry::Attachment(m)
+            | TranscriptEntry::System(m) => m.parent_uuid.as_deref(),
+            _ => None,
+        };
+    }
+
+    chain.reverse();
+    // Only user/assistant entries contribute to the conversation.
+    chain.retain(|e| e.is_chain_participant());
+    chain
+}
+
+/// Reconstruct `Vec<Message>` for the ACTIVE branch of a loaded transcript.
+///
+/// Leaf-aware counterpart of [`messages_from_transcript`]: with no `leaf` entry
+/// it is identical (linear, file order); with a `leaf` entry it returns only
+/// the messages on the active branch (root→leaf), so reverted-away turns held
+/// on a sibling branch are excluded from the reconstructed conversation.
+pub fn active_branch_messages(entries: &[TranscriptEntry]) -> Vec<Message> {
+    active_branch_entries(entries)
+        .into_iter()
+        .filter_map(|e| match e {
+            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m) => Some(m.message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Filter transcript entries by agent role ("manager" or "executor").
 ///
 /// Returns only User and Assistant entries whose `agent_role` matches `role`.
@@ -731,6 +854,163 @@ mod tests {
         // Newest first.
         assert_eq!(sessions[0].session_id, "bbbb");
         assert_eq!(sessions[1].session_id, "aaaa");
+    }
+
+    // -----------------------------------------------------------------------
+    // Session tree / leaf reconstruction (issue #234)
+    // -----------------------------------------------------------------------
+
+    /// Build a chain-participant entry with an explicit entry-level `uuid`,
+    /// `parent_uuid`, and a distinct text body so branches are identifiable.
+    fn chain_entry(role: Role, uuid: &str, parent: Option<&str>, text: &str) -> TranscriptEntry {
+        let is_assistant = role == Role::Assistant;
+        let msg = Message {
+            role,
+            content: MessageContent::Text(text.to_string()),
+            uuid: Some(format!("msg-{uuid}")),
+            cost: None,
+            snapshot_patch: None,
+        };
+        let tm = TranscriptMessage {
+            uuid: Some(uuid.to_string()),
+            parent_uuid: parent.map(|s| s.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            session_id: "sess".to_string(),
+            cwd: "/proj".to_string(),
+            message: msg,
+            is_sidechain: false,
+            user_type: "external".to_string(),
+            version: "test".to_string(),
+            git_branch: None,
+            agent_role: None,
+            managed_session_id: None,
+            extra: Default::default(),
+        };
+        if is_assistant {
+            TranscriptEntry::Assistant(tm)
+        } else {
+            TranscriptEntry::User(tm)
+        }
+    }
+
+    fn texts(msgs: &[Message]) -> Vec<String> {
+        msgs.iter()
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    /// BACK-COMPAT GUARANTEE: an old-format session with NO `leaf` entry loads
+    /// exactly as before — chain participants in file order, identical to
+    /// `messages_from_transcript`.
+    #[test]
+    fn old_format_no_leaf_loads_in_file_order() {
+        let entries = vec![
+            chain_entry(Role::User, "u1", None, "hello"),
+            chain_entry(Role::Assistant, "a1", Some("u1"), "hi"),
+            chain_entry(Role::User, "u2", Some("a1"), "again"),
+            chain_entry(Role::Assistant, "a2", Some("u2"), "yes"),
+        ];
+
+        // No leaf entry present.
+        assert!(last_leaf(&entries).is_none());
+
+        let active = active_branch_messages(&entries);
+        let linear = messages_from_transcript(&entries);
+        // Identical to the pre-#234 linear reconstruction.
+        assert_eq!(texts(&active), texts(&linear));
+        assert_eq!(texts(&active), vec!["hello", "hi", "again", "yes"]);
+    }
+
+    /// A session with a `leaf` reconstructs the branch ending at that leaf by
+    /// walking parent links, excluding the abandoned sibling branch (which is
+    /// still present on disk).
+    #[test]
+    fn leaf_reconstructs_active_branch() {
+        // Tree:
+        //   u1 ── a1 ──┬── u2a ── a2a   (abandoned branch)
+        //              └── u2b ── a2b   (active branch, leaf = a2b)
+        let entries = vec![
+            chain_entry(Role::User, "u1", None, "start"),
+            chain_entry(Role::Assistant, "a1", Some("u1"), "ok"),
+            chain_entry(Role::User, "u2a", Some("a1"), "path-A"),
+            chain_entry(Role::Assistant, "a2a", Some("u2a"), "reply-A"),
+            chain_entry(Role::User, "u2b", Some("a1"), "path-B"),
+            chain_entry(Role::Assistant, "a2b", Some("u2b"), "reply-B"),
+            TranscriptEntry::Leaf(LeafEntry {
+                leaf_uuid: Some("a2b".to_string()),
+            }),
+        ];
+
+        let active = active_branch_messages(&entries);
+        // Only the B branch, in root→leaf order.
+        assert_eq!(texts(&active), vec!["start", "ok", "path-B", "reply-B"]);
+
+        // Re-pointing the leaf at the abandoned branch retrieves it — nothing
+        // was destroyed.
+        let mut back = entries.clone();
+        back.push(TranscriptEntry::Leaf(LeafEntry {
+            leaf_uuid: Some("a2a".to_string()),
+        }));
+        let restored = active_branch_messages(&back);
+        assert_eq!(texts(&restored), vec!["start", "ok", "path-A", "reply-A"]);
+    }
+
+    /// The last `leaf` entry wins when several are present.
+    #[test]
+    fn last_leaf_wins() {
+        let entries = vec![
+            chain_entry(Role::User, "u1", None, "a"),
+            chain_entry(Role::Assistant, "a1", Some("u1"), "b"),
+            chain_entry(Role::User, "u2", Some("a1"), "c"),
+            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("u2".to_string()) }),
+            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("a1".to_string()) }),
+        ];
+        let active = active_branch_messages(&entries);
+        assert_eq!(texts(&active), vec!["a", "b"]);
+    }
+
+    /// A reset leaf (no `leafUuid`) yields an empty active branch.
+    #[test]
+    fn reset_leaf_yields_empty_branch() {
+        let entries = vec![
+            chain_entry(Role::User, "u1", None, "a"),
+            chain_entry(Role::Assistant, "a1", Some("u1"), "b"),
+            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: None }),
+        ];
+        assert!(active_branch_messages(&entries).is_empty());
+    }
+
+    /// A leaf pointing at a missing uuid falls back to file order.
+    #[test]
+    fn dangling_leaf_falls_back_to_file_order() {
+        let entries = vec![
+            chain_entry(Role::User, "u1", None, "a"),
+            chain_entry(Role::Assistant, "a1", Some("u1"), "b"),
+            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("nope".to_string()) }),
+        ];
+        assert_eq!(texts(&active_branch_messages(&entries)), vec!["a", "b"]);
+    }
+
+    /// The `leaf` entry round-trips through JSON and is skippable by readers
+    /// that ignore it (it is not a chain participant).
+    #[test]
+    fn leaf_entry_json_round_trip() {
+        let e = TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("abc".to_string()) });
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"type\":\"leaf\""), "got {s}");
+        assert!(s.contains("\"leafUuid\":\"abc\""), "got {s}");
+        let back: TranscriptEntry = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, TranscriptEntry::Leaf(_)));
+        assert!(!back.is_chain_participant());
+        assert!(back.uuid().is_none());
+
+        // Reset leaf omits leafUuid.
+        let reset = TranscriptEntry::Leaf(LeafEntry { leaf_uuid: None });
+        let s2 = serde_json::to_string(&reset).unwrap();
+        assert_eq!(s2, "{\"type\":\"leaf\"}");
     }
 
     #[test]
