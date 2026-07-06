@@ -130,6 +130,21 @@ pub struct QueryConfig {
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
     /// Managed agent (manager-executor) configuration.
     pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
+    /// Names of the tools enabled for this session (issue #233).
+    ///
+    /// When populated, `build_system_prompt` forwards these to
+    /// `SystemPromptOptions::enabled_tools` so the "Tool use guidelines"
+    /// section only emits per-tool guidance for tools that are actually
+    /// loaded. `None`/empty means "unknown" and every block is emitted,
+    /// which keeps existing behaviour for callers that don't set it.
+    ///
+    // TODO(#233): populate this from the live tool set. The authoritative
+    // list is the `tools: &[Box<dyn Tool>]` argument of `run_query_loop`,
+    // but that function is under active refactor elsewhere and is off-limits
+    // here, so callers that build both the tool vec and the config (or a
+    // future hook inside the loop) should set this field to activate
+    // progressive tool disclosure in production.
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl Default for QueryConfig {
@@ -156,6 +171,7 @@ impl Default for QueryConfig {
             agent_definition: None,
             model_registry: None,
             managed_agents: None,
+            enabled_tools: None,
         }
     }
 }
@@ -2420,6 +2436,9 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
+        // Forward the session's enabled tool set so per-tool guideline blocks
+        // are only emitted for tools that are actually loaded (issue #233).
+        enabled_tools: config.enabled_tools.clone(),
         ..Default::default()
     };
 
@@ -2545,6 +2564,7 @@ mod tests {
             agent_definition: None,
             model_registry: None,
             managed_agents: None,
+            enabled_tools: None,
         }
     }
 
