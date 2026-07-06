@@ -145,12 +145,12 @@ pub struct QueryConfig {
     /// loaded. `None`/empty means "unknown" and every block is emitted,
     /// which keeps existing behaviour for callers that don't set it.
     ///
-    // TODO(#233): populate this from the live tool set. The authoritative
-    // list is the `tools: &[Box<dyn Tool>]` argument of `run_query_loop`,
-    // but that function is under active refactor elsewhere and is off-limits
-    // here, so callers that build both the tool vec and the config (or a
-    // future hook inside the loop) should set this field to activate
-    // progressive tool disclosure in production.
+    // Populated in-loop (issue #233 completion): when left `None`,
+    // `run_query_loop` fills this from its live `tools: &[Box<dyn Tool>]`
+    // argument before assembling the system prompt, so the top-level
+    // interactive session gets progressive tool disclosure. Callers that build
+    // both the tool vec and the config (e.g. sub-agents) may still set it
+    // explicitly; the loop only fills an unset field.
     pub enabled_tools: Option<Vec<String>>,
     /// End-of-turn continuation policy (issue #230 / MI-3).
     ///
@@ -1069,6 +1069,17 @@ pub async fn run_query_loop(
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
             let mut patched = config.clone();
+
+            // Progressive tool disclosure (issue #233 completion): populate
+            // `enabled_tools` from the live tool set this run exposes so
+            // `build_system_prompt` only emits per-tool guideline blocks for
+            // tools that are actually loaded. This is the boundary #233 wired
+            // up; sub-agents already set it explicitly, so only fill it in when
+            // the caller left it unset.
+            if patched.enabled_tools.is_none() {
+                patched.enabled_tools =
+                    Some(tools.iter().map(|t| t.name().to_string()).collect());
+            }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
