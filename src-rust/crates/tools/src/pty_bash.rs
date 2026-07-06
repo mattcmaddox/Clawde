@@ -104,21 +104,19 @@ fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
     map
 }
 
+// SECURITY (#211): restored env vars are NEVER emitted into this script.
+// The script becomes an argv element (`bash -c "<script>"`), which is readable
+// by any local user via `ps auxww` / `/proc/<pid>/cmdline`. Instead the restored
+// vars are handed to the child through its ENVIRONMENT via `apply_restored_env`
+// (portable_pty `CommandBuilder::env`), so secret values never touch a command line.
 #[cfg(unix)]
 fn build_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -> String {
     let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
     let cwd_escaped: String = effective_cwd.to_string_lossy().replace('\'', "'\\''");
 
-    let mut export_lines = String::new();
-    for (k, v) in &state.env_vars {
-        let v_escaped: String = v.replace('\'', "'\\''");
-        export_lines.push_str(&format!("export {}='{}'\n", k, v_escaped));
-    }
-
     format!(
         r#"set -e
 cd '{cwd}'
-{exports}
 set +e
 {user_cmd}
 __CC_EXIT_CODE=$?
@@ -128,10 +126,21 @@ env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true
 exit $__CC_EXIT_CODE
 "#,
         cwd = cwd_escaped,
-        exports = export_lines,
         user_cmd = command,
         sentinel = SHELL_STATE_SENTINEL,
     )
+}
+
+/// Plumb the persisted shell env vars into the child process's environment
+/// (NOT its argv). Each var is set with `CommandBuilder::env`, so the child
+/// inherits it exactly as `export` would have — but the value never appears on
+/// any command line. This is the sole path through which restored values reach
+/// the child (#211).
+#[cfg(unix)]
+fn apply_restored_env(cmd: &mut portable_pty::CommandBuilder, env_vars: &HashMap<String, String>) {
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +309,7 @@ fn strip_ansi(s: &str) -> String {
 async fn run_in_pty(
     script: &str,
     working_dir: &str,
+    env_vars: &HashMap<String, String>,
     timeout: Duration,
 ) -> Result<(String, i32), String> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -319,6 +329,8 @@ async fn run_in_pty(
     let mut cmd = CommandBuilder::new("bash");
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
+    // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
+    apply_restored_env(&mut cmd, env_vars);
 
     let mut child = pair
         .slave
@@ -584,17 +596,22 @@ impl Tool for PtyBashTool {
         // ── Unix PTY path ────────────────────────────────────────────────────
         #[cfg(unix)]
         {
-            // Build the wrapper script that restores + captures shell state.
-            let (script, working_dir_str) = {
+            // Build the wrapper script that restores cwd + captures shell state.
+            // Restored env vars are cloned out and later injected into the child's
+            // environment (never its argv) — see `apply_restored_env` (#211).
+            let (script, restored_env, working_dir_str) = {
                 let state = shell_state_arc.lock();
                 let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
+                let restored_env = state.env_vars.clone();
                 let wd = ctx.working_dir.to_string_lossy().into_owned();
-                (script, wd)
+                (script, restored_env, wd)
             };
 
-            let result =
-                tokio::time::timeout(timeout_dur, run_in_pty(&script, &working_dir_str, timeout_dur))
-                    .await;
+            let result = tokio::time::timeout(
+                timeout_dur,
+                run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur),
+            )
+            .await;
 
             match result {
                 Ok(Ok((raw_output, exit_code))) => {
@@ -648,6 +665,77 @@ impl Tool for PtyBashTool {
                 Ok(Err(e)) => ToolResult::error(format!("PTY execution failed: {}", e)),
                 Err(_) => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// #211: restored env values (secrets) must NOT be baked into the wrapper
+    /// script, because that script becomes an argv element of `bash -c`, which is
+    /// visible to any local user via `ps auxww` / `/proc/<pid>/cmdline`.
+    #[test]
+    fn wrapper_script_never_embeds_restored_env_values() {
+        let mut state = ShellState::new();
+        state
+            .env_vars
+            .insert("SECRET".to_string(), "topsecret".to_string());
+        state
+            .env_vars
+            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "aws-argv-leak".to_string());
+
+        let base = PathBuf::from("/tmp");
+        let script = build_wrapper_script("echo hi", &state, &base);
+
+        // The secret VALUES must never appear in the script string / argv.
+        assert!(
+            !script.contains("topsecret"),
+            "secret value leaked into wrapper script (argv):\n{script}"
+        );
+        assert!(
+            !script.contains("aws-argv-leak"),
+            "AWS secret leaked into wrapper script (argv):\n{script}"
+        );
+        // And there must be no re-exported `export KEY=` lines for restored vars.
+        assert!(
+            !script.contains("export SECRET="),
+            "restored var was re-exported into the script (argv):\n{script}"
+        );
+        assert!(
+            !script.contains("export AWS_SECRET_ACCESS_KEY="),
+            "restored var was re-exported into the script (argv):\n{script}"
+        );
+    }
+
+    /// #211: the value IS delivered to the child — but through its environment
+    /// (`CommandBuilder::env`), which is not part of argv. This exercises the
+    /// env-plumbing function directly.
+    #[test]
+    fn restored_env_reaches_child_via_env_map_not_argv() {
+        use portable_pty::CommandBuilder;
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("SECRET".to_string(), "topsecret".to_string());
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.args(["-c", "true"]);
+        apply_restored_env(&mut cmd, &env_vars);
+
+        // Value is present in the child's environment...
+        assert_eq!(cmd.get_env("SECRET"), Some(OsStr::new("topsecret")));
+        // ...and NOT in argv (only `bash -c true`).
+        for arg in cmd.get_argv() {
+            assert!(
+                !arg.to_string_lossy().contains("topsecret"),
+                "secret value leaked into CommandBuilder argv: {arg:?}"
+            );
         }
     }
 }
