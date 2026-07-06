@@ -19,7 +19,7 @@ use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
 use crate::streaming::{AnthropicStreamEvent, ContentDelta, NullStreamHandler};
 use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
@@ -176,109 +176,62 @@ impl LlmProvider for AnthropicProvider {
 
         let mut id = String::from("unknown");
         let mut model = String::new();
-        let mut text_parts: Vec<(usize, String)> = Vec::new();
-        let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = UsageInfo::default();
 
-        // We need to track tool use blocks being assembled from partial JSON.
-        // Use a simple per-index buffer.
-        let mut tool_buffers: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new(); // index -> (id, name, json_buf)
+        // Accumulate every content block (text, thinking, tool_use, …) keyed by
+        // its stream index. Captures thinking/signature/reasoning deltas (which
+        // the previous `_ => {}` arm silently dropped) and preserves interleave
+        // order via a single ordered pass. See issue #217.
+        let mut blocks = StreamBlockAccumulator::new();
 
         use futures::StreamExt;
         while let Some(result) = stream.next().await {
             match result {
                 Err(e) => return Err(e),
-                Ok(evt) => match evt {
-                    StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: msg_model,
-                        usage: msg_usage,
-                    } => {
-                        id = msg_id;
-                        model = msg_model;
-                        usage = msg_usage;
-                    }
-                    StreamEvent::ContentBlockStart {
-                        index,
-                        content_block,
-                    } => match content_block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push((index, text));
-                        }
-                        ContentBlock::ToolUse {
-                            id: tool_id,
-                            name,
-                            input: _,
+                Ok(evt) => {
+                    // Content-block events feed the accumulator; message
+                    // lifecycle events update the local id/model/usage/stop.
+                    blocks.on_event(&evt);
+                    match evt {
+                        StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: msg_model,
+                            usage: msg_usage,
                         } => {
-                            tool_buffers.insert(index, (tool_id, name, String::new()));
+                            id = msg_id;
+                            model = msg_model;
+                            usage = msg_usage;
                         }
-                        other => {
-                            content_blocks.push(other);
+                        StreamEvent::MessageDelta {
+                            stop_reason: sr,
+                            usage: delta_usage,
+                        } => {
+                            if let Some(r) = sr {
+                                stop_reason = r;
+                            }
+                            if let Some(u) = delta_usage {
+                                usage.output_tokens += u.output_tokens;
+                            }
                         }
-                    },
-                    StreamEvent::TextDelta { index, text } => {
-                        if let Some(entry) = text_parts.iter_mut().find(|(i, _)| *i == index) {
-                            entry.1.push_str(&text);
-                        }
-                    }
-                    StreamEvent::InputJsonDelta {
-                        index,
-                        partial_json,
-                    } => {
-                        if let Some((_, _, buf)) = tool_buffers.get_mut(&index) {
-                            buf.push_str(&partial_json);
-                        }
-                    }
-                    StreamEvent::ContentBlockStop { index } => {
-                        // Finalize any tool use block at this index.
-                        if let Some((tool_id, name, json_buf)) = tool_buffers.remove(&index) {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(serde_json::Value::Object(Default::default()));
-                            content_blocks.push(ContentBlock::ToolUse {
-                                id: tool_id,
-                                name,
-                                input,
+                        StreamEvent::MessageStop => break,
+                        StreamEvent::Error { error_type, message } => {
+                            return Err(ProviderError::StreamError {
+                                provider: self.id.clone(),
+                                message: format!("[{}] {}", error_type, message),
+                                partial_response: None,
                             });
                         }
+                        _ => {}
                     }
-                    StreamEvent::MessageDelta {
-                        stop_reason: sr,
-                        usage: delta_usage,
-                    } => {
-                        if let Some(r) = sr {
-                            stop_reason = r;
-                        }
-                        if let Some(u) = delta_usage {
-                            usage.output_tokens += u.output_tokens;
-                        }
-                    }
-                    StreamEvent::MessageStop => break,
-                    StreamEvent::Error { error_type, message } => {
-                        return Err(ProviderError::StreamError {
-                            provider: self.id.clone(),
-                            message: format!("[{}] {}", error_type, message),
-                            partial_response: None,
-                        });
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
-        // Assemble text blocks into content, sorted by index.
-        text_parts.sort_by_key(|(i, _)| *i);
-        let mut all_blocks: Vec<(usize, ContentBlock)> = text_parts
-            .into_iter()
-            .map(|(i, text)| (i, ContentBlock::Text { text }))
-            .collect();
-        // We don't have indices for the non-text blocks — just append them.
-        // In practice content blocks are already in-order from the stream.
-        for block in content_blocks {
-            all_blocks.push((usize::MAX, block));
-        }
-        let final_content: Vec<ContentBlock> = all_blocks.into_iter().map(|(_, b)| b).collect();
+        // Finalize every block in stream-index order — a single ordered pass
+        // that preserves interleave (thinking → text → tool_use, …). No block is
+        // appended out of band, so signed-thinking replay order is intact. #217.
+        let final_content: Vec<ContentBlock> = blocks.finish();
 
         Ok(ProviderResponse {
             id,

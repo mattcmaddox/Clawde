@@ -191,6 +191,160 @@ pub enum StreamEvent {
 }
 
 // ---------------------------------------------------------------------------
+// StreamBlockAccumulator
+// ---------------------------------------------------------------------------
+
+/// Partial content-block state accumulated while draining a `StreamEvent`
+/// stream. Mirrors the streaming `StreamAccumulator` in `lib.rs`, but over the
+/// provider-level [`StreamEvent`]/[`ContentBlock`] types.
+enum PartialBlock {
+    Text(String),
+    Thinking {
+        thinking_buf: String,
+        signature_buf: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        json_buf: String,
+    },
+    /// Any block that arrives fully-formed on `ContentBlockStart` and needs no
+    /// delta accumulation (e.g. `RedactedThinking`, images).
+    Passthrough(ContentBlock),
+}
+
+impl PartialBlock {
+    fn empty_thinking() -> Self {
+        PartialBlock::Thinking {
+            thinking_buf: String::new(),
+            signature_buf: String::new(),
+        }
+    }
+
+    fn from_start(block: ContentBlock) -> Self {
+        match block {
+            ContentBlock::Text { text } => PartialBlock::Text(text),
+            ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+                thinking_buf: thinking,
+                signature_buf: signature,
+            },
+            ContentBlock::ToolUse { id, name, .. } => PartialBlock::ToolUse {
+                id,
+                name,
+                json_buf: String::new(),
+            },
+            other => PartialBlock::Passthrough(other),
+        }
+    }
+
+    fn finish(self) -> ContentBlock {
+        match self {
+            PartialBlock::Text(text) => ContentBlock::Text { text },
+            PartialBlock::Thinking {
+                thinking_buf,
+                signature_buf,
+            } => ContentBlock::Thinking {
+                thinking: thinking_buf,
+                signature: signature_buf,
+            },
+            PartialBlock::ToolUse { id, name, json_buf } => {
+                let input =
+                    serde_json::from_str(&json_buf).unwrap_or(Value::Object(Default::default()));
+                ContentBlock::ToolUse { id, name, input }
+            }
+            PartialBlock::Passthrough(block) => block,
+        }
+    }
+}
+
+/// Aggregates provider-level [`StreamEvent`] content-block events into ordered,
+/// finalized [`ContentBlock`]s. Shared by the non-streaming `create_message`
+/// aggregators (Anthropic, MiniMax, …) so that `ThinkingDelta` / `SignatureDelta`
+/// / `ReasoningDelta` are captured into their block (rather than dropped) and
+/// every block — text, thinking, tool_use, and anything else — keeps the stream
+/// index it was emitted at. `finish()` is a single index-ordered pass, so the
+/// model's interleave order (thinking-first / signed-thinking replay) survives.
+/// See issue #217.
+#[derive(Default)]
+pub(crate) struct StreamBlockAccumulator {
+    partials: std::collections::BTreeMap<usize, PartialBlock>,
+}
+
+impl StreamBlockAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one `StreamEvent`. Only content-block events mutate state; message
+    /// lifecycle events (`MessageStart`, `MessageDelta`, `MessageStop`,
+    /// `ContentBlockStop`, `Error`) are ignored so callers still handle those
+    /// (id / model / usage / stop_reason) themselves.
+    pub(crate) fn on_event(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                self.partials
+                    .insert(*index, PartialBlock::from_start(content_block.clone()));
+            }
+            StreamEvent::TextDelta { index, text } => {
+                if let Some(PartialBlock::Text(buf)) = self.partials.get_mut(index) {
+                    buf.push_str(text);
+                }
+            }
+            StreamEvent::ThinkingDelta { index, thinking } => {
+                if let PartialBlock::Thinking { thinking_buf, .. } = self
+                    .partials
+                    .entry(*index)
+                    .or_insert_with(PartialBlock::empty_thinking)
+                {
+                    thinking_buf.push_str(thinking);
+                }
+            }
+            StreamEvent::ReasoningDelta { index, reasoning } => {
+                // `ReasoningDelta` is an alias for thinking text used by some
+                // providers; fold it into the same thinking block.
+                if let PartialBlock::Thinking { thinking_buf, .. } = self
+                    .partials
+                    .entry(*index)
+                    .or_insert_with(PartialBlock::empty_thinking)
+                {
+                    thinking_buf.push_str(reasoning);
+                }
+            }
+            StreamEvent::SignatureDelta { index, signature } => {
+                if let PartialBlock::Thinking { signature_buf, .. } = self
+                    .partials
+                    .entry(*index)
+                    .or_insert_with(PartialBlock::empty_thinking)
+                {
+                    signature_buf.push_str(signature);
+                }
+            }
+            StreamEvent::InputJsonDelta {
+                index,
+                partial_json,
+            } => {
+                if let Some(PartialBlock::ToolUse { json_buf, .. }) = self.partials.get_mut(index) {
+                    json_buf.push_str(partial_json);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Consume the accumulator, producing finalized content blocks in the
+    /// stream-index order the model emitted them.
+    pub(crate) fn finish(self) -> Vec<ContentBlock> {
+        self.partials
+            .into_values()
+            .map(PartialBlock::finish)
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ProviderCapabilities
 // ---------------------------------------------------------------------------
 
