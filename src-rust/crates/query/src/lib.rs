@@ -2149,23 +2149,14 @@ pub async fn run_query_loop(
                     })
                     .collect();
 
-                // Run all tool futures concurrently; join_all preserves order.
-                // But race the batch against the loop's cancel token (issue #218):
-                // on cancellation we abandon any in-flight tools promptly instead
-                // of blocking until the slowest one finishes, and synthesize a
-                // cancelled ToolResult for EVERY tool so each tool_use still gets a
-                // matching tool_result and the message history stays well-formed.
-                let mut batch_cancelled = false;
-                let exec_results: Vec<ToolResult> = tokio::select! {
-                    results = futures::future::join_all(exec_futures) => results,
-                    _ = tool_ctx.cancel_token.cancelled() => {
-                        batch_cancelled = true;
-                        prepared
-                            .iter()
-                            .map(|_| ToolResult::error(TOOL_CANCELLED_MSG))
-                            .collect()
-                    }
-                };
+                // Run all tool futures concurrently, but race the batch against the
+                // loop's cancel token (issue #218): on cancellation the in-flight
+                // tools are abandoned promptly instead of blocking until the
+                // slowest one finishes, and a cancelled ToolResult is synthesized
+                // for EVERY tool so each tool_use still gets a matching tool_result
+                // and the message history stays well-formed.
+                let (exec_results, batch_cancelled) =
+                    run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
                 // When the batch was cancelled we skip the awaiting PostToolUse
@@ -2341,6 +2332,34 @@ async fn execute_tool(
         None => {
             warn!(tool = name, "Unknown tool requested");
             ToolResult::error(format!("Unknown tool: {}", name))
+        }
+    }
+}
+
+/// Run a batch of tool-execution futures concurrently, abandoning them promptly
+/// if `cancel_token` fires (issue #218).
+///
+/// Returns exactly one `ToolResult` per input future, in order, plus a bool that
+/// is `true` iff the batch was cancelled before every tool finished. On the
+/// happy path (no cancellation) this is `join_all` and the results are the real
+/// tool outputs. On cancellation the in-flight futures are dropped (abandoned)
+/// and every position is filled with a synthetic cancelled `ToolResult` so the
+/// caller can still answer every `tool_use` and keep the message history valid.
+async fn run_tool_batch<F>(
+    exec_futures: Vec<F>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> (Vec<ToolResult>, bool)
+where
+    F: std::future::Future<Output = ToolResult>,
+{
+    let count = exec_futures.len();
+    tokio::select! {
+        results = futures::future::join_all(exec_futures) => (results, false),
+        _ = cancel_token.cancelled() => {
+            let cancelled = (0..count)
+                .map(|_| ToolResult::error(TOOL_CANCELLED_MSG))
+                .collect();
+            (cancelled, true)
         }
     }
 }
@@ -3029,6 +3048,93 @@ mod tests {
         assert!(permission_level_is_gated(PermissionLevel::Execute));
         assert!(permission_level_is_gated(PermissionLevel::Dangerous));
         assert!(permission_level_is_gated(PermissionLevel::Forbidden));
+    }
+
+    // ---- Issue #218: cancellation plumbing ---------------------------------
+
+    /// (a) The parallel tool executor (`run_tool_batch`, the exact code the query
+    /// loop runs) must abandon a long-running tool the moment the cancel token
+    /// fires: with a tool future that never completes and a pre-cancelled token,
+    /// the batch returns promptly instead of blocking, reports cancellation, and
+    /// still yields one cancelled `ToolResult` per tool so every `tool_use` can
+    /// be answered and the message history stays valid.
+    #[tokio::test]
+    async fn executor_abandons_in_flight_tools_on_cancel() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel(); // pre-cancelled
+
+        // Two tool futures: one that never completes (a long-running tool) and
+        // one that would succeed. Boxed so they share a concrete type.
+        let never: Pin<Box<dyn Future<Output = ToolResult> + Send>> =
+            Box::pin(std::future::pending());
+        let quick: Pin<Box<dyn Future<Output = ToolResult> + Send>> =
+            Box::pin(async { ToolResult::success("done") });
+
+        // If the executor blocked on the never-completing tool this would time
+        // out; it must return promptly instead.
+        let (results, cancelled) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_tool_batch(vec![never, quick], &cancel),
+        )
+        .await
+        .expect("executor must return promptly, not block on the pending tool");
+
+        assert!(cancelled, "batch must report that it was cancelled");
+        assert_eq!(
+            results.len(),
+            2,
+            "every tool_use must still receive a tool_result"
+        );
+        assert!(
+            results.iter().all(|r| r.is_error),
+            "cancelled tool results are errors"
+        );
+        assert!(
+            results[0].content.contains("cancelled"),
+            "cancelled result should say so, got: {}",
+            results[0].content
+        );
+    }
+
+    /// The happy path is unchanged: with a live (never-cancelled) token the batch
+    /// runs the futures to completion and returns their real results in order.
+    #[tokio::test]
+    async fn executor_runs_to_completion_without_cancel() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // `std::future::ready` gives both futures the same concrete type so they
+        // share a Vec (mirroring the Either-unified futures the real loop builds).
+        let f1 = std::future::ready(ToolResult::success("a"));
+        let f2 = std::future::ready(ToolResult::error("b"));
+
+        let (results, cancelled) = run_tool_batch(vec![f1, f2], &cancel).await;
+
+        assert!(!cancelled, "no cancellation should have occurred");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "a");
+        assert!(!results[0].is_error);
+        assert_eq!(results[1].content, "b");
+        assert!(results[1].is_error);
+    }
+
+    /// (b) A sub-agent receives a CHILD of the parent's cancel token — exactly
+    /// how `AgentTool` derives it from `ctx.cancel_token` — so cancelling the
+    /// parent query propagates into the sub-agent. `ToolContext` now exposes the
+    /// token, and cancelling it must flip the child.
+    #[test]
+    fn subagent_child_token_propagates_parent_cancel() {
+        let ctx = deny_all_context();
+        // AgentTool spawns each sub-agent with a token derived exactly this way.
+        let child = ctx.cancel_token.child_token();
+
+        assert!(!child.is_cancelled(), "child starts live");
+        ctx.cancel_token.cancel();
+        assert!(
+            child.is_cancelled(),
+            "cancelling the parent's token must cancel the sub-agent's child token"
+        );
     }
 }
 
