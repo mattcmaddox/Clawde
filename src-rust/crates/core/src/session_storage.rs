@@ -506,6 +506,76 @@ pub async fn truncate_after(path: &Path, from_uuid: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// Append a `leaf` entry pointing the active tip at `leaf_uuid` (or reset the
+/// active branch to empty when `leaf_uuid` is `None`).
+///
+/// This is append-only and therefore NON-destructive: later entries stay on
+/// disk as a sibling branch. On the next load, [`active_branch_messages`]
+/// follows this pointer to reconstruct the active conversation. This is the
+/// storage primitive behind non-destructive revert/fork (#234).
+pub async fn set_leaf(path: &Path, leaf_uuid: Option<&str>) -> crate::Result<()> {
+    let entry = TranscriptEntry::Leaf(LeafEntry {
+        leaf_uuid: leaf_uuid.map(|s| s.to_string()),
+    });
+    write_transcript_entry(path, &entry).await
+}
+
+/// Non-destructive counterpart to [`truncate_after`].
+///
+/// Finds the entry whose *message* uuid matches `target_message_uuid` — the
+/// same key [`truncate_after`] uses — and points the active leaf at that
+/// entry's parent, so the target turn and everything after it are retained on a
+/// sibling branch instead of being deleted. On the next load,
+/// [`active_branch_messages`] reconstructs the conversation ending just before
+/// the target.
+///
+/// Returns `Ok(true)` if a leaf pointer was written, `Ok(false)` if the target
+/// uuid was not found (a no-op, matching `truncate_after`'s not-found case).
+///
+/// Back-compat guard: if the target is *not* the first turn yet has no
+/// `parentUuid` (an unchained/legacy transcript where a leaf walk cannot
+/// recover the retained prefix), this falls back to the destructive
+/// [`truncate_after`] so behavior is never worse than before.
+pub async fn branch_before(path: &Path, target_message_uuid: &str) -> crate::Result<bool> {
+    let entries = load_transcript(path).await?;
+
+    let mut first_participant: Option<&str> = None;
+    let mut target: Option<&TranscriptMessage> = None;
+    for e in &entries {
+        let m = match e {
+            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m) => m,
+            _ => continue,
+        };
+        let mid = m.message.uuid.as_deref();
+        if first_participant.is_none() {
+            first_participant = mid;
+        }
+        if mid == Some(target_message_uuid) {
+            target = Some(m);
+            break;
+        }
+    }
+
+    let target = match target {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+
+    let parent = target.parent_uuid.as_deref();
+    let is_first = first_participant == Some(target_message_uuid);
+
+    if parent.is_none() && !is_first {
+        // Legacy transcript with no walkable parent chain: pointing the leaf at
+        // "before the target" would drop the retained prefix on reconstruction.
+        // Preserve exact legacy behavior instead.
+        truncate_after(path, target_message_uuid).await?;
+        return Ok(true);
+    }
+
+    set_leaf(path, parent).await?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helper: read tail metadata without a full parse
 // ---------------------------------------------------------------------------
@@ -1011,6 +1081,120 @@ mod tests {
         let reset = TranscriptEntry::Leaf(LeafEntry { leaf_uuid: None });
         let s2 = serde_json::to_string(&reset).unwrap();
         assert_eq!(s2, "{\"type\":\"leaf\"}");
+    }
+
+    /// Build a `Message` whose inner uuid equals the entry uuid, so the tree
+    /// (entry-level) and revert key (message-level) uuids coincide.
+    fn msg_with_uuid(role: Role, uuid: &str, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.to_string()),
+            uuid: Some(uuid.to_string()),
+            cost: None,
+            snapshot_patch: None,
+        }
+    }
+
+    /// Write a linear, properly-chained transcript to disk and return the path.
+    async fn write_chain(dir: &std::path::Path, chained: bool) -> PathBuf {
+        let path = dir.join("chain.jsonl");
+        // u1 -> a1 -> u2 -> a2
+        let steps = [
+            (Role::User, "u1", None, "start"),
+            (Role::Assistant, "a1", Some("u1"), "ok"),
+            (Role::User, "u2", Some("a1"), "next"),
+            (Role::Assistant, "a2", Some("u2"), "reply"),
+        ];
+        for (role, uuid, parent, text) in steps {
+            let parent = if chained { parent } else { None };
+            let is_assistant = role == Role::Assistant;
+            let msg = msg_with_uuid(role, uuid, text);
+            let entry = if is_assistant {
+                make_assistant_entry(msg, uuid, parent, "sess", "/proj")
+            } else {
+                make_user_entry(msg, uuid, parent, "sess", "/proj")
+            };
+            write_transcript_entry(&path, &entry).await.unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn set_leaf_appends_pointer() {
+        let dir = tempdir().unwrap();
+        let path = write_chain(dir.path(), true).await;
+        set_leaf(&path, Some("a1")).await.unwrap();
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(
+            last_leaf(&entries).and_then(|l| l.leaf_uuid.as_deref()),
+            Some("a1")
+        );
+    }
+
+    /// Non-destructive branch: reverting the last assistant turn points the leaf
+    /// at its parent, keeps the later entry on disk, and yields the right
+    /// active conversation on reload.
+    #[tokio::test]
+    async fn branch_before_retains_later_entries_and_sets_leaf() {
+        let dir = tempdir().unwrap();
+        let path = write_chain(dir.path(), true).await;
+
+        let branched = branch_before(&path, "a2").await.unwrap();
+        assert!(branched);
+
+        // The reverted turn is still physically on disk (non-destructive).
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("\"reply\""), "later entry must be retained on disk");
+
+        // Reconstructed active branch ends just before the reverted turn.
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(
+            last_leaf(&entries).and_then(|l| l.leaf_uuid.as_deref()),
+            Some("u2")
+        );
+        let active = active_branch_messages(&entries);
+        assert_eq!(texts(&active), vec!["start", "ok", "next"]);
+
+        // The abandoned turn can be recovered by re-pointing the leaf.
+        set_leaf(&path, Some("a2")).await.unwrap();
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(
+            texts(&active_branch_messages(&entries)),
+            vec!["start", "ok", "next", "reply"]
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_before_not_found_is_noop() {
+        let dir = tempdir().unwrap();
+        let path = write_chain(dir.path(), true).await;
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+
+        let branched = branch_before(&path, "no-such-uuid").await.unwrap();
+        assert!(!branched);
+
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(before, after, "no-op must not modify the file");
+    }
+
+    /// When the transcript has no walkable parent chain, branch_before must fall
+    /// back to the destructive truncate so the retained prefix is not lost.
+    #[tokio::test]
+    async fn branch_before_falls_back_when_unchained() {
+        let dir = tempdir().unwrap();
+        let path = write_chain(dir.path(), false).await; // parent_uuid all None
+
+        let branched = branch_before(&path, "a2").await.unwrap();
+        assert!(branched);
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        // Destructive fallback dropped the reverted turn and wrote no leaf.
+        assert!(!raw.contains("\"reply\""), "unchained fallback truncates the turn");
+        assert!(!raw.contains("\"type\":\"leaf\""), "fallback writes no leaf pointer");
+
+        let entries = load_transcript(&path).await.unwrap();
+        assert!(last_leaf(&entries).is_none());
+        assert_eq!(texts(&active_branch_messages(&entries)), vec!["start", "ok", "next"]);
     }
 
     #[test]
