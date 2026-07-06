@@ -1317,6 +1317,20 @@ fn home_dir() -> Option<String> {
 /// in `paste_contents` for retrieval at submit time.  This mirrors opencode's
 /// behaviour and prevents the input box from flooding with multi-hundred-line
 /// pastes.  Single-line short strings are inserted verbatim.
+/// Normalize `\r\n` and lone `\r` into `\n`.
+///
+/// The prompt buffer must never contain a bare carriage return: the renderer
+/// splits logical lines on `\n` and advances the cursor's byte offset assuming
+/// a single-byte separator, so a `\r` (or CRLF pair) desyncs that accounting
+/// and can slice mid-codepoint (#221).
+fn normalize_newlines(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn handle_paste(
     content: &str,
     paste_counter: &mut u32,
@@ -1693,6 +1707,10 @@ impl PromptInputState {
         if let Some(stored_content) = stored {
             self.paste_contents.insert(self.paste_counter, stored_content);
         }
+        // Normalize CRLF / lone CR into LF before inserting. A stray '\r' in
+        // the buffer desyncs the render cursor's byte accounting (which assumes
+        // a 1-byte '\n' separator) and can slice mid-codepoint (#221).
+        let text = normalize_newlines(&text);
         for c in text.chars() {
             self.text.insert(self.cursor, c);
             self.cursor += c.len_utf8();
@@ -2964,17 +2982,12 @@ pub fn render_prompt_input(
     // Text rows start 1 row below the top separator.
     let text_start_y = area.y + 1;
 
-    // Split into logical lines; guarantee at least one.
-    let logical_lines: Vec<String> = {
-        let collected: Vec<String> = display_text.lines().map(|l| l.to_string()).collect();
-        if display_text.ends_with('\n') || collected.is_empty() {
-            let mut v = collected;
-            v.push(String::new());
-            v
-        } else {
-            collected
-        }
-    };
+    // Split into logical lines on '\n'. Using `split` (not `.lines()`, which
+    // strips '\r') keeps the byte accounting below in sync with the buffer:
+    // each logical line is separated by exactly one '\n' byte, and text ending
+    // in '\n' naturally yields a trailing empty line. `split` always yields at
+    // least one element, so there is always >= 1 logical line (#221).
+    let logical_lines: Vec<String> = display_text.split('\n').map(|l| l.to_string()).collect();
 
     let text_style = if state.text.is_empty() && !focused {
         Style::default().fg(Color::DarkGray)
@@ -3007,8 +3020,14 @@ pub fn render_prompt_input(
             // The +1 accounts for the '\n' between logical lines (last line has no trailing \n).
             let line_end_byte = byte_idx + line_bytes;
             if state.cursor <= line_end_byte {
-                let intra_byte = state.cursor - byte_idx;
-                let display_col = UnicodeWidthStr::width(&line_text[..intra_byte.min(line_bytes)]);
+                // Clamp the cursor into this line, then walk back to a char
+                // boundary so a multibyte codepoint straddling the cut never
+                // panics the slice (#221).
+                let mut intra_byte = (state.cursor - byte_idx).min(line_bytes);
+                while intra_byte > 0 && !line_text.is_char_boundary(intra_byte) {
+                    intra_byte -= 1;
+                }
+                let display_col = UnicodeWidthStr::width(&line_text[..intra_byte]);
                 found = Some((li, display_col));
                 break 'outer;
             }
@@ -4512,5 +4531,36 @@ mod tests {
         s.accept_suggestion();
         assert_eq!(s.text, "@src/main.rs more text");
         assert_eq!(s.cursor, "@src/main.rs".len());
+    }
+
+    // ---- #221: CRLF + multibyte paste/render safety --------------------
+
+    #[test]
+    fn paste_normalizes_crlf_and_lone_cr() {
+        // A stray '\r' must never enter the buffer: it desyncs the renderer's
+        // cursor byte accounting (which assumes a 1-byte separator) (#221).
+        let mut s = PromptInputState::new();
+        s.paste("x\r\né");
+        assert_eq!(s.text, "x\né");
+        assert!(!s.text.contains('\r'));
+        assert!(s.text.is_char_boundary(s.cursor));
+
+        let mut s2 = PromptInputState::new();
+        s2.paste("a\rb");
+        assert_eq!(s2.text, "a\nb");
+    }
+
+    #[test]
+    fn render_crlf_multibyte_cursor_midcodepoint_no_panic() {
+        // Seed a buffer with CRLF + a 2-byte char and place the cursor where the
+        // pre-fix accounting mapped mid-codepoint (`&"é"[..1]`) and panicked.
+        let mut s = PromptInputState::new();
+        s.text = "x\r\né".to_string();
+        s.cursor = 3; // byte offset of the start of 'é' (a valid boundary)
+
+        let area = Rect { x: 0, y: 0, width: 12, height: 4 };
+        let mut buf = Buffer::empty(area);
+        // Reaching the end of this call without panicking is the assertion.
+        render_prompt_input(&s, area, &mut buf, true, InputMode::Default, Color::Blue, false);
     }
 }
