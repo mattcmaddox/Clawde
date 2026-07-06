@@ -1698,7 +1698,7 @@ async fn run_interactive(
         render::render_app, restore_terminal, setup_terminal, App,
         device_auth_dialog::DeviceAuthEvent,
     };
-    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -2125,7 +2125,17 @@ async fn run_interactive(
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.any_modal_open();
-                    if key.code == KeyCode::Enter && app.is_streaming && !any_dialog_open {
+                    // Only a bare Enter submits/queues. A *modified* Enter
+                    // (Shift/Alt/Ctrl+Enter) means "insert a newline" and must
+                    // fall through to app.handle_key_event below, which inserts
+                    // it into the prompt buffer. Ctrl+J (a non-Enter key) is the
+                    // other newline escape and never reaches these branches.
+                    // (issue #224 — Shift+Enter inserts a newline; Enter submits.)
+                    let plain_enter = key.code == KeyCode::Enter
+                        && !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL);
+                    if plain_enter && app.is_streaming && !any_dialog_open {
                         // Queue the message: it will auto-submit once the
                         // current turn finishes (issue #149).
                         let input = app.take_input();
@@ -2141,7 +2151,7 @@ async fn run_interactive(
                         }
                         continue;
                     }
-                    if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter && !app.is_streaming && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some()
