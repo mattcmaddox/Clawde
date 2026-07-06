@@ -275,6 +275,7 @@ pub async fn write_transcript_entry(
     // Ensure parent directory exists before attempting the write.
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
+        crate::accounts::set_user_only_dir_perms(parent);
     }
 
     // Open in append mode; create if absent.
@@ -286,6 +287,9 @@ pub async fn write_transcript_entry(
         .await?;
 
     file.write_all(line.as_bytes()).await?;
+    // Transcripts may contain secrets read into context; keep them
+    // owner-only (issue #212).
+    crate::accounts::set_user_only_perms(path);
     Ok(())
 }
 
@@ -473,6 +477,8 @@ pub async fn truncate_after(path: &Path, from_uuid: &str) -> crate::Result<()> {
         lines.push('\n');
     }
     tokio::fs::write(path, lines).await?;
+    // Preserve owner-only perms across the full rewrite (issue #212).
+    crate::accounts::set_user_only_perms(path);
     Ok(())
 }
 

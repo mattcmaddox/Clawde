@@ -3278,9 +3278,13 @@ pub mod history {
     pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
         let dir = sessions_dir();
         tokio::fs::create_dir_all(&dir).await?;
+        crate::accounts::set_user_only_dir_perms(&dir);
         let path = dir.join(format!("{}.json", session.id));
         let content = serde_json::to_string_pretty(session)?;
         tokio::fs::write(&path, content).await?;
+        // Session transcripts can contain secrets pulled into context; keep
+        // them owner-only (issue #212).
+        crate::accounts::set_user_only_perms(&path);
         Ok(())
     }
 
