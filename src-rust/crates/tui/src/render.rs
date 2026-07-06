@@ -2740,13 +2740,11 @@ fn render_legacy_history_search(
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let truncated = if UnicodeWidthStr::width(entry) > (dialog_width as usize - 6) {
-                let mut s = entry.to_string();
-                s.truncate(dialog_width as usize - 9);
-                format!("{}\u{2026}", s)
-            } else {
-                entry.to_string()
-            };
+            // truncate_end is width-aware, cuts on char boundaries, and appends
+            // its own ellipsis. The old code did `String::truncate` on a raw
+            // byte index (panics mid-codepoint) after a `usize` subtraction that
+            // could underflow-panic on a narrow terminal (#221).
+            let truncated = truncate_end(entry, (dialog_width as usize).saturating_sub(6));
 
             let (prefix, style) = if is_selected {
                 (
@@ -3184,5 +3182,26 @@ mod tool_block_tests {
         assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
+    }
+
+    #[test]
+    fn legacy_history_search_narrow_multibyte_no_panic() {
+        use crate::app::{App, HistorySearch};
+        use claurst_core::config::Config;
+        use claurst_core::cost::CostTracker;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.prompt_input.history = vec!["\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(6)]; // wide CJK
+        let mut hs = HistorySearch::new();
+        hs.matches = vec![0];
+
+        // width 10 -> dialog_width 6 -> `dialog_width - 9` underflow-panicked
+        // pre-fix, and `String::truncate` on a byte index sliced the CJK entry
+        // mid-codepoint (#221). No panic == pass.
+        let mut terminal = Terminal::new(TestBackend::new(10, 12)).unwrap();
+        terminal
+            .draw(|frame| render_legacy_history_search(frame, &hs, &app, frame.area()))
+            .unwrap();
     }
 }
