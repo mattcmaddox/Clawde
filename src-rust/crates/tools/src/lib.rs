@@ -526,6 +526,23 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool is "advanced" / rarely used and a candidate for
+    /// deferred (on-demand) disclosure rather than being sent in every request.
+    ///
+    /// Defaults to `false` (always disclosed). This is purely a metadata hint
+    /// today — the prompt/tool-definition layer can read it to decide which
+    /// tools to omit from the initial request and surface only via `ToolSearch`.
+    ///
+    // TODO(#233): wire this into the request assembly so `advanced()` tools are
+    // omitted from the initial `tools` array and loaded on demand. That requires
+    // a mutable *active tool set* tracked across turns inside `run_query_loop`,
+    // which is under active refactor on other branches and intentionally left
+    // untouched here. Land the tracking + gated re-injection there, then have
+    // `all_tools()` callers filter on `advanced()` for the first request.
+    fn advanced(&self) -> bool {
+        false
+    }
+
     /// JSON Schema describing the tool's input parameters.
     fn input_schema(&self) -> Value;
 
