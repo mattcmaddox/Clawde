@@ -18,6 +18,7 @@ pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod sanitize;
 pub mod session_memory;
 pub mod skill_prefetch;
 pub use agent_tool::{AgentTool, init_team_swarm_runner};
@@ -27,6 +28,7 @@ pub use goal_loop::{GoalContinuation, StopReason, check_and_continue_goal, mark_
 pub use skill_prefetch::{
     SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
+pub use sanitize::sanitize_history;
 pub use compact::{
     AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
