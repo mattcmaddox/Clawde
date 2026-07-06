@@ -12,6 +12,7 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
+pub mod continuation;
 pub mod goal_loop;
 pub mod managed_orchestrator;
 pub mod compact;
@@ -23,6 +24,9 @@ pub mod session_memory;
 pub mod skill_prefetch;
 pub use agent_tool::{AgentTool, init_team_swarm_runner};
 pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
+pub use continuation::{
+    ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
+};
 pub use cron_scheduler::start_cron_scheduler;
 pub use goal_loop::{GoalContinuation, StopReason, check_and_continue_goal, mark_goal_complete};
 pub use skill_prefetch::{
@@ -145,6 +149,13 @@ pub struct QueryConfig {
     // future hook inside the loop) should set this field to activate
     // progressive tool disclosure in production.
     pub enabled_tools: Option<Vec<String>>,
+    /// End-of-turn continuation policy (issue #230 / MI-3).
+    ///
+    /// `Default` stops after one turn (normal, non-goal behaviour). Goal-driven
+    /// autonomy selects `Goal`, which keeps the loop running while an active
+    /// goal's guards allow, injecting the goal continuation message as the next
+    /// user turn — instead of the CLI REPL re-dispatching a fresh turn.
+    pub continuation: crate::continuation::ContinuationMode,
 }
 
 impl Default for QueryConfig {
@@ -172,6 +183,7 @@ impl Default for QueryConfig {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            continuation: crate::continuation::ContinuationMode::Default,
         }
     }
 }
@@ -827,6 +839,17 @@ pub async fn run_query_loop(
         .and_then(|a| a.max_turns)
         .unwrap_or(config.max_turns);
 
+    // In-loop continuation policy (issue #230 / MI-3). Consulted at the end of
+    // every turn that finishes with `end_turn`. The default policy stops after
+    // one turn; the goal policy keeps the loop running while an active goal's
+    // guards allow. Built once per run.
+    let continuation_policy = config.continuation.policy();
+    // Wall-clock start of the current "continuation turn" (a span from a user /
+    // continuation message to the next `end_turn`). Reset on each accepted
+    // continuation so goal time/turn accounting matches the old per-dispatch
+    // measurement.
+    let mut goal_turn_start = std::time::Instant::now();
+
     // Shadow-git snapshot: capture the worktree state before any tools run so we
     // can produce a per-turn file-change patch when the turn ends.
     let shadow_snap: Option<std::sync::Arc<claurst_core::snapshot::ShadowSnapshot>> =
@@ -864,6 +887,52 @@ pub async fn run_query_loop(
                 message: last_msg,
                 usage: UsageInfo::default(),
             };
+        }
+
+        // Continuation decision at `end_turn` (issue #230 / MI-3). Consults the
+        // active continuation policy: `Continue` injects the follow-up message
+        // as the next user turn and keeps looping (resetting the per-turn budget
+        // so `effective_max_turns` bounds tool-rounds *within* a continuation
+        // turn — the cross-turn cap is the policy's own guard, e.g. the goal
+        // runaway limit); `Stop` surfaces any note and returns `EndTurn`.
+        // Defined as a macro because it must `continue`/`return` the loop.
+        macro_rules! continue_or_end {
+            ($assistant_msg:expr, $usage:expr) => {{
+                let decision = continuation_policy.decide(&crate::continuation::TurnEndContext {
+                    session_id: &tool_ctx.session_id,
+                    total_tokens_used: cost_tracker.total_tokens(),
+                    turn_elapsed_secs: goal_turn_start.elapsed().as_secs(),
+                });
+                match decision {
+                    crate::continuation::ContinuationDecision::Continue { message } => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(
+                                "Goal: continuing autonomously… (use /goal pause to stop)"
+                                    .to_string(),
+                            ));
+                        }
+                        messages.push(Message::user(message));
+                        // Fresh per-continuation-turn budget, mirroring the old
+                        // one-loop-per-goal-turn design.
+                        turn = 0;
+                        max_tokens_recovery_count = 0;
+                        retries_left = 2;
+                        goal_turn_start = std::time::Instant::now();
+                        continue;
+                    }
+                    crate::continuation::ContinuationDecision::Stop { note } => {
+                        if let Some(note) = note {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Status(note));
+                            }
+                        }
+                        return QueryOutcome::EndTurn {
+                            message: $assistant_msg,
+                            usage: $usage,
+                        };
+                    }
+                }
+            }};
         }
 
         // Check for cancellation
@@ -1566,10 +1635,7 @@ pub async fn run_query_loop(
                         }
                     }
 
-                    return QueryOutcome::EndTurn {
-                        message: assistant_msg,
-                        usage,
-                    };
+                    continue_or_end!(assistant_msg, usage);
                 } else if provider_id_str != "anthropic" {
                     // Non-Anthropic provider detected but no API key / credentials
                     // available.  Return a clear error instead of silently falling
@@ -2021,10 +2087,7 @@ pub async fn run_query_loop(
                     }
                 }
 
-                return QueryOutcome::EndTurn {
-                    message: assistant_msg,
-                    usage,
-                };
+                continue_or_end!(assistant_msg, usage);
             }
             "max_tokens" => {
                 // Mirror the TS recovery loop: inject a continuation nudge and
@@ -2263,10 +2326,7 @@ pub async fn run_query_loop(
                         assistant_msg.snapshot_patch = Some(patch);
                     }
                 }
-                return QueryOutcome::EndTurn {
-                    message: assistant_msg,
-                    usage,
-                };
+                continue_or_end!(assistant_msg, usage);
             }
             other => {
                 warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
@@ -2282,10 +2342,7 @@ pub async fn run_query_loop(
                         assistant_msg.snapshot_patch = Some(patch);
                     }
                 }
-                return QueryOutcome::EndTurn {
-                    message: assistant_msg,
-                    usage,
-                };
+                continue_or_end!(assistant_msg, usage);
             }
         }
     }
@@ -2565,6 +2622,7 @@ mod tests {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            continuation: crate::continuation::ContinuationMode::Default,
         }
     }
 
