@@ -1210,12 +1210,11 @@ fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width
 fn append_turn_items(
     items: &mut Vec<RenderedLineItem>,
     turn: &TranscriptTurn<'_>,
-    width: u16,
-    tool_names: &std::collections::HashMap<String, String>,
-    expanded_thinking: &std::collections::HashSet<u64>,
+    ctx: &RenderContext,
     frame_count: u64,
     accent: Color,
 ) {
+    let width = ctx.width;
     push_rendered_items(
         items,
         render_transcript_user_message(turn.user_message, turn.metadata, width),
@@ -1230,16 +1229,7 @@ fn append_turn_items(
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
     for (message_index, message) in &turn.assistant_messages {
-        let tagged = render_transcript_assistant_message_tagged(
-            message,
-            &RenderContext {
-                width,
-                highlight: true,
-                show_thinking: false,
-                tool_names: tool_names.clone(),
-                expanded_thinking: expanded_thinking.clone(),
-            },
-        );
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
         if !tagged.is_empty() {
             sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
         }
@@ -1348,7 +1338,17 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         thinking_expanded_len: app.thinking_expanded.len(),
     };
     let build_items = || {
+        // Build `tool_names` and the render context ONCE per rebuild and lend
+        // them to every message renderer, instead of cloning a HashMap+HashSet
+        // for each assistant message (issue #222).
         let tool_names = build_tool_names(&app.messages);
+        let ctx = RenderContext {
+            width,
+            highlight: true,
+            show_thinking: false,
+            tool_names: &tool_names,
+            expanded_thinking: &app.thinking_expanded,
+        };
         let turns = build_transcript_turns(app);
         let mut turn_map = std::collections::HashMap::new();
         for turn in &turns {
@@ -1375,9 +1375,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     append_turn_items(
                         &mut items,
                         turn,
-                        width,
-                        &tool_names,
-                        &app.thinking_expanded,
+                        &ctx,
                         app.frame_count,
                         app.accent_color,
                     );
@@ -1386,16 +1384,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 }
             }
 
-            let tagged = render_transcript_assistant_message_tagged(
-                message,
-                &RenderContext {
-                    width,
-                    highlight: true,
-                    show_thinking: false,
-                    tool_names: tool_names.clone(),
-                    expanded_thinking: app.thinking_expanded.clone(),
-                },
-            );
+            let tagged = render_transcript_assistant_message_tagged(message, &ctx);
             push_rendered_items_tagged(&mut items, tagged, Some(index));
             push_blank_item(&mut items);
             index += 1;

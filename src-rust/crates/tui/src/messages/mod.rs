@@ -27,7 +27,12 @@ pub use markdown_enhanced::{
 };
 
 /// Context passed to all renderers.
-pub struct RenderContext {
+///
+/// `tool_names` and `expanded_thinking` are borrowed rather than owned: the
+/// transcript builder holds a single copy of each per render pass and lends it
+/// to every message renderer, so the hot path no longer clones a `HashMap` and
+/// a `HashSet` for every assistant message (see issue #222).
+pub struct RenderContext<'a> {
     /// Current terminal width (for word-wrap decisions).
     pub width: u16,
     /// Whether syntax highlighting is enabled.
@@ -36,19 +41,26 @@ pub struct RenderContext {
     pub show_thinking: bool,
     /// Maps `tool_use_id` → `tool_name` so ToolResult blocks can dispatch to
     /// the correct specialized renderer (e.g. Bash output vs. generic result).
-    pub tool_names: HashMap<String, String>,
+    pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
-    pub expanded_thinking: std::collections::HashSet<u64>,
+    pub expanded_thinking: &'a std::collections::HashSet<u64>,
 }
 
-impl Default for RenderContext {
+/// Shared empty collections so `RenderContext::default()` can hand out
+/// `'static` borrows without allocating.
+static EMPTY_TOOL_NAMES: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_EXPANDED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
+
+impl Default for RenderContext<'static> {
     fn default() -> Self {
         Self {
             width: 80,
             highlight: true,
             show_thinking: false,
-            tool_names: HashMap::new(),
-            expanded_thinking: std::collections::HashSet::new(),
+            tool_names: &EMPTY_TOOL_NAMES,
+            expanded_thinking: &EMPTY_EXPANDED_THINKING,
         }
     }
 }
@@ -2330,7 +2342,7 @@ mod tests {
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext { tool_names: &tool_names, ..Default::default() };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
