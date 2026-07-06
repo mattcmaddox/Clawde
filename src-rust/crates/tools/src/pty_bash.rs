@@ -371,7 +371,6 @@ async fn run_in_pty(
     timeout: Duration,
 ) -> PtyOutcome {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use std::io::Read;
 
     let pty_system = native_pty_system();
 
@@ -414,37 +413,15 @@ async fn run_in_pty(
     let master = pair.master;
 
     // Read all PTY output in a blocking thread (portable_pty reader is sync) and
-    // reap the child there so we can return its exit code.
+    // reap the child there so we can return its exit code. drive_pty_child stops
+    // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
+    // which a detached grandchild would hold open forever (#184).
     let read_handle = tokio::task::spawn_blocking(move || {
-        let mut child = child;
-        let mut reader = reader;
-        let mut output = String::new();
-        let mut buf = [0u8; 4096];
-        const MAX_BYTES: usize = 2 * 1024 * 1024;
-        let mut total = 0usize;
-
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    total += n;
-                    if total > MAX_BYTES {
-                        output.push_str("\n[output truncated at 2 MB limit]");
-                        break;
-                    }
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-                Err(_) => break,
-            }
-        }
-
-        let exit_code = match child.wait() {
-            Ok(status) => status.exit_code() as i32,
-            Err(_) => -1,
-        };
+        let master_fd = master.as_raw_fd();
+        let result = drive_pty_child(child, reader, master_fd);
         // Keep the master fd alive until reading + reaping is complete.
         drop(master);
-        (output, exit_code)
+        result
     });
 
     // Kill-on-drop guard: if this future is dropped mid-command (turn cancelled)
@@ -467,6 +444,112 @@ async fn run_in_pty(
             PtyOutcome::TimedOut
         }
     }
+}
+
+/// Poll interval used to wake the PTY read loop so it can notice that the direct
+/// child has exited even while a detached grandchild still holds the pty open.
+#[cfg(unix)]
+const PTY_POLL_INTERVAL_MS: i32 = 20;
+
+/// Wait up to `timeout_ms` for `fd` to become readable. Returns `true` when the
+/// caller should attempt a read — data ready, EOF/hangup, or a poll error we'd
+/// rather surface through `read` — and `false` on a clean timeout with nothing
+/// pending.
+#[cfg(unix)]
+fn poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, timeout_ms) };
+        if rc < 0 {
+            // Retry on EINTR; on any other error let the subsequent `read` surface it.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return true;
+        }
+        // rc == 0 → clean timeout, nothing ready. rc > 0 → POLLIN/POLLHUP/POLLERR.
+        return rc > 0;
+    }
+}
+
+/// Drive a spawned PTY child to completion: read its output while it runs, reap
+/// it, and return `(output, exit_code)`.
+///
+/// Crucially — and mirroring bash.rs's `drive_child` — the loop stops as soon as
+/// the DIRECT child exits rather than waiting for pty EOF. A grandchild that
+/// detached into its own session (`setsid`) inherits the pty slave and would
+/// otherwise hold it open indefinitely, hanging the tool for the grandchild's
+/// full lifetime (#184). `poll_readable` lets the blocking read wake up
+/// periodically so we can re-check `try_wait()` without spinning.
+#[cfg(unix)]
+fn drive_pty_child(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut reader: Box<dyn std::io::Read + Send>,
+    master_fd: Option<std::os::unix::io::RawFd>,
+) -> (String, i32) {
+    use std::io::Read;
+
+    let mut output = String::new();
+    let mut buf = [0u8; 4096];
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    let mut total = 0usize;
+
+    // Set once the direct child has exited. We then drain any already-buffered
+    // pty output and stop — we never block waiting for EOF that a detached
+    // grandchild would hold open forever (#184).
+    let mut child_exited = false;
+
+    loop {
+        // Wait briefly for data. When we can poll, this lets the loop wake up to
+        // re-check the child's liveness even while the pty is held open elsewhere.
+        let data_ready = match master_fd {
+            Some(fd) => poll_readable(fd, PTY_POLL_INTERVAL_MS),
+            None => true, // can't poll — fall back to a plain blocking read
+        };
+
+        if data_ready {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF: every pty writer (incl. the child) is gone
+                Ok(n) => {
+                    total += n;
+                    if total > MAX_BYTES {
+                        output.push_str("\n[output truncated at 2 MB limit]");
+                        break;
+                    }
+                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    continue; // keep draining while bytes remain
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+        }
+
+        // Nothing was ready this cycle.
+        if child_exited {
+            // Direct child already exited and the pty is now idle → stop instead
+            // of hanging on a detached grandchild still holding it open (#184).
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Direct child is done. Loop once more to drain any final buffered
+                // bytes; the `child_exited` guard above then breaks us out.
+                child_exited = true;
+            }
+            Ok(None) => {}   // still running
+            Err(_) => break, // can't observe the child — bail rather than spin
+        }
+    }
+
+    let exit_code = match child.wait() {
+        Ok(status) => status.exit_code() as i32,
+        Err(_) => -1,
+    };
+    (output, exit_code)
 }
 
 // ---------------------------------------------------------------------------
