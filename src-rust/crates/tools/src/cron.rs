@@ -260,6 +260,9 @@ fn default_true() -> bool { true }
 
 #[async_trait]
 impl Tool for CronCreateTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "CronCreate" }
 
     fn description(&self) -> &str {

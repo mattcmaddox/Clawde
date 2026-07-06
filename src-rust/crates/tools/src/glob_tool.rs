@@ -18,6 +18,9 @@ struct GlobInput {
 
 #[async_trait]
 impl Tool for GlobTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GLOB
     }

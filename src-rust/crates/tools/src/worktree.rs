@@ -55,6 +55,10 @@ struct EnterWorktreeInput {
 
 #[async_trait]
 impl Tool for EnterWorktreeTool {
+    // Gates itself: prompts for worktree creation AND for the post_create_command
+    // in `execute()` (#210). The central backstop must not also prompt.
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "EnterWorktree" }
 
     fn description(&self) -> &str {

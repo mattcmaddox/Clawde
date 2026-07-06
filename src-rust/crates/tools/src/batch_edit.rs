@@ -30,6 +30,9 @@ struct BatchEditInput {
 
 #[async_trait]
 impl Tool for BatchEditTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_BATCH_EDIT
     }

@@ -507,6 +507,19 @@ pub trait Tool: Send + Sync {
     /// The permission level the tool requires.
     fn permission_level(&self) -> PermissionLevel;
 
+    /// Whether this tool performs its own permission gating inside `execute()`.
+    ///
+    /// - `false` (default): the central backstop in `execute_tool` is
+    ///   responsible for gating this tool. Secure by default — a tool that
+    ///   forgets to call `ctx.check_permission*` is still caught by the backstop
+    ///   whenever its `permission_level()` is a gated level.
+    /// - `true`: the tool already prompts for permission internally (it calls
+    ///   `ctx.check_permission*` in `execute()`), so the central gate must NOT
+    ///   also prompt — this prevents double-prompting.
+    fn self_gates(&self) -> bool {
+        false
+    }
+
     /// JSON Schema describing the tool's input parameters.
     fn input_schema(&self) -> Value;
 

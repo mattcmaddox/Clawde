@@ -30,6 +30,9 @@ struct SkillInput {
 
 #[async_trait]
 impl Tool for SkillTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "Skill" }
 
     fn description(&self) -> &str {
