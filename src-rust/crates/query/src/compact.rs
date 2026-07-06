@@ -1486,6 +1486,91 @@ mod tests {
         assert_eq!(context_window_for_model("claude-2"), 100_000);
     }
 
+    // ---- resolve_context_window (#216) -------------------------------------
+
+    /// Build an in-memory `ModelRegistry` from a models.dev-style JSON snapshot
+    /// by round-tripping it through the real `load_cache` parse path.
+    fn registry_from_json(json: &str) -> claurst_api::ModelRegistry {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models_dev.json");
+        std::fs::write(&path, json).expect("write snapshot");
+        let mut reg = claurst_api::ModelRegistry::new();
+        reg.load_cache(&path);
+        reg
+    }
+
+    // A fake provider with a genuine 1M window and a placeholder (no-limit)
+    // model. Fake ids keep the fixture isolated from the bundled snapshot.
+    const TEST_SNAPSHOT: &str = r#"{"testprov":{"id":"testprov","name":"Test Provider","env":[],"models":{"big-context-model":{"id":"big-context-model","name":"Big Context Model","limit":{"context":1000000,"output":65536}},"tiny-model":{"id":"tiny-model","name":"Tiny Model"}}}}"#;
+
+    #[test]
+    fn resolve_prefers_registry_for_large_context_model() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Sanity: the registry really carries the 1M window.
+        assert_eq!(
+            reg.get("testprov", "big-context-model").unwrap().info.context_window,
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_handles_canonical_provider_slash_model_string() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Model string carries the provider prefix; still resolves to 1M.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "testprov/big-context-model"),
+            1_000_000
+        );
+        // Provider arg is wrong but the "provider/model" string still resolves.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "anthropic", "testprov/big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_registry_none() {
+        // No registry → heuristic. Claude-ish and legacy both come through.
+        assert_eq!(
+            resolve_context_window(None, "anthropic", "claude-opus-4-8"),
+            context_window_for_model("claude-opus-4-8")
+        );
+        assert_eq!(resolve_context_window(None, "anthropic", "claude-opus-4-8"), 200_000);
+        assert_eq!(resolve_context_window(None, "some-provider", "some-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_no_registry_entry() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Provider/model that isn't in the registry → heuristic default.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "nope", "ghost-model"),
+            context_window_for_model("ghost-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "nope", "ghost-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_ignores_placeholder_4096_window() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // The registry stores the models.dev-omission placeholder (4096)...
+        assert_eq!(
+            reg.get("testprov", "tiny-model").unwrap().info.context_window,
+            4096
+        );
+        // ...but resolve treats it as "unknown" and uses the heuristic instead
+        // of compacting a real session at ~3.7k tokens.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "tiny-model"),
+            context_window_for_model("tiny-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
+    }
+
     // ---- estimate_tokens_for_messages --------------------------------------
 
     #[test]
