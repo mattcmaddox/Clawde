@@ -30,9 +30,10 @@ pub use skill_prefetch::{
 pub use compact::{
     AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    compact_conversation, context_collapse, context_window_for_model, format_compact_summary,
-    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed,
-    reactive_compact, resolve_context_window, should_auto_compact, should_compact,
+    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
+    context_window_for_model, format_compact_summary, get_compact_prompt,
+    group_messages_for_compact, micro_compact_if_needed, reactive_compact,
+    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
     should_context_collapse, snip_compact,
 };
 pub use session_memory::{
@@ -1720,15 +1721,27 @@ pub async fn run_query_loop(
             }
         }
 
+        // Resolve the effective context window ONCE per turn for the active
+        // provider+model. Prefer the models.dev-backed registry value (correct
+        // for every provider — 1M Gemini/GPT windows, 32k local models) and
+        // fall back to the Claude-centric heuristic only when the registry has
+        // no usable entry. All threshold logic below keys off this. (#216)
+        let context_window = compact::resolve_context_window(
+            config.model_registry.as_deref(),
+            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+            &config.model,
+        );
+
         // Emit token warning events when approaching context limits.
         // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
         {
-            let warning_state =
-                compact::calculate_token_warning_state(usage.input_tokens, &config.model);
+            let warning_state = compact::calculate_token_warning_state_for_window(
+                usage.input_tokens,
+                context_window,
+            );
             if warning_state != compact::TokenWarningState::Ok {
                 if let Some(ref tx) = event_tx {
-                    let window = compact::context_window_for_model(&config.model);
-                    let pct_used = usage.input_tokens as f64 / window as f64;
+                    let pct_used = usage.input_tokens as f64 / context_window as f64;
                     let _ = tx.send(QueryEvent::TokenWarning {
                         state: warning_state,
                         pct_used,
@@ -1751,7 +1764,7 @@ pub async fn run_query_loop(
 
         if reactive_compact_enabled {
             // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = compact::context_window_for_model(&config.model);
+            let context_limit = context_window;
             if compact::should_context_collapse(usage.input_tokens, context_limit) {
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status(
@@ -1805,6 +1818,7 @@ pub async fn run_query_loop(
                 messages,
                 usage.input_tokens,
                 &config.model,
+                context_window,
                 &mut compact_state,
             )
             .await

@@ -560,12 +560,23 @@ pub fn resolve_context_window(
 
 /// Determine token-warning state given current input token count and model.
 ///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`calculate_token_warning_state_for_window`] with a window resolved
+/// via [`resolve_context_window`] so non-Claude providers size correctly.
+pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
+    calculate_token_warning_state_for_window(input_tokens, context_window_for_model(model))
+}
+
+/// Determine token-warning state against an explicit context window.
+///
 /// Thresholds (mirrors TypeScript autoCompact.ts):
 ///   ≥ 95 % → Critical (red warning)
 ///   ≥ 80 % → Warning  (yellow warning)
 ///   <  80 % → Ok
-pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
-    let window = context_window_for_model(model);
+pub fn calculate_token_warning_state_for_window(
+    input_tokens: u64,
+    window: u64,
+) -> TokenWarningState {
     let pct = input_tokens as f64 / window as f64;
 
     if pct >= CRITICAL_PCT {
@@ -578,11 +589,22 @@ pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWar
 }
 
 /// Return `true` when auto-compaction should fire.
+///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
+    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+}
+
+/// Return `true` when auto-compaction should fire, against an explicit window.
+pub fn should_auto_compact_for_window(
+    input_tokens: u64,
+    window: u64,
+    state: &AutoCompactState,
+) -> bool {
     if state.disabled {
         return false;
     }
-    let window = context_window_for_model(model);
     let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
     input_tokens >= threshold
 }
@@ -742,14 +764,19 @@ pub async fn compact_conversation(
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
 /// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
+///
+/// `context_window` is the effective window for the active provider+model
+/// (resolve it via [`resolve_context_window`]); `model` is still used for the
+/// summarisation API call.
 pub async fn auto_compact_if_needed(
     client: &claurst_api::AnthropicClient,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
+    context_window: u64,
     state: &mut AutoCompactState,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact(input_tokens, model, state) {
+    if !should_auto_compact_for_window(input_tokens, context_window, state) {
         return None;
     }
 
