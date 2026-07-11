@@ -3013,6 +3013,16 @@ impl App {
         Self::persist_onboarding_complete()
     }
 
+    /// Persist `skip_dangerous_mode_permission_prompt = true` to the settings
+    /// file after the user accepts the Bypass Permissions warning, so the
+    /// dialog is a one-time gate rather than shown on every launch.
+    /// Best-effort: failures are silently ignored to not disrupt the session.
+    fn persist_bypass_permissions_accepted() -> anyhow::Result<()> {
+        let mut settings = claurst_core::config::Settings::load_sync()?;
+        settings.skip_dangerous_mode_permission_prompt = true;
+        settings.save_sync()
+    }
+
     /// Resolve the character to insert for a printable key press, applying the
     /// US-QWERTY shift map only when the kitty keyboard protocol is active.
     ///
@@ -3113,6 +3123,8 @@ impl App {
 
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
         // session exits immediately. Mirrors TS BypassPermissionsModeDialog.tsx.
+        // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
+        // so the warning is shown once, not on every launch.
         if self.bypass_permissions_dialog.visible {
             match key.code {
                 KeyCode::Char('1') | KeyCode::Esc => {
@@ -3122,12 +3134,14 @@ impl App {
                 KeyCode::Char('2') => {
                     // "Yes, I accept" — dismiss and continue
                     self.bypass_permissions_dialog.dismiss();
+                    let _ = Self::persist_bypass_permissions_accepted();
                 }
                 KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
                 KeyCode::Enter => {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
+                        let _ = Self::persist_bypass_permissions_accepted();
                     } else {
                         self.should_exit = true;
                     }
@@ -5381,7 +5395,14 @@ impl App {
             // (which also uses `split_whitespace().next()`) matches correctly.
             let first_word = command.split_whitespace().next().unwrap_or("").to_string();
             if !first_word.is_empty() {
-                self.bash_prefix_allowlist.insert(first_word);
+                self.bash_prefix_allowlist.insert(first_word.clone());
+                // Persist so the "always allow" choice survives restarts.
+                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
+                    if !settings.allowed_bash_prefixes.contains(&first_word) {
+                        settings.allowed_bash_prefixes.push(first_word);
+                        let _ = settings.save_sync();
+                    }
+                }
             }
         }
     }

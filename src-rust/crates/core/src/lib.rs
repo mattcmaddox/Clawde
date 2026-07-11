@@ -1160,6 +1160,16 @@ pub mod config {
         /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
         #[serde(default, rename = "hasCompletedOnboarding")]
         pub has_completed_onboarding: bool,
+        /// Whether the user has accepted the Bypass Permissions warning.
+        /// Mirrors TS `skipDangerousModePermissionPrompt`: once accepted the
+        /// startup warning dialog is never shown again.
+        #[serde(default, rename = "skipDangerousModePermissionPrompt")]
+        pub skip_dangerous_mode_permission_prompt: bool,
+        /// Bash command prefixes (first word) the user chose to always allow
+        /// from the permission dialog's "Allow commands matching <prefix>*"
+        /// option. Loaded into the prefix allowlist at startup.
+        #[serde(default, rename = "allowedBashPrefixes")]
+        pub allowed_bash_prefixes: Vec<String>,
         /// App version at last launch — used to detect upgrades and show release notes.
         #[serde(default, rename = "lastSeenVersion")]
         pub last_seen_version: Option<String>,
@@ -1849,6 +1859,12 @@ pub mod config {
                 // malicious repo could set `trustProjectMcpServers: true` to
                 // bypass the approval gate entirely.
                 trust_project_mcp_servers: base.trust_project_mcp_servers,
+                // SECURITY: same reasoning — these silence approval prompts,
+                // so only the user's global settings may set them. A project
+                // settings file must not be able to pre-accept bypass mode or
+                // pre-approve bash command prefixes.
+                skip_dangerous_mode_permission_prompt: base.skip_dangerous_mode_permission_prompt,
+                allowed_bash_prefixes: base.allowed_bash_prefixes,
                 permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
                 enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
@@ -4362,6 +4378,26 @@ mod tests {
     fn test_hooks_config_default() {
         let cfg = crate::config::Config::default();
         assert!(cfg.hooks.is_empty());
+    }
+
+    /// The bypass-permissions acceptance and always-allow bash prefixes must
+    /// round-trip through settings.json so they survive restarts.
+    #[test]
+    fn settings_persist_bypass_acceptance_and_bash_prefixes() {
+        let mut settings = crate::config::Settings::default();
+        assert!(!settings.skip_dangerous_mode_permission_prompt);
+        assert!(settings.allowed_bash_prefixes.is_empty());
+
+        settings.skip_dangerous_mode_permission_prompt = true;
+        settings.allowed_bash_prefixes.push("git".to_string());
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"skipDangerousModePermissionPrompt\":true"));
+        assert!(json.contains("\"allowedBashPrefixes\":[\"git\"]"));
+
+        let restored: crate::config::Settings = serde_json::from_str(&json).unwrap();
+        assert!(restored.skip_dangerous_mode_permission_prompt);
+        assert_eq!(restored.allowed_bash_prefixes, vec!["git".to_string()]);
     }
 
     /// Security (issue #123): MCP servers declared in a repository's

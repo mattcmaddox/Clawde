@@ -157,7 +157,7 @@ impl PermissionRequest {
         }
     }
 
-    /// Build a FileRead-specific dialog (3 options: once / session / deny).
+    /// Build a FileRead-specific dialog (4 options: once / session / persistent / deny).
     pub fn file_read(
         tool_use_id: String,
         tool_name: String,
@@ -242,11 +242,12 @@ impl PermissionRequest {
         opts
     }
 
-    /// FileRead options (3): once / session / deny.
+    /// FileRead options (4): once / session / persistent / deny.
     pub fn file_read_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
             PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
+            PermissionOption { label: "Yes, always allow (persistent)".to_string(), key: 'p' },
             PermissionOption { label: "No, deny".to_string(), key: 'n' },
         ]
     }
@@ -409,7 +410,7 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 /// For `Bash` with a `suggested_prefix`, a 5th option is shown:
 ///   │  [5] Allow commands matching git*              │
 ///
-/// For `FileRead`, only 3 options (once / session / deny).
+/// For `FileRead`, 4 options (once / session / persistent / deny).
 /// For `FileWrite`, 4 options (once / session / project / deny).
 pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area: Rect) {
     // Scale dialog width with the terminal: minimum 40 cols for narrow screens,
@@ -1472,17 +1473,18 @@ mod tests {
     }
 
     #[test]
-    fn file_read_has_three_options() {
+    fn file_read_has_four_options() {
         let pr = PermissionRequest::file_read(
             "id-fr".to_string(),
             "ReadFile".to_string(),
             "Wants to read /etc/hosts".to_string(),
             "/etc/hosts".to_string(),
         );
-        assert_eq!(pr.options.len(), 3);
+        assert_eq!(pr.options.len(), 4);
         assert_eq!(pr.options[0].key, 'y');
         assert_eq!(pr.options[1].key, 'Y');
-        assert_eq!(pr.options[2].key, 'n');
+        assert_eq!(pr.options[2].key, 'p'); // persistent allow
+        assert_eq!(pr.options[3].key, 'n');
         assert!(matches!(pr.kind, PermissionDialogKind::FileRead { .. }));
     }
 
@@ -1514,19 +1516,19 @@ mod tests {
     }
 
     #[test]
-    fn permission_key_digit_out_of_range_ignored_for_three_option_dialog() {
+    fn permission_key_digit_out_of_range_ignored_for_four_option_dialog() {
         let mut pr = PermissionRequest::file_read(
             "id".to_string(),
             "ReadFile".to_string(),
             "desc".to_string(),
             "/foo".to_string(),
         );
-        assert_eq!(pr.options.len(), 3);
-        // Press '4' — out of range for a 3-option dialog, should NOT confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('4')));
-        assert!(!confirmed);
-        // Press '5' — also out of range.
+        assert_eq!(pr.options.len(), 4);
+        // Press '5' — out of range for a 4-option dialog, should NOT confirm.
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
+        assert!(!confirmed);
+        // Press '6' — also out of range.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('6')));
         assert!(!confirmed);
     }
 

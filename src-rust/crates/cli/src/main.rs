@@ -1905,6 +1905,11 @@ async fn run_interactive(
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
 
+    // Restore "always allow" bash prefixes persisted from earlier sessions so
+    // previously-approved command prefixes don't prompt again.
+    app.bash_prefix_allowlist
+        .extend(settings.allowed_bash_prefixes.iter().cloned());
+
     // If a non-Anthropic provider is active, prefix model_name with "provider/model"
     // so the status bar can show the provider name.
     if let Some(ref provider) = live_config.provider {
@@ -1920,10 +1925,14 @@ async fn run_interactive(
 
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate
     // Shown as the highest-priority startup dialog (blocks all other UI).
-    // Only show once per session — subsequent sessions in the same directory
-    // will show the dialog again (not persisted across sessions).
+    // Accepting persists `skipDangerousModePermissionPrompt` to settings.json
+    // (TS parity), so the warning is a one-time gate — not re-shown on every
+    // launch.
     use claurst_core::config::PermissionMode;
-    if live_config.permission_mode == PermissionMode::BypassPermissions && !app.bypass_permissions_dialog_shown {
+    if live_config.permission_mode == PermissionMode::BypassPermissions
+        && !settings.skip_dangerous_mode_permission_prompt
+        && !app.bypass_permissions_dialog_shown
+    {
         app.bypass_permissions_dialog.show();
         app.bypass_permissions_dialog_shown = true;
     } else if live_config.permission_mode != PermissionMode::BypassPermissions {
@@ -2998,7 +3007,16 @@ async fn run_interactive(
                             app.permission_request = None;
 
                             if let Some(prefix) = bash_prefix {
-                                app.bash_prefix_allowlist.insert(prefix);
+                                app.bash_prefix_allowlist.insert(prefix.clone());
+                                // "Always allow" must survive restarts: persist
+                                // the prefix to settings.json so it is reloaded
+                                // into the allowlist on the next launch.
+                                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
+                                    if !settings.allowed_bash_prefixes.contains(&prefix) {
+                                        settings.allowed_bash_prefixes.push(prefix);
+                                        let _ = settings.save_sync();
+                                    }
+                                }
                             }
 
                             if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
