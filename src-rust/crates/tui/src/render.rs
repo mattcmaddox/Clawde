@@ -2146,6 +2146,12 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             Line::from(vec![
                 Span::styled("? shortcuts", Style::default().fg(dim)),
             ])
+        } else if app.prompt_input.has_expandable_paste_ref() {
+            // A [Pasted text #N ...] placeholder is in the buffer — tell the
+            // user how to view the full pasted body before submitting.
+            Line::from(vec![
+                Span::styled("alt+e/click to expand paste", Style::default().fg(dim)),
+            ])
         } else {
             Line::from(Vec::<Span>::new())
         };

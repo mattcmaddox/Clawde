@@ -402,6 +402,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         ("Enter",           "Submit message"),
         ("Up / Down",       "Input history"),
         ("Ctrl+R",          "Search history"),
+        ("Alt+E",           "Expand pasted text"),
         ("Esc",             "Cancel / close"),
     ] {
         left_lines.push(kb_line(key, desc));

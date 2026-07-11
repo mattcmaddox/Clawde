@@ -238,6 +238,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("tab", "indent", KeyContext::Chat),
         ("shift+tab", "reverseIndent", KeyContext::Chat),
 
+        // Paste placeholders — expand `[Pasted text #N ...]` back into the
+        // full pasted body (clicking the placeholder does the same).
+        ("alt+e", "expandPaste", KeyContext::Chat),
+
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),

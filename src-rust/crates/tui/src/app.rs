@@ -5044,6 +5044,17 @@ impl App {
                 }
                 false
             }
+            "expandPaste" => {
+                // Alt+E: expand the [Pasted text #N ...] placeholder at the
+                // cursor (or the first one in the buffer) so the full pasted
+                // body is visible and editable in place. Allowed while
+                // streaming — the prompt stays editable for composing queued
+                // messages.
+                if self.prompt_input.expand_paste_ref_at_cursor() {
+                    self.refresh_prompt_input();
+                }
+                false
+            }
             "scrollUp" => {
                 self.scroll_up_by(10);
                 false
@@ -5762,6 +5773,57 @@ impl App {
     }
 
     /// Process mouse events (trackpad scroll, text selection, etc.).
+    /// Handle a left click inside the prompt input: move the cursor to the
+    /// clicked position and, when the click lands on a `[Pasted text #N ...]`
+    /// placeholder, expand it in place so the full pasted body can be read
+    /// (and edited) before submitting.
+    fn handle_prompt_click(&mut self, col: u16, row: u16) {
+        if self.prompt_input.text.is_empty() {
+            return;
+        }
+        // Reconstruct the prompt widget geometry of the last rendered frame.
+        // `last_input_area` is the whole bottom pane; `render_input` carves a
+        // 1-row model/mode status line off the top when there is room, and
+        // `render_prompt_input` adds an image-pill row when attachments are
+        // pending, then a top separator row before the wrapped text rows.
+        let mut rect = self.last_input_area.get();
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        if rect.height > 2 {
+            rect.y += 1;
+            rect.height -= 1;
+        }
+        if !self.prompt_input.pending_images.is_empty() && rect.height > 1 {
+            rect.y += 1;
+            rect.height -= 1;
+        }
+        // 2-cell "❯ " prefix + 2-cell right margin (see render_prompt_input).
+        let width = rect.width.saturating_sub(4) as usize;
+        if width == 0 {
+            return;
+        }
+        let text_start_y = rect.y + 1; // top separator occupies rect.y
+        let max_text_rows = rect.height.saturating_sub(2) as usize;
+        let total_rows = self.prompt_input.visual_row_count(width);
+        // Mirror the renderer's scroll: keep the cursor row visible.
+        let (cursor_row, _) = self.prompt_input.cursor_visual_pos(width);
+        let scroll = if total_rows > max_text_rows && cursor_row >= max_text_rows {
+            cursor_row + 1 - max_text_rows
+        } else {
+            0
+        };
+        let visible_rows = total_rows.saturating_sub(scroll).min(max_text_rows);
+        if row < text_start_y || (row - text_start_y) as usize >= visible_rows {
+            return;
+        }
+        let target_row = scroll + (row - text_start_y) as usize;
+        let target_col = col.saturating_sub(rect.x + 2) as usize;
+        self.prompt_input.set_cursor_at_visual(target_row, target_col, width);
+        self.prompt_input.expand_paste_ref_at(self.prompt_input.cursor);
+        self.refresh_prompt_input();
+    }
+
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
 
@@ -5988,6 +6050,7 @@ impl App {
                 if in_input {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();
+                    self.handle_prompt_click(mouse_event.column, mouse_event.row);
                 } else if selectable_area.width == 0 || selectable_area.height == 0 {
                     self.click_count = 0;
                 } else if in_selectable {
@@ -6754,6 +6817,46 @@ mod tests {
         app.handle_mouse_event(scroll_up_event());
         assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
         assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
+    }
+
+    // ---- click-to-expand paste placeholders ----
+
+    #[test]
+    fn prompt_click_on_placeholder_expands_it() {
+        let mut app = make_app();
+        // Bottom pane as rendered: 1 status row (height > 2), then the top
+        // separator at y=21, text rows from y=22. Prefix "❯ " is 2 cells.
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+
+        // Click on the separator row: no expansion.
+        app.handle_prompt_click(10, 21);
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+
+        // Click inside the placeholder on the first text row.
+        app.handle_prompt_click(2 + 5, 22);
+        assert_eq!(app.prompt_input.text, "hi l1\nl2\nl3");
+        assert!(app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn prompt_click_off_placeholder_moves_cursor_only() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hello ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        let text_before = app.prompt_input.text.clone();
+
+        // Click on "hello " before the placeholder: cursor moves, no expand.
+        app.handle_prompt_click(2 + 1, 22);
+        assert_eq!(app.prompt_input.text, text_before);
+        assert_eq!(app.prompt_input.cursor, 1);
     }
 
     // ---- scroll_offset clamping (issue #223) ----
