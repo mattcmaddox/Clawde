@@ -1314,10 +1314,11 @@ fn home_dir() -> Option<String> {
 /// Handle a paste event.
 ///
 /// Large pastes (≥3 lines or >150 chars) are replaced with a compact
-/// placeholder like `[Pasted ~12 lines #3]` while the real content is stored
-/// in `paste_contents` for retrieval at submit time.  This mirrors opencode's
-/// behaviour and prevents the input box from flooding with multi-hundred-line
-/// pastes.  Single-line short strings are inserted verbatim.
+/// placeholder like `[Pasted text #3 +12 lines]` (the shared claurst-core
+/// reference format) while the real content is stored in `paste_contents`.
+/// The placeholder is expanded back into the full content at submit time
+/// (`take()`), by clicking it, or via the `expandPaste` keybinding.
+/// Single-line short strings are inserted verbatim.
 /// Normalize `\r\n` and lone `\r` into `\n`.
 ///
 /// The prompt buffer must never contain a bare carriage return: the renderer
@@ -1342,7 +1343,9 @@ pub fn handle_paste(
         return (content.to_string(), None);
     }
     *paste_counter += 1;
-    let placeholder = format!("[Pasted ~{} lines #{}]", line_count, paste_counter);
+    let num_lines = claurst_core::prompt_history::get_pasted_text_ref_num_lines(content);
+    let placeholder =
+        claurst_core::prompt_history::format_pasted_text_ref(*paste_counter, num_lines);
     (placeholder, Some(content.to_string()))
 }
 
@@ -1704,14 +1707,16 @@ impl PromptInputState {
 
     /// Handle a paste event.
     pub fn paste(&mut self, content: &str) {
-        let (text, stored) = handle_paste(content, &mut self.paste_counter);
+        // Normalize CRLF / lone CR into LF before storing or inserting. A stray
+        // '\r' in the buffer desyncs the render cursor's byte accounting (which
+        // assumes a 1-byte '\n' separator) and can slice mid-codepoint (#221).
+        // Stored paste bodies are normalized too, because expanding a
+        // placeholder splices the body back into the buffer.
+        let content = normalize_newlines(content);
+        let (text, stored) = handle_paste(&content, &mut self.paste_counter);
         if let Some(stored_content) = stored {
             self.paste_contents.insert(self.paste_counter, stored_content);
         }
-        // Normalize CRLF / lone CR into LF before inserting. A stray '\r' in
-        // the buffer desyncs the render cursor's byte accounting (which assumes
-        // a 1-byte '\n' separator) and can slice mid-codepoint (#221).
-        let text = normalize_newlines(&text);
         for c in text.chars() {
             self.text.insert(self.cursor, c);
             self.cursor += c.len_utf8();
@@ -2588,7 +2593,7 @@ impl PromptInputState {
         self.visual_anchor = None;
         self.vim_command_buf.clear();
         self.vim_search_buf.clear();
-        // #223: emptying the buffer removes every `[Pasted ~N lines #M]`
+        // #223: emptying the buffer removes every `[Pasted text #N ...]`
         // placeholder along with it, so the paste bodies stored in
         // `paste_contents` are now unreachable. Drop them to bound memory —
         // otherwise every large block ever pasted is retained for the App's
@@ -2598,11 +2603,95 @@ impl PromptInputState {
         self.paste_contents.clear();
     }
 
-    /// Take the current text, clearing the input.
+    /// Take the current text, clearing the input. Paste placeholders are
+    /// expanded back into their stored bodies so the submitted message carries
+    /// the real pasted content, not the `[Pasted text #N ...]` stand-in.
     pub fn take(&mut self) -> String {
-        let text = self.text.clone();
+        let text = self.expanded_text();
         self.clear();
         text
+    }
+
+    /// The submit-ready text: every `[Pasted text #N]` / `[Pasted text #N +X
+    /// lines]` placeholder replaced with its stored body. Placeholders whose
+    /// body is no longer stored (e.g. hand-typed or edited references) are
+    /// left as-is. Replacements run in reverse order so earlier byte offsets
+    /// stay valid.
+    pub fn expanded_text(&self) -> String {
+        let mut out = self.text.clone();
+        if self.paste_contents.is_empty() {
+            return out;
+        }
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs.into_iter().rev() {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            if let Some(body) = self.paste_contents.get(&id) {
+                out.replace_range(start..start + matched.len(), body);
+            }
+        }
+        out
+    }
+
+    /// True when the buffer contains at least one paste placeholder that can
+    /// still be expanded (its body is stored). Drives the footer hint.
+    pub fn has_expandable_paste_ref(&self) -> bool {
+        if self.paste_contents.is_empty() {
+            return false;
+        }
+        claurst_core::prompt_history::parse_references_with_positions(&self.text)
+            .iter()
+            .any(|(id, matched, _)| {
+                matched.starts_with("[Pasted text #") && self.paste_contents.contains_key(id)
+            })
+    }
+
+    /// Expand the paste placeholder covering byte offset `offset` (start
+    /// inclusive, end inclusive so the cursor sitting just past the `]` still
+    /// counts) back into its stored body, in place. The cursor lands at the
+    /// end of the inserted body. Returns `true` if a placeholder was expanded.
+    pub fn expand_paste_ref_at(&mut self, offset: usize) -> bool {
+        if self.mode == InputMode::Readonly {
+            return false;
+        }
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            let end = start + matched.len();
+            if offset < start || offset > end {
+                continue;
+            }
+            let Some(body) = self.paste_contents.remove(&id) else {
+                continue;
+            };
+            self.push_undo();
+            self.text.replace_range(start..end, &body);
+            self.cursor = start + body.len();
+            self.update_token_estimate();
+            return true;
+        }
+        false
+    }
+
+    /// Expand the paste placeholder at the cursor; falls back to the first
+    /// expandable placeholder in the buffer so the keybinding works without
+    /// first navigating onto the reference.
+    pub fn expand_paste_ref_at_cursor(&mut self) -> bool {
+        if self.expand_paste_ref_at(self.cursor) {
+            return true;
+        }
+        let first = claurst_core::prompt_history::parse_references_with_positions(&self.text)
+            .into_iter()
+            .find(|(id, matched, _)| {
+                matched.starts_with("[Pasted text #") && self.paste_contents.contains_key(id)
+            });
+        match first {
+            Some((_, _, start)) => self.expand_paste_ref_at(start),
+            None => false,
+        }
     }
 
     /// Returns true if the text (up to cursor) contains a word-boundary `@` token,
@@ -2766,7 +2855,7 @@ impl PromptInputState {
         true
     }
 
-    fn visual_row_count(&self, width: usize) -> usize {
+    pub(crate) fn visual_row_count(&self, width: usize) -> usize {
         if self.text.is_empty() || width == 0 {
             return 1;
         }
@@ -2777,7 +2866,7 @@ impl PromptInputState {
         total.max(1)
     }
 
-    fn set_cursor_at_visual(&mut self, target_row: usize, target_col: usize, width: usize) {
+    pub(crate) fn set_cursor_at_visual(&mut self, target_row: usize, target_col: usize, width: usize) {
         if width == 0 {
             return;
         }
@@ -3666,11 +3755,10 @@ mod tests {
     #[test]
     fn paste_large_content_placeholder() {
         let mut counter = 0u32;
-        // >150 chars → triggers placeholder
+        // >150 chars, single line → placeholder without a line count
         let big = "x".repeat(200);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
-        assert!(result.contains("#1"), "expected counter in placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1]");
         assert!(stored.is_some());
         assert_eq!(counter, 1);
     }
@@ -3681,8 +3769,7 @@ mod tests {
         // ≥3 lines → triggers placeholder regardless of length
         let big = "line\n".repeat(300);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
-        assert!(result.contains("lines"), "expected line count in placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1 +300 lines]");
         assert!(stored.is_some());
     }
 
@@ -3692,7 +3779,7 @@ mod tests {
         // Exactly 3 lines (the threshold) should use a placeholder.
         let three_lines = "a\nb\nc";
         let (result, stored) = handle_paste(three_lines, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "3-line paste should be placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1 +2 lines]");
         assert!(stored.is_some());
     }
 
@@ -3733,17 +3820,20 @@ mod tests {
         // Three large pastes were stored, keyed by the incrementing counter.
         assert_eq!(s.paste_contents.len(), 3, "each large paste should be stored");
 
-        // Before eviction the submitted text still expands correctly: every
-        // placeholder in the buffer maps back to its original body.
-        assert!(s.text.contains("#1]") && s.text.contains("#2]") && s.text.contains("#3]"));
+        // Before eviction every placeholder in the buffer maps back to its
+        // original body.
+        assert!(s.text.contains("#1") && s.text.contains("#2") && s.text.contains("#3"));
         assert_eq!(s.paste_contents.get(&1), Some(&block_a));
         assert_eq!(s.paste_contents.get(&2), Some(&block_b));
         assert_eq!(s.paste_contents.get(&3), Some(&block_c));
 
-        // Submit. The taken text keeps its placeholders (expansion is not
-        // broken), but the stored bodies are reclaimed.
+        // Submit. The taken text carries the expanded bodies (the agent must
+        // receive the real content, not the placeholders) and the stored
+        // bodies are reclaimed.
         let taken = s.take();
-        assert!(taken.contains("[Pasted ~"), "placeholders survive the take");
+        assert!(!taken.contains("[Pasted text #"), "placeholders must be expanded on take");
+        assert!(taken.contains(&block_a) && taken.contains(&block_b) && taken.contains(&block_c));
+        assert!(taken.contains(" and then "), "inline text between pastes survives");
         assert!(s.paste_contents.is_empty(), "paste_contents must be emptied on submit (#223)");
         assert!(s.text.is_empty());
 
@@ -3760,6 +3850,89 @@ mod tests {
         assert_eq!(s.paste_contents.len(), 1);
         s.clear();
         assert!(s.paste_contents.is_empty(), "clear() must reclaim stored pastes (#223)");
+    }
+
+    #[test]
+    fn take_expands_placeholder_with_surrounding_text() {
+        let mut s = PromptInputState::new();
+        for c in "explain this: ".chars() {
+            s.insert_char(c);
+        }
+        let body = "fn main() {\n    println!(\"hi\");\n}\n";
+        s.paste(body);
+        for c in " please".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.text.contains("[Pasted text #1"));
+        let taken = s.take();
+        assert_eq!(taken, format!("explain this: {body} please"));
+    }
+
+    #[test]
+    fn take_leaves_unknown_refs_alone() {
+        // A hand-typed reference with no stored body must pass through
+        // untouched instead of vanishing or panicking.
+        let mut s = PromptInputState::new();
+        for c in "see [Pasted text #7] there".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.take(), "see [Pasted text #7] there");
+    }
+
+    #[test]
+    fn take_expands_crlf_paste_normalized() {
+        // CRLF pastes are normalized at store time, so the expanded submit
+        // text never re-introduces a bare '\r' (#221 invariant).
+        let mut s = PromptInputState::new();
+        s.paste("a\r\nb\r\nc\r\nd");
+        let taken = s.take();
+        assert_eq!(taken, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn expand_paste_ref_at_cursor_inline() {
+        let mut s = PromptInputState::new();
+        let body = "x\ny\nz";
+        s.paste(body);
+        // Cursor sits right after the placeholder post-paste (inclusive end).
+        assert!(s.expand_paste_ref_at_cursor());
+        assert_eq!(s.text, body);
+        assert_eq!(s.cursor, body.len());
+        assert!(s.paste_contents.is_empty(), "expanded body is dropped from the store");
+        // A second expand has nothing left to do.
+        assert!(!s.expand_paste_ref_at_cursor());
+    }
+
+    #[test]
+    fn expand_paste_ref_falls_back_to_first_ref() {
+        let mut s = PromptInputState::new();
+        s.paste("one\ntwo\nthree");
+        // Move the cursor away from the placeholder.
+        s.cursor = 0;
+        for c in "prefix ".chars() {
+            s.insert_char(c);
+        }
+        s.cursor = 0;
+        assert!(s.expand_paste_ref_at_cursor());
+        assert_eq!(s.text, "prefix one\ntwo\nthree");
+    }
+
+    #[test]
+    fn expand_paste_ref_ignores_image_refs() {
+        let mut s = PromptInputState::new();
+        s.paste("a\nb\nc"); // stored as text paste #1
+        s.cursor = 0;
+        for c in "[Image #1] ".chars() {
+            s.insert_char(c);
+        }
+        // Cursor inside the image ref: must not splice the text body there.
+        s.cursor = 3;
+        assert!(!s.expand_paste_ref_at(3));
+        assert!(s.text.starts_with("[Image #1] "));
+        // The text placeholder itself still expands.
+        assert!(s.has_expandable_paste_ref());
+        assert!(s.expand_paste_ref_at(s.text.len()));
+        assert_eq!(s.text, "[Image #1] a\nb\nc");
     }
 
     // ---- compute_typeahead ---------------------------------------------
