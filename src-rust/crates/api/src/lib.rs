@@ -891,7 +891,7 @@ pub mod client {
                         claurst_core::oauth_config::claude_code_user_agent(),
                     )
                     .header("x-app", "cli")
-                    .header("Authorization", format!("Bearer {}", &self.config.api_key));
+                    .header("Authorization", format!("Bearer {}", self.config.api_key));
             } else {
                 req = req.header("x-api-key", &self.config.api_key);
             }
@@ -1049,7 +1049,7 @@ pub mod client {
                         )
                         .header("x-claude-code-session-id", &session_id)
                         .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
-                        .header("Authorization", format!("Bearer {}", &self.config.api_key));
+                        .header("Authorization", format!("Bearer {}", self.config.api_key));
                 } else {
                     // API-key path: no `x-anthropic-billing-header` (it is a
                     // Claude Code / subscription artefact, not emitted by the

@@ -104,10 +104,7 @@ pub fn project_root_for(cwd: &Path) -> Option<PathBuf> {
                 }
             }
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 
