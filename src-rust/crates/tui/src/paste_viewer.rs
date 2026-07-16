@@ -117,8 +117,8 @@ impl PasteViewer {
 /// Render the paste viewer modal into `buf`, clamping the scroll offset to
 /// the measured content height as a side effect.
 pub fn render_paste_viewer_buf(viewer: &PasteViewer, area: Rect, buf: &mut Buffer) {
-    let width = area.width.saturating_sub(6).min(100).max(20);
-    let height = area.height.saturating_sub(4).min(40).max(8);
+    let width = area.width.saturating_sub(6).clamp(20, 100);
+    let height = area.height.saturating_sub(4).clamp(8, 40);
     let layout = begin_modal_buf(buf, area, width, height, 2, 1);
 
     render_modal_title_buf(
@@ -175,8 +175,10 @@ mod tests {
 
     #[test]
     fn open_splits_lines_and_resets_scroll() {
-        let mut v = PasteViewer::default();
-        v.scroll = 7;
+        let mut v = PasteViewer {
+            scroll: 7,
+            ..Default::default()
+        };
         v.open(3, "a\nb\tc\nd");
         assert!(v.visible);
         assert_eq!(v.paste_id, 3);
