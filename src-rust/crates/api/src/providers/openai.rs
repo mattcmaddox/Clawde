@@ -249,7 +249,7 @@ impl OpenAiProvider {
                 ContentBlock::Text { text } => {
                     text_parts.push(text.as_str());
                 }
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     let args = serde_json::to_string(input).unwrap_or_default();
                     tool_calls.push(json!({
                         "id": id,
@@ -492,7 +492,12 @@ impl OpenAiProvider {
                     .unwrap_or("{}");
                 let input: Value =
                     serde_json::from_str(args_str).unwrap_or(json!({}));
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                content_blocks.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature: None,
+                });
             }
         }
 
@@ -642,6 +647,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "search".to_string(),
                 input: json!({ "q": "test" }),
+                thought_signature: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -982,6 +988,7 @@ impl LlmProvider for OpenAiProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }

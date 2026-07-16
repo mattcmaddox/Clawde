@@ -1290,6 +1290,7 @@ mod tests {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             },
             ContentBlock::Text {
                 text: "Done".to_string(),

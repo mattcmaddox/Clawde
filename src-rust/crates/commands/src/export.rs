@@ -43,7 +43,7 @@ fn export_message_to_markdown(
                     ContentBlock::Text { text } => {
                         text_parts.push(text.as_str());
                     }
-                    ContentBlock::ToolUse { id, name, input } => {
+                    ContentBlock::ToolUse { id, name, input, .. } => {
                         tool_uses.push((id.as_str(), name.as_str(), input));
                     }
                     ContentBlock::Thinking { thinking, .. } => {

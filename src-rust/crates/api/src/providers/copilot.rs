@@ -371,6 +371,7 @@ impl CopilotProvider {
                                     id,
                                     name,
                                     input: tool_input,
+                                    ..
                                 } => {
                                     flush_assistant_content(&mut input, &mut message_parts);
                                     input.push(json!({
@@ -551,7 +552,12 @@ impl CopilotProvider {
                         .and_then(|value| value.as_str())
                         .unwrap_or("{}");
                     let input = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
-                    content.push(ContentBlock::ToolUse { id, name, input });
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 _ => {}
             }
@@ -660,10 +666,11 @@ impl CopilotProvider {
             for (index, block) in response.content.iter().enumerate() {
                 let start_block = match block {
                     ContentBlock::Text { .. } => ContentBlock::Text { text: String::new() },
-                    ContentBlock::ToolUse { id, name, .. } => ContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, thought_signature, .. } => ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: json!({}),
+                        thought_signature: thought_signature.clone(),
                     },
                     ContentBlock::Thinking { .. } => ContentBlock::Thinking {
                         thinking: String::new(),
@@ -1051,6 +1058,7 @@ impl LlmProvider for CopilotProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: serde_json::json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }

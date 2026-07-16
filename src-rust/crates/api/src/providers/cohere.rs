@@ -230,7 +230,12 @@ impl CohereProvider {
                         .unwrap_or("{}");
                     let input: Value =
                         serde_json::from_str(input_str).unwrap_or_else(|_| json!({}));
-                    content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                    content_blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
             }
         }
@@ -554,6 +559,7 @@ impl LlmProvider for CohereProvider {
                                         id: tc_id,
                                         name: tc_name,
                                         input: json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }

@@ -992,7 +992,7 @@ async fn summarise_head(
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 match block {
-                    ContentBlock::ToolUse { name, input, id } => {
+                    ContentBlock::ToolUse { name, input, id, .. } => {
                         transcript.push_str(&format!(
                             "[Tool Call: {} (id={})]\nInput: {}\n\n",
                             name, id, input
@@ -1734,6 +1734,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             input,
+            thought_signature: None,
         }])
     }
 
