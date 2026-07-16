@@ -532,17 +532,31 @@ impl OpenAiProvider {
             Some(v) => v,
             None => return UsageInfo::default(),
         };
+        let prompt_tokens = u
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // OpenAI-compatible servers report prompt-cache hits under
+        // `prompt_tokens_details.cached_tokens` (OpenAI spec; llama.cpp >= b4600
+        // mirrors it when prompt caching is enabled). Unlike Anthropic, whose
+        // `input_tokens` excludes cached tokens, OpenAI's `prompt_tokens` is
+        // *inclusive* of the cached count, so we split it back out to keep the
+        // additive convention (`input_tokens + cache_read_input_tokens ==
+        // prompt_tokens`) used by the cost tracker and context accounting.
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|v| v.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(prompt_tokens);
         UsageInfo {
-            input_tokens: u
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            input_tokens: prompt_tokens.saturating_sub(cache_read),
             output_tokens: u
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: cache_read,
         }
     }
 
@@ -662,6 +676,69 @@ mod tests {
         assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("user"));
         assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
         assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
+    }
+
+    #[test]
+    fn parse_usage_none_is_all_zero() {
+        let usage = OpenAiProvider::parse_usage(None);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_without_cache_details_reports_zero_cache() {
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 42,
+        })));
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_reads_cached_tokens_from_prompt_details() {
+        // OpenAI spec / llama.cpp: prompt_tokens is inclusive of cached_tokens.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 800 },
+        })));
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        // input_tokens is the non-cached remainder so the two never double-count.
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens,
+            1000,
+            "input + cache_read must reconstruct the reported prompt_tokens"
+        );
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn parse_usage_cache_details_present_but_zero() {
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        })));
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_cached_tokens_clamped_to_prompt_tokens() {
+        // Defensive: a malformed server that reports cached > prompt must not
+        // underflow input_tokens.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": { "cached_tokens": 999 },
+        })));
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.input_tokens, 0);
     }
 }
 
