@@ -1030,6 +1030,13 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         registry.load_cache(&models_cache_path());
     }
 
+    // Layer user metadata overrides on top of the catalog (issue #309) so the
+    // listing matches what the TUI picker and context logic use.
+    let overrides = claurst_core::config::Settings::load_sync()
+        .map(|s| s.effective_config().model_overrides)
+        .unwrap_or_default();
+    registry.apply_model_overrides(&overrides);
+
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
         None => registry.list_all(),

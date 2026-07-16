@@ -2120,6 +2120,54 @@ pub mod config {
         }
 
         #[test]
+        fn effective_config_merges_top_level_model_overrides() {
+            let mut settings = Settings::default();
+            // Nested `config` block wins for a key present in both.
+            settings.config.model_overrides.insert(
+                "custom-openai/a".to_string(),
+                ModelOverride { context_window: Some(111), ..Default::default() },
+            );
+            settings.model_overrides.insert(
+                "custom-openai/a".to_string(),
+                ModelOverride { context_window: Some(999), ..Default::default() },
+            );
+            // Top-level-only key is folded in.
+            settings.model_overrides.insert(
+                "custom-openai/b".to_string(),
+                ModelOverride { context_window: Some(222), ..Default::default() },
+            );
+            let config = settings.effective_config();
+            assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
+            assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+        }
+
+        #[test]
+        fn model_override_accepts_camel_and_snake_case() {
+            // Top-level camelCase key `modelOverrides`, camelCase fields.
+            let camel = r#"{
+                "modelOverrides": {
+                    "custom-openai/x": { "contextWindow": 32768, "maxOutputTokens": 4096, "name": "X" }
+                }
+            }"#;
+            let s: Settings = serde_json::from_str(camel).unwrap();
+            let ov = &s.model_overrides["custom-openai/x"];
+            assert_eq!(ov.context_window, Some(32768));
+            assert_eq!(ov.max_output_tokens, Some(4096));
+            assert_eq!(ov.name.as_deref(), Some("X"));
+
+            // snake_case top-level alias `model_overrides` and snake_case fields.
+            let snake = r#"{
+                "model_overrides": {
+                    "ollama/y": { "context_window": 262144, "status": "beta" }
+                }
+            }"#;
+            let s: Settings = serde_json::from_str(snake).unwrap();
+            let ov = &s.model_overrides["ollama/y"];
+            assert_eq!(ov.context_window, Some(262144));
+            assert_eq!(ov.status.as_deref(), Some("beta"));
+        }
+
+        #[test]
         fn zero_is_treated_as_unset() {
             let config = Config { request_timeout_secs: Some(0), ..Default::default() };
             assert_eq!(
