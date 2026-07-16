@@ -5677,7 +5677,7 @@ impl App {
     ///
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
-    fn handle_paste_data(&mut self, data: String) {
+    pub fn handle_paste_data(&mut self, data: String) {
         use crate::prompt_input::detect_pasted_path;
         use crate::image_paste::PastedImage;
 

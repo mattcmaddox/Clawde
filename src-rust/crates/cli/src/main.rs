@@ -3096,9 +3096,12 @@ async fn run_interactive(
                     }
                 }
                 Event::Paste(data) => {
-                    // Cmd+V paste on macOS / Ctrl+Shift+V on Linux (via bracketed paste)
-                    if !app.is_streaming
-                        && app.permission_request.is_none()
+                    // Bracketed paste (Cmd+V on macOS, Ctrl+Shift+V on Linux, any
+                    // terminal with bracketed paste). Deliberately NOT gated on
+                    // is_streaming: the prompt stays editable during a turn so a
+                    // follow-up can be composed/queued — dropping the event here
+                    // silently loses the pasted content.
+                    if app.permission_request.is_none()
                         && !app.history_search_overlay.visible
                         && app.history_search.is_none()
                     {
@@ -3108,8 +3111,11 @@ async fn run_interactive(
                                 app.key_input_dialog.insert_char(ch);
                             }
                         } else {
-                            // Paste into main prompt input
-                            app.prompt_input.paste(&data);
+                            // Paste into the main prompt through the shared path
+                            // so file-path/image pastes and the large-paste
+                            // placeholder are handled uniformly.
+                            app.handle_paste_data(data);
+                            app.refresh_prompt_input();
                         }
                     }
                 }
