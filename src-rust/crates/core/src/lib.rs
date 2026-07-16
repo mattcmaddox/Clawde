@@ -219,6 +219,13 @@ pub mod types {
             id: String,
             name: String,
             input: Value,
+            /// Opaque, provider-supplied metadata that must be echoed back
+            /// verbatim on subsequent turns for the tool call to be accepted.
+            /// Currently carries Google Gemini's `thoughtSignature` for thinking
+            /// models (issue #311); `None` for every other provider. Persisted
+            /// with the session so it survives save/load.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            thought_signature: Option<String>,
         },
         ToolResult {
             tool_use_id: String,
