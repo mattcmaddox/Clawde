@@ -840,7 +840,11 @@ mod tests {
     }
 
     #[test]
-    fn test_render_app_keeps_logo_header_after_first_message() {
+    fn test_render_app_shows_scrollable_banner_after_first_message() {
+        // Once a conversation starts, the welcome box is no longer pinned as a
+        // fixed header (issue #310): a compact banner leads the transcript (and
+        // scrolls away with content), while the rich two-column welcome box — its
+        // mascot and "Recent activity" panel — is only the empty-screen welcome.
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
@@ -859,8 +863,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
+        // The compact banner (title + hint) and the message both render.
         assert!(rendered.contains("Claurst"));
+        assert!(rendered.contains("? for shortcuts"));
         assert!(rendered.contains("hello"));
+        // The full welcome box's recent-activity panel must NOT be drawn during
+        // a conversation — that would mean the old fixed header is still there.
+        assert!(!rendered.contains("Recent activity"));
     }
 
     #[test]
