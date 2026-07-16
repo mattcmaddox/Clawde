@@ -809,7 +809,7 @@ async fn main() -> anyhow::Result<()> {
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
     // from the models.dev cache if available.
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     // Build query config
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
@@ -1030,6 +1030,13 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         registry.load_cache(&models_cache_path());
     }
 
+    // Layer user metadata overrides on top of the catalog (issue #309) so the
+    // listing matches what the TUI picker and context logic use.
+    let overrides = claurst_core::config::Settings::load_sync()
+        .map(|s| s.effective_config().model_overrides)
+        .unwrap_or_default();
+    registry.apply_model_overrides(&overrides);
+
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
         None => registry.list_all(),
@@ -1154,7 +1161,7 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
+fn load_cached_model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry> {
     let mut reg = claurst_api::ModelRegistry::new();
     // CLAURST_MODELS_PATH wins outright — useful for offline dev where you
     // pin a known-good api.json on disk.
@@ -1168,6 +1175,9 @@ fn load_cached_model_registry() -> Arc<claurst_api::ModelRegistry> {
             reg.load_cache(&models_dev_cache_path());
         }
     }
+    // Layer user metadata overrides on top of the catalog (issue #309). Stored
+    // in the registry, so any later cache reload re-asserts them automatically.
+    reg.apply_model_overrides(&config.model_overrides);
     Arc::new(reg)
 }
 
@@ -1340,7 +1350,7 @@ async fn refresh_provider_runtime_state(
     );
     let provider_registry =
         Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     spawn_models_cache_refresh();
 
@@ -1385,7 +1395,7 @@ async fn reload_provider_runtime_state(
     );
     let provider_registry =
         Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
-    let model_registry = load_cached_model_registry();
+    let model_registry = load_cached_model_registry(&config);
 
     Ok(RefreshedProviderRuntime {
         config,
@@ -3685,10 +3695,29 @@ async fn run_interactive(
                 let pid = claurst_core::ProviderId::new(&provider_id_str);
                 if let Some(provider) = registry.get(&pid) {
                     let provider = provider.clone();
+                    // Layer user metadata overrides (issue #309) onto the
+                    // live-discovered list too, so self-hosted / openai-compatible
+                    // endpoints show the corrected context window in the picker.
+                    let overrides = app.config.model_overrides.clone();
+                    let provider_key = provider_id_str.clone();
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     app.model_fetch_rx = Some(rx);
                     app.model_picker.loading_models = true;
                     tokio::spawn(async move {
+                        // Effective context window for a discovered model:
+                        // the user override wins, else the discovered value.
+                        let ctx_for = |id: &str, discovered: u32| -> u32 {
+                            overrides
+                                .get(&format!("{}/{}", provider_key, id))
+                                .and_then(|o| o.context_window)
+                                .unwrap_or(discovered)
+                        };
+                        let name_for = |id: &str, discovered: &str| -> String {
+                            overrides
+                                .get(&format!("{}/{}", provider_key, id))
+                                .and_then(|o| o.name.clone())
+                                .unwrap_or_else(|| discovered.to_string())
+                        };
                         match provider.discover_models().await {
                             Ok(models) => {
                                 let entries: Vec<claurst_tui::model_picker::ModelEntry> =
@@ -3707,10 +3736,10 @@ async fn run_interactive(
                                                 by_id.get(&id).cloned().unwrap_or_else(|| {
                                                     claurst_tui::model_picker::ModelEntry {
                                                         id: id.clone(),
-                                                        display_name: m.name.clone(),
+                                                        display_name: name_for(&id, &m.name),
                                                         description:
                                                             claurst_tui::model_picker::format_context_window(
-                                                                m.context_window,
+                                                                ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
                                                     }
@@ -3720,14 +3749,17 @@ async fn run_interactive(
                                     } else {
                                         models
                                             .into_iter()
-                                            .map(|m| claurst_tui::model_picker::ModelEntry {
-                                                id: m.id.to_string(),
-                                                display_name: m.name.clone(),
-                                                description:
-                                                    claurst_tui::model_picker::format_context_window(
-                                                        m.context_window,
-                                                    ),
-                                                is_current: false,
+                                            .map(|m| {
+                                                let id = m.id.to_string();
+                                                claurst_tui::model_picker::ModelEntry {
+                                                    display_name: name_for(&id, &m.name),
+                                                    description:
+                                                        claurst_tui::model_picker::format_context_window(
+                                                            ctx_for(&id, m.context_window),
+                                                        ),
+                                                    id,
+                                                    is_current: false,
+                                                }
                                             })
                                             .collect()
                                     };

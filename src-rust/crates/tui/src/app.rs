@@ -1255,6 +1255,19 @@ impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        // Build the model registry up front so user metadata overrides
+        // (issue #309) are layered on before the struct owns `config`.
+        let model_registry = {
+            let mut reg = claurst_api::ModelRegistry::new();
+            // Try to load cached models.dev data from disk.
+            let cache_path = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("claurst")
+                .join("models.json");
+            reg.load_cache(&cache_path);
+            reg.apply_model_overrides(&config.model_overrides);
+            reg
+        };
         Self {
             config,
             cost_tracker,
@@ -1370,16 +1383,7 @@ impl App {
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
-            model_registry: {
-                let mut reg = claurst_api::ModelRegistry::new();
-                // Try to load cached models.dev data from disk.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("claurst")
-                    .join("models.json");
-                reg.load_cache(&cache_path);
-                reg
-            },
+            model_registry,
             model_picker_fetch_pending: false,
             model_picker_provider_id: None,
             session_list_pending: false,
@@ -1971,6 +1975,8 @@ impl App {
         self.config = config;
         self.provider_registry = provider_registry;
         self.model_registry = claurst_api::ModelRegistry::new();
+        // Re-layer user metadata overrides (issue #309) onto the fresh registry.
+        self.model_registry.apply_model_overrides(&self.config.model_overrides);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
