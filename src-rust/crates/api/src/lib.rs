@@ -1488,7 +1488,7 @@ impl StreamAccumulator {
                         PartialBlock::ToolUse { id, name, json_buf } => {
                             let input = serde_json::from_str(&json_buf)
                                 .unwrap_or(Value::Object(Default::default()));
-                            ContentBlock::ToolUse { id, name, input }
+                            ContentBlock::ToolUse { id, name, input, thought_signature: None }
                         }
                         PartialBlock::Thinking {
                             thinking_buf,

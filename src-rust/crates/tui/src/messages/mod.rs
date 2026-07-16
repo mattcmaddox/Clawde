@@ -1627,7 +1627,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     ctx.width,
                 ));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let rendered = render_tool_use_inner(&name, &input);
                 // Silence unused-variable warning on id — kept for symmetry with ToolResult lookup.
@@ -2090,6 +2090,7 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "tool-1".to_string(),
@@ -2289,6 +2290,7 @@ mod tests {
             id: "tu-1".to_string(),
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -2306,6 +2308,7 @@ mod tests {
             id: "tu-2".to_string(),
             name: "Read".to_string(),
             input: serde_json::json!({"file_path": "/tmp/foo.txt"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -2326,6 +2329,7 @@ mod tests {
                 "subagent_type": "explore",
                 "description": "Trace the auth flow"
             }),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()

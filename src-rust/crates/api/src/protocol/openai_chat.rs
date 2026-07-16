@@ -225,6 +225,7 @@ impl OpenAiChatDecoder {
                             id: tc_id.to_string(),
                             name,
                             input: json!({}),
+                            thought_signature: None,
                         },
                     });
                 }

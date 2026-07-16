@@ -1236,6 +1236,7 @@ mod tests {
                 id: format!("tu-{i}"),
                 name: t.to_string(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             });
         }
         TranscriptEntry::Assistant(TranscriptMessage {

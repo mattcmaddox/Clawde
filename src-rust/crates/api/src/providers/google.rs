@@ -152,12 +152,27 @@ impl GoogleProvider {
                     })) }
             }
 
-            ContentBlock::ToolUse { name, input, .. } => Some(json!({
-                "functionCall": {
-                    "name": name,
-                    "args": input
+            ContentBlock::ToolUse {
+                name,
+                input,
+                thought_signature,
+                ..
+            } => {
+                let mut part = json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": input
+                    }
+                });
+                // Gemini 3.x thinking models require the exact `thoughtSignature`
+                // captured from the response to be echoed back on the functionCall
+                // part; omitting it yields HTTP 400 (issue #311). REST JSON uses
+                // camelCase. Absent signature → old behaviour (no key emitted).
+                if let (Some(sig), Some(obj)) = (thought_signature, part.as_object_mut()) {
+                    obj.insert("thoughtSignature".to_string(), json!(sig));
                 }
-            })),
+                Some(part)
+            }
 
             // Thinking blocks are not supported by Gemini — drop silently.
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
@@ -534,6 +549,7 @@ impl GoogleProvider {
                         .unwrap_or("")
                         .to_string();
                     let args = fc.get("args").cloned().unwrap_or(json!({}));
+                    let thought_signature = thought_signature_from_part(part);
                     let occurrence = tool_name_counts
                         .entry(name.clone())
                         .and_modify(|count| *count += 1)
@@ -543,6 +559,7 @@ impl GoogleProvider {
                         id,
                         name,
                         input: args,
+                        thought_signature,
                     });
                 }
             }
@@ -801,6 +818,10 @@ impl LlmProvider for GoogleProvider {
                                             .get("args")
                                             .map(|a| a.to_string())
                                             .unwrap_or_else(|| "{}".to_string());
+                                        // Gemini streams a functionCall part whole, so its
+                                        // thoughtSignature is present on this same part and
+                                        // must ride along on the ToolUse block (#311).
+                                        let thought_signature = thought_signature_from_part(part);
 
                                         let idx = if let Some((existing_idx, _, _)) = open_tool_calls.get(&part_idx) {
                                             *existing_idx
@@ -819,6 +840,7 @@ impl LlmProvider for GoogleProvider {
                                                     id,
                                                     name: name.clone(),
                                                     input: json!({}),
+                                                    thought_signature,
                                                 },
                                             });
                                             idx
@@ -963,6 +985,17 @@ fn uuid_v4_simple() -> String {
     format!("{:032x}", b)
 }
 
+/// Extract Gemini's opaque `thoughtSignature` (camelCase in REST JSON) from a
+/// response `part`. Thinking models attach it as a sibling of `functionCall`;
+/// it must be captured and echoed back verbatim on the next turn or the API
+/// rejects the tool call with HTTP 400 (issue #311). Shared by the streaming
+/// and non-streaming parsers, whose parts have the identical shape.
+fn thought_signature_from_part(part: &Value) -> Option<String> {
+    part.get("thoughtSignature")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,6 +1026,7 @@ mod tests {
                 id: "call_search_2".to_string(),
                 name: "search".to_string(),
                 input: json!({"q": "cats"}),
+                thought_signature: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_search_2".to_string(),
@@ -1063,6 +1097,159 @@ mod tests {
         assert!(matches!(
             &parsed.content[1],
             ContentBlock::ToolUse { id, .. } if id == "call_search_2"
+        ));
+    }
+
+    #[test]
+    fn thought_signature_from_part_captures_streaming_signature() {
+        // The streaming SSE parser lives inside an async network generator with
+        // no test seam, but it extracts the signature through this exact helper.
+        // A streamed functionCall part carries `thoughtSignature` as a sibling of
+        // `functionCall`, identical to the non-streaming shape (#311).
+        let streamed_part = json!({
+            "functionCall": { "name": "read", "args": { "path": "a.rs" } },
+            "thoughtSignature": "SIG_STREAM_1"
+        });
+        assert_eq!(
+            thought_signature_from_part(&streamed_part).as_deref(),
+            Some("SIG_STREAM_1"),
+            "streamed functionCall part's signature is captured"
+        );
+
+        // A part without a signature (older/non-thinking models) yields None.
+        let unsigned_part = json!({
+            "functionCall": { "name": "read", "args": {} }
+        });
+        assert!(
+            thought_signature_from_part(&unsigned_part).is_none(),
+            "absent signature stays None"
+        );
+    }
+
+    #[test]
+    fn parse_response_body_captures_thought_signature() {
+        // Gemini 3.x thinking models attach a camelCase `thoughtSignature` as a
+        // sibling of `functionCall` on the part; it must be captured (#311).
+        let provider = GoogleProvider::new("test".to_string());
+        let response = json!({
+            "candidates": [{
+                "finishReason": "FUNCTION_CALL",
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": { "name": "read", "args": { "path": "a.rs" } },
+                            "thoughtSignature": "SIG_ABC123"
+                        }
+                    ]
+                }
+            }],
+            "usageMetadata": {}
+        });
+
+        let parsed = provider
+            .parse_response_body(&response, "gemini-3.1-pro-preview")
+            .expect("parsed response");
+
+        match &parsed.content[0] {
+            ContentBlock::ToolUse {
+                name,
+                thought_signature,
+                ..
+            } => {
+                assert_eq!(name, "read");
+                assert_eq!(thought_signature.as_deref(), Some("SIG_ABC123"));
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_body_omits_signature_when_absent() {
+        // A functionCall part without a signature (older/non-thinking models)
+        // yields a ToolUse with `thought_signature == None` (old behaviour).
+        let provider = GoogleProvider::new("test".to_string());
+        let response = json!({
+            "candidates": [{
+                "finishReason": "FUNCTION_CALL",
+                "content": {
+                    "parts": [
+                        { "functionCall": { "name": "read", "args": {} } }
+                    ]
+                }
+            }],
+            "usageMetadata": {}
+        });
+
+        let parsed = provider
+            .parse_response_body(&response, "gemini-2.0-flash")
+            .expect("parsed response");
+
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::ToolUse { thought_signature, .. } if thought_signature.is_none()
+        ));
+    }
+
+    #[test]
+    fn build_request_body_round_trips_thought_signature_onto_function_call() {
+        // A captured signature must ride back as a camelCase sibling of the
+        // functionCall part, or Gemini 3.x rejects the turn with HTTP 400 (#311).
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "call_read".to_string(),
+                name: "read".to_string(),
+                input: json!({ "path": "a.rs" }),
+                thought_signature: Some("SIG_ABC123".to_string()),
+            },
+        ])]);
+
+        let body = provider.build_request_body(&request);
+        let contents = body["contents"].as_array().expect("contents array");
+        let part = &contents[0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], json!("read"));
+        assert_eq!(part["functionCall"]["args"], json!({ "path": "a.rs" }));
+        assert_eq!(part["thoughtSignature"], json!("SIG_ABC123"));
+    }
+
+    #[test]
+    fn build_request_body_without_signature_omits_thought_signature_key() {
+        // Absent signature keeps the old wire shape: no thoughtSignature key.
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "call_read".to_string(),
+                name: "read".to_string(),
+                input: json!({ "path": "a.rs" }),
+                thought_signature: None,
+            },
+        ])]);
+
+        let body = provider.build_request_body(&request);
+        let part = &body["contents"][0]["parts"][0];
+        assert_eq!(part["functionCall"]["name"], json!("read"));
+        assert!(
+            part.get("thoughtSignature").is_none(),
+            "absent signature must not emit a thoughtSignature key"
+        );
+    }
+
+    #[test]
+    fn thought_signature_survives_content_block_serde_round_trip() {
+        // The signature must persist across session save/load (JSON round-trip).
+        let block = ContentBlock::ToolUse {
+            id: "call_read".to_string(),
+            name: "read".to_string(),
+            input: json!({ "path": "a.rs" }),
+            thought_signature: Some("SIG_PERSIST".to_string()),
+        };
+        let encoded = serde_json::to_string(&block).expect("serialize");
+        assert!(encoded.contains("thought_signature"));
+        let decoded: ContentBlock = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            ContentBlock::ToolUse { thought_signature, .. }
+                if thought_signature.as_deref() == Some("SIG_PERSIST")
         ));
     }
 }

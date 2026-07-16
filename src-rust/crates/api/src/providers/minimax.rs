@@ -158,6 +158,7 @@ impl MinimaxProvider {
                             id,
                             name,
                             input: serde_json::Value::Object(Default::default()),
+                            thought_signature: None,
                         }
                     }
                     _ => return None,

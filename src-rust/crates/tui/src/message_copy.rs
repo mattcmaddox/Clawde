@@ -30,7 +30,7 @@ pub fn copy_as_markdown(message: &Message) -> String {
                             signature, thinking
                         ))
                     }
-                    claurst_core::ContentBlock::ToolUse { id, name, input } => {
+                    claurst_core::ContentBlock::ToolUse { id, name, input, .. } => {
                         // Format tool use as code block
                         Some(format!(
                             "```json\n// Tool: {}\n// ID: {}\n{}\n```",
@@ -330,7 +330,7 @@ fn format_block_for_json(block: &claurst_core::ContentBlock) -> String {
     match block {
         claurst_core::ContentBlock::Text { text } => text.clone(),
         claurst_core::ContentBlock::Image { .. } => "[Image content]".to_string(),
-        claurst_core::ContentBlock::ToolUse { id, name, input } => {
+        claurst_core::ContentBlock::ToolUse { id, name, input, .. } => {
             format!(
                 "[Tool: {} (ID: {})]\n{}",
                 name,

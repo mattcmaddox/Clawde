@@ -492,7 +492,12 @@ impl CodexProvider {
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
                     let input = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
-                    content.push(ContentBlock::ToolUse { id, name, input });
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 _ => {}
             }
@@ -705,6 +710,7 @@ impl LlmProvider for CodexProvider {
                                                         id: call_id,
                                                         name,
                                                         input: json!({}),
+                                                        thought_signature: None,
                                                     },
                                                 });
                                             }

@@ -209,6 +209,7 @@ mod tests {
             id: id.to_string(),
             name: "Read".to_string(),
             input: serde_json::json!({ "path": "/tmp/x" }),
+            thought_signature: None,
         }
     }
 
