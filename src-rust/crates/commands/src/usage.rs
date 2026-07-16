@@ -29,6 +29,13 @@ impl SlashCommand for UsageCommand {
         let total = ctx.cost_tracker.total_tokens();
         let cost = ctx.cost_tracker.total_cost_usd();
 
+        // Some providers (notably local OpenAI-compatible servers that don't
+        // report `prompt_tokens_details.cached_tokens`) never surface cache
+        // usage. Show "n/a" rather than a permanent 0, which reads as if
+        // caching were broken. See docs/local-models.md.
+        let cache_creation_disp = display_cache_count(cache_creation, cache_read);
+        let cache_read_disp = display_cache_count(cache_read, cache_creation);
+
         // Try to get account tier from OAuth tokens
         let account_info = match claurst_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
@@ -62,8 +69,8 @@ impl SlashCommand for UsageCommand {
             model = ctx.config.effective_model(),
             input = input,
             output = output,
-            cache_creation = cache_creation,
-            cache_read = cache_read,
+            cache_creation = cache_creation_disp,
+            cache_read = cache_read_disp,
             total = total,
             cost = cost,
         ))
@@ -125,7 +132,7 @@ impl SlashCommand for ExtraUsageCommand {
                Cache read:        {cache_read:>10}\n\
                Total tokens:      {total:>10}\n\n\
              Cache Performance:\n\
-               Cache hit rate:    {cache_hit_pct:.1}%\n\
+               Cache hit rate:    {cache_hit_disp}\n\
                Cache efficiency:  {cache_eff}\n\n\
              Cost:\n\
                Total cost:        ${cost:.4}\n\
@@ -134,10 +141,14 @@ impl SlashCommand for ExtraUsageCommand {
             cost_per_call = cost_per_call,
             input = input,
             output = output,
-            cache_creation = cache_creation,
-            cache_read = cache_read,
+            cache_creation = display_cache_count(cache_creation, cache_read),
+            cache_read = display_cache_count(cache_read, cache_creation),
             total = total,
-            cache_hit_pct = cache_hit_pct,
+            cache_hit_disp = if cache_total > 0 {
+                format!("{:.1}%", cache_hit_pct)
+            } else {
+                "n/a".to_string()
+            },
             cache_eff = if cache_hit_pct > 70.0 {
                 "Excellent"
             } else if cache_hit_pct > 40.0 {
@@ -150,5 +161,40 @@ impl SlashCommand for ExtraUsageCommand {
             cost = cost,
             cost_per_k = if total > 0 { cost / (total as f64 / 1000.0) } else { 0.0 },
         ))
+    }
+}
+
+/// Render a cache token count for display. When neither the read nor the write
+/// counter recorded any activity this session, the provider almost certainly
+/// does not report cache usage at all (e.g. a local OpenAI-compatible server
+/// without prompt caching), so show `n/a` instead of a flat `0` that reads as
+/// if caching were broken.
+fn display_cache_count(value: u64, other: u64) -> String {
+    if value == 0 && other == 0 {
+        "n/a".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_cache_count;
+
+    #[test]
+    fn cache_count_zero_both_is_na() {
+        assert_eq!(display_cache_count(0, 0), "n/a");
+    }
+
+    #[test]
+    fn cache_count_nonzero_shows_number() {
+        assert_eq!(display_cache_count(1234, 0), "1234");
+    }
+
+    #[test]
+    fn cache_count_zero_read_but_nonzero_write_shows_zero() {
+        // Anthropic can report cache_creation on the first turn with no reads
+        // yet; that is real activity, so the zero read count is honest, not n/a.
+        assert_eq!(display_cache_count(0, 500), "0");
     }
 }

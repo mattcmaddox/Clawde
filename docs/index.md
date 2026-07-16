@@ -134,7 +134,9 @@ claurst --provider ollama --model llama3.2
 OPENAI_API_KEY=sk-... claurst --provider openai --model gpt-4o
 ```
 
-See [Providers](providers) for setup instructions for every supported provider.
+See [Providers](providers) for setup instructions for every supported provider,
+or the [Local Models](local-models) guide for running against llama.cpp,
+LM Studio, Ollama, or any OpenAI-compatible server on your own machine.
 
 ---
 
@@ -192,6 +194,7 @@ See [Slash Commands](commands) for the complete reference.
 - [Slash Commands](commands) — all 70+ commands
 - [Tools Reference](tools) — all 40+ tools and permission levels
 - [Providers](providers) — configuring each LLM provider
+- [Local Models](local-models) — llama.cpp, LM Studio, Ollama, and other OpenAI-compatible servers
 - [MCP Integration](mcp) — Model Context Protocol servers
 - [Plugins](plugins) — building and using plugins
 - [Agents](agents) — multi-agent orchestration

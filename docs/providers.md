@@ -2,6 +2,10 @@
 
 Claurst supports a wide range of LLM providers through a unified provider abstraction. Every provider implements the same `LlmProvider` trait, so switching between them requires only a configuration change.
 
+> Running a model on your own machine (llama.cpp, LM Studio, Ollama, vLLM)? See
+> the dedicated [Local Models](local-models) guide for recommended server flags,
+> tool-calling setup, model guidance, and cache accounting.
+
 ---
 
 ## Selecting a Provider
@@ -397,6 +401,10 @@ Connects to a locally running llama.cpp HTTP server. No API key required.
 ```
 
 Start llama.cpp with the `--server` flag before use.
+
+For recommended `llama-server` flags (tool calling, context sizing, prompt
+caching), model guidance, and cache-accounting details, see the
+[Local Models](local-models) guide.
 
 ---
 
