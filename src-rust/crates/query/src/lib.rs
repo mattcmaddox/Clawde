@@ -1001,8 +1001,11 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                    // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
+                    // thought_signature carries Gemini's opaque per-call signature
+                    // through stream assembly so it survives into the persisted
+                    // ToolUse block and is echoed back next turn (#311).
+                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
                         std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
@@ -1054,9 +1057,9 @@ pub async fn run_query_loop(
                                             }
                                             claurst_api::StreamEvent::ContentBlockStart {
                                                 index,
-                                                content_block: ContentBlock::ToolUse { id, name, .. },
+                                                content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
+                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
                                             }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1068,7 +1071,7 @@ pub async fn run_query_loop(
                                                 thinking_chunks.push(reasoning.clone());
                                             }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                                if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
                                                 }
                                             }
@@ -1177,7 +1180,7 @@ pub async fn run_query_loop(
                     let mut malformed_tool_calls: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
                             let input = match parse_tool_args(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -1193,7 +1196,7 @@ pub async fn run_query_loop(
                                     serde_json::json!({})
                                 }
                             };
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
                         }
                     }
 
@@ -1216,7 +1219,7 @@ pub async fn run_query_loop(
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input } = b {
+                        if let ContentBlock::ToolUse { id, name, input, .. } = b {
                             Some((id.clone(), name.clone(), input.clone()))
                         } else {
                             None
@@ -1857,7 +1860,7 @@ pub async fn run_query_loop(
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
-                    if let ContentBlock::ToolUse { id, name, input } = block {
+                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
                         // Clone from the references returned by get_tool_use_blocks()
                         let id = id.clone();
                         let name = name.clone();
@@ -2770,6 +2773,7 @@ mod tests {
                             id: tool_id,
                             name: "noop_tool".to_string(),
                             input: serde_json::json!({}),
+                            thought_signature: None,
                         },
                     }),
                     Ok(StreamEvent::InputJsonDelta {

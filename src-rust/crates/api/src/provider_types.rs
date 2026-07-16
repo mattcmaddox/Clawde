@@ -204,6 +204,9 @@ enum PartialBlock {
         id: String,
         name: String,
         json_buf: String,
+        /// Opaque provider signature (e.g. Gemini's `thoughtSignature`) captured
+        /// on `ContentBlockStart`; echoed back on the finalized block (#311).
+        thought_signature: Option<String>,
     },
     /// Any block that arrives fully-formed on `ContentBlockStart` and needs no
     /// delta accumulation (e.g. `RedactedThinking`, images).
@@ -225,10 +228,11 @@ impl PartialBlock {
                 thinking_buf: thinking,
                 signature_buf: signature,
             },
-            ContentBlock::ToolUse { id, name, .. } => PartialBlock::ToolUse {
+            ContentBlock::ToolUse { id, name, thought_signature, .. } => PartialBlock::ToolUse {
                 id,
                 name,
                 json_buf: String::new(),
+                thought_signature,
             },
             other => PartialBlock::Passthrough(other),
         }
@@ -244,10 +248,10 @@ impl PartialBlock {
                 thinking: thinking_buf,
                 signature: signature_buf,
             },
-            PartialBlock::ToolUse { id, name, json_buf } => {
+            PartialBlock::ToolUse { id, name, json_buf, thought_signature } => {
                 let input =
                     serde_json::from_str(&json_buf).unwrap_or(Value::Object(Default::default()));
-                ContentBlock::ToolUse { id, name, input }
+                ContentBlock::ToolUse { id, name, input, thought_signature }
             }
             PartialBlock::Passthrough(block) => block,
         }
@@ -519,6 +523,7 @@ mod tests {
                 id: "tool_1".into(),
                 name: "get_weather".into(),
                 input: Value::Null,
+                thought_signature: Some("sig-tool-xyz".into()),
             },
         });
         acc.on_event(&StreamEvent::InputJsonDelta {
@@ -549,13 +554,18 @@ mod tests {
             other => panic!("expected Text block second, got {other:?}"),
         }
         match &blocks[2] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, thought_signature } => {
                 assert_eq!(id, "tool_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(
                     input.get("city").and_then(Value::as_str),
                     Some("Paris"),
                     "tool_use JSON assembled from partial deltas"
+                );
+                assert_eq!(
+                    thought_signature.as_deref(),
+                    Some("sig-tool-xyz"),
+                    "opaque tool-call signature survives stream assembly"
                 );
             }
             other => panic!("expected ToolUse block third, got {other:?}"),
