@@ -41,6 +41,7 @@ values. Keys absent from the project file fall back to the global value.
   "provider": "anthropic",
   "config": { ... },
   "providers": { ... },
+  "modelOverrides": { ... },
   "projects": { ... },
   "commands": { ... },
   "formatter": { ... },
@@ -54,7 +55,9 @@ values. Keys absent from the project file fall back to the global value.
 ```
 
 Most day-to-day options live inside the `config` object. Provider credentials
-live in the `providers` map.
+live in the `providers` map. Corrected model metadata for self-hosted or
+unknown models lives in the `modelOverrides` map — see
+[Model metadata overrides](providers.md#overriding-model-metadata).
 
 ---
 

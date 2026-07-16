@@ -711,3 +711,51 @@ The above example allows only `gpt-4o` (whitelist minus blacklist).
 Claurst ships a bundled snapshot of models for Anthropic, OpenAI, and Google. At runtime it optionally refreshes from the public `https://models.dev/api.json` API (cached to `~/.claurst/models_cache.json`, refreshed at most every 5 minutes). Network failures are swallowed silently; the bundled snapshot is always sufficient for normal operation.
 
 When no model is explicitly set, Claurst scores available models by priority patterns to pick the best default. Well-known model prefixes (`claude-*`, `gpt-*`, `gemini-*`, etc.) are always routed to their canonical provider regardless of gateway entries in the remote cache.
+
+### Overriding model metadata
+
+Self-hosted endpoints (the `custom-openai` / Ollama / LM Studio / llama.cpp
+providers) and model aliases that models.dev does not know can end up with the
+wrong context window or max-output size — either because the alias is matched to
+an unrelated catalog entry, or because there is no catalog entry at all. The
+`modelOverrides` map lets you supply or correct that metadata. **User overrides
+take precedence over the models.dev catalog and over the built-in defaults.**
+
+Add it at the top level of `~/.claurst/settings.json` (or inside the `config`
+object), keyed by the fully-qualified `"provider/model"` id:
+
+```json
+{
+  "modelOverrides": {
+    "custom-openai/my-local-llm": {
+      "contextWindow": 32768,
+      "maxOutputTokens": 4096,
+      "name": "My Local LLM",
+      "releaseDate": "2026-01-01",
+      "status": "beta"
+    },
+    "ollama/qwen3-coder-30b": {
+      "contextWindow": 262144
+    }
+  }
+}
+```
+
+**Fields** (all optional — an unset field keeps the catalog value):
+
+| Field | Type | Description |
+|---|---|---|
+| `contextWindow` | integer | Total context window size in tokens |
+| `maxOutputTokens` | integer | Maximum tokens the model can emit in one response |
+| `name` | string | Human-readable display name shown in the model picker |
+| `releaseDate` | string | ISO 8601 date; drives newest-first ordering in the picker |
+| `status` | string | Lifecycle status (`active`, `beta`, `alpha`, `deprecated`) |
+
+Field names accept both camelCase (`contextWindow`) and snake_case
+(`context_window`). The key **must** contain a `/` — a bare model id is ignored,
+because the registry is keyed by `provider/model`.
+
+When the keyed model exists in the catalog, the override patches it in place.
+When it does not (a self-hosted alias), Claurst materialises a synthetic entry
+so the corrected values flow everywhere the metadata is read: the `/model`
+picker, the token-usage warnings, and the auto-compact thresholds.
