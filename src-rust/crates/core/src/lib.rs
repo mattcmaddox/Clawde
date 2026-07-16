@@ -941,6 +941,67 @@ pub mod config {
         }
     }
 
+    // ---- ModelOverride ---------------------------------------------------
+
+    /// User-supplied metadata override for a single model, keyed by the
+    /// `"provider/model"` string in [`Config::model_overrides`].
+    ///
+    /// Every field is optional: a `Some` value takes precedence over the
+    /// models.dev catalog entry (and over any built-in default), while a `None`
+    /// leaves the catalog value untouched. When the keyed model is absent from
+    /// the catalog entirely (a self-hosted alias, or an id models.dev does not
+    /// know), the override is materialised into a synthetic registry entry so
+    /// the model picker, token warnings, and auto-compact thresholds size it
+    /// correctly instead of mismatching it to an unrelated catalog model.
+    ///
+    /// Field names accept both camelCase (`contextWindow`) and snake_case
+    /// (`context_window`) so the override reads naturally whether it lives at the
+    /// top level of `settings.json` or under the nested `config` block.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct ModelOverride {
+        /// Total context window size in tokens.
+        #[serde(
+            default,
+            rename = "contextWindow",
+            alias = "context_window",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub context_window: Option<u32>,
+        /// Maximum tokens the model can emit in a single response.
+        #[serde(
+            default,
+            rename = "maxOutputTokens",
+            alias = "max_output_tokens",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_output_tokens: Option<u32>,
+        /// Human-readable display name shown in the model picker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// First public availability (ISO 8601 date), drives date-DESC listing.
+        #[serde(
+            default,
+            rename = "releaseDate",
+            alias = "release_date",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub release_date: Option<String>,
+        /// Lifecycle status string (`"active"`, `"beta"`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    impl ModelOverride {
+        /// Whether this override carries no data (every field is `None`).
+        pub fn is_empty(&self) -> bool {
+            self.context_window.is_none()
+                && self.max_output_tokens.is_none()
+                && self.name.is_none()
+                && self.release_date.is_none()
+                && self.status.is_none()
+        }
+    }
+
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
@@ -982,6 +1043,11 @@ pub mod config {
         /// Per-provider configurations
         #[serde(default)]
         pub provider_configs: HashMap<String, ProviderConfig>,
+        /// User-supplied model metadata overrides, keyed by `"provider/model"`.
+        /// Take precedence over the models.dev catalog (copied from Settings on
+        /// load; see [`ModelOverride`]).
+        #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
+        pub model_overrides: HashMap<String, ModelOverride>,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
@@ -1179,6 +1245,12 @@ pub mod config {
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
+        /// User-supplied model metadata overrides stored in settings.json,
+        /// keyed by `"provider/model"`. Merged into
+        /// [`Config::model_overrides`] by [`Settings::effective_config`] and
+        /// take precedence over the models.dev catalog.
+        #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
+        pub model_overrides: HashMap<String, ModelOverride>,
         /// User-defined slash command templates.
         #[serde(default)]
         pub commands: HashMap<String, CommandTemplate>,
@@ -1691,6 +1763,11 @@ pub mod config {
             for (id, pc) in &self.providers {
                 config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
             }
+            // Merge top-level `modelOverrides` into config.model_overrides
+            // (nested `config` block wins for keys present in both).
+            for (id, ov) in &self.model_overrides {
+                config.model_overrides.entry(id.clone()).or_insert_with(|| ov.clone());
+            }
             // Copy top-level formatters and commands into config.
             for (k, v) in &self.formatter {
                 config.formatter.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1828,6 +1905,7 @@ pub mod config {
                 hooks: merge_map(base.config.hooks, over.config.hooks),
                 provider: over.config.provider.or(base.config.provider),
                 provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
+                model_overrides: merge_map(base.config.model_overrides, over.config.model_overrides),
                 formatter: merge_map(base.config.formatter, over.config.formatter),
                 commands: merge_map(base.config.commands, over.config.commands),
                 agents: merge_map(base.config.agents, over.config.agents),
@@ -1872,6 +1950,7 @@ pub mod config {
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
+                model_overrides: merge_map(base.model_overrides, over.model_overrides),
                 commands: merge_map(base.commands, over.commands),
                 formatter: merge_map(base.formatter, over.formatter),
                 agents: merge_map(base.agents, over.agents),
