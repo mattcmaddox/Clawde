@@ -1109,8 +1109,6 @@ pub struct App {
     /// A single key event that was drained from the queue during paste-burst
     /// detection but wasn't part of the burst (e.g. a modifier key that stopped
     /// the burst). Replayed at the top of the next loop iteration.
-    /// Non-character key swallowed by the paste-burst drain, replayed at the
-    /// top of the next event-loop iteration (see `try_detect_paste_burst`).
     pub pending_key: Option<crossterm::event::KeyEvent>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
