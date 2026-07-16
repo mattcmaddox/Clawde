@@ -1107,7 +1107,9 @@ pub struct App {
     /// A single key event that was drained from the queue during paste-burst
     /// detection but wasn't part of the burst (e.g. a modifier key that stopped
     /// the burst). Replayed at the top of the next loop iteration.
-    pending_key: Option<crossterm::event::KeyEvent>,
+    /// Non-character key swallowed by the paste-burst drain, replayed at the
+    /// top of the next event-loop iteration (see `try_detect_paste_burst`).
+    pub pending_key: Option<crossterm::event::KeyEvent>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
@@ -5727,6 +5729,17 @@ impl App {
             && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
     }
 
+    /// Gate for paste-burst detection in the live CLI event loop: keystrokes
+    /// are currently flowing into the prompt (no modal is capturing input and
+    /// vim is in insert mode). Unlike `prompt_is_accepting_text`, streaming
+    /// does NOT disable it — the prompt stays editable during a turn for
+    /// queued composition, and a raw-key paste flood must be captured there
+    /// too instead of submitting on every pasted newline.
+    pub fn paste_burst_allowed(&self) -> bool {
+        !self.any_modal_open()
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+    }
+
     /// Drain any immediately-available key events from the crossterm event
     /// queue (zero-timeout poll) and return them alongside `first` as a single
     /// pasted string if the burst is large enough to be a paste.
@@ -5745,7 +5758,7 @@ impl App {
     /// single keystroke.  If a non-character key is encountered while
     /// draining, it is stored in `self.pending_key` and will be replayed at
     /// the top of the next event-loop iteration.
-    fn try_detect_paste_burst(
+    pub fn try_detect_paste_burst(
         &mut self,
         first: char,
     ) -> Option<String> {
@@ -5767,10 +5780,21 @@ impl App {
 
         while let Ok(true) = crossterm::event::poll(std::time::Duration::ZERO) {
             match crossterm::event::read() {
-                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                Ok(Event::Key(k)) => {
+                    // Windows emits Press+Release pairs for every keystroke,
+                    // so Release events are interleaved with the flood — skip
+                    // them instead of treating them as end-of-burst (which
+                    // capped every burst at a single character).
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     match k.code {
                         KeyCode::Char(c) => buf.push(c),
                         KeyCode::Enter => buf.push('\n'),
+                        // Raw tabs are indentation in pasted code; ending the
+                        // burst on them would truncate the paste and replay
+                        // Tab as a completion keypress.
+                        KeyCode::Tab => buf.push('\t'),
                         _ => {
                             // Non-character key — save it for replay.
                             self.pending_key = Some(k);
