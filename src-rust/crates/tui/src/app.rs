@@ -953,6 +953,8 @@ pub struct App {
     pub agents_menu: AgentsMenuState,
     /// Diff viewer overlay.
     pub diff_viewer: DiffViewerState,
+    /// Read-only viewer for [Pasted text #N ...] placeholders.
+    pub paste_viewer: crate::paste_viewer::PasteViewer,
     /// Session-quality feedback survey overlay.
     pub feedback_survey: crate::feedback_survey::FeedbackSurveyState,
     /// Memory file selector overlay (AGENTS.md browser).
@@ -1339,6 +1341,7 @@ impl App {
             mcp_view: McpViewState::new(),
             agents_menu: AgentsMenuState::new(),
             diff_viewer: DiffViewerState::new(),
+            paste_viewer: crate::paste_viewer::PasteViewer::default(),
             feedback_survey: crate::feedback_survey::FeedbackSurveyState::new(),
             memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState::new(),
             hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState::new(),
@@ -2325,6 +2328,7 @@ impl App {
             || self.mcp_view.visible
             || self.agents_menu.visible
             || self.diff_viewer.visible
+            || self.paste_viewer.visible
             || self.global_search.visible
             || self.feedback_survey.visible
             || self.memory_file_selector.visible
@@ -3865,6 +3869,11 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.hooks_config_menu.select_next(),
                 _ => {}
             }
+            return false;
+        }
+
+        if self.paste_viewer.visible {
+            self.handle_paste_viewer_key(key);
             return false;
         }
 
@@ -5865,8 +5874,49 @@ impl App {
         let target_row = scroll + (row - text_start_y) as usize;
         let target_col = col.saturating_sub(rect.x + 2) as usize;
         self.prompt_input.set_cursor_at_visual(target_row, target_col, width);
-        self.prompt_input.expand_paste_ref_at(self.prompt_input.cursor);
+        // Clicking a [Pasted text #N ...] placeholder opens the read-only
+        // viewer so the body can be read without splicing it into the
+        // prompt; Alt+E remains the in-place expansion for editing.
+        if let Some((id, body)) = self.prompt_input.paste_ref_at(self.prompt_input.cursor) {
+            self.paste_viewer.open(id, &body);
+        }
         self.refresh_prompt_input();
+    }
+
+    /// Key handling while the paste viewer modal is open.
+    fn handle_paste_viewer_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.paste_viewer.close(),
+            KeyCode::Up | KeyCode::Char('k') => self.paste_viewer.scroll_up(1),
+            KeyCode::Down | KeyCode::Char('j') => self.paste_viewer.scroll_down(1),
+            KeyCode::PageUp => self.paste_viewer.page_up(),
+            KeyCode::PageDown => self.paste_viewer.page_down(),
+            KeyCode::Home | KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),
+            KeyCode::End | KeyCode::Char('G') => self.paste_viewer.scroll_to_bottom(),
+            // Alt+E from inside the viewer: same in-place expansion as on the
+            // placeholder itself, then close (the body now lives in the
+            // prompt buffer).
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                let id = self.paste_viewer.paste_id;
+                self.paste_viewer.close();
+                self.expand_paste_ref_by_id(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Expand the `[Pasted text #N ...]` placeholder with the given id, if it
+    /// is still present in the prompt buffer with a stored body.
+    fn expand_paste_ref_by_id(&mut self, id: u32) {
+        let target =
+            claurst_core::prompt_history::parse_references_with_positions(&self.prompt_input.text)
+                .into_iter()
+                .find(|(rid, matched, _)| *rid == id && matched.starts_with("[Pasted text #"));
+        if let Some((_, _, start)) = target {
+            self.prompt_input.expand_paste_ref_at(start);
+            self.refresh_prompt_input();
+        }
     }
 
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
@@ -5878,6 +5928,17 @@ impl App {
         // Keyboard scrolling (PageUp/PageDown, etc.) is handled elsewhere and is
         // unaffected by this gate.
         if !self.config.mouse_capture_enabled() {
+            return;
+        }
+
+        // The paste viewer modal swallows mouse input: the wheel scrolls its
+        // body, everything else is inert (Esc/q close it).
+        if self.paste_viewer.visible {
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => self.paste_viewer.scroll_up(3),
+                MouseEventKind::ScrollDown => self.paste_viewer.scroll_down(3),
+                _ => {}
+            }
             return;
         }
 
@@ -6864,10 +6925,10 @@ mod tests {
         assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
     }
 
-    // ---- click-to-expand paste placeholders ----
+    // ---- click-to-view paste placeholders ----
 
     #[test]
-    fn prompt_click_on_placeholder_expands_it() {
+    fn prompt_click_on_placeholder_opens_viewer() {
         let mut app = make_app();
         // Bottom pane as rendered: 1 status row (height > 2), then the top
         // separator at y=21, text rows from y=22. Prefix "❯ " is 2 cells.
@@ -6878,12 +6939,38 @@ mod tests {
         app.prompt_input.paste("l1\nl2\nl3");
         assert!(app.prompt_input.text.contains("[Pasted text #1"));
 
-        // Click on the separator row: no expansion.
+        // Click on the separator row: nothing opens.
         app.handle_prompt_click(10, 21);
-        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+        assert!(!app.paste_viewer.visible);
 
-        // Click inside the placeholder on the first text row.
+        // Click inside the placeholder on the first text row: the viewer
+        // opens read-only — the placeholder stays in the buffer and the body
+        // stays stored so submit-time expansion is unaffected.
         app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+        assert_eq!(app.paste_viewer.paste_id, 1);
+        assert_eq!(app.paste_viewer.line_count(), 3);
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+        assert!(!app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn paste_viewer_alt_e_expands_into_prompt() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+
+        let alt_e = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('e'),
+            KeyModifiers::ALT,
+        );
+        app.handle_paste_viewer_key(alt_e);
+        assert!(!app.paste_viewer.visible);
         assert_eq!(app.prompt_input.text, "hi l1\nl2\nl3");
         assert!(app.prompt_input.paste_contents.is_empty());
     }
@@ -6898,10 +6985,11 @@ mod tests {
         app.prompt_input.paste("l1\nl2\nl3");
         let text_before = app.prompt_input.text.clone();
 
-        // Click on "hello " before the placeholder: cursor moves, no expand.
+        // Click on "hello " before the placeholder: cursor moves, no viewer.
         app.handle_prompt_click(2 + 1, 22);
         assert_eq!(app.prompt_input.text, text_before);
         assert_eq!(app.prompt_input.cursor, 1);
+        assert!(!app.paste_viewer.visible);
     }
 
     // ---- scroll_offset clamping (issue #223) ----

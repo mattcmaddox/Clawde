@@ -691,6 +691,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_diff_dialog(&mut state, size, frame.buffer_mut());
     }
 
+    if app.paste_viewer.visible {
+        crate::paste_viewer::render_paste_viewer_buf(&app.paste_viewer, size, frame.buffer_mut());
+    }
+
     if app.global_search.visible {
         render_global_search(&app.global_search, size, frame.buffer_mut());
     }
@@ -2150,7 +2154,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             // A [Pasted text #N ...] placeholder is in the buffer — tell the
             // user how to view the full pasted body before submitting.
             Line::from(vec![
-                Span::styled("alt+e/click to expand paste", Style::default().fg(dim)),
+                Span::styled("click to view paste · alt+e expands", Style::default().fg(dim)),
             ])
         } else {
             Line::from(Vec::<Span>::new())

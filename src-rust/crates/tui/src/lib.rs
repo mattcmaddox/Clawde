@@ -101,6 +101,8 @@ pub mod theme_screen;
 pub mod theme_colors;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
 pub mod diff_viewer;
+/// Read-only viewer for [Pasted text #N ...] placeholders.
+pub mod paste_viewer;
 /// Virtual scrollable list for efficient message rendering.
 pub mod virtual_list;
 /// Message type renderers (assistant, user, tool use, etc.).
