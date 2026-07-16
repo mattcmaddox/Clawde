@@ -598,7 +598,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Length(status_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(size);
 
@@ -1114,46 +1114,41 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         render_plugin_hints(frame, &app.plugin_hints, ha);
     }
 
-    let notice_lines = startup_notice_lines(app, content_area.width);
-    let header_height = WELCOME_BOX_HEIGHT + notice_lines.len() as u16;
-    let show_logo_header = content_area.height >= header_height + 3 && content_area.width >= 60;
-    let (logo_area, notices_area, msg_area) = if show_logo_header {
-        let splits = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(header_height), Constraint::Min(1)])
-            .split(content_area);
-        if notice_lines.is_empty() {
-            (Some(splits[0]), None, splits[1])
-        } else {
-            let header_splits = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(WELCOME_BOX_HEIGHT),
-                    Constraint::Length(notice_lines.len() as u16),
-                ])
-                .split(splits[0]);
-            (Some(header_splits[0]), Some(header_splits[1]), splits[1])
-        }
-    } else {
-        (None, None, content_area)
-    };
-
-    if let Some(la) = logo_area {
-        render_welcome_box(frame, app, la);
-        if let Some(na) = notices_area {
-            render_startup_notices(frame, app, na);
-        }
-    } else if app.messages.is_empty()
+    // The rich two-column welcome box is a full welcome SCREEN, shown only while
+    // the transcript is empty. Once a conversation starts it is NOT kept as a
+    // fixed header (which permanently ate ~9 rows, issue #310); instead a compact
+    // banner is prepended to the transcript (see `welcome_banner_lines`) so it
+    // scrolls away with the content and the conversation reclaims the space.
+    let transcript_empty = app.messages.is_empty()
         && app.streaming_text.is_empty()
         && app.streaming_thinking.is_empty()
-        && app.tool_use_blocks.is_empty()
-    {
+        && app.tool_use_blocks.is_empty();
+
+    if transcript_empty {
         app.last_msg_area.set(Rect::default());
         app.message_row_map.borrow_mut().clear();
         app.thinking_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
+        // Startup notices (remote session, +dir, away summary) sit just below
+        // the welcome box on the empty screen.
+        let notice_lines = startup_notice_lines(app, content_area.width);
+        if !notice_lines.is_empty() && content_area.height > WELCOME_BOX_HEIGHT {
+            let notices_area = Rect {
+                x: content_area.x,
+                y: content_area.y + WELCOME_BOX_HEIGHT,
+                width: content_area.width,
+                height: content_area.height - WELCOME_BOX_HEIGHT,
+            };
+            render_startup_notices(frame, app, notices_area);
+        }
         return;
     }
+
+    // Active conversation: the whole content area is the (scrollable) transcript.
+    // The welcome box is no longer on screen, so clear the anchor rect used to
+    // position error modals against its right column.
+    app.footer_right_column_area.set(Rect::default());
+    let msg_area = content_area;
 
     // Store the actual message pane bounds for mouse event handling (text selection, scrolling).
     app.last_msg_area.set(msg_area);
@@ -1514,6 +1509,10 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 
     let total = app.messages.len();
     let mut items = Vec::new();
+    // Prepend the compact welcome banner as ordinary scrollable content so it
+    // scrolls away with the conversation instead of sitting in a fixed header
+    // (issue #310).
+    push_rendered_items(&mut items, welcome_banner_lines(app, width), None, false);
     build_message_items_range(app, width, &ctx, &turn_map, 0, total, true, &mut items);
 
     if total == 0 && !app.tool_use_blocks.is_empty() {
@@ -1621,8 +1620,10 @@ fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 
     // Committed prefix: messages before the live turn. Stable across streaming
     // deltas, so keyed by identity (not `transcript_version`) and served from
-    // cache every frame after the first.
-    let mut items = if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
+    // cache every frame after the first. The cached prefix does NOT include the
+    // welcome banner, so the entry stays byte-identical to the non-streaming
+    // build's committed range.
+    let prefix = if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
         cache
             .borrow()
             .as_ref()
@@ -1643,6 +1644,13 @@ fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         });
         prefix
     };
+
+    // The welcome banner leads the transcript and scrolls away with content
+    // (issue #310). Prepended here, outside the committed-prefix cache, so
+    // banner ++ prefix ++ tail stays byte-identical to `build_all_items`.
+    let mut items = Vec::new();
+    push_rendered_items(&mut items, welcome_banner_lines(app, width), None, false);
+    items.extend(prefix);
 
     // Live tail: the actively-streaming turn, rebuilt fresh every frame.
     build_message_items_range(app, width, &ctx, &turn_map, split_idx, total, true, &mut items);
@@ -1761,6 +1769,103 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     right_lines.extend(recent_activity_lines(&app.recent_sessions, right_w_usize));
 
     frame.render_widget(Paragraph::new(right_lines).wrap(Wrap { trim: false }), h_chunks[2]);
+}
+
+/// Build the compact welcome banner shown at the very top of the transcript.
+///
+/// Unlike the full two-column welcome box (which is a whole welcome *screen*
+/// rendered only while the transcript is empty), this banner is prepended to the
+/// message list as ordinary scrollable content, so it scrolls away with the
+/// conversation instead of occupying a permanent fixed header (issue #310). It
+/// carries the greeting the box led with plus a getting-started hint and any
+/// startup notices, in just a few rows.
+///
+/// Deliberately free of disk/IO or per-frame state (no `select_tip`, which reads
+/// the tip history from disk) so it is cheap to rebuild every streaming frame and
+/// byte-identical between the full and cached-prefix render paths.
+fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let accent = app.accent_color;
+
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.is_empty());
+    let greeting = match username {
+        Some(ref name) => format!("Welcome back, {}!", name),
+        None => "Welcome to Claurst".to_string(),
+    };
+
+    // Too narrow for a bordered box: fall back to a single title line + notices.
+    if width < 24 {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                "Claurst ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("v{}", APP_VERSION),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+        lines.extend(startup_notice_lines(app, width));
+        lines.push(Line::from(""));
+        return lines;
+    }
+
+    let box_w = width as usize;
+    let inner_w = box_w.saturating_sub(4); // "│ " + content + " │"
+
+    // Top border with an embedded title: ╭─ Claurst vX.Y ─…─╮
+    // Span widths: "╭─"=2, " Claurst "=9, "v{ver} "=ver+2, dashes=fill, "╮"=1.
+    let used = 2 + 9 + (APP_VERSION.len() + 2) + 1;
+    let fill = box_w.saturating_sub(used);
+    let top = Line::from(vec![
+        Span::styled("\u{256d}\u{2500}", Style::default().fg(accent)),
+        Span::styled(
+            " Claurst ",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("v{} ", APP_VERSION),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{}\u{256e}", "\u{2500}".repeat(fill)),
+            Style::default().fg(accent),
+        ),
+    ]);
+
+    let content_row = |text: String, style: Style| -> Line<'static> {
+        let text = truncate_end(&text, inner_w);
+        let pad = inner_w.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+        Line::from(vec![
+            Span::styled("\u{2502} ", Style::default().fg(accent)),
+            Span::styled(text, style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(" \u{2502}", Style::default().fg(accent)),
+        ])
+    };
+
+    let bottom = Line::from(Span::styled(
+        format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(box_w.saturating_sub(2))),
+        Style::default().fg(accent),
+    ));
+
+    let mut lines = vec![
+        top,
+        content_row(
+            greeting,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        content_row(
+            "/help for commands  \u{00b7}  ? for shortcuts".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        bottom,
+    ];
+    lines.extend(startup_notice_lines(app, width));
+    lines.push(Line::from(""));
+    lines
 }
 
 // â”€â”€ Per-message rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
