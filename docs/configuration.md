@@ -629,6 +629,16 @@ matches. They are defined in the `formatter` map:
     }
   },
 
+  // Correct metadata for self-hosted / unknown models (keyed by provider/model).
+  // Overrides win over the models.dev catalog.
+  "modelOverrides": {
+    "custom-openai/my-local-llm": {
+      "contextWindow": 32768,
+      "maxOutputTokens": 4096,
+      "name": "My Local LLM"
+    }
+  },
+
   // Custom slash commands
   "commands": {
     "test": {
