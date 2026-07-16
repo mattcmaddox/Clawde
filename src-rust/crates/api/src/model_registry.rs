@@ -772,6 +772,10 @@ pub struct ModelRegistry {
     cache_path: Option<PathBuf>,
     /// Minimum age before a network refresh is attempted again (mtime-based).
     refresh_interval: Duration,
+    /// User-supplied metadata overrides, keyed by `"provider/model"`. Re-applied
+    /// after every catalog merge so they stay authoritative across cache reloads
+    /// and network refreshes (issue #309).
+    overrides: HashMap<String, claurst_core::config::ModelOverride>,
 }
 
 impl ModelRegistry {
@@ -782,6 +786,7 @@ impl ModelRegistry {
             providers: HashMap::new(),
             cache_path: None,
             refresh_interval: Duration::from_secs(5 * 60),
+            overrides: HashMap::new(),
         };
         registry.load_bundled_snapshot();
         registry
@@ -1110,6 +1115,8 @@ impl ModelRegistry {
                 if let Some(parsed) = parse_snapshot_str(&text) {
                     self.merge_entries(parsed.models);
                     self.providers.extend(parsed.providers);
+                    // Re-assert user overrides over the freshly fetched catalog.
+                    self.reapply_overrides();
                     if let Some(ref path) = self.cache_path.clone() {
                         // Write the raw response so future loads can re-parse
                         // it identically.  Best-effort; ignore I/O errors.
@@ -1154,6 +1161,8 @@ impl ModelRegistry {
             if !parsed.models.is_empty() {
                 self.merge_entries(parsed.models);
                 self.providers.extend(parsed.providers);
+                // Re-assert user overrides over the freshly merged catalog.
+                self.reapply_overrides();
                 return;
             }
         }
@@ -1161,6 +1170,7 @@ impl ModelRegistry {
         // Legacy: our own serialized HashMap<String, ModelEntry> format.
         if let Ok(entries) = serde_json::from_str::<HashMap<String, ModelEntry>>(&data) {
             self.merge_entries(entries);
+            self.reapply_overrides();
         }
     }
 
@@ -1193,6 +1203,144 @@ impl ModelRegistry {
             }
             self.entries.insert(key, entry);
         }
+    }
+
+    /// Register user-supplied [`ModelOverride`]s and layer them onto the catalog.
+    ///
+    /// Precedence is **user override > models.dev > built-in defaults**: each
+    /// `Some` field replaces the catalog value for the keyed `"provider/model"`,
+    /// leaving unset fields untouched. A key with no catalog entry — a
+    /// self-hosted alias, or an id models.dev does not know — is materialised
+    /// into a synthetic entry so context-window-dependent logic (the model
+    /// picker, token warnings, auto-compact thresholds) sizes it from the
+    /// override instead of mismatching it to an unrelated catalog model.
+    ///
+    /// The overrides are retained and automatically re-applied after every
+    /// later cache reload ([`Self::load_cache`]) and network refresh
+    /// ([`Self::refresh_from_models_dev`]) so a fresh catalog merge can never
+    /// silently clobber them.
+    ///
+    /// Keys without a `'/'` separator are skipped: the registry is keyed by
+    /// `"provider/model"` and a bare id cannot be placed unambiguously.
+    ///
+    /// [`ModelOverride`]: claurst_core::config::ModelOverride
+    pub fn apply_model_overrides(
+        &mut self,
+        overrides: &HashMap<String, claurst_core::config::ModelOverride>,
+    ) {
+        for (key, ov) in overrides {
+            self.overrides.insert(key.clone(), ov.clone());
+        }
+        apply_overrides_to_entries(&mut self.entries, &self.overrides);
+    }
+
+    /// Re-apply the retained overrides after a catalog merge, so a cache reload
+    /// or refresh never wipes out user-corrected metadata. No-op when no
+    /// overrides are registered.
+    fn reapply_overrides(&mut self) {
+        if self.overrides.is_empty() {
+            return;
+        }
+        apply_overrides_to_entries(&mut self.entries, &self.overrides);
+    }
+}
+
+/// Layer `overrides` onto `entries`: patch existing catalog rows in place and
+/// synthesize a minimal entry for any `"provider/model"` key the catalog lacks.
+/// Malformed keys (no `'/'`, or an empty half) and empty overrides are skipped.
+fn apply_overrides_to_entries(
+    entries: &mut HashMap<String, ModelEntry>,
+    overrides: &HashMap<String, claurst_core::config::ModelOverride>,
+) {
+    for (key, ov) in overrides {
+        if ov.is_empty() {
+            continue;
+        }
+        let Some((provider, model)) = key.split_once('/') else {
+            tracing::warn!(key = %key, "model override key must be \"provider/model\"; skipping");
+            continue;
+        };
+        if provider.is_empty() || model.is_empty() {
+            tracing::warn!(key = %key, "model override key must be \"provider/model\"; skipping");
+            continue;
+        }
+
+        let registry_key = format!("{}/{}", provider, model);
+        match entries.get_mut(&registry_key) {
+            Some(entry) => {
+                // Patch: each Some field wins over the catalog value.
+                if let Some(cw) = ov.context_window {
+                    entry.info.context_window = cw;
+                }
+                if let Some(mo) = ov.max_output_tokens {
+                    entry.info.max_output_tokens = mo;
+                }
+                if let Some(name) = &ov.name {
+                    entry.info.name = name.clone();
+                }
+                if let Some(rd) = &ov.release_date {
+                    entry.release_date = Some(rd.clone());
+                    entry.info.release_date = Some(rd.clone());
+                }
+                if let Some(st) = &ov.status {
+                    entry.status = model_status_from_str(st);
+                    entry.info.status = Some(st.clone());
+                }
+            }
+            None => {
+                // Materialise a synthetic entry for an id the catalog lacks.
+                let entry = ModelEntry {
+                    info: ModelInfo {
+                        id: ModelId::new(model),
+                        provider_id: ProviderId::new(provider),
+                        name: ov.name.clone().unwrap_or_else(|| model.to_string()),
+                        context_window: ov.context_window.unwrap_or(0),
+                        max_output_tokens: ov.max_output_tokens.unwrap_or(0),
+                        release_date: ov.release_date.clone(),
+                        status: ov.status.clone(),
+                    },
+                    family: None,
+                    status: ov
+                        .status
+                        .as_deref()
+                        .map(model_status_from_str)
+                        .unwrap_or_default(),
+                    release_date: ov.release_date.clone(),
+                    last_updated: None,
+                    knowledge: None,
+                    open_weights: false,
+                    tool_calling: true,
+                    reasoning: false,
+                    structured_output: false,
+                    temperature: true,
+                    attachment: false,
+                    interleaved: None,
+                    modalities_input: vec![Modality::Text],
+                    modalities_output: vec![Modality::Text],
+                    cost_input: None,
+                    cost_output: None,
+                    cost_cache_read: None,
+                    cost_cache_write: None,
+                    cost: CostBreakdown::default(),
+                    provider_override: None,
+                    experimental_modes: HashMap::new(),
+                    options: HashMap::new(),
+                    headers: HashMap::new(),
+                };
+                entries.insert(registry_key, entry);
+            }
+        }
+    }
+}
+
+/// Parse a models.dev lifecycle status string into [`ModelStatus`], defaulting
+/// to `Active` for anything unrecognised.
+fn model_status_from_str(s: &str) -> ModelStatus {
+    match s.to_ascii_lowercase().as_str() {
+        "beta" => ModelStatus::Beta,
+        "alpha" => ModelStatus::Alpha,
+        "deprecated" => ModelStatus::Deprecated,
+        _ => ModelStatus::Active,
     }
 }
 
@@ -1851,5 +1999,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- model overrides (issue #309) --------------------------------------
+
+    use claurst_core::config::ModelOverride;
+
+    fn overrides(pairs: Vec<(&str, ModelOverride)>) -> HashMap<String, ModelOverride> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn override_patches_existing_catalog_entry() {
+        let mut reg = ModelRegistry::new();
+        // Pick a real catalog model and prove the override wins over models.dev.
+        let model = reg
+            .list_by_provider("anthropic")
+            .iter()
+            .find(|m| (*m.info.id).contains("opus"))
+            .map(|m| m.info.id.to_string())
+            .expect("anthropic must have an opus model in the bundled snapshot");
+        let key = format!("anthropic/{model}");
+
+        let original = reg.get("anthropic", &model).unwrap();
+        assert_ne!(original.info.context_window, 12_345, "test value must differ");
+
+        reg.apply_model_overrides(&overrides(vec![(
+            key.as_str(),
+            ModelOverride {
+                context_window: Some(12_345),
+                max_output_tokens: Some(6_789),
+                name: Some("My Patched Opus".to_string()),
+                ..Default::default()
+            },
+        )]));
+
+        let patched = reg.get("anthropic", &model).unwrap();
+        assert_eq!(patched.info.context_window, 12_345);
+        assert_eq!(patched.info.max_output_tokens, 6_789);
+        assert_eq!(patched.info.name, "My Patched Opus");
+    }
+
+    #[test]
+    fn override_partial_leaves_other_fields_intact() {
+        let mut reg = ModelRegistry::new();
+        let model = reg
+            .list_by_provider("anthropic")
+            .iter()
+            .find(|m| (*m.info.id).contains("opus"))
+            .map(|m| m.info.id.to_string())
+            .expect("anthropic opus model present");
+        let original_max = reg.get("anthropic", &model).unwrap().info.max_output_tokens;
+        let original_name = reg.get("anthropic", &model).unwrap().info.name.clone();
+
+        // Only context_window is set; max_output_tokens and name must survive.
+        reg.apply_model_overrides(&overrides(vec![(
+            format!("anthropic/{model}").as_str(),
+            ModelOverride { context_window: Some(500_000), ..Default::default() },
+        )]));
+
+        let patched = reg.get("anthropic", &model).unwrap();
+        assert_eq!(patched.info.context_window, 500_000);
+        assert_eq!(patched.info.max_output_tokens, original_max);
+        assert_eq!(patched.info.name, original_name);
+    }
+
+    #[test]
+    fn override_synthesizes_entry_for_unknown_alias() {
+        let mut reg = ModelRegistry::new();
+        // A self-hosted alias models.dev never heard of.
+        assert!(reg.get("custom-openai", "my-local-llm").is_none());
+
+        reg.apply_model_overrides(&overrides(vec![(
+            "custom-openai/my-local-llm",
+            ModelOverride {
+                context_window: Some(32_768),
+                max_output_tokens: Some(4_096),
+                name: Some("My Local LLM".to_string()),
+                status: Some("beta".to_string()),
+                ..Default::default()
+            },
+        )]));
+
+        let entry = reg
+            .get("custom-openai", "my-local-llm")
+            .expect("synthetic entry must be inserted for an unknown alias");
+        assert_eq!(entry.info.context_window, 32_768);
+        assert_eq!(entry.info.max_output_tokens, 4_096);
+        assert_eq!(entry.info.name, "My Local LLM");
+        assert_eq!(entry.status, ModelStatus::Beta);
+        // And it surfaces in the provider listing the picker reads.
+        assert!(reg
+            .list_by_provider("custom-openai")
+            .iter()
+            .any(|m| &*m.info.id == "my-local-llm"));
+    }
+
+    #[test]
+    fn override_empty_or_malformed_keys_are_ignored() {
+        let mut reg = ModelRegistry::new();
+        let before = reg.len();
+        reg.apply_model_overrides(&overrides(vec![
+            // Empty override — nothing to apply.
+            ("custom-openai/noop", ModelOverride::default()),
+            // No provider/model separator — cannot be placed.
+            ("bare-id", ModelOverride { context_window: Some(1_000), ..Default::default() }),
+            // Empty provider / model halves.
+            ("/model", ModelOverride { context_window: Some(1_000), ..Default::default() }),
+            ("provider/", ModelOverride { context_window: Some(1_000), ..Default::default() }),
+        ]));
+        assert_eq!(reg.len(), before, "malformed/empty overrides must not add entries");
+        assert!(reg.get("custom-openai", "noop").is_none());
     }
 }
