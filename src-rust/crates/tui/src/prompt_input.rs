@@ -2676,6 +2676,26 @@ impl PromptInputState {
         false
     }
 
+    /// The paste placeholder covering byte offset `offset` (same hit rules as
+    /// `expand_paste_ref_at`) together with its stored body, without mutating
+    /// the buffer — used by the read-only paste viewer.
+    pub fn paste_ref_at(&self, offset: usize) -> Option<(u32, String)> {
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            let end = start + matched.len();
+            if offset < start || offset > end {
+                continue;
+            }
+            if let Some(body) = self.paste_contents.get(&id) {
+                return Some((id, body.clone()));
+            }
+        }
+        None
+    }
+
     /// Expand the paste placeholder at the cursor; falls back to the first
     /// expandable placeholder in the buffer so the keybinding works without
     /// first navigating onto the reference.

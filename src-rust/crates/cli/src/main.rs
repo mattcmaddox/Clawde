@@ -2197,7 +2197,11 @@ async fn run_interactive(
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
-        let synthetic_event: Option<Event> = if app.pending_auto_submit && !app.is_streaming {
+        let synthetic_event: Option<Event> = if let Some(k) = app.pending_key.take() {
+            // A non-character key swallowed by the paste-burst drain — replay
+            // it so the keystroke that ended a raw-key paste is not lost.
+            Some(Event::Key(k))
+        } else if app.pending_auto_submit && !app.is_streaming {
             app.pending_auto_submit = false;
             Some(Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Enter,
@@ -2241,6 +2245,29 @@ async fn run_interactive(
                             break 'main;
                         }
                         continue;
+                    }
+
+                    // ── Paste-burst detection ─────────────────────────────
+                    // Terminals without bracketed paste (notably Windows
+                    // Ctrl+V, some tmux configs) dump the clipboard as raw
+                    // key events: every pasted newline arrives as Enter and
+                    // would submit a truncated prompt. A zero-timeout drain
+                    // right after the first character captures the whole
+                    // flood as one paste (human typing never queues 2+ chars
+                    // in the same instant). Must run BEFORE the Enter/submit
+                    // handling below so pasted newlines can't submit.
+                    if key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT
+                    {
+                        if let KeyCode::Char(c) = key.code {
+                            if app.paste_burst_allowed() {
+                                if let Some(burst) = app.try_detect_paste_burst(c) {
+                                    app.handle_paste_data(burst);
+                                    app.refresh_prompt_input();
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
@@ -3106,9 +3133,12 @@ async fn run_interactive(
                     }
                 }
                 Event::Paste(data) => {
-                    // Cmd+V paste on macOS / Ctrl+Shift+V on Linux (via bracketed paste)
-                    if !app.is_streaming
-                        && app.permission_request.is_none()
+                    // Bracketed paste (Cmd+V on macOS, Ctrl+Shift+V on Linux, any
+                    // terminal with bracketed paste). Deliberately NOT gated on
+                    // is_streaming: the prompt stays editable during a turn so a
+                    // follow-up can be composed/queued — dropping the event here
+                    // silently loses the pasted content.
+                    if app.permission_request.is_none()
                         && !app.history_search_overlay.visible
                         && app.history_search.is_none()
                     {
@@ -3118,8 +3148,11 @@ async fn run_interactive(
                                 app.key_input_dialog.insert_char(ch);
                             }
                         } else {
-                            // Paste into main prompt input
-                            app.prompt_input.paste(&data);
+                            // Paste into the main prompt through the shared path
+                            // so file-path/image pastes and the large-paste
+                            // placeholder are handled uniformly.
+                            app.handle_paste_data(data);
+                            app.refresh_prompt_input();
                         }
                     }
                 }
