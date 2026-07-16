@@ -5798,8 +5798,20 @@ impl App {
                         continue;
                     }
                     match k.code {
+                        // A raw LF (0x0A) in the flood arrives as Ctrl+J —
+                        // map it back to a newline or Unix pastes lose their
+                        // line breaks (they'd insert a literal 'j').
+                        KeyCode::Char('j')
+                            if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            buf.push('\n')
+                        }
                         KeyCode::Char(c) => buf.push(c),
-                        KeyCode::Enter => buf.push('\n'),
+                        // A raw CR (0x0D) arrives as Enter. Push '\r', not
+                        // '\n': normalize_newlines() collapses CRLF pairs and
+                        // lone CRs later, so CRLF pastes (Windows) don't end
+                        // up with doubled line breaks.
+                        KeyCode::Enter => buf.push('\r'),
                         // Raw tabs are indentation in pasted code; ending the
                         // burst on them would truncate the paste and replay
                         // Tab as a completion keypress.
