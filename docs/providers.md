@@ -1,6 +1,6 @@
 # LLM Providers
 
-Claurst supports a wide range of LLM providers through a unified provider abstraction. Every provider implements the same `LlmProvider` trait, so switching between them requires only a configuration change.
+Clawde supports a wide range of LLM providers through a unified provider abstraction. Every provider implements the same `LlmProvider` trait, so switching between them requires only a configuration change.
 
 > Running a model on your own machine (llama.cpp, LM Studio, Ollama, vLLM)? See
 > the dedicated [Local Models](local-models) guide for recommended server flags,
@@ -13,12 +13,12 @@ Claurst supports a wide range of LLM providers through a unified provider abstra
 Use the `--provider` flag on any invocation to override the active provider:
 
 ```
-claurst --provider openai "refactor this module"
-claurst --provider ollama "explain this function"
-claurst --provider groq --model llama-3.3-70b-versatile "write tests"
+clawde --provider openai "refactor this module"
+clawde --provider ollama "explain this function"
+clawde --provider groq --model llama-3.3-70b-versatile "write tests"
 ```
 
-The provider can also be set persistently in `~/.claurst/settings.json`:
+The provider can also be set persistently in `~/.clawde/settings.json`:
 
 ```json
 {
@@ -26,7 +26,7 @@ The provider can also be set persistently in `~/.claurst/settings.json`:
 }
 ```
 
-When no provider is specified, Claurst defaults to **Anthropic**.
+When no provider is specified, Clawde defaults to **Anthropic**.
 
 ---
 
@@ -259,7 +259,7 @@ The built-in provider uses the Anthropic-compatible Messages API.
 | `MiniMax-M3` | 1,000,000 | Text, image, video | Off by default; supports `adaptive` and `disabled` |
 | `MiniMax-M2.7` | 204,800 | Text | Always on |
 
-The catalog retains the model's complete input-modality metadata. Claurst's built-in attachment flow currently sends text and image blocks.
+The catalog retains the model's complete input-modality metadata. Clawde's built-in attachment flow currently sends text and image blocks.
 
 Pricing is in USD per million tokens:
 
@@ -271,7 +271,7 @@ Pricing is in USD per million tokens:
 | `MiniMax-M3` | Priority | Over 512k | $0.90 | $3.60 | $0.18 | Not published |
 | `MiniMax-M2.7` | Standard | All requests | $0.30 | $1.20 | $0.06 | $0.375 |
 
-| Protocol | Global base URL | China base URL | Path added by Claurst |
+| Protocol | Global base URL | China base URL | Path added by Clawde |
 |---|---|---|---|
 | Anthropic | `https://api.minimax.io/anthropic` | `https://api.minimaxi.com/anthropic` | `/v1/messages` |
 | OpenAI-compatible | `https://api.minimax.io/v1` | `https://api.minimaxi.com/v1` | `/chat/completions` |
@@ -329,7 +329,7 @@ For the OpenAI-compatible protocol, use the custom provider with the correspondi
 
 Connects to a locally running Ollama instance. No API key required.
 
-**Base URL:** Reads `OLLAMA_HOST` (defaults to `http://localhost:11434`). Claurst appends `/v1` to construct the OpenAI-compatible endpoint.
+**Base URL:** Reads `OLLAMA_HOST` (defaults to `http://localhost:11434`). Clawde appends `/v1` to construct the OpenAI-compatible endpoint.
 
 **Default model:** `llama3.2`
 
@@ -351,7 +351,7 @@ Connects to a locally running Ollama instance. No API key required.
 Run a model locally first with `ollama pull llama3.2`, then:
 
 ```
-claurst --provider ollama --model llama3.2 "explain this code"
+clawde --provider ollama --model llama3.2 "explain this code"
 ```
 
 ---
@@ -360,7 +360,7 @@ claurst --provider ollama --model llama3.2 "explain this code"
 
 Connects to a locally running LM Studio server. No API key required.
 
-**Base URL:** Reads `LM_STUDIO_HOST` (defaults to `http://localhost:1234`). Claurst appends `/v1`.
+**Base URL:** Reads `LM_STUDIO_HOST` (defaults to `http://localhost:1234`). Clawde appends `/v1`.
 
 **Default model:** `default` (whichever model is loaded in LM Studio)
 
@@ -383,7 +383,7 @@ Connects to a locally running LM Studio server. No API key required.
 
 Connects to a locally running llama.cpp HTTP server. No API key required.
 
-**Base URL:** Reads `LLAMA_CPP_HOST` (defaults to `http://localhost:8080`). Claurst appends `/v1`.
+**Base URL:** Reads `LLAMA_CPP_HOST` (defaults to `http://localhost:8080`). Clawde appends `/v1`.
 
 **Default model:** `default`
 
@@ -508,7 +508,7 @@ OpenAI-compatible API with Mistral-specific protocol quirks (tool call ID format
 
 ### OpenRouter
 
-Unified API gateway to many models. Sends `HTTP-Referer: https://claurst.ai/` and `X-Title: Claurst` headers automatically.
+Unified API gateway to many models. Sends `HTTP-Referer: https://clawde.ai/` and `X-Title: Clawde` headers automatically.
 
 **Authentication:** `OPENROUTER_API_KEY` environment variable.
 
@@ -660,7 +660,7 @@ Wafer-scale inference hardware.
 
 ## Per-Provider Configuration in settings.json
 
-The `providers` map in `~/.claurst/settings.json` accepts per-provider `ProviderConfig` objects:
+The `providers` map in `~/.clawde/settings.json` accepts per-provider `ProviderConfig` objects:
 
 ```json
 {
@@ -716,9 +716,9 @@ The above example allows only `gpt-4o` (whitelist minus blacklist).
 
 ## Model Registry
 
-Claurst ships a bundled snapshot of models for Anthropic, OpenAI, and Google. At runtime it optionally refreshes from the public `https://models.dev/api.json` API (cached to `~/.claurst/models_cache.json`, refreshed at most every 5 minutes). Network failures are swallowed silently; the bundled snapshot is always sufficient for normal operation.
+Clawde ships a bundled snapshot of models for Anthropic, OpenAI, and Google. At runtime it optionally refreshes from the public `https://models.dev/api.json` API (cached to `~/.clawde/models_cache.json`, refreshed at most every 5 minutes). Network failures are swallowed silently; the bundled snapshot is always sufficient for normal operation.
 
-When no model is explicitly set, Claurst scores available models by priority patterns to pick the best default. Well-known model prefixes (`claude-*`, `gpt-*`, `gemini-*`, etc.) are always routed to their canonical provider regardless of gateway entries in the remote cache.
+When no model is explicitly set, Clawde scores available models by priority patterns to pick the best default. Well-known model prefixes (`claude-*`, `gpt-*`, `gemini-*`, etc.) are always routed to their canonical provider regardless of gateway entries in the remote cache.
 
 ### Overriding model metadata
 
@@ -729,7 +729,7 @@ an unrelated catalog entry, or because there is no catalog entry at all. The
 `modelOverrides` map lets you supply or correct that metadata. **User overrides
 take precedence over the models.dev catalog and over the built-in defaults.**
 
-Add it at the top level of `~/.claurst/settings.json` (or inside the `config`
+Add it at the top level of `~/.clawde/settings.json` (or inside the `config`
 object), keyed by the fully-qualified `"provider/model"` id:
 
 ```json
@@ -764,6 +764,6 @@ Field names accept both camelCase (`contextWindow`) and snake_case
 because the registry is keyed by `provider/model`.
 
 When the keyed model exists in the catalog, the override patches it in place.
-When it does not (a self-hosted alias), Claurst materialises a synthetic entry
+When it does not (a self-hosted alias), Clawde materialises a synthetic entry
 so the corrected values flow everywhere the metadata is read: the `/model`
 picker, the token-usage warnings, and the auto-compact thresholds.

@@ -1,6 +1,6 @@
 # Development Rules
 
-Agent-facing rules for working on Claurst. Mirrors and extends `src-rust/.claude/CLAUDE.md`; when the two disagree, the rule closer to the code wins.
+Agent-facing rules for working on Clawde. Mirrors and extends `src-rust/.claude/CLAUDE.md`; when the two disagree, the rule closer to the code wins.
 
 ## Conversational Style
 
@@ -34,7 +34,7 @@ Run from `src-rust/` unless noted.
 - After Rust changes (not docs): `cargo check --workspace` — fix every error and warning before committing.
 - Clippy: `cargo clippy --workspace --all-targets -- -D warnings`. Fix lints; do not `#[allow(...)]` without justification.
 - Format: `cargo fmt --all`. Run before committing.
-- Tests: `cargo test --workspace` for everything, `cargo test --package claurst-<crate>` for a single crate, `cargo test --package claurst-<crate> -- <pattern>` for a specific test.
+- Tests: `cargo test --workspace` for everything, `cargo test --package clawde-<crate>` for a single crate, `cargo test --package clawde-<crate> -- <pattern>` for a specific test.
 - Avoid running `cargo build --release` or `cargo run --release` unless you specifically need optimised output — debug builds and `cargo check` are 10× faster.
 - If you create or modify a test, run it and iterate until it passes.
 - For TUI changes: validate by hand with `cargo run -- "test prompt"` (interactive) or `cargo run -- --print "test"` (headless). The `--print` mode is faster for verifying non-TUI logic.
@@ -49,19 +49,19 @@ The ratatui frontend is sensitive to terminal size and key encoding. For repeata
 cargo build
 
 # 80×24 session
-tmux new-session -d -s claurst-test -x 80 -y 24
-tmux send-keys -t claurst-test "./target/debug/claurst" Enter
+tmux new-session -d -s clawde-test -x 80 -y 24
+tmux send-keys -t clawde-test "./target/debug/clawde" Enter
 
 # Give it time to redraw, then capture
-sleep 2 && tmux capture-pane -t claurst-test -p
+sleep 2 && tmux capture-pane -t clawde-test -p
 
 # Drive input
-tmux send-keys -t claurst-test "your prompt here" Enter
-tmux send-keys -t claurst-test Escape
-tmux send-keys -t claurst-test C-o   # ctrl+o
+tmux send-keys -t clawde-test "your prompt here" Enter
+tmux send-keys -t clawde-test Escape
+tmux send-keys -t clawde-test C-o   # ctrl+o
 
 # Cleanup
-tmux kill-session -t claurst-test
+tmux kill-session -t clawde-test
 ```
 
 On Windows hosts, prefer `cargo run -- --print "..."` against the headless path. The Windows console has known quirks with the kitty keyboard protocol — see `crates/tui` for the push/pop workaround.
@@ -116,7 +116,7 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ## Releasing
 
-Claurst uses a **single workspace version** stamped across every surface (Cargo workspace, Cargo.lock entries for the 12 `claurst*` crates, `npm/package.json`, README badge, docs, ACP registry template). Versioning is forward-only — the release workflow refuses to ship a tag less than or equal to the highest existing tag.
+Clawde uses a **single workspace version** stamped across every surface (Cargo workspace, Cargo.lock entries for the 12 `clawde*` crates, `npm/package.json`, README badge, docs, ACP registry template). Versioning is forward-only — the release workflow refuses to ship a tag less than or equal to the highest existing tag.
 
 ## **CRITICAL** Git Rules for Parallel Agents
 

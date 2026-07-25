@@ -17,4 +17,5 @@ refs/
 # VSCode / unsolicited devcontainers mounts
 .vscode/
 .claurst/
+.clawde/
 

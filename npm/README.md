@@ -1,27 +1,27 @@
-# claurst
+# clawde
 
 **Open-source, multi-provider terminal coding agent built in Rust.**
 
-[![Version](https://img.shields.io/npm/v/claurst?style=flat-square)](https://www.npmjs.com/package/claurst)
-[![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](https://github.com/kuberwastaken/claurst/blob/main/LICENSE.md)
+[![Version](https://img.shields.io/npm/v/clawde?style=flat-square)](https://www.npmjs.com/package/clawde)
+[![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](https://github.com/kuberwastaken/clawde/blob/main/LICENSE.md)
 
 ## Install
 
 ```bash
-npm install -g claurst
+npm install -g clawde
 ```
 
 ```bash
-bun install -g claurst
+bun install -g clawde
 ```
 
-On install, the correct pre-built native binary for your platform is automatically downloaded from [GitHub Releases](https://github.com/kuberwastaken/claurst/releases). No compilation required.
+On install, the correct pre-built native binary for your platform is automatically downloaded from [GitHub Releases](https://github.com/kuberwastaken/clawde/releases). No compilation required.
 
 ## Usage
 
 ```bash
-claurst                    # interactive TUI
-claurst -p "fix this bug"  # headless one-shot
+clawde                    # interactive TUI
+clawde -p "fix this bug"  # headless one-shot
 ```
 
 ## Supported platforms
@@ -34,7 +34,7 @@ claurst -p "fix this bug"  # headless one-shot
 
 ## Links
 
-- [Homepage](https://claurst.kuber.studio)
-- [GitHub](https://github.com/kuberwastaken/claurst)
-- [Documentation](https://claurst.kuber.studio/docs)
-- [Issues](https://github.com/kuberwastaken/claurst/issues)
+- [Homepage](https://clawde.kuber.studio)
+- [GitHub](https://github.com/kuberwastaken/clawde)
+- [Documentation](https://clawde.kuber.studio/docs)
+- [Issues](https://github.com/kuberwastaken/clawde/issues)

@@ -1,15 +1,15 @@
 {
-  "name": "claurst",
+  "name": "clawde",
   "version": "0.1.7",
   "description": "Open-source, multi-provider terminal coding agent built in Rust",
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kuberwastaken/claurst.git"
+    "url": "git+https://github.com/Kuberwastaken/clawde.git"
   },
-  "homepage": "https://claurst.kuber.studio",
+  "homepage": "https://clawde.kuber.studio",
   "bugs": {
-    "url": "https://github.com/kuberwastaken/claurst/issues"
+    "url": "https://github.com/kuberwastaken/clawde/issues"
   },
   "keywords": [
     "ai",
@@ -22,7 +22,7 @@
   ],
   "author": "Kuber Mehta",
   "bin": {
-    "claurst": "bin/claurst"
+    "clawde": "bin/clawde"
   },
   "scripts": {
     "postinstall": "node install.js"

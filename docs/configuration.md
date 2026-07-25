@@ -1,6 +1,6 @@
-# Claurst Configuration Reference
+# Clawde Configuration Reference
 
-Claurst is configured through a layered system of JSON files, environment
+Clawde is configured through a layered system of JSON files, environment
 variables, and command-line flags. This document describes every option.
 
 ---
@@ -10,22 +10,22 @@ variables, and command-line flags. This document describes every option.
 The global settings file lives at:
 
 ```
-~/.claurst/settings.json
+~/.clawde/settings.json
 ```
 
-The directory `~/.claurst/` is created automatically on first run if it does
+The directory `~/.clawde/` is created automatically on first run if it does
 not exist. The file is standard JSON (or JSONC — comments are stripped before
 parsing).
 
 ### Per-project settings
 
-Claurst walks up from the current working directory looking for a project-level
+Clawde walks up from the current working directory looking for a project-level
 settings file. The first file found wins (project settings take precedence over
 global settings):
 
 ```
-<project-root>/.claurst/settings.json
-<project-root>/.claurst/settings.jsonc
+<project-root>/.clawde/settings.json
+<project-root>/.clawde/settings.jsonc
 ```
 
 Settings that appear in the project file override the corresponding global
@@ -87,7 +87,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
-| `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.claurst/output-styles/`. |
+| `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.clawde/output-styles/`. |
 | `output_format` | string | `"text"` | Output format for headless (`--print`) mode. One of `"text"`, `"json"`, `"stream-json"`. |
 | `verbose` | boolean | false | Enable debug-level log output. |
 
@@ -102,7 +102,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `custom_system_prompt` | string \| null | null | Replace the default Claurst system prompt entirely with this text. |
+| `custom_system_prompt` | string \| null | null | Replace the default Clawde system prompt entirely with this text. |
 | `append_system_prompt` | string \| null | null | Append this text to the end of the assembled system prompt (after AGENTS.md content). |
 
 ### Tool access
@@ -120,7 +120,7 @@ prefixed with their server name (`myserver_toolname`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `additional_dirs` | array of strings | [] | Additional filesystem paths Claurst is allowed to read and write. Equivalent to passing `--add-dir` on the command line. |
+| `additional_dirs` | array of strings | [] | Additional filesystem paths Clawde is allowed to read and write. Equivalent to passing `--add-dir` on the command line. |
 
 ### MCP servers
 
@@ -163,7 +163,7 @@ defined as a map from event name to an array of hook entries.
     { "command": "/path/to/my-logger.sh", "tool_filter": "Bash", "blocking": false }
   ],
   "Stop": [
-    { "command": "notify-send 'Claurst done'", "blocking": false }
+    { "command": "notify-send 'Clawde done'", "blocking": false }
   ]
 }
 ```
@@ -210,7 +210,7 @@ where you want maximum throughput.
 
 All permission checks are skipped entirely. Every tool call is allowed
 unconditionally. This mode cannot be used when running as root or via `sudo`
-on Unix systems (Claurst blocks it).
+on Unix systems (Clawde blocks it).
 
 Use with caution: the model can read and modify any file reachable from the
 current working directory without any user confirmation.
@@ -225,30 +225,30 @@ modifications.
 The permission mode can also be overridden per-session on the command line:
 
 ```bash
-claurst --permission-mode acceptEdits "refactor the auth module"
-claurst --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
+clawde --permission-mode acceptEdits "refactor the auth module"
+clawde --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
 ```
 
 ---
 
 ## AGENTS.md Memory Files
 
-AGENTS.md files are plain Markdown documents that Claurst injects into the
+AGENTS.md files are plain Markdown documents that Clawde injects into the
 system prompt at startup. They let you give the model persistent context about
 your project, coding standards, or personal preferences without repeating
 yourself in every session.
 
 ### File locations and priority
 
-Claurst loads AGENTS.md files from four locations. They are processed in the
+Clawde loads AGENTS.md files from four locations. They are processed in the
 following order (earlier = higher priority, later content is appended below):
 
 | Scope | Path | Description |
 |-------|------|-------------|
-| Managed | `~/.claurst/rules/*.md` | Global policy files. All `.md` files in this directory are loaded in alphabetical order. |
-| User | `~/.claurst/AGENTS.md` | Your personal preferences and instructions, applied to all projects. |
+| Managed | `~/.clawde/rules/*.md` | Global policy files. All `.md` files in this directory are loaded in alphabetical order. |
+| User | `~/.clawde/AGENTS.md` | Your personal preferences and instructions, applied to all projects. |
 | Project | `<project-root>/AGENTS.md` | Project-level context: architecture notes, conventions, workflows. Typically committed to version control. |
-| Local | `<project-root>/.claurst/AGENTS.md` | Local overrides not committed to version control (add `.claurst/` to `.gitignore`). |
+| Local | `<project-root>/.clawde/AGENTS.md` | Local overrides not committed to version control (add `.clawde/` to `.gitignore`). |
 
 Files from all four locations are concatenated (separated by blank lines) into
 a single system-prompt fragment. If the same instruction appears at multiple
@@ -305,7 +305,7 @@ skipped with a warning comment.
 To skip all AGENTS.md files for a session:
 
 ```bash
-claurst --no-claude-md "your prompt"
+clawde --no-claude-md "your prompt"
 ```
 
 Or in a session, use the `--bare` flag to disable AGENTS.md, hooks, and
@@ -315,7 +315,7 @@ plugins simultaneously.
 
 ## Providers
 
-Claurst can send requests to multiple LLM providers. Set the active provider
+Clawde can send requests to multiple LLM providers. Set the active provider
 via the `provider` key in settings or the `--provider` CLI flag.
 
 ### Provider IDs
@@ -407,7 +407,7 @@ and `api_base` override the corresponding environment variables.
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
 | `CLAURST_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
 | `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
-| `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). |
+| `RUST_LOG` | Tracing filter (e.g. `debug`, `clawde_core=trace`). |
 
 ---
 
@@ -518,7 +518,7 @@ Configure via `/managed-agents configure` or `/managed-agents preset <name>`. Se
 
 ## File Formatters
 
-Formatters run automatically after Claurst writes a file whose extension
+Formatters run automatically after Clawde writes a file whose extension
 matches. They are defined in the `formatter` map:
 
 ```json

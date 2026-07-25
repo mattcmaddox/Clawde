@@ -68,10 +68,12 @@ fn extensions_for_type(t: &str) -> Vec<&'static str> {
 #[async_trait]
 impl Tool for GrepTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_GREP
+        clawde_core::constants::TOOL_NAME_GREP
     }
 
     fn description(&self) -> &str {
@@ -235,10 +237,7 @@ impl Tool for GrepTool {
 
             // Type filter
             if !type_exts.is_empty() {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !type_exts.contains(&ext) {
                     continue;
                 }
@@ -328,6 +327,20 @@ impl Tool for GrepTool {
 }
 
 impl GrepTool {
+    /// Test-only helper: expose search_file for testing.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn search_file_test(
+        &self,
+        path: &PathBuf,
+        regex: &regex::Regex,
+        output_mode: &str,
+        context_lines: usize,
+        show_line_numbers: bool,
+    ) -> ToolResult {
+        self.search_file(path, regex, output_mode, context_lines, show_line_numbers)
+    }
+
     fn search_file(
         &self,
         path: &PathBuf,
@@ -338,7 +351,9 @@ impl GrepTool {
     ) -> ToolResult {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read {}: {}", path.display(), e)),
+            Err(e) => {
+                return ToolResult::error(format!("Failed to read {}: {}", path.display(), e))
+            }
         };
 
         let lines: Vec<&str> = content.lines().collect();
@@ -351,19 +366,12 @@ impl GrepTool {
         }
 
         if matching_lines.is_empty() {
-            return ToolResult::success(format!(
-                "No matches found in {}",
-                path.display()
-            ));
+            return ToolResult::success(format!("No matches found in {}", path.display()));
         }
 
         match output_mode {
             "files_with_matches" => ToolResult::success(path.display().to_string()),
-            "count" => ToolResult::success(format!(
-                "{}:{}",
-                path.display(),
-                matching_lines.len()
-            )),
+            "count" => ToolResult::success(format!("{}:{}", path.display(), matching_lines.len())),
             _ => {
                 let mut results = Vec::new();
                 for line_idx in &matching_lines {
@@ -383,5 +391,233 @@ impl GrepTool {
                 ToolResult::success(results.join("\n"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn grep_matches_in_file_files_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.rs");
+        std::fs::write(&path, "fn hello() {\n    println!(\"hello world\");\n}\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "hello",
+                    "path": path.to_string_lossy(),
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(res.content.contains("test.rs"));
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_shows_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "apple\nbanana\ncherry\napple pie\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "apple",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(res.content.contains("apple"), "should contain 'apple'");
+        assert!(
+            res.content.contains("apple pie"),
+            "should contain 'apple pie'"
+        );
+        assert!(
+            !res.content.contains("banana"),
+            "should not contain 'banana'"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_match.txt");
+        std::fs::write(&path, "nothing to see here\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "zzz_nonexistent_999",
+                    "path": path.to_string_lossy(),
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep should not error on no matches");
+        assert!(res.content.contains("No matches"));
+    }
+
+    #[tokio::test]
+    async fn grep_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("case.txt");
+        std::fs::write(&path, "Hello World\nHELLO WORLD\nhello world\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // Without -i: only first line matches (capital H)
+        let res_cs = GrepTool
+            .execute(
+                json!({
+                    "pattern": "^Hello",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "count",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res_cs.is_error, "case-sensitive grep failed");
+        assert!(
+            res_cs.content.contains(":1"),
+            "expected 1 match: {:?}",
+            res_cs.content
+        );
+
+        // With -i: all three lines match
+        let res_ci = GrepTool
+            .execute(
+                json!({
+                    "pattern": "^hello",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "count",
+                    "-i": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res_ci.is_error, "case-insensitive grep failed");
+        assert!(
+            res_ci.content.contains(":3"),
+            "expected 3 matches: {:?}",
+            res_ci.content
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_count_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.txt");
+        std::fs::write(&path, "match\nskip\nmatch\nskip\nmatch\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "match",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "count",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(res.content.contains(":3"), "expected 3 matches");
+    }
+
+    #[tokio::test]
+    async fn grep_invalid_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "[invalid",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(res.is_error, "expected error for invalid regex");
+        assert!(res.content.contains("Invalid regex"));
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_prefixed_with_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search.txt");
+        std::fs::write(&path, "target line\nother content\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "target",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                    "-n": true,
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(
+            res.content.contains("target line"),
+            "should contain matched line"
+        );
+        assert!(res.content.contains("1:"), "should show line number prefix");
+        assert!(
+            !res.content.contains("other content"),
+            "should NOT contain non-matching line"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_context_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context_test.txt");
+        std::fs::write(&path, "before\nmatch\nafter\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "match",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                    "context": 1,
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(
+            res.content.contains("before"),
+            "context should include line before"
+        );
+        assert!(
+            res.content.contains("match"),
+            "context should include match"
+        );
+        assert!(
+            res.content.contains("after"),
+            "context should include line after"
+        );
     }
 }

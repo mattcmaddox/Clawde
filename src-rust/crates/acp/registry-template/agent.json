@@ -1,10 +1,10 @@
 {
-  "id": "claurst",
-  "name": "Claurst",
+  "id": "clawde",
+  "name": "Clawde",
   "version": "0.1.7",
   "description": "Open-source, multi-provider terminal coding agent built in Rust. Multi-provider routing (Anthropic, OpenAI, Google, Groq, Ollama, OpenAI-compatible, …), full MCP support, plugin system, Rustle companion, chat forking, memory consolidation. No telemetry.",
-  "repository": "https://github.com/kuberwastaken/claurst",
-  "website": "https://claurst.kuber.studio",
+  "repository": "https://github.com/kuberwastaken/clawde",
+  "website": "https://clawde.kuber.studio",
   "authors": [
     "Kuber Mehta"
   ],
@@ -12,28 +12,28 @@
   "distribution": {
     "binary": {
       "darwin-aarch64": {
-        "archive": "https://github.com/kuberwastaken/claurst/releases/download/v0.1.7/claurst-macos-aarch64.tar.gz",
-        "cmd": "./claurst",
+        "archive": "https://github.com/kuberwastaken/clawde/releases/download/v0.1.7/clawde-macos-aarch64.tar.gz",
+        "cmd": "./clawde",
         "args": ["acp"]
       },
       "darwin-x86_64": {
-        "archive": "https://github.com/kuberwastaken/claurst/releases/download/v0.1.7/claurst-macos-x86_64.tar.gz",
-        "cmd": "./claurst",
+        "archive": "https://github.com/kuberwastaken/clawde/releases/download/v0.1.7/clawde-macos-x86_64.tar.gz",
+        "cmd": "./clawde",
         "args": ["acp"]
       },
       "linux-aarch64": {
-        "archive": "https://github.com/kuberwastaken/claurst/releases/download/v0.1.7/claurst-linux-aarch64.tar.gz",
-        "cmd": "./claurst",
+        "archive": "https://github.com/kuberwastaken/clawde/releases/download/v0.1.7/clawde-linux-aarch64.tar.gz",
+        "cmd": "./clawde",
         "args": ["acp"]
       },
       "linux-x86_64": {
-        "archive": "https://github.com/kuberwastaken/claurst/releases/download/v0.1.7/claurst-linux-x86_64.tar.gz",
-        "cmd": "./claurst",
+        "archive": "https://github.com/kuberwastaken/clawde/releases/download/v0.1.7/clawde-linux-x86_64.tar.gz",
+        "cmd": "./clawde",
         "args": ["acp"]
       },
       "windows-x86_64": {
-        "archive": "https://github.com/kuberwastaken/claurst/releases/download/v0.1.7/claurst-windows-x86_64.zip",
-        "cmd": "./claurst.exe",
+        "archive": "https://github.com/kuberwastaken/clawde/releases/download/v0.1.7/clawde-windows-x86_64.zip",
+        "cmd": "./clawde.exe",
         "args": ["acp"]
       }
     }

@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 version = "0.1.7"
 edition = "2021"
-authors = ["Claurst"]
+authors = ["Clawde"]
 license = "GPL-3.0"
 
 [workspace.dependencies]
@@ -109,17 +109,17 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 schemars = { version = "0.8", features = ["derive"] }
 
 # Workspace crates
-claurst-core = { path = "crates/core" }
-claurst-acp = { path = "crates/acp" }
-claurst-api = { path = "crates/api" }
-claurst-tools = { path = "crates/tools" }
-claurst-query = { path = "crates/query" }
-claurst-tui = { path = "crates/tui" }
-claurst-commands = { path = "crates/commands" }
-claurst-mcp = { path = "crates/mcp" }
-claurst-bridge = { path = "crates/bridge" }
-claurst-buddy = { path = "crates/buddy" }
-claurst-plugins = { path = "crates/plugins" }
+clawde-core = { path = "crates/core" }
+clawde-acp = { path = "crates/acp" }
+clawde-api = { path = "crates/api" }
+clawde-tools = { path = "crates/tools" }
+clawde-query = { path = "crates/query" }
+clawde-tui = { path = "crates/tui" }
+clawde-commands = { path = "crates/commands" }
+clawde-mcp = { path = "crates/mcp" }
+clawde-bridge = { path = "crates/bridge" }
+clawde-buddy = { path = "crates/buddy" }
+clawde-plugins = { path = "crates/plugins" }
 
 # Shipped binaries statically link two TLS stacks (rustls + BoringSSL),
 # bundled SQLite, syntect, and image codecs — LTO and symbol stripping cut

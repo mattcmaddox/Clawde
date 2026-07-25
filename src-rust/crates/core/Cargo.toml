@@ -1,5 +1,5 @@
 [package]
-name = "claurst-core"
+name = "clawde-core"
 version.workspace = true
 edition.workspace = true
 

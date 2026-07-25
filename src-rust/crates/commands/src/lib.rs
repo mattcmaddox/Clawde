@@ -5,13 +5,13 @@
 // Each command is a struct implementing the `SlashCommand` trait.
 
 use async_trait::async_trait;
-use claurst_core::config::{Config, Settings, Theme};
-use claurst_core::cost::CostTracker;
-use claurst_core::types::{ContentBlock, Message};
+use clawde_core::config::{Config, Settings, Theme};
+use clawde_core::cost::CostTracker;
+use clawde_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 #[allow(unused_imports)]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Core trait
@@ -29,9 +29,9 @@ pub struct CommandContext {
     pub remote_session_url: Option<String>,
     // Note: config already contains hooks, mcp_servers, etc.
     /// Live MCP manager — present when servers are connected.
-    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     /// Optional callback for starting an MCP OAuth flow in the background.
-    pub mcp_auth_runner: Option<Arc<dyn Fn(claurst_mcp::oauth::McpAuthSession) + Send + Sync>>,
+    pub mcp_auth_runner: Option<Arc<dyn Fn(clawde_mcp::oauth::McpAuthSession) + Send + Sync>>,
 }
 
 /// Result of running a slash command.
@@ -59,7 +59,7 @@ pub enum CommandResult {
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
     /// Load a previously saved session into the live REPL.
-    ResumeSession(claurst_core::history::ConversationSession),
+    ResumeSession(clawde_core::history::ConversationSession),
     /// Update the current session title.
     RenameSession(String),
     /// Trigger the OAuth login flow (handled by the REPL in main.rs).
@@ -68,7 +68,7 @@ pub enum CommandResult {
     /// Trigger the OAuth login flow for a specific provider with optional
     /// human-friendly label for the new account profile.
     ///
-    /// `provider` is one of `claurst_core::accounts::PROVIDER_ANTHROPIC` or
+    /// `provider` is one of `clawde_core::accounts::PROVIDER_ANTHROPIC` or
     /// `PROVIDER_CODEX`. `login_with_claude_ai` is only meaningful for
     /// Anthropic.
     StartLoginForProvider {
@@ -162,19 +162,23 @@ fn provider_lookup_ids(provider_id: &str) -> Vec<&str> {
 
 fn resolve_fast_model_id(config: &Config) -> String {
     let provider_id = config.selected_provider_id();
-    let registry = claurst_api::ModelRegistry::new();
+    let registry = clawde_api::ModelRegistry::new();
 
     provider_lookup_ids(provider_id)
         .into_iter()
         .find_map(|lookup_id| registry.best_small_model_for_provider(lookup_id))
-        .unwrap_or_else(|| stripped_model_for_provider(provider_id, config.effective_model()).to_string())
+        .unwrap_or_else(|| {
+            stripped_model_for_provider(provider_id, config.effective_model()).to_string()
+        })
 }
 
-async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claurst_api::LlmProvider>> {
+async fn provider_for_config(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn clawde_api::LlmProvider>> {
     let anthropic_auth = config.resolve_anthropic_auth_async().await;
-    let registry = claurst_api::ProviderRegistry::from_config(
+    let registry = clawde_api::ProviderRegistry::from_config(
         config,
-        claurst_api::client::ClientConfig {
+        clawde_api::client::ClientConfig {
             api_key: anthropic_auth
                 .as_ref()
                 .map(|(credential, _)| credential.clone())
@@ -189,7 +193,11 @@ async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claur
 
     provider_lookup_ids(config.selected_provider_id())
         .into_iter()
-        .find_map(|lookup_id| registry.get(&claurst_core::ProviderId::new(lookup_id)).cloned())
+        .find_map(|lookup_id| {
+            registry
+                .get(&clawde_core::ProviderId::new(lookup_id))
+                .cloned()
+        })
 }
 
 fn text_from_content_blocks(blocks: &[ContentBlock]) -> String {
@@ -366,7 +374,7 @@ fn open_with_system(target: &str) -> std::io::Result<()> {
     }
 }
 
-fn format_keystroke(keystroke: &claurst_core::keybindings::ParsedKeystroke) -> String {
+fn format_keystroke(keystroke: &clawde_core::keybindings::ParsedKeystroke) -> String {
     let mut parts = Vec::new();
     if keystroke.ctrl {
         parts.push("ctrl".to_string());
@@ -387,7 +395,7 @@ fn format_keystroke(keystroke: &claurst_core::keybindings::ParsedKeystroke) -> S
     parts.join("+")
 }
 
-fn format_chord(chord: &[claurst_core::keybindings::ParsedKeystroke]) -> String {
+fn format_chord(chord: &[clawde_core::keybindings::ParsedKeystroke]) -> String {
     chord
         .iter()
         .map(format_keystroke)
@@ -397,9 +405,9 @@ fn format_chord(chord: &[claurst_core::keybindings::ParsedKeystroke]) -> String 
 
 fn generate_keybindings_template() -> anyhow::Result<String> {
     let mut grouped: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
-    for binding in claurst_core::keybindings::default_bindings() {
+    for binding in clawde_core::keybindings::default_bindings() {
         let chord = format_chord(&binding.chord);
-        if claurst_core::keybindings::NON_REBINDABLE.contains(&chord.as_str()) {
+        if clawde_core::keybindings::NON_REBINDABLE.contains(&chord.as_str()) {
             continue;
         }
         grouped
@@ -417,10 +425,7 @@ fn generate_keybindings_template() -> anyhow::Result<String> {
             .collect(),
     };
 
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(&template)?
-    ))
+    Ok(format!("{}\n", serde_json::to_string_pretty(&template)?))
 }
 
 fn parse_theme(name: &str) -> Option<Theme> {
@@ -438,7 +443,7 @@ fn current_output_style_name(config: &Config) -> &str {
 }
 
 fn available_output_style_names() -> Vec<String> {
-    claurst_core::output_styles::all_styles(&Settings::config_dir())
+    clawde_core::output_styles::all_styles(&Settings::config_dir())
         .into_iter()
         .map(|style| style.name)
         .collect()
@@ -499,34 +504,40 @@ fn execute_named_command_from_slash(
 /// Category labels for help grouping.
 fn command_category(name: &str) -> &'static str {
     match name {
-        "clear" | "new" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" | "fork" => {
-            "Conversation"
-        }
-        "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort"
-        | "voice" | "statusline" | "output-style" | "keybindings"
-        | "privacy-settings" | "rate-limit-options" | "sandbox-toggle" => "Settings",
+        "clear" | "new" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch"
+        | "fork" => "Conversation",
+        "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
+        | "statusline" | "output-style" | "keybindings" | "privacy-settings"
+        | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
         "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
-        "memory" | "files" | "diff" | "init" | "commit" | "review"
-        | "security-review" | "import-config" => "Project",
+        "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review"
+        | "import-config" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
-        "session" | "resume" | "remote-control" | "remote-env"
-        | "teleport" | "move" => "Sessions & Remote",
+        "session" | "resume" | "remote-control" | "remote-env" | "teleport" | "move" => {
+            "Sessions & Remote"
+        }
         "help" | "exit" => "General",
         "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
-        "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
-        | "stickers" | "passes" | "desktop" | "mobile" | "btw" => "Tools & Extras",
+        "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
+        | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
     }
 }
 
 #[async_trait]
 impl SlashCommand for HelpCommand {
-    fn name(&self) -> &str { "help" }
-    fn aliases(&self) -> Vec<&str> { vec!["h", "?"] }
-    fn description(&self) -> &str { "Show available commands and usage information" }
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["h", "?"]
+    }
+    fn description(&self) -> &str {
+        "Show available commands and usage information"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if !args.is_empty() {
@@ -538,7 +549,11 @@ impl SlashCommand for HelpCommand {
                 } else {
                     format!(
                         "\nAliases: {}",
-                        aliases.iter().map(|a| format!("/{}", a)).collect::<Vec<_>>().join(", ")
+                        aliases
+                            .iter()
+                            .map(|a| format!("/{}", a))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 };
                 return CommandResult::Message(format!(
@@ -583,16 +598,21 @@ impl SlashCommand for HelpCommand {
             } else {
                 format!(
                     " ({})",
-                    aliases.iter().map(|a| format!("/{}", a)).collect::<Vec<_>>().join(", ")
+                    aliases
+                        .iter()
+                        .map(|a| format!("/{}", a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             };
-            by_cat
-                .entry(cat)
-                .or_default()
-                .push(format!("  /{:<20} {}", format!("{}{}", cmd.name(), alias_str), cmd.description()));
+            by_cat.entry(cat).or_default().push(format!(
+                "  /{:<20} {}",
+                format!("{}{}", cmd.name(), alias_str),
+                cmd.description()
+            ));
         }
 
-        let mut output = String::from("Claurst — Slash Commands\n");
+        let mut output = String::from("Clawde — Slash Commands\n");
         output.push_str("════════════════════════════\n");
 
         for cat in &category_order {
@@ -613,9 +633,15 @@ impl SlashCommand for HelpCommand {
 
 #[async_trait]
 impl SlashCommand for ClearCommand {
-    fn name(&self) -> &str { "clear" }
-    fn aliases(&self) -> Vec<&str> { vec!["c", "reset"] }
-    fn description(&self) -> &str { "Clear the conversation history" }
+    fn name(&self) -> &str {
+        "clear"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["c", "reset"]
+    }
+    fn description(&self) -> &str {
+        "Clear the conversation history"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::ClearConversation
@@ -626,33 +652,207 @@ impl SlashCommand for ClearCommand {
 
 #[async_trait]
 impl SlashCommand for CompactCommand {
-    fn name(&self) -> &str { "compact" }
-    fn description(&self) -> &str { "Compact the conversation to reduce token usage" }
+    fn name(&self) -> &str {
+        "compact"
+    }
+    fn description(&self) -> &str {
+        "Compact the conversation to reduce token usage"
+    }
+    fn help(&self) -> &str {
+        "Usage: /compact [custom instructions]\n\n\
+         Summarises the conversation using the active provider, preserving\n\
+         key technical details, decisions, file paths, and current task status.\n\
+         The summary replaces earlier messages so the model can continue with\n\
+         reduced token usage.\n\n\
+         Optional custom instructions can tailor the summary focus:\n\
+           /compact focus on the API design decisions\n\
+           /compact include all error messages encountered"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let msg_count = ctx.messages.len();
-        let instruction = if args.is_empty() {
-            "Provide a detailed summary of our conversation so far, preserving all \
-             key technical details, decisions made, file paths mentioned, and current \
-             task status."
-                .to_string()
-        } else {
-            args.to_string()
+        if msg_count < 2 {
+            return CommandResult::Message(
+                "Conversation has fewer than 2 messages -- nothing to compact.".to_string(),
+            );
+        }
+
+        let transcript = build_conversation_transcript(&ctx.messages);
+
+        let provider = match provider_for_config(&ctx.config).await {
+            Some(p) => p,
+            None => {
+                return CommandResult::Error(
+                    "No provider available for compaction. Configure an API key first.".to_string(),
+                );
+            }
         };
 
-        CommandResult::UserMessage(format!(
-            "[Compact requested ({} messages). Instruction: {}]",
-            msg_count, instruction
-        ))
+        let compact_model = resolve_fast_model_id(&ctx.config);
+        let custom_instructions = if args.trim().is_empty() {
+            None
+        } else {
+            Some(args.trim())
+        };
+
+        let compact_prompt_text =
+            clawde_query::compact::get_compact_prompt(custom_instructions, None);
+
+        let system_prompt = "You are an expert conversation summariser that creates \
+            thorough, structured summaries preserving all technical details, \
+            file names, code snippets, and decisions. Follow the instructions \
+            carefully and respond with the structured format requested.";
+
+        let user_content = format!(
+            "{}\n\n<conversation_to_summarize original_messages=\"{}\">\n{}\n</conversation_to_summarize>",
+            compact_prompt_text,
+            msg_count,
+            transcript
+        );
+
+        let request = clawde_api::ProviderRequest {
+            model: compact_model.clone(),
+            messages: vec![Message::user(user_content)],
+            system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt.to_string())),
+            tools: vec![],
+            max_tokens: 8192,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: serde_json::Value::Object(Default::default()),
+        };
+
+        match provider.create_message(request).await {
+            Ok(response) => {
+                let raw_text = text_from_content_blocks(&response.content);
+                if raw_text.trim().is_empty() {
+                    return CommandResult::Error(
+                        "Compact summary was empty. Try again or use /compact send.".to_string(),
+                    );
+                }
+
+                let formatted = clawde_query::compact::format_compact_summary(&raw_text);
+
+                CommandResult::Message(format!(
+                    "Conversation Compact\n\
+                     ------------------\n\
+                     Original messages: {msg_count}\n\
+                     Model: {compact_model}\n\n\
+                     {formatted}\n\n\
+                     ----\n\
+                     Use /compact send to ask the model to perform the compaction \
+                     (replace history with this summary)."
+                ))
+            }
+            Err(_e) => {
+                let fallback_instruction = if args.trim().is_empty() {
+                    "Provide a detailed summary of our conversation so far, preserving all \
+                     key technical details, decisions made, file paths mentioned, and current \
+                     task status."
+                } else {
+                    args.trim()
+                };
+                CommandResult::UserMessage(format!(
+                    "[Compact requested ({} messages). Instruction: {}]",
+                    msg_count, fallback_instruction
+                ))
+            }
+        }
     }
 }
 
-// ---- /cost ---------------------------------------------------------------
+/// Build a plain-text transcript of all messages for the compaction prompt.
+fn build_conversation_transcript(messages: &[Message]) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        let role_label = match msg.role {
+            clawde_core::types::Role::User => "Human",
+            clawde_core::types::Role::Assistant => "Assistant",
+        };
+        let text = msg.get_all_text();
+        transcript.push_str(&format!("{}: {}\n\n", role_label, text));
 
+        if let clawde_core::types::MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                match block {
+                    clawde_core::types::ContentBlock::ToolUse {
+                        name, input, id, ..
+                    } => {
+                        transcript.push_str(&format!(
+                            "[Tool Call: {} (id={})]\nInput: {}\n\n",
+                            name, id, input
+                        ));
+                    }
+                    clawde_core::types::ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } => {
+                        let result_text = match content {
+                            clawde_core::types::ToolResultContent::Text(t) => {
+                                if t.len() > 2000 {
+                                    let safe_end = t
+                                        .char_indices()
+                                        .nth(2000)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(t.len());
+                                    format!(
+                                        "{}... (truncated, {} total chars)",
+                                        &t[..safe_end],
+                                        t.len()
+                                    )
+                                } else {
+                                    t.clone()
+                                }
+                            }
+                            clawde_core::types::ToolResultContent::Blocks(_) => {
+                                "[complex content]".to_string()
+                            }
+                        };
+                        let error_flag = if is_error.unwrap_or(false) {
+                            " [ERROR]"
+                        } else {
+                            ""
+                        };
+                        transcript.push_str(&format!(
+                            "[Tool Result (id={}){}]\n{}\n\n",
+                            tool_use_id, error_flag, result_text
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    const MAX_TRANSCRIPT_CHARS: usize = 80_000;
+    if transcript.len() > MAX_TRANSCRIPT_CHARS {
+        let safe_end = transcript
+            .char_indices()
+            .nth(MAX_TRANSCRIPT_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(transcript.len());
+        format!(
+            "{}...\n\n[TRANSCRIPT TRUNCATED: {} total chars, showing first {}]\n",
+            &transcript[..safe_end],
+            transcript.len(),
+            MAX_TRANSCRIPT_CHARS
+        )
+    } else {
+        transcript
+    }
+}
 #[async_trait]
 impl SlashCommand for CostCommand {
-    fn name(&self) -> &str { "cost" }
-    fn description(&self) -> &str { "Show token usage and cost for this session" }
+    fn name(&self) -> &str {
+        "cost"
+    }
+    fn description(&self) -> &str {
+        "Show token usage and cost for this session"
+    }
     fn help(&self) -> &str {
         "Usage: /cost\n\n\
          Shows per-category token counts and the estimated cost for this session.\n\
@@ -664,7 +864,7 @@ impl SlashCommand for CostCommand {
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let tracker = &ctx.cost_tracker;
         let model = ctx.config.effective_model();
-        let pricing = claurst_core::cost::ModelPricing::for_model(model);
+        let pricing = clawde_core::cost::ModelPricing::for_model(model);
 
         let input = tracker.input_tokens();
         let output = tracker.output_tokens();
@@ -674,10 +874,10 @@ impl SlashCommand for CostCommand {
         let cost = tracker.total_cost_usd();
 
         // Per-category cost breakdown.
-        let input_cost    = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
-        let output_cost   = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
-        let cc_cost       = (cache_create as f64 * pricing.cache_creation_per_mtk) / 1_000_000.0;
-        let cr_cost       = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
+        let input_cost = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
+        let output_cost = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
+        let cc_cost = (cache_create as f64 * pricing.cache_creation_per_mtk) / 1_000_000.0;
+        let cr_cost = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
 
         // Pricing info line.
         let pricing_line = format!(
@@ -691,10 +891,12 @@ impl SlashCommand for CostCommand {
         // Cache savings note: how much input cost was avoided by using cache-read
         // instead of re-sending those tokens as normal input.
         let savings = if cache_read > 0 {
-            let saved =
-                (cache_read as f64 * (pricing.input_per_mtk - pricing.cache_read_per_mtk))
-                    / 1_000_000.0;
-            format!("\n  Cache savings:  ${:.4}  ({} tokens served from cache)", saved, cache_read)
+            let saved = (cache_read as f64 * (pricing.input_per_mtk - pricing.cache_read_per_mtk))
+                / 1_000_000.0;
+            format!(
+                "\n  Cache savings:  ${:.4}  ({} tokens served from cache)",
+                saved, cache_read
+            )
         } else {
             String::new()
         };
@@ -732,9 +934,15 @@ impl SlashCommand for CostCommand {
 
 #[async_trait]
 impl SlashCommand for ExitCommand {
-    fn name(&self) -> &str { "exit" }
-    fn aliases(&self) -> Vec<&str> { vec!["quit", "q"] }
-    fn description(&self) -> &str { "Exit Claurst" }
+    fn name(&self) -> &str {
+        "exit"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["quit", "q"]
+    }
+    fn description(&self) -> &str {
+        "Exit Claurst"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Exit
@@ -745,8 +953,12 @@ impl SlashCommand for ExitCommand {
 
 #[async_trait]
 impl SlashCommand for ModelCommand {
-    fn name(&self) -> &str { "model" }
-    fn description(&self) -> &str { "Show or change the current model" }
+    fn name(&self) -> &str {
+        "model"
+    }
+    fn description(&self) -> &str {
+        "Show or change the current model"
+    }
     fn help(&self) -> &str {
         "Usage: /model [<model-id>]\n\n\
          Without arguments, shows the current model.\n\n\
@@ -763,10 +975,7 @@ impl SlashCommand for ModelCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
-            CommandResult::Message(format!(
-                "Current model: {}",
-                ctx.config.effective_model()
-            ))
+            CommandResult::Message(format!("Current model: {}", ctx.config.effective_model()))
         } else {
             // Accept both "provider/model" and bare model names.
             // The config stores the full string (including provider prefix when present)
@@ -795,15 +1004,18 @@ impl SlashCommand for ModelCommand {
 
 #[async_trait]
 impl SlashCommand for VersionCommand {
-    fn name(&self) -> &str { "version" }
-    fn aliases(&self) -> Vec<&str> { vec!["v"] }
-    fn description(&self) -> &str { "Show version information" }
+    fn name(&self) -> &str {
+        "version"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["v"]
+    }
+    fn description(&self) -> &str {
+        "Show version information"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        CommandResult::Message(format!(
-            "Claurst v{}",
-            claurst_core::constants::APP_VERSION
-        ))
+        CommandResult::Message(format!("Clawde v{}", clawde_core::constants::APP_VERSION))
     }
 }
 
@@ -811,32 +1023,35 @@ impl SlashCommand for VersionCommand {
 
 #[async_trait]
 impl SlashCommand for ResumeCommand {
-    fn name(&self) -> &str { "resume" }
-    fn aliases(&self) -> Vec<&str> { vec!["r", "continue"] }
-    fn description(&self) -> &str { "Resume a previous conversation" }
+    fn name(&self) -> &str {
+        "resume"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["r", "continue"]
+    }
+    fn description(&self) -> &str {
+        "Resume a previous conversation"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if args.is_empty() {
-            let sessions = claurst_core::history::list_sessions().await;
+            let sessions = clawde_core::history::list_sessions().await;
             if sessions.is_empty() {
                 return CommandResult::Message("No previous sessions found.".to_string());
             }
             let last = &sessions[0];
-            match claurst_core::history::load_session(&last.id).await {
+            match clawde_core::history::load_session(&last.id).await {
                 Ok(session) => CommandResult::ResumeSession(session),
-                Err(e) => CommandResult::Error(format!(
-                    "Failed to load session {}: {}",
-                    last.id, e
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Failed to load session {}: {}", last.id, e))
+                }
             }
         } else {
-            match claurst_core::history::load_session(args.trim()).await {
+            match clawde_core::history::load_session(args.trim()).await {
                 Ok(session) => CommandResult::ResumeSession(session),
-                Err(e) => CommandResult::Error(format!(
-                    "Failed to load session {}: {}",
-                    args.trim(),
-                    e
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Failed to load session {}: {}", args.trim(), e))
+                }
             }
         }
     }
@@ -846,12 +1061,16 @@ impl SlashCommand for ResumeCommand {
 
 #[async_trait]
 impl SlashCommand for StatusCommand {
-    fn name(&self) -> &str { "status" }
-    fn description(&self) -> &str { "Show comprehensive system and session status" }
+    fn name(&self) -> &str {
+        "status"
+    }
+    fn description(&self) -> &str {
+        "Show comprehensive system and session status"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Auth status
-        let auth_status = match claurst_core::oauth::OAuthTokens::load().await {
+        let auth_status = match clawde_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
                 let sub = tokens.subscription_type.as_deref().unwrap_or("oauth");
                 format!("Authenticated ({})", sub)
@@ -891,7 +1110,7 @@ impl SlashCommand for StatusCommand {
             .unwrap_or_else(|_| "n/a".to_string());
 
         CommandResult::Message(format!(
-            "Claurst Status\n\
+            "Clawde Status\n\
              ══════════════════\n\
              Auth:           {auth_status}\n\
              Model:          {model}\n\
@@ -933,8 +1152,12 @@ impl SlashCommand for StatusCommand {
 
 #[async_trait]
 impl SlashCommand for DiffCommand {
-    fn name(&self) -> &str { "diff" }
-    fn description(&self) -> &str { "Show git diff of changes in the working directory" }
+    fn name(&self) -> &str {
+        "diff"
+    }
+    fn description(&self) -> &str {
+        "Show git diff of changes in the working directory"
+    }
     fn help(&self) -> &str {
         "Usage: /diff [--stat|--staged|<ref>]\n\n\
          Shows git diff output for the current working directory.\n\n\
@@ -1005,8 +1228,12 @@ impl SlashCommand for DiffCommand {
 
 #[async_trait]
 impl SlashCommand for InitCommand {
-    fn name(&self) -> &str { "init" }
-    fn description(&self) -> &str { "Initialize a new project with AGENTS.md" }
+    fn name(&self) -> &str {
+        "init"
+    }
+    fn description(&self) -> &str {
+        "Initialize a new project with AGENTS.md"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let path = ctx.working_dir.join("AGENTS.md");
@@ -1025,10 +1252,7 @@ impl SlashCommand for InitCommand {
             - List important files and their purposes\n";
 
         match tokio::fs::write(&path, default_content).await {
-            Ok(()) => CommandResult::Message(format!(
-                "Created AGENTS.md at {}",
-                path.display()
-            )),
+            Ok(()) => CommandResult::Message(format!("Created AGENTS.md at {}", path.display())),
             Err(e) => CommandResult::Error(format!("Failed to create AGENTS.md: {}", e)),
         }
     }
@@ -1038,8 +1262,12 @@ impl SlashCommand for InitCommand {
 
 #[async_trait]
 impl SlashCommand for ImportConfigCommand {
-    fn name(&self) -> &str { "import-config" }
-    fn description(&self) -> &str { "Import CLAUDE.md and settings.json from ~/.claude" }
+    fn name(&self) -> &str {
+        "import-config"
+    }
+    fn description(&self) -> &str {
+        "Import CLAUDE.md and settings.json from ~/.claude"
+    }
     fn help(&self) -> &str {
         "Usage: /import-config\n\
          Import user-level Claude Code configuration from ~/.claude:\n\
@@ -1057,8 +1285,12 @@ impl SlashCommand for ImportConfigCommand {
 
 #[async_trait]
 impl SlashCommand for HooksCommand {
-    fn name(&self) -> &str { "hooks" }
-    fn description(&self) -> &str { "Show configured event hooks" }
+    fn name(&self) -> &str {
+        "hooks"
+    }
+    fn description(&self) -> &str {
+        "Show configured event hooks"
+    }
     fn help(&self) -> &str {
         "Usage: /hooks\n\
          Show hooks configured in settings.json under 'hooks'.\n\
@@ -1097,9 +1329,15 @@ impl SlashCommand for HooksCommand {
 
 #[async_trait]
 impl SlashCommand for ThinkingCommand {
-    fn name(&self) -> &str { "thinking" }
-    fn description(&self) -> &str { "Toggle extended thinking mode" }
-    fn aliases(&self) -> Vec<&str> { vec!["think"] }
+    fn name(&self) -> &str {
+        "thinking"
+    }
+    fn description(&self) -> &str {
+        "Toggle extended thinking mode"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["think"]
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Extended thinking is configured through the model; just inform the user
@@ -1107,7 +1345,8 @@ impl SlashCommand for ThinkingCommand {
         if model.contains("claude-3-5") || model.contains("claude-3.5") {
             CommandResult::Message(
                 "Extended thinking is not available for Claude 3.5 models.\n\
-                 Use claude-opus-4-6 or claude-sonnet-4-6 for extended thinking.".to_string()
+                 Use claude-opus-4-6 or claude-sonnet-4-6 for extended thinking."
+                    .to_string(),
             )
         } else {
             CommandResult::Message(format!(
@@ -1124,13 +1363,21 @@ impl SlashCommand for ThinkingCommand {
 
 #[async_trait]
 impl SlashCommand for NamedCommandAdapter {
-    fn name(&self) -> &str { self.slash_name }
+    fn name(&self) -> &str {
+        self.slash_name
+    }
 
-    fn aliases(&self) -> Vec<&str> { self.slash_aliases.to_vec() }
+    fn aliases(&self) -> Vec<&str> {
+        self.slash_aliases.to_vec()
+    }
 
-    fn description(&self) -> &str { self.slash_description }
+    fn description(&self) -> &str {
+        self.slash_description
+    }
 
-    fn help(&self) -> &str { self.slash_help }
+    fn help(&self) -> &str {
+        self.slash_help
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         execute_named_command_from_slash(self.target_name, args, ctx)
@@ -1335,18 +1582,18 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
 /// Find a command by name or alias.
 pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     let name = name.trim_start_matches('/');
-    all_commands().into_iter().find(|c| {
-        c.name() == name || c.aliases().contains(&name)
-    })
+    all_commands()
+        .into_iter()
+        .find(|c| c.name() == name || c.aliases().contains(&name))
 }
 
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
 /// populating `HelpOverlay::commands` at startup.
-pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
+pub fn build_help_entries() -> Vec<clawde_tui::overlays::HelpEntry> {
     all_commands()
         .iter()
         .filter(|c| !c.hidden())
-        .map(|c| claurst_tui::overlays::HelpEntry {
+        .map(|c| clawde_tui::overlays::HelpEntry {
             name: c.name().to_string(),
             aliases: c.aliases().join(", "),
             description: c.description().to_string(),
@@ -1362,20 +1609,27 @@ pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
 /// A slash command backed by a user-defined template in `settings.json`.
 struct TemplateCommand {
     name: String,
-    template: claurst_core::CommandTemplate,
+    template: clawde_core::CommandTemplate,
 }
 
 #[async_trait]
 impl SlashCommand for TemplateCommand {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn description(&self) -> &str {
-        self.template.description.as_deref().unwrap_or("Custom command")
+        self.template
+            .description
+            .as_deref()
+            .unwrap_or("Custom command")
     }
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let mut words = args.split_whitespace();
         let arg1 = words.next().unwrap_or("");
         let arg2 = words.next().unwrap_or("");
-        let prompt = self.template.template
+        let prompt = self
+            .template
+            .template
             .replace("$ARGUMENTS", args)
             .replace("$1", arg1)
             .replace("$2", arg2);
@@ -1385,13 +1639,17 @@ impl SlashCommand for TemplateCommand {
 
 /// Build slash commands from user-defined command templates stored in
 /// `settings.commands`.
-pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
-    settings.commands.iter().map(|(name, template)| {
-        Box::new(TemplateCommand {
-            name: name.clone(),
-            template: template.clone(),
-        }) as Box<dyn SlashCommand>
-    }).collect()
+pub fn commands_from_settings(settings: &clawde_core::Settings) -> Vec<Box<dyn SlashCommand>> {
+    settings
+        .commands
+        .iter()
+        .map(|(name, template)| {
+            Box::new(TemplateCommand {
+                name: name.clone(),
+                template: template.clone(),
+            }) as Box<dyn SlashCommand>
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,14 +1665,19 @@ struct SkillCommand {
 
 #[async_trait]
 impl SlashCommand for SkillCommand {
-    fn name(&self) -> &str { &self.name }
-    fn description(&self) -> &str { &self.description }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let mut words = args.split_whitespace();
         let arg1 = words.next().unwrap_or("");
         let arg2 = words.next().unwrap_or("");
-        let prompt = self.template
+        let prompt = self
+            .template
             .replace("$ARGUMENTS", args)
             .replace("$1", arg1)
             .replace("$2", arg2);
@@ -1430,15 +1693,13 @@ impl SlashCommand for SkillCommand {
 /// with a built-in command will be silently skipped.
 pub fn commands_from_discovered_skills(
     cwd: &std::path::Path,
-    skills_config: &claurst_core::SkillsConfig,
+    skills_config: &clawde_core::SkillsConfig,
 ) -> Vec<Box<dyn SlashCommand>> {
-    let discovered = claurst_core::discover_skills(cwd, skills_config);
+    let discovered = clawde_core::discover_skills(cwd, skills_config);
     // Build a set of built-in command names so we can skip collisions.
     let all_cmds = all_commands();
-    let builtin_names: std::collections::HashSet<&str> = all_cmds
-        .iter()
-        .map(|c| c.name())
-        .collect();
+    let builtin_names: std::collections::HashSet<&str> =
+        all_cmds.iter().map(|c| c.name()).collect();
 
     discovered
         .into_values()
@@ -1454,12 +1715,11 @@ pub fn commands_from_discovered_skills(
 }
 
 /// Execute a slash command string (with leading /).
-pub async fn execute_command(
-    input: &str,
-    ctx: &mut CommandContext,
-) -> Option<CommandResult> {
-    if !claurst_tui::input::is_slash_command(input) { return None; }
-    let (name, args) = claurst_tui::input::parse_slash_command(input);
+pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<CommandResult> {
+    if !clawde_tui::input::is_slash_command(input) {
+        return None;
+    }
+    let (name, args) = clawde_tui::input::parse_slash_command(input);
 
     // First check built-in commands.
     if let Some(cmd) = find_command(name) {
@@ -1469,13 +1729,16 @@ pub async fn execute_command(
     // Check user-defined command templates from settings.
     let cmd_name = name.trim_start_matches('/');
     if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
-        let tc = TemplateCommand { name: cmd_name.to_string(), template: tmpl };
+        let tc = TemplateCommand {
+            name: cmd_name.to_string(),
+            template: tmpl,
+        };
         return Some(tc.execute(args, ctx).await);
     }
 
     // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
     {
-        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
+        let discovered = clawde_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
         if let Some(skill) = discovered.get(cmd_name) {
             let sc = SkillCommand {
                 name: skill.name.clone(),
@@ -1488,7 +1751,7 @@ pub async fn execute_command(
 
     // Then check plugin-defined slash commands.
     let project_dir = ctx.working_dir.clone();
-    let registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
+    let registry = clawde_plugins::load_plugins(&project_dir, &[]).await;
     for cmd_def in registry.all_command_defs() {
         if cmd_def.name == cmd_name {
             let adapter = PluginSlashCommandAdapter { def: cmd_def };
@@ -1518,11 +1781,11 @@ pub mod stats;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::cost::CostTracker;
+    use clawde_core::cost::CostTracker;
 
     fn make_ctx() -> CommandContext {
         CommandContext {
-            config: claurst_core::config::Config::default(),
+            config: clawde_core::config::Config::default(),
             cost_tracker: CostTracker::new(),
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),
@@ -1592,13 +1855,40 @@ mod tests {
     #[test]
     fn test_core_commands_present() {
         let expected = [
-            "help", "clear", "compact", "cost", "exit", "model",
-            "config", "version", "status", "diff", "memory", "hooks",
-            "permissions", "plan", "tasks", "session", "login", "logout", "refresh",
-            "usage", "plugin", "reload-plugins",
-            "add-dir", "agents", "branch", "tag",
-            "passes", "ide", "pr-comments", "desktop", "mobile",
-            "install-github-app", "web-setup", "stickers",
+            "help",
+            "clear",
+            "compact",
+            "cost",
+            "exit",
+            "model",
+            "config",
+            "version",
+            "status",
+            "diff",
+            "memory",
+            "hooks",
+            "permissions",
+            "plan",
+            "tasks",
+            "session",
+            "login",
+            "logout",
+            "refresh",
+            "usage",
+            "plugin",
+            "reload-plugins",
+            "add-dir",
+            "agents",
+            "branch",
+            "tag",
+            "passes",
+            "ide",
+            "pr-comments",
+            "desktop",
+            "mobile",
+            "install-github-app",
+            "web-setup",
+            "stickers",
         ];
         for name in &expected {
             assert!(
@@ -1631,7 +1921,10 @@ mod tests {
         let CommandResult::Message(text) = result else {
             panic!("empty /output-style should list styles, got {result:?}");
         };
-        assert!(text.contains("caveman"), "personas must appear in the list: {text}");
+        assert!(
+            text.contains("caveman"),
+            "personas must appear in the list: {text}"
+        );
         assert!(text.contains("rocky"));
         assert!(text.contains("default"));
         // Default config → default is the current style.
@@ -1662,9 +1955,9 @@ mod tests {
         // End-to-end of the persist path: /output-style / /rocky set
         // config.output_style, which resolves to the persona's prompt text for
         // the system prompt.
-        let config = claurst_core::config::Config {
+        let config = clawde_core::config::Config {
             output_style: Some("rocky".to_string()),
-            ..claurst_core::config::Config::default()
+            ..clawde_core::config::Config::default()
         };
         let prompt = config
             .resolve_output_style_prompt()
@@ -1679,7 +1972,10 @@ mod tests {
         let template = generate_keybindings_template().expect("template must generate");
         let parsed: serde_json::Value =
             serde_json::from_str(&template).expect("template must be valid JSON");
-        assert!(parsed.get("bindings").is_some(), "template needs a bindings block");
+        assert!(
+            parsed.get("bindings").is_some(),
+            "template needs a bindings block"
+        );
     }
 
     #[test]
@@ -1747,7 +2043,7 @@ mod tests {
         assert!(matches!(result, CommandResult::Message(_)));
         if let CommandResult::Message(msg) = result {
             assert!(
-                msg.contains("claude") || msg.contains("Claurst") || msg.contains('.'),
+                msg.contains("claude") || msg.contains("Clawde") || msg.contains('.'),
                 "Version message should contain version number, got: {}",
                 msg
             );
@@ -1774,7 +2070,7 @@ mod tests {
                 login_with_claude_ai,
                 label,
             } => {
-                assert_eq!(provider, claurst_core::accounts::PROVIDER_ANTHROPIC);
+                assert_eq!(provider, clawde_core::accounts::PROVIDER_ANTHROPIC);
                 assert!(login_with_claude_ai);
                 assert!(label.is_none());
             }
@@ -1793,7 +2089,7 @@ mod tests {
                 login_with_claude_ai,
                 ..
             } => {
-                assert_eq!(provider, claurst_core::accounts::PROVIDER_ANTHROPIC);
+                assert_eq!(provider, clawde_core::accounts::PROVIDER_ANTHROPIC);
                 assert!(!login_with_claude_ai);
             }
             other => panic!("expected StartLoginForProvider, got {:?}", other),
@@ -1807,11 +2103,9 @@ mod tests {
         let result = cmd.execute("--codex --label work", &mut ctx).await;
         match result {
             CommandResult::StartLoginForProvider {
-                provider,
-                label,
-                ..
+                provider, label, ..
             } => {
-                assert_eq!(provider, claurst_core::accounts::PROVIDER_CODEX);
+                assert_eq!(provider, clawde_core::accounts::PROVIDER_CODEX);
                 assert_eq!(label.as_deref(), Some("work"));
             }
             other => panic!("expected StartLoginForProvider, got {:?}", other),
@@ -1872,6 +2166,376 @@ mod tests {
                 "agent alpha".to_string(),
                 "second value".to_string(),
             ]
+        );
+    }
+    // ---- /plan tests -------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_plan_command_registered() {
+        assert!(find_command("plan").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_plan_no_args_empty_conversation() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("plan").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        // Without a plan file, returns a message about plan status.
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("No active plan") || msg.contains("Current Plan"),
+                    "Expected plan status message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_exit_returns_user_message() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("plan").unwrap();
+        let result = cmd.execute("exit", &mut ctx).await;
+        assert!(matches!(result, CommandResult::UserMessage(_)));
+    }
+
+    #[tokio::test]
+    async fn test_plan_with_description_returns_user_message() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("plan").unwrap();
+        let result = cmd.execute("refactor the auth module", &mut ctx).await;
+        assert!(matches!(result, CommandResult::UserMessage(_)));
+    }
+
+    // ---- /compact tests ----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_compact_empty_conversation() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("compact").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("fewer than 2 messages"),
+                    "Expected 'fewer than 2 messages', got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compact_single_message() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        let cmd = find_command("compact").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("fewer than 2 messages"),
+                    "Expected 'fewer than 2 messages', got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compact_two_messages_no_provider() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        ctx.messages.push(Message::assistant("Hi there!"));
+        let cmd = find_command("compact").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        // Falls back to UserMessage when the provider API call fails,
+        // or Error when provider_for_config returns None.
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("Compact"),
+                    "Expected compact instruction, got: {}",
+                    msg
+                );
+            }
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("No provider available"),
+                    "Expected provider error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage or Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_empty() {
+        let result = build_conversation_transcript(&[]);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_single_user() {
+        let msgs = vec![Message::user("Hello world")];
+        let result = build_conversation_transcript(&msgs);
+        assert!(result.contains("Human: Hello world"));
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_user_assistant() {
+        let msgs = vec![
+            Message::user("What is Rust?"),
+            Message::assistant("Rust is a systems programming language."),
+        ];
+        let result = build_conversation_transcript(&msgs);
+        assert!(result.contains("Human: What is Rust?"));
+        assert!(result.contains("Assistant: Rust is a systems programming language."));
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_with_tool_call() {
+        use clawde_core::types::ContentBlock;
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "toolu_abc".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "echo hi"}),
+            thought_signature: None,
+        }];
+        let msg = Message::assistant_blocks(blocks);
+        let result = build_conversation_transcript(&[msg]);
+        assert!(
+            result.contains("Tool Call: bash (id=toolu_abc)"),
+            "Result: {}",
+            result
+        );
+        assert!(result.contains("echo hi"), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_with_tool_result() {
+        use clawde_core::types::{ContentBlock, ToolResultContent};
+        let blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_abc".to_string(),
+            content: ToolResultContent::Text("success".to_string()),
+            is_error: Some(false),
+        }];
+        let msg = Message::user_blocks(blocks);
+        let result = build_conversation_transcript(&[msg]);
+        assert!(
+            result.contains("Tool Result (id=toolu_abc)"),
+            "Result: {}",
+            result
+        );
+        assert!(result.contains("success"), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_with_tool_error() {
+        use clawde_core::types::{ContentBlock, ToolResultContent};
+        let blocks = vec![ContentBlock::ToolResult {
+            tool_use_id: "toolu_err".to_string(),
+            content: ToolResultContent::Text("command not found".to_string()),
+            is_error: Some(true),
+        }];
+        let msg = Message::user_blocks(blocks);
+        let result = build_conversation_transcript(&[msg]);
+        assert!(
+            result.contains("[ERROR]"),
+            "Error flag missing in: {}",
+            result
+        );
+        assert!(result.contains("command not found"), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_build_conversation_transcript_utf8_truncation() {
+        let long_text = "\\u{1F600}".repeat(45_000);
+        let msgs = vec![Message::user(&long_text)];
+        let result = build_conversation_transcript(&msgs);
+        assert!(
+            result.contains("TRANSCRIPT TRUNCATED"),
+            "Expected truncation marker, got {} chars: {}...",
+            result.len(),
+            &result[..result.len().min(100)]
+        );
+    }
+
+    // ---- /ctx-viz tests ----------------------------------------------------
+
+    #[test]
+    fn test_ctx_viz_command_registered() {
+        assert!(find_command("ctx-viz").is_some());
+    }
+
+    #[test]
+    fn test_ctx_viz_alias_ctx() {
+        assert!(find_command("ctx").is_some());
+    }
+
+    #[test]
+    fn test_ctx_viz_alias_context_visualizer() {
+        assert!(find_command("context-visualizer").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ctx_viz_empty_conversation_returns_message() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("ctx-viz").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("Context Visualization"),
+                    "Expected 'Context Visualization' header, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ctx_viz_shows_model_and_window() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("ctx-viz").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Model:"), "No Model line");
+                assert!(msg.contains("Context window:"), "No Context window line");
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    // ---- /summary tests ----------------------------------------------------
+
+    #[test]
+    fn test_summary_command_registered() {
+        assert!(find_command("summary").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_summary_empty_conversation() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("summary").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("No messages in conversation yet"),
+                    "Expected empty conversation message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summary_single_message_falls_back() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        let cmd = find_command("summary").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("summary"),
+                    "Expected UserMessage with summary instruction, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage (fallback), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summary_two_messages_falls_back() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        ctx.messages.push(Message::assistant("Hi there!"));
+        let cmd = find_command("summary").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("summary"),
+                    "Expected UserMessage with summary instruction, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage (fallback), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summary_with_focus_arg_small() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        let cmd = find_command("summary").unwrap();
+        let result = cmd.execute("decisions", &mut ctx).await;
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("Focus on: decisions"),
+                    "Expected focus instruction in message, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_summary_three_messages_no_provider() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        ctx.messages.push(Message::assistant("Hi there!"));
+        ctx.messages.push(Message::user("What is Rust?"));
+        let cmd = find_command("summary").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        // Falls back to UserMessage when the provider API call fails,
+        // or Error when provider_for_config returns None.
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("summary"),
+                    "Expected summary fallback instruction, got: {}",
+                    msg
+                );
+            }
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("No provider available"),
+                    "Expected provider error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage or Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_commands_present() {
+        assert!(
+            find_command("summary").is_some(),
+            "/summary should be registered"
+        );
+        assert!(
+            find_command("ctx-viz").is_some(),
+            "/ctx-viz should be registered"
+        );
+        assert!(find_command("plan").is_some(), "/plan should be registered");
+        assert!(
+            find_command("compact").is_some(),
+            "/compact should be registered"
         );
     }
 }

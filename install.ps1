@@ -1,10 +1,10 @@
-# Claurst installer for Windows (PowerShell).
+# Clawde installer for Windows (PowerShell).
 #
 # Usage (one-liner):
-#   irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/<your-github-username>/clawde/releases/latest/download/install.ps1 | iex
 #
 # Or download and run locally:
-#   Invoke-WebRequest https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 -OutFile install.ps1
+#   Invoke-WebRequest https://github.com/<your-github-username>/clawde/releases/latest/download/install.ps1 -OutFile install.ps1
 #   .\install.ps1
 
 [CmdletBinding()]
@@ -18,8 +18,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$App = 'claurst'
-$Repo = 'Kuberwastaken/claurst'
+$App = 'clawde'
+$Repo = '<your-github-username>/clawde'
 
 function Write-Info($msg)    { Write-Host $msg }
 function Write-Success($msg) { Write-Host $msg -ForegroundColor Green }
@@ -29,7 +29,7 @@ function Write-Muted($msg)   { Write-Host $msg -ForegroundColor DarkGray }
 
 function Show-Usage {
 @"
-Claurst installer (Windows)
+Clawde installer (Windows)
 
 Usage: install.ps1 [options]
 
@@ -37,13 +37,13 @@ Options:
     -Help                   Show this help
     -Version <version>      Install a specific version (e.g., 0.1.0)
     -Binary <path>          Install from a local binary instead of downloading
-    -InstallDir <path>      Override install location (default: %LOCALAPPDATA%\Programs\claurst)
+    -InstallDir <path>      Override install location (default: %LOCALAPPDATA%\Programs\clawde)
     -NoModifyPath           Don't add the install dir to user PATH
 
 Examples:
-    irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+    irm https://github.com/Kuberwastaken/clawde/releases/latest/download/install.ps1 | iex
     .\install.ps1 -Version 0.1.0
-    .\install.ps1 -Binary C:\path\to\claurst.exe
+    .\install.ps1 -Binary C:\path\to\clawde.exe
 "@
 }
 
@@ -68,12 +68,12 @@ function Get-Arch {
 }
 
 # ----- Resolve install directory -----
-# Binary location is independent of the claurst data dir. Default to the
-# per-user programs location (%LOCALAPPDATA%\Programs\claurst), falling back to
+# Binary location is independent of the clawde data dir. Default to the
+# per-user programs location (%LOCALAPPDATA%\Programs\clawde), falling back to
 # the user profile when LOCALAPPDATA is unavailable.
 if ([string]::IsNullOrEmpty($InstallDir)) {
     if (-not [string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
-        $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\claurst"
+        $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\clawde"
     } else {
         $InstallDir = Join-Path $env:USERPROFILE ".local\bin"
     }
@@ -88,7 +88,7 @@ function Resolve-Version {
         return ($script:Version -replace '^v', '')
     }
     try {
-        $resp = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'claurst-installer' }
+        $resp = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'clawde-installer' }
         $tag = $resp.tag_name
         if ([string]::IsNullOrEmpty($tag)) { throw "no tag_name in response" }
         return ($tag -replace '^v', '')
@@ -100,10 +100,10 @@ function Resolve-Version {
 
 # ----- Already-installed check -----
 function Check-Existing($desiredVersion) {
-    $existing = Get-Command claurst -ErrorAction SilentlyContinue
+    $existing = Get-Command clawde -ErrorAction SilentlyContinue
     if ($null -eq $existing) { return }
     try {
-        $vline = (& claurst --version) 2>&1 | Select-Object -First 1
+        $vline = (& clawde --version) 2>&1 | Select-Object -First 1
         $installed = ($vline -split '\s+')[-1]
     } catch {
         $installed = 'unknown'
@@ -113,21 +113,21 @@ function Check-Existing($desiredVersion) {
         Write-Muted "Use -Version to install a different one."
         exit 0
     }
-    Write-Muted "Found existing claurst at $($existing.Source) (v$installed) - upgrading to v$desiredVersion"
+    Write-Muted "Found existing clawde at $($existing.Source) (v$installed) - upgrading to v$desiredVersion"
 }
 
 # ----- Download & extract -----
 function Download-And-Install($desiredVersion, $arch) {
-    $archive = "claurst-windows-$arch.zip"
+    $archive = "clawde-windows-$arch.zip"
     $url = "https://github.com/$Repo/releases/download/v$desiredVersion/$archive"
-    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claurst-install-" + [System.Guid]::NewGuid().ToString('N'))
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("clawde-install-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
     $zipPath = Join-Path $tmpRoot $archive
     $extractDir = Join-Path $tmpRoot "extract"
     New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
-    Write-Info "Installing claurst v$desiredVersion (windows-$arch)"
+    Write-Info "Installing clawde v$desiredVersion (windows-$arch)"
     Write-Muted "Downloading $url"
     try {
         # Disable progress UI for a faster, less noisy download.
@@ -200,9 +200,9 @@ function Download-And-Install($desiredVersion, $arch) {
         exit 1
     }
 
-    $extractedExe = Join-Path $extractDir 'claurst.exe'
+    $extractedExe = Join-Path $extractDir 'clawde.exe'
     if (-not (Test-Path $extractedExe)) {
-        Write-Err "Archive did not contain expected binary 'claurst.exe'"
+        Write-Err "Archive did not contain expected binary 'clawde.exe'"
         Get-ChildItem -Recurse $extractDir | Format-Table FullName
         Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
         exit 1
@@ -217,14 +217,14 @@ function Install-FromBinary {
         Write-Err "Binary not found at $script:Binary"
         exit 1
     }
-    Write-Info "Installing claurst from $script:Binary"
+    Write-Info "Installing clawde from $script:Binary"
     Install-Binary $script:Binary
 }
 
 function Install-Binary($source) {
-    $target = Join-Path $InstallDir 'claurst.exe'
+    $target = Join-Path $InstallDir 'clawde.exe'
 
-    # The currently running claurst.exe (if any) holds an exclusive file lock on
+    # The currently running clawde.exe (if any) holds an exclusive file lock on
     # Windows.  Try to swap by renaming the old one first.
     if (Test-Path $target) {
         $stale = "$target.old"
@@ -259,7 +259,7 @@ function Add-ToUserPath {
     }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
 
-    # Make it visible in this session too so claurst --version works immediately.
+    # Make it visible in this session too so clawde --version works immediately.
     $env:Path = $InstallDir + ';' + $env:Path
 
     Write-Success ("Added " + $InstallDir + " to user PATH")
@@ -288,15 +288,15 @@ Add-ToUserPath
 GithubPathHint
 
 Write-Host ""
-Write-Success "claurst is installed!"
+Write-Success "clawde is installed!"
 Write-Host ""
 Write-Muted  "Quickstart:"
 Write-Muted  "  # Set an API key"
 Write-Host   "  `$env:ANTHROPIC_API_KEY = 'sk-ant-...'"
 Write-Host   ""
 Write-Muted  "  # Open a new terminal, then:"
-Write-Success "  claurst             "
+Write-Success "  clawde             "
 Write-Muted  "  # or"
-Write-Success "  claurst -p `"...`"      "
+Write-Success "  clawde -p `"...`"      "
 Write-Host   ""
 Write-Muted  "Docs: https://github.com/$Repo"

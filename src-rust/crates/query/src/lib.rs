@@ -16,55 +16,55 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
-pub mod continuation;
-pub mod goal_loop;
-pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
+pub mod continuation;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod goal_loop;
+pub mod managed_orchestrator;
 pub mod sanitize;
 pub mod session_memory;
 pub mod skill_prefetch;
 
 mod runner;
-pub use runner::*;
-pub use agent_tool::{AgentTool, init_team_swarm_runner};
-pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
+pub use agent_tool::{init_team_swarm_runner, AgentTool};
+pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
+pub use compact::{
+    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
+    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
+    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
+    group_messages_for_compact, micro_compact_if_needed, reactive_compact, resolve_context_window,
+    should_auto_compact, should_auto_compact_for_window, should_compact, should_context_collapse,
+    snip_compact, AutoCompactState, CompactResult, CompactTrigger, MessageGroup,
+    MicroCompactConfig, TokenWarningState,
+};
 pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
 pub use goal_loop::{
-    GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
-    mark_goal_complete,
+    check_and_continue_goal, decide_goal_continuation, mark_goal_complete, GoalContinuation,
+    StopReason,
 };
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
-};
+pub use runner::*;
 pub use sanitize::sanitize_history;
-pub use compact::{
-    AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
-    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
-    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
-    group_messages_for_compact, micro_compact_if_needed, reactive_compact,
-    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact,
-};
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
+pub use skill_prefetch::{
+    format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
+};
 
-use claurst_api::{
-    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
+use clawde_api::{
+    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
-use claurst_core::config::Config;
-use claurst_core::cost::CostTracker;
-use claurst_core::error::ClaudeError;
-use claurst_core::types::{ContentBlock, Message, Role, ToolResultContent, UsageInfo};
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use clawde_core::config::Config;
+use clawde_core::cost::CostTracker;
+use clawde_core::error::ClaudeError;
+use clawde_core::types::{ContentBlock, Message, Role, ToolResultContent, UsageInfo};
+use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -80,7 +80,10 @@ pub enum QueryOutcome {
     /// The model finished its turn (end_turn stop reason).
     EndTurn { message: Message, usage: UsageInfo },
     /// The model hit max_tokens.
-    MaxTokens { partial_message: Message, usage: UsageInfo },
+    MaxTokens {
+        partial_message: Message,
+        usage: UsageInfo,
+    },
     /// The conversation was cancelled by the user.
     Cancelled,
     /// An unrecoverable error occurred.
@@ -97,7 +100,7 @@ pub struct QueryConfig {
     pub max_turns: u32,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
-    pub output_style: claurst_core::system_prompt::OutputStyle,
+    pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
@@ -110,7 +113,7 @@ pub struct QueryConfig {
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
     /// level specifies one.
-    pub effort_level: Option<claurst_core::effort::EffortLevel>,
+    pub effort_level: Option<clawde_core::effort::EffortLevel>,
     /// T1-4: Optional shared command queue.
     ///
     /// When set, the query loop drains this queue before each API call and
@@ -134,16 +137,16 @@ pub struct QueryConfig {
     /// When `config.provider` is set to something other than "anthropic" and
     /// this registry contains that provider, the registry's provider is used
     /// instead of `AnthropicClient`.
-    pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    pub provider_registry: Option<std::sync::Arc<clawde_api::ProviderRegistry>>,
     /// Active agent name (e.g., "build", "plan", "explore", or None for default).
     pub agent_name: Option<String>,
     /// Resolved agent definition for the current session.
-    pub agent_definition: Option<claurst_core::AgentDefinition>,
+    pub agent_definition: Option<clawde_core::AgentDefinition>,
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
-    pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
+    pub model_registry: Option<std::sync::Arc<clawde_api::ModelRegistry>>,
     /// Managed agent (manager-executor) configuration.
-    pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
+    pub managed_agents: Option<clawde_core::ManagedAgentConfig>,
     /// Names of the tools enabled for this session (issue #233).
     ///
     /// When populated, `build_system_prompt` forwards these to
@@ -171,12 +174,12 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            model: claurst_core::constants::DEFAULT_MODEL.to_string(),
-            max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
-            max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            model: clawde_core::constants::DEFAULT_MODEL.to_string(),
+            max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
+            max_turns: clawde_core::constants::MAX_TURNS_DEFAULT,
             system_prompt: None,
             append_system_prompt: None,
-            output_style: claurst_core::system_prompt::OutputStyle::Default,
+            output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
@@ -205,10 +208,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -218,18 +218,15 @@ impl QueryConfig {
     ///
     /// Prefers the best model for the configured provider (from models.dev data)
     /// over the hardcoded defaults.
-    pub fn from_config_with_registry(cfg: &Config, registry: &claurst_api::ModelRegistry) -> Self {
+    pub fn from_config_with_registry(cfg: &Config, registry: &clawde_api::ModelRegistry) -> Self {
         // We can't move the Arc here, but we need a clone for the query loop.
         // Callers typically wrap the registry in an Arc already.
         Self {
-            model: claurst_api::effective_model_for_config(cfg, registry),
+            model: clawde_api::effective_model_for_config(cfg, registry),
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -242,11 +239,24 @@ pub enum QueryEvent {
     /// A stream event from the API.
     Stream(AnthropicStreamEvent),
     /// A tool is about to be executed.
-    ToolStart { tool_name: String, tool_id: String, input_json: String },
+    ToolStart {
+        tool_name: String,
+        tool_id: String,
+        input_json: String,
+    },
     /// A tool has finished executing.
-    ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
+    ToolEnd {
+        tool_name: String,
+        tool_id: String,
+        result: String,
+        is_error: bool,
+    },
     /// The model finished a turn.
-    TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
+    TurnComplete {
+        turn: u32,
+        stop_reason: String,
+        usage: Option<UsageInfo>,
+    },
     /// An informational status message.
     Status(String),
     /// An error.
@@ -254,7 +264,10 @@ pub enum QueryEvent {
     /// Token usage has crossed a warning threshold.
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
-    TokenWarning { state: TokenWarningState, pct_used: f64 },
+    TokenWarning {
+        state: TokenWarningState,
+        pct_used: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +305,7 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 /// text so the message history stays well-formed.
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
-// Spinner verbs are imported from claurst_core::spinner
+// Spinner verbs are imported from clawde_core::spinner
 
 /// Resolve the effective effort level for a turn.
 ///
@@ -304,14 +317,14 @@ const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user befor
 /// unchanged. Checking only the *last* user message keeps the mode scoped to the
 /// turn that asked for it (a later plain turn deactivates it automatically).
 ///
-/// [`EffortLevel::Ultracode`]: claurst_core::effort::EffortLevel::Ultracode
+/// [`EffortLevel::Ultracode`]: clawde_core::effort::EffortLevel::Ultracode
 fn effective_effort_for_turn(
-    config_effort: Option<claurst_core::effort::EffortLevel>,
+    config_effort: Option<clawde_core::effort::EffortLevel>,
     messages: &[Message],
-) -> Option<claurst_core::effort::EffortLevel> {
+) -> Option<clawde_core::effort::EffortLevel> {
     if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
-        if claurst_core::effort::text_triggers_ultracode(&last_user.get_all_text()) {
-            return Some(claurst_core::effort::EffortLevel::Ultracode);
+        if clawde_core::effort::text_triggers_ultracode(&last_user.get_all_text()) {
+            return Some(clawde_core::effort::EffortLevel::Ultracode);
         }
     }
     config_effort
@@ -332,26 +345,23 @@ fn effective_effort_for_turn(
 fn effective_output_style_for_turn(
     config: &QueryConfig,
     messages: &[Message],
-) -> (
-    claurst_core::system_prompt::OutputStyle,
-    Option<String>,
-) {
+) -> (clawde_core::system_prompt::OutputStyle, Option<String>) {
     if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
         if let Some(style_name) =
-            claurst_core::keywords::inline_persona_style(&last_user.get_all_text())
+            clawde_core::keywords::inline_persona_style(&last_user.get_all_text())
         {
             // Inline `normal` (→ "default") resets the persona for this turn.
             if style_name == "default" {
-                return (claurst_core::system_prompt::OutputStyle::Default, None);
+                return (clawde_core::system_prompt::OutputStyle::Default, None);
             }
             // Otherwise apply the named persona's prompt for this turn only.
-            let prompt = claurst_core::output_styles::find_style(
-                &claurst_core::output_styles::builtin_styles(),
+            let prompt = clawde_core::output_styles::find_style(
+                &clawde_core::output_styles::builtin_styles(),
                 style_name,
             )
             .map(|style| style.prompt.clone())
             .filter(|prompt| !prompt.trim().is_empty());
-            return (claurst_core::system_prompt::OutputStyle::Default, prompt);
+            return (clawde_core::system_prompt::OutputStyle::Default, prompt);
         }
     }
     // No inline persona keyword — keep the persistent selection.
@@ -368,7 +378,7 @@ fn effective_output_style_for_turn(
 /// appended as a plain user message between turns.  Callers that do not need
 /// command queuing may pass `None` or an empty `Vec`.
 pub async fn run_query_loop(
-    client: &claurst_api::AnthropicClient,
+    client: &clawde_api::AnthropicClient,
     messages: &mut Vec<Message>,
     tools: &[Box<dyn Tool>],
     tool_ctx: &ToolContext,
@@ -416,7 +426,8 @@ pub async fn run_query_loop(
     let mut degradation_done = false;
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
+    let effective_max_turns = config
+        .agent_definition
         .as_ref()
         .and_then(|a| a.max_turns)
         .unwrap_or(config.max_turns);
@@ -434,9 +445,9 @@ pub async fn run_query_loop(
 
     // Shadow-git snapshot: capture the worktree state before any tools run so we
     // can produce a per-turn file-change patch when the turn ends.
-    let shadow_snap: Option<std::sync::Arc<claurst_core::snapshot::ShadowSnapshot>> =
+    let shadow_snap: Option<std::sync::Arc<clawde_core::snapshot::ShadowSnapshot>> =
         if tool_ctx.config.auto_commits == Some(true) {
-            claurst_core::snapshot::get_or_create(&tool_ctx.working_dir)
+            clawde_core::snapshot::get_or_create(&tool_ctx.working_dir)
         } else {
             None
         };
@@ -650,8 +661,7 @@ pub async fn run_query_loop(
             // up; sub-agents already set it explicitly, so only fill it in when
             // the caller left it unset.
             if patched.enabled_tools.is_none() {
-                patched.enabled_tools =
-                    Some(tools.iter().map(|t| t.name().to_string()).collect());
+                patched.enabled_tools = Some(tools.iter().map(|t| t.name().to_string()).collect());
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -667,7 +677,8 @@ pub async fn run_query_loop(
             // If managed-agent mode is active, append orchestration instructions.
             if let Some(ref ma_config) = config.managed_agents {
                 if ma_config.enabled {
-                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    let ma_prompt =
+                        crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
                     patched.append_system_prompt = Some(match &patched.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
                         None => ma_prompt,
@@ -693,15 +704,19 @@ pub async fn run_query_loop(
             // from the CLI into the loop so continuation turns get it too.
             // GoalStore access here is fully synchronous (no lock held across
             // an `.await`).
-            if matches!(config.continuation, crate::continuation::ContinuationMode::Goal) {
-                if let Some(goal) = claurst_core::GoalStore::open_default()
+            if matches!(
+                config.continuation,
+                crate::continuation::ContinuationMode::Goal
+            ) {
+                if let Some(goal) = clawde_core::GoalStore::open_default()
                     .and_then(|s| s.get_active_goal(&tool_ctx.session_id))
                 {
-                    let addendum = claurst_core::goal_system_prompt_addendum(&goal);
-                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
-                        Some(existing) => format!("{}\n{}", existing, addendum),
-                        None => addendum,
-                    });
+                    let addendum = clawde_core::goal_system_prompt_addendum(&goal);
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{}\n{}", existing, addendum),
+                            None => addendum,
+                        });
                 }
             }
 
@@ -712,8 +727,8 @@ pub async fn run_query_loop(
             // The keyword also raises the effort to top reasoning (see the
             // budget / provider mapping below). Applied fresh each turn so it
             // deactivates naturally, and composes with goal mode.
-            if effective_effort_level == Some(claurst_core::effort::EffortLevel::Ultracode) {
-                let uc_addendum = claurst_core::effort::ultracode_system_prompt_addendum();
+            if effective_effort_level == Some(clawde_core::effort::EffortLevel::Ultracode) {
+                let uc_addendum = clawde_core::effort::ultracode_system_prompt_addendum();
                 patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
                     Some(existing) => format!("{}\n{}", existing, uc_addendum),
                     None => uc_addendum,
@@ -742,9 +757,9 @@ pub async fn run_query_loop(
         // Resolve effective thinking budget:
         //   1. Explicit `thinking_budget` in config takes precedence.
         //   2. Fall back to the effort level's budget when no explicit budget is set.
-        let effective_thinking_budget = config.thinking_budget.or_else(|| {
-            effective_effort_level.and_then(|el| el.thinking_budget_tokens())
-        });
+        let effective_thinking_budget = config
+            .thinking_budget
+            .or_else(|| effective_effort_level.and_then(|el| el.thinking_budget_tokens()));
 
         if let Some(budget) = effective_thinking_budget {
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
@@ -752,15 +767,16 @@ pub async fn run_query_loop(
 
         // Apply temperature: explicit config value takes precedence, then agent override,
         // then effort-level override.
-        let effective_temperature = config.temperature
+        let effective_temperature = config
+            .temperature
             .or_else(|| {
-                config.agent_definition.as_ref()
+                config
+                    .agent_definition
+                    .as_ref()
                     .and_then(|a| a.temperature)
                     .map(|t| t as f32)
             })
-            .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
-            });
+            .or_else(|| effective_effort_level.and_then(|el| el.temperature()));
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
@@ -772,7 +788,7 @@ pub async fn run_query_loop(
             let tx = tx.clone();
             Arc::new(ChannelStreamHandler { tx })
         } else {
-            Arc::new(claurst_api::streaming::NullStreamHandler)
+            Arc::new(clawde_api::streaming::NullStreamHandler)
         };
 
         // Non-Anthropic provider dispatch: if the model is "provider/model"
@@ -784,7 +800,12 @@ pub async fn run_query_loop(
         //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
         //   4. Default to "anthropic"
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
+            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx
+                .config
+                .provider
+                .as_deref()
+                .filter(|p| *p != "anthropic")
+            {
                 // Explicit non-Anthropic provider in config — use it.
                 // If the stored model is in canonical "provider/model" form,
                 // strip the top-level provider prefix before sending it to the
@@ -802,31 +823,66 @@ pub async fn run_query_loop(
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
                     // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
-                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
+                    "anthropic",
+                    "openai",
+                    "google",
+                    "azure",
+                    "amazon-bedrock",
+                    "github-copilot",
+                    "codex",
+                    "openai-codex",
+                    "cohere",
+                    "minimax",
                     // Local / self-hosted
                     "ollama",
-                    "lmstudio", "lm-studio",
-                    "llamacpp", "llama-cpp", "llama-server",
+                    "lmstudio",
+                    "lm-studio",
+                    "llamacpp",
+                    "llama-cpp",
+                    "llama-server",
                     // OpenAI-compat cloud providers
-                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
-                    "huggingface", "nvidia", "fireworks", "sambanova",
+                    "groq",
+                    "mistral",
+                    "deepseek",
+                    "xai",
+                    "perplexity",
+                    "cerebras",
+                    "openrouter",
+                    "togetherai",
+                    "together-ai",
+                    "deepinfra",
+                    "venice",
+                    "huggingface",
+                    "nvidia",
+                    "fireworks",
+                    "sambanova",
                     // Additional OpenAI-compat providers
-                    "qwen", "alibaba", "siliconflow",
-                    "moonshot", "moonshotai",
-                    "zhipu", "zhipuai",
+                    "qwen",
+                    "alibaba",
+                    "siliconflow",
+                    "moonshot",
+                    "moonshotai",
+                    "zhipu",
+                    "zhipuai",
                     "zai",
-                    "nebius", "novita", "ovhcloud", "scaleway",
-                    "vultr", "vultr-ai",
-                    "baseten", "friendli", "upstage", "stepfun",
+                    "nebius",
+                    "novita",
+                    "ovhcloud",
+                    "scaleway",
+                    "vultr",
+                    "vultr-ai",
+                    "baseten",
+                    "friendli",
+                    "upstage",
+                    "stepfun",
                 ];
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
                 } else {
                     // Treat the whole string as the model ID, fall through
                     // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    let fallback_provider =
+                        tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
                     (fallback_provider.to_string(), effective_model.clone())
                 }
             } else {
@@ -835,19 +891,20 @@ pub async fn run_query_loop(
                 // Use the shared model registry from QueryConfig if available;
                 // otherwise construct a temporary one.
                 let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
+                let model_reg: &clawde_api::ModelRegistry =
+                    if let Some(ref shared) = config.model_registry {
+                        shared
+                    } else {
+                        temp_reg = {
+                            let mut r = clawde_api::ModelRegistry::new();
+                            if let Some(cache_dir) = dirs::cache_dir() {
+                                let cache_path = cache_dir.join("claurst").join("models_dev.json");
+                                r.load_cache(&cache_path);
+                            }
+                            r
+                        };
+                        &temp_reg
                     };
-                    &temp_reg
-                };
                 if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
                     let pid_str = detected_pid.to_string();
                     if pid_str != "anthropic" {
@@ -865,18 +922,16 @@ pub async fn run_query_loop(
             // Dispatch through the provider path for non-Anthropic providers,
             // AND for Anthropic when the pre-built client has no API key
             // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
+            let use_provider_dispatch = provider_id_str != "anthropic" || client.api_key_is_empty();
 
             if use_provider_dispatch {
-                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
+                let pid = clawde_core::provider_id::ProviderId::new(&provider_id_str);
 
                 // Always prefer a fresh provider built from the auth_store so
                 // that keys added at runtime via /connect are picked up
                 // immediately — even when the provider was pre-registered at
                 // startup with a stale or missing key.
-                let runtime_provider =
-                    claurst_api::registry::runtime_provider_for(&provider_id_str);
+                let runtime_provider = clawde_api::registry::runtime_provider_for(&provider_id_str);
 
                 let registry_provider = if runtime_provider.is_some() {
                     // Fresh auth_store key available — use it instead of the
@@ -890,11 +945,13 @@ pub async fn run_query_loop(
 
                 // Rebuild providers using the unified base resolver so overrides
                 // from settings/env/defaults are applied consistently.
-                if claurst_api::registry::resolve_provider_api_base(
+                if clawde_api::registry::resolve_provider_api_base(
                     &tool_ctx.config,
                     &provider_id_str,
-                ).is_some() {
-                    if let Some(overridden) = claurst_api::registry::provider_from_config(
+                )
+                .is_some()
+                {
+                    if let Some(overridden) = clawde_api::registry::provider_from_config(
                         &tool_ctx.config,
                         &provider_id_str,
                     ) {
@@ -906,7 +963,7 @@ pub async fn run_query_loop(
 
                     // Notify TUI that we're calling the provider using a random spinner verb
                     if let Some(ref tx) = event_tx {
-                        use claurst_core::sample_spinner_verb;
+                        use clawde_core::sample_spinner_verb;
                         let seed = provider_id_str.len() ^ model_id_str.len();
                         let verb = sample_spinner_verb(seed);
                         let _ = tx.send(QueryEvent::Status(format!("✳ {}…", verb)));
@@ -918,10 +975,10 @@ pub async fn run_query_loop(
                     // with placeholder text when the provider doesn't support them,
                     // preventing crashes on text-only models.
                     let mut caps = provider.capabilities();
-                    if let Some(model_entry) = config
-                        .model_registry
-                        .as_ref()
-                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
+                    if let Some(model_entry) =
+                        config.model_registry.as_ref().and_then(|model_registry| {
+                            model_registry.get(&provider_id_str, &model_id_str)
+                        })
                     {
                         caps.image_input = model_entry.vision();
                         caps.tool_calling = model_entry.tool_calling;
@@ -930,26 +987,35 @@ pub async fn run_query_loop(
                     // Max-steps degradation (issue #230): dispatch the final
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
-                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let provider_messages: Vec<claurst_core::types::Message> = messages
+                    let provider_tools: Vec<clawde_core::types::ToolDefinition> =
+                        if caps.tool_calling && !degradation_turn {
+                            tools.iter().map(|t| t.to_definition()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                    let provider_messages: Vec<clawde_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
-                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                            if let clawde_core::types::MessageContent::Blocks(ref mut blocks) =
+                                msg.content
+                            {
                                 for block in blocks.iter_mut() {
                                     match block {
-                                        claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
-                                            *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[Image not supported by this model]".to_string(),
+                                        clawde_core::types::ContentBlock::Image { .. }
+                                            if !caps.image_input =>
+                                        {
+                                            *block = clawde_core::types::ContentBlock::Text {
+                                                text: "[Image not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
-                                        claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
-                                            *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[PDF not supported by this model]".to_string(),
+                                        clawde_core::types::ContentBlock::Document { .. }
+                                            if !caps.pdf_input =>
+                                        {
+                                            *block = clawde_core::types::ContentBlock::Text {
+                                                text: "[PDF not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
                                         _ => {}
@@ -960,7 +1026,7 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
-                    let provider_request = claurst_api::ProviderRequest {
+                    let provider_request = clawde_api::ProviderRequest {
                         model: model_id_str.to_owned(),
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
@@ -971,8 +1037,7 @@ pub async fn run_query_loop(
                         top_k: None,
                         stop_sequences: vec![],
                         thinking: if caps.thinking {
-                            effective_thinking_budget
-                                .map(claurst_api::ThinkingConfig::enabled)
+                            effective_thinking_budget.map(clawde_api::ThinkingConfig::enabled)
                         } else {
                             None
                         },
@@ -990,9 +1055,9 @@ pub async fn run_query_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(
-                                claurst_core::error::ClaudeError::Api(e.to_string())
-                            );
+                            return QueryOutcome::Error(clawde_core::error::ClaudeError::Api(
+                                e.to_string(),
+                            ));
                         }
                     };
 
@@ -1005,8 +1070,10 @@ pub async fn run_query_loop(
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
                     // ToolUse block and is echoed back next turn (#311).
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
-                        std::collections::HashMap::new();
+                    let mut tool_call_blocks: std::collections::HashMap<
+                        usize,
+                        (String, String, String, Option<String>),
+                    > = std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1049,47 +1116,47 @@ pub async fn run_query_loop(
 
                                         // Accumulate response data.
                                         match &evt {
-                                            claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
+                                            clawde_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
                                                 usage.input_tokens = u.input_tokens;
                                                 usage.cache_read_input_tokens = u.cache_read_input_tokens;
                                                 usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
                                             }
-                                            claurst_api::StreamEvent::ContentBlockStart {
+                                            clawde_api::StreamEvent::ContentBlockStart {
                                                 index,
                                                 content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
                                                 tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
                                             }
-                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
+                                            clawde_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
-                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
+                                            clawde_api::StreamEvent::ThinkingDelta { thinking, .. } => {
                                                 thinking_chunks.push(thinking.clone());
                                             }
-                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
+                                            clawde_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
                                                 thinking_chunks.push(reasoning.clone());
                                             }
-                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
+                                            clawde_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
                                                 }
                                             }
-                                            claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
+                                            clawde_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
                                                 stop_str = match stop_reason {
-                                                    Some(claurst_api::provider_types::StopReason::ToolUse) => "tool_use".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::MaxTokens) => "max_tokens".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::StopSequence) => "stop_sequence".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::ContentFiltered) => "content_filtered".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::EndTurn) => "end_turn".to_string(),
-                                                    Some(claurst_api::provider_types::StopReason::Other(s)) => s.clone(),
+                                                    Some(clawde_api::provider_types::StopReason::ToolUse) => "tool_use".to_string(),
+                                                    Some(clawde_api::provider_types::StopReason::MaxTokens) => "max_tokens".to_string(),
+                                                    Some(clawde_api::provider_types::StopReason::StopSequence) => "stop_sequence".to_string(),
+                                                    Some(clawde_api::provider_types::StopReason::ContentFiltered) => "content_filtered".to_string(),
+                                                    Some(clawde_api::provider_types::StopReason::EndTurn) => "end_turn".to_string(),
+                                                    Some(clawde_api::provider_types::StopReason::Other(s)) => s.clone(),
                                                     None => "end_turn".to_string(),
                                                 };
                                                 if let Some(u) = u {
                                                     usage.output_tokens = u.output_tokens;
                                                 }
                                             }
-                                            claurst_api::StreamEvent::MessageStop => break,
+                                            clawde_api::StreamEvent::MessageStop => break,
                                             _ => {}
                                         }
                                     }
@@ -1165,7 +1232,9 @@ pub async fn run_query_loop(
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text.clone() });
+                        content_blocks.push(ContentBlock::Text {
+                            text: combined_text.clone(),
+                        });
                     }
 
                     // Reconstruct tool-use blocks (sorted by index for determinism).
@@ -1180,7 +1249,9 @@ pub async fn run_query_loop(
                     let mut malformed_tool_calls: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
+                        if let Some((id, name, json_str, thought_signature)) =
+                            tool_call_blocks.remove(&idx)
+                        {
                             let input = match parse_tool_args(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -1196,13 +1267,18 @@ pub async fn run_query_loop(
                                     serde_json::json!({})
                                 }
                             };
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
+                            content_blocks.push(ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature,
+                            });
                         }
                     }
 
                     let mut assistant_msg = Message {
-                        role: claurst_core::types::Role::Assistant,
-                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        role: clawde_core::types::Role::Assistant,
+                        content: clawde_core::types::MessageContent::Blocks(content_blocks.clone()),
                         uuid: Some(msg_id),
                         cost: None,
                         snapshot_patch: None,
@@ -1218,13 +1294,19 @@ pub async fn run_query_loop(
                     messages.push(assistant_msg.clone());
 
                     // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = b {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let tool_use_blocks: Vec<_> = content_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } = b
+                            {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
                     // Execute tools if any tool_use blocks were returned.
                     // Note: we check the blocks themselves rather than relying
@@ -1263,13 +1345,15 @@ pub async fn run_query_loop(
                             }
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                content: clawde_core::types::ToolResultContent::Text(
+                                    result.content,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
                         messages.push(Message {
-                            role: claurst_core::types::Role::User,
-                            content: claurst_core::types::MessageContent::Blocks(tool_results),
+                            role: clawde_core::types::Role::User,
+                            content: clawde_core::types::MessageContent::Blocks(tool_results),
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
@@ -1293,14 +1377,18 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::Stream(
                                 AnthropicStreamEvent::ContentBlockDelta {
                                     index: 0,
-                                    delta: claurst_api::streaming::ContentDelta::TextDelta { text: placeholder.clone() },
+                                    delta: clawde_api::streaming::ContentDelta::TextDelta {
+                                        text: placeholder.clone(),
+                                    },
                                 },
                             ));
                         }
-                        if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
+                        if let clawde_core::types::MessageContent::Blocks(ref mut blocks) =
                             assistant_msg.content
                         {
-                            blocks.push(ContentBlock::Text { text: placeholder.clone() });
+                            blocks.push(ContentBlock::Text {
+                                text: placeholder.clone(),
+                            });
                         }
                         if let Some(last) = messages.last_mut() {
                             *last = assistant_msg.clone();
@@ -1344,12 +1432,10 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
-                    return QueryOutcome::Error(
-                        ClaudeError::Api(format!(
-                            "No API key for provider '{}' (model '{}'). {}",
-                            provider_id_str, model_id_str, hint
-                        ))
-                    );
+                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                        "No API key for provider '{}' (model '{}'). {}",
+                        provider_id_str, model_id_str, hint
+                    )));
                 }
                 // Anthropic with no auth_store key: fall through to the raw
                 // client path below (which has its own deferred key validation
@@ -1365,7 +1451,9 @@ pub async fn run_query_loop(
                 // On overloaded/rate-limit errors, attempt one switch to the fallback model.
                 let err_str = e.to_string().to_lowercase();
                 if !used_fallback
-                    && (err_str.contains("overloaded") || err_str.contains("529") || err_str.contains("rate_limit"))
+                    && (err_str.contains("overloaded")
+                        || err_str.contains("529")
+                        || err_str.contains("rate_limit"))
                 {
                     if let Some(ref fb) = config.fallback_model {
                         warn!(
@@ -1479,9 +1567,14 @@ pub async fn run_query_loop(
         // providers that emit non-standard finish reasons).
         let raw_stop = stop_reason.as_deref().unwrap_or("end_turn");
         let stop = match raw_stop {
-            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => raw_stop,
+            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => {
+                raw_stop
+            }
             _ if !assistant_msg.get_tool_use_blocks().is_empty() => {
-                warn!(stop_reason = raw_stop, "Unknown stop reason with tool_use blocks present; treating as tool_use");
+                warn!(
+                    stop_reason = raw_stop,
+                    "Unknown stop reason with tool_use blocks present; treating as tool_use"
+                );
                 "tool_use"
             }
             _ => raw_stop,
@@ -1536,18 +1629,14 @@ pub async fn run_query_loop(
         // caching the bare `input_tokens` field undercounts badly. Fall back to
         // the estimate only before the first response / when usage is absent. (#231)
         let real_usage = usage.total_input();
-        let context_tokens = compact::estimate_context_tokens(
-            messages,
-            (real_usage > 0).then_some(real_usage),
-        );
+        let context_tokens =
+            compact::estimate_context_tokens(messages, (real_usage > 0).then_some(real_usage));
 
         // Emit token warning events when approaching context limits.
         // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
         {
-            let warning_state = compact::calculate_token_warning_state_for_window(
-                context_tokens,
-                context_window,
-            );
+            let warning_state =
+                compact::calculate_token_warning_state_for_window(context_tokens, context_window);
             if warning_state != compact::TokenWarningState::Ok {
                 if let Some(ref tx) = event_tx {
                     let pct_used = context_tokens as f64 / context_window as f64;
@@ -1569,7 +1658,7 @@ pub async fn run_query_loop(
         //
         // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
         let reactive_compact_enabled =
-            claurst_core::feature_gates::is_feature_enabled("reactive_compact");
+            clawde_core::feature_gates::is_feature_enabled("reactive_compact");
 
         if reactive_compact_enabled {
             // Reactive path: emergency collapse takes priority over normal compact.
@@ -1582,8 +1671,7 @@ pub async fn run_query_loop(
                 }
                 // Pass a clone so the live conversation survives a failed
                 // compaction; `*messages` is only overwritten on success (#213).
-                let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
+                let outcome = compact::context_collapse(messages.clone(), client, config).await;
                 match apply_compact_result(messages, outcome) {
                     Ok(tokens_freed) => {
                         info!(tokens_freed, "Context-collapse complete");
@@ -1612,7 +1700,7 @@ pub async fn run_query_loop(
                         info!(tokens_freed, "Reactive compact complete");
                     }
                     // `*messages` is left untouched on both failure arms below.
-                    Err(claurst_core::error::ClaudeError::Cancelled) => {
+                    Err(clawde_core::error::ClaudeError::Cancelled) => {
                         warn!("Reactive compact was cancelled; conversation preserved");
                     }
                     Err(e) => {
@@ -1652,7 +1740,7 @@ pub async fn run_query_loop(
         // Helper closure for firing the Stop hook.
         macro_rules! fire_stop_hook {
             ($msg:expr) => {{
-                let stop_ctx = claurst_core::hooks::HookContext {
+                let stop_ctx = clawde_core::hooks::HookContext {
                     event: "Stop".to_string(),
                     tool_name: None,
                     tool_input: None,
@@ -1660,9 +1748,9 @@ pub async fn run_query_loop(
                     is_error: None,
                     session_id: Some(tool_ctx.session_id.clone()),
                 };
-                claurst_core::hooks::run_hooks(
+                clawde_core::hooks::run_hooks(
                     &tool_ctx.config.hooks,
-                    claurst_core::config::HookEvent::Stop,
+                    clawde_core::config::HookEvent::Stop,
                     &stop_ctx,
                     &tool_ctx.working_dir,
                 )
@@ -1694,12 +1782,12 @@ pub async fn run_query_loop(
                     // requiring an Arc in the existing run_query_loop signature.
                     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
                         if !api_key.is_empty() {
-                            if let Ok(sm_client) = claurst_api::AnthropicClient::new(
-                                claurst_api::client::ClientConfig {
+                            if let Ok(sm_client) =
+                                clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
                                     api_key,
                                     ..Default::default()
-                                },
-                            ) {
+                                })
+                            {
                                 let sm_client = std::sync::Arc::new(sm_client);
                                 tokio::spawn(async move {
                                     let extractor =
@@ -1744,9 +1832,9 @@ pub async fn run_query_loop(
                 // the spawn doesn't call run_query_loop recursively from within
                 // its own future (which would make the future !Send).
                 {
-                    let claurst_home = claurst_core::config::Settings::config_dir();
-                    let memory_dir = Some(claurst_home.join("memory"));
-                    let conversations_dir = Some(claurst_home.join("conversations"));
+                    let clawde_home = clawde_core::config::Settings::config_dir();
+                    let memory_dir = Some(clawde_home.join("memory"));
+                    let conversations_dir = Some(clawde_home.join("conversations"));
                     if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
                         let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
                         if let Ok(Some(task)) = dreamer.maybe_trigger().await {
@@ -1766,7 +1854,7 @@ pub async fn run_query_loop(
                             let ctx_for_dream = tool_ctx.clone();
                             tokio::spawn(async move {
                                 let agent = crate::agent_tool::AgentTool;
-                                let _result = claurst_tools::Tool::execute(
+                                let _result = clawde_tools::Tool::execute(
                                     &agent,
                                     agent_input,
                                     &ctx_for_dream,
@@ -1860,7 +1948,10 @@ pub async fn run_query_loop(
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
-                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         // Clone from the references returned by get_tool_use_blocks()
                         let id = id.clone();
                         let name = name.clone();
@@ -1875,7 +1966,7 @@ pub async fn run_query_loop(
                         }
 
                         let hooks = &tool_ctx.config.hooks;
-                        let hook_ctx = claurst_core::hooks::HookContext {
+                        let hook_ctx = clawde_core::hooks::HookContext {
                             event: "PreToolUse".to_string(),
                             tool_name: Some(name.clone()),
                             tool_input: Some(input.clone()),
@@ -1883,33 +1974,36 @@ pub async fn run_query_loop(
                             is_error: None,
                             session_id: Some(tool_ctx.session_id.clone()),
                         };
-                        let pre_outcome = claurst_core::hooks::run_hooks(
+                        let pre_outcome = clawde_core::hooks::run_hooks(
                             hooks,
-                            claurst_core::config::HookEvent::PreToolUse,
+                            clawde_core::config::HookEvent::PreToolUse,
                             &hook_ctx,
                             &tool_ctx.working_dir,
                         )
                         .await;
 
                         let plugin_pre_outcome =
-                            claurst_plugins::run_global_pre_tool_hook(&name, &input);
+                            clawde_plugins::run_global_pre_tool_hook(&name, &input);
 
-                        let blocked_result =
-                            if let claurst_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let claurst_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                None
-                            };
+                        let blocked_result = if let clawde_core::hooks::HookOutcome::Blocked(
+                            reason,
+                        ) = pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                            Some(clawde_tools::ToolResult::error(format!(
+                                "Blocked by hook: {}",
+                                reason
+                            )))
+                        } else if let clawde_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                            Some(clawde_tools::ToolResult::error(format!(
+                                "Blocked by plugin hook: {}",
+                                reason
+                            )))
+                        } else {
+                            None
+                        };
 
                         prepared.push(PreparedTool {
                             id,
@@ -1954,12 +2048,11 @@ pub async fn run_query_loop(
                 // hooks (they run external commands and would defeat the point of
                 // returning promptly) but still emit ToolEnd + build every result
                 // block so the conversation and TUI stay consistent.
-                let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len());
+                let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                 for (p, result) in prepared.iter().zip(exec_results) {
                     if !batch_cancelled {
                         let hooks = &tool_ctx.config.hooks;
-                        let post_ctx = claurst_core::hooks::HookContext {
+                        let post_ctx = clawde_core::hooks::HookContext {
                             event: "PostToolUse".to_string(),
                             tool_name: Some(p.name.clone()),
                             tool_input: Some(p.input.clone()),
@@ -1967,15 +2060,15 @@ pub async fn run_query_loop(
                             is_error: Some(result.is_error),
                             session_id: Some(tool_ctx.session_id.clone()),
                         };
-                        claurst_core::hooks::run_hooks(
+                        clawde_core::hooks::run_hooks(
                             hooks,
-                            claurst_core::config::HookEvent::PostToolUse,
+                            clawde_core::config::HookEvent::PostToolUse,
                             &post_ctx,
                             &tool_ctx.working_dir,
                         )
                         .await;
 
-                        claurst_plugins::run_global_post_tool_hook(
+                        clawde_plugins::run_global_post_tool_hook(
                             &p.name,
                             &p.input,
                             &result.content,
@@ -2028,7 +2121,10 @@ pub async fn run_query_loop(
                 continue_or_end!(assistant_msg, usage);
             }
             other => {
-                warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
+                warn!(
+                    stop_reason = other,
+                    "Unknown stop reason, treating as end_turn"
+                );
                 fire_stop_hook!(assistant_msg);
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
@@ -2069,7 +2165,7 @@ impl StreamHandler for ChannelStreamHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_api::SystemPrompt;
+    use clawde_api::SystemPrompt;
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
@@ -2078,7 +2174,7 @@ mod tests {
             max_turns: 10,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
-            output_style: claurst_core::system_prompt::OutputStyle::Default,
+            output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
@@ -2169,7 +2265,7 @@ mod tests {
                 text
             );
             assert!(
-                text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                text.contains(clawde_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
                 "Default prompt must contain the dynamic boundary marker"
             );
         } else {
@@ -2207,7 +2303,7 @@ mod tests {
             assert!(text.contains("Additional context."));
             // append_system_prompt appears after the boundary
             let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                .find(clawde_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
                 .expect("boundary must exist");
             let append_pos = text.find("Additional context.").unwrap();
             assert!(
@@ -2231,7 +2327,7 @@ mod tests {
                 "Appended text must appear in the prompt"
             );
             let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+                .find(clawde_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
                 .expect("boundary must exist");
             let append_pos = text.find("Appended text.").unwrap();
             assert!(
@@ -2275,7 +2371,7 @@ mod tests {
         let s = format!("{:?}", outcome);
         assert!(s.contains("Cancelled"));
 
-        let err_outcome = QueryOutcome::Error(claurst_core::error::ClaudeError::RateLimit);
+        let err_outcome = QueryOutcome::Error(clawde_core::error::ClaudeError::RateLimit);
         let s2 = format!("{:?}", err_outcome);
         assert!(s2.contains("Error"));
     }
@@ -2285,7 +2381,7 @@ mod tests {
         let options = build_provider_options(
             "google",
             "gemini-3-flash-preview",
-            Some(claurst_core::effort::EffortLevel::High),
+            Some(clawde_core::effort::EffortLevel::High),
             None,
         );
         assert_eq!(
@@ -2303,7 +2399,7 @@ mod tests {
         let options = build_provider_options(
             "openrouter",
             "gpt-5.4",
-            Some(claurst_core::effort::EffortLevel::Medium),
+            Some(clawde_core::effort::EffortLevel::Medium),
             None,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
@@ -2315,9 +2411,9 @@ mod tests {
     fn test_build_provider_options_codex_effort_ladder() {
         // Codex maps the lower tiers like any OpenAI reasoning model...
         for (level, expected) in [
-            (claurst_core::effort::EffortLevel::Low, "low"),
-            (claurst_core::effort::EffortLevel::Medium, "medium"),
-            (claurst_core::effort::EffortLevel::High, "high"),
+            (clawde_core::effort::EffortLevel::Low, "low"),
+            (clawde_core::effort::EffortLevel::Medium, "medium"),
+            (clawde_core::effort::EffortLevel::High, "high"),
         ] {
             let options = build_provider_options("openai-codex", "gpt-5.5", Some(level), None);
             assert_eq!(options["reasoningEffort"], serde_json::json!(expected));
@@ -2326,7 +2422,7 @@ mod tests {
         let options = build_provider_options(
             "openai-codex",
             "gpt-5.5",
-            Some(claurst_core::effort::EffortLevel::Max),
+            Some(clawde_core::effort::EffortLevel::Max),
             None,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("xhigh"));
@@ -2336,7 +2432,7 @@ mod tests {
         let other = build_provider_options(
             "openrouter",
             "gpt-5.4",
-            Some(claurst_core::effort::EffortLevel::Max),
+            Some(clawde_core::effort::EffortLevel::Max),
             None,
         );
         assert_eq!(other["reasoningEffort"], serde_json::json!("high"));
@@ -2347,7 +2443,7 @@ mod tests {
         let options = build_provider_options(
             "amazon-bedrock",
             "anthropic.claude-sonnet-4-6-v1",
-            Some(claurst_core::effort::EffortLevel::High),
+            Some(clawde_core::effort::EffortLevel::High),
             Some(10_000),
         );
         assert_eq!(
@@ -2389,8 +2485,7 @@ mod tests {
 
         // Simulate a failed reactive_compact / context_collapse (API error,
         // Cancelled, empty summary all map to Err here).
-        let outcome: Result<compact::CompactResult, ClaudeError> =
-            Err(ClaudeError::Cancelled);
+        let outcome: Result<compact::CompactResult, ClaudeError> = Err(ClaudeError::Cancelled);
         let result = apply_compact_result(&mut messages, outcome);
 
         assert!(result.is_err(), "helper must surface the compaction error");
@@ -2464,19 +2559,19 @@ mod tests {
     /// Permission handler that denies everything (returns `Ask`, which in a
     /// non-interactive context surfaces as a hard denial).
     struct DenyAllHandler;
-    impl claurst_core::permissions::PermissionHandler for DenyAllHandler {
+    impl clawde_core::permissions::PermissionHandler for DenyAllHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Ask {
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Ask {
                 reason: "denied by test handler".to_string(),
             }
         }
         fn request_permission(
             &self,
-            request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
             self.check_permission(request)
         }
     }
@@ -2491,11 +2586,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for MockTool {
-        fn name(&self) -> &str { self.name }
-        fn description(&self) -> &str { "mock tool for backstop tests" }
-        fn permission_level(&self) -> PermissionLevel { self.level }
-        fn self_gates(&self) -> bool { self.self_gates }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "mock tool for backstop tests"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            self.level
+        }
+        fn self_gates(&self) -> bool {
+            self.self_gates
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             self.ran.store(true, AtomicOrdering::SeqCst);
             ToolResult::success("mock ran")
@@ -2505,17 +2610,17 @@ mod tests {
     fn deny_all_context() -> ToolContext {
         ToolContext {
             working_dir: std::path::PathBuf::from("/workspace"),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: Arc::new(DenyAllHandler),
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "backstop-test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
-            config: claurst_core::config::Config::default(),
+            config: clawde_core::config::Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,
@@ -2709,7 +2814,7 @@ mod tests {
     /// empty (i.e. tools were disabled — the max-steps degradation turn) and
     /// replays a scripted response. Drives `run_query_loop` end-to-end.
     struct RecordingProvider {
-        id: claurst_core::provider_id::ProviderId,
+        id: clawde_core::provider_id::ProviderId,
         /// One entry per request: `true` when its tool set was empty.
         tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
         /// When true, always end the turn with text (ignores tools). Otherwise
@@ -2719,8 +2824,8 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl claurst_api::LlmProvider for RecordingProvider {
-        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+    impl clawde_api::LlmProvider for RecordingProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
             &self.id
         }
         fn name(&self) -> &str {
@@ -2729,26 +2834,26 @@ mod tests {
 
         async fn create_message(
             &self,
-            _request: claurst_api::ProviderRequest,
-        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
             unimplemented!("these tests only use create_message_stream")
         }
 
         async fn create_message_stream(
             &self,
-            request: claurst_api::ProviderRequest,
+            request: clawde_api::ProviderRequest,
         ) -> Result<
             std::pin::Pin<
                 Box<
                     dyn futures::Stream<
-                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
                         > + Send,
                 >,
             >,
-            claurst_api::ProviderError,
+            clawde_api::ProviderError,
         > {
-            use claurst_api::provider_types::StopReason;
-            use claurst_api::StreamEvent;
+            use clawde_api::provider_types::StopReason;
+            use clawde_api::StreamEvent;
 
             let tools_empty = request.tools.is_empty();
             self.tools_empty_per_request
@@ -2759,7 +2864,7 @@ mod tests {
             let msg_id = uuid::Uuid::new_v4().to_string();
             let emit_tool_use = !self.always_end_turn && !tools_empty;
 
-            let events: Vec<Result<StreamEvent, claurst_api::ProviderError>> = if emit_tool_use {
+            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if emit_tool_use {
                 let tool_id = uuid::Uuid::new_v4().to_string();
                 vec![
                     Ok(StreamEvent::MessageStart {
@@ -2810,12 +2915,12 @@ mod tests {
 
         async fn health_check(
             &self,
-        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
-            Ok(claurst_api::ProviderStatus::Healthy)
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
         }
 
-        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
-            claurst_api::ProviderCapabilities {
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
                 streaming: true,
                 tool_calling: true,
                 thinking: false,
@@ -2825,7 +2930,7 @@ mod tests {
                 video_input: false,
                 caching: false,
                 structured_output: false,
-                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
             }
         }
     }
@@ -2850,15 +2955,15 @@ mod tests {
     ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
-            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
             always_end_turn,
         });
-        let mut registry = claurst_api::ProviderRegistry::new();
+        let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
         let registry = Arc::new(registry);
 
-        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
             api_key: "test-key".to_string(),
             ..Default::default()
         })
@@ -2874,7 +2979,7 @@ mod tests {
         config.provider_registry = Some(registry);
         config.continuation = continuation;
 
-        let cost = claurst_core::cost::CostTracker::new();
+        let cost = clawde_core::cost::CostTracker::new();
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut messages = vec![Message::user("start")];
 
@@ -2974,7 +3079,7 @@ mod tests {
         use crate::goal_loop::{decide_goal_continuation, GoalContinuation, StopReason};
 
         let store =
-            claurst_core::GoalStore::open(std::path::Path::new(":memory:")).expect("open store");
+            clawde_core::GoalStore::open(std::path::Path::new(":memory:")).expect("open store");
 
         // Active goal, guards allow → continue with the goal continuation message.
         store.set_goal("live", "ship the feature", None).unwrap();
@@ -3001,26 +3106,26 @@ mod tests {
         }
         assert_eq!(
             store.get_goal("budget").unwrap().status,
-            claurst_core::GoalStatus::BudgetLimited,
+            clawde_core::GoalStatus::BudgetLimited,
             "over-budget goal must be persisted as budget-limited"
         );
 
         // Runaway guard tripped → paused outcome (same as the cross-turn design).
         store.set_goal("runaway", "endless", None).unwrap();
-        for _ in 0..claurst_core::MAX_GOAL_TURNS {
+        for _ in 0..clawde_core::MAX_GOAL_TURNS {
             store.record_turn("runaway", 0).unwrap();
         }
         match decide_goal_continuation(&store, "runaway", 0, 1) {
             GoalContinuation::Stop {
                 reason: StopReason::RunawayGuard { turns_used },
             } => {
-                assert_eq!(turns_used, claurst_core::MAX_GOAL_TURNS);
+                assert_eq!(turns_used, clawde_core::MAX_GOAL_TURNS);
             }
             _ => panic!("a runaway goal must pause"),
         }
         assert_eq!(
             store.get_goal("runaway").unwrap().status,
-            claurst_core::GoalStatus::Paused,
+            clawde_core::GoalStatus::Paused,
             "runaway goal must be persisted as paused"
         );
     }
@@ -3029,7 +3134,7 @@ mod tests {
 
     #[test]
     fn ultracode_keyword_raises_effort_to_ultracode() {
-        use claurst_core::effort::EffortLevel;
+        use clawde_core::effort::EffortLevel;
         let msgs = vec![Message::user("please ultracode this refactor")];
         // Even with no configured effort, the keyword forces Ultracode.
         assert_eq!(
@@ -3045,7 +3150,7 @@ mod tests {
 
     #[test]
     fn no_keyword_keeps_configured_effort() {
-        use claurst_core::effort::EffortLevel;
+        use clawde_core::effort::EffortLevel;
         let msgs = vec![Message::user("please refactor this module")];
         assert_eq!(effective_effort_for_turn(None, &msgs), None);
         assert_eq!(
@@ -3068,7 +3173,7 @@ mod tests {
 
     #[test]
     fn ultracode_addendum_flows_into_built_system_prompt() {
-        use claurst_core::effort::EffortLevel;
+        use clawde_core::effort::EffortLevel;
         // Mirrors the loop wiring: when the effective effort is Ultracode the
         // procedure addendum is threaded through `append_system_prompt` into the
         // assembled system prompt.
@@ -3077,13 +3182,13 @@ mod tests {
             effective_effort_for_turn(None, &msgs),
             Some(EffortLevel::Ultracode)
         );
-        let addendum = claurst_core::effort::ultracode_system_prompt_addendum();
-        let opts = claurst_core::system_prompt::SystemPromptOptions {
+        let addendum = clawde_core::effort::ultracode_system_prompt_addendum();
+        let opts = clawde_core::system_prompt::SystemPromptOptions {
             append_system_prompt: Some(addendum),
             skip_env_info: true,
             ..Default::default()
         };
-        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let prompt = clawde_core::system_prompt::build_system_prompt(&opts);
         assert!(prompt.contains("Ultracode Mode"));
         assert!(prompt.contains("TeamCreate"));
 
@@ -3092,8 +3197,8 @@ mod tests {
             effective_effort_for_turn(None, &[Message::user("hi there")]),
             None
         );
-        let plain = claurst_core::system_prompt::build_system_prompt(
-            &claurst_core::system_prompt::SystemPromptOptions {
+        let plain = clawde_core::system_prompt::build_system_prompt(
+            &clawde_core::system_prompt::SystemPromptOptions {
                 skip_env_info: true,
                 ..Default::default()
             },
@@ -3130,7 +3235,10 @@ mod tests {
             Message::user("now just tidy the docs"),
         ];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
-        assert!(prompt.is_none(), "persona should not persist to a plain turn");
+        assert!(
+            prompt.is_none(),
+            "persona should not persist to a plain turn"
+        );
     }
 
     #[test]
@@ -3156,7 +3264,7 @@ mod tests {
         let msgs = vec![Message::user("back to normal for this one please")];
         let (style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.is_none(), "inline normal should reset the persona");
-        assert_eq!(style, claurst_core::system_prompt::OutputStyle::Default);
+        assert_eq!(style, clawde_core::system_prompt::OutputStyle::Default);
     }
 
     #[test]
@@ -3165,7 +3273,7 @@ mod tests {
         // transiently.
         let cfg = QueryConfig {
             output_style_prompt: Some(
-                claurst_core::output_styles::OutputStyleDef::builtin_caveman().prompt,
+                clawde_core::output_styles::OutputStyleDef::builtin_caveman().prompt,
             ),
             ..QueryConfig::default()
         };

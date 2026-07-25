@@ -1,15 +1,15 @@
 # Plugins
 
-Claurst's plugin system lets you extend the agent with additional slash commands, agents, skills, MCP servers, LSP servers, and lifecycle hooks — all packaged in a single directory.
+Clawde's plugin system lets you extend the agent with additional slash commands, agents, skills, MCP servers, LSP servers, and lifecycle hooks — all packaged in a single directory.
 
 ---
 
 ## Plugin Discovery
 
-Plugins are loaded from the `~/.claurst/plugins/` directory. Each subdirectory that contains a valid `plugin.toml` or `plugin.json` manifest is treated as a plugin.
+Plugins are loaded from the `~/.clawde/plugins/` directory. Each subdirectory that contains a valid `plugin.toml` or `plugin.json` manifest is treated as a plugin.
 
 ```
-~/.claurst/plugins/
+~/.clawde/plugins/
 ├── my-plugin/
 │   ├── plugin.toml          <- manifest
 │   ├── commands/            <- *.md slash command definitions
@@ -291,7 +291,7 @@ Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` 
     {
       "hooks": [
         {
-          "command": "notify-send 'Claurst finished'",
+          "command": "notify-send 'Clawde finished'",
           "blocking": false
         }
       ]
@@ -321,7 +321,7 @@ Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` 
 }
 ```
 
-When a blocking hook exits non-zero, Claurst denies the operation and reports the hook's stderr as the reason.
+When a blocking hook exits non-zero, Clawde denies the operation and reports the hook's stderr as the reason.
 
 **Environment variables available to hook processes:**
 
@@ -357,13 +357,13 @@ After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugi
 /reload-plugins
 ```
 
-Rescans `~/.claurst/plugins/`, re-reads all manifests, and refreshes the active hook registry, commands, agents, skills, and MCP server definitions. Use this after making changes to a plugin directory or after installing a new plugin.
+Rescans `~/.clawde/plugins/`, re-reads all manifests, and refreshes the active hook registry, commands, agents, skills, and MCP server definitions. Use this after making changes to a plugin directory or after installing a new plugin.
 
 ---
 
 ## Plugin Marketplace Integration
 
-Plugins published to the Claurst marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace integration allows:
+Plugins published to the Clawde marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace integration allows:
 
 - Browsing available plugins
 - Installing plugins by ID
@@ -380,7 +380,7 @@ Locally installed plugins (via a file path) do not require a `marketplace_id`.
 ## Example: A Complete Plugin
 
 ```toml
-# ~/.claurst/plugins/code-quality/plugin.toml
+# ~/.clawde/plugins/code-quality/plugin.toml
 
 name        = "code-quality"
 version     = "0.3.1"
@@ -401,7 +401,7 @@ default     = false
 ```
 
 ```json
-// ~/.claurst/plugins/code-quality/hooks/hooks.json
+// ~/.clawde/plugins/code-quality/hooks/hooks.json
 {
   "description": "Lint and format on file edits",
   "hooks": {
