@@ -229,7 +229,106 @@ struct CommandContext {
 
 ---
 
-### 5. `query` (3,300 lines) — Agent Orchestration
+## Arg Completion System
+
+The arg completion system provides inline typeahead for slash command arguments —
+type `/effort ` (with space) and see available options with availability highlighting,
+arrow-key navigation, and Enter-to-select.
+
+### Architecture
+
+```
+User types /<cmd> <partial> in prompt
+           │
+           ▼
+PromptInputState::update_suggestions()
+  │  calls compute_slash_suggestions()
+  │  which detects space → delegates to arg_completions_fn
+           │
+           ▼
+App::arg_completions: Option<Arc<dyn Fn + Send + Sync>>
+  │  (set by cli/src/main.rs to avoid circular dep)
+           │
+           ▼
+clawde_commands::get_arg_completions(cmd_name, partial)
+  │  uses OnceLock-cached all_commands() list
+  │  finds command → calls cmd.arg_completions(partial)
+  │  filters by partial prefix (case-insensitive)
+           │
+           ▼
+Vec<ArgCompletion> → Vec<TypeaheadSuggestion>
+  │  text: "/cmd val", arg_value: Some("val")
+  │  faded: !available (dimmed, unselectable)
+           │
+           ▼
+render_prompt_suggestions() in render.rs
+  │  TypeaheadSource::ArgCompletion: uses arg_value
+  │  faded items: DarkGray + DIM
+```
+
+### Key Types
+
+| Type | Location | Purpose |
+|------|----------|---------|
+| `ArgCompletion` | `commands/src/lib.rs` | `{ value, description, available }` — argument option |
+| `arg_completions(partial)` | `SlashCommand` trait | Default: empty vec. Override per-command |
+| `get_arg_completions(cmd, partial)` | `commands/src/lib.rs` | Public helper with `OnceLock` caching + filtering |
+| `TypeaheadSuggestion` | `tui/src/prompt_input.rs` | `{ text, description, source, faded, arg_value }` — renderable suggestion |
+| `TypeaheadSource::ArgCompletion` | `tui/src/prompt_input.rs` | Variant for argument-level suggestions |
+| `App::arg_completions` | `tui/src/app.rs` | `Option<Arc<dyn Fn + Send + Sync>>` — closure bridge from CLI layer |
+
+### Commands with Arg Completions
+
+| Command | Completions | Source File |
+|---------|-------------|-------------|
+| `/effort` | none, minimal, low, medium, high, xhigh, max, ultracode | `session_tools.rs` |
+| `/auto-compact` | on, off | `lib.rs` |
+| `/theme` | default, dark, light, catppuccin | `appearance.rs` |
+| `/output-style` | (dynamic — from disk, OnceLock-cached) | `appearance.rs` |
+| `/diff` | --stat, --staged | `lib.rs` |
+| `/agent` | (built-in visible agents, OnceLock-cached) | `providers.rs` |
+| `/model` | (~4500 model IDs from bundled snapshot, OnceLock-cached) | `lib.rs` |
+| `/managed-agents` | status, presets, preset, setup, configure, enable, disable, reset, budget | `managed_agents.rs` |
+
+### Circular Dependency Resolution
+
+The TUI crate (`clawde-tui`) defines `TypeaheadSuggestion` but the commands crate
+(`clawde-commands`) defines `ArgCompletion`. The commands crate already depends on
+the TUI crate (for `HelpEntry`), so the TUI crate cannot import from commands.
+
+**Solution:** The `App` struct holds `arg_completions: Option<Arc<dyn Fn(...) + Send + Sync>>`
+which is set from `cli/src/main.rs` at startup. The CLI layer imports both crates,
+converts `ArgCompletion` → `TypeaheadSuggestion`, and sets the closure on the app.
+
+### Adding Arg Completions to a Command
+
+1. Override `arg_completions(&self, partial: &str)` in the `SlashCommand` impl
+2. Return a `Vec<ArgCompletion>` with `value` (the argument text), `description`,
+   and `available` (set false for options not available in current context)
+3. For dynamic lists (models, styles, agents): use `OnceLock` to cache the first
+   computation. The filtering by user-typed prefix happens automatically in
+   `get_arg_completions()`
+4. Add unit tests in the test module covering: empty partial, filtering, case
+   insensitivity, and completeness (all expected completions present)
+
+### Rendering
+
+In `tui/src/render.rs` (`render_prompt_suggestions`), `TypeaheadSource::ArgCompletion`:
+- **Label**: Uses `suggestion.arg_value.as_deref().unwrap_or(&suggestion.text)`
+  (previously a fragile `split_whitespace().nth(1)` hack)
+- **Dimmed**: Faded items (`available: false`) get `Color::DarkGray + Modifier::DIM`
+  and cannot be selected via arrow keys
+- **Description**: Shown beside the label in the remaining space
+
+### Selection
+
+In `tui/src/prompt_input.rs` (`accept_suggestion`), when the source is `ArgCompletion`:
+- The entire `suggestion.text` replaces the prompt input (e.g. `/effort medium`)
+- Faded items are silently ignored (arrow keys skip over them)
+
+---
+
+### 4. `commands` (2,500 lines) — Slash Commands (continued)
 
 **File:** `src-rust/crates/query/src/lib.rs` + 12 modules + `runner/` subdirectory
 

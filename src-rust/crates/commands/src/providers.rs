@@ -13,14 +13,18 @@ pub struct AgentCommand;
 
 #[async_trait]
 impl SlashCommand for ProvidersCommand {
-    fn name(&self) -> &str { "providers" }
-    fn description(&self) -> &str { "List available AI providers and their status" }
+    fn name(&self) -> &str {
+        "providers"
+    }
+    fn description(&self) -> &str {
+        "List available AI providers and their status"
+    }
     fn help(&self) -> &str {
         "Usage: /providers\n\nList all providers registered in the model registry with their\nmodel counts, context windows, and pricing information."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let all = registry.list_all();
 
         if all.is_empty() {
@@ -44,15 +48,23 @@ impl SlashCommand for ProvidersCommand {
         let mut lines = vec!["Available providers:\n".to_string()];
         for provider in &provider_keys {
             let models = &by_provider[provider];
-            lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
-                if models.len() == 1 { "" } else { "s" }));
+            lines.push(format!(
+                "\n{} ({} model{})",
+                provider.to_uppercase(),
+                models.len(),
+                if models.len() == 1 { "" } else { "s" }
+            ));
             for m in models.iter().take(3) {
                 let cost_str = match (m.cost_input, m.cost_output) {
                     (Some(i), Some(o)) => format!("${:.2}/${:.2} per 1M", i, o),
                     _ => "free/local".to_string(),
                 };
-                lines.push(format!("  {} — {}K ctx, {}",
-                    m.info.id, m.info.context_window / 1000, cost_str));
+                lines.push(format!(
+                    "  {} — {}K ctx, {}",
+                    m.info.id,
+                    m.info.context_window / 1000,
+                    cost_str
+                ));
             }
             if models.len() > 3 {
                 lines.push(format!("  ... and {} more", models.len() - 3));
@@ -67,8 +79,12 @@ impl SlashCommand for ProvidersCommand {
 
 #[async_trait]
 impl SlashCommand for ConnectCommand {
-    fn name(&self) -> &str { "connect" }
-    fn description(&self) -> &str { "Connect an AI provider" }
+    fn name(&self) -> &str {
+        "connect"
+    }
+    fn description(&self) -> &str {
+        "Connect an AI provider"
+    }
     fn help(&self) -> &str {
         "Usage: /connect\n\nOpens the interactive provider picker dialog.\nSelect a provider to see setup instructions."
     }
@@ -83,8 +99,31 @@ impl SlashCommand for ConnectCommand {
 
 #[async_trait]
 impl SlashCommand for AgentCommand {
-    fn name(&self) -> &str { "agent" }
-    fn description(&self) -> &str { "List available agents or get info about a specific agent" }
+    fn name(&self) -> &str {
+        "agent"
+    }
+    fn description(&self) -> &str {
+        "List available agents or get info about a specific agent"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        use std::sync::OnceLock;
+        static AGENTS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+        let agents = AGENTS.get_or_init(|| {
+            clawde_core::default_agents()
+                .into_iter()
+                .filter(|(_, d)| d.visible)
+                .map(|(name, def)| (name, def.description.unwrap_or_default()))
+                .collect()
+        });
+        agents
+            .iter()
+            .map(|(name, desc)| ArgCompletion {
+                value: name.clone(),
+                description: desc.clone(),
+                available: true,
+            })
+            .collect()
+    }
     fn help(&self) -> &str {
         "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\nTo use an agent, start Claurst with: --agent <name>"
     }
@@ -93,8 +132,8 @@ impl SlashCommand for AgentCommand {
         use std::collections::HashMap;
 
         // Merge built-in defaults with user-defined agents (user wins on collision).
-        let mut all_agents: HashMap<String, claurst_core::AgentDefinition> =
-            claurst_core::default_agents();
+        let mut all_agents: HashMap<String, clawde_core::AgentDefinition> =
+            clawde_core::default_agents();
         all_agents.extend(ctx.config.agents.clone());
 
         let agent_name = args.trim();
@@ -142,9 +181,7 @@ impl SlashCommand for AgentCommand {
             if let Some(ref prompt) = def.prompt {
                 output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
             }
-            output.push_str(&format!(
-                "\nTo activate: claurst --agent {}", agent_name
-            ));
+            output.push_str(&format!("\nTo activate: claurst --agent {}", agent_name));
             CommandResult::Message(output)
         } else {
             CommandResult::Error(format!(

@@ -11,8 +11,20 @@ pub struct PermissionsCommand;
 
 #[async_trait]
 impl SlashCommand for PermissionsCommand {
-    fn name(&self) -> &str { "permissions" }
-    fn description(&self) -> &str { "View or change tool permission settings" }
+    fn name(&self) -> &str {
+        "permissions"
+    }
+    fn description(&self) -> &str {
+        "View or change tool permission settings"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "set".into(), description: "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(), available: true },
+            ArgCompletion { value: "allow".into(), description: "Allow a specific tool".into(), available: true },
+            ArgCompletion { value: "deny".into(), description: "Deny a specific tool".into(), available: true },
+            ArgCompletion { value: "reset".into(), description: "Clear all permission overrides".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset]\n\n\
          Modes: default, accept-edits, bypass-permissions, plan\n\n\
@@ -47,9 +59,7 @@ impl SlashCommand for PermissionsCommand {
                  Use /permissions set <mode> to change the permission mode.\n\
                  Use /permissions allow|deny <tool> to override individual tools.\n\
                  Use /permissions reset to clear all overrides.",
-                ctx.config.permission_mode,
-                allowed_display,
-                denied_display,
+                ctx.config.permission_mode, allowed_display, denied_display,
             ));
         }
 
@@ -60,17 +70,25 @@ impl SlashCommand for PermissionsCommand {
         match sub {
             "set" => {
                 let mode = match arg.to_lowercase().as_str() {
-                    "default" => claurst_core::config::PermissionMode::Default,
-                    "accept-edits" | "accept_edits" => claurst_core::config::PermissionMode::AcceptEdits,
-                    "bypass-permissions" | "bypass_permissions" => claurst_core::config::PermissionMode::BypassPermissions,
-                    "plan" => claurst_core::config::PermissionMode::Plan,
-                    _ => return CommandResult::Error(
-                        "Mode must be: default, accept-edits, bypass-permissions, or plan".to_string()
-                    ),
+                    "default" => clawde_core::config::PermissionMode::Default,
+                    "accept-edits" | "accept_edits" => {
+                        clawde_core::config::PermissionMode::AcceptEdits
+                    }
+                    "bypass-permissions" | "bypass_permissions" => {
+                        clawde_core::config::PermissionMode::BypassPermissions
+                    }
+                    "plan" => clawde_core::config::PermissionMode::Plan,
+                    _ => {
+                        return CommandResult::Error(
+                            "Mode must be: default, accept-edits, bypass-permissions, or plan"
+                                .to_string(),
+                        )
+                    }
                 };
                 let mut new_config = ctx.config.clone();
                 new_config.permission_mode = mode.clone();
-                if let Err(e) = save_settings_mutation(|s| s.config.permission_mode = mode.clone()) {
+                if let Err(e) = save_settings_mutation(|s| s.config.permission_mode = mode.clone())
+                {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
                 CommandResult::ConfigChangeMessage(
@@ -122,11 +140,11 @@ impl SlashCommand for PermissionsCommand {
                 let mut new_config = ctx.config.clone();
                 new_config.allowed_tools.clear();
                 new_config.disallowed_tools.clear();
-                new_config.permission_mode = claurst_core::config::PermissionMode::Default;
+                new_config.permission_mode = clawde_core::config::PermissionMode::Default;
                 if let Err(e) = save_settings_mutation(|s| {
                     s.config.allowed_tools.clear();
                     s.config.disallowed_tools.clear();
-                    s.config.permission_mode = claurst_core::config::PermissionMode::Default;
+                    s.config.permission_mode = clawde_core::config::PermissionMode::Default;
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }

@@ -109,6 +109,20 @@ pub enum CommandResult {
     },
 }
 
+/// A single argument completion for a slash command's inline typeahead.
+///
+/// Returned by [`SlashCommand::arg_completions`] so the prompt input can
+/// offer a dropdown of valid arguments as the user types.
+#[derive(Debug, Clone)]
+pub struct ArgCompletion {
+    /// The argument value (e.g. `"low"`, `"on"`, `"dark"`).
+    pub value: String,
+    /// Human-readable description (e.g. `"Quick, straightforward implementation"`).
+    pub description: String,
+    /// Whether this option is currently available (false → dimmed / disabled).
+    pub available: bool,
+}
+
 /// Every slash command implements this trait.
 #[async_trait]
 pub trait SlashCommand: Send + Sync {
@@ -127,6 +141,17 @@ pub trait SlashCommand: Send + Sync {
     /// Whether this command is visible in /help output.
     fn hidden(&self) -> bool {
         false
+    }
+    /// Return argument completions for inline typeahead after the command name.
+    ///
+    /// Called when the user has typed the full command name followed by a space
+    /// and (optionally) a partial argument.  The returned completions are shown
+    /// in the typeahead popup; any whose [`ArgCompletion::available`] is `false`
+    /// are rendered dimmed and cannot be selected.
+    ///
+    /// The default implementation returns an empty list (no arg completions).
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![]
     }
     /// Execute the command with the given arguments string.
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult;
@@ -445,10 +470,18 @@ fn current_output_style_name(config: &Config) -> &str {
 }
 
 fn available_output_style_names() -> Vec<String> {
-    clawde_core::output_styles::all_styles(&Settings::config_dir())
-        .into_iter()
-        .map(|style| style.name)
-        .collect()
+    // Cache the disk read per process lifetime — called on every keystroke
+    // while the user types /output-style arguments.
+    use std::sync::OnceLock;
+    static STYLES: OnceLock<Vec<String>> = OnceLock::new();
+    STYLES
+        .get_or_init(|| {
+            clawde_core::output_styles::all_styles(&Settings::config_dir())
+                .into_iter()
+                .map(|style| style.name)
+                .collect()
+        })
+        .clone()
 }
 
 fn split_command_args(args: &str) -> Vec<String> {
@@ -1027,6 +1060,45 @@ impl SlashCommand for ModelCommand {
     fn description(&self) -> &str {
         "Show or change the current model"
     }
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        // Cache model IDs from the bundled models.dev snapshot.
+        // The OnceLock builds the vec once per process lifetime (deduped),
+        // then each keystroke only clones the entries matching the typed
+        // prefix — not the full list.
+        use std::collections::HashSet;
+        use std::sync::OnceLock;
+        static MODELS: OnceLock<Vec<ArgCompletion>> = OnceLock::new();
+        let models = MODELS.get_or_init(|| {
+            let registry = clawde_api::ModelRegistry::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut completions: Vec<ArgCompletion> = Vec::new();
+            for m in registry.list_all() {
+                let id = m.info.id.to_string();
+                // Deduplicate: same model ID can appear from multiple
+                // providers (e.g. gpt-4o via both OpenAI and Azure).
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                completions.push(ArgCompletion {
+                    value: id,
+                    description: format!(
+                        "{} ({}K ctx)",
+                        m.info.name,
+                        m.info.context_window / 1000
+                    ),
+                    available: true,
+                });
+            }
+            completions.sort_by(|a, b| a.value.cmp(&b.value));
+            completions
+        });
+        let partial_lower = partial.to_lowercase();
+        models
+            .iter()
+            .filter(|ac| ac.value.to_lowercase().starts_with(&partial_lower))
+            .cloned()
+            .collect()
+    }
     fn help(&self) -> &str {
         "Usage: /model [<model-id>]\n\n\
          Without arguments, shows the current model.\n\n\
@@ -1225,6 +1297,12 @@ impl SlashCommand for DiffCommand {
     }
     fn description(&self) -> &str {
         "Show git diff of changes in the working directory"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "--stat".into(), description: "Summary of changed files".into(), available: true },
+            ArgCompletion { value: "--staged".into(), description: "Diff of staged changes".into(), available: true },
+        ]
     }
     fn help(&self) -> &str {
         "Usage: /diff [--stat|--staged|<ref>]\n\n\
@@ -1439,6 +1517,12 @@ impl SlashCommand for AutoCompactCommand {
     }
     fn description(&self) -> &str {
         "Toggle automatic context compaction on/off"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "on".into(), description: "Enable automatic compaction".into(), available: true },
+            ArgCompletion { value: "off".into(), description: "Disable automatic compaction".into(), available: true },
+        ]
     }
     fn help(&self) -> &str {
         "Usage: /auto-compact [on|off]\n\n\
@@ -1715,6 +1799,42 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     all_commands()
         .into_iter()
         .find(|c| c.name() == name || c.aliases().contains(&name))
+}
+
+/// Get argument completions for a registered slash command.
+///
+/// `cmd_name` is the command name without the leading `/`.
+/// `partial` is the text after the command name and space (may be empty).
+///
+/// Returns completions whose `value` case-insensitively starts with `partial`.
+///
+/// Uses a `OnceLock`-cached command list so the full `all_commands()` vec is
+/// only allocated once per process lifetime, not on every keystroke.
+///
+/// **Filtering note:** This function always applies a prefix filter after
+/// calling [`SlashCommand::arg_completions`].  Commands that pre-filter for
+/// performance (like `/model`) will see a redundant but harmless second pass
+/// — a no-op on already-filtered results.  The cost is negligible
+/// (typically O(1–20) entries) and keeping the filter here means every
+/// command benefits from it without needing to implement it themselves.
+pub fn get_arg_completions(cmd_name: &str, partial: &str) -> Vec<ArgCompletion> {
+    use std::sync::OnceLock;
+    static CMDS: OnceLock<Vec<Box<dyn SlashCommand>>> = OnceLock::new();
+    let cmds = CMDS.get_or_init(|| all_commands());
+
+    let cmd = match cmds
+        .iter()
+        .find(|c| c.name() == cmd_name || c.aliases().contains(&cmd_name))
+    {
+        Some(c) => c,
+        None => return vec![],
+    };
+    let completions = cmd.arg_completions(partial);
+    let partial_lower = partial.to_lowercase();
+    completions
+        .into_iter()
+        .filter(|ac| ac.value.to_lowercase().starts_with(&partial_lower))
+        .collect()
 }
 
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
@@ -2806,3 +2926,99 @@ mod tests {
         }
     }
 }
+    // ---- arg_completions system tests ----------------------------------
+
+    #[test]
+    fn get_arg_completions_filters_case_insensitive() {
+        let completions = crate::get_arg_completions("effort", "m");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"medium"), "should match 'medium'");
+        assert!(values.contains(&"minimal"), "should match 'minimal'");
+        assert!(values.contains(&"max"), "should match 'max'");
+        assert!(!values.contains(&"low"), "should not match 'low'");
+        assert!(!values.contains(&"high"), "should not match 'high'");
+    }
+
+    #[test]
+    fn get_arg_completions_empty_partial_returns_all() {
+        let completions = crate::get_arg_completions("effort", "");
+        assert_eq!(completions.len(), 8, "should return all 8 levels");
+    }
+
+    #[test]
+    fn get_arg_completions_unknown_command_returns_empty() {
+        let completions = crate::get_arg_completions("nonexistent", "x");
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn get_arg_completions_exact_match() {
+        let completions = crate::get_arg_completions("effort", "high");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].value, "high");
+    }
+
+    #[test]
+    fn get_arg_completions_no_match_returns_empty() {
+        let completions = crate::get_arg_completions("effort", "zzz");
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn auto_compact_completions_on_off() {
+        let completions = crate::get_arg_completions("auto-compact", "");
+        assert_eq!(completions.len(), 2);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"on"));
+        assert!(values.contains(&"off"));
+    }
+
+    #[test]
+    fn theme_completions_all_four() {
+        let completions = crate::get_arg_completions("theme", "");
+        assert_eq!(completions.len(), 4);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"default"));
+        assert!(values.contains(&"dark"));
+        assert!(values.contains(&"light"));
+        assert!(values.contains(&"catppuccin"));
+    }
+
+    #[test]
+    fn diff_completions_flags() {
+        let completions = crate::get_arg_completions("diff", "");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--stat"));
+        assert!(values.contains(&"--staged"));
+    }
+
+    #[test]
+    fn get_arg_completions_cmd_name_is_case_sensitive() {
+        // find_command is case-sensitive but get_arg_completions uses it directly.
+        // Commands are always lowercase, so this tests the normal path.
+        let completions = crate::get_arg_completions("EFFORT", "HIGH");
+        // "EFFORT" won't match "effort" in find_command's case-sensitive comparison
+        assert!(completions.is_empty(), "EFFORT != effort in case-sensitive find_command");
+    }
+
+    #[test]
+    fn arg_completions_all_available_by_default() {
+        let completions = crate::get_arg_completions("effort", "");
+        for c in &completions {
+            assert!(c.available, "{} should be available by default", c.value);
+        }
+    }
+
+    #[test]
+    fn once_lock_caches_command_list() {
+        // Call twice — the second call reuses the cached list.
+        let first = crate::get_arg_completions("effort", "");
+        let second = crate::get_arg_completions("effort", "");
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.value, b.value);
+        }
+
+}
+
+

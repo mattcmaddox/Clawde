@@ -3163,6 +3163,40 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
             }
+            TypeaheadSource::ArgCompletion => {
+                let value = suggestion
+                    .arg_value
+                    .as_deref()
+                    .unwrap_or(&suggestion.text);
+                let display_name = truncate_text(value, label_width);
+                let label_style = if suggestion.faded {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
+                } else {
+                    label_style
+                };
+                spans.push(Span::styled(
+                    format!("{display_name:<width$}", width = label_width),
+                    label_style,
+                ));
+                if !suggestion.description.is_empty() {
+                    let desc_style = if suggestion.faded {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        detail_style
+                    };
+                    spans.push(Span::styled(
+                        truncate_text(
+                            &suggestion.description,
+                            area.width.saturating_sub(label_width as u16 + 10) as usize,
+                        ),
+                        desc_style,
+                    ));
+                }
+            }
             TypeaheadSource::FileRef => {
                 spans.push(Span::styled("+ ", accent_style));
                 spans.push(Span::styled(

@@ -2,7 +2,7 @@
 //
 // Extracted from lib.rs (issue #232). Behavior-preserving move.
 
-use super::{CommandContext, CommandResult, SlashCommand};
+use super::{ArgCompletion, CommandContext, CommandResult, SlashCommand};
 use async_trait::async_trait;
 
 pub struct GoalCommand;
@@ -15,7 +15,8 @@ fn parse_token_budget(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k'))
+    {
         (n, 1_000u64)
     } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
         (n, 1_000_000u64)
@@ -27,8 +28,21 @@ fn parse_token_budget(s: &str) -> Option<u64> {
 
 #[async_trait]
 impl SlashCommand for GoalCommand {
-    fn name(&self) -> &str { "goal" }
-    fn description(&self) -> &str { "Set or manage a durable long-running goal for autonomous work" }
+    fn name(&self) -> &str {
+        "goal"
+    }
+    fn description(&self) -> &str {
+        "Set or manage a durable long-running goal for autonomous work"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "status".into(), description: "Show current goal status".into(), available: true },
+            ArgCompletion { value: "pause".into(), description: "Pause the active goal".into(), available: true },
+            ArgCompletion { value: "resume".into(), description: "Resume a paused goal".into(), available: true },
+            ArgCompletion { value: "clear".into(), description: "Delete the current goal".into(), available: true },
+            ArgCompletion { value: "complete".into(), description: "Request a completion audit".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage:\n\
          /goal <objective>              — set a new goal and begin working autonomously\n\
@@ -48,9 +62,10 @@ impl SlashCommand for GoalCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        if !claurst_core::goals_enabled() {
+        if !clawde_core::goals_enabled() {
             return CommandResult::Message(
-                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable.".to_string(),
+                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable."
+                    .to_string(),
             );
         }
 
@@ -67,20 +82,22 @@ impl SlashCommand for GoalCommand {
                 };
                 match store.get_goal(session_id) {
                     None => return CommandResult::Message("No active goal.".to_string()),
-                    Some(g) if g.status == claurst_core::GoalStatus::Complete => {
+                    Some(g) if g.status == clawde_core::GoalStatus::Complete => {
                         return CommandResult::Message("Goal is already complete.".to_string());
                     }
-                    Some(g) if g.status == claurst_core::GoalStatus::Paused => {
+                    Some(g) if g.status == clawde_core::GoalStatus::Paused => {
                         return CommandResult::Message(
                             "Goal is already paused. Use /goal resume to continue.".to_string(),
                         );
                     }
                     _ => {}
                 }
-                if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Paused) {
+                if let Err(e) = store.set_status(session_id, clawde_core::GoalStatus::Paused) {
                     return CommandResult::Error(format!("Failed to pause goal: {}", e));
                 }
-                return CommandResult::Message("Goal paused. Use /goal resume to continue.".to_string());
+                return CommandResult::Message(
+                    "Goal paused. Use /goal resume to continue.".to_string(),
+                );
             }
             "resume" => {
                 let store = match open_goal_store() {
@@ -89,20 +106,22 @@ impl SlashCommand for GoalCommand {
                 };
                 match store.get_goal(session_id) {
                     None => return CommandResult::Message("No goal to resume.".to_string()),
-                    Some(g) if g.status == claurst_core::GoalStatus::Active => {
+                    Some(g) if g.status == clawde_core::GoalStatus::Active => {
                         return CommandResult::Message("Goal is already active.".to_string());
                     }
-                    Some(g) if g.status == claurst_core::GoalStatus::Complete => {
+                    Some(g) if g.status == clawde_core::GoalStatus::Complete => {
                         return CommandResult::Message(
                             "Goal is complete. Use /goal <objective> to set a new one.".to_string(),
                         );
                     }
                     _ => {}
                 }
-                if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Active) {
+                if let Err(e) = store.set_status(session_id, clawde_core::GoalStatus::Active) {
                     return CommandResult::Error(format!("Failed to resume goal: {}", e));
                 }
-                return CommandResult::Message("Goal resumed. Claurst will continue on the next message.".to_string());
+                return CommandResult::Message(
+                    "Goal resumed. Claurst will continue on the next message.".to_string(),
+                );
             }
             "clear" => {
                 let store = match open_goal_store() {
@@ -171,25 +190,22 @@ impl SlashCommand for GoalCommand {
         };
 
         match store.set_goal(session_id, objective, token_budget) {
-            Err(claurst_core::GoalError::ObjectiveTooLong { len, max }) => {
-                CommandResult::Error(format!(
-                    "Objective too long ({} chars). Max {} chars.",
-                    len, max
-                ))
-            }
+            Err(clawde_core::GoalError::ObjectiveTooLong { len, max }) => CommandResult::Error(
+                format!("Objective too long ({} chars). Max {} chars.", len, max),
+            ),
             Err(e) => CommandResult::Error(format!("Failed to set goal: {}", e)),
             Ok(goal) => {
                 // Return UserMessage so the query loop fires immediately and the
                 // model begins working toward the goal without user needing to
                 // send another message.
-                CommandResult::UserMessage(claurst_core::goal_kickoff_message(&goal))
+                CommandResult::UserMessage(clawde_core::goal_kickoff_message(&goal))
             }
         }
     }
 }
 
-fn open_goal_store() -> Option<claurst_core::GoalStore> {
-    claurst_core::GoalStore::open_default()
+fn open_goal_store() -> Option<clawde_core::GoalStore> {
+    clawde_core::GoalStore::open_default()
 }
 
 fn goal_status(session_id: &str) -> CommandResult {
@@ -198,9 +214,9 @@ fn goal_status(session_id: &str) -> CommandResult {
         None => return CommandResult::Error("Could not open goal store.".to_string()),
     };
     match store.get_goal(session_id) {
-        None => CommandResult::Message(
-            "No active goal. Set one with:\n  /goal <objective>".to_string(),
-        ),
+        None => {
+            CommandResult::Message("No active goal. Set one with:\n  /goal <objective>".to_string())
+        }
         Some(g) => {
             let budget_line = g
                 .budget_display()

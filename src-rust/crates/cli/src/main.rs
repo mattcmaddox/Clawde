@@ -1936,6 +1936,21 @@ async fn run_interactive(
         app.effort_level = level;
     }
     app.provider_registry = base_query_config.provider_registry.clone();
+    // Wire argument-level slash-command completions from the commands crate.
+    app.arg_completions = Some(std::sync::Arc::new(
+        |cmd_name: &str, partial: &str| -> Vec<clawde_tui::prompt_input::TypeaheadSuggestion> {
+            clawde_commands::get_arg_completions(cmd_name, partial)
+                .into_iter()
+                .map(|ac| clawde_tui::prompt_input::TypeaheadSuggestion {
+                    text: format!("/{} {}", cmd_name, ac.value),
+                    description: ac.description,
+                    source: clawde_tui::prompt_input::TypeaheadSource::ArgCompletion,
+                    faded: !ac.available,
+                    arg_value: Some(ac.value),
+                })
+                .collect()
+        },
+    ));
     app.refresh_context_window_size();
     app.auto_compact_enabled = live_config.auto_compact;
 

@@ -15,11 +15,11 @@ pub struct ExportCommand;
 /// Assistant messages render as `## Assistant\n<text>` followed by
 /// `### Tool: <name>\n**Input:** …\n**Output:** …` for each tool call pair.
 fn export_message_to_markdown(
-    msg: &claurst_core::types::Message,
-    all_messages: &[claurst_core::types::Message],
+    msg: &clawde_core::types::Message,
+    all_messages: &[clawde_core::types::Message],
     msg_idx: usize,
 ) -> String {
-    use claurst_core::types::{ContentBlock, MessageContent, Role, ToolResultContent};
+    use clawde_core::types::{ContentBlock, MessageContent, Role, ToolResultContent};
 
     let role_label = match msg.role {
         Role::User => "User",
@@ -43,7 +43,9 @@ fn export_message_to_markdown(
                     ContentBlock::Text { text } => {
                         text_parts.push(text.as_str());
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         tool_uses.push((id.as_str(), name.as_str(), input));
                     }
                     ContentBlock::Thinking { thinking, .. } => {
@@ -73,7 +75,12 @@ fn export_message_to_markdown(
                 'search: for next_msg in all_messages.iter().skip(msg_idx + 1) {
                     if let MessageContent::Blocks(next_blocks) = &next_msg.content {
                         for nb in next_blocks {
-                            if let ContentBlock::ToolResult { tool_use_id, content, is_error } = nb {
+                            if let ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } = nb
+                            {
                                 if tool_use_id.as_str() == *tool_id {
                                     let text = match content {
                                         ToolResultContent::Text(t) => t.clone(),
@@ -89,17 +96,27 @@ fn export_message_to_markdown(
                                             .collect::<Vec<_>>()
                                             .join(""),
                                     };
-                                    let label = if is_error.unwrap_or(false) { "Error" } else { "Output" };
-                                    found_output = Some(format!("**{}:** `{}`\n",
+                                    let label = if is_error.unwrap_or(false) {
+                                        "Error"
+                                    } else {
+                                        "Output"
+                                    };
+                                    found_output = Some(format!(
+                                        "**{}:** `{}`\n",
                                         label,
-                                        text.lines().next().unwrap_or(&text).trim()));
+                                        text.lines().next().unwrap_or(&text).trim()
+                                    ));
                                     break 'search;
                                 }
                             }
                         }
                     }
                 }
-                out.push_str(found_output.as_deref().unwrap_or("**Output:** *(pending)*\n"));
+                out.push_str(
+                    found_output
+                        .as_deref()
+                        .unwrap_or("**Output:** *(pending)*\n"),
+                );
             }
         }
     }
@@ -113,7 +130,10 @@ fn build_markdown_export(ctx: &CommandContext) -> String {
     out.push_str("# Conversation Export\n\n");
     out.push_str(&format!("- **Session ID:** {}\n", ctx.session_id));
     out.push_str(&format!("- **Model:** {}\n", ctx.config.effective_model()));
-    out.push_str(&format!("- **Exported:** {}\n", chrono::Utc::now().to_rfc3339()));
+    out.push_str(&format!(
+        "- **Exported:** {}\n",
+        chrono::Utc::now().to_rfc3339()
+    ));
     if let Some(ref title) = ctx.session_title {
         out.push_str(&format!("- **Title:** {}\n", title));
     }
@@ -148,8 +168,18 @@ fn build_json_export(ctx: &CommandContext) -> serde_json::Value {
 
 #[async_trait]
 impl SlashCommand for ExportCommand {
-    fn name(&self) -> &str { "export" }
-    fn description(&self) -> &str { "Export conversation to markdown or JSON" }
+    fn name(&self) -> &str {
+        "export"
+    }
+    fn description(&self) -> &str {
+        "Export conversation to markdown or JSON"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "--format".into(), description: "Set output format (markdown or json)".into(), available: true },
+            ArgCompletion { value: "--output".into(), description: "Write to file path".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /export [--format markdown|json] [--output <file>]\n\n\
          Export the current conversation.\n\n\
@@ -181,7 +211,7 @@ impl SlashCommand for ExportCommand {
                         i += 2;
                     } else {
                         return CommandResult::Error(
-                            "--format requires a value: markdown or json".to_string()
+                            "--format requires a value: markdown or json".to_string(),
                         );
                     }
                 }
@@ -190,9 +220,7 @@ impl SlashCommand for ExportCommand {
                         output_path = Some(tokens[i + 1].to_string());
                         i += 2;
                     } else {
-                        return CommandResult::Error(
-                            "--output requires a file path".to_string()
-                        );
+                        return CommandResult::Error("--output requires a file path".to_string());
                     }
                 }
                 other if !other.starts_with('-') => {
@@ -214,7 +242,8 @@ impl SlashCommand for ExportCommand {
             Some("json") => "json",
             Some(other) => {
                 return CommandResult::Error(format!(
-                    "Unknown format '{}'. Use 'markdown' or 'json'.", other
+                    "Unknown format '{}'. Use 'markdown' or 'json'.",
+                    other
                 ));
             }
             None => {
@@ -251,7 +280,11 @@ impl SlashCommand for ExportCommand {
                     format!(
                         "{}.{}",
                         filename,
-                        if resolved_format == "markdown" { "md" } else { "json" }
+                        if resolved_format == "markdown" {
+                            "md"
+                        } else {
+                            "json"
+                        }
                     )
                 } else {
                     filename.to_string()
@@ -270,9 +303,9 @@ impl SlashCommand for ExportCommand {
                         ctx.messages.len(),
                         resolved_format,
                     )),
-                    Err(e) => CommandResult::Error(format!(
-                        "Failed to write {}: {}", path.display(), e
-                    )),
+                    Err(e) => {
+                        CommandResult::Error(format!("Failed to write {}: {}", path.display(), e))
+                    }
                 }
             }
             None => {
