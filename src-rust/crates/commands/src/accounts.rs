@@ -405,3 +405,299 @@ impl SlashCommand for RefreshCommand {
         CommandResult::RefreshProviderState
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Panic-safe guard: sets `CLAWDE_HOME` to a temp dir with an optional
+    /// test registry, and restores the original env var on drop (even during
+    /// unwinding from a panic).
+    struct TestAccounts {
+        _tmp: tempfile::TempDir,
+        prev_clawde_home: Option<std::ffi::OsString>,
+    }
+
+    impl TestAccounts {
+        /// Seed a registry with 2 Anthropic profiles + 1 Codex profile,
+        /// marking "work" as the active Anthropic account and "gpt" as the
+        /// active Codex account.
+        fn seeded() -> Self {
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+
+            let registry = clawde_core::accounts::AccountRegistry {
+                version: 1,
+                providers: {
+                    let mut pm = std::collections::BTreeMap::new();
+
+                    let mut anthropic =
+                        clawde_core::accounts::ProviderAccounts::default();
+                    anthropic.active = Some("work".to_string());
+                    anthropic.profiles.insert(
+                        "work".to_string(),
+                        clawde_core::accounts::AccountProfile {
+                            id: "work".into(),
+                            email: Some("me@work.com".into()),
+                            ..Default::default()
+                        },
+                    );
+                    anthropic.profiles.insert(
+                        "pro".to_string(),
+                        clawde_core::accounts::AccountProfile {
+                            id: "pro".into(),
+                            email: Some("me@pro.com".into()),
+                            ..Default::default()
+                        },
+                    );
+                    pm.insert(
+                        clawde_core::accounts::PROVIDER_ANTHROPIC
+                            .to_string(),
+                        anthropic,
+                    );
+
+                    let mut codex =
+                        clawde_core::accounts::ProviderAccounts::default();
+                    codex.active = Some("gpt".to_string());
+                    codex.profiles.insert(
+                        "gpt".to_string(),
+                        clawde_core::accounts::AccountProfile {
+                            id: "gpt".into(),
+                            email: Some("me@openai.com".into()),
+                            ..Default::default()
+                        },
+                    );
+                    pm.insert(
+                        clawde_core::accounts::PROVIDER_CODEX
+                            .to_string(),
+                        codex,
+                    );
+                    pm
+                },
+            };
+            registry.save().unwrap();
+
+            TestAccounts {
+                _tmp: tmp,
+                prev_clawde_home: prev,
+            }
+        }
+
+        /// Point CLAWDE_HOME at a temp dir with NO accounts.json (empty
+        /// registry).
+        fn empty() -> Self {
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            TestAccounts {
+                _tmp: tmp,
+                prev_clawde_home: prev,
+            }
+        }
+    }
+
+    impl Drop for TestAccounts {
+        fn drop(&mut self) {
+            match &self.prev_clawde_home {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn login_arg_completions_empty_returns_flags() {
+        let _env = TestAccounts::seeded();
+        let cmd = LoginCommand;
+        let completions = cmd.arg_completions("");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--console"));
+        assert!(values.contains(&"--codex"));
+        assert!(values.contains(&"--label"));
+        assert_eq!(completions.len(), 3, "expected exactly 3 flags");
+    }
+
+    #[test]
+    fn login_arg_completions_label_returns_profile_ids() {
+        let _env = TestAccounts::seeded();
+        let cmd = LoginCommand;
+        let completions = cmd.arg_completions("--label");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        // Should include all three profiles, prefixed with --label
+        assert!(values.contains(&"--label work"));
+        assert!(values.contains(&"--label pro"));
+        assert!(values.contains(&"--label gpt"));
+        // Should NOT include bare flags
+        assert!(!values.contains(&"--console"));
+        assert!(!values.contains(&"--codex"));
+    }
+
+    #[test]
+    fn login_arg_completions_label_filters_by_prefix() {
+        let _env = TestAccounts::seeded();
+        let cmd = LoginCommand;
+        let completions = cmd.arg_completions("--label wo");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        // Should only match "work" (starts with "wo")
+        assert!(values.contains(&"--label work"), "expected --label work to match");
+        assert!(!values.contains(&"--label pro"), "pro should not match 'wo'");
+        assert!(!values.contains(&"--label gpt"), "gpt should not match 'wo'");
+    }
+
+    #[test]
+    fn login_arg_completions_label_no_profiles_returns_empty() {
+        let _env = TestAccounts::empty();
+        let cmd = LoginCommand;
+        let completions = cmd.arg_completions("--label");
+        assert!(
+            completions.is_empty(),
+            "expected no completions when no profiles exist"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // /switch arg completions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn switch_arg_completions_empty_returns_flag_and_profiles() {
+        let _env = TestAccounts::seeded();
+        let cmd = SwitchCommand;
+        let completions = cmd.arg_completions("");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"), "should offer --codex flag");
+        assert!(values.contains(&"work"), "should list Anthropic profiles");
+        assert!(values.contains(&"pro"), "should list both Anthropic profiles");
+        assert!(!values.contains(&"gpt"), "should NOT list Codex profiles");
+        assert_eq!(completions.len(), 3, "expected --codex + 2 Anthropic profiles");
+    }
+
+    #[test]
+    fn switch_arg_completions_prefix_filters_anthropic_profiles() {
+        let _env = TestAccounts::seeded();
+        let cmd = SwitchCommand;
+        // arg_completions returns all possible items; the prefix filter is
+        // applied by get_arg_completions.  Here we just verify the method
+        // returns Anthropic profiles (unfiltered) alongside the --codex flag.
+        let completions = cmd.arg_completions("wo");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        // The method returns --codex + all Anthropic profiles; prefix
+        // filtering happens at the get_arg_completions layer.
+        assert!(values.contains(&"--codex"), "raw arg_completions always includes flag");
+        assert!(values.contains(&"work"), "raw results include all Anthropic profiles");
+        assert!(values.contains(&"pro"), "raw results include all Anthropic profiles");
+        assert!(values.len() >= 3, "expected at least 3 items (flag + 2 profiles)");
+    }
+
+    #[test]
+    fn switch_arg_completions_codex_returns_codex_profiles() {
+        let _env = TestAccounts::seeded();
+        let cmd = SwitchCommand;
+        let completions = cmd.arg_completions("--codex");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex gpt"), "should return prefixed Codex profile");
+        assert!(!values.contains(&"--codex"), "should NOT return bare --codex flag");
+        assert!(!values.contains(&"work"), "should NOT return Anthropic profiles");
+        assert_eq!(completions.len(), 1, "expected exactly 1 Codex profile");
+    }
+
+    #[test]
+    fn switch_arg_completions_codex_prefix_filters() {
+        let _env = TestAccounts::seeded();
+        let cmd = SwitchCommand;
+        let completions = cmd.arg_completions("--codex g");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex gpt"), "'g' should match 'gpt'");
+        assert_eq!(completions.len(), 1, "expected only --codex gpt");
+    }
+
+    #[test]
+    fn switch_arg_completions_empty_registry_returns_only_flag() {
+        let _env = TestAccounts::empty();
+        let cmd = SwitchCommand;
+        let completions = cmd.arg_completions("");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"), "flag always offered");
+        assert_eq!(completions.len(), 1, "only --codex when no profiles exist");
+    }
+
+    // -----------------------------------------------------------------------
+    // /logout arg completions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn logout_arg_completions_empty_returns_flags_and_active_hint() {
+        let _env = TestAccounts::seeded();
+        let cmd = LogoutCommand;
+        let completions = cmd.arg_completions("");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"), "should offer --codex flag");
+        assert!(values.contains(&"--all"), "should offer --all flag");
+        assert!(values.contains(&"work"), "should show active Anthropic profile");
+        // The active hint should be dimmed (not selectable)
+        let work_hint = completions.iter().find(|c| c.value == "work").unwrap();
+        assert!(!work_hint.available, "active hint should be dimmed");
+        assert!(!values.contains(&"gpt"), "should NOT show active Codex profile");
+        assert_eq!(completions.len(), 3, "expected 2 flags + 1 active hint");
+    }
+
+    #[test]
+    fn logout_arg_completions_codex_shows_active_codex_hint() {
+        let _env = TestAccounts::seeded();
+        let cmd = LogoutCommand;
+        let completions = cmd.arg_completions("--codex");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"), "should offer --codex flag");
+        assert!(values.contains(&"--all"), "should offer --all flag");
+        assert!(values.contains(&"gpt"), "should show active Codex profile");
+        let gpt_hint = completions.iter().find(|c| c.value == "gpt").unwrap();
+        assert!(!gpt_hint.available, "Codex hint should be dimmed");
+        assert!(!values.contains(&"work"), "should NOT show Anthropic profile");
+        // 2 flags + 1 codex hint = 3. (--all stays because arg_completions adds
+        // it unconditionally; get_arg_completions would filter it out.)
+        assert_eq!(completions.len(), 3, "expected 2 flags + 1 codex hint");
+    }
+
+    #[test]
+    fn logout_arg_completions_all_lists_profiles() {
+        let _env = TestAccounts::seeded();
+        let cmd = LogoutCommand;
+        let completions = cmd.arg_completions("--all");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"), "should offer --codex flag");
+        assert!(values.contains(&"--all"), "should offer --all flag");
+        // All three profiles should be listed as dimmed informational items
+        assert!(values.contains(&"work"), "should list Anthropic 'work'");
+        assert!(values.contains(&"pro"), "should list Anthropic 'pro'");
+        assert!(values.contains(&"gpt"), "should list Codex 'gpt'");
+        // Check --all-listed profiles are all dimmed
+        // (work may appear twice: once from active hint, once from --all listing)
+        for profile in ["pro", "gpt"] {
+            let hint = completions.iter().find(|c| c.value == profile).unwrap();
+            assert!(!hint.available, "{} profile should be dimmed", profile);
+        }
+        // work should appear at least once and be dimmed
+        let work_hints: Vec<&ArgCompletion> =
+            completions.iter().filter(|c| c.value == "work").collect();
+        assert!(!work_hints.is_empty(), "work should appear at least once");
+        for h in &work_hints {
+            assert!(!h.available, "all work hints should be dimmed");
+        }
+    }
+
+    #[test]
+    fn logout_arg_completions_empty_without_profiles() {
+        let _env = TestAccounts::empty();
+        let cmd = LogoutCommand;
+        let completions = cmd.arg_completions("");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"--codex"));
+        assert!(values.contains(&"--all"));
+        assert_eq!(completions.len(), 2, "flags only when no active profile");
+    }
+}
