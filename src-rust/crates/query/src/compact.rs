@@ -2364,4 +2364,146 @@ mod tests {
             + 1;
         assert_eq!(listed, MAX_MANIFEST_FILES);
     }
+
+    // ---- Query-loop gate: mock provider + gate verification ------------------
+
+    /// Mock [`LlmProvider`] that records whether `create_message` was called.
+    ///
+    /// Used to verify that the query-loop gate (`tool_ctx.config.auto_compact`)
+    /// correctly prevents the provider from being invoked when auto-compact is
+    /// disabled or threshold is not met.
+    struct GateMockProvider {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    impl GateMockProvider {
+        fn new() -> Self {
+            Self {
+                called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn was_called(&self) -> bool {
+            self.called.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for GateMockProvider {
+        fn id(&self) -> &clawde_core::ProviderId {
+            static ID: std::sync::LazyLock<clawde_core::ProviderId> =
+                std::sync::LazyLock::new(|| clawde_core::ProviderId::new("mock"));
+            &*ID
+        }
+
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            self.called.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(clawde_api::ProviderError::ServerError {
+                provider: clawde_core::ProviderId::new("mock"),
+                status: Some(500),
+                message: "mock: compaction intentionally blocked".into(),
+                is_retryable: false,
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>>
+                        + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            unimplemented!("mock does not support streaming")
+        }
+
+        async fn health_check(&self) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: false,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// When the circuit breaker is open (`state.disabled == true`), the gate must
+    /// skip the provider call entirely — mirroring the `tool_ctx.config.auto_compact`
+    /// guard in `run_query_loop`.
+    #[tokio::test]
+    async fn gate_skips_provider_when_state_disabled() {
+        let provider = GateMockProvider::new();
+        let messages: Vec<Message> = vec![];
+        let mut state = AutoCompactState {
+            disabled: true,
+            ..Default::default()
+        };
+
+        // 95% of a 200k window = 190k — above the 90% threshold.
+        let result = auto_compact_if_needed(&provider, &messages, 190_000, "test-model", 200_000, &mut state).await;
+
+        assert!(result.is_none(), "gate must return None when disabled");
+        assert!(!provider.was_called(), "provider must NOT be called when gate is disabled");
+    }
+
+    /// When auto-compact is enabled but the token count is below the 90% threshold,
+    /// the gate must also skip the provider call.
+    #[tokio::test]
+    async fn gate_skips_provider_when_below_threshold() {
+        let provider = GateMockProvider::new();
+        let messages: Vec<Message> = vec![];
+        let mut state = AutoCompactState::default();
+
+        // 50% of a 200k window = 100k — below the 90% threshold.
+        let result = auto_compact_if_needed(&provider, &messages, 100_000, "test-model", 200_000, &mut state).await;
+
+        assert!(result.is_none(), "gate must return None when below threshold");
+        assert!(!provider.was_called(), "provider must NOT be called below threshold");
+    }
+
+    /// When auto-compact is enabled AND the threshold is met (first compaction,
+    /// no debounce history), the provider IS invoked.
+    #[tokio::test]
+    async fn gate_invokes_provider_when_enabled_and_above_threshold() {
+        let provider = GateMockProvider::new();
+        // Use filler() to create large messages that exceed KEEP_RECENT_TOKENS
+        // so compact_conversation doesn't short-circuit with "everything fits".
+        let big = filler(20_000);
+        let messages: Vec<Message> = vec![
+            Message::user(big.clone()),
+            Message::assistant(big.clone()),
+            Message::user(big),
+        ];
+        let mut state = AutoCompactState::default();
+        state.turns_since_last_compact = 10; // bypass turn-gap debounce
+
+        // 95% — above threshold. First compaction has no debounce history.
+        let result = auto_compact_if_needed(&provider, &messages, 190_000, "test-model", 200_000, &mut state).await;
+
+        // The mock provider returns an error, so auto_compact_if_needed returns None.
+        assert!(result.is_none(), "compaction yields None on provider error");
+        assert!(provider.was_called(), "provider WAS called — gate allowed compaction to proceed");
+        assert_eq!(state.consecutive_failures, 1, "provider error increments failure count");
+    }
 }
