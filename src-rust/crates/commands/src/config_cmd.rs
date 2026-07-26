@@ -11,9 +11,41 @@ pub struct ConfigCommand;
 
 #[async_trait]
 impl SlashCommand for ConfigCommand {
-    fn name(&self) -> &str { "config" }
-    fn aliases(&self) -> Vec<&str> { vec!["settings"] }
-    fn description(&self) -> &str { "Show or modify configuration settings" }
+    fn name(&self) -> &str {
+        "config"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["settings"]
+    }
+    fn description(&self) -> &str {
+        "Show or modify configuration settings"
+    }
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut completions = vec![
+            ArgCompletion { value: "show".into(), description: "Show current configuration".into(), available: true },
+            ArgCompletion { value: "get".into(), description: "Get a config key value".into(), available: true },
+            ArgCompletion { value: "set".into(), description: "Set a config key".into(), available: true },
+            ArgCompletion { value: "unset".into(), description: "Unset a config key (revert to default)".into(), available: true },
+        ];
+        // Second-level: /config set <key>, /config get <key>, /config unset <key>
+        if partial == "set" || partial.starts_with("set ") {
+            completions.push(ArgCompletion { value: "set theme".into(), description: "Set the UI theme (default, dark, light)".into(), available: true });
+            completions.push(ArgCompletion { value: "set output-style".into(), description: "Set the output style".into(), available: true });
+            completions.push(ArgCompletion { value: "set model".into(), description: "Set the active model".into(), available: true });
+            completions.push(ArgCompletion { value: "set permission-mode".into(), description: "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(), available: true });
+        }
+        if partial == "get" || partial.starts_with("get ") {
+            completions.push(ArgCompletion { value: "get theme".into(), description: "Show current theme".into(), available: true });
+            completions.push(ArgCompletion { value: "get output-style".into(), description: "Show current output style".into(), available: true });
+            completions.push(ArgCompletion { value: "get model".into(), description: "Show current model".into(), available: true });
+            completions.push(ArgCompletion { value: "get permission-mode".into(), description: "Show current permission mode".into(), available: true });
+        }
+        if partial == "unset" || partial.starts_with("unset ") {
+            completions.push(ArgCompletion { value: "unset model".into(), description: "Reset model to default".into(), available: true });
+            completions.push(ArgCompletion { value: "unset output-style".into(), description: "Reset output style to default".into(), available: true });
+        }
+        completions
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
@@ -32,10 +64,9 @@ impl SlashCommand for ConfigCommand {
                     "output-style = {}",
                     current_output_style_name(&ctx.config)
                 )),
-                "model" => CommandResult::Message(format!(
-                    "model = {}",
-                    ctx.config.effective_model()
-                )),
+                "model" => {
+                    CommandResult::Message(format!("model = {}", ctx.config.effective_model()))
+                }
                 "permission-mode" | "permission_mode" => CommandResult::Message(format!(
                     "permission-mode = {:?}",
                     ctx.config.permission_mode
@@ -49,7 +80,8 @@ impl SlashCommand for ConfigCommand {
                 "model" => {
                     let mut new_config = ctx.config.clone();
                     new_config.model = None;
-                    if let Err(err) = save_settings_mutation(|settings| settings.config.model = None)
+                    if let Err(err) =
+                        save_settings_mutation(|settings| settings.config.model = None)
                     {
                         return CommandResult::Error(format!(
                             "Failed to save configuration: {}",
@@ -120,8 +152,7 @@ impl SlashCommand for ConfigCommand {
                 }
 
                 let mut new_config = ctx.config.clone();
-                new_config.output_style =
-                    (normalized != "default").then(|| normalized.clone());
+                new_config.output_style = (normalized != "default").then(|| normalized.clone());
                 if let Err(err) = save_settings_mutation(|settings| {
                     settings.config.output_style =
                         (normalized != "default").then(|| normalized.clone());
@@ -154,21 +185,18 @@ impl SlashCommand for ConfigCommand {
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
-                CommandResult::ConfigChangeMessage(
-                    new_config,
-                    format!("Model set to {}.", value),
-                )
+                CommandResult::ConfigChangeMessage(new_config, format!("Model set to {}.", value))
             }
             "permission-mode" | "permission_mode" => {
                 let mode = match value.trim().to_lowercase().as_str() {
-                    "default" => claurst_core::config::PermissionMode::Default,
+                    "default" => clawde_core::config::PermissionMode::Default,
                     "accept-edits" | "accept_edits" => {
-                        claurst_core::config::PermissionMode::AcceptEdits
+                        clawde_core::config::PermissionMode::AcceptEdits
                     }
                     "bypass-permissions" | "bypass_permissions" => {
-                        claurst_core::config::PermissionMode::BypassPermissions
+                        clawde_core::config::PermissionMode::BypassPermissions
                     }
-                    "plan" => claurst_core::config::PermissionMode::Plan,
+                    "plan" => clawde_core::config::PermissionMode::Plan,
                     _ => {
                         return CommandResult::Error(
                             "Permission mode must be one of: default, accept-edits, bypass-permissions, plan"

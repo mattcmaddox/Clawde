@@ -15,8 +15,26 @@ pub struct PrivacySettingsCommand;
 
 #[async_trait]
 impl SlashCommand for ColorCommand {
-    fn name(&self) -> &str { "color" }
-    fn description(&self) -> &str { "Set or show the prompt bar color for this session" }
+    fn name(&self) -> &str {
+        "color"
+    }
+    fn description(&self) -> &str {
+        "Set or show the prompt bar color for this session"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "default".into(), description: "Reset to default color".into(), available: true },
+            ArgCompletion { value: "red".into(), description: "Red prompt bar".into(), available: true },
+            ArgCompletion { value: "green".into(), description: "Green prompt bar".into(), available: true },
+            ArgCompletion { value: "blue".into(), description: "Blue prompt bar".into(), available: true },
+            ArgCompletion { value: "yellow".into(), description: "Yellow prompt bar".into(), available: true },
+            ArgCompletion { value: "cyan".into(), description: "Cyan prompt bar".into(), available: true },
+            ArgCompletion { value: "magenta".into(), description: "Magenta prompt bar".into(), available: true },
+            ArgCompletion { value: "white".into(), description: "White prompt bar".into(), available: true },
+            ArgCompletion { value: "orange".into(), description: "Orange prompt bar".into(), available: true },
+            ArgCompletion { value: "purple".into(), description: "Purple prompt bar".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /color [<name|#RRGGBB|default>]\n\n\
          Sets the accent color for the prompt bar in this session.\n\
@@ -43,10 +61,11 @@ impl SlashCommand for ColorCommand {
             None
         } else {
             let known_colors = [
-                "red", "green", "blue", "yellow", "cyan", "magenta",
-                "white", "orange", "purple", "pink", "gray", "grey",
+                "red", "green", "blue", "yellow", "cyan", "magenta", "white", "orange", "purple",
+                "pink", "gray", "grey",
             ];
-            let is_hex = color.starts_with('#') && (color.len() == 4 || color.len() == 7)
+            let is_hex = color.starts_with('#')
+                && (color.len() == 4 || color.len() == 7)
                 && color[1..].chars().all(|c| c.is_ascii_hexdigit());
             if !is_hex && !known_colors.contains(&color.to_lowercase().as_str()) {
                 return CommandResult::Error(format!(
@@ -72,8 +91,20 @@ impl SlashCommand for ColorCommand {
 
 #[async_trait]
 impl SlashCommand for ThemeCommand {
-    fn name(&self) -> &str { "theme" }
-    fn description(&self) -> &str { "Show or change the current theme" }
+    fn name(&self) -> &str {
+        "theme"
+    }
+    fn description(&self) -> &str {
+        "Show or change the current theme"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
+        vec![
+            super::ArgCompletion { value: "default".into(), description: "System terminal default".into(), available: true },
+            super::ArgCompletion { value: "dark".into(), description: "Dark color scheme".into(), available: true },
+            super::ArgCompletion { value: "light".into(), description: "Light color scheme".into(), available: true },
+            super::ArgCompletion { value: "catppuccin".into(), description: "Catppuccin Mocha theme".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /theme [default|dark|light]\n\
          Without arguments, shows the active theme. With an argument, updates the theme for this and future sessions."
@@ -89,15 +120,12 @@ impl SlashCommand for ThemeCommand {
         }
 
         let Some(theme) = parse_theme(args) else {
-            return CommandResult::Error(
-                "Theme must be one of: default, dark, light".to_string(),
-            );
+            return CommandResult::Error("Theme must be one of: default, dark, light".to_string());
         };
 
         let mut new_config = ctx.config.clone();
         new_config.theme = theme.clone();
-        if let Err(err) = save_settings_mutation(|settings| settings.config.theme = theme.clone())
-        {
+        if let Err(err) = save_settings_mutation(|settings| settings.config.theme = theme.clone()) {
             return CommandResult::Error(format!("Failed to save theme: {}", err));
         }
 
@@ -112,8 +140,22 @@ impl SlashCommand for ThemeCommand {
 
 #[async_trait]
 impl SlashCommand for OutputStyleCommand {
-    fn name(&self) -> &str { "output-style" }
-    fn description(&self) -> &str { "Show or switch the current output style" }
+    fn name(&self) -> &str {
+        "output-style"
+    }
+    fn description(&self) -> &str {
+        "Show or switch the current output style"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
+        available_output_style_names()
+            .into_iter()
+            .map(|name| super::ArgCompletion {
+                value: name.clone(),
+                description: name.clone(),
+                available: true,
+            })
+            .collect()
+    }
     fn help(&self) -> &str {
         "Usage: /output-style [style-name]\n\n\
          With no argument: list available styles and show the current one.\n\
@@ -153,8 +195,7 @@ impl SlashCommand for OutputStyleCommand {
         let mut new_config = ctx.config.clone();
         new_config.output_style = (normalized != "default").then(|| normalized.clone());
         if let Err(err) = save_settings_mutation(|settings| {
-            settings.config.output_style =
-                (normalized != "default").then(|| normalized.clone());
+            settings.config.output_style = (normalized != "default").then(|| normalized.clone());
         }) {
             return CommandResult::Error(format!("Failed to save configuration: {}", err));
         }
@@ -173,8 +214,12 @@ impl SlashCommand for OutputStyleCommand {
 
 #[async_trait]
 impl SlashCommand for KeybindingsCommand {
-    fn name(&self) -> &str { "keybindings" }
-    fn description(&self) -> &str { "Create or open ~/.claurst/keybindings.json" }
+    fn name(&self) -> &str {
+        "keybindings"
+    }
+    fn description(&self) -> &str {
+        "Create or open ~/.claurst/keybindings.json"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let config_dir = Settings::config_dir();
@@ -239,8 +284,12 @@ impl SlashCommand for KeybindingsCommand {
 
 #[async_trait]
 impl SlashCommand for PrivacySettingsCommand {
-    fn name(&self) -> &str { "privacy-settings" }
-    fn description(&self) -> &str { "Open Claurst privacy settings" }
+    fn name(&self) -> &str {
+        "privacy-settings"
+    }
+    fn description(&self) -> &str {
+        "Open Claurst privacy settings"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let url = "https://claude.ai/settings/data-privacy-controls";

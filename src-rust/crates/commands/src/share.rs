@@ -12,7 +12,9 @@ pub struct LinksCommand;
 
 #[async_trait]
 impl SlashCommand for ShareCommand {
-    fn name(&self) -> &str { "share" }
+    fn name(&self) -> &str {
+        "share"
+    }
     fn description(&self) -> &str {
         "Upload the current session as a secret GitHub gist and return a shareable URL"
     }
@@ -28,7 +30,7 @@ impl SlashCommand for ShareCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        use claurst_core::share_export::{share_viewer_url, write_session_html, SessionExportMeta};
+        use clawde_core::share_export::{share_viewer_url, write_session_html, SessionExportMeta};
 
         // 1. Check that `gh` is installed and authenticated. Uses tokio::process
         //    so the TUI event loop keeps animating during the (occasionally
@@ -67,8 +69,12 @@ impl SlashCommand for ShareCommand {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .collect();
-        let stem = if safe_id.is_empty() { "session".to_string() } else { safe_id };
-        let tmp = std::env::temp_dir().join(format!("claurst-session-{stem}.html"));
+        let stem = if safe_id.is_empty() {
+            "session".to_string()
+        } else {
+            safe_id
+        };
+        let tmp = std::env::temp_dir().join(format!("clawde-session-{stem}.html"));
 
         if let Err(e) = write_session_html(&tmp, &ctx.messages, &meta) {
             return CommandResult::Error(format!("Failed to render session HTML: {e}"));
@@ -130,9 +136,7 @@ impl SlashCommand for ShareCommand {
             "Could not auto-open the link. Copy the URL above. The gist is secret (unlisted); delete the gist to revoke access."
         };
 
-        CommandResult::Message(format!(
-            "Share URL: {viewer}\nGist: {gist_url}\n\n{footer}"
-        ))
+        CommandResult::Message(format!("Share URL: {viewer}\nGist: {gist_url}\n\n{footer}"))
     }
 }
 
@@ -150,7 +154,10 @@ fn links_url_regex() -> &'static regex::Regex {
 fn strip_trailing_punct(url: &str) -> String {
     let mut s = url.to_string();
     while let Some(c) = s.chars().last() {
-        if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>') {
+        if matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>'
+        ) {
             s.pop();
         } else {
             break;
@@ -168,8 +175,8 @@ fn extract_session_urls(messages: &[Message]) -> Vec<String> {
 
     for msg in messages {
         let text: String = match &msg.content {
-            claurst_core::types::MessageContent::Text(t) => t.clone(),
-            claurst_core::types::MessageContent::Blocks(blocks) => blocks
+            clawde_core::types::MessageContent::Text(t) => t.clone(),
+            clawde_core::types::MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::Text { text } => Some(text.as_str()),
@@ -192,10 +199,20 @@ fn extract_session_urls(messages: &[Message]) -> Vec<String> {
 
 #[async_trait]
 impl SlashCommand for LinksCommand {
-    fn name(&self) -> &str { "links" }
-    fn aliases(&self) -> Vec<&str> { vec!["link"] }
+    fn name(&self) -> &str {
+        "links"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["link"]
+    }
     fn description(&self) -> &str {
         "List URLs in this session and open them in your browser"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "list".into(), description: "Print a numbered list of all URLs".into(), available: true },
+            ArgCompletion { value: "last".into(), description: "Open the most recent URL".into(), available: true },
+        ]
     }
     fn help(&self) -> &str {
         "Usage: /links [N | last | list]\n\n\

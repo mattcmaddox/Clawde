@@ -14,8 +14,19 @@ pub struct RateLimitOptionsCommand;
 
 #[async_trait]
 impl SlashCommand for VoiceCommand {
-    fn name(&self) -> &str { "voice" }
-    fn description(&self) -> &str { "Toggle voice input mode on/off" }
+    fn name(&self) -> &str {
+        "voice"
+    }
+    fn description(&self) -> &str {
+        "Toggle voice input mode on/off"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "on".into(), description: "Enable voice mode".into(), available: true },
+            ArgCompletion { value: "off".into(), description: "Disable voice mode".into(), available: true },
+            ArgCompletion { value: "status".into(), description: "Show current voice mode and endpoint info".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /voice [on|off|status]\n\n\
          Enables or disables voice input (push-to-talk).\n\
@@ -42,9 +53,14 @@ impl SlashCommand for VoiceCommand {
             "off" | "disable" | "disabled" | "false" | "0" => false,
             "" => !currently_enabled, // toggle
             "status" => {
-                let state = if currently_enabled { "enabled" } else { "disabled" };
-                let endpoint = std::env::var("WHISPER_ENDPOINT_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1/audio/transcriptions (default)".to_string());
+                let state = if currently_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                let endpoint = std::env::var("WHISPER_ENDPOINT_URL").unwrap_or_else(|_| {
+                    "https://api.openai.com/v1/audio/transcriptions (default)".to_string()
+                });
                 let key_source = if std::env::var("OPENAI_API_KEY").is_ok() {
                     "OPENAI_API_KEY"
                 } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
@@ -88,9 +104,7 @@ impl SlashCommand for VoiceCommand {
                         endpoint, key_hint
                     ))
                 } else {
-                    CommandResult::Message(
-                        "Voice recording deactivated.".to_string(),
-                    )
+                    CommandResult::Message("Voice recording deactivated.".to_string())
                 }
             }
             Err(e) => CommandResult::Error(format!("Failed to save voice setting: {}", e)),
@@ -102,9 +116,15 @@ impl SlashCommand for VoiceCommand {
 
 #[async_trait]
 impl SlashCommand for UpgradeCommand {
-    fn name(&self) -> &str { "update" }
-    fn aliases(&self) -> Vec<&str> { vec!["upgrade"] }
-    fn description(&self) -> &str { "Check for updates and download the latest release" }
+    fn name(&self) -> &str {
+        "update"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["upgrade"]
+    }
+    fn description(&self) -> &str {
+        "Check for updates and download the latest release"
+    }
     fn help(&self) -> &str {
         "Usage: /update\n\n\
          Checks GitHub releases for the latest version of Claurst.\n\
@@ -112,7 +132,7 @@ impl SlashCommand for UpgradeCommand {
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = claurst_core::constants::APP_VERSION;
+        let current = clawde_core::constants::APP_VERSION;
 
         // Check GitHub releases API for latest version
         let client = reqwest::Client::builder()
@@ -138,8 +158,7 @@ impl SlashCommand for UpgradeCommand {
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let json: serde_json::Value =
-                    r.json().await.unwrap_or(serde_json::Value::Null);
+                let json: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
 
                 let tag = json
                     .get("tag_name")
@@ -193,8 +212,12 @@ impl SlashCommand for UpgradeCommand {
 
 #[async_trait]
 impl SlashCommand for ReleaseNotesCommand {
-    fn name(&self) -> &str { "release-notes" }
-    fn description(&self) -> &str { "Show release notes for the current version" }
+    fn name(&self) -> &str {
+        "release-notes"
+    }
+    fn description(&self) -> &str {
+        "Show release notes for the current version"
+    }
     fn help(&self) -> &str {
         "Usage: /release-notes [version]\n\n\
          Fetches and displays release notes from GitHub.\n\
@@ -202,7 +225,7 @@ impl SlashCommand for ReleaseNotesCommand {
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = claurst_core::constants::APP_VERSION;
+        let current = clawde_core::constants::APP_VERSION;
         let version = args.trim();
 
         let tag = if version.is_empty() {
@@ -235,8 +258,7 @@ impl SlashCommand for ReleaseNotesCommand {
 
         match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => {
-                let json: serde_json::Value =
-                    r.json().await.unwrap_or(serde_json::Value::Null);
+                let json: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
 
                 let body = json
                     .get("body")
@@ -248,10 +270,7 @@ impl SlashCommand for ReleaseNotesCommand {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown date");
 
-                let html_url = json
-                    .get("html_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let html_url = json.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
 
                 CommandResult::Message(format!(
                     "Release Notes: Claurst {tag}\n\
@@ -283,8 +302,12 @@ impl SlashCommand for ReleaseNotesCommand {
 
 #[async_trait]
 impl SlashCommand for RateLimitOptionsCommand {
-    fn name(&self) -> &str { "rate-limit-options" }
-    fn description(&self) -> &str { "Show rate limit tiers and current rate limit status" }
+    fn name(&self) -> &str {
+        "rate-limit-options"
+    }
+    fn description(&self) -> &str {
+        "Show rate limit tiers and current rate limit status"
+    }
     fn help(&self) -> &str {
         "Usage: /rate-limit-options\n\n\
          Displays available rate limit tiers and the current tier for your account.\n\
@@ -293,14 +316,18 @@ impl SlashCommand for RateLimitOptionsCommand {
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Try to read from OAuth tokens file to get subscription/tier info
-        let tier_info = match claurst_core::oauth::OAuthTokens::load().await {
+        let tier_info = match clawde_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
                 let sub_type = tokens.subscription_type.as_deref().unwrap_or("unknown");
                 format!(
                     "Account type:    {}\n\
                      Scopes:          {}",
                     sub_type,
-                    if tokens.scopes.is_empty() { "none".to_string() } else { tokens.scopes.join(", ") }
+                    if tokens.scopes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        tokens.scopes.join(", ")
+                    }
                 )
             }
             None => {
