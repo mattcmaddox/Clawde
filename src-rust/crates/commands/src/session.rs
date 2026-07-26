@@ -80,6 +80,12 @@ impl SlashCommand for PlanCommand {
     fn description(&self) -> &str {
         "Enter, view, or manage plan mode"
     }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "open".into(), description: "Open the plan file in your $EDITOR".into(), available: true },
+            ArgCompletion { value: "exit".into(), description: "Leave plan mode and resume normal execution".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /plan [open|<description>|exit]\n\n\
          Subcommands:\n\
@@ -227,6 +233,11 @@ impl SlashCommand for SessionCommand {
     }
     fn description(&self) -> &str {
         "Show or manage conversation sessions"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "list".into(), description: "List all saved sessions".into(), available: true },
+        ]
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {

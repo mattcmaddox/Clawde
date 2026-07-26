@@ -174,11 +174,17 @@ impl SlashCommand for ExportCommand {
     fn description(&self) -> &str {
         "Export conversation to markdown or JSON"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut completions = vec![
             ArgCompletion { value: "--format".into(), description: "Set output format (markdown or json)".into(), available: true },
             ArgCompletion { value: "--output".into(), description: "Write to file path".into(), available: true },
-        ]
+        ];
+        // Second-level completions: /export --format <format>
+        if partial == "--format" || partial.starts_with("--format ") {
+            completions.push(ArgCompletion { value: "--format markdown".into(), description: "Render as readable Markdown".into(), available: true });
+            completions.push(ArgCompletion { value: "--format json".into(), description: "Full structured JSON export".into(), available: true });
+        }
+        completions
     }
     fn help(&self) -> &str {
         "Usage: /export [--format markdown|json] [--output <file>]\n\n\

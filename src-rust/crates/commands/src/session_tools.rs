@@ -18,15 +18,21 @@ pub struct CommitCommand;
 
 #[async_trait]
 impl SlashCommand for SkillsCommand {
-    fn name(&self) -> &str { "skills" }
-    fn aliases(&self) -> Vec<&str> { vec!["skill"] }
-    fn description(&self) -> &str { "List available skills in .claurst/commands/" }
+    fn name(&self) -> &str {
+        "skills"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["skill"]
+    }
+    fn description(&self) -> &str {
+        "List available skills in .claurst/commands/"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut found: Vec<String> = Vec::new();
         let dirs = [
             ctx.working_dir.join(".claurst").join("commands"),
-            claurst_core::config::Settings::config_dir().join("commands"),
+            clawde_core::config::Settings::config_dir().join("commands"),
         ];
 
         for dir in &dirs {
@@ -46,7 +52,7 @@ impl SlashCommand for SkillsCommand {
         }
 
         // Include skills contributed by installed plugins.
-        if let Some(registry) = claurst_plugins::global_plugin_registry() {
+        if let Some(registry) = clawde_plugins::global_plugin_registry() {
             for skill_dir in registry.all_skill_paths() {
                 if let Ok(entries) = std::fs::read_dir(&skill_dir) {
                     for entry in entries.flatten() {
@@ -75,15 +81,13 @@ impl SlashCommand for SkillsCommand {
         }
 
         // Include discovered skills from .claurst/skills/ and configured paths/URLs.
-        let discovered = claurst_core::discover_skills(
-            &ctx.working_dir,
-            &ctx.config.skills,
-        );
+        let discovered = clawde_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
 
         let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
                 "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
-                 Example: .claurst/commands/review.md".to_string(),
+                 Example: .claurst/commands/review.md"
+                    .to_string(),
             );
         } else if found.is_empty() {
             String::new()
@@ -92,12 +96,16 @@ impl SlashCommand for SkillsCommand {
             format!(
                 "Available skills ({}):\n{}",
                 found.len(),
-                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
+                found
+                    .iter()
+                    .map(|s| format!("  /{}", s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
 
         if !discovered.is_empty() {
-            let mut disc_list: Vec<(&String, &claurst_core::DiscoveredSkill)> =
+            let mut disc_list: Vec<(&String, &clawde_core::DiscoveredSkill)> =
                 discovered.iter().collect();
             disc_list.sort_by_key(|(name, _)| name.as_str());
 
@@ -123,8 +131,12 @@ impl SlashCommand for SkillsCommand {
 
 #[async_trait]
 impl SlashCommand for RewindCommand {
-    fn name(&self) -> &str { "rewind" }
-    fn description(&self) -> &str { "Interactively select a message to rewind to" }
+    fn name(&self) -> &str {
+        "rewind"
+    }
+    fn description(&self) -> &str {
+        "Interactively select a message to rewind to"
+    }
     fn help(&self) -> &str {
         "Usage: /rewind\n\
          Opens an interactive overlay to select the message to rewind to.\n\
@@ -133,7 +145,9 @@ impl SlashCommand for RewindCommand {
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         if ctx.messages.is_empty() {
-            return CommandResult::Message("Nothing to rewind — conversation is empty.".to_string());
+            return CommandResult::Message(
+                "Nothing to rewind — conversation is empty.".to_string(),
+            );
         }
         CommandResult::OpenRewindOverlay
     }
@@ -143,8 +157,12 @@ impl SlashCommand for RewindCommand {
 
 #[async_trait]
 impl SlashCommand for StatsCommand {
-    fn name(&self) -> &str { "stats" }
-    fn description(&self) -> &str { "Show token usage and cost statistics" }
+    fn name(&self) -> &str {
+        "stats"
+    }
+    fn description(&self) -> &str {
+        "Show token usage and cost statistics"
+    }
     fn help(&self) -> &str {
         "Usage: /stats\n\n\
          Shows detailed token usage and cost breakdown for the current session,\n\
@@ -162,15 +180,21 @@ impl SlashCommand for StatsCommand {
         let model = ctx.config.effective_model();
 
         // Count user/assistant turns separately.
-        let user_turns = ctx.messages.iter()
-            .filter(|m| m.role == claurst_core::types::Role::User)
+        let user_turns = ctx
+            .messages
+            .iter()
+            .filter(|m| m.role == clawde_core::types::Role::User)
             .count();
-        let assistant_turns = ctx.messages.iter()
-            .filter(|m| m.role == claurst_core::types::Role::Assistant)
+        let assistant_turns = ctx
+            .messages
+            .iter()
+            .filter(|m| m.role == clawde_core::types::Role::Assistant)
             .count();
 
         // Count tool-use invocations.
-        let tool_calls: usize = ctx.messages.iter()
+        let tool_calls: usize = ctx
+            .messages
+            .iter()
             .map(|m| m.get_tool_use_blocks().len())
             .sum();
 
@@ -221,14 +245,19 @@ impl SlashCommand for StatsCommand {
 
 #[async_trait]
 impl SlashCommand for FilesCommand {
-    fn name(&self) -> &str { "files" }
-    fn description(&self) -> &str { "List files referenced in the current conversation" }
+    fn name(&self) -> &str {
+        "files"
+    }
+    fn description(&self) -> &str {
+        "List files referenced in the current conversation"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         use std::collections::HashSet;
         // Scan message content for file paths (simple heuristic)
         let mut files: HashSet<String> = HashSet::new();
-        let path_re = regex::Regex::new(r#"(?m)([A-Za-z]:[\\/][^\s,;:"'<>]+|/[^\s,;:"'<>]{3,})"#).ok();
+        let path_re =
+            regex::Regex::new(r#"(?m)([A-Za-z]:[\\/][^\s,;:"'<>]+|/[^\s,;:"'<>]{3,})"#).ok();
 
         for msg in &ctx.messages {
             let text = msg.get_all_text();
@@ -254,7 +283,11 @@ impl SlashCommand for FilesCommand {
         CommandResult::Message(format!(
             "Referenced files ({}):\n{}",
             sorted.len(),
-            sorted.iter().map(|f| format!("  {}", f)).collect::<Vec<_>>().join("\n")
+            sorted
+                .iter()
+                .map(|f| format!("  {}", f))
+                .collect::<Vec<_>>()
+                .join("\n")
         ))
     }
 }
@@ -263,8 +296,12 @@ impl SlashCommand for FilesCommand {
 
 #[async_trait]
 impl SlashCommand for RenameCommand {
-    fn name(&self) -> &str { "rename" }
-    fn description(&self) -> &str { "Rename the current session" }
+    fn name(&self) -> &str {
+        "rename"
+    }
+    fn description(&self) -> &str {
+        "Rename the current session"
+    }
     fn help(&self) -> &str {
         "Usage: /rename [new name]\n\n\
          With a name: sets the session title immediately.\n\
@@ -296,12 +333,18 @@ impl SlashCommand for RenameCommand {
             .take(20)
             .filter_map(|m| {
                 let text = m.get_all_text();
-                if text.is_empty() { return None; }
+                if text.is_empty() {
+                    return None;
+                }
                 let role = match m.role {
-                    claurst_core::types::Role::User => "User",
-                    claurst_core::types::Role::Assistant => "Assistant",
+                    clawde_core::types::Role::User => "User",
+                    clawde_core::types::Role::Assistant => "Assistant",
                 };
-                Some(format!("{}: {}", role, text.chars().take(300).collect::<String>()))
+                Some(format!(
+                    "{}: {}",
+                    role,
+                    text.chars().take(300).collect::<String>()
+                ))
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -329,13 +372,13 @@ impl SlashCommand for RenameCommand {
             Examples: fix-login-bug, add-auth-feature, refactor-api-client. \
             Respond with ONLY the name, nothing else.";
 
-        let request = claurst_api::ProviderRequest {
+        let request = clawde_api::ProviderRequest {
             model: rename_model,
             messages: vec![Message::user(format!(
                 "Conversation to name:\n\n{}",
                 &excerpt[..excerpt.len().min(2000)]
             ))],
-            system_prompt: Some(claurst_api::SystemPrompt::Text(system_prompt.to_string())),
+            system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt.to_string())),
             tools: vec![],
             max_tokens: 64,
             temperature: None,
@@ -348,7 +391,9 @@ impl SlashCommand for RenameCommand {
 
         match provider.create_message(request).await {
             Ok(response) => {
-                let raw_text = text_from_content_blocks(&response.content).trim().to_string();
+                let raw_text = text_from_content_blocks(&response.content)
+                    .trim()
+                    .to_string();
 
                 let generated = raw_text
                     .to_lowercase()
@@ -361,7 +406,8 @@ impl SlashCommand for RenameCommand {
                 if cleaned.is_empty() {
                     return CommandResult::Error(
                         "Could not generate a valid name from conversation. \
-                         Use /rename <name> to set manually.".to_string(),
+                         Use /rename <name> to set manually."
+                            .to_string(),
                     );
                 }
 
@@ -379,35 +425,63 @@ impl SlashCommand for RenameCommand {
 
 #[async_trait]
 impl SlashCommand for EffortCommand {
-    fn name(&self) -> &str { "effort" }
-    fn description(&self) -> &str { "Set the model's thinking effort (low | normal | high)" }
+    fn name(&self) -> &str {
+        "effort"
+    }
+    fn description(&self) -> &str {
+        "Set the model's thinking effort (low | normal | high)"
+    }
     fn help(&self) -> &str {
         "Usage: /effort [low|normal|high]\n\
          Sets how much computation the model uses for reasoning.\n\
          'high' enables extended thinking with a larger budget."
     }
 
+    fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
+        vec![
+            super::ArgCompletion { value: "none".into(), description: "No reasoning at all".into(), available: true },
+            super::ArgCompletion { value: "minimal".into(), description: "Smallest reasoning budget".into(), available: true },
+            super::ArgCompletion { value: "low".into(), description: "Quick, straightforward implementation".into(), available: true },
+            super::ArgCompletion { value: "medium".into(), description: "Balanced approach (default)".into(), available: true },
+            super::ArgCompletion { value: "high".into(), description: "Comprehensive with extensive testing".into(), available: true },
+            super::ArgCompletion { value: "xhigh".into(), description: "Extended reasoning, higher thinking budget".into(), available: true },
+            super::ArgCompletion { value: "max".into(), description: "Maximum capability, deepest reasoning".into(), available: true },
+            super::ArgCompletion { value: "ultracode".into(), description: "Top reasoning + delegation workflow".into(), available: true },
+        ]
+    }
+
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        match args.trim() {
-            "" => CommandResult::Message("Current effort: normal\nUse /effort [low|normal|high] to change.".to_string()),
-            "low" => {
-                // Low effort: smaller max_tokens
-                ctx.config.max_tokens = Some(4096);
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            "normal" => {
-                ctx.config.max_tokens = None; // use default
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            "high" => {
-                ctx.config.max_tokens = Some(32768);
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            other => CommandResult::Error(format!(
-                "Unknown effort level '{}'. Use: low | normal | high",
-                other
-            )),
+        use clawde_core::effort::EffortLevel;
+        let args = args.trim();
+        if args.is_empty() {
+            return CommandResult::Message(
+                "Usage: /effort [none|minimal|low|medium|high|xhigh|max|ultracode]\n\n\
+                 Current effort: normal\n\n\
+                 Available levels:\n\
+                   none      — No reasoning at all\n\
+                   minimal   — Smallest reasoning budget\n\
+                   low       — Quick, straightforward implementation\n\
+                   medium    — Balanced approach (default, also 'normal')\n\
+                   high      — Comprehensive with extensive testing\n\
+                   xhigh     — Extended reasoning, higher thinking budget\n\
+                   max       — Maximum capability, deepest reasoning\n\
+                   ultracode — Top reasoning + delegation workflow"
+                    .to_string(),
+            );
         }
+
+        let level = match EffortLevel::from_str(args) {
+            Some(l) => l,
+            None => {
+                return CommandResult::Error(format!(
+                    "Unknown effort level '{}'. Use: none | minimal | low | medium | high | xhigh | max | ultracode",
+                    args
+                ));
+            }
+        };
+
+        let label = format!("{} {}", level.symbol(), level.label());
+        CommandResult::ConfigChangeMessage(ctx.config.clone(), format!("Effort: {label}"))
     }
 }
 
@@ -415,30 +489,221 @@ impl SlashCommand for EffortCommand {
 
 #[async_trait]
 impl SlashCommand for SummaryCommand {
-    fn name(&self) -> &str { "summary" }
-    fn description(&self) -> &str { "Generate a brief summary of the conversation so far" }
+    fn name(&self) -> &str {
+        "summary"
+    }
+    fn description(&self) -> &str {
+        "Generate a brief summary of the conversation so far"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "decisions".into(), description: "Highlight key decisions made".into(), available: true },
+            ArgCompletion { value: "files".into(), description: "Focus on files created or modified".into(), available: true },
+        ]
+    }
+    fn help(&self) -> &str {
+        "Usage: /summary [focus]\n\n\
+         Generates a concise 3-5 sentence summary of the conversation using\n\
+         the active provider.  The summary focuses on what has been accomplished\n\
+         and the current state.\n\n\
+         An optional focus argument tailors the summary:\n\
+           /summary decisions     — highlight key decisions made\n\
+           /summary files         — focus on files created or modified"
+    }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let count = ctx.messages.len();
         if count == 0 {
-            return CommandResult::Message("No messages in conversation yet.".to_string());
+            return CommandResult::Message(
+                "No messages in conversation yet. Start a conversation first.".to_string(),
+            );
         }
 
-        // Ask the model to summarize by injecting a hidden user message
-        CommandResult::UserMessage(
-            "Please provide a brief (3-5 sentence) summary of our conversation so far, \
-             focusing on what has been accomplished and the current state."
-                .to_string(),
-        )
+        // For very short conversations, fall back to the old UserMessage approach
+        // since an API call isn't worth the overhead.
+        if count < 3 {
+            let focus = if args.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" Focus on: {}.", args.trim())
+            };
+            return CommandResult::UserMessage(format!(
+                "Please provide a brief (2-3 sentence) summary of our conversation \
+                 so far, focusing on what has been accomplished and the current state.{}",
+                focus
+            ));
+        }
+
+        // Get the active provider.
+        let provider = match provider_for_config(&ctx.config).await {
+            Some(p) => p,
+            None => {
+                return CommandResult::Error(
+                    "No provider available for summarisation. Configure an API key first."
+                        .to_string(),
+                );
+            }
+        };
+        let summary_model = resolve_fast_model_id(&ctx.config);
+
+        // Build a concise conversation excerpt (up to the most relevant messages).
+        let excerpt = build_summary_excerpt(&ctx.messages, 4000);
+
+        // Determine the focus instruction.
+        let focus_instruction = if args.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\nFocus specifically on: {}.", args.trim())
+        };
+
+        let system_prompt = "You are an expert conversation summariser. Produce a concise \
+            3-5 sentence summary that captures what has been accomplished and the \
+            current state of the work. Be specific about file names, features built, \
+            and decisions made. Use plain text only — no XML, no markdown headings.";
+
+        let user_message = format!(
+            "Please summarise the following conversation:\n\n{}{}",
+            excerpt, focus_instruction
+        );
+
+        let request = clawde_api::ProviderRequest {
+            model: summary_model.clone(),
+            messages: vec![Message::user(user_message)],
+            system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt.to_string())),
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: serde_json::Value::Object(Default::default()),
+        };
+
+        match provider.create_message(request).await {
+            Ok(response) => {
+                let raw_text = text_from_content_blocks(&response.content);
+                if raw_text.trim().is_empty() {
+                    return CommandResult::Error(
+                        "Generated summary was empty. Try again.".to_string(),
+                    );
+                }
+
+                CommandResult::Message(format!(
+                    "Conversation Summary\n\
+                     ═══════════════════════\n\
+                     Messages: {count}  ·  Model: {summary_model}\n\n\
+                     {summary}\n",
+                    count = count,
+                    summary_model = summary_model,
+                    summary = raw_text.trim(),
+                ))
+            }
+            Err(_e) => {
+                // Fall back to the old UserMessage approach if the API call fails.
+                let focus = if args.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Focus on: {}.", args.trim())
+                };
+                CommandResult::UserMessage(format!(
+                    "Please provide a brief (3-5 sentence) summary of our conversation \
+                     so far, focusing on what has been accomplished and the current state.{}",
+                    focus
+                ))
+            }
+        }
     }
+}
+
+/// Build a concise conversation excerpt limited to approximately `max_chars`.
+/// Takes messages from both ends: the first few (context) and the last several
+/// (most recent activity), with a gap marker in between if truncated.
+fn build_summary_excerpt(messages: &[Message], max_chars: usize) -> String {
+    let total = messages.len();
+    if total == 0 {
+        return String::new();
+    }
+
+    // Build an indexed transcript.
+    let mut parts: Vec<(usize, String)> = Vec::with_capacity(total);
+    for (i, msg) in messages.iter().enumerate() {
+        let role_label = match msg.role {
+            clawde_core::types::Role::User => "User",
+            clawde_core::types::Role::Assistant => "Assistant",
+        };
+        let text = msg.get_all_text();
+        // Truncate very long individual messages to 500 chars
+        let truncated: String = text.chars().take(500).collect();
+        let ellipsis = if text.len() > 500 {
+            "… (truncated)"
+        } else {
+            ""
+        };
+        parts.push((i, format!("{}: {}{}", role_label, truncated, ellipsis)));
+    }
+
+    // Estimate full size.
+    let full_size: usize = parts.iter().map(|(_, s)| s.len()).sum();
+    if full_size <= max_chars {
+        return parts
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+
+    // Keep the first 2 messages (context) and the last N messages (recent activity).
+    let keep_head = 2.min(total);
+    let keep_tail = 3.min(total.saturating_sub(keep_head));
+    let mut available = max_chars;
+    let mut result = Vec::new();
+
+    // Always include the first messages for context.
+    for (_, s) in parts.iter().take(keep_head) {
+        if s.len() <= available {
+            result.push(s.clone());
+            available = available.saturating_sub(s.len());
+        }
+    }
+
+    // Only add a gap marker when messages are actually omitted.
+    let omitted = total.saturating_sub(keep_head + keep_tail);
+    if omitted > 0 {
+        let gap = if omitted == 1 {
+            "… (1 message omitted)\n".to_string()
+        } else {
+            format!("… ({} messages omitted)\n", omitted)
+        };
+        let gap_len = gap.len();
+        if gap_len <= available {
+            result.push(gap);
+            available = available.saturating_sub(gap_len);
+        }
+    }
+
+    // Include the last few messages (most recent activity).
+    let keep_tail = 3.min(total.saturating_sub(keep_head));
+    for (_, s) in parts.iter().rev().take(keep_tail).rev() {
+        if s.len() <= available {
+            result.push(s.clone());
+            available = available.saturating_sub(s.len());
+        }
+    }
+
+    result.join("\n\n")
 }
 
 // ---- /commit -------------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for CommitCommand {
-    fn name(&self) -> &str { "commit" }
-    fn description(&self) -> &str { "Ask Claurst to commit staged changes" }
+    fn name(&self) -> &str {
+        "commit"
+    }
+    fn description(&self) -> &str {
+        "Ask Claurst to commit staged changes"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let extra = if args.trim().is_empty() {

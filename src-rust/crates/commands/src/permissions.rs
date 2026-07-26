@@ -4,8 +4,20 @@
 
 use super::*;
 use async_trait::async_trait;
+use std::sync::OnceLock;
 
 pub struct PermissionsCommand;
+
+/// Cached list of all built-in tool names for `allow`/`deny` completions.
+fn tool_names() -> &'static Vec<String> {
+    static TOOL_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    TOOL_NAMES.get_or_init(|| {
+        clawde_tools::all_tools()
+            .into_iter()
+            .map(|t| t.name().to_string())
+            .collect()
+    })
+}
 
 // ---- /permissions --------------------------------------------------------
 
@@ -17,13 +29,40 @@ impl SlashCommand for PermissionsCommand {
     fn description(&self) -> &str {
         "View or change tool permission settings"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut completions = vec![
             ArgCompletion { value: "set".into(), description: "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(), available: true },
             ArgCompletion { value: "allow".into(), description: "Allow a specific tool".into(), available: true },
             ArgCompletion { value: "deny".into(), description: "Deny a specific tool".into(), available: true },
             ArgCompletion { value: "reset".into(), description: "Clear all permission overrides".into(), available: true },
-        ]
+        ];
+        // Second-level completions: /permissions set <mode>
+        if partial == "set" || partial.starts_with("set ") {
+            completions.push(ArgCompletion { value: "set default".into(), description: "Default permission mode".into(), available: true });
+            completions.push(ArgCompletion { value: "set accept-edits".into(), description: "Auto-accept file edits".into(), available: true });
+            completions.push(ArgCompletion { value: "set bypass-permissions".into(), description: "Bypass all permissions".into(), available: true });
+            completions.push(ArgCompletion { value: "set plan".into(), description: "Plan mode".into(), available: true });
+        }
+        // Second-level completions: /permissions allow <tool> and deny <tool>
+        // Values must include the subcommand prefix so the get_arg_completions
+        // prefix-match filter works correctly (e.g. "allow Ba" matches "allow Bash").
+        let prefix = if partial == "allow" || partial.starts_with("allow ") {
+            Some("allow ")
+        } else if partial == "deny" || partial.starts_with("deny ") {
+            Some("deny ")
+        } else {
+            None
+        };
+        if let Some(pfx) = prefix {
+            for name in tool_names() {
+                completions.push(ArgCompletion {
+                    value: format!("{pfx}{name}"),
+                    description: String::new(),
+                    available: true,
+                });
+            }
+        }
+        completions
     }
     fn help(&self) -> &str {
         "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset]\n\n\
