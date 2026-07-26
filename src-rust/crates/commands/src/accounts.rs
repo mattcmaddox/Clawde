@@ -19,7 +19,46 @@ impl SlashCommand for LoginCommand {
     fn description(&self) -> &str {
         "Authenticate with Anthropic or Codex (multi-account)"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let trimmed = partial.trim();
+
+        // When the user has typed --label, suggest existing profile IDs as
+        // common naming hints.  Use a prefixed pattern so the caller's prefix
+        // filter (which matches the full partial text) works correctly.
+        if trimmed == "--label" || trimmed.starts_with("--label ") {
+            let registry = clawde_core::accounts::AccountRegistry::load();
+            let after = trimmed
+                .strip_prefix("--label")
+                .unwrap_or("")
+                .trim();
+            let mut results = Vec::new();
+            for provider in [
+                clawde_core::accounts::PROVIDER_ANTHROPIC,
+                clawde_core::accounts::PROVIDER_CODEX,
+            ] {
+                for profile in registry.list(provider) {
+                    if after.is_empty()
+                        || profile
+                            .id
+                            .to_lowercase()
+                            .starts_with(&after.to_lowercase())
+                    {
+                        results.push(ArgCompletion {
+                            value: format!("--label {}", profile.id),
+                            description: format!(
+                                "{} profile: {}",
+                                provider,
+                                profile.display_name()
+                            ),
+                            available: true,
+                        });
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Otherwise offer the flags.
         vec![
             ArgCompletion { value: "--console".into(), description: "Login with API key (Console)".into(), available: true },
             ArgCompletion { value: "--codex".into(), description: "Login with ChatGPT/Codex account".into(), available: true },
@@ -77,11 +116,62 @@ impl SlashCommand for LogoutCommand {
     fn description(&self) -> &str {
         "Clear credentials for the active account"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let registry = clawde_core::accounts::AccountRegistry::load();
+        let trimmed = partial.trim();
+
+        // Base flags always shown.
+        let mut results: Vec<ArgCompletion> = vec![
             ArgCompletion { value: "--codex".into(), description: "Log out the Codex account".into(), available: true },
             ArgCompletion { value: "--all".into(), description: "Log out all accounts".into(), available: true },
-        ]
+        ];
+
+        // Show active Anthropic profile name as informational hint when no
+        // flag or --all is specified (default targets the active Anthropic
+        // account). Use `available: false` so it renders dimmed — visible
+        // but not selectable (the command does not accept a profile-id arg).
+        if !trimmed.contains("--codex") {
+            if let Some(active) = registry.active(clawde_core::accounts::PROVIDER_ANTHROPIC) {
+                results.push(ArgCompletion {
+                    value: active.to_string(),
+                    description: "Active Anthropic profile (logged out by default)".into(),
+                    available: false,
+                });
+            }
+        }
+
+        // Show active Codex profile name when --codex is involved.
+        // Dimmed (available: false) because /logout doesn't accept a profile-id
+        // argument — it always targets the active account.  The hint is purely
+        // informational so the user knows which profile will be affected.
+        if trimmed.contains("--codex") {
+            if let Some(active) = registry.active(clawde_core::accounts::PROVIDER_CODEX) {
+                results.push(ArgCompletion {
+                    value: active.to_string(),
+                    description: "Active Codex profile (will be logged out)".into(),
+                    available: false,
+                });
+            }
+        }
+
+        // When --all is specified, list all profiles that would be purged
+        // as informational items.
+        if trimmed.contains("--all") {
+            for provider in [
+                clawde_core::accounts::PROVIDER_ANTHROPIC,
+                clawde_core::accounts::PROVIDER_CODEX,
+            ] {
+                for profile in registry.list(provider) {
+                    results.push(ArgCompletion {
+                        value: profile.id.clone(),
+                        description: format!("Would purge {} profile", provider),
+                        available: false,
+                    });
+                }
+            }
+        }
+
+        results
     }
     fn help(&self) -> &str {
         "Usage: /logout [--codex] [--all]\n\n\
@@ -218,10 +308,44 @@ impl SlashCommand for SwitchCommand {
     fn description(&self) -> &str {
         "Switch the active account for a provider"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
-            ArgCompletion { value: "--codex".into(), description: "Switch the Codex account instead of Anthropic".into(), available: true },
-        ]
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let registry = clawde_core::accounts::AccountRegistry::load();
+        let trimmed = partial.trim();
+
+        // If the user has already typed --codex, show Codex profiles.
+        // Return them with a `--codex ` prefix so the caller's prefix filter
+        // (which matches the full partial text) works correctly.
+        if trimmed == "--codex" || trimmed.starts_with("--codex ") {
+            let after = trimmed.trim_start_matches("--codex").trim();
+            return registry
+                .list(clawde_core::accounts::PROVIDER_CODEX)
+                .into_iter()
+                .map(|p| ArgCompletion {
+                    value: format!("--codex {}", p.id),
+                    description: p.display_name(),
+                    available: true,
+                })
+                .filter(|c| {
+                    after.is_empty()
+                        || c.value.to_lowercase().starts_with(&format!("--codex {}", after))
+                })
+                .collect();
+        }
+
+        // Otherwise offer --codex flag + Anthropic profile ids.
+        let mut results = vec![ArgCompletion {
+            value: "--codex".into(),
+            description: "Switch the Codex account instead of Anthropic".into(),
+            available: true,
+        }];
+        for profile in registry.list(clawde_core::accounts::PROVIDER_ANTHROPIC) {
+            results.push(ArgCompletion {
+                value: profile.id.clone(),
+                description: profile.display_name(),
+                available: true,
+            });
+        }
+        results
     }
     fn help(&self) -> &str {
         "Usage: /switch [--codex] <profile-id>\n\n\
