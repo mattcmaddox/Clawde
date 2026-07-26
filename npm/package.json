@@ -7,7 +7,7 @@
     "type": "git",
     "url": "git+https://github.com/mattcmaddox/Clawde.git"
   },
-  "homepage": "https://clawde.kuber.studio",
+  "homepage": "https://mattcmaddox.github.io/Clawde",
   "bugs": {
     "url": "https://github.com/mattcmaddox/Clawde/issues"
   },
@@ -20,7 +20,7 @@
     "tui",
     "rust"
   ],
-  "author": "Kuber Mehta",
+  "author": "Matt Maddox",
   "bin": {
     "clawde": "bin/clawde"
   },

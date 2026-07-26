@@ -34,7 +34,7 @@ clawde -p "fix this bug"  # headless one-shot
 
 ## Links
 
-- [Homepage](https://clawde.kuber.studio)
+- [Homepage](https://mattcmaddox.github.io/Clawde)
 - [GitHub](https://github.com/mattcmaddox/Clawde)
-- [Documentation](https://clawde.kuber.studio/docs)
+- [Documentation](https://mattcmaddox.github.io/Clawde/docs)
 - [Issues](https://github.com/mattcmaddox/Clawde/issues)

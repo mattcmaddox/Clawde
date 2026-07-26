@@ -189,7 +189,7 @@ After merge, Zed and other ACP-aware editors will pick up Clawde on their next r
 
 ## Documentation
 
-For more info on how to configure Clawde, [head over to our docs](https://clawde.kuber.studio/docs).
+For more info on how to configure Clawde, [head over to our docs](https://mattcmaddox.github.io/Clawde/docs).
 
 >**PS:** The original breakdown of the findings from Claude Code's source that started this project is on [my blog](https://kuber.studio/blog/AI/Claude-Code's-Entire-Source-Code-Got-Leaked-via-a-Sourcemap-in-npm,-Let's-Talk-About-it) - the full technical writeup of what was found, how the leak happened, and what it revealed.
 
