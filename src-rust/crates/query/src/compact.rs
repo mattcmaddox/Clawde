@@ -21,13 +21,24 @@
 //   the most recent `keep_recent_messages` intact.  This is lighter than a
 //   full compaction and can fire proactively at 75 % capacity.
 
-use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
-use claurst_core::error::ClaudeError;
-use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
+use clawde_api::{LlmProvider, ProviderRequest, SystemPrompt};
+use clawde_core::error::ClaudeError;
+use clawde_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Extract text from all Text content blocks (summariser output is plain text).
+fn compact_text_from_blocks(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
 
 // ---------------------------------------------------------------------------
 // Constants (mirrors TypeScript autoCompact.ts)
@@ -57,8 +68,24 @@ const KEEP_RECENT_TOKENS: u64 = 16_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 // Percentage thresholds for token warning states (mirrors TS autoCompact.ts)
-const WARNING_PCT: f64 = 0.80;   // 80 % full → yellow warning
-const CRITICAL_PCT: f64 = 0.95;  // 95 % full → red critical
+const WARNING_PCT: f64 = 0.80; // 80 % full → yellow warning
+const CRITICAL_PCT: f64 = 0.95; // 95 % full → red critical
+
+// ---- Debounce / hysteresis: prevent auto-compact thrashing ----
+
+/// Minimum turn gap between two auto-compactions.
+///
+/// When context usage hovers right at the trigger threshold (e.g. 90 %),
+/// compacting every turn would waste API calls and churn the transcript.
+/// This gate ensures the conversation has at least this many uninterrupted
+/// turns before another compaction fires.
+const MIN_COMPACT_TURN_GAP: u32 = 5;
+
+/// Minimum wall-clock seconds between two auto-compactions.
+///
+/// Time-based guard that catches edge cases where turns happen very quickly
+/// (e.g. a few short tool calls) while still near the threshold.
+const MIN_COMPACT_TIME_GAP_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -73,6 +100,10 @@ pub struct AutoCompactState {
     pub consecutive_failures: u32,
     /// Whether the circuit breaker is open (too many failures).
     pub disabled: bool,
+    /// Turns since last successful compaction (debounce: prevents thrashing).
+    pub turns_since_last_compact: u32,
+    /// When the last compaction completed (time-based debounce).
+    pub last_compact_at: Option<std::time::Instant>,
 }
 
 impl AutoCompactState {
@@ -80,6 +111,8 @@ impl AutoCompactState {
     pub fn on_success(&mut self) {
         self.compaction_count += 1;
         self.consecutive_failures = 0;
+        self.turns_since_last_compact = 0;
+        self.last_compact_at = Some(std::time::Instant::now());
     }
 
     /// Record a failed compaction; open circuit breaker if too many.
@@ -130,7 +163,11 @@ impl MessageGroup {
     fn from_messages(messages: Vec<Message>) -> Self {
         let topic_hint = extract_topic_hint(&messages);
         let token_estimate = estimate_tokens_for_messages(&messages);
-        Self { messages, topic_hint, token_estimate }
+        Self {
+            messages,
+            topic_hint,
+            token_estimate,
+        }
     }
 }
 
@@ -166,10 +203,7 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
         .iter()
         .map(|m| match &m.content {
             MessageContent::Text(t) => t.len(),
-            MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .map(estimate_block_chars)
-                .sum(),
+            MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
         })
         .sum();
     // chars / 4 = rough tokens, then * 4/3 padding
@@ -179,12 +213,10 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
 fn estimate_block_chars(block: &ContentBlock) -> usize {
     match block {
         ContentBlock::Text { text } => text.len(),
-        ContentBlock::ToolUse { name, input, .. } => {
-            name.len() + input.to_string().len()
-        }
+        ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
         ContentBlock::ToolResult { content, .. } => match content {
-            claurst_core::types::ToolResultContent::Text(t) => t.len(),
-            claurst_core::types::ToolResultContent::Blocks(blocks) => {
+            clawde_core::types::ToolResultContent::Text(t) => t.len(),
+            clawde_core::types::ToolResultContent::Blocks(blocks) => {
                 blocks.iter().map(estimate_block_chars).sum()
             }
         },
@@ -265,7 +297,7 @@ impl Default for MicroCompactConfig {
 ///
 /// Returns `Some(new_messages)` when compaction occurred, `None` otherwise.
 pub async fn micro_compact_if_needed(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
@@ -294,7 +326,7 @@ pub async fn micro_compact_if_needed(
     );
 
     let target_tokens = config.summary_target_tokens as u32;
-    match summarise_head(client, messages, split_at, model, target_tokens).await {
+    match summarise_head(provider, messages, split_at, model, target_tokens).await {
         Ok(new_msgs) => {
             info!(
                 original = total,
@@ -324,7 +356,8 @@ const NO_TOOLS_PREAMBLE: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call a
 \n";
 
 /// The trailing reminder that reinforces the no-tools instruction.
-const NO_TOOLS_TRAILER: &str = "\n\nREMINDER: Do NOT call any tools. Respond with plain text only — \
+const NO_TOOLS_TRAILER: &str =
+    "\n\nREMINDER: Do NOT call any tools. Respond with plain text only — \
 an <analysis> block followed by a <summary> block. \
 Tool calls will be rejected and you will fail the task.";
 
@@ -631,7 +664,7 @@ fn extract_file_operations(messages: &[Message]) -> FileOps {
 
 /// Pull the file path(s) touched by a single tool call into `ops`.
 fn collect_file_op(name: &str, input: &Value, ops: &mut FileOps) {
-    use claurst_core::constants::{
+    use clawde_core::constants::{
         TOOL_NAME_APPLY_PATCH, TOOL_NAME_BATCH_EDIT, TOOL_NAME_FILE_EDIT, TOOL_NAME_FILE_READ,
         TOOL_NAME_FILE_WRITE, TOOL_NAME_NOTEBOOK_EDIT,
     };
@@ -830,7 +863,7 @@ const MIN_PLAUSIBLE_REGISTRY_WINDOW: u64 = 8192;
 /// `(provider, model_id)` pair. Returns `None` when there is no entry or the
 /// stored window is an implausible placeholder.
 fn registry_context_window(
-    registry: &claurst_api::ModelRegistry,
+    registry: &clawde_api::ModelRegistry,
     provider: &str,
     model_id: &str,
 ) -> Option<u64> {
@@ -840,7 +873,7 @@ fn registry_context_window(
 
 /// Resolve the effective context window for the active provider + model.
 ///
-/// The models.dev-backed [`claurst_api::ModelRegistry`] is the source of truth:
+/// The models.dev-backed [`clawde_api::ModelRegistry`] is the source of truth:
 /// it carries real per-model context windows for *every* provider (Gemini/GPT
 /// 1M windows, 32k local models, …), so we prefer it. We fall back to the
 /// Claude-only [`context_window_for_model`] heuristic only when the registry is
@@ -849,7 +882,7 @@ fn registry_context_window(
 /// `model` may be either a bare model id (`"gemini-3-pro"`) or a canonical
 /// `"provider/model"` string; both forms are handled.
 pub fn resolve_context_window(
-    registry: Option<&claurst_api::ModelRegistry>,
+    registry: Option<&clawde_api::ModelRegistry>,
     provider: &str,
     model: &str,
 ) -> u64 {
@@ -918,7 +951,9 @@ pub fn calculate_token_warning_state_for_window(
 
     if pct >= CRITICAL_PCT {
         TokenWarningState::Critical
-    } else if pct >= WARNING_PCT || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS {
+    } else if pct >= WARNING_PCT
+        || window.saturating_sub(input_tokens) <= WARNING_THRESHOLD_BUFFER_TOKENS
+    {
         TokenWarningState::Warning
     } else {
         TokenWarningState::Ok
@@ -954,7 +989,7 @@ pub fn should_auto_compact_for_window(
 /// carefully crafted compaction prompt from TypeScript prompt.ts.
 /// Returns a new conversation: [summary user msg] + messages[split_at..].
 async fn summarise_head(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
     messages: &[Message],
     split_at: usize,
     model: &str,
@@ -992,18 +1027,32 @@ async fn summarise_head(
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 match block {
-                    ContentBlock::ToolUse { name, input, id, .. } => {
+                    ContentBlock::ToolUse {
+                        name, input, id, ..
+                    } => {
                         transcript.push_str(&format!(
                             "[Tool Call: {} (id={})]\nInput: {}\n\n",
                             name, id, input
                         ));
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         let result_text = match content {
-                            claurst_core::types::ToolResultContent::Text(t) => t.as_str().to_string(),
-                            claurst_core::types::ToolResultContent::Blocks(_) => "[complex content]".to_string(),
+                            clawde_core::types::ToolResultContent::Text(t) => {
+                                t.as_str().to_string()
+                            }
+                            clawde_core::types::ToolResultContent::Blocks(_) => {
+                                "[complex content]".to_string()
+                            }
                         };
-                        let error_flag = if is_error.unwrap_or(false) { " [ERROR]" } else { "" };
+                        let error_flag = if is_error.unwrap_or(false) {
+                            " [ERROR]"
+                        } else {
+                            ""
+                        };
                         transcript.push_str(&format!(
                             "[Tool Result (id={}){}]\n{}\n\n",
                             tool_use_id, error_flag, result_text
@@ -1018,9 +1067,7 @@ async fn summarise_head(
     // Feed the prior summary WITHOUT its files-touched manifest: the manifest is
     // re-appended deterministically below (parsed + unioned), so echoing it in
     // the prompt would only risk the model drifting the file list.
-    let previous_summary_for_prompt = previous_summary
-        .as_deref()
-        .map(strip_files_touched_section);
+    let previous_summary_for_prompt = previous_summary.as_deref().map(strip_files_touched_section);
 
     // Select the UPDATE prompt variant when a prior summary is present.
     let compact_prompt = get_compact_prompt(None, previous_summary_for_prompt.as_deref());
@@ -1044,35 +1091,31 @@ async fn summarise_head(
         )
     };
 
-    let api_msgs = vec![ApiMessage {
-        role: "user".to_string(),
-        content: Value::String(user_content),
-    }];
-
-    let request = CreateMessageRequest::builder(model, max_summary_tokens)
-        .messages(api_msgs)
-        .system(SystemPrompt::Text(
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages: vec![Message::user(user_content)],
+        system_prompt: Some(SystemPrompt::Text(
             "You are a helpful assistant that creates concise yet thorough conversation summaries. \
              Preserve all technical details, file names, code snippets, and decisions that would \
              be important for continuing the work. Follow the structured format exactly."
                 .to_string(),
-        ))
-        .build();
+        )),
+        tools: vec![],
+        max_tokens: max_summary_tokens,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: vec![],
+        thinking: None,
+        provider_options: Default::default(),
+    };
 
-    // Use a null handler since we just want the final accumulated message.
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
+    let response = provider
+        .create_message(request)
+        .await
+        .map_err(|e| ClaudeError::Api(e.to_string()))?;
 
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
-    }
-
-    let (summary_msg, _usage, _stop) = acc.finish();
-    let raw_summary = summary_msg.get_all_text();
+    let raw_summary = compact_text_from_blocks(&response.content);
 
     if raw_summary.is_empty() {
         return Err(ClaudeError::Other("Compact summary was empty".to_string()));
@@ -1164,7 +1207,7 @@ fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> us
 /// Compact `messages` in-place, replacing the head with a summary.
 /// Returns the new messages vector on success.
 pub async fn compact_conversation(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
     messages: &[Message],
     model: &str,
 ) -> Result<Vec<Message>, ClaudeError> {
@@ -1191,7 +1234,7 @@ pub async fn compact_conversation(
     );
 
     // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(client, messages, split_at, model, 20_000).await
+    summarise_head(provider, messages, split_at, model, 20_000).await
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
@@ -1201,7 +1244,7 @@ pub async fn compact_conversation(
 /// (resolve it via [`resolve_context_window`]); `model` is still used for the
 /// summarisation API call.
 pub async fn auto_compact_if_needed(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
@@ -1212,6 +1255,34 @@ pub async fn auto_compact_if_needed(
         return None;
     }
 
+    // Debounce: don't compact too frequently even when the token count says we
+    // should.  When context hovers near the threshold, compacting every turn
+    // wastes API calls and churns the transcript.  Both a minimum turn gap and
+    // a minimum wall-clock time must elapse since the last successful compaction.
+    //
+    // The gate only fires after the FIRST compaction has occurred — before that
+    // there is nothing to throttle (first compaction fires immediately at threshold).
+    state.turns_since_last_compact += 1;
+    if let Some(last) = state.last_compact_at {
+        if state.turns_since_last_compact < MIN_COMPACT_TURN_GAP {
+            debug!(
+                turns_since = state.turns_since_last_compact,
+                min_gap = MIN_COMPACT_TURN_GAP,
+                "Auto-compact debounced (turn-gap)"
+            );
+            return None;
+        }
+        let elapsed = last.elapsed().as_secs();
+        if elapsed < MIN_COMPACT_TIME_GAP_SECS {
+            debug!(
+                elapsed_secs = elapsed,
+                min_gap_secs = MIN_COMPACT_TIME_GAP_SECS,
+                "Auto-compact debounced (time-gap)"
+            );
+            return None;
+        }
+    }
+
     info!(
         input_tokens,
         model,
@@ -1219,7 +1290,7 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(client, messages, model).await {
+    match compact_conversation(provider, messages, model).await {
         Ok(new_msgs) => {
             state.on_success();
             info!(
@@ -1259,7 +1330,10 @@ pub async fn auto_compact_if_needed(
 #[derive(Debug, Clone)]
 pub enum CompactTrigger {
     /// Normal 90 %-threshold compact.
-    TokenThreshold { tokens_used: u64, context_limit: u64 },
+    TokenThreshold {
+        tokens_used: u64,
+        context_limit: u64,
+    },
     /// Caller requested an unconditional compact.
     Forced,
 }
@@ -1268,7 +1342,7 @@ pub enum CompactTrigger {
 #[derive(Debug, Clone)]
 pub struct CompactResult {
     /// The new (reduced) message list.
-    pub messages: Vec<claurst_core::types::Message>,
+    pub messages: Vec<clawde_core::types::Message>,
     /// Formatted summary text injected at the head of `messages`.
     pub summary: String,
     /// Rough estimate of how many tokens were freed.
@@ -1308,7 +1382,10 @@ pub fn should_context_collapse(tokens_used: u64, context_limit: u64) -> bool {
 /// Returns `(new_messages, rough_tokens_freed)`.
 ///
 /// Mirrors `snipCompact` from TypeScript (no API call required — purely local).
-pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: usize) -> (Vec<claurst_core::types::Message>, u64) {
+pub fn snip_compact(
+    messages: Vec<clawde_core::types::Message>,
+    keep_n_newest: usize,
+) -> (Vec<clawde_core::types::Message>, u64) {
     let total = messages.len();
     if total <= keep_n_newest + 1 {
         // Nothing to snip.
@@ -1324,8 +1401,7 @@ pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: 
     }
 
     // Estimate how many tokens the snipped range held.
-    let snipped_tokens =
-        estimate_tokens_for_messages(&messages[snip_start..snip_end]) as u64;
+    let snipped_tokens = estimate_tokens_for_messages(&messages[snip_start..snip_end]) as u64;
 
     let mut result = Vec::with_capacity(1 + keep_n_newest);
     result.push(messages[0].clone());
@@ -1340,7 +1416,10 @@ pub fn snip_compact(messages: Vec<claurst_core::types::Message>, keep_n_newest: 
 /// Returns the cut index (0 = keep everything, messages.len() = keep nothing).
 /// Iterates from the newest message backwards, accumulating token estimates
 /// until the budget is exhausted.
-pub fn calculate_messages_to_keep_index(messages: &[claurst_core::types::Message], token_budget: u64) -> usize {
+pub fn calculate_messages_to_keep_index(
+    messages: &[clawde_core::types::Message],
+    token_budget: u64,
+) -> usize {
     if messages.is_empty() {
         return 0;
     }
@@ -1367,8 +1446,8 @@ pub fn calculate_messages_to_keep_index(messages: &[claurst_core::types::Message
 /// Image tokens are expensive and carry no information that a text summary
 /// needs.  Mirrors the TypeScript `stripImages` helper used inside
 /// `reactiveCompact.ts`.
-fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
-    use claurst_core::types::{ContentBlock, MessageContent};
+fn strip_images(messages: Vec<clawde_core::types::Message>) -> Vec<clawde_core::types::Message> {
+    use clawde_core::types::{ContentBlock, MessageContent};
 
     messages
         .into_iter()
@@ -1378,7 +1457,8 @@ fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core
                 // If stripping left only an empty block list, collapse to a
                 // placeholder text so the conversation remains parseable.
                 if blocks.is_empty() {
-                    msg.content = MessageContent::Text("[image removed for compaction]".to_string());
+                    msg.content =
+                        MessageContent::Text("[image removed for compaction]".to_string());
                 }
             }
             msg
@@ -1390,19 +1470,19 @@ fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core
 /// conversation.
 ///
 /// Feature gate: only call this when
-/// `claurst_core::feature_gates::is_feature_enabled("reactive_compact")` is true.
+/// `clawde_core::feature_gates::is_feature_enabled("reactive_compact")` is true.
 ///
 /// The `cancel` token is checked before the API call so the user can abort
 /// a long-running compact.
 pub async fn reactive_compact(
-    messages: Vec<claurst_core::types::Message>,
-    client: &claurst_api::AnthropicClient,
+    messages: Vec<clawde_core::types::Message>,
+    provider: &dyn LlmProvider,
     config: &crate::QueryConfig,
     cancel: tokio_util::sync::CancellationToken,
     recently_modified: &[std::path::PathBuf],
-) -> Result<CompactResult, claurst_core::error::ClaudeError> {
+) -> Result<CompactResult, clawde_core::error::ClaudeError> {
     if cancel.is_cancelled() {
-        return Err(claurst_core::error::ClaudeError::Cancelled);
+        return Err(clawde_core::error::ClaudeError::Cancelled);
     }
 
     let total = messages.len();
@@ -1430,11 +1510,10 @@ pub async fn reactive_compact(
         });
     }
 
-    let original_token_estimate =
-        estimate_tokens_for_messages(&stripped[..split_at]) as u64;
+    let original_token_estimate = estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
     let mut new_messages =
-        summarise_head(client, &stripped, split_at, &config.model, 20_000).await?;
+        summarise_head(provider, &stripped, split_at, &config.model, 20_000).await?;
 
     // The summary lives as the first message in new_messages.
     let summary_text = new_messages
@@ -1463,7 +1542,7 @@ pub async fn reactive_compact(
         };
         let file_name = path.display().to_string();
         let text = format!("<file path=\"{}\">\n{}\n</file>", file_name, content);
-        new_messages.push(claurst_core::types::Message::user(text));
+        new_messages.push(clawde_core::types::Message::user(text));
         injected += 1;
     }
 
@@ -1485,13 +1564,10 @@ pub async fn reactive_compact(
 /// context is at ≥ 97 % capacity and a regular reactive compact is unlikely
 /// to free enough space.
 pub async fn context_collapse(
-    messages: Vec<claurst_core::types::Message>,
-    client: &claurst_api::AnthropicClient,
+    messages: Vec<clawde_core::types::Message>,
+    provider: &dyn LlmProvider,
     config: &crate::QueryConfig,
-) -> Result<CompactResult, claurst_core::error::ClaudeError> {
-    use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
-    use serde_json::Value;
-    use std::sync::Arc;
+) -> Result<CompactResult, clawde_core::error::ClaudeError> {
 
     let total = messages.len();
     if total == 0 {
@@ -1508,8 +1584,8 @@ pub async fn context_collapse(
     let mut transcript = String::new();
     for msg in &messages {
         let role = match msg.role {
-            claurst_core::types::Role::User => "Human",
-            claurst_core::types::Role::Assistant => "Assistant",
+            clawde_core::types::Role::User => "Human",
+            clawde_core::types::Role::Assistant => "Assistant",
         };
         let text = msg.get_all_text();
         if !text.is_empty() {
@@ -1529,42 +1605,39 @@ pub async fn context_collapse(
         transcript
     );
 
-    let api_msgs = vec![ApiMessage {
-        role: "user".to_string(),
-        content: Value::String(collapse_prompt),
-    }];
-
-    let request = CreateMessageRequest::builder(&config.model, 1_000)
-        .messages(api_msgs)
-        .system(SystemPrompt::Text(
+    let request = ProviderRequest {
+        model: config.model.clone(),
+        messages: vec![Message::user(collapse_prompt)],
+        system_prompt: Some(SystemPrompt::Text(
             "You are a conversation summariser. Produce an emergency ultra-short \
              summary as instructed. Plain text only."
                 .to_string(),
-        ))
-        .build();
+        )),
+        tools: vec![],
+        max_tokens: 1_000,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: vec![],
+        thinking: None,
+        provider_options: Default::default(),
+    };
 
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
+    let response = provider
+        .create_message(request)
+        .await
+        .map_err(|e| clawde_core::error::ClaudeError::Api(e.to_string()))?;
 
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
-    }
-
-    let (summary_msg, _usage, _stop) = acc.finish();
-    let summary_text = summary_msg.get_all_text();
+    let summary_text = compact_text_from_blocks(&response.content);
 
     if summary_text.is_empty() {
-        return Err(claurst_core::error::ClaudeError::Other(
+        return Err(clawde_core::error::ClaudeError::Other(
             "Context-collapse summary was empty".to_string(),
         ));
     }
 
     // Keep only: the synthetic summary + the most recent user turn.
-    let collapse_notice = claurst_core::types::Message::user(format!(
+    let collapse_notice = clawde_core::types::Message::user(format!(
         "[EMERGENCY CONTEXT COLLAPSE — conversation condensed to stay within limits]\n\n{}",
         summary_text
     ));
@@ -1573,7 +1646,7 @@ pub async fn context_collapse(
     let last_user = messages
         .iter()
         .rev()
-        .find(|m| m.role == claurst_core::types::Role::User)
+        .find(|m| m.role == clawde_core::types::Role::User)
         .cloned();
 
     let mut new_messages = vec![collapse_notice];
@@ -1605,8 +1678,10 @@ const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 ///
 /// When the same file is read more than once in the conversation, replaces
 /// all but the last read with `[Content shown N time(s); showing last occurrence only]`.
-pub fn collapse_read_tool_results(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
-    use claurst_core::types::{ContentBlock, MessageContent, ToolResultContent};
+pub fn collapse_read_tool_results(
+    messages: Vec<clawde_core::types::Message>,
+) -> Vec<clawde_core::types::Message> {
+    use clawde_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashMap;
 
     // Helper: extract a fingerprint string from ToolResultContent.
@@ -1665,8 +1740,10 @@ pub fn collapse_read_tool_results(messages: Vec<claurst_core::types::Message>) -
 ///
 /// If the same search was run more than once (same query), keep only the
 /// most recent result; replace earlier results with a truncation notice.
-pub fn collapse_search_results(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core::types::Message> {
-    use claurst_core::types::{ContentBlock, MessageContent, ToolResultContent};
+pub fn collapse_search_results(
+    messages: Vec<clawde_core::types::Message>,
+) -> Vec<clawde_core::types::Message> {
+    use clawde_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashSet;
 
     fn fingerprint(content: &ToolResultContent) -> Option<String> {
@@ -1679,7 +1756,7 @@ pub fn collapse_search_results(messages: Vec<claurst_core::types::Message>) -> V
     let mut seen_results: HashSet<String> = HashSet::new();
 
     // Iterate in reverse to keep the latest occurrence.
-    let mut result: Vec<claurst_core::types::Message> = messages
+    let mut result: Vec<clawde_core::types::Message> = messages
         .into_iter()
         .rev()
         .map(|mut msg| {
@@ -1712,7 +1789,7 @@ pub fn collapse_search_results(messages: Vec<claurst_core::types::Message>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, ToolResultContent};
+    use clawde_core::types::{Message, ToolResultContent};
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
@@ -1788,7 +1865,10 @@ mod tests {
 
     #[test]
     fn test_should_not_compact_when_disabled() {
-        let state = AutoCompactState { disabled: true, ..Default::default() };
+        let state = AutoCompactState {
+            disabled: true,
+            ..Default::default()
+        };
         assert!(!should_auto_compact(195_000, "claude-sonnet-4-6", &state));
     }
 
@@ -1946,11 +2026,11 @@ mod tests {
 
     /// Build an in-memory `ModelRegistry` from a models.dev-style JSON snapshot
     /// by round-tripping it through the real `load_cache` parse path.
-    fn registry_from_json(json: &str) -> claurst_api::ModelRegistry {
+    fn registry_from_json(json: &str) -> clawde_api::ModelRegistry {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("models_dev.json");
         std::fs::write(&path, json).expect("write snapshot");
-        let mut reg = claurst_api::ModelRegistry::new();
+        let mut reg = clawde_api::ModelRegistry::new();
         reg.load_cache(&path);
         reg
     }
@@ -1964,7 +2044,10 @@ mod tests {
         let reg = registry_from_json(TEST_SNAPSHOT);
         // Sanity: the registry really carries the 1M window.
         assert_eq!(
-            reg.get("testprov", "big-context-model").unwrap().info.context_window,
+            reg.get("testprov", "big-context-model")
+                .unwrap()
+                .info
+                .context_window,
             1_000_000
         );
         assert_eq!(
@@ -1995,8 +2078,14 @@ mod tests {
             resolve_context_window(None, "anthropic", "claude-opus-4-8"),
             context_window_for_model("claude-opus-4-8")
         );
-        assert_eq!(resolve_context_window(None, "anthropic", "claude-opus-4-8"), 200_000);
-        assert_eq!(resolve_context_window(None, "some-provider", "some-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(None, "anthropic", "claude-opus-4-8"),
+            200_000
+        );
+        assert_eq!(
+            resolve_context_window(None, "some-provider", "some-model"),
+            100_000
+        );
     }
 
     #[test]
@@ -2007,7 +2096,10 @@ mod tests {
             resolve_context_window(Some(&reg), "nope", "ghost-model"),
             context_window_for_model("ghost-model")
         );
-        assert_eq!(resolve_context_window(Some(&reg), "nope", "ghost-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(Some(&reg), "nope", "ghost-model"),
+            100_000
+        );
     }
 
     #[test]
@@ -2015,7 +2107,10 @@ mod tests {
         let reg = registry_from_json(TEST_SNAPSHOT);
         // The registry stores the models.dev-omission placeholder (4096)...
         assert_eq!(
-            reg.get("testprov", "tiny-model").unwrap().info.context_window,
+            reg.get("testprov", "tiny-model")
+                .unwrap()
+                .info
+                .context_window,
             4096
         );
         // ...but resolve treats it as "unknown" and uses the heuristic instead
@@ -2024,7 +2119,10 @@ mod tests {
             resolve_context_window(Some(&reg), "testprov", "tiny-model"),
             context_window_for_model("tiny-model")
         );
-        assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "tiny-model"),
+            100_000
+        );
     }
 
     // ---- estimate_tokens_for_messages --------------------------------------
@@ -2078,10 +2176,10 @@ mod tests {
         // A round whose tool_use is huge, so the raw budget cut lands right on
         // the tool_result — which would orphan it from its call.
         let msgs = vec![
-            Message::user(filler(400)),                                       // 0
+            Message::user(filler(400)), // 0
             assistant_tool_use("t1", "Bash", serde_json::json!({ "command": filler(8000) })), // 1 (BIG)
-            user_tool_result("t1", &filler(400)),                            // 2 (tool_result)
-            Message::assistant(filler(400)),                                 // 3
+            user_tool_result("t1", &filler(400)), // 2 (tool_result)
+            Message::assistant(filler(400)),      // 3
         ];
 
         // Raw token-budget index lands ON the tool_result (index 2).
@@ -2247,7 +2345,10 @@ mod tests {
             .collect();
         let manifest = format_files_touched(&extract_file_operations(&msgs));
 
-        assert!(manifest.contains("(+5 more)"), "expected overflow marker:\n{manifest}");
+        assert!(
+            manifest.contains("(+5 more)"),
+            "expected overflow marker:\n{manifest}"
+        );
         // Exactly MAX_MANIFEST_FILES paths are shown before the marker.
         let modified_line = manifest
             .lines()

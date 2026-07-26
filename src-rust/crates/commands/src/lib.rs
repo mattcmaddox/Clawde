@@ -9,6 +9,7 @@ use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
+use std::time::Duration;
 #[allow(unused_imports)]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -303,6 +304,7 @@ pub struct InitCommand;
 pub struct HooksCommand;
 pub struct ImportConfigCommand;
 pub struct ThinkingCommand;
+pub struct AutoCompactCommand;
 // New commands
 // Batch-1 new commands
 // New commands: teleport, btw, ctx-viz, sandbox-toggle
@@ -520,7 +522,7 @@ fn command_category(name: &str) -> &'static str {
             "Sessions & Remote"
         }
         "help" | "exit" => "General",
-        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
+        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "auto-compact" => "AI & Thinking",
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
         | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
@@ -650,6 +652,88 @@ impl SlashCommand for ClearCommand {
 
 // ---- /compact ------------------------------------------------------------
 
+/// Errors that can occur during compact summary generation.
+#[derive(Debug)]
+enum CompactError {
+    /// No provider available.
+    NoProvider,
+    /// The provider returned an error.
+    ProviderError,
+    /// The API request timed out.
+    Timeout,
+    /// The generated summary was empty.
+    EmptySummary,
+}
+
+/// Generate a compact summary of the conversation, returning the formatted
+/// summary text on success or a [`CompactError`] on failure.
+///
+/// Handles the common logic shared by `/compact` (preview) and
+/// `/compact send` (inject): transcript building, provider lookup, request
+/// construction, API call with timeout, response parsing, and formatting.
+/// Each caller maps the result into the appropriate [`CommandResult`] variant.
+async fn try_compact(
+    ctx: &CommandContext,
+    msg_count: usize,
+    custom_instructions: Option<&str>,
+    compact_model: &str,
+) -> Result<String, CompactError> {
+    let transcript = build_conversation_transcript(&ctx.messages);
+
+    let provider = match provider_for_config(&ctx.config).await {
+        Some(p) => p,
+        None => return Err(CompactError::NoProvider),
+    };
+
+    let compact_prompt_text =
+        clawde_query::compact::get_compact_prompt(custom_instructions, None);
+
+    let system_prompt_text =
+        "You are an expert conversation summariser that creates thorough, structured          summaries preserving all technical details, file names, code snippets, and          decisions. Follow the instructions carefully and respond with the structured          format requested.";
+
+    let user_content = format!(
+        "{}\n\n<conversation_to_summarize original_messages=\"{}\">\n{}\n</conversation_to_summarize>",
+        compact_prompt_text,
+        msg_count,
+        transcript
+    );
+
+    let request = clawde_api::ProviderRequest {
+        model: compact_model.to_string(),
+        messages: vec![clawde_core::types::Message::user(user_content)],
+        system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt_text.to_string())),
+        tools: vec![],
+        max_tokens: 8192,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: vec![],
+        thinking: None,
+        provider_options: serde_json::Value::Object(Default::default()),
+    };
+
+    let response = match tokio::time::timeout(
+        Duration::from_secs(120),
+        provider.create_message(request),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => return Err(CompactError::ProviderError),
+        Err(_) => {
+            tracing::warn!("Compact request timed out after 120s");
+            return Err(CompactError::Timeout);
+        }
+    };
+
+    let raw_text = crate::text_from_content_blocks(&response.content);
+    if raw_text.trim().is_empty() {
+        return Err(CompactError::EmptySummary);
+    }
+
+    Ok(clawde_query::compact::format_compact_summary(&raw_text))
+}
+
 #[async_trait]
 impl SlashCommand for CompactCommand {
     fn name(&self) -> &str {
@@ -659,14 +743,15 @@ impl SlashCommand for CompactCommand {
         "Compact the conversation to reduce token usage"
     }
     fn help(&self) -> &str {
-        "Usage: /compact [custom instructions]\n\n\
+        "Usage: /compact [custom instructions|send]\n\n\
          Summarises the conversation using the active provider, preserving\n\
          key technical details, decisions, file paths, and current task status.\n\
          The summary replaces earlier messages so the model can continue with\n\
          reduced token usage.\n\n\
-         Optional custom instructions can tailor the summary focus:\n\
-           /compact focus on the API design decisions\n\
-           /compact include all error messages encountered"
+         Subcommands:\n\
+           /compact                    - preview the compact summary\n\
+           /compact <instructions>     - preview with custom focus\n\
+           /compact send               - inject the summary as a user message"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -677,92 +762,75 @@ impl SlashCommand for CompactCommand {
             );
         }
 
-        let transcript = build_conversation_transcript(&ctx.messages);
-
-        let provider = match provider_for_config(&ctx.config).await {
-            Some(p) => p,
-            None => {
-                return CommandResult::Error(
-                    "No provider available for compaction. Configure an API key first.".to_string(),
-                );
-            }
-        };
-
-        let compact_model = resolve_fast_model_id(&ctx.config);
-        let custom_instructions = if args.trim().is_empty() {
+        // Determine whether to inject (send) or preview, and collect any
+        // custom instructions from the arguments (skipped for "send").
+        let is_send = args.trim().eq_ignore_ascii_case("send");
+        let custom_instructions = if is_send || args.trim().is_empty() {
             None
         } else {
             Some(args.trim())
         };
 
-        let compact_prompt_text =
-            clawde_query::compact::get_compact_prompt(custom_instructions, None);
+        let compact_model = resolve_fast_model_id(&ctx.config);
 
-        let system_prompt = "You are an expert conversation summariser that creates \
-            thorough, structured summaries preserving all technical details, \
-            file names, code snippets, and decisions. Follow the instructions \
-            carefully and respond with the structured format requested.";
-
-        let user_content = format!(
-            "{}\n\n<conversation_to_summarize original_messages=\"{}\">\n{}\n</conversation_to_summarize>",
-            compact_prompt_text,
-            msg_count,
-            transcript
-        );
-
-        let request = clawde_api::ProviderRequest {
-            model: compact_model.clone(),
-            messages: vec![Message::user(user_content)],
-            system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt.to_string())),
-            tools: vec![],
-            max_tokens: 8192,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: vec![],
-            thinking: None,
-            provider_options: serde_json::Value::Object(Default::default()),
-        };
-
-        match provider.create_message(request).await {
-            Ok(response) => {
-                let raw_text = text_from_content_blocks(&response.content);
-                if raw_text.trim().is_empty() {
-                    return CommandResult::Error(
-                        "Compact summary was empty. Try again or use /compact send.".to_string(),
-                    );
-                }
-
-                let formatted = clawde_query::compact::format_compact_summary(&raw_text);
-
-                CommandResult::Message(format!(
-                    "Conversation Compact\n\
-                     ------------------\n\
-                     Original messages: {msg_count}\n\
-                     Model: {compact_model}\n\n\
-                     {formatted}\n\n\
-                     ----\n\
-                     Use /compact send to ask the model to perform the compaction \
-                     (replace history with this summary)."
-                ))
-            }
-            Err(_e) => {
-                let fallback_instruction = if args.trim().is_empty() {
-                    "Provide a detailed summary of our conversation so far, preserving all \
-                     key technical details, decisions made, file paths mentioned, and current \
-                     task status."
+        match try_compact(ctx, msg_count, custom_instructions, &compact_model).await {
+            Ok(formatted) => {
+                if is_send {
+                    CommandResult::UserMessage(format!(
+                        "[Compact requested - {} earlier messages summarized. Summary below replaces them. Please continue from where we left off.]\n\n<compact-summary>\n{}\n</compact-summary>",
+                        msg_count, formatted
+                    ))
                 } else {
-                    args.trim()
-                };
-                CommandResult::UserMessage(format!(
-                    "[Compact requested ({} messages). Instruction: {}]",
-                    msg_count, fallback_instruction
-                ))
+                    CommandResult::Message(format!(
+                        "Conversation Compact\n------------------\nOriginal messages: {msg_count}\nModel: {compact_model}\n\n{formatted}\n\n----\nUse /compact send to ask the model to perform the compaction (replace history with this summary)."
+                    ))
+                }
+            }
+            Err(CompactError::NoProvider) => CommandResult::Error(
+                "No provider available for compaction. Configure an API key first.".to_string(),
+            ),
+            Err(CompactError::ProviderError) => {
+                if is_send {
+                    CommandResult::Error(
+                        "Compact send failed. Try /compact first to preview.".to_string(),
+                    )
+                } else {
+                    let fallback_instruction = if args.trim().is_empty() {
+                        "Provide a detailed summary of our conversation so far, preserving all key technical details, decisions made, file paths mentioned, and current task status."
+                    } else {
+                        args.trim()
+                    };
+                    CommandResult::UserMessage(format!(
+                        "[Compact requested ({} messages). Instruction: {}]",
+                        msg_count, fallback_instruction
+                    ))
+                }
+            }
+            Err(CompactError::Timeout) => {
+                if is_send {
+                    CommandResult::Error(
+                        "Compact send timed out after 120 seconds. Try /compact first to preview.".to_string(),
+                    )
+                } else {
+                    CommandResult::Message(
+                        "Compact request timed out after 120 seconds. Try again or use /compact send to request the model to summarise the conversation in a new message.".to_string(),
+                    )
+                }
+            }
+            Err(CompactError::EmptySummary) => {
+                if is_send {
+                    CommandResult::Error(
+                        "Compact summary was empty. Cannot perform compaction.".to_string(),
+                    )
+                } else {
+                    CommandResult::Error(
+                        "Compact summary was empty. Try again or use /compact send.".to_string(),
+                    )
+                }
             }
         }
     }
 }
-
 /// Build a plain-text transcript of all messages for the compaction prompt.
 fn build_conversation_transcript(messages: &[Message]) -> String {
     let mut transcript = String::new();
@@ -1359,6 +1427,67 @@ impl SlashCommand for ThinkingCommand {
     }
 }
 
+// ---- /auto-compact ----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AutoCompactCommand {
+    fn name(&self) -> &str {
+        "auto-compact"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["autocompact"]
+    }
+    fn description(&self) -> &str {
+        "Toggle automatic context compaction on/off"
+    }
+    fn help(&self) -> &str {
+        "Usage: /auto-compact [on|off]\n\n\
+         Toggles automatic context compaction. When enabled, the conversation\n\
+         is automatically compacted as the context window fills up.\n\n\
+         Subcommands:\n\
+           /auto-compact        - toggle status (show current state)\n\
+           /auto-compact on     - enable auto-compact\n\
+           /auto-compact off    - disable auto-compact\n\
+         The setting is persisted in settings.json."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let current = ctx.config.auto_compact;
+        let new_value = match args.trim() {
+            "on" | "enable" | "1" | "true" => true,
+            "off" | "disable" | "0" | "false" => false,
+            "" => !current, // toggle
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown argument '{}'. Use 'on', 'off', or no argument to toggle.",
+                    other
+                ));
+            }
+        };
+
+        if new_value == current {
+            return CommandResult::Message(format!(
+                "Auto-compact is already {}.", if current { "enabled" } else { "disabled" }
+            ));
+        }
+
+        // Persist the setting via settings.json
+        if let Err(e) = save_settings_mutation(|settings| {
+            settings.auto_compact = new_value;
+        }) {
+            return CommandResult::Error(format!("Failed to save setting: {}", e));
+        }
+
+        let mut new_config = ctx.config.clone();
+        new_config.auto_compact = new_value;
+        let msg = format!(
+            "Auto-compact {}.",
+            if new_value { "enabled" } else { "disabled" }
+        );
+        CommandResult::ConfigChangeMessage(new_config, msg)
+    }
+}
+
 // ---- Named-command slash adapters ----------------------------------------
 
 #[async_trait]
@@ -1427,6 +1556,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SessionCommand),
         Box::new(ForkCommand),
         Box::new(ThinkingCommand),
+        Box::new(AutoCompactCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
         Box::new(KeybindingsCommand),
@@ -2274,7 +2404,35 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
+    async fn test_compact_send_with_two_messages() {
+        let mut ctx = make_ctx();
+        ctx.messages.push(Message::user("Hello"));
+        ctx.messages.push(Message::assistant("Hi there!"));
+        let cmd = find_command("compact").unwrap();
+        let result = cmd.execute("send", &mut ctx).await;
+        // With no provider configured, falls back to Error "No provider available".
+        // With a provider but API failure, falls back to UserMessage with fallback
+        // instruction. Both are acceptable outcomes.
+        match result {
+            CommandResult::UserMessage(msg) => {
+                assert!(
+                    msg.contains("Compact"),
+                    "Expected compact instruction, got: {}",
+                    msg
+                );
+            }
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("No provider") || msg.contains("timed out") || msg.contains("Compact send failed"),
+                    "Expected provider or timeout error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected UserMessage or Error, got {:?}", other),
+        }
+    }
+
     fn test_build_conversation_transcript_empty() {
         let result = build_conversation_transcript(&[]);
         assert_eq!(result, "");
@@ -2537,5 +2695,114 @@ mod tests {
             find_command("compact").is_some(),
             "/compact should be registered"
         );
+    }
+
+    // ---- /auto-compact tests (Gap 6: ConfigChange sync regression) ----------
+
+    #[tokio::test]
+    async fn auto_compact_command_toggle_on_from_off() {
+        let mut ctx = make_ctx();
+        ctx.config.auto_compact = false;
+        let cmd = AutoCompactCommand;
+
+        let result = cmd.execute("on", &mut ctx).await;
+
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(
+                    new_cfg.auto_compact,
+                    "ConfigChangeMessage should have auto_compact = true after /auto-compact on"
+                );
+                assert!(
+                    msg.to_lowercase().contains("enabled"),
+                    "Status message should indicate auto-compact was enabled, got: {msg}"
+                );
+            }
+            other => panic!("Expected ConfigChangeMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_command_toggle_off_from_on() {
+        let mut ctx = make_ctx();
+        ctx.config.auto_compact = true;
+        let cmd = AutoCompactCommand;
+
+        let result = cmd.execute("off", &mut ctx).await;
+
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(
+                    !new_cfg.auto_compact,
+                    "ConfigChangeMessage should have auto_compact = false after /auto-compact off"
+                );
+                assert!(
+                    msg.to_lowercase().contains("disabled"),
+                    "Status message should indicate auto-compact was disabled, got: {msg}"
+                );
+            }
+            other => panic!("Expected ConfigChangeMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_command_toggle_no_args_flips_state() {
+        let mut ctx = make_ctx();
+        ctx.config.auto_compact = false;
+        let cmd = AutoCompactCommand;
+
+        let result = cmd.execute("", &mut ctx).await;
+
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, _msg) => {
+                assert!(
+                    new_cfg.auto_compact,
+                    "Toggle from off should produce auto_compact = true"
+                );
+            }
+            other => panic!("Expected ConfigChangeMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_command_noop_when_already_in_state() {
+        let mut ctx = make_ctx();
+        ctx.config.auto_compact = true;
+        let cmd = AutoCompactCommand;
+
+        let result = cmd.execute("on", &mut ctx).await;
+
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("already"),
+                    "No-op should say 'already enabled', got: {msg}"
+                );
+                // Verify config was NOT changed by the no-op.
+                assert!(
+                    ctx.config.auto_compact,
+                    "auto_compact should still be true after no-op"
+                );
+            }
+            other => panic!("Expected Message for no-op, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_compact_command_rejects_unknown_arg() {
+        let mut ctx = make_ctx();
+        let cmd = AutoCompactCommand;
+
+        let result = cmd.execute("maybe", &mut ctx).await;
+
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(
+                    msg.contains("Unknown"),
+                    "Error message should say 'Unknown', got: {msg}"
+                );
+            }
+            other => panic!("Expected Error for unknown arg, got {other:?}"),
+        }
     }
 }

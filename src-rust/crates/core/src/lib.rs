@@ -1872,6 +1872,11 @@ pub mod config {
                     config.skills.urls.push(u.clone());
                 }
             }
+            // Top-level autoCompact: the Settings field defaults to true (via serde),
+            // whereas Config::auto_compact defaults to false.  Merge so that
+            // `"autoCompact": true` in settings.json actually enables auto-compact.
+            config.auto_compact = self.auto_compact || config.auto_compact;
+
             // Copy file autocomplete and injection settings from the top-level Settings
             // fields, but only when they were explicitly set (differ from their defaults).
             // If they're at defaults, the nested "config" section value (already in `config`
@@ -4935,6 +4940,7 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
+        let _lock = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
@@ -5526,6 +5532,47 @@ mod tests {
         assert_eq!(
             registry.get(&id).unwrap().status,
             tasks::TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_legacy_claurst_fallback() {
+        // Verify that config_dir() falls back to ~/.claurst/ when
+        // ~/.clawde/ does not exist (backward compat for pre-rename installs).
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(".claurst");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let _lock = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", dir.path());
+
+        // Clear CLAWDE_HOME / XDG_CONFIG_HOME so they don't interfere
+        let saved_clawde_home = std::env::var_os("CLAWDE_HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::remove_var("CLAWDE_HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        let result = Settings::config_dir();
+
+        // Restore env vars
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_clawde_home {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert!(
+            result.ends_with(".claurst"),
+            "Expected config_dir() to fall back to .claurst/ but got {}",
+            result.display()
         );
     }
 }

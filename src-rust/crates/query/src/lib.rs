@@ -58,7 +58,7 @@ pub use skill_prefetch::{
 
 use clawde_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemPrompt, ThinkingConfig,
+    StreamHandler, LlmProvider, SystemPrompt, ThinkingConfig,
 };
 use clawde_core::config::Config;
 use clawde_core::cost::CostTracker;
@@ -456,7 +456,39 @@ pub async fn run_query_loop(
         s.track().await
     } else {
         None
+    };    // Resolve a provider for auto-compact API calls (Gap 2: generic provider support).
+    // Uses the existing provider_registry if available, otherwise builds a fresh
+    // registry from config so compaction works with both Anthropic and non-Anthropic providers.
+    let compact_provider: Option<Arc<dyn LlmProvider>> = {
+        let pid = tool_ctx.config.selected_provider_id();
+        // Try the existing provider_registry first.
+        let from_registry = config.provider_registry.as_ref().and_then(|reg| {
+            reg.get(&clawde_core::ProviderId::new(&*pid)).cloned()
+        });
+        if from_registry.is_some() {
+            from_registry
+        } else {
+            // No registry available — build one from config.
+            let anthropic_auth = tool_ctx.config.resolve_anthropic_auth_async().await;
+            let new_reg = clawde_api::ProviderRegistry::from_config(
+                &tool_ctx.config,
+                clawde_api::client::ClientConfig {
+                    api_key: anthropic_auth
+                        .as_ref()
+                        .map(|(credential, _)| credential.clone())
+                        .unwrap_or_default(),
+                    api_base: tool_ctx.config.resolve_anthropic_api_base(),
+                    use_bearer_auth: anthropic_auth
+                        .as_ref()
+                        .is_some_and(|(_, use_bearer)| *use_bearer),
+                    ..Default::default()
+                },
+            );
+            new_reg.get(&clawde_core::ProviderId::new(pid)).cloned()
+        }
     };
+
+
 
     loop {
         turn += 1;
@@ -1660,75 +1692,79 @@ pub async fn run_query_loop(
         let reactive_compact_enabled =
             clawde_core::feature_gates::is_feature_enabled("reactive_compact");
 
-        if reactive_compact_enabled {
-            // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = context_window;
-            if compact::should_context_collapse(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Compacting context... (emergency collapse)".to_string(),
-                    ));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome = compact::context_collapse(messages.clone(), client, config).await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Context-collapse complete");
+        // Guard: only compact when a provider is available (prevents panic if
+        // no API key is configured at the start of a session).
+        if let Some(ref cp) = compact_provider {
+            if tool_ctx.config.auto_compact {
+            if reactive_compact_enabled {
+                // Reactive path: emergency collapse takes priority over normal compact.
+                let context_limit = context_window;
+                if compact::should_context_collapse(context_tokens, context_limit) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Compacting context... (emergency collapse)".to_string(),
+                        ));
                     }
-                    Err(e) => {
-                        // `*messages` is left untouched — the conversation is intact.
-                        warn!(error = %e, "Context-collapse failed; conversation preserved");
+                    // Pass a clone so the live conversation survives a failed
+                    // compaction; `*messages` is only overwritten on success (#213).
+                    let outcome = compact::context_collapse(messages.clone(), cp.as_ref(), config).await;
+                    match apply_compact_result(messages, outcome) {
+                        Ok(tokens_freed) => {
+                            info!(tokens_freed, "Context-collapse complete");
+                        }
+                        Err(e) => {
+                            // `*messages` is left untouched — the conversation is intact.
+                            warn!(error = %e, "Context-collapse failed; conversation preserved");
+                        }
+                    }
+                } else if compact::should_compact(context_tokens, context_limit) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
+                    }
+                    // Pass a clone so the live conversation survives a failed
+                    // compaction; `*messages` is only overwritten on success (#213).
+                    let outcome = compact::reactive_compact(
+                        messages.clone(),
+                        cp.as_ref(),
+                        config,
+                        cancel_token.clone(),
+                        &[],
+                    )
+                    .await;
+                    match apply_compact_result(messages, outcome) {
+                        Ok(tokens_freed) => {
+                            info!(tokens_freed, "Reactive compact complete");
+                        }
+                        // `*messages` is left untouched on both failure arms below.
+                        Err(clawde_core::error::ClaudeError::Cancelled) => {
+                            warn!("Reactive compact was cancelled; conversation preserved");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Reactive compact failed; conversation preserved");
+                        }
                     }
                 }
-            } else if compact::should_compact(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome = compact::reactive_compact(
-                    messages.clone(),
-                    client,
-                    config,
-                    cancel_token.clone(),
-                    &[],
+            } else if stop == "end_turn" || stop == "tool_use" {
+                // Proactive auto-compact (original path, used when reactive compact is off).
+                if let Some(new_msgs) = compact::auto_compact_if_needed(
+                    cp.as_ref(),
+                    messages,
+                    context_tokens,
+                    &config.model,
+                    context_window,
+                    &mut compact_state,
                 )
-                .await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Reactive compact complete");
+                .await
+                {
+                    *messages = new_msgs;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Context compacted to stay within limits.".to_string(),
+                        ));
                     }
-                    // `*messages` is left untouched on both failure arms below.
-                    Err(clawde_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled; conversation preserved");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Reactive compact failed; conversation preserved");
-                    }
-                }
-            }
-        } else if stop == "end_turn" || stop == "tool_use" {
-            // Proactive auto-compact (original path, used when reactive compact is off).
-            if let Some(new_msgs) = compact::auto_compact_if_needed(
-                client,
-                messages,
-                context_tokens,
-                &config.model,
-                context_window,
-                &mut compact_state,
-            )
-            .await
-            {
-                *messages = new_msgs;
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Context compacted to stay within limits.".to_string(),
-                    ));
                 }
             }
         }
-
         if let Some(ref tx) = event_tx {
             let _ = tx.send(QueryEvent::TurnComplete {
                 turn,
@@ -2140,7 +2176,8 @@ pub async fn run_query_loop(
                 continue_or_end!(assistant_msg, usage);
             }
         }
-    }
+                }
+}
 }
 
 /// Stream handler that forwards events to an unbounded channel.

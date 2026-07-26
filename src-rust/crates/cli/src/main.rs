@@ -48,6 +48,7 @@ use clawde_core::{
 };
 use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use parking_lot::Mutex as ParkingMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -1891,6 +1892,7 @@ async fn run_interactive(
         session.working_dir = Some(tool_ctx.working_dir.display().to_string());
         session
     };
+    let mut last_auto_save = std::time::Instant::now();
     let initial_messages = session.messages.clone();
     let mut base_query_config = query_config;
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
@@ -2203,7 +2205,40 @@ async fn run_interactive(
         .map(|s| s.terminal_progress_bar)
         .unwrap_or(true);
     let mut progress_shown = false;
+
+    // SIGTERM handler for graceful shutdown: sets a flag that the event loop
+    // checks so we can save state and restore the terminal before exiting.
+    let sigterm = Arc::new(AtomicBool::new(false));
+    {
+        let sigterm = sigterm.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sig = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Failed to register SIGTERM handler: {}", e);
+                        return;
+                    }
+                };
+                sig.recv().await;
+                tracing::info!("SIGTERM received — initiating graceful shutdown");
+                sigterm.store(true, Ordering::SeqCst);
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix platforms, use ctrl_c() as a fallback
+                // (crossterm's raw mode already captures Ctrl+C in the TUI,
+                // so this is mainly a safety net for shutdown signals).
+                let _ = tokio::signal::ctrl_c().await;
+                sigterm.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
     'main: loop {
+
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
         app.notifications.tick();
@@ -2301,6 +2336,18 @@ async fn run_interactive(
                             break 'main;
                         }
                         continue;
+                    }
+
+                    // Check for SIGTERM (kill from outside the process)
+                    if sigterm.load(Ordering::Relaxed) {
+                        tracing::info!("SIGTERM — exiting TUI loop");
+                        if app.is_streaming {
+                            if let Some(ref ct) = cancel {
+                                ct.cancel();
+                            }
+                        }
+                        app.should_exit = true;
+                        break 'main;
                     }
 
                     // ── Paste-burst detection ─────────────────────────────
@@ -2682,6 +2729,8 @@ async fn run_interactive(
                                         .as_deref()
                                         .map(|m| m.contains("haiku"))
                                         .unwrap_or(false);
+                                    // Sync auto-compact toggle (Gap 6: footer indicator in-session).
+                                    app.auto_compact_enabled = applied_cfg.auto_compact;
                                     // Sync plan_mode visual indicator.
                                     app.plan_mode = matches!(
                                         applied_cfg.permission_mode,
@@ -2706,12 +2755,15 @@ async fn run_interactive(
                                         // model reset to None means fast mode off.
                                         app.fast_mode = false;
                                     }
+                                    // Sync auto-compact toggle (Gap 6: footer indicator in-session).
+                                    app.auto_compact_enabled = applied_cfg.auto_compact;
                                     app.config = applied_cfg.clone();
                                     session.model = clawde_api::effective_model_for_config(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    app.status_message = Some(msg);
+                                    let status_for_message = msg.clone();
+                                    app.status_message = Some(status_for_message);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.
@@ -4352,6 +4404,13 @@ async fn run_interactive(
             app.maybe_prompt_next_mcp_server();
         }
 
+        // Periodic auto-save every 30 seconds (protects against crashes)
+        if last_auto_save.elapsed() >= std::time::Duration::from_secs(30) {
+            session.updated_at = chrono::Utc::now();
+            let _ = clawde_core::history::save_session(&session).await;
+            last_auto_save = std::time::Instant::now();
+        }
+
         if app.should_exit {
             break 'main;
         }
@@ -4360,6 +4419,12 @@ async fn run_interactive(
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }
+
+    // Save session state before terminal restore (critical for SIGTERM path
+    // where the event loop breaks and bypasses the per-turn save points).
+    session.updated_at = chrono::Utc::now();
+    let _ = clawde_core::history::save_session(&session).await;
+
     restore_terminal(&mut terminal)?;
     Ok(())
 }
