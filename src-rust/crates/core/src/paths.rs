@@ -31,7 +31,7 @@ mod tests {
 
     // The resolver reads process-global env (`CLAWDE_HOME`, `HOME`,
     // `XDG_CONFIG_HOME`). Serialize every test that mutates them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -157,4 +157,43 @@ mod tests {
         assert_eq!(super::clawde_home(), Settings::config_dir());
         assert_eq!(super::clawde_home(), PathBuf::from(tmp.path()));
     }
+
+    /// Auto-migration: when `~/.clawde` doesn't exist but `~/.claurst` does,
+    /// `config_dir()` renames the legacy dir to the new name on first run.
+    #[test]
+    fn clawde_home_migrates_legacy_claurst_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new();
+        let home = tempfile::tempdir().unwrap();
+
+        // Create legacy dir with a settings file.
+        let legacy = home.path().join(".claurst");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("settings.json"), "{\"auto_compact\":true}").unwrap();
+
+        std::env::set_var("HOME", home.path());
+
+        let new = home.path().join(".clawde");
+        assert!(!new.exists(), "~/.clawde must not exist before migration");
+
+        let resolved = Settings::config_dir();
+
+        // After migration, ~/.clawde exists and contains the settings file.
+        assert!(new.is_dir(), "~/.clawde must exist after migration");
+        assert!(
+            new.join("settings.json").exists(),
+            "settings.json must be in the migrated dir"
+        );
+        assert_eq!(resolved, new, "config_dir must return the migrated path");
+        assert!(!legacy.exists(), "~/.claurst must not exist after migration");
+
+        // Verify file content survived the rename.
+        let content = std::fs::read_to_string(new.join("settings.json")).unwrap();
+        assert_eq!(content, "{\"auto_compact\":true}", "file content must survive migration");
+    }
 }
+
+// Re-export so the lock is accessible from sibling modules (lib.rs, accounts.rs, etc.)
+// without exposing the private `tests` module itself.
+#[cfg(all(test, unix))]
+pub(crate) use tests::ENV_LOCK;

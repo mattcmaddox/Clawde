@@ -1751,10 +1751,30 @@ pub mod config {
             if new_dir.is_dir() {
                 return new_dir;
             }
-            // 2b. Back-compat: legacy `~/.claurst` (pre-rename installs).
+            // 2b. Auto-migration: if `~/.clawde` doesn't exist but legacy
+            // `~/.claurst` does (pre-rename install), rename it to `~/.clawde`
+            // so the transition happens seamlessly on first run.
             let legacy = home.join(".claurst");
             if legacy.is_dir() {
-                return legacy;
+                match std::fs::rename(&legacy, &new_dir) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Migrated legacy config dir {} -> {}",
+                            legacy.display(),
+                            new_dir.display()
+                        );
+                        return new_dir;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not migrate legacy config dir {} -> {}: {}. Using legacy path.",
+                            legacy.display(),
+                            new_dir.display(),
+                            e
+                        );
+                        return legacy;
+                    }
+                }
             }
 
             // 3. XDG config location for fresh installs.
@@ -5554,8 +5574,18 @@ mod tests {
         std::env::remove_var("XDG_CONFIG_HOME");
 
         let result = Settings::config_dir();
+        let migrated = dir.path().join(".clawde");
 
-        // Restore env vars
+        // After auto-migration, the legacy dir is renamed to ~/.clawde.
+        assert!(
+            result == migrated,
+            "Expected config_dir() to migrate .claurst -> .clawde, got {}",
+            result.display()
+        );
+        assert!(
+            migrated.is_dir(),
+            "~/.clawde must exist after migration"
+        );
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
@@ -5569,10 +5599,7 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
-        assert!(
-            result.ends_with(".claurst"),
-            "Expected config_dir() to fall back to .claurst/ but got {}",
-            result.display()
-        );
+        // Legacy dir is now renamed to .clawde by auto-migration.
+        assert!(!legacy.exists(), ".claurst must not exist after migration");
     }
 }

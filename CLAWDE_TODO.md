@@ -13,10 +13,11 @@
 ### [legacy] Legacy ~/.claurst/ backward compat tested
 - [x] Test that existing users with `~/.claurst/` dirs are properly detected
 - [x] Test that `$CLAURST_HOME` env var still works (or document that it was renamed to `$CLAWDE_HOME`)
-- [ ] Add migration script or handling in `paths.rs` to rename `~/.claurst/` to `~/.clawde/` on first run
-  - The fallback chain is in place: `$CLAWDE_HOME` > `~/.clawde/` > `~/.claurst/` > XDG
-  - A `#[test] fn legacy_claurst_fallback()` validates this in `core/src/lib.rs`
-  - Still missing: auto-migration of existing `~/.claurst/` dir to `~/.clawde/` on first run
+- [x] Auto-migration: `config_dir()` now renames `~/.claurst/` to `~/.clawde/` on first run when the legacy dir exists but the new dir doesn't.
+  - Implemented in `Settings::config_dir()` (lib.rs:1749-1775)
+  - `std::fs::rename` is atomic on same filesystem; graceful fallback to legacy path on error
+  - Test: `clawde_home_migrates_legacy_claurst_dir` verifies the rename + file content survival
+  - Test: `test_legacy_claurst_fallback` updated to reflect auto-migration behavior
 
 ### [tools] Grep tool UTF-8 safety
 - [x] The `grep_tool.rs` `content` field — verified intentional, used in `content_lines` Display impl
