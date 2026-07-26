@@ -13,8 +13,19 @@ pub struct RefreshCommand;
 
 #[async_trait]
 impl SlashCommand for LoginCommand {
-    fn name(&self) -> &str { "login" }
-    fn description(&self) -> &str { "Authenticate with Anthropic or Codex (multi-account)" }
+    fn name(&self) -> &str {
+        "login"
+    }
+    fn description(&self) -> &str {
+        "Authenticate with Anthropic or Codex (multi-account)"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "--console".into(), description: "Login with API key (Console)".into(), available: true },
+            ArgCompletion { value: "--codex".into(), description: "Login with ChatGPT/Codex account".into(), available: true },
+            ArgCompletion { value: "--label".into(), description: "Set a profile label for the saved account".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /login [--console] [--codex] [--label <name>]\n\n\
          Start an OAuth login. By default authenticates with Claude.ai. Pass\n\
@@ -30,9 +41,9 @@ impl SlashCommand for LoginCommand {
         let label = parse_label_arg(&tokens);
 
         let provider = if use_codex {
-            claurst_core::accounts::PROVIDER_CODEX
+            clawde_core::accounts::PROVIDER_CODEX
         } else {
-            claurst_core::accounts::PROVIDER_ANTHROPIC
+            clawde_core::accounts::PROVIDER_ANTHROPIC
         };
 
         CommandResult::StartLoginForProvider {
@@ -60,8 +71,18 @@ fn parse_label_arg(tokens: &[&str]) -> Option<String> {
 
 #[async_trait]
 impl SlashCommand for LogoutCommand {
-    fn name(&self) -> &str { "logout" }
-    fn description(&self) -> &str { "Clear credentials for the active account" }
+    fn name(&self) -> &str {
+        "logout"
+    }
+    fn description(&self) -> &str {
+        "Clear credentials for the active account"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "--codex".into(), description: "Log out the Codex account".into(), available: true },
+            ArgCompletion { value: "--all".into(), description: "Log out all accounts".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /logout [--codex] [--all]\n\n\
          By default removes the active Anthropic account. `--codex` targets\n\
@@ -76,21 +97,21 @@ impl SlashCommand for LogoutCommand {
 
         if use_codex {
             if purge_all {
-                let mut registry = claurst_core::accounts::AccountRegistry::load();
+                let mut registry = clawde_core::accounts::AccountRegistry::load();
                 let ids: Vec<String> = registry
-                    .list(claurst_core::accounts::PROVIDER_CODEX)
+                    .list(clawde_core::accounts::PROVIDER_CODEX)
                     .into_iter()
                     .map(|p| p.id)
                     .collect();
                 for id in &ids {
-                    let _ = registry.remove(claurst_core::accounts::PROVIDER_CODEX, id);
+                    let _ = registry.remove(clawde_core::accounts::PROVIDER_CODEX, id);
                 }
                 return CommandResult::Message(format!(
                     "Removed {} stored Codex account(s).",
                     ids.len()
                 ));
             }
-            if let Err(e) = claurst_core::oauth_config::clear_codex_tokens() {
+            if let Err(e) = clawde_core::oauth_config::clear_codex_tokens() {
                 return CommandResult::Error(format!("Failed to clear Codex tokens: {}", e));
             }
             return CommandResult::Message("Logged out of the active Codex account.".to_string());
@@ -98,16 +119,18 @@ impl SlashCommand for LogoutCommand {
 
         // Anthropic logout.
         if purge_all {
-            let mut registry = claurst_core::accounts::AccountRegistry::load();
+            let mut registry = clawde_core::accounts::AccountRegistry::load();
             let ids: Vec<String> = registry
-                .list(claurst_core::accounts::PROVIDER_ANTHROPIC)
+                .list(clawde_core::accounts::PROVIDER_ANTHROPIC)
                 .into_iter()
                 .map(|p| p.id)
                 .collect();
             for id in &ids {
-                let _ = registry.remove(claurst_core::accounts::PROVIDER_ANTHROPIC, id);
+                let _ = registry.remove(clawde_core::accounts::PROVIDER_ANTHROPIC, id);
             }
-            let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
+            let mut settings = clawde_core::config::Settings::load()
+                .await
+                .unwrap_or_default();
             settings.config.api_key = None;
             let _ = settings.save().await;
             ctx.config.api_key = None;
@@ -117,10 +140,12 @@ impl SlashCommand for LogoutCommand {
             ));
         }
 
-        if let Err(e) = claurst_core::oauth::OAuthTokens::clear().await {
+        if let Err(e) = clawde_core::oauth::OAuthTokens::clear().await {
             return CommandResult::Error(format!("Failed to clear OAuth tokens: {}", e));
         }
-        let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
+        let mut settings = clawde_core::config::Settings::load()
+            .await
+            .unwrap_or_default();
         settings.config.api_key = None;
         if let Err(e) = settings.save().await {
             return CommandResult::Error(format!("Failed to update settings: {}", e));
@@ -136,8 +161,12 @@ pub struct AccountsCommand;
 
 #[async_trait]
 impl SlashCommand for AccountsCommand {
-    fn name(&self) -> &str { "accounts" }
-    fn description(&self) -> &str { "List stored Anthropic and Codex accounts" }
+    fn name(&self) -> &str {
+        "accounts"
+    }
+    fn description(&self) -> &str {
+        "List stored Anthropic and Codex accounts"
+    }
     fn help(&self) -> &str {
         "Usage: /accounts\n\n\
          Lists every stored Anthropic and Codex account along with the\n\
@@ -146,11 +175,11 @@ impl SlashCommand for AccountsCommand {
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let registry = claurst_core::accounts::AccountRegistry::load();
+        let registry = clawde_core::accounts::AccountRegistry::load();
         let mut out = String::new();
         for (provider, label) in [
-            (claurst_core::accounts::PROVIDER_ANTHROPIC, "Anthropic"),
-            (claurst_core::accounts::PROVIDER_CODEX, "Codex"),
+            (clawde_core::accounts::PROVIDER_ANTHROPIC, "Anthropic"),
+            (clawde_core::accounts::PROVIDER_CODEX, "Codex"),
         ] {
             let profiles = registry.list(provider);
             let active = registry.active(provider);
@@ -183,8 +212,12 @@ pub struct SwitchCommand;
 
 #[async_trait]
 impl SlashCommand for SwitchCommand {
-    fn name(&self) -> &str { "switch" }
-    fn description(&self) -> &str { "Switch the active account for a provider" }
+    fn name(&self) -> &str {
+        "switch"
+    }
+    fn description(&self) -> &str {
+        "Switch the active account for a provider"
+    }
     fn help(&self) -> &str {
         "Usage: /switch [--codex] <profile-id>\n\n\
          Make a stored account active. Defaults to Anthropic; pass `--codex`\n\
@@ -196,9 +229,9 @@ impl SlashCommand for SwitchCommand {
         let tokens: Vec<&str> = args.split_whitespace().collect();
         let use_codex = tokens.contains(&"--codex");
         let provider = if use_codex {
-            claurst_core::accounts::PROVIDER_CODEX
+            clawde_core::accounts::PROVIDER_CODEX
         } else {
-            claurst_core::accounts::PROVIDER_ANTHROPIC
+            clawde_core::accounts::PROVIDER_ANTHROPIC
         };
         let display = if use_codex { "Codex" } else { "Anthropic" };
         let id = tokens.iter().find(|t| !t.starts_with("--"));
@@ -210,12 +243,11 @@ impl SlashCommand for SwitchCommand {
             ));
         };
 
-        let mut registry = claurst_core::accounts::AccountRegistry::load();
+        let mut registry = clawde_core::accounts::AccountRegistry::load();
         match registry.switch_to(provider, id) {
-            Ok(()) => CommandResult::Message(format!(
-                "Switched {} active account to '{}'.",
-                display, id
-            )),
+            Ok(()) => {
+                CommandResult::Message(format!("Switched {} active account to '{}'.", display, id))
+            }
             Err(e) => CommandResult::Error(format!("{}", e)),
         }
     }
@@ -225,8 +257,12 @@ impl SlashCommand for SwitchCommand {
 
 #[async_trait]
 impl SlashCommand for RefreshCommand {
-    fn name(&self) -> &str { "refresh" }
-    fn description(&self) -> &str { "Clear saved provider auth and model caches" }
+    fn name(&self) -> &str {
+        "refresh"
+    }
+    fn description(&self) -> &str {
+        "Clear saved provider auth and model caches"
+    }
     fn help(&self) -> &str {
         "Usage: /refresh\n\n\
          Clears saved provider credentials, provider/model selection, and model caches, then rebuilds the live runtime state.\n\

@@ -19,6 +19,7 @@ pub struct ChromeCommand;
 
 mod chrome_cdp {
     use base64::Engine as _;
+    use futures::{SinkExt, StreamExt};
     use once_cell::sync::Lazy;
     use parking_lot::Mutex;
     use serde_json::{json, Value};
@@ -27,7 +28,6 @@ mod chrome_cdp {
     use tokio_tungstenite::{
         connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
     };
-    use futures::{SinkExt, StreamExt};
 
     // -----------------------------------------------------------------------
     // Global session state
@@ -121,9 +121,9 @@ mod chrome_cdp {
         let ws_url = tabs
             .as_array()
             .and_then(|arr| {
-                arr.iter().find(|t| t["type"] == "page").and_then(|t| {
-                    t["webSocketDebuggerUrl"].as_str().map(|s| s.to_string())
-                })
+                arr.iter()
+                    .find(|t| t["type"] == "page")
+                    .and_then(|t| t["webSocketDebuggerUrl"].as_str().map(|s| s.to_string()))
             })
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -142,11 +142,15 @@ mod chrome_cdp {
             })
             .unwrap_or_default();
 
-        let (ws, _) = connect_async(&ws_url).await.map_err(|e| {
-            anyhow::anyhow!("WebSocket connect to {} failed: {}", ws_url, e)
-        })?;
+        let (ws, _) = connect_async(&ws_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket connect to {} failed: {}", ws_url, e))?;
 
-        let mut session = ChromeSession { ws, port, tab_url: tab_url.clone() };
+        let mut session = ChromeSession {
+            ws,
+            port,
+            tab_url: tab_url.clone(),
+        };
         // Enable Page domain so captureScreenshot etc. work.
         cdp_call(&mut session.ws, "Page.enable", json!({})).await?;
         // Enable Runtime domain for eval/click/fill.
@@ -340,16 +344,28 @@ mod chrome_cdp {
         store_session(s);
         result
     }
-
 }
 
 // ---- SlashCommand impl -------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for ChromeCommand {
-    fn name(&self) -> &str { "chrome" }
+    fn name(&self) -> &str {
+        "chrome"
+    }
     fn description(&self) -> &str {
         "Browser automation via Chrome DevTools Protocol (CDP)"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "connect".into(), description: "Connect to Chrome".into(), available: true },
+            ArgCompletion { value: "navigate".into(), description: "Navigate to a URL".into(), available: true },
+            ArgCompletion { value: "screenshot".into(), description: "Take a screenshot".into(), available: true },
+            ArgCompletion { value: "click".into(), description: "Click a CSS selector".into(), available: true },
+            ArgCompletion { value: "fill".into(), description: "Fill an input field".into(), available: true },
+            ArgCompletion { value: "eval".into(), description: "Evaluate JavaScript".into(), available: true },
+            ArgCompletion { value: "disconnect".into(), description: "Disconnect from Chrome".into(), available: true },
+        ]
     }
     fn help(&self) -> &str {
         "Usage: /chrome <subcommand> [args]\n\n\
@@ -380,10 +396,7 @@ impl SlashCommand for ChromeCommand {
                     match p.parse() {
                         Ok(n) => n,
                         Err(_) => {
-                            return CommandResult::Error(format!(
-                                "Invalid port number: {}",
-                                p
-                            ));
+                            return CommandResult::Error(format!("Invalid port number: {}", p));
                         }
                     }
                 } else if rest.is_empty() {

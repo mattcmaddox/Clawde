@@ -12,9 +12,22 @@ pub struct RemoteEnvCommand;
 
 #[async_trait]
 impl SlashCommand for RemoteControlCommand {
-    fn name(&self) -> &str { "remote-control" }
-    fn aliases(&self) -> Vec<&str> { vec!["rc"] }
-    fn description(&self) -> &str { "Show or manage the remote control (Bridge) connection" }
+    fn name(&self) -> &str {
+        "remote-control"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["rc"]
+    }
+    fn description(&self) -> &str {
+        "Show or manage the remote control (Bridge) connection"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "start".into(), description: "Start the remote-control bridge listener".into(), available: true },
+            ArgCompletion { value: "stop".into(), description: "Stop the bridge listener".into(), available: true },
+            ArgCompletion { value: "status".into(), description: "Show bridge connection status".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /remote-control [start|stop|status]\n\n\
          The Bridge feature lets you connect your local Claurst CLI to the\n\
@@ -27,7 +40,7 @@ impl SlashCommand for RemoteControlCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let settings = match claurst_core::config::Settings::load().await {
+        let settings = match clawde_core::config::Settings::load().await {
             Ok(s) => s,
             Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
         };
@@ -51,8 +64,11 @@ impl SlashCommand for RemoteControlCommand {
                     "not set (required to connect)"
                 };
 
-                let startup_status =
-                    if remote_at_startup { "enabled at startup" } else { "disabled" };
+                let startup_status = if remote_at_startup {
+                    "enabled at startup"
+                } else {
+                    "disabled"
+                };
 
                 // Active session info from context
                 let session_section = if let Some(ref url) = ctx.remote_session_url {
@@ -69,7 +85,7 @@ impl SlashCommand for RemoteControlCommand {
                 };
 
                 // Device fingerprint (first 12 chars are enough for display)
-                let fingerprint = claurst_bridge::device_fingerprint();
+                let fingerprint = clawde_bridge::device_fingerprint();
                 let fp_short = &fingerprint[..fingerprint.len().min(12)];
 
                 CommandResult::Message(format!(
@@ -160,8 +176,12 @@ impl SlashCommand for RemoteControlCommand {
 
 #[async_trait]
 impl SlashCommand for RemoteEnvCommand {
-    fn name(&self) -> &str { "remote-env" }
-    fn description(&self) -> &str { "Show and manage environment variables for remote sessions" }
+    fn name(&self) -> &str {
+        "remote-env"
+    }
+    fn description(&self) -> &str {
+        "Show and manage environment variables for remote sessions"
+    }
     fn help(&self) -> &str {
         "Usage: /remote-env [set <KEY> <VALUE> | unset <KEY> | list]\n\n\
          Manages env vars stored in config that are forwarded to remote Claurst sessions.\n\
@@ -227,9 +247,7 @@ impl SlashCommand for RemoteEnvCommand {
             }
             "unset" | "remove" | "delete" => {
                 if key.is_empty() {
-                    return CommandResult::Error(
-                        "Usage: /remote-env unset <KEY>".to_string(),
-                    );
+                    return CommandResult::Error("Usage: /remote-env unset <KEY>".to_string());
                 }
                 if !ctx.config.env.contains_key(key) {
                     return CommandResult::Message(format!("Key '{}' is not set.", key));
