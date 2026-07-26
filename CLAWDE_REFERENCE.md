@@ -9,7 +9,7 @@ chat forking, memory consolidation, sub-agent delegation, and much more.
 
 **Version:** 0.1.7  
 **License:** GPL-3.0  
-**Repository:** https://github.com/Kuberwastaken/clawde  
+**Repository:** https://github.com/mattcmaddox/Clawde  
 **Binary:** `clawde` (formerly `claurst`)  
 **Config directory:** `~/.clawde/` (legacy: `~/.claurst/` fallback)
 

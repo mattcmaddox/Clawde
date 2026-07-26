@@ -3,7 +3,7 @@
 **Open-source, multi-provider terminal coding agent built in Rust.**
 
 [![Version](https://img.shields.io/npm/v/clawde?style=flat-square)](https://www.npmjs.com/package/clawde)
-[![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](https://github.com/kuberwastaken/clawde/blob/main/LICENSE.md)
+[![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](https://github.com/mattcmaddox/Clawde/blob/main/LICENSE.md)
 
 ## Install
 
@@ -15,7 +15,7 @@ npm install -g clawde
 bun install -g clawde
 ```
 
-On install, the correct pre-built native binary for your platform is automatically downloaded from [GitHub Releases](https://github.com/kuberwastaken/clawde/releases). No compilation required.
+On install, the correct pre-built native binary for your platform is automatically downloaded from [GitHub Releases](https://github.com/mattcmaddox/Clawde/releases). No compilation required.
 
 ## Usage
 
@@ -35,6 +35,6 @@ clawde -p "fix this bug"  # headless one-shot
 ## Links
 
 - [Homepage](https://clawde.kuber.studio)
-- [GitHub](https://github.com/kuberwastaken/clawde)
+- [GitHub](https://github.com/mattcmaddox/Clawde)
 - [Documentation](https://clawde.kuber.studio/docs)
-- [Issues](https://github.com/kuberwastaken/clawde/issues)
+- [Issues](https://github.com/mattcmaddox/Clawde/issues)

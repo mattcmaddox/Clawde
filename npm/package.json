@@ -5,11 +5,11 @@
   "license": "GPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kuberwastaken/clawde.git"
+    "url": "git+https://github.com/mattcmaddox/Clawde.git"
   },
   "homepage": "https://clawde.kuber.studio",
   "bugs": {
-    "url": "https://github.com/kuberwastaken/clawde/issues"
+    "url": "https://github.com/mattcmaddox/Clawde/issues"
   },
   "keywords": [
     "ai",

@@ -5,9 +5,9 @@
 <img src="public/Ship.png" alt="Rustle on the ship" width="350" />
 
 <p>
-    <a href="https://github.com/kuberwastaken/clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/kuberwastaken/clawde"><img src="https://img.shields.io/badge/Version-0.1.7-2E8B57?style=for-the-badge" alt="Version 0.1.7"></a>
-    <a href="https://github.com/kuberwastaken/clawde/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
+    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
+    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Version-0.1.7-2E8B57?style=for-the-badge" alt="Version 0.1.7"></a>
+    <a href="https://github.com/mattcmaddox/Clawde/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
 </p>
 
 <br />
@@ -17,7 +17,7 @@
 
 ---
 
-Clawde is an **open-source, multi-provider terminal coding agent** built from the ground up in Rust. It started as a clean-room reimplementation of Claude Code's behavior (from [spec](https://github.com/kuberwastaken/clawde/tree/main/spec)) and has since evolved into an amazing TUI pair programmer with multi-provider support, a rich UI, plugin system, a companion named Rustle, chat forking, memory consolidation, and much more.
+Clawde is an **open-source, multi-provider terminal coding agent** built from the ground up in Rust. It started as a clean-room reimplementation of Claude Code's behavior (from [spec](https://github.com/mattcmaddox/Clawde/tree/main/spec)) and has since evolved into an amazing TUI pair programmer with multi-provider support, a rich UI, plugin system, a companion named Rustle, chat forking, memory consolidation, and much more.
 
 It's fast, it's memory-efficient, it's yours to run however you want, and there's no tracking or telemetry.
 
@@ -46,13 +46,13 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 **Linux / macOS:**
 
 ```bash
-curl -fsSL https://github.com/kuberwastaken/clawde/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/mattcmaddox/Clawde/releases/latest/download/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://github.com/kuberwastaken/clawde/releases/latest/download/install.ps1 | iex
+irm https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 | iex
 ```
 
 This drops `clawde` into `~/.clawde/bin` (or `%USERPROFILE%\.clawde\bin` on Windows) and adds it to your `PATH` automatically. Open a new terminal and run `clawde`.
@@ -83,7 +83,7 @@ clawde upgrade
 
 ## Manual download
 
-If you'd rather grab the binary yourself, the latest archives are on [**GitHub Releases**](https://github.com/kuberwastaken/clawde/releases):
+If you'd rather grab the binary yourself, the latest archives are on [**GitHub Releases**](https://github.com/mattcmaddox/Clawde/releases):
 
 | Platform | Archive |
 |----------|---------|
@@ -98,7 +98,7 @@ Each archive contains a single `clawde` (or `clawde.exe`) binary. Extract it and
 ## Build from source
 
 ```bash
-git clone https://github.com/kuberwastaken/clawde.git
+git clone https://github.com/mattcmaddox/Clawde.git
 cd clawde/src-rust
 cargo build --release --package clawde
 
@@ -200,7 +200,7 @@ For more info on how to configure Clawde, [head over to our docs](https://clawde
 Clawde is built for the community, by the community and we'd love your help making it better.
 Please see and include AGENTS.md for project-specific rules (for both humans and agents).
 
-[Open an issue](https://github.com/Kuberwastaken/clawde/issues/new) for bugs, ideas, or questions, or [Raise a PR](https://github.com/Kuberwastaken/clawde/pulls/new) to fix bugs, add features, or improve documentation.
+[Open an issue](https://github.com/mattcmaddox/Clawde/issues/new) for bugs, ideas, or questions, or [Raise a PR](https://github.com/mattcmaddox/Clawde/pulls/new) to fix bugs, add features, or improve documentation.
 
 ---
 
@@ -211,9 +211,9 @@ This is a **clean-room Rust reimplementation** of Claude Code's behavior.
 
 The process was explicitly two-phase:
 
-**Specification** [`spec/`](https://github.com/kuberwastaken/clawde/tree/main/spec) — An AI agent analyzed the source and produced exhaustive behavioral specifications and improvements, deviated from the original: architecture, data flows, tool contracts, system designs. No source code was carried forward.
+**Specification** [`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec) — An AI agent analyzed the source and produced exhaustive behavioral specifications and improvements, deviated from the original: architecture, data flows, tool contracts, system designs. No source code was carried forward.
 
-**Implementation** [`src-rust/`](https://github.com/kuberwastaken/clawde/tree/main/src-rust) — A separate AI agent implemented from the spec alone, never referencing the original TypeScript. The output is idiomatic Rust that reproduces the behavior, not the expression.
+**Implementation** [`src-rust/`](https://github.com/mattcmaddox/Clawde/tree/main/src-rust) — A separate AI agent implemented from the spec alone, never referencing the original TypeScript. The output is idiomatic Rust that reproduces the behavior, not the expression.
 
 This mirrors the legal precedent established by Phoenix Technologies v. IBM (1984) — clean-room engineering of the BIOS — and the principle from Baker v. Selden (1879) that copyright protects expression, not ideas or behavior.
 
