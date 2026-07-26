@@ -218,6 +218,11 @@ impl SlashCommand for SwitchCommand {
     fn description(&self) -> &str {
         "Switch the active account for a provider"
     }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion { value: "--codex".into(), description: "Switch the Codex account instead of Anthropic".into(), available: true },
+        ]
+    }
     fn help(&self) -> &str {
         "Usage: /switch [--codex] <profile-id>\n\n\
          Make a stored account active. Defaults to Anthropic; pass `--codex`\n\
