@@ -288,7 +288,32 @@ render_prompt_suggestions() in render.rs
 | `/diff` | --stat, --staged | `lib.rs` |
 | `/agent` | (built-in visible agents, OnceLock-cached) | `providers.rs` |
 | `/model` | (~4500 model IDs from bundled snapshot, OnceLock-cached) | `lib.rs` |
-| `/managed-agents` | status, presets, preset, setup, configure, enable, disable, reset, budget | `managed_agents.rs` |
+| `/managed-agents` | status, presets, preset, setup, configure, enable, disable, reset, budget + 6 preset names | `managed_agents.rs` |
+| `/permissions` | set (→ default, accept-edits, bypass-permissions, plan), allow (→ 40+ tool names), deny (→ tool names), reset | `permissions.rs` |
+| `/export` | --format (→ markdown, json), --output | `export.rs` |
+| `/plan` | open, exit | `session.rs` |
+| `/session` | list | `session.rs` |
+| `/summary` | decisions, files | `session_tools.rs` |
+| `/voice` | on, off, status | `maintenance.rs` |
+| `/links` | list, last | `share.rs` |
+| `/color` | default + 9 named colors (red, green, blue, yellow, cyan, magenta, white, orange, purple) | `appearance.rs` |
+| `/config` | show, get (→ theme, output-style, model, permission-mode), set (→ theme, output-style, model, permission-mode), unset (→ model, output-style) | `config_cmd.rs` |
+| `/mcp` | list, status, auth, connect, logs, resources, prompts, get-prompt | `mcp.rs` |
+| `/plugin` | list, reload, info, enable, disable, install | `plugin.rs` |
+| `/chrome` | connect, navigate, screenshot, click, fill, eval, disconnect | `chrome.rs` |
+| `/login` | --console, --codex, --label, --label `<profile-id>` (suggests existing profile IDs from registry) | `accounts.rs` |
+| `/logout` | --codex, --all, active-profile hints (dimmed, informational) | `accounts.rs` |
+| `/remote-control` | start, stop, status | `remote.rs` |
+
+**Commands with no structured subcommands (default empty):**
+`/compact`, `/cost`, `/resume`, `/init`, `/clear`, `/exit`, `/help`,
+`/version`, `/fork`, `/tasks`, `/skills`, `/rewind`, `/rename`, `/commit`,
+`/files`, `/release-notes`, `/review`, `/doctor`, `/search`, `/share`,
+`/copy`, `/upgrade` (alias `/update`), `/thinking` (alias `/think`),
+`/hooks`, `/stats`, `/accounts`, `/switch`, `/refresh`, `/new`, `/move`,
+`/usage`, `/extra-usage`, `/caveman`, `/rocky`, `/normal`, `/keybindings`,
+`/privacy`, `/rate-limit-options`, `/template`, `/diagnostics`, `/heapdump`,
+`/insights` (alias `/ctx-viz`), `/btw`, `/ultra-review`
 
 ### Circular Dependency Resolution
 
@@ -310,6 +335,34 @@ converts `ArgCompletion` → `TypeaheadSuggestion`, and sets the closure on the 
    `get_arg_completions()`
 4. Add unit tests in the test module covering: empty partial, filtering, case
    insensitivity, and completeness (all expected completions present)
+
+### Arg Completion Test Coverage (accounts.rs)
+
+The test module in `accounts.rs` uses a `TestAccounts` struct with `Drop` impl
+for panic-safe env var restoration. Tests validate the unfiltered raw output of
+`arg_completions()` (prefix filtering is in `get_arg_completions()`, tested separately):
+
+| Command | Tests | What's Covered |
+|---------|-------|----------------|
+| `/login` | 4 | Empty → 3 flags (`--console`, `--codex`, `--label`); `--label` → profile IDs with prefix filter; empty registry → empty |
+| `/switch` | 5 | Empty → `--codex` + Anthropic profiles; prefix filter; `--codex` mode → Codex-only; codex prefix filter; empty registry → flag only |
+| `/logout` | 4 | Empty → 2 flags + active profile hint (dimmed); `--codex` → codex hint; `--all` → all profiles dimmed; empty registry |
+
+**Total:** 13 unit tests across 3 account-related commands.
+
+**`TestAccounts` pattern:**
+```rust
+struct TestAccounts {
+    _tmp: tempfile::TempDir,                          // keeps tempdir alive
+    prev_clawde_home: Option<std::ffi::OsString>,      // original env var
+}
+impl Drop for TestAccounts {
+    fn drop(&mut self) { /* restore env var — fires even on panic */ }
+}
+```
+`TestAccounts::seeded()` creates a temp `CLAWDE_HOME` with 3 profiles (2 Anthropic + 1 Codex)
+and sets active accounts. `TestAccounts::empty()` creates a temp `CLAWDE_HOME` with no
+`accounts.json`.
 
 ### Rendering
 
