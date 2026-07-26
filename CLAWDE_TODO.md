@@ -34,9 +34,9 @@
 
 ---
 
-## ✅ Auto-Compact System (Gaps 1–5) — Complete
+## ✅ Auto-Compact System (Gaps 1–6 + reactive wiring) — Complete
 
-All five gaps identified in the auto-compact research have been implemented.
+All six gaps identified in the auto-compact research have been implemented and tested.
 
 | Gap | Description | Status | Files Changed |
 |-----|-------------|--------|---------------|
@@ -45,9 +45,16 @@ All five gaps identified in the auto-compact research have been implemented.
 | 3 | User-facing config toggle — `Settings::effective_config()` merge, `/auto-compact` command, query loop gate | ✅ | `core/src/lib.rs` (config), `query/src/lib.rs`, `commands/src/lib.rs` |
 | 4 | TUI footer context indicator — green/yellow/red "ctx: N%" display with auto-compact on/off state | ✅ | `tui/src/render.rs` |
 | 5 | Debounce/hysteresis — min 5 turns + min 60 sec between compactions, first compaction fires immediately | ✅ | `query/src/compact.rs` |
+| R | Reactive compact wired into auto_compact config gate — `CLAUDE_REACTIVE_COMPACT=1` now AND-ed with `tool_ctx.config.auto_compact` | ✅ | `query/src/lib.rs` (commit 3d5142b) |
 
 ### Gap 6 (discovered during audit — FIXED)
 - [x] **Runtime ConfigChange propagation**: `app.auto_compact_enabled` now syncs in both `ConfigChange` and `ConfigChangeMessage` handlers in `main.rs`. The `/auto-compact` command updates the TUI footer indicator immediately in-session.
+
+### Tests added (this session)
+- [x] **27 integration tests** in `crates/cli/tests/auto_compact_integration.rs` — command toggle, config flow, threshold, debounce, footer state derivation, E2E chain (commit e5aff11)
+- [x] **3 gate tests** with `GateMockProvider` in `query/src/compact.rs` — verifies provider not called when disabled/below-threshold, called when enabled+above-threshold (commit 1ec1c11)
+- [x] **5 unit tests** for `/auto-compact` command in `commands/src/lib.rs` — on/off/toggle/noop/error
+- [x] **All passing**: `cargo test --workspace — ~1,800 tests, 0 failures`
 
 ---
 
