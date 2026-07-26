@@ -1688,9 +1688,14 @@ pub async fn run_query_loop(
         // compact / context-collapse instead. This fires on every streaming turn
         // so it can act before a prompt-too-long error is returned by the API.
         //
-        // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
+        // Feature gate check: requires BOTH the CLAURST_FEATURE_REACTIVE_COMPACT=1
+        // env var AND the user-facing auto_compact config toggle.  The config
+        // gate appears again in the outer `if tool_ctx.config.auto_compact` guard
+        // below (which also protects the else-if proactive path).  The AND here
+        // ensures /auto-compact off disables mid-stream compaction specifically.
         let reactive_compact_enabled =
-            clawde_core::feature_gates::is_feature_enabled("reactive_compact");
+            clawde_core::feature_gates::is_feature_enabled("reactive_compact")
+            && tool_ctx.config.auto_compact;
 
         // Guard: only compact when a provider is available (prevents panic if
         // no API key is configured at the start of a session).
