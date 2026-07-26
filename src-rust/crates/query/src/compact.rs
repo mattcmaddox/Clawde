@@ -2388,6 +2388,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl clawde_api::LlmProvider for GateMockProvider {
         fn id(&self) -> &clawde_core::ProviderId {
             static ID: std::sync::LazyLock<clawde_core::ProviderId> =
