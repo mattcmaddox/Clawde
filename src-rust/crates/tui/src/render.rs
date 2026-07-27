@@ -74,7 +74,7 @@ const SPINNER: &[char] = &[
     '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}',
 ];
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
-const WELCOME_BOX_HEIGHT: u16 = 9;
+const WELCOME_BOX_HEIGHT: u16 = 12;
 const STATUS_THINKING: &str = "thinking";
 const STATUS_THINKING_ELLIPSIS: &str = "thinking\u{2026}";
 
@@ -1790,11 +1790,11 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // The box should be at most the full area width, and a fixed height.
     let box_width = area.width;
     let box_height: u16 = WELCOME_BOX_HEIGHT;
-    if area.height < box_height || box_width < 30 {
+    if area.height < box_height || box_width < 35 {
         // Too small: fall back to a single line
         let line = Line::from(vec![
             Span::styled(
-                "Claurst ",
+                "Clawde ",
                 Style::default()
                     .fg(CLAUDE_ORANGE)
                     .add_modifier(Modifier::BOLD),
@@ -1814,7 +1814,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         height: box_height,
     };
 
-    // Outer border with title "Claurst vX.Y"
+    // Outer border with title "Clawde vX.Y"
     let accent = app.accent_color;
     let outer_block = Block::default()
         .borders(Borders::ALL)
@@ -1822,7 +1822,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(accent))
         .title(Line::from(vec![
             Span::styled(
-                " Claurst ",
+                " Clawde ",
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1841,9 +1841,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Split inner into left | divider(1) | right
-    // Left width: ~28 chars or half the inner width, whichever is smaller
+    // Left width: at least 29 (mascot art is 29 wide), at most 32
     let left_w = (inner.width / 2)
-        .clamp(22, 32)
+        .clamp(29, 32)
         .min(inner.width.saturating_sub(3));
     let right_w = inner.width.saturating_sub(left_w + 1);
     let h_chunks = Layout::default()
@@ -1884,22 +1884,23 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     )));
     left_lines.push(Line::from(""));
     // Center mascot in left column
-    let mascot_indent = left_w.saturating_sub(11) / 2;
+    let mascot_indent = left_w.saturating_sub(29) / 2;
     let pad = " ".repeat(mascot_indent as usize);
     for cl in &rustle {
         let mut spans = vec![Span::raw(pad.clone())];
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
     }
-    frame.render_widget(
-        Paragraph::new(left_lines).wrap(Wrap { trim: false }),
-        h_chunks[0],
-    );
+    // No wrapping needed: all mascot rows (29 wide + 1 pad) fit within
+    // left_w (=29-32), and the welcome message is shorter still. Using plain
+    // Paragraph (no Wrap) avoids any potential WordWrapper quirks with
+    // Unicode block characters in the mascot frames.
+    frame.render_widget(Paragraph::new(left_lines), h_chunks[0]);
 
     // --- Right column ---
     let tip_text = clawde_core::tips::select_tip(0)
         .map(|t| t.content.to_string())
-        .unwrap_or_else(|| "Edit AGENTS.md to add instructions for Claurst".to_string());
+        .unwrap_or_else(|| "Edit AGENTS.md to add instructions for Clawde".to_string());
 
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(Line::from(Span::styled(
@@ -1949,14 +1950,14 @@ fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         .filter(|u| !u.is_empty());
     let greeting = match username {
         Some(ref name) => format!("Welcome back, {}!", name),
-        None => "Welcome to Claurst".to_string(),
+        None => "Welcome to Clawde".to_string(),
     };
 
     // Too narrow for a bordered box: fall back to a single title line + notices.
     if width < 24 {
         let mut lines = vec![Line::from(vec![
             Span::styled(
-                "Claurst ",
+                "Clawde ",
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1972,14 +1973,14 @@ fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let box_w = width as usize;
     let inner_w = box_w.saturating_sub(4); // "│ " + content + " │"
 
-    // Top border with an embedded title: ╭─ Claurst vX.Y ─…─╮
-    // Span widths: "╭─"=2, " Claurst "=9, "v{ver} "=ver+2, dashes=fill, "╮"=1.
+    // Top border with an embedded title: ╭─ Clawde vX.Y ─…─╮
+    // Span widths: "╭─"=2, " Clawde "=9, "v{ver} "=ver+2, dashes=fill, "╮"=1.
     let used = 2 + 9 + (APP_VERSION.len() + 2) + 1;
     let fill = box_w.saturating_sub(used);
     let top = Line::from(vec![
         Span::styled("\u{256d}\u{2500}", Style::default().fg(accent)),
         Span::styled(
-            " Claurst ",
+            " Clawde ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(

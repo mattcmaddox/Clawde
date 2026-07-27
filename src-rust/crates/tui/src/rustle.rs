@@ -1,231 +1,155 @@
 //! Rustle mascot rendering for ratatui.
 //!
-//! A 5-row Unicode block-art crab-like creature. Call `rustle_lines()` to get
-//! 5 `Line` values (4 body rows + 1 blank spacing row) ready for embedding in
-//! a Paragraph.
+//! An 8-row Unicode block-art mascot. Call `rustle_lines()` to get
+//! 8 `Line` values ready for embedding in a Paragraph.
 //!
-//! Structure (top to bottom):
-//!   Row 1 — head: narrow top (5-wide) widening downward (7-wide)
-//!   Row 2 — claws + eyes: widest row, pincers extend from sides
-//!   Row 3 — body
-//!   Row 4 — legs: body tapers into two pairs of legs via ▀ gap
-//!   Row 5 — blank spacing
+//! Animation frames live in `FRAMES`; frame 0 is the default pose.
+//! Append new frames to the array to extend the animation.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 /// The pose / expression of the Rustle mascot.
+///
+/// Every variant explicitly maps to a frame index in `FRAMES` via
+/// [`rustle_lines`].  The old eye-shift micro-interactions (`LookRight`,
+/// `LookDown`) were removed — the new animation is purely the 6-frame
+/// loading cycle via `Loading`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RustlePose {
     Default,
-    ArmsUp,
-    LookLeft,
-    LookRight,
-    LookDown,
     /// Loading / error spinner — `frame` drives the animation.
     Loading { frame: u64 },
 }
 
-/// Body-part style: bold pink foreground (#e91e63).
+/// Mascot style: bold green foreground rgb(0, 255, 0).
 fn body_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(233, 30, 99))
+        .fg(Color::Rgb(0, 255, 0))
         .add_modifier(Modifier::BOLD)
 }
 
-/// Eye-row style: pink text on black background.
-fn eye_bg_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(233, 30, 99))
-        .bg(Color::Black)
-        .add_modifier(Modifier::BOLD)
-}
+/// Animation frames for the mascot. Each frame is 8 rows × 29 cols.
+/// Frame 0 is the default (rest) pose. Append additional frames to
+/// extend the animation cycle.
+///
+/// chars used: ▄ ▛ ▜ ▟ ▙ █ ▔ ▌ ▗ ▖ ▐ ▝ ▘ ▚
+const FRAMES: [[&str; 8]; 6] = [
+    // Frame 0 — Rest claw (centered, no platform)
+    [
+        "                             ",
+        "                             ",
+        "                   ▄▛▜▛▜▄    ",
+        "                 ▟▛▜▙▟▙▟▛▜▙  ",
+        "                 █▙▟▛▔▔▜▙▟█  ",
+        "                 ▜██▌▗▖▐██▛  ",
+        "                  ▝▜████▛▘   ",
+        "                   ▝████▘    ",
+    ],
+    // Frame 1 — Rest claw up-shifted + platform
+    [
+        "                             ",
+        "                   ▄▛▜▛▜▄    ",
+        "                 ▟▛▜▙▟▙▟▛▜▙  ",
+        "                 █▙▟▛▔▔▜▙▟█  ",
+        "                 ▜██▌▗▖▐██▛  ",
+        "                  ▝▜████▛▘   ",
+        "                   ▝████▘    ",
+        "                    ████     ",
+    ],
+    // Frame 2 — Extend + stairs (fingers extended, with platform)
+    [
+        "                  ▗ ▐  ▌ ▖   ",
+        "                  ▐▄▛▜▛▜▄▌   ",
+        "                 ▟▛▜▙▟▙▟▛▜▙  ",
+        "                 █▙▟▛▔▔▜▙▟█  ",
+        "                 ▜██▌▗▖▐██▛  ",
+        "                  ▝▜████▛▘   ",
+        "                   ▝████▘    ",
+        "                    ████     ",
+    ],
+    // Frame 3 — Extend + stairs + staircase (with platform)
+    [
+        "                  ▗ ▐  ▌ ▖   ",
+        "    ▚  ▚          ▐▄▛▜▛▜▄▌   ",
+        "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
+        "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
+        " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
+        "  ▚  ▚  ▚         ▝▜████▛▘   ",
+        "   ▚  ▚            ▝████▘    ",
+        "                    ████     ",
+    ],
+    // Frame 4 — Rest + staircase (with platform)
+    [
+        "                             ",
+        "    ▚  ▚           ▄▛▜▛▜▄    ",
+        "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
+        "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
+        " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
+        "  ▚  ▚  ▚         ▝▜████▛▘   ",
+        "   ▚  ▚            ▝████▘    ",
+        "                    ████     ",
+    ],
+    // Frame 5 — Rest claw up (loop back, with platform)
+    [
+        "                             ",
+        "                   ▄▛▜▛▜▄    ",
+        "                 ▟▛▜▙▟▙▟▛▜▙  ",
+        "                 █▙▟▛▔▔▜▙▟█  ",
+        "                 ▜██▌▗▖▐██▛  ",
+        "                  ▝▜████▛▘   ",
+        "                   ▝████▘    ",
+        "                    ████     ",
+    ],
+];
 
-/// Eyeball highlight style: white on black.
-fn eyeball_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .bg(Color::Black)
-        .add_modifier(Modifier::BOLD)
-}
+/// Number of animation frames available.
+pub const FRAME_COUNT: usize = FRAMES.len();
 
-/// Build spans for the eye section, giving ▘/▝ eyeball characters white
-/// foreground and everything else pink-on-black.
-fn eye_spans(s: &'static str) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut buf_is_eyeball = false;
+/// How long each frame is displayed (in milliseconds) during the loading
+/// animation.  Frame 0 (rest) holds for 3 s; frames 1-5 cycle faster at
+/// 1.5 s each so the gesture animation feels responsive.
+const FRAME_DURATIONS_MS: [u64; FRAMES.len()] = [3000, 1500, 2000, 2000, 1500, 1500];
 
-    for ch in s.chars() {
-        let is_eyeball =
-            ch == '▘'
-                || ch == '▝'
-                || ch == '▀'
-                || ch == '▄'
-                || ch == '▖'
-                || ch == '▌'
-                || ch == '▐';
+/// Total duration of one full animation cycle in milliseconds.
+/// (Manual sum — `.iter().sum()` is not yet stable in const context.)
+const CYCLE_MS: u64 = FRAME_DURATIONS_MS[0]
+    + FRAME_DURATIONS_MS[1]
+    + FRAME_DURATIONS_MS[2]
+    + FRAME_DURATIONS_MS[3]
+    + FRAME_DURATIONS_MS[4]
+    + FRAME_DURATIONS_MS[5];
 
-        if is_eyeball != buf_is_eyeball && !buf.is_empty() {
-            let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
-            spans.push(Span::styled(buf.clone(), style));
-            buf.clear();
+/// Given the number of milliseconds elapsed since the animation started,
+/// return the frame index that should be displayed.
+///
+/// Walks the per-frame durations, wrapping at the cycle boundary so the
+/// animation loops seamlessly.
+pub fn loading_frame_for_elapsed(elapsed_ms: u64) -> u64 {
+    let t = elapsed_ms % CYCLE_MS;
+    let mut acc = 0u64;
+    for (i, &dur) in FRAME_DURATIONS_MS.iter().enumerate() {
+        acc += dur;
+        if t < acc {
+            return i as u64;
         }
-
-        buf_is_eyeball = is_eyeball;
-        buf.push(ch);
     }
-
-    if !buf.is_empty() {
-        let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
-        spans.push(Span::styled(buf, style));
-    }
-
-    spans
+    0
 }
 
-/// Build the spinner eye spans for the Loading pose.
+/// Returns 8 Lines representing the Rustle mascot.
 ///
-/// Each eye socket is a single character cell with a 2×2 sub-pixel grid.
-/// The spinner rotates which quarter-block is lit:
-///   Left eye (clockwise):        ▘ → ▝ → ▗ → ▖
-///   Right eye (anti-clockwise):  ▝ → ▘ → ▖ → ▗
-///
-/// The current position is white; trailing positions use progressively
-/// darker grays so the animation looks like a sweeping gradient.
-fn loading_eye_spans(frame: u64) -> Vec<Span<'static>> {
-    // Quarter-block characters for each 2×2 position:
-    //   0=TL(▘)  1=TR(▝)  2=BR(▗)  3=BL(▖)
-    const QUARTERS: [char; 4] = ['▘', '▝', '▗', '▖'];
-    // Clockwise order for left eye
-    const CW: [usize; 4] = [0, 1, 2, 3];
-    // Anti-clockwise order for right eye (mirrored)
-    const CCW: [usize; 4] = [1, 0, 3, 2];
-
-    // Brightness gradient: current → trailing positions
-    const COLORS: [Color; 4] = [
-        Color::White,
-        Color::Rgb(170, 170, 175),
-        Color::Rgb(110, 110, 115),
-        Color::Rgb(55, 55, 60),
-    ];
-
-    // One step every 5 frames (~250ms at 50ms/frame = smooth spin)
-    let step = (frame / 5) as usize % 4;
-
-    // Build left eye: show all 4 quarter-blocks overlaid via half-blocks.
-    // Since one character can only show one quarter, we show the BRIGHTEST
-    // position as the visible quarter-block character and cycle it.
-    let left_ch = QUARTERS[CW[step]];
-    let left_color = COLORS[0]; // current position is always white
-
-    let right_ch = QUARTERS[CCW[step]];
-    let right_color = COLORS[0];
-
-    // For a trail effect, also render the PREVIOUS position in a dimmer shade
-    // using a second character. The eye section format is:
-    //   [left_prev][left_curr] █ [right_curr][right_prev]
-    let left_prev_step = (step + 3) % 4; // one step back
-    let left_prev_ch = QUARTERS[CW[left_prev_step]];
-    let right_prev_step = (step + 3) % 4;
-    let right_prev_ch = QUARTERS[CCW[right_prev_step]];
-
-    vec![
-        // Left eye: previous (dim) then current (bright)
-        Span::styled(
-            left_prev_ch.to_string(),
-            Style::default().fg(COLORS[2]).bg(Color::Black).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            left_ch.to_string(),
-            Style::default().fg(left_color).bg(Color::Black).add_modifier(Modifier::BOLD),
-        ),
-        // Nose
-        Span::styled("█".to_string(), eye_bg_style()),
-        // Right eye: current (bright) then previous (dim)
-        Span::styled(
-            right_ch.to_string(),
-            Style::default().fg(right_color).bg(Color::Black).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            right_prev_ch.to_string(),
-            Style::default().fg(COLORS[2]).bg(Color::Black).add_modifier(Modifier::BOLD),
-        ),
-    ]
-}
-
-/// Returns 5 Lines representing the Rustle mascot:
-///   [0] — head row (5-wide top, 7-wide bottom)
-///   [1] — claws + eyes row (widest — pincers extend from sides)
-///   [2] — body row
-///   [3] — legs row (body tapers into two pairs of legs)
-///   [4] — blank spacing line
-pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 5] {
-    // Pose varies the claw row (Row 2):
-    //   r2l — left claw + head edge (body_style)
-    //   r2e — eye section with ▘/▝ eyeball highlights
-    //   r2r — head edge + right claw (body_style)
-
-    let (r2l, r2e, r2r) = match pose {
-        RustlePose::Default => (
-            "█▄█",       // left claw tip, ▄ gap-to-connect, head edge
-            "▀ █▀ ",    // keep the left eye as-is; match the right eye size and move it up-left
-            "█▄█",       // head edge, ▄ connect-to-gap, right claw tip
-        ),
-        RustlePose::ArmsUp => (
-            "█▀█",       // ▀ = claw raised (upper half = arm up)
-            "▀ █▀ ",    // keep the left eye as-is; match the right eye size and move it up-left
-            "█▀█",       // raised right claw
-        ),
-        RustlePose::LookLeft => (
-            "█▄█",
-            "▘ █ ▘",    // single-pixel upper-left quarter blocks = eyes shifted left
-            "█▄█",
-        ),
-        RustlePose::LookRight => (
-            "█▄█",
-            " ▀█ ▀",    // mirror of Default: upper-half blocks, shifted right
-            "█▄█",
-        ),
-        RustlePose::LookDown => (
-            "█▄█",
-            "▄ █▄ ",    // lower-half blocks = eyes shifted down
-            "█▄█",
-        ),
-        RustlePose::Loading { .. } => (
-            "█▄█", "", "█▄█",  // eyes built separately via loading_eye_spans
-        ),
+/// Each variant maps to a frame index explicitly so the compiler flags any
+/// newly-added variant that hasn't been wired up (no wildcard arm).
+pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 8] {
+    let idx = match pose {
+        RustlePose::Default => 0,
+        RustlePose::Loading { frame } => (*frame as usize) % FRAME_COUNT,
     };
 
-    // Row 1: head — narrow top (5-wide), wider bottom (7-wide)
-    let row1 = Line::from(vec![
-        Span::styled("  ▄█████▄  ".to_string(), body_style()),
-    ]);
-
-    // Row 2: claws extending from sides + face with eyeball highlights (widest row)
-    let mut row2_spans = vec![Span::styled(r2l.to_string(), body_style())];
-    if let RustlePose::Loading { frame } = pose {
-        row2_spans.extend(loading_eye_spans(*frame));
-    } else {
-        row2_spans.extend(eye_spans(r2e));
-    }
-    row2_spans.push(Span::styled(r2r.to_string(), body_style()));
-    let row2 = Line::from(row2_spans);
-
-    // Row 3: body
-    let row3 = Line::from(vec![
-        Span::styled(" ████████  ".to_string(), body_style()),
-    ]);
-
-    // Row 4: legs — upper half body (6-wide), lower half two leg pairs (2+gap+2)
-    let row4 = Line::from(vec![
-        Span::styled("  ██▀▀██   ".to_string(), body_style()),
-    ]);
-
-    // Row 5: blank spacing
-    let row5 = Line::from("");
-
-    [row1, row2, row3, row4, row5]
+    FRAMES[idx].map(|row| {
+        Line::from(vec![Span::styled(row.to_string(), body_style())])
+    })
 }
 
 #[cfg(test)]
@@ -241,20 +165,96 @@ mod tests {
     }
 
     #[test]
-    fn default_pose_right_eye_matches_left_eye_size() {
+    fn all_poses_produce_8_lines() {
+        let poses = [
+            RustlePose::Default,
+            RustlePose::Loading { frame: 0 },
+        ];
+        for pose in &poses {
+            let lines = rustle_lines(pose);
+            assert_eq!(lines.len(), 8, "pose {:?} should produce 8 lines", pose);
+        }
+    }
+
+    #[test]
+    fn each_row_is_exactly_29_chars() {
         let lines = rustle_lines(&RustlePose::Default);
-        assert_eq!(line_text(&lines[1]), "█▄█▀ █▀ █▄█");
+        for (i, line) in lines.iter().enumerate() {
+            let text = line_text(line);
+            assert_eq!(
+                text.chars().count(),
+                29,
+                "row {} should be 29 chars, got {:?}",
+                i,
+                text
+            );
+        }
     }
 
     #[test]
-    fn arms_up_pose_right_eye_matches_left_eye_size() {
-        let lines = rustle_lines(&RustlePose::ArmsUp);
-        assert_eq!(line_text(&lines[1]), "█▀█▀ █▀ █▀█");
+    fn default_pose_row_0_matches_frame() {
+        let lines = rustle_lines(&RustlePose::Default);
+        assert_eq!(line_text(&lines[0]), "                             ");
     }
 
     #[test]
-    fn look_right_pose_eyes_match_default_size() {
-        let lines = rustle_lines(&RustlePose::LookRight);
-        assert_eq!(line_text(&lines[1]), "█▄█ ▀█ ▀█▄█");
+    fn default_pose_last_row_is_mascot_feet() {
+        let lines = rustle_lines(&RustlePose::Default);
+        assert_eq!(line_text(&lines[7]), "                   ▝████▘    ");
+    }
+
+    #[test]
+    fn frame_count_is_at_least_one() {
+        assert!(FRAME_COUNT >= 1);
+    }
+
+    #[test]
+    fn loading_pose_cycles_through_frames() {
+        // Verify each frame index maps to the correct frame via modulo.
+        let row0_by_frame: [&str; 6] = [
+            "                             ", // frame 0 — blank row 0 (rest, centered)
+            "                             ", // frame 1 — blank row 0 (rest up-shifted)
+            "                  ▗ ▐  ▌ ▖   ", // frame 2 — extended fingers
+            "                  ▗ ▐  ▌ ▖   ", // frame 3 — extended fingers + staircase
+            "                             ", // frame 4 — blank row 0 (rest + staircase)
+            "                             ", // frame 5 — blank row 0 (rest up, loop back)
+        ];
+        for f in 0..(FRAMES.len() * 2) + 1 {
+            let lines = rustle_lines(&RustlePose::Loading { frame: f as u64 });
+            let idx = f % FRAMES.len();
+            assert_eq!(
+                line_text(&lines[0]),
+                row0_by_frame[idx],
+                "frame index {} → frame {}",
+                f,
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn loading_frame_for_elapsed_matches_durations() {
+        // Frame 0 holds for 3000 ms (0..2999 → 0, 3000 → 1)
+        assert_eq!(loading_frame_for_elapsed(0), 0);
+        assert_eq!(loading_frame_for_elapsed(2999), 0);
+        assert_eq!(loading_frame_for_elapsed(3000), 1);
+        // Frame 1 holds for 1500 ms (3000..4499 → 1, 4500 → 2)
+        assert_eq!(loading_frame_for_elapsed(4499), 1);
+        assert_eq!(loading_frame_for_elapsed(4500), 2);
+        // Frame 2 holds for 2000 ms (4500..6499 → 2, 6500 → 3)
+        assert_eq!(loading_frame_for_elapsed(6499), 2);
+        assert_eq!(loading_frame_for_elapsed(6500), 3);
+        // Frame 3 holds for 2000 ms (6500..8499 → 3, 8500 → 4)
+        assert_eq!(loading_frame_for_elapsed(8499), 3);
+        assert_eq!(loading_frame_for_elapsed(8500), 4);
+        // Frame 4 holds for 1500 ms (8500..9999 → 4, 10000 → 5)
+        assert_eq!(loading_frame_for_elapsed(9999), 4);
+        assert_eq!(loading_frame_for_elapsed(10000), 5);
+        // Frame 5 holds for 1500 ms (10000..11499 → 5, 11500 wraps to 0)
+        assert_eq!(loading_frame_for_elapsed(11499), 5);
+        assert_eq!(loading_frame_for_elapsed(11500), 0);
+        // Second cycle starts
+        assert_eq!(loading_frame_for_elapsed(14499), 0);
+        assert_eq!(loading_frame_for_elapsed(14500), 1);
     }
 }
