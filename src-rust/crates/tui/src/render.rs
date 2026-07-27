@@ -1882,7 +1882,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )));
-    left_lines.push(Line::from(""));
+    // Blank separator is intentionally removed — the greeting sits flush above
+    // the mascot, giving all 10 rows to the animation.  (The right column is
+    // unaffected since both panes are independent Paragraph widgets.)
     // Center mascot in left column
     let mascot_indent = left_w.saturating_sub(29) / 2;
     let pad = " ".repeat(mascot_indent as usize);
