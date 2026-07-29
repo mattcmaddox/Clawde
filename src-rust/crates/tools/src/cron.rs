@@ -58,7 +58,7 @@ static CRON_STORE: Lazy<Arc<RwLock<HashMap<String, CronTask>>>> =
 
 /// Path to `~/.claurst/scheduled_tasks.json`.
 fn scheduled_tasks_path() -> Option<PathBuf> {
-    Some(claurst_core::config::Settings::config_dir().join("scheduled_tasks.json"))
+    Some(clawde_core::config::Settings::config_dir().join("scheduled_tasks.json"))
 }
 
 /// Ensure the store has been loaded from disk (once per process).
@@ -255,14 +255,20 @@ struct CronCreateInput {
     durable: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[async_trait]
 impl Tool for CronCreateTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
-    fn name(&self) -> &str { "CronCreate" }
+    fn name(&self) -> &str {
+        "CronCreate"
+    }
 
     fn description(&self) -> &str {
         "Schedule a recurring or one-shot prompt using a standard 5-field cron expression \
@@ -277,7 +283,9 @@ impl Tool for CronCreateTool {
     // Creating a scheduled task installs a durable/session prompt that later runs
     // an agent unattended, so it is an arbitrary-execution primitive and must be
     // gated (issue #209) — not `None`.
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Execute }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -401,13 +409,17 @@ struct CronDeleteInput {
 
 #[async_trait]
 impl Tool for CronDeleteTool {
-    fn name(&self) -> &str { "CronDelete" }
+    fn name(&self) -> &str {
+        "CronDelete"
+    }
 
     fn description(&self) -> &str {
         "Cancel a scheduled cron task by its ID. Use CronList to find the ID."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -454,13 +466,17 @@ pub struct CronListTool;
 
 #[async_trait]
 impl Tool for CronListTool {
-    fn name(&self) -> &str { "CronList" }
+    fn name(&self) -> &str {
+        "CronList"
+    }
 
     fn description(&self) -> &str {
         "List all currently scheduled cron tasks."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -518,7 +534,8 @@ async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), 
     let durable: Vec<&CronTask> = store.values().filter(|t| t.durable).collect();
     let json = serde_json::to_string_pretty(&durable).map_err(|e| e.to_string())?;
 
-    let path = scheduled_tasks_path().ok_or_else(|| "Cannot determine home directory".to_string())?;
+    let path =
+        scheduled_tasks_path().ok_or_else(|| "Cannot determine home directory".to_string())?;
     let dir = path.parent().ok_or("No parent directory")?;
 
     tokio::fs::create_dir_all(dir)
@@ -539,19 +556,19 @@ mod tests {
 
     /// Handler that always asks; with `non_interactive = true` this denies.
     struct DenyHandler;
-    impl claurst_core::permissions::PermissionHandler for DenyHandler {
+    impl clawde_core::permissions::PermissionHandler for DenyHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Ask {
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Ask {
                 reason: "denied in test".to_string(),
             }
         }
         fn request_permission(
             &self,
-            request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
             self.check_permission(request)
         }
     }
@@ -559,17 +576,17 @@ mod tests {
     fn deny_ctx() -> ToolContext {
         ToolContext {
             working_dir: std::env::temp_dir(),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: Arc::new(DenyHandler),
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "cron-deny-test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
-            config: claurst_core::config::Config::default(),
+            config: clawde_core::config::Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,

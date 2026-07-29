@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
+use std::cell::Cell;
 
 use crate::overlays::centered_rect;
 
@@ -22,6 +23,8 @@ use crate::overlays::centered_rect;
 pub struct InvalidConfigDialogState {
     /// Whether the dialog is currently visible.
     pub visible: bool,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     /// Kind of config error.
     pub kind: InvalidConfigKind,
     /// Human-readable error message (may be multi-line).
@@ -51,6 +54,7 @@ impl InvalidConfigDialogState {
             kind: InvalidConfigKind::Settings,
             error_message: error.to_string(),
             scroll: 0,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -61,6 +65,7 @@ impl InvalidConfigDialogState {
             kind: InvalidConfigKind::ClaudeMd,
             error_message: error.to_string(),
             scroll: 0,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -97,6 +102,7 @@ pub fn render_invalid_config_dialog(
     let dialog_width = 80u16.min(area.width.saturating_sub(4));
     let dialog_height = 24u16.min(area.height.saturating_sub(4));
     let dialog_area = centered_rect(dialog_width, dialog_height, area);
+    state.last_rect.set(dialog_area);
 
     frame.render_widget(Clear, dialog_area);
 
@@ -148,22 +154,24 @@ pub fn render_invalid_config_dialog(
     // Instructions
     lines.push(Line::from(vec![Span::styled(
         "To resolve:".to_string(),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )]));
     let instructions = match state.kind {
         InvalidConfigKind::Settings => vec![
             "  1. Open ~/.claurst/settings.json in a text editor.",
             "  2. Fix the JSON syntax error shown above.",
-            "  3. Restart Claurst.",
+            "  3. Restart Clawde.",
         ],
         InvalidConfigKind::ClaudeMd => vec![
             "  1. Open the AGENTS.md file shown above in a text editor.",
             "  2. Fix the syntax error.",
-            "  3. Restart Claurst.",
+            "  3. Restart Clawde.",
         ],
         InvalidConfigKind::Generic => vec![
             "  1. Fix the configuration file shown above.",
-            "  2. Restart Claurst.",
+            "  2. Restart Clawde.",
         ],
     };
     for instr in instructions {
@@ -177,7 +185,9 @@ pub fn render_invalid_config_dialog(
     // Dismiss hint
     lines.push(Line::from(vec![Span::styled(
         "  Press Enter or Escape to dismiss and continue with defaults.",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )]));
 
     let total_lines = lines.len() as u16;
@@ -230,13 +240,19 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let state = InvalidConfigDialogState::show_settings_error("JSON parse error: unexpected ,");
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-            render_invalid_config_dialog(frame, &state, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_invalid_config_dialog(frame, &state, area);
+            })
+            .unwrap();
 
         let buf = terminal.backend().buffer().clone();
-        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
         assert!(content.contains("Invalid Settings") || content.contains("Configuration"));
     }
 
@@ -245,13 +261,19 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         let state = InvalidConfigDialogState::show_settings_error("missing field `model`");
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-            render_invalid_config_dialog(frame, &state, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_invalid_config_dialog(frame, &state, area);
+            })
+            .unwrap();
 
         let buf = terminal.backend().buffer().clone();
-        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
         assert!(content.contains("missing field") || content.contains("Error"));
     }
 
@@ -261,10 +283,12 @@ mod tests {
         let state = InvalidConfigDialogState::new(); // visible = false
         let snapshot_before = terminal.backend().buffer().clone();
 
-        terminal.draw(|frame| {
-            let area = frame.area();
-            render_invalid_config_dialog(frame, &state, area);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_invalid_config_dialog(frame, &state, area);
+            })
+            .unwrap();
 
         // Buffer should be unchanged since dialog is hidden
         let buf = terminal.backend().buffer().clone();

@@ -11,8 +11,12 @@ pub struct CopyCommand;
 
 #[async_trait]
 impl SlashCommand for CopyCommand {
-    fn name(&self) -> &str { "copy" }
-    fn description(&self) -> &str { "Copy the last assistant response to the clipboard" }
+    fn name(&self) -> &str {
+        "copy"
+    }
+    fn description(&self) -> &str {
+        "Copy the last assistant response to the clipboard"
+    }
     fn help(&self) -> &str {
         "Usage: /copy [n]\n\n\
          Copies the most recent assistant response to the system clipboard.\n\
@@ -23,11 +27,11 @@ impl SlashCommand for CopyCommand {
         let n: usize = args.trim().parse().unwrap_or(1).max(1);
 
         // Find the Nth most recent assistant message
-        let assistant_msgs: Vec<&claurst_core::types::Message> = ctx
+        let assistant_msgs: Vec<&clawde_core::types::Message> = ctx
             .messages
             .iter()
             .rev()
-            .filter(|m| m.role == claurst_core::types::Role::Assistant)
+            .filter(|m| m.role == clawde_core::types::Role::Assistant)
             .take(n)
             .collect();
 

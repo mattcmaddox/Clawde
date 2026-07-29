@@ -7,7 +7,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::tasks::{global_registry, TaskStatus};
+use clawde_core::tasks::{global_registry, TaskStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -195,8 +195,14 @@ mod tests {
     fn monitor_schema_has_action_and_task_id() {
         let schema = MonitorTool.input_schema();
         let props = &schema["properties"];
-        assert!(props["action"].is_object(), "schema should have 'action' property");
-        assert!(props["task_id"].is_object(), "schema should have 'task_id' property");
+        assert!(
+            props["action"].is_object(),
+            "schema should have 'action' property"
+        );
+        assert!(
+            props["task_id"].is_object(),
+            "schema should have 'task_id' property"
+        );
     }
 
     #[test]
@@ -215,7 +221,11 @@ mod tests {
         let ctx = make_test_ctx();
         let result = tool.execute(input, &ctx).await;
         // Either "No background tasks." or a list — both are successes.
-        assert!(!result.is_error, "list action should not return an error: {}", result.content);
+        assert!(
+            !result.is_error,
+            "list action should not return an error: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -249,23 +259,23 @@ mod tests {
     }
 
     fn make_test_ctx() -> ToolContext {
-        use claurst_core::config::Config;
-        use claurst_core::permissions::AutoPermissionHandler;
+        use clawde_core::config::Config;
+        use clawde_core::permissions::AutoPermissionHandler;
         use std::path::PathBuf;
-        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: claurst_core::config::PermissionMode::Default,
+            mode: clawde_core::config::PermissionMode::Default,
         });
         ToolContext {
             working_dir: PathBuf::from("."),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "test-monitor".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,

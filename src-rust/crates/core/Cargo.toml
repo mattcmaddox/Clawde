@@ -1,6 +1,7 @@
 [package]
 name = "clawde-core"
 version.workspace = true
+description = "Foundation crate: config, auth, storage, types, permissions, keybindings, effort levels, and utilities"
 edition.workspace = true
 
 [features]

@@ -1,6 +1,6 @@
 // Integration tests for MCP template rendering
 
-use claurst_core::mcp_templates::TemplateRenderer;
+use clawde_core::mcp_templates::TemplateRenderer;
 use serde_json::json;
 
 #[test]
@@ -21,10 +21,8 @@ fn test_nested_path() {
             "version": "1.0"
         }
     });
-    let result = TemplateRenderer::render(
-        "Created by {{meta.author}} (v{{meta.version}})",
-        &context,
-    );
+    let result =
+        TemplateRenderer::render("Created by {{meta.author}} (v{{meta.version}})", &context);
     assert_eq!(result, "Created by Alice (v1.0)");
 }
 

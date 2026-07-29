@@ -31,17 +31,50 @@ impl SlashCommand for PermissionsCommand {
     }
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
         let mut completions = vec![
-            ArgCompletion { value: "set".into(), description: "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(), available: true },
-            ArgCompletion { value: "allow".into(), description: "Allow a specific tool".into(), available: true },
-            ArgCompletion { value: "deny".into(), description: "Deny a specific tool".into(), available: true },
-            ArgCompletion { value: "reset".into(), description: "Clear all permission overrides".into(), available: true },
+            ArgCompletion {
+                value: "set".into(),
+                description:
+                    "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "allow".into(),
+                description: "Allow a specific tool".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "deny".into(),
+                description: "Deny a specific tool".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "reset".into(),
+                description: "Clear all permission overrides".into(),
+                available: true,
+            },
         ];
         // Second-level completions: /permissions set <mode>
         if partial == "set" || partial.starts_with("set ") {
-            completions.push(ArgCompletion { value: "set default".into(), description: "Default permission mode".into(), available: true });
-            completions.push(ArgCompletion { value: "set accept-edits".into(), description: "Auto-accept file edits".into(), available: true });
-            completions.push(ArgCompletion { value: "set bypass-permissions".into(), description: "Bypass all permissions".into(), available: true });
-            completions.push(ArgCompletion { value: "set plan".into(), description: "Plan mode".into(), available: true });
+            completions.push(ArgCompletion {
+                value: "set default".into(),
+                description: "Default permission mode".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set accept-edits".into(),
+                description: "Auto-accept file edits".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set bypass-permissions".into(),
+                description: "Bypass all permissions".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set plan".into(),
+                description: "Plan mode".into(),
+                available: true,
+            });
         }
         // Second-level completions: /permissions allow <tool> and deny <tool>
         // Values must include the subcommand prefix so the get_arg_completions

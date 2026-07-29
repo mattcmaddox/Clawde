@@ -57,8 +57,8 @@ pub use skill_prefetch::{
 };
 
 use clawde_api::{
-    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, LlmProvider, SystemPrompt, ThinkingConfig,
+    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, LlmProvider,
+    StreamAccumulator, StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use clawde_core::config::Config;
 use clawde_core::cost::CostTracker;
@@ -268,6 +268,16 @@ pub enum QueryEvent {
         state: TokenWarningState,
         pct_used: f64,
     },
+    /// Rate-limit usage metadata from the most recent API response headers.
+    /// Emitted once per request when the provider returns rate-limit headers.
+    RateLimitUpdate {
+        /// Which provider returned these headers (e.g. "anthropic", "groq").
+        provider_id: String,
+        /// Fraction of tokens budget used (0.0–1.0).
+        tokens_pct_used: f32,
+        /// Fraction of requests budget used (0.0–1.0).
+        requests_pct_used: f32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -456,15 +466,16 @@ pub async fn run_query_loop(
         s.track().await
     } else {
         None
-    };    // Resolve a provider for auto-compact API calls (Gap 2: generic provider support).
-    // Uses the existing provider_registry if available, otherwise builds a fresh
-    // registry from config so compaction works with both Anthropic and non-Anthropic providers.
+    }; // Resolve a provider for auto-compact API calls (Gap 2: generic provider support).
+       // Uses the existing provider_registry if available, otherwise builds a fresh
+       // registry from config so compaction works with both Anthropic and non-Anthropic providers.
     let compact_provider: Option<Arc<dyn LlmProvider>> = {
         let pid = tool_ctx.config.selected_provider_id();
         // Try the existing provider_registry first.
-        let from_registry = config.provider_registry.as_ref().and_then(|reg| {
-            reg.get(&clawde_core::ProviderId::new(&*pid)).cloned()
-        });
+        let from_registry = config
+            .provider_registry
+            .as_ref()
+            .and_then(|reg| reg.get(&clawde_core::ProviderId::new(&*pid)).cloned());
         if from_registry.is_some() {
             from_registry
         } else {
@@ -487,8 +498,6 @@ pub async fn run_query_loop(
             new_reg.get(&clawde_core::ProviderId::new(pid)).cloned()
         }
     };
-
-
 
     loop {
         turn += 1;
@@ -1016,6 +1025,16 @@ pub async fn run_query_loop(
                         caps.tool_calling = model_entry.tool_calling;
                         caps.thinking = model_entry.reasoning;
                     }
+                    // Per-model overrides from the provider itself — used by
+                    // compositing providers (FreeProvider) that don't have
+                    // entries in the static model registry.
+                    if let Some(tc) = provider.tool_calling_for(&model_id_str) {
+                        caps.tool_calling = tc;
+                    }
+                    let effective_max_tokens = provider
+                        .max_tokens_cap_for(&model_id_str)
+                        .map(|cap| config.max_tokens.min(cap))
+                        .unwrap_or(config.max_tokens);
                     // Max-steps degradation (issue #230): dispatch the final
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
@@ -1063,7 +1082,7 @@ pub async fn run_query_loop(
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
                         tools: provider_tools,
-                        max_tokens: config.max_tokens,
+                        max_tokens: effective_max_tokens,
                         temperature: effective_temperature.map(|t| t as f64),
                         top_p: None,
                         top_k: None,
@@ -1148,6 +1167,15 @@ pub async fn run_query_loop(
 
                                         // Accumulate response data.
                                         match &evt {
+                                            clawde_api::StreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::RateLimitUpdate {
+                                                        provider_id: provider_id.clone(),
+                                                        tokens_pct_used: *tokens_pct_used,
+                                                        requests_pct_used: *requests_pct_used,
+                                                    });
+                                                }
+                                            }
                                             clawde_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
                                                 usage.input_tokens = u.input_tokens;
@@ -1402,8 +1430,8 @@ pub async fn run_query_loop(
                     // knows the turn really ended.
                     if combined_text.is_empty() && combined_thinking.is_empty() {
                         let placeholder = format!(
-                            "(no response — model ended the turn with stop_reason \"{}\")",
-                            stop_str
+                            "(no response from {}/{} — model ended the turn with stop_reason \"{}\")",
+                            provider_id_str, model_id_str, stop_str
                         );
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::Stream(
@@ -1533,7 +1561,15 @@ pub async fn run_query_loop(
                     match event {
                         Some(evt) => {
                             accumulator.on_event(&evt);
-                            match &evt {
+                            match &evt {AnthropicStreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::RateLimitUpdate {
+                            provider_id: provider_id.clone(),
+                                            tokens_pct_used: *tokens_pct_used,
+                                            requests_pct_used: *requests_pct_used,
+                                        });
+                                    }
+                                }
                                 AnthropicStreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
@@ -1695,494 +1731,502 @@ pub async fn run_query_loop(
         // ensures /auto-compact off disables mid-stream compaction specifically.
         let reactive_compact_enabled =
             clawde_core::feature_gates::is_feature_enabled("reactive_compact")
-            && tool_ctx.config.auto_compact;
+                && tool_ctx.config.auto_compact;
 
         // Guard: only compact when a provider is available (prevents panic if
         // no API key is configured at the start of a session).
         if let Some(ref cp) = compact_provider {
             if tool_ctx.config.auto_compact {
-            if reactive_compact_enabled {
-                // Reactive path: emergency collapse takes priority over normal compact.
-                let context_limit = context_window;
-                if compact::should_context_collapse(context_tokens, context_limit) {
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(
-                            "Compacting context... (emergency collapse)".to_string(),
-                        ));
-                    }
-                    // Pass a clone so the live conversation survives a failed
-                    // compaction; `*messages` is only overwritten on success (#213).
-                    let outcome = compact::context_collapse(messages.clone(), cp.as_ref(), config).await;
-                    match apply_compact_result(messages, outcome) {
-                        Ok(tokens_freed) => {
-                            info!(tokens_freed, "Context-collapse complete");
+                if reactive_compact_enabled {
+                    // Reactive path: emergency collapse takes priority over normal compact.
+                    let context_limit = context_window;
+                    if compact::should_context_collapse(context_tokens, context_limit) {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(
+                                "Compacting context... (emergency collapse)".to_string(),
+                            ));
                         }
-                        Err(e) => {
-                            // `*messages` is left untouched — the conversation is intact.
-                            warn!(error = %e, "Context-collapse failed; conversation preserved");
+                        // Pass a clone so the live conversation survives a failed
+                        // compaction; `*messages` is only overwritten on success (#213).
+                        let outcome =
+                            compact::context_collapse(messages.clone(), cp.as_ref(), config).await;
+                        match apply_compact_result(messages, outcome) {
+                            Ok(tokens_freed) => {
+                                info!(tokens_freed, "Context-collapse complete");
+                            }
+                            Err(e) => {
+                                // `*messages` is left untouched — the conversation is intact.
+                                warn!(error = %e, "Context-collapse failed; conversation preserved");
+                            }
+                        }
+                    } else if compact::should_compact(context_tokens, context_limit) {
+                        if let Some(ref tx) = event_tx {
+                            let _ =
+                                tx.send(QueryEvent::Status("Compacting context...".to_string()));
+                        }
+                        // Pass a clone so the live conversation survives a failed
+                        // compaction; `*messages` is only overwritten on success (#213).
+                        let outcome = compact::reactive_compact(
+                            messages.clone(),
+                            cp.as_ref(),
+                            config,
+                            cancel_token.clone(),
+                            &[],
+                        )
+                        .await;
+                        match apply_compact_result(messages, outcome) {
+                            Ok(tokens_freed) => {
+                                info!(tokens_freed, "Reactive compact complete");
+                            }
+                            // `*messages` is left untouched on both failure arms below.
+                            Err(clawde_core::error::ClaudeError::Cancelled) => {
+                                warn!("Reactive compact was cancelled; conversation preserved");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Reactive compact failed; conversation preserved");
+                            }
                         }
                     }
-                } else if compact::should_compact(context_tokens, context_limit) {
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
-                    }
-                    // Pass a clone so the live conversation survives a failed
-                    // compaction; `*messages` is only overwritten on success (#213).
-                    let outcome = compact::reactive_compact(
-                        messages.clone(),
+                } else if stop == "end_turn" || stop == "tool_use" {
+                    // Proactive auto-compact (original path, used when reactive compact is off).
+                    if let Some(new_msgs) = compact::auto_compact_if_needed(
                         cp.as_ref(),
-                        config,
-                        cancel_token.clone(),
-                        &[],
+                        messages,
+                        context_tokens,
+                        &config.model,
+                        context_window,
+                        &mut compact_state,
                     )
-                    .await;
-                    match apply_compact_result(messages, outcome) {
-                        Ok(tokens_freed) => {
-                            info!(tokens_freed, "Reactive compact complete");
+                    .await
+                    {
+                        *messages = new_msgs;
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(
+                                "Context compacted to stay within limits.".to_string(),
+                            ));
                         }
-                        // `*messages` is left untouched on both failure arms below.
-                        Err(clawde_core::error::ClaudeError::Cancelled) => {
-                            warn!("Reactive compact was cancelled; conversation preserved");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Reactive compact failed; conversation preserved");
-                        }
-                    }
-                }
-            } else if stop == "end_turn" || stop == "tool_use" {
-                // Proactive auto-compact (original path, used when reactive compact is off).
-                if let Some(new_msgs) = compact::auto_compact_if_needed(
-                    cp.as_ref(),
-                    messages,
-                    context_tokens,
-                    &config.model,
-                    context_window,
-                    &mut compact_state,
-                )
-                .await
-                {
-                    *messages = new_msgs;
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(
-                            "Context compacted to stay within limits.".to_string(),
-                        ));
                     }
                 }
             }
-        }
-        if let Some(ref tx) = event_tx {
-            let _ = tx.send(QueryEvent::TurnComplete {
-                turn,
-                stop_reason: stop.to_string(),
-                usage: Some(usage.clone()),
-            });
-        }
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::TurnComplete {
+                    turn,
+                    stop_reason: stop.to_string(),
+                    usage: Some(usage.clone()),
+                });
+            }
 
-        // Helper closure for firing the Stop hook.
-        macro_rules! fire_stop_hook {
-            ($msg:expr) => {{
-                let stop_ctx = clawde_core::hooks::HookContext {
-                    event: "Stop".to_string(),
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: Some($msg.get_all_text()),
-                    is_error: None,
-                    session_id: Some(tool_ctx.session_id.clone()),
-                };
-                clawde_core::hooks::run_hooks(
-                    &tool_ctx.config.hooks,
-                    clawde_core::config::HookEvent::Stop,
-                    &stop_ctx,
-                    &tool_ctx.working_dir,
-                )
-                .await;
-            }};
-        }
+            // Helper closure for firing the Stop hook.
+            macro_rules! fire_stop_hook {
+                ($msg:expr) => {{
+                    let stop_ctx = clawde_core::hooks::HookContext {
+                        event: "Stop".to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: Some($msg.get_all_text()),
+                        is_error: None,
+                        session_id: Some(tool_ctx.session_id.clone()),
+                    };
+                    clawde_core::hooks::run_hooks(
+                        &tool_ctx.config.hooks,
+                        clawde_core::config::HookEvent::Stop,
+                        &stop_ctx,
+                        &tool_ctx.working_dir,
+                    )
+                    .await;
+                }};
+            }
 
-        match stop {
-            "end_turn" => {
-                fire_stop_hook!(assistant_msg);
+            match stop {
+                "end_turn" => {
+                    fire_stop_hook!(assistant_msg);
 
-                // T1-3: Fire Stop hooks in background (fire-and-forget).
-                // `stop_hooks_with_full_behavior` spawns blocking tasks internally
-                // and returns immediately with an empty Vec.
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                    // T1-3: Fire Stop hooks in background (fire-and-forget).
+                    // `stop_hooks_with_full_behavior` spawns blocking tasks internally
+                    // and returns immediately with an empty Vec.
+                    let _bg = stop_hooks_with_full_behavior(
+                        &assistant_msg,
+                        &tool_ctx.config,
+                        tool_ctx.working_dir.clone(),
+                    );
 
-                // Asynchronously extract and persist session memories if warranted.
-                // Runs in a detached Tokio task so it doesn't block the query loop.
-                if session_memory::SessionMemoryExtractor::should_extract(messages) {
-                    let model_clone = config.model.clone();
-                    let messages_clone = messages.clone();
-                    let working_dir_clone = tool_ctx.working_dir.clone();
+                    // Asynchronously extract and persist session memories if warranted.
+                    // Runs in a detached Tokio task so it doesn't block the query loop.
+                    if session_memory::SessionMemoryExtractor::should_extract(messages) {
+                        let model_clone = config.model.clone();
+                        let messages_clone = messages.clone();
+                        let working_dir_clone = tool_ctx.working_dir.clone();
 
-                    // Build a fresh client using the same API key.  This avoids
-                    // requiring an Arc in the existing run_query_loop signature.
-                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                        if !api_key.is_empty() {
-                            if let Ok(sm_client) =
-                                clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
-                                    api_key,
-                                    ..Default::default()
-                                })
-                            {
-                                let sm_client = std::sync::Arc::new(sm_client);
-                                tokio::spawn(async move {
-                                    let extractor =
-                                        session_memory::SessionMemoryExtractor::new(&model_clone);
-                                    match extractor
-                                        .extract(&messages_clone, &working_dir_clone, &sm_client)
-                                        .await
-                                    {
-                                        Ok(memories) if !memories.is_empty() => {
-                                            let target = working_dir_clone
-                                                .join(".claurst")
-                                                .join("AGENTS.md");
-                                            if let Err(e) =
-                                                session_memory::SessionMemoryExtractor::persist(
-                                                    &memories, &target,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
+                        // Build a fresh client using the same API key.  This avoids
+                        // requiring an Arc in the existing run_query_loop signature.
+                        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                            if !api_key.is_empty() {
+                                if let Ok(sm_client) = clawde_api::AnthropicClient::new(
+                                    clawde_api::client::ClientConfig {
+                                        api_key,
+                                        ..Default::default()
+                                    },
+                                ) {
+                                    let sm_client = std::sync::Arc::new(sm_client);
+                                    tokio::spawn(async move {
+                                        let extractor = session_memory::SessionMemoryExtractor::new(
+                                            &model_clone,
+                                        );
+                                        match extractor
+                                            .extract(
+                                                &messages_clone,
+                                                &working_dir_clone,
+                                                &sm_client,
+                                            )
+                                            .await
+                                        {
+                                            Ok(memories) if !memories.is_empty() => {
+                                                let target = working_dir_clone
+                                                    .join(".claurst")
+                                                    .join("AGENTS.md");
+                                                if let Err(e) =
+                                                    session_memory::SessionMemoryExtractor::persist(
+                                                        &memories, &target,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "Failed to persist session memories"
+                                                    );
+                                                }
+                                            }
+                                            Ok(_) => {} // no memories extracted
+                                            Err(e) => {
+                                                tracing::debug!(
                                                     error = %e,
-                                                    "Failed to persist session memories"
+                                                    "Session memory extraction failed (non-fatal)"
                                                 );
                                             }
                                         }
-                                        Ok(_) => {} // no memories extracted
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                error = %e,
-                                                "Session memory extraction failed (non-fatal)"
-                                            );
-                                        }
-                                    }
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Trigger AutoDream consolidation check (non-blocking, best-effort).
+                    // maybe_trigger() checks gates + acquires lock. If it returns
+                    // Some(task), we spawn a background subagent via AgentTool so
+                    // the spawn doesn't call run_query_loop recursively from within
+                    // its own future (which would make the future !Send).
+                    {
+                        let clawde_home = clawde_core::config::Settings::config_dir();
+                        let memory_dir = Some(clawde_home.join("memory"));
+                        let conversations_dir = Some(clawde_home.join("conversations"));
+                        if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
+                            let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
+                            if let Ok(Some(task)) = dreamer.maybe_trigger().await {
+                                // Run the consolidation subagent in a background Tokio
+                                // task. We use the AgentTool execute path (via
+                                // poll_background_agent / BACKGROUND_AGENTS) to avoid
+                                // re-entering run_query_loop from within the same
+                                // future graph.
+                                let agent_input = serde_json::json!({
+                                    "description": "memory consolidation",
+                                    "prompt": task.prompt,
+                                    "max_turns": 20,
+                                    "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
+                                    "run_in_background": true,
+                                    "isolation": null
+                                });
+                                let ctx_for_dream = tool_ctx.clone();
+                                tokio::spawn(async move {
+                                    let agent = crate::agent_tool::AgentTool;
+                                    let _result = clawde_tools::Tool::execute(
+                                        &agent,
+                                        agent_input,
+                                        &ctx_for_dream,
+                                    )
+                                    .await;
+                                    crate::auto_dream::AutoDream::finish_consolidation(&task).await;
                                 });
                             }
                         }
                     }
-                }
 
-                // Trigger AutoDream consolidation check (non-blocking, best-effort).
-                // maybe_trigger() checks gates + acquires lock. If it returns
-                // Some(task), we spawn a background subagent via AgentTool so
-                // the spawn doesn't call run_query_loop recursively from within
-                // its own future (which would make the future !Send).
-                {
-                    let clawde_home = clawde_core::config::Settings::config_dir();
-                    let memory_dir = Some(clawde_home.join("memory"));
-                    let conversations_dir = Some(clawde_home.join("conversations"));
-                    if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
-                        let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
-                        if let Ok(Some(task)) = dreamer.maybe_trigger().await {
-                            // Run the consolidation subagent in a background Tokio
-                            // task. We use the AgentTool execute path (via
-                            // poll_background_agent / BACKGROUND_AGENTS) to avoid
-                            // re-entering run_query_loop from within the same
-                            // future graph.
-                            let agent_input = serde_json::json!({
-                                "description": "memory consolidation",
-                                "prompt": task.prompt,
-                                "max_turns": 20,
-                                "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
-                                "run_in_background": true,
-                                "isolation": null
-                            });
-                            let ctx_for_dream = tool_ctx.clone();
-                            tokio::spawn(async move {
-                                let agent = crate::agent_tool::AgentTool;
-                                let _result = clawde_tools::Tool::execute(
-                                    &agent,
-                                    agent_input,
-                                    &ctx_for_dream,
-                                )
-                                .await;
-                                crate::auto_dream::AutoDream::finish_consolidation(&task).await;
-                            });
+                    // Attach snapshot patch covering all file changes this query.
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                        let patch = snap.patch(hash).await;
+                        if !patch.files.is_empty() {
+                            assistant_msg.snapshot_patch = Some(patch);
                         }
                     }
-                }
 
-                // Attach snapshot patch covering all file changes this query.
-                if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
-                    let patch = snap.patch(hash).await;
-                    if !patch.files.is_empty() {
-                        assistant_msg.snapshot_patch = Some(patch);
+                    continue_or_end!(assistant_msg, usage);
+                }
+                "max_tokens" => {
+                    // Mirror the TS recovery loop: inject a continuation nudge and
+                    // retry up to MAX_TOKENS_RECOVERY_LIMIT times before surfacing
+                    // the partial response as QueryOutcome::MaxTokens.
+                    if max_tokens_recovery_count < MAX_TOKENS_RECOVERY_LIMIT {
+                        max_tokens_recovery_count += 1;
+                        warn!(
+                            attempt = max_tokens_recovery_count,
+                            limit = MAX_TOKENS_RECOVERY_LIMIT,
+                            "max_tokens hit — injecting continuation message (attempt {}/{})",
+                            max_tokens_recovery_count,
+                            MAX_TOKENS_RECOVERY_LIMIT,
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "Output token limit hit — continuing (attempt {}/{})",
+                                max_tokens_recovery_count, MAX_TOKENS_RECOVERY_LIMIT
+                            )));
+                        }
+                        // The partial assistant message must be in the history so
+                        // the continuation makes sense to the model.
+                        messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
+                        continue;
                     }
-                }
-
-                continue_or_end!(assistant_msg, usage);
-            }
-            "max_tokens" => {
-                // Mirror the TS recovery loop: inject a continuation nudge and
-                // retry up to MAX_TOKENS_RECOVERY_LIMIT times before surfacing
-                // the partial response as QueryOutcome::MaxTokens.
-                if max_tokens_recovery_count < MAX_TOKENS_RECOVERY_LIMIT {
-                    max_tokens_recovery_count += 1;
+                    // Recovery exhausted — surface the partial response.
                     warn!(
-                        attempt = max_tokens_recovery_count,
-                        limit = MAX_TOKENS_RECOVERY_LIMIT,
-                        "max_tokens hit — injecting continuation message (attempt {}/{})",
-                        max_tokens_recovery_count,
-                        MAX_TOKENS_RECOVERY_LIMIT,
+                        "max_tokens recovery exhausted after {} attempts",
+                        MAX_TOKENS_RECOVERY_LIMIT
                     );
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!(
-                            "Output token limit hit — continuing (attempt {}/{})",
-                            max_tokens_recovery_count, MAX_TOKENS_RECOVERY_LIMIT
-                        )));
-                    }
-                    // The partial assistant message must be in the history so
-                    // the continuation makes sense to the model.
-                    messages.push(Message::user(MAX_TOKENS_RECOVERY_MSG));
-                    continue;
-                }
-                // Recovery exhausted — surface the partial response.
-                warn!(
-                    "max_tokens recovery exhausted after {} attempts",
-                    MAX_TOKENS_RECOVERY_LIMIT
-                );
-                return QueryOutcome::MaxTokens {
-                    partial_message: assistant_msg,
-                    usage,
-                };
-            }
-            "tool_use" => {
-                // A completed tool-use turn counts as a successful recovery
-                // boundary; reset the max_tokens retry counter.
-                max_tokens_recovery_count = 0;
-                // Extract tool calls and execute them
-                let tool_blocks = assistant_msg.get_tool_use_blocks();
-                if tool_blocks.is_empty() {
-                    // Shouldn't happen but treat as end_turn
-                    return QueryOutcome::EndTurn {
-                        message: assistant_msg,
+                    return QueryOutcome::MaxTokens {
+                        partial_message: assistant_msg,
                         usage,
                     };
                 }
+                "tool_use" => {
+                    // A completed tool-use turn counts as a successful recovery
+                    // boundary; reset the max_tokens retry counter.
+                    max_tokens_recovery_count = 0;
+                    // Extract tool calls and execute them
+                    let tool_blocks = assistant_msg.get_tool_use_blocks();
+                    if tool_blocks.is_empty() {
+                        // Shouldn't happen but treat as end_turn
+                        return QueryOutcome::EndTurn {
+                            message: assistant_msg,
+                            usage,
+                        };
+                    }
 
-                // ---------------------------------------------------------------------------
-                // Streaming tool executor: parallel non-agent tool dispatch.
-                //
-                // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
-                //          and may display interactive permission dialogs).
-                // Phase 2: Dispatch all non-blocked tool executions concurrently via
-                //          futures::future::join_all, preserving original order.
-                // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
-                //
-                // This mirrors the TypeScript StreamingToolExecutor pattern.
-                // ---------------------------------------------------------------------------
+                    // ---------------------------------------------------------------------------
+                    // Streaming tool executor: parallel non-agent tool dispatch.
+                    //
+                    // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
+                    //          and may display interactive permission dialogs).
+                    // Phase 2: Dispatch all non-blocked tool executions concurrently via
+                    //          futures::future::join_all, preserving original order.
+                    // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
+                    //
+                    // This mirrors the TypeScript StreamingToolExecutor pattern.
+                    // ---------------------------------------------------------------------------
 
-                // Intermediate record produced during Phase 1.
-                struct PreparedTool {
-                    id: String,
-                    name: String,
-                    input: Value,
-                    /// None means the pre-hook blocked execution; the String is the error reason.
-                    blocked_result: Option<ToolResult>,
-                }
+                    // Intermediate record produced during Phase 1.
+                    struct PreparedTool {
+                        id: String,
+                        name: String,
+                        input: Value,
+                        /// None means the pre-hook blocked execution; the String is the error reason.
+                        blocked_result: Option<ToolResult>,
+                    }
 
-                // Phase 1: sequential pre-hook pass.
-                let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
-                for block in tool_blocks {
-                    if let ContentBlock::ToolUse {
-                        id, name, input, ..
-                    } = block
-                    {
-                        // Clone from the references returned by get_tool_use_blocks()
-                        let id = id.clone();
-                        let name = name.clone();
-                        let input = input.clone();
+                    // Phase 1: sequential pre-hook pass.
+                    let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
+                    for block in tool_blocks {
+                        if let ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } = block
+                        {
+                            // Clone from the references returned by get_tool_use_blocks()
+                            let id = id.clone();
+                            let name = name.clone();
+                            let input = input.clone();
+
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::ToolStart {
+                                    tool_name: name.clone(),
+                                    tool_id: id.clone(),
+                                    input_json: input.to_string(),
+                                });
+                            }
+
+                            let hooks = &tool_ctx.config.hooks;
+                            let hook_ctx = clawde_core::hooks::HookContext {
+                                event: "PreToolUse".to_string(),
+                                tool_name: Some(name.clone()),
+                                tool_input: Some(input.clone()),
+                                tool_output: None,
+                                is_error: None,
+                                session_id: Some(tool_ctx.session_id.clone()),
+                            };
+                            let pre_outcome = clawde_core::hooks::run_hooks(
+                                hooks,
+                                clawde_core::config::HookEvent::PreToolUse,
+                                &hook_ctx,
+                                &tool_ctx.working_dir,
+                            )
+                            .await;
+
+                            let plugin_pre_outcome =
+                                clawde_plugins::run_global_pre_tool_hook(&name, &input);
+
+                            let blocked_result = if let clawde_core::hooks::HookOutcome::Blocked(
+                                reason,
+                            ) = pre_outcome
+                            {
+                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                                Some(clawde_tools::ToolResult::error(format!(
+                                    "Blocked by hook: {}",
+                                    reason
+                                )))
+                            } else if let clawde_plugins::HookOutcome::Deny(reason) =
+                                plugin_pre_outcome
+                            {
+                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                                Some(clawde_tools::ToolResult::error(format!(
+                                    "Blocked by plugin hook: {}",
+                                    reason
+                                )))
+                            } else {
+                                None
+                            };
+
+                            prepared.push(PreparedTool {
+                                id,
+                                name,
+                                input,
+                                blocked_result,
+                            });
+                        }
+                    }
+
+                    // Phase 2: build execution futures for non-blocked tools and join them.
+                    // Blocked tools yield a ready future with the pre-computed error result.
+                    // Non-blocked tools execute concurrently via join_all.
+                    // Each async block owns its cloned name/input so there are no lifetime issues.
+                    let exec_futures: Vec<_> = prepared
+                        .iter()
+                        .map(|p| {
+                            if p.blocked_result.is_some() {
+                                let r = p.blocked_result.clone().unwrap();
+                                futures::future::Either::Left(async move { r })
+                            } else {
+                                let name = p.name.clone();
+                                let input = p.input.clone();
+                                futures::future::Either::Right(async move {
+                                    execute_tool(&name, &input, tools, tool_ctx).await
+                                })
+                            }
+                        })
+                        .collect();
+
+                    // Run all tool futures concurrently, but race the batch against the
+                    // loop's cancel token (issue #218): on cancellation the in-flight
+                    // tools are abandoned promptly instead of blocking until the
+                    // slowest one finishes, and a cancelled ToolResult is synthesized
+                    // for EVERY tool so each tool_use still gets a matching tool_result
+                    // and the message history stays well-formed.
+                    let (exec_results, batch_cancelled) =
+                        run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
+
+                    // Phase 3: post-hooks, event emission, and result block assembly.
+                    // When the batch was cancelled we skip the awaiting PostToolUse
+                    // hooks (they run external commands and would defeat the point of
+                    // returning promptly) but still emit ToolEnd + build every result
+                    // block so the conversation and TUI stay consistent.
+                    let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
+                    for (p, result) in prepared.iter().zip(exec_results) {
+                        if !batch_cancelled {
+                            let hooks = &tool_ctx.config.hooks;
+                            let post_ctx = clawde_core::hooks::HookContext {
+                                event: "PostToolUse".to_string(),
+                                tool_name: Some(p.name.clone()),
+                                tool_input: Some(p.input.clone()),
+                                tool_output: Some(result.content.clone()),
+                                is_error: Some(result.is_error),
+                                session_id: Some(tool_ctx.session_id.clone()),
+                            };
+                            clawde_core::hooks::run_hooks(
+                                hooks,
+                                clawde_core::config::HookEvent::PostToolUse,
+                                &post_ctx,
+                                &tool_ctx.working_dir,
+                            )
+                            .await;
+
+                            clawde_plugins::run_global_post_tool_hook(
+                                &p.name,
+                                &p.input,
+                                &result.content,
+                                result.is_error,
+                            );
+                        }
 
                         if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::ToolStart {
-                                tool_name: name.clone(),
-                                tool_id: id.clone(),
-                                input_json: input.to_string(),
+                            let _ = tx.send(QueryEvent::ToolEnd {
+                                tool_name: p.name.clone(),
+                                tool_id: p.id.clone(),
+                                result: result.content.clone(),
+                                is_error: result.is_error,
                             });
                         }
 
-                        let hooks = &tool_ctx.config.hooks;
-                        let hook_ctx = clawde_core::hooks::HookContext {
-                            event: "PreToolUse".to_string(),
-                            tool_name: Some(name.clone()),
-                            tool_input: Some(input.clone()),
-                            tool_output: None,
-                            is_error: None,
-                            session_id: Some(tool_ctx.session_id.clone()),
-                        };
-                        let pre_outcome = clawde_core::hooks::run_hooks(
-                            hooks,
-                            clawde_core::config::HookEvent::PreToolUse,
-                            &hook_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        let plugin_pre_outcome =
-                            clawde_plugins::run_global_pre_tool_hook(&name, &input);
-
-                        let blocked_result = if let clawde_core::hooks::HookOutcome::Blocked(
-                            reason,
-                        ) = pre_outcome
-                        {
-                            warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                            Some(clawde_tools::ToolResult::error(format!(
-                                "Blocked by hook: {}",
-                                reason
-                            )))
-                        } else if let clawde_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome
-                        {
-                            warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                            Some(clawde_tools::ToolResult::error(format!(
-                                "Blocked by plugin hook: {}",
-                                reason
-                            )))
-                        } else {
-                            None
-                        };
-
-                        prepared.push(PreparedTool {
-                            id,
-                            name,
-                            input,
-                            blocked_result,
+                        result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: p.id.clone(),
+                            content: ToolResultContent::Text(result.content),
+                            is_error: if result.is_error { Some(true) } else { None },
                         });
                     }
-                }
 
-                // Phase 2: build execution futures for non-blocked tools and join them.
-                // Blocked tools yield a ready future with the pre-computed error result.
-                // Non-blocked tools execute concurrently via join_all.
-                // Each async block owns its cloned name/input so there are no lifetime issues.
-                let exec_futures: Vec<_> = prepared
-                    .iter()
-                    .map(|p| {
-                        if p.blocked_result.is_some() {
-                            let r = p.blocked_result.clone().unwrap();
-                            futures::future::Either::Left(async move { r })
-                        } else {
-                            let name = p.name.clone();
-                            let input = p.input.clone();
-                            futures::future::Either::Right(async move {
-                                execute_tool(&name, &input, tools, tool_ctx).await
-                            })
+                    // Append tool results as a user message so the history remains
+                    // valid (every tool_use is answered) even on cancellation.
+                    messages.push(Message::user_blocks(result_blocks));
+
+                    // If the batch was abandoned due to cancellation, stop the loop
+                    // now rather than sending the (cancelled) results back to the model.
+                    if batch_cancelled {
+                        return QueryOutcome::Cancelled;
+                    }
+
+                    // Continue the loop to send results back to the model
+                    continue;
+                }
+                "stop_sequence" => {
+                    fire_stop_hook!(assistant_msg);
+                    let _bg = stop_hooks_with_full_behavior(
+                        &assistant_msg,
+                        &tool_ctx.config,
+                        tool_ctx.working_dir.clone(),
+                    );
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                        let patch = snap.patch(hash).await;
+                        if !patch.files.is_empty() {
+                            assistant_msg.snapshot_patch = Some(patch);
                         }
-                    })
-                    .collect();
-
-                // Run all tool futures concurrently, but race the batch against the
-                // loop's cancel token (issue #218): on cancellation the in-flight
-                // tools are abandoned promptly instead of blocking until the
-                // slowest one finishes, and a cancelled ToolResult is synthesized
-                // for EVERY tool so each tool_use still gets a matching tool_result
-                // and the message history stays well-formed.
-                let (exec_results, batch_cancelled) =
-                    run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
-
-                // Phase 3: post-hooks, event emission, and result block assembly.
-                // When the batch was cancelled we skip the awaiting PostToolUse
-                // hooks (they run external commands and would defeat the point of
-                // returning promptly) but still emit ToolEnd + build every result
-                // block so the conversation and TUI stay consistent.
-                let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                for (p, result) in prepared.iter().zip(exec_results) {
-                    if !batch_cancelled {
-                        let hooks = &tool_ctx.config.hooks;
-                        let post_ctx = clawde_core::hooks::HookContext {
-                            event: "PostToolUse".to_string(),
-                            tool_name: Some(p.name.clone()),
-                            tool_input: Some(p.input.clone()),
-                            tool_output: Some(result.content.clone()),
-                            is_error: Some(result.is_error),
-                            session_id: Some(tool_ctx.session_id.clone()),
-                        };
-                        clawde_core::hooks::run_hooks(
-                            hooks,
-                            clawde_core::config::HookEvent::PostToolUse,
-                            &post_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        clawde_plugins::run_global_post_tool_hook(
-                            &p.name,
-                            &p.input,
-                            &result.content,
-                            result.is_error,
-                        );
                     }
-
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::ToolEnd {
-                            tool_name: p.name.clone(),
-                            tool_id: p.id.clone(),
-                            result: result.content.clone(),
-                            is_error: result.is_error,
-                        });
+                    continue_or_end!(assistant_msg, usage);
+                }
+                other => {
+                    warn!(
+                        stop_reason = other,
+                        "Unknown stop reason, treating as end_turn"
+                    );
+                    fire_stop_hook!(assistant_msg);
+                    let _bg = stop_hooks_with_full_behavior(
+                        &assistant_msg,
+                        &tool_ctx.config,
+                        tool_ctx.working_dir.clone(),
+                    );
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                        let patch = snap.patch(hash).await;
+                        if !patch.files.is_empty() {
+                            assistant_msg.snapshot_patch = Some(patch);
+                        }
                     }
-
-                    result_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: p.id.clone(),
-                        content: ToolResultContent::Text(result.content),
-                        is_error: if result.is_error { Some(true) } else { None },
-                    });
+                    continue_or_end!(assistant_msg, usage);
                 }
-
-                // Append tool results as a user message so the history remains
-                // valid (every tool_use is answered) even on cancellation.
-                messages.push(Message::user_blocks(result_blocks));
-
-                // If the batch was abandoned due to cancellation, stop the loop
-                // now rather than sending the (cancelled) results back to the model.
-                if batch_cancelled {
-                    return QueryOutcome::Cancelled;
-                }
-
-                // Continue the loop to send results back to the model
-                continue;
-            }
-            "stop_sequence" => {
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
-                if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
-                    let patch = snap.patch(hash).await;
-                    if !patch.files.is_empty() {
-                        assistant_msg.snapshot_patch = Some(patch);
-                    }
-                }
-                continue_or_end!(assistant_msg, usage);
-            }
-            other => {
-                warn!(
-                    stop_reason = other,
-                    "Unknown stop reason, treating as end_turn"
-                );
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
-                if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
-                    let patch = snap.patch(hash).await;
-                    if !patch.files.is_empty() {
-                        assistant_msg.snapshot_patch = Some(patch);
-                    }
-                }
-                continue_or_end!(assistant_msg, usage);
             }
         }
-                }
-}
+    }
 }
 
 /// Stream handler that forwards events to an unbounded channel.
@@ -2297,12 +2341,12 @@ mod tests {
     #[test]
     fn test_system_prompt_default_when_empty() {
         // The default prompt (no custom system prompt set) should include the
-        // Claurst attribution and standard sections.
+        // Clawde attribution and standard sections.
         let cfg = make_config(None, None);
         let prompt = build_system_prompt(&cfg);
         if let SystemPrompt::Text(text) = prompt {
             assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
+                text.contains("Clawde") || text.contains("coding agent"),
                 "Default prompt should contain attribution: {}",
                 text
             );
@@ -2327,7 +2371,7 @@ mod tests {
                 "Custom prompt text should appear in the output"
             );
             assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
+                text.contains("Clawde") || text.contains("coding agent"),
                 "Default attribution should still be present"
             );
         } else {

@@ -1,4 +1,4 @@
-// upgrade.rs — `claurst upgrade` subcommand.
+// upgrade.rs — `clawde upgrade` subcommand.
 //
 // Downloads the latest release from GitHub, extracts it, and atomically
 // replaces the running binary.  Mirrors the logic in install.sh / install.ps1
@@ -12,8 +12,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const REPO: &str = "Kuberwastaken/claurst";
-const APP: &str = "claurst";
+const REPO: &str = "Kuberwastaken/clawde";
+const APP: &str = "clawde";
 
 pub async fn run_upgrade(args: &[String]) -> Result<()> {
     // -------- arg parsing --------
@@ -59,8 +59,8 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
     }
 
     // -------- locate current exe --------
-    let exe_path = std::env::current_exe()
-        .context("could not determine current executable path")?;
+    let exe_path =
+        std::env::current_exe().context("could not determine current executable path")?;
     let exe_path = std::fs::canonicalize(&exe_path).unwrap_or(exe_path);
     println!("Installed at:    {}", exe_path.display());
 
@@ -85,9 +85,9 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
 
     // -------- locate the new binary --------
     let bin_name = if cfg!(target_os = "windows") {
-        "claurst.exe"
+        "clawde.exe"
     } else {
-        "claurst"
+        "clawde"
     };
     let new_binary = extract_dir.join(bin_name);
     if !new_binary.exists() {
@@ -125,18 +125,18 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     println!("\nUpgraded to v{}.", target_version);
-    println!("Run `claurst --version` in a new shell to verify.");
+    println!("Run `clawde --version` in a new shell to verify.");
     Ok(())
 }
 
 fn print_help() {
     println!(
-        "Usage: claurst upgrade [options]\n\n\
+        "Usage: clawde upgrade [options]\n\n\
          Options:\n\
            -v, --version <v>   Install a specific version (default: latest)\n\
            -f, --force         Reinstall even if already up to date\n\
            -h, --help          Show this help\n\n\
-         Downloads the latest claurst release from GitHub and replaces this\n\
+         Downloads the latest clawde release from GitHub and replaces this\n\
          binary in place. Your settings and sessions are preserved."
     );
 }
@@ -183,7 +183,7 @@ async fn fetch_latest_version() -> Result<String> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent(format!("claurst-upgrade/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("clawde-upgrade/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
@@ -204,7 +204,7 @@ async fn fetch_latest_version() -> Result<String> {
 async fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .user_agent(format!("claurst-upgrade/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("clawde-upgrade/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
@@ -246,7 +246,12 @@ fn extract_archive(archive: &Path, dest: &Path, is_zip: bool) -> Result<()> {
         }
         // tar -xf works on Windows 10+ via bsdtar.
         let status = std::process::Command::new("tar")
-            .args(["-xf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
+            .args([
+                "-xf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
             .status()
             .context("failed to spawn tar")?;
         if !status.success() {
@@ -255,7 +260,12 @@ fn extract_archive(archive: &Path, dest: &Path, is_zip: bool) -> Result<()> {
         Ok(())
     } else {
         let status = std::process::Command::new("tar")
-            .args(["-xzf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
+            .args([
+                "-xzf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
             .status()
             .context("failed to spawn tar")?;
         if !status.success() {
@@ -301,10 +311,11 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
         let mut sidelined = current.to_path_buf();
         sidelined.set_extension("exe.old");
         let _ = std::fs::remove_file(&sidelined);
-        std::fs::rename(current, &sidelined)
-            .with_context(|| format!("failed to sideline current exe to {}", sidelined.display()))?;
+        std::fs::rename(current, &sidelined).with_context(|| {
+            format!("failed to sideline current exe to {}", sidelined.display())
+        })?;
         if let Err(e) = std::fs::copy(new, current) {
-            // Try to roll back the rename so the user isn't left without claurst.
+            // Try to roll back the rename so the user isn't left without clawde.
             let _ = std::fs::rename(&sidelined, current);
             bail!("failed to install new binary: {}", e);
         }
@@ -340,7 +351,7 @@ fn tempdir_for_upgrade() -> Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let dir = base.join(format!("claurst-upgrade-{}-{}", pid, now));
+    let dir = base.join(format!("clawde-upgrade-{}-{}", pid, now));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

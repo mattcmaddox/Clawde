@@ -12,9 +12,15 @@ pub struct ThinkBackPlayCommand;
 
 #[async_trait]
 impl SlashCommand for ThinkBackCommand {
-    fn name(&self) -> &str { "think-back" }
-    fn aliases(&self) -> Vec<&str> { vec!["thinkback"] }
-    fn description(&self) -> &str { "Show thinking traces from previous responses in this session" }
+    fn name(&self) -> &str {
+        "think-back"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["thinkback"]
+    }
+    fn description(&self) -> &str {
+        "Show thinking traces from previous responses in this session"
+    }
     fn help(&self) -> &str {
         "Usage: /think-back [n]\n\n\
          Displays the thinking/reasoning traces from the most recent model responses.\n\
@@ -29,7 +35,7 @@ impl SlashCommand for ThinkBackCommand {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.role == claurst_core::types::Role::Assistant)
+            .filter(|(_, m)| m.role == clawde_core::types::Role::Assistant)
             .filter_map(|(idx, m)| {
                 let blocks = m.get_thinking_blocks();
                 if blocks.is_empty() {
@@ -38,7 +44,7 @@ impl SlashCommand for ThinkBackCommand {
                 let thinking: String = blocks
                     .iter()
                     .filter_map(|b| {
-                        if let claurst_core::types::ContentBlock::Thinking { thinking, .. } = b {
+                        if let clawde_core::types::ContentBlock::Thinking { thinking, .. } = b {
                             Some(thinking.as_str())
                         } else {
                             None
@@ -46,7 +52,11 @@ impl SlashCommand for ThinkBackCommand {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                if thinking.is_empty() { None } else { Some((idx, thinking)) }
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some((idx, thinking))
+                }
             })
             .collect();
 
@@ -82,8 +92,12 @@ impl SlashCommand for ThinkBackCommand {
 
 #[async_trait]
 impl SlashCommand for ThinkBackPlayCommand {
-    fn name(&self) -> &str { "thinkback-play" }
-    fn description(&self) -> &str { "Replay a thinking trace as an animated walkthrough" }
+    fn name(&self) -> &str {
+        "thinkback-play"
+    }
+    fn description(&self) -> &str {
+        "Replay a thinking trace as an animated walkthrough"
+    }
     fn help(&self) -> &str {
         "Usage: /thinkback-play [n]\n\n\
          Replays a previous thinking trace, formatted for easy reading.\n\
@@ -96,7 +110,7 @@ impl SlashCommand for ThinkBackPlayCommand {
         let thinking_blocks: Vec<String> = ctx
             .messages
             .iter()
-            .filter(|m| m.role == claurst_core::types::Role::Assistant)
+            .filter(|m| m.role == clawde_core::types::Role::Assistant)
             .filter_map(|m| {
                 let blocks = m.get_thinking_blocks();
                 if blocks.is_empty() {
@@ -105,7 +119,7 @@ impl SlashCommand for ThinkBackPlayCommand {
                 let t: String = blocks
                     .iter()
                     .filter_map(|b| {
-                        if let claurst_core::types::ContentBlock::Thinking { thinking, .. } = b {
+                        if let clawde_core::types::ContentBlock::Thinking { thinking, .. } = b {
                             Some(thinking.as_str())
                         } else {
                             None
@@ -113,7 +127,11 @@ impl SlashCommand for ThinkBackPlayCommand {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                if t.is_empty() { None } else { Some(t) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
             })
             .collect();
 

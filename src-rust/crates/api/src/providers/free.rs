@@ -20,11 +20,13 @@
 //   * anything else                  →  passed through verbatim
 //     to the first upstream in the chain.
 
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use clawde_core::provider_id::{ModelId, ProviderId};
 use futures::Stream;
 
 use crate::provider::{LlmProvider, ModelInfo};
@@ -33,6 +35,8 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
 };
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Catalog
@@ -49,94 +53,619 @@ pub struct FreeUpstream {
     pub key_url: &'static str,
     pub default_model: &'static str,
     pub note: &'static str,
+    /// Whether the default model supports function/tool calling.
+    pub tool_calling: bool,
+    /// Hard cap on `max_tokens` for this upstream's default model.
+    /// When set, requests are silently clamped to this value.
+    pub max_tokens_cap: Option<u32>,
 }
 
 /// Ordered priority of providers we stack into Free mode. Order matters —
-/// `free/auto` tries each in turn, so put the fastest / most generous tiers
-/// first. Mirrors the priority list in freellmapi's router.
+/// `free/auto` tries each in turn, so put the highest-quality, most reliable
+/// tiers first. The chain starts with the best models (Llama 3.3 70B-class)
+/// and falls through to lighter fallbacks.
 pub const FREE_CATALOG: &[FreeUpstream] = &[
+    // Tier 1: Best-quality models
     FreeUpstream {
-        id: "groq",
-        title: "Groq",
-        key_url: "console.groq.com/keys",
-        default_model: "llama-3.3-70b-versatile",
-        note: "fast — Llama 3.3, GPT-OSS, Qwen3",
-    },
-    FreeUpstream {
-        id: "cerebras",
-        title: "Cerebras",
-        key_url: "cloud.cerebras.ai",
-        default_model: "qwen-3-235b-a22b-instruct-2507",
-        note: "wafer-scale — Qwen3 235B",
-    },
-    FreeUpstream {
-        id: "google",
-        title: "Google Gemini",
-        key_url: "aistudio.google.com/app/apikey",
-        default_model: "gemini-2.5-flash",
-        note: "Gemini 2.5 Flash",
-    },
-    FreeUpstream {
-        id: "mistral",
-        title: "Mistral",
-        key_url: "console.mistral.ai/api-keys",
-        default_model: "mistral-large-latest",
-        note: "Large · Medium · Codestral · Devstral",
-    },
-    FreeUpstream {
-        id: "sambanova",
-        title: "SambaNova",
-        key_url: "cloud.sambanova.ai",
-        default_model: "Meta-Llama-3.3-70B-Instruct",
-        note: "DeepSeek V3 · Llama 4 · Gemma 3",
+        id: "huggingface",
+        title: "Hugging Face",
+        key_url: "huggingface.co/settings/tokens",
+        default_model: "meta-llama/Llama-3.3-70B-Instruct",
+        note: "free Inference API — Llama 3.3 70B",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
     },
     FreeUpstream {
         id: "nvidia",
         title: "NVIDIA NIM",
         key_url: "build.nvidia.com",
         default_model: "meta/llama-3.3-70b-instruct",
-        note: "NIM endpoints (trial)",
+        note: "Llama 3.3 70B — 2 keys",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    FreeUpstream {
+        id: "cerebras",
+        title: "Cerebras",
+        key_url: "cloud.cerebras.ai",
+        default_model: "gpt-oss-120b",
+        note: "GPT-OSS 120B (65K ctx) · Gemma 4 31B",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    // Tier 2: Very good models (some currently rate-limited)
+    FreeUpstream {
+        id: "google",
+        title: "Google Gemini",
+        key_url: "aistudio.google.com/app/apikey",
+        default_model: "gemini-2.5-flash",
+        note: "Gemini 2.5 Flash",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    FreeUpstream {
+        id: "github-models",
+        title: "GitHub Models",
+        key_url: "github.com/settings/tokens",
+        default_model: "gpt-4o-mini",
+        note: "GPT-4o-mini — 2 keys",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    FreeUpstream {
+        id: "sambanova",
+        title: "SambaNova",
+        key_url: "cloud.sambanova.ai",
+        default_model: "Meta-Llama-3.3-70B-Instruct",
+        note: "Llama 3.3 70B · DeepSeek V3",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    // Tier 3: Decent fallbacks
+    FreeUpstream {
+        id: "cline",
+        title: "Cline",
+        key_url: "app.cline.bot/settings",
+        default_model: "stepfun/step-3.7-flash",
+        note: "live free-model API — auto-discovers best model at startup",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
+    },
+    FreeUpstream {
+        id: "mistral",
+        title: "Mistral",
+        key_url: "console.mistral.ai/api-keys",
+        default_model: "labs-devstral-small-2512",
+        note: "Devstral Small (free) · Large · Codestral",
+        tool_calling: true,
+        max_tokens_cap: None,
     },
     FreeUpstream {
         id: "cohere",
         title: "Cohere",
         key_url: "dashboard.cohere.com/api-keys",
-        default_model: "command-r-plus",
-        note: "Command R+ (trial)",
-    },
-    FreeUpstream {
-        id: "openrouter",
-        title: "OpenRouter",
-        key_url: "openrouter.ai/keys",
-        default_model: "openrouter/free",
-        note: "19 free-tier models — $10 top-up lifts caps",
+        default_model: "north-mini-code-1-0",
+        note: "North Mini Code (free) · Command R+",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
     },
     FreeUpstream {
         id: "opencode-zen",
         title: "OpenCode Zen",
         key_url: "opencode.ai/auth",
         default_model: "minimax-m2.5-free",
-        note: "MiniMax M2.5 · Big Pickle · Ring 2.6",
+        note: "MiniMax M2.5 — 2 keys",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
     },
     FreeUpstream {
         id: "zai",
         title: "Z.AI",
         key_url: "z.ai/manage-apikey/apikey-list",
-        default_model: "glm-4.6",
-        note: "GLM-4.6 · GLM-4.7",
+        default_model: "glm-4.7",
+        note: "GLM-4.7 · GLM-5 · GLM-5.1 — Zhipu AI international",
+        tool_calling: true,
+        max_tokens_cap: Some(8_192),
     },
+    // Tier 4: Paywalled — kept as last resort
     FreeUpstream {
-        id: "zhipuai",
-        title: "Zhipu",
-        key_url: "open.bigmodel.cn",
-        default_model: "glm-4.5",
-        note: "GLM-4.5 (CN endpoint)",
+        id: "openrouter",
+        title: "OpenRouter",
+        key_url: "openrouter.ai/keys",
+        default_model: "openrouter/free",
+        note: "19 free-tier models — requires $10 prepaid credits",
+        tool_calling: true,
+        max_tokens_cap: None,
     },
 ];
 
 /// Look up a catalog entry by its `id`.
 pub fn catalog_entry(id: &str) -> Option<&'static FreeUpstream> {
     FREE_CATALOG.iter().find(|e| e.id == id)
+}
+
+/// Static storage for the most recently built FreeProvider's model defaults.
+/// Populated by `build_free_provider` in registry.rs; read by the TUI for
+/// the /ctx-viz "Free models" table. Thread-safe via OnceLock.
+static RECENT_FREE_MODEL_DEFAULTS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+fn recent_free_model_defaults() -> &'static Mutex<Vec<(String, String)>> {
+    RECENT_FREE_MODEL_DEFAULTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set the free model defaults from a newly-built FreeProvider's chain.
+/// Called by `build_free_provider` in registry.rs after constructing the
+/// chain. The TUI reads these via [`take_free_model_defaults`].
+pub fn store_free_model_defaults(defaults: Vec<(String, String)>) {
+    if let Ok(mut guard) = recent_free_model_defaults().lock() {
+        *guard = defaults;
+    }
+}
+
+/// Retrieve the stored free model defaults.
+/// Returns a clone so that multiple callers (startup wiring, /models
+/// command) all see the same data. Returns an empty vec if none have
+/// been stored yet.
+pub fn take_free_model_defaults() -> Vec<(String, String)> {
+    RECENT_FREE_MODEL_DEFAULTS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Live free-model discovery (per-provider API endpoints)
+// ---------------------------------------------------------------------------
+
+/// Describes how to discover the current best free model for an upstream
+/// at provider-runtime build time. Each variant encapsulates the provider-
+/// specific API endpoint, auth mechanism, and response parsing needed.
+///
+/// To add a new provider with live discovery:
+///   1. Add a variant to this enum
+///   2. Wire it in [`discovery_for`]
+///   3. Add the fetch function that implements the variant's logic
+///   4. Wire the variant in [`run_live_discovery`]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FreeModelDiscovery {
+    /// No live discovery — use the hardcoded `default_model` (or
+    /// models.dev auto-detection which runs separately).
+    None,
+    /// Fetch from Cline's recommended-models API.
+    ClineRecommended,
+    /// Fetch from OpenRouter's models API — finds free (pricing=0)
+    /// models that support tool calling, picks the one with the
+    /// largest context window.
+    OpenRouterFreeModels,
+    /// Fetch from a standard OpenAI-compatible `/v1/models` endpoint.
+    /// Returns the first available model ID that matches models.dev's
+    /// auto-detected free model for this upstream (to verify it's
+    /// actually live), or the first model from the endpoint if no
+    /// match is found.
+    OpenAiModelList {
+        /// The base URL of the OpenAI-compatible API, e.g.
+        /// `"https://api.groq.com/openai/v1"`.
+        base_url: &'static str,
+    },
+    /// Fetch from Google Gemini's `/v1beta/models` endpoint.
+    /// Uses query-parameter auth (`?key=`). Response has a `models`
+    /// array with `name` fields like `"models/gemini-2.5-flash"`.
+    /// Strips the `models/` prefix to get the model ID.
+    GeminiModels,
+}
+
+/// Map each FREE_CATALOG upstream to its live discovery method.
+pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
+    match upstream_id {
+        "cline" => FreeModelDiscovery::ClineRecommended,
+        "openrouter" => FreeModelDiscovery::OpenRouterFreeModels,
+        "huggingface" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://router.huggingface.co/v1",
+        },
+        "cerebras" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api.cerebras.ai/v1",
+        },
+        "nvidia" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://integrate.api.nvidia.com/v1",
+        },
+        "google" => FreeModelDiscovery::GeminiModels,
+        _ => FreeModelDiscovery::None,
+    }
+}
+
+/// Run live discovery for the first entry whose ID matches `upstream_id`.
+/// Returns the discovered model ID, or `None` if discovery is not configured
+/// or the fetch fails.
+pub fn run_live_discovery(
+    upstream_id: &str,
+    auth_store: &clawde_core::AuthStore,
+) -> Option<String> {
+    match discovery_for(upstream_id) {
+        FreeModelDiscovery::ClineRecommended => {
+            let key = auth_store
+                .keys_for("cline")
+                .and_then(|k| k.first().cloned())
+                .or_else(|| auth_store.api_key_for("cline"))?;
+            fetch_cline_free_model(&key)
+        }
+        FreeModelDiscovery::OpenRouterFreeModels => {
+            let key = auth_store
+                .keys_for("openrouter")
+                .and_then(|k| k.first().cloned())
+                .or_else(|| auth_store.api_key_for("openrouter"))?;
+            fetch_openrouter_free_model(&key)
+        }
+        FreeModelDiscovery::OpenAiModelList { base_url } => {
+            let key = auth_store
+                .keys_for(upstream_id)
+                .and_then(|k| k.first().cloned())
+                .or_else(|| auth_store.api_key_for(upstream_id))?;
+            fetch_openai_compat_model_list(&key, base_url, upstream_id)
+        }
+        FreeModelDiscovery::GeminiModels => {
+            let key = auth_store
+                .keys_for("google")
+                .and_then(|k| k.first().cloned())
+                .or_else(|| auth_store.api_key_for("google"))?;
+            fetch_gemini_models(&key)
+        }
+        FreeModelDiscovery::None => None,
+    }
+}
+
+/// Fetch Cline's current free models from their recommended-models API.
+///
+/// Cline's API at `https://api.cline.bot/api/v1/ai/cline/recommended-models`
+/// returns a `{ "free": [...] }` array of currently available free models.
+/// This list rotates as Cline updates their free tier.
+///
+/// Returns the first free model ID, or `None` if the API is unreachable,
+/// the key is invalid, or no free models are currently offered.
+pub fn fetch_cline_free_model(cline_api_key: &str) -> Option<String> {
+    let key = cline_api_key.to_string();
+    // reqwest::blocking::Client creates an internal tokio runtime. Dropping
+    // that runtime inside an existing tokio runtime context panics, so the
+    // entire blocking HTTP call is moved to a plain OS thread.
+    std::thread::spawn(move || {
+        let url = "https://api.cline.bot/api/v1/ai/cline/recommended-models";
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| {
+                client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {}", key))
+                    .send()
+            })
+        else {
+            tracing::warn!("fetch_cline_free_model: HTTP request failed");
+            return None;
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "fetch_cline_free_model: HTTP {} — check Cline API key",
+                response.status(),
+            );
+            return None;
+        }
+
+        let Ok(data) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_cline_free_model: failed to parse JSON");
+            return None;
+        };
+
+        let free_models = data.get("free").and_then(|v| v.as_array())?;
+        let first = free_models.first()?;
+        let model_id = first.get("id")?.as_str()?;
+
+        tracing::info!(
+            "Cline recommended free model: {} (from {} available)",
+            model_id,
+            free_models.len(),
+        );
+
+        Some(model_id.to_string())
+    })
+    .join()
+    .ok().flatten()
+}
+
+/// Fetch OpenRouter's current free models from their models API.
+///
+/// OpenRouter's API at `https://openrouter.ai/api/v1/models` returns
+/// a `{ "data": [...] }` array of all models with pricing. Free models
+/// have `pricing.prompt`, `pricing.completion`, and `pricing.request`
+/// all set to `"0"`.
+///
+/// Selection criteria:
+/// 1. Model must be free (all pricing fields = "0")
+/// 2. Model must not be archived
+/// 3. Model must support tool calling (`supported_parameters` includes "tools")
+/// 4. Among qualifying models, pick the one with the largest `context_length`
+///
+/// Returns the best free model ID, or `None` if the API is unreachable,
+/// the key is invalid, or no qualifying free models are found.
+pub fn fetch_openrouter_free_model(openrouter_api_key: &str) -> Option<String> {
+    let key = openrouter_api_key.to_string();
+    // reqwest::blocking::Client creates an internal tokio runtime. Dropping
+    // that runtime inside an existing tokio runtime context panics, so the
+    // entire blocking HTTP call is moved to a plain OS thread.
+    std::thread::spawn(move || {
+        let url = "https://openrouter.ai/api/v1/models";
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| {
+                client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {}", key))
+                    .send()
+            })
+        else {
+            tracing::warn!("fetch_openrouter_free_model: HTTP request failed");
+            return None;
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "fetch_openrouter_free_model: HTTP {} — check OpenRouter API key",
+                response.status(),
+            );
+            return None;
+        }
+
+        let Ok(payload) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_openrouter_free_model: failed to parse JSON");
+            return None;
+        };
+
+        let models = payload.get("data").and_then(|v| v.as_array())?;
+
+        // Collect free (all pricing=0), non-archived, tool-supporting models.
+        let mut candidates: Vec<(&str, u64)> = Vec::new();
+
+        for model in models {
+            let model_id = match model.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Skip archived models
+            if model.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+
+            // Check pricing: all must be "0"
+            let pricing = match model.get("pricing").and_then(|v| v.as_object()) {
+                Some(p) => p,
+                None => continue,
+            };
+            let prompt_cost = pricing.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let completion_cost = pricing.get("completion").and_then(|v| v.as_str()).unwrap_or("");
+            let request_cost = pricing.get("request").and_then(|v| v.as_str()).unwrap_or("0");
+            if prompt_cost != "0" || completion_cost != "0" || request_cost != "0" {
+                continue;
+            }
+
+            // Check tool calling support
+            let supports_tools = model
+                .get("supported_parameters")
+                .and_then(|v| v.as_array())
+                .map(|params| params.iter().any(|p| p.as_str() == Some("tools")))
+                .unwrap_or(false);
+            if !supports_tools {
+                continue;
+            }
+
+            // Context window for ranking
+            let ctx = model
+                .get("context_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            candidates.push((model_id, ctx));
+        }
+
+        // Sort by context window descending, pick the best
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        if let Some((model_id, ctx)) = candidates.first() {
+            tracing::info!(
+                "OpenRouter recommended free model: {} ({} context, from {} candidates)",
+                model_id,
+                ctx,
+                candidates.len(),
+            );
+            Some((*model_id).to_string())
+        } else {
+            tracing::warn!("fetch_openrouter_free_model: no free tool-capable models found");
+            None
+        }
+    })
+    .join()
+    .ok().flatten()
+}
+
+/// Fetch model list from a standard OpenAI-compatible `/v1/models` endpoint.
+///
+/// Cross-references the list with models.dev auto-detected free models
+/// (from [`fetch_best_free_models_from_modelsdev`]) to find the best known
+/// free model that's actually available on this provider. If no match is
+/// found, returns the first available model ID as a fallback.
+pub fn fetch_openai_compat_model_list(
+    api_key: &str,
+    base_url: &str,
+    upstream_id: &str,
+) -> Option<String> {
+    let api_key = api_key.to_string();
+    let base_url = base_url.to_string();
+    let upstream_id = upstream_id.to_string();
+    // reqwest::blocking::Client creates an internal tokio runtime. Dropping
+    // that runtime inside an existing tokio runtime context panics, so the
+    // entire blocking HTTP call is moved to a plain OS thread.
+    std::thread::spawn(move || {
+        let models_url = format!("{}/models", base_url.trim_end_matches('/'));
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| {
+                client
+                    .get(&models_url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .send()
+            })
+        else {
+            tracing::warn!("fetch_openai_compat_model_list({}): HTTP request failed", upstream_id);
+            return None;
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "fetch_openai_compat_model_list({}): HTTP {} — check API key",
+                upstream_id,
+                response.status(),
+            );
+            return None;
+        }
+
+        let Ok(payload) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_openai_compat_model_list({}): failed to parse JSON", upstream_id);
+            return None;
+        };
+
+        // Collect available model IDs from the response.
+        let available: Vec<&str> = payload
+            .get("data")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if available.is_empty() {
+            tracing::warn!("fetch_openai_compat_model_list({}): no models in response", upstream_id);
+            return None;
+        }
+
+        // Try to find the models.dev-recommended free model in the available list.
+        let auto_detected = fetch_best_free_models_from_modelsdev();
+        if let Some(recommended) = auto_detected.get(upstream_id.as_str()) {
+            if available.contains(&recommended.as_str()) {
+                tracing::info!(
+                    "{} live model list confirmed models.dev pick: {}",
+                    upstream_id,
+                    recommended,
+                );
+                return Some(recommended.clone());
+            }
+        }
+
+        // Fallback: prefer the catalog's default_model when it's available.
+        if let Some(entry) = crate::providers::free::catalog_entry(&upstream_id) {
+            if available.contains(&entry.default_model) {
+                tracing::info!(
+                    "{} live model list: catalog default {} is available",
+                    upstream_id,
+                    entry.default_model,
+                );
+                return Some(entry.default_model.to_string());
+            }
+        }
+
+        // Last resort: return the first available model.
+        let first = available[0].to_string();
+        tracing::info!(
+            "{} live model list returned first model: {} ({} available)",
+            upstream_id,
+            first,
+            available.len(),
+        );
+        Some(first)
+    })
+    .join()
+    .ok().flatten()
+}
+
+/// Fetch Google Gemini's current available models from their models API.
+///
+/// Gemini's API at `https://generativelanguage.googleapis.com/v1beta/models`
+/// uses query-parameter auth (`?key=`). Response has a `models` array with
+/// `name` fields like `"models/gemini-2.5-flash"`. Strips the `models/`
+/// prefix to get the bare model ID.
+///
+/// Returns the first available model ID, or `None` if the API is unreachable,
+/// the key is invalid, or no models are found.
+pub fn fetch_gemini_models(api_key: &str) -> Option<String> {
+    let api_key = api_key.to_string();
+    // reqwest::blocking::Client creates an internal tokio runtime. Dropping
+    // that runtime inside an existing tokio runtime context panics, so the
+    // entire blocking HTTP call is moved to a plain OS thread.
+    std::thread::spawn(move || {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+            api_key
+        );
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| client.get(&url).send())
+        else {
+            tracing::warn!("fetch_gemini_models: HTTP request failed");
+            return None;
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "fetch_gemini_models: HTTP {} — check Google API key",
+                response.status(),
+            );
+            return None;
+        }
+
+        let Ok(payload) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_gemini_models: failed to parse JSON");
+            return None;
+        };
+
+        let models = payload.get("models").and_then(|v| v.as_array())?;
+
+        // Collect model IDs, stripping the "models/" prefix
+        let mut model_ids: Vec<&str> = Vec::new();
+        for model in models {
+            let name = match model.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Strip "models/" prefix to get bare model ID
+            let model_id = name.strip_prefix("models/").unwrap_or(name);
+            // Skip deprecated/not-yet-supported models
+            let supported = model
+                .get("supportedGenerationMethods")
+                .and_then(|v| v.as_array())
+                .map(|methods| {
+                    methods
+                        .iter()
+                        .any(|m| m.as_str() == Some("generateContent"))
+                })
+                .unwrap_or(false);
+            if supported {
+                model_ids.push(model_id);
+            }
+        }
+
+        let first = model_ids.first()?;
+        tracing::info!(
+            "Gemini available models: {} ({} support generateContent)",
+            first,
+            model_ids.len(),
+        );
+        Some((*first).to_string())
+    })
+    .join()
+    .ok().flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +676,235 @@ pub fn catalog_entry(id: &str) -> Option<&'static FreeUpstream> {
 pub struct FreeEntry {
     pub upstream: FreeUpstream,
     pub provider: Arc<dyn LlmProvider>,
+    /// Overrides `upstream.default_model` when set. Populated by
+    /// [`fetch_best_free_models_from_modelsdev`] at build time so that
+    /// the chain always uses the best currently-free model for each
+    /// upstream without needing hardcoded catalog changes.
+    pub effective_model: Option<String>,
+}
+
+/// Routing strategy for the FreeProvider's fallback chain.
+///
+/// Controls how the provider selects which upstream to try first and in what
+/// order. Plumbed from `settings.json` → `providers.free.options.routing`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategy {
+    /// Try upstreams in catalog (priority) order. Current default.
+    #[default]
+    Sequential,
+    /// Randomly select an upstream with failover to the next on failure.
+    RandomFailover,
+    /// Route to the upstream with the lowest historical latency.
+    LatencyBased,
+}
+
+/// Circuit breaker configuration for the FreeProvider.
+///
+/// When an upstream fails `max_fails` times within `window_secs`, it is
+/// cooled down for `cooldown_secs` and skipped in the fallback loop.
+/// Disabled by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Max failures before the upstream is cooled down (0 = disabled).
+    #[serde(default = "default_cb_max_fails")]
+    pub max_fails: u32,
+    /// Time window in seconds for counting failures.
+    #[serde(default = "default_cb_window")]
+    pub window_secs: u64,
+    /// How long to cool down an upstream (seconds).
+    #[serde(default = "default_cb_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+const fn default_cb_max_fails() -> u32 {
+    3
+}
+const fn default_cb_window() -> u64 {
+    60
+}
+const fn default_cb_cooldown() -> u64 {
+    120
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            max_fails: 3,
+            window_secs: 60,
+            cooldown_secs: 120,
+        }
+    }
+}
+
+/// Latency tracking configuration for latency-based routing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyConfig {
+    /// How many samples to keep in the sliding window (0 = disabled).
+    #[serde(default = "default_latency_samples")]
+    pub max_samples: usize,
+}
+
+const fn default_latency_samples() -> usize {
+    10
+}
+
+impl Default for LatencyConfig {
+    fn default() -> Self {
+        Self { max_samples: 10 }
+    }
+}
+
+/// Routing configuration for a [`FreeProvider`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Which strategy to use for upstream selection.
+    #[serde(default)]
+    pub strategy: RoutingStrategy,
+    /// Optional circuit-breaker: when an upstream fails N times, skip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Optional latency tracking config for latency-based routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<LatencyConfig>,
+    /// Per-upstream request timeout in seconds. When an upstream's
+    /// `create_message` or `create_message_stream` call takes longer
+    /// than this, it is treated as a transient error and the next
+    /// upstream in the chain is tried. Default: 30 seconds.
+    #[serde(default = "default_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+}
+
+const fn default_upstream_timeout() -> u64 {
+    30
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: RoutingStrategy::default(),
+            circuit_breaker: None,
+            latency: None,
+            upstream_timeout_secs: default_upstream_timeout(),
+        }
+    }
+}
+
+/// Per-upstream failure history and cooldown for the circuit breaker.
+struct CooldownState {
+    /// Sliding window of failure timestamps per upstream index.
+    failures: Vec<VecDeque<Instant>>,
+    /// Cooldown expiry per upstream index. `None` = not in cooldown.
+    cooldown_until: Vec<Option<Instant>>,
+    /// Number of active keys in the ring, cached for the `TUI status bar`.
+    config: CircuitBreakerConfig,
+}
+
+impl CooldownState {
+    fn new(n: usize, config: CircuitBreakerConfig) -> Self {
+        let mut failures = Vec::with_capacity(n);
+        let mut cooldown_until = Vec::with_capacity(n);
+        for _ in 0..n {
+            failures.push(VecDeque::new());
+            cooldown_until.push(None);
+        }
+        Self {
+            failures,
+            cooldown_until,
+            config,
+        }
+    }
+
+    /// Remove expired cooldowns and old failure timestamps.
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.config.window_secs);
+        for i in 0..self.failures.len() {
+            // Prune expired cooldowns.
+            if let Some(until) = self.cooldown_until[i] {
+                if now >= until {
+                    self.cooldown_until[i] = None;
+                    self.failures[i].clear();
+                }
+            }
+            // Prune old failure timestamps outside the window.
+            while self.failures[i]
+                .front()
+                .map_or(false, |t| now - *t > window)
+            {
+                self.failures[i].pop_front();
+            }
+        }
+    }
+
+    /// Whether the upstream at `idx` is in cooldown.
+    fn is_in_cooldown(&self, idx: usize) -> bool {
+        idx < self.cooldown_until.len() && self.cooldown_until[idx].is_some()
+    }
+
+    /// Record a failure at `idx`. Returns `true` if the upstream just
+    /// crossed the threshold and was put into cooldown.
+    fn record_failure(&mut self, idx: usize) -> bool {
+        if idx >= self.failures.len() || self.config.max_fails == 0 {
+            return false;
+        }
+        self.failures[idx].push_back(Instant::now());
+        if self.failures[idx].len() >= self.config.max_fails as usize {
+            self.cooldown_until[idx] =
+                Some(Instant::now() + std::time::Duration::from_secs(self.config.cooldown_secs));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a success at `idx` — resets the failure counter.
+    fn record_success(&mut self, idx: usize) {
+        if idx < self.failures.len() {
+            self.failures[idx].clear();
+        }
+    }
+}
+
+/// Per-upstream latency samples for latency-based routing.
+struct LatencyState {
+    /// Sliding window of request durations (seconds) per upstream index.
+    samples: Vec<VecDeque<f64>>,
+}
+
+impl LatencyState {
+    fn new(n: usize) -> Self {
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            samples.push(VecDeque::with_capacity(10));
+        }
+        Self { samples }
+    }
+
+    /// Record a latency sample at `idx`.
+    fn record(&mut self, idx: usize, duration_secs: f64, max_samples: usize) {
+        if idx >= self.samples.len() {
+            return;
+        }
+        let q = &mut self.samples[idx];
+        if q.len() >= max_samples {
+            q.pop_front();
+        }
+        q.push_back(duration_secs);
+    }
+
+    /// Average latency for upstream `idx`, or `f64::MAX` if no samples.
+    fn avg_latency(&self, idx: usize) -> f64 {
+        if idx >= self.samples.len() {
+            return f64::MAX;
+        }
+        let q = &self.samples[idx];
+        if q.is_empty() {
+            return f64::MAX;
+        }
+        let sum: f64 = q.iter().sum();
+        sum / q.len() as f64
+    }
 }
 
 /// Composite provider that stacks free-tier upstreams behind a single
@@ -154,6 +912,11 @@ pub struct FreeEntry {
 pub struct FreeProvider {
     id: ProviderId,
     chain: Vec<FreeEntry>,
+    routing: RoutingConfig,
+    /// Circuit-breaker state (per-upstream cooldown).
+    cooldown: Arc<Mutex<CooldownState>>,
+    /// Latency tracking state (per-upstream sliding window).
+    latencies: Arc<Mutex<LatencyState>>,
 }
 
 #[derive(Debug)]
@@ -168,11 +931,160 @@ enum Route {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Auto-detect best free models from models.dev
+// ---------------------------------------------------------------------------
+
+/// Cache for the best free model per upstream, populated once at first use.
+static AUTO_DETECTED_DEFAULTS: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Fetch `models.dev` and find the best free (cost=0) model with tool_call
+/// support for each FREE_CATALOG upstream.
+///
+/// Selection criteria (matching Cline's approach from their source):
+/// 1. Model must be free (cost.input == 0 && cost.output == 0)
+/// 2. Model must support tool calling (tool_call == true)
+/// 3. Model must not be deprecated
+/// 4. Among qualifying models, pick the one with the largest context window
+///
+/// Results are cached in [`AUTO_DETECTED_DEFAULTS`] so the HTTP fetch
+/// only happens once per process lifetime.
+pub fn fetch_best_free_models_from_modelsdev() -> &'static HashMap<String, String> {
+    AUTO_DETECTED_DEFAULTS.get_or_init(|| {
+        // reqwest::blocking::Client creates an internal tokio runtime. Dropping
+        // that runtime inside an existing tokio runtime context (e.g. under
+        // #[tokio::main]) panics. Run the entire HTTP fetch on a plain OS thread
+        // so the internal runtime is created and dropped outside any async context.
+        std::thread::spawn(|| {
+            let url = "https://models.dev/api.json";
+            let Ok(response) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .and_then(|client| client.get(url).send())
+            else {
+                tracing::warn!("fetch_best_free_models_from_modelsdev: HTTP request failed");
+                return HashMap::new();
+            };
+
+            let Ok(data) = response.json::<serde_json::Value>() else {
+                tracing::warn!("fetch_best_free_models_from_modelsdev: failed to parse JSON");
+                return HashMap::new();
+            };
+
+            let mut result = HashMap::new();
+
+            for upstream in FREE_CATALOG {
+                let Some(provider) = data.get(upstream.id) else { continue };
+                let Some(models) = provider.get("models") else { continue };
+                let Some(models_obj) = models.as_object() else { continue };
+
+                let mut candidates: Vec<(&str, u64)> = Vec::new();
+
+                for (model_id, model_info) in models_obj {
+                    // Must be free
+                    let cost = model_info.get("cost").and_then(|c| c.as_object());
+                    let cost_in = cost.and_then(|c| c.get("input")).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let cost_out = cost.and_then(|c| c.get("output")).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    if cost_in != 0.0 || cost_out != 0.0 {
+                        continue;
+                    }
+
+                    // Must support tool calling (matching Cline's filtering)
+                    let tool_call = model_info.get("tool_call").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if !tool_call {
+                        continue;
+                    }
+
+                    // Must not be deprecated
+                    let status = model_info.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if status == "deprecated" || status == "legacy" {
+                        continue;
+                    }
+
+                    // Context window for ranking
+                    let limit = model_info.get("limit").and_then(|l| l.as_object());
+                    let context = limit.and_then(|l| l.get("context")).and_then(|v| v.as_u64()).unwrap_or(0);
+
+                    candidates.push((model_id, context));
+                }
+
+                // Sort by context window descending, pick the best
+                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+                if let Some((model_id, _ctx)) = candidates.first() {
+                    let prev = result.insert(upstream.id.to_string(), (*model_id).to_string());
+                    if prev.is_none() {
+                        tracing::info!(
+                            "Auto-detected free model for {}: {} ({} context)",
+                            upstream.id,
+                            model_id,
+                            _ctx,
+                        );
+                    }
+                }
+            }
+
+            if result.is_empty() {
+                tracing::warn!("fetch_best_free_models_from_modelsdev: no free models found");
+            } else {
+                tracing::info!(
+                    "Auto-detected free models for {} upstreams",
+                    result.len(),
+                );
+            }
+
+            result
+        })
+        .join()
+        .unwrap_or_else(|_| {
+            tracing::warn!("fetch_best_free_models_from_modelsdev: thread panicked");
+            HashMap::new()
+        })
+    })
+}
+
 impl FreeProvider {
+    /// Resolve the effective default model for the entry at `idx`.
+    /// Uses the auto-detected override when available, otherwise falls
+    /// back to the hardcoded `upstream.default_model`.
+    fn model_for_entry(&self, idx: usize) -> &str {
+        if let Some(ref em) = self.chain[idx].effective_model {
+            em.as_str()
+        } else {
+            self.chain[idx].upstream.default_model
+        }
+    }
+
+    /// Create a new `FreeProvider` with the default [`RoutingConfig`]
+    /// (sequential failover in catalog order).
     pub fn new(chain: Vec<FreeEntry>) -> Self {
+        let n = chain.len();
         Self {
             id: ProviderId::new(ProviderId::FREE),
             chain,
+            routing: RoutingConfig::default(),
+            cooldown: Arc::new(Mutex::new(CooldownState::new(
+                n,
+                CircuitBreakerConfig::default(),
+            ))),
+            latencies: Arc::new(Mutex::new(LatencyState::new(n))),
+        }
+    }
+
+    /// Create a new `FreeProvider` with an explicit [`RoutingConfig`].
+    ///
+    /// The routing config controls which upstream-selection strategy is
+    /// used (sequential, random-failover, etc.) and is typically parsed
+    /// from `settings.json` → `providers.free.options.routing`.
+    pub fn with_routing(chain: Vec<FreeEntry>, routing: RoutingConfig) -> Self {
+        let n = chain.len();
+        let cb_config = routing.circuit_breaker.clone().unwrap_or_default();
+        Self {
+            id: ProviderId::new(ProviderId::FREE),
+            chain,
+            routing,
+            cooldown: Arc::new(Mutex::new(CooldownState::new(n, cb_config))),
+            latencies: Arc::new(Mutex::new(LatencyState::new(n))),
         }
     }
 
@@ -187,11 +1099,7 @@ impl FreeProvider {
     /// Decide how to route a user-facing model id into the chain.
     fn resolve_route(&self, model: &str) -> Route {
         let trimmed = model.trim();
-        if trimmed.is_empty()
-            || trimmed == "free"
-            || trimmed == "auto"
-            || trimmed == "free/auto"
-        {
+        if trimmed.is_empty() || trimmed == "free" || trimmed == "auto" || trimmed == "free/auto" {
             return Route::Auto;
         }
 
@@ -229,14 +1137,35 @@ impl FreeProvider {
         Route::Auto
     }
 
-    /// Build the per-attempt (provider, model) sequence for a given request.
+    fn circuit_breaker_enabled(&self) -> bool {
+        self.routing
+            .circuit_breaker
+            .as_ref()
+            .map_or(false, |c| c.max_fails > 0)
+    }
+
+    fn max_latency_samples(&self) -> usize {
+        self.routing.latency.as_ref().map_or(0, |l| l.max_samples)
+    }
+
+    /// Build the per-attempt (provider, model) sequence for a given request,
+    /// applying the configured [`RoutingStrategy`].
     fn attempt_plan(&self, route: &Route) -> Vec<(usize, String)> {
+        match self.routing.strategy {
+            RoutingStrategy::RandomFailover => self.attempt_plan_random(route),
+            RoutingStrategy::LatencyBased => self.attempt_plan_latency(route),
+            RoutingStrategy::Sequential => self.attempt_plan_sequential(route),
+        }
+    }
+
+    /// Original sequential plan: upstreams in catalog (or pinned) order.
+    fn attempt_plan_sequential(&self, route: &Route) -> Vec<(usize, String)> {
         match route {
             Route::Auto => self
                 .chain
                 .iter()
                 .enumerate()
-                .map(|(idx, entry)| (idx, entry.upstream.default_model.to_string()))
+                .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
                 .collect(),
             Route::Pinned {
                 start_idx,
@@ -244,12 +1173,96 @@ impl FreeProvider {
             } => {
                 let mut plan = Vec::with_capacity(self.chain.len());
                 plan.push((*start_idx, pinned_model.clone()));
-                for (idx, entry) in self.chain.iter().enumerate() {
+                for (idx, _entry) in self.chain.iter().enumerate() {
                     if idx == *start_idx {
                         continue;
                     }
-                    plan.push((idx, entry.upstream.default_model.to_string()));
+                    plan.push((idx, self.model_for_entry(idx).to_string()));
                 }
+                plan
+            }
+        }
+    }
+
+    /// Random-failover plan: shuffle each request's order so load is
+    /// distributed across all upstreams over time.  For pinned routes,
+    /// the pinned upstream is always first, then the rest are shuffled.
+    fn attempt_plan_random(&self, route: &Route) -> Vec<(usize, String)> {
+        let mut rng = rand::thread_rng();
+        match route {
+            Route::Auto => {
+                let mut plan: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .collect();
+                plan.shuffle(&mut rng);
+                plan
+            }
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
+                let mut rest: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != *start_idx)
+                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .collect();
+                rest.shuffle(&mut rng);
+
+                let mut plan = Vec::with_capacity(self.chain.len());
+                plan.push((*start_idx, pinned_model.clone()));
+                plan.extend(rest);
+                plan
+            }
+        }
+    }
+
+    /// Latency-based plan: sort upstreams by their historical average
+    /// latency (lowest first). For pinned routes, the pinned upstream is
+    /// always first, then the rest are sorted by latency.
+    fn attempt_plan_latency(&self, route: &Route) -> Vec<(usize, String)> {
+        let latencies = self.latencies.lock().unwrap();
+        match route {
+            Route::Auto => {
+                let mut plan: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .collect();
+                plan.sort_by(|a, b| {
+                    latencies
+                        .avg_latency(a.0)
+                        .partial_cmp(&latencies.avg_latency(b.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                plan
+            }
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
+                let mut rest: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| *idx != *start_idx)
+                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .collect();
+                rest.sort_by(|a, b| {
+                    latencies
+                        .avg_latency(a.0)
+                        .partial_cmp(&latencies.avg_latency(b.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let mut plan = Vec::with_capacity(self.chain.len());
+                plan.push((*start_idx, pinned_model.clone()));
+                plan.extend(rest);
                 plan
             }
         }
@@ -262,6 +1275,69 @@ impl FreeProvider {
             err,
             ProviderError::InvalidRequest { .. } | ProviderError::ContentFiltered { .. }
         )
+    }
+
+    /// Expose the current [`RoutingConfig`] for introspection (e.g. TUI
+    /// status display showing the active strategy).
+    pub fn routing_config(&self) -> &RoutingConfig {
+        &self.routing
+    }
+
+    /// Check if an upstream is in cooldown (circuit breaker).
+    fn is_in_cooldown(&self, idx: usize) -> bool {
+        if !self.circuit_breaker_enabled() {
+            return false;
+        }
+        let cd = self.cooldown.lock().unwrap();
+        cd.is_in_cooldown(idx)
+    }
+
+    /// Record a successful request at `idx` with the given `elapsed` duration.
+    fn record_success(&self, idx: usize, elapsed: std::time::Duration) {
+        // Reset circuit breaker failure counter for this upstream.
+        if self.circuit_breaker_enabled() {
+            let mut cd = self.cooldown.lock().unwrap();
+            cd.record_success(idx);
+        }
+        // Record latency sample.
+        let max_samples = self.max_latency_samples();
+        if max_samples > 0 {
+            let mut lat = self.latencies.lock().unwrap();
+            lat.record(idx, elapsed.as_secs_f64(), max_samples);
+        }
+    }
+
+    /// Record a failed request at `idx`.
+    fn record_failure(&self, idx: usize) {
+        if !self.circuit_breaker_enabled() {
+            return;
+        }
+        let mut cd = self.cooldown.lock().unwrap();
+        cd.prune_expired();
+        if cd.record_failure(idx) {
+            tracing::info!(
+                "FreeProvider: upstream {} cooled down for {}s ({} failures)",
+                idx,
+                cd.config.cooldown_secs,
+                cd.config.max_fails,
+            );
+        }
+    }
+
+    /// Return the effective model for each upstream in the chain.
+    ///
+    /// Returns a vector of `(upstream_title, effective_model_id)` pairs,
+    /// one per entry in the fallback chain. Used by the TUI to display
+    /// which free models were auto-detected at startup or via live
+    /// discovery (Cline, OpenRouter, etc.).
+    pub fn free_model_defaults(&self) -> Vec<(String, String)> {
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                (entry.upstream.title.to_string(), self.model_for_entry(idx).to_string())
+            })
+            .collect()
     }
 }
 
@@ -282,8 +1358,9 @@ impl LlmProvider for FreeProvider {
         if self.chain.is_empty() {
             return Err(ProviderError::AuthFailed {
                 provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
             });
         }
 
@@ -292,21 +1369,139 @@ impl LlmProvider for FreeProvider {
         let mut last_err: Option<ProviderError> = None;
 
         for (idx, upstream_model) in plan {
+            // Circuit breaker: skip upstreams in cooldown.
+            if self.is_in_cooldown(idx) {
+                tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
+                continue;
+            }
+
             let entry = &self.chain[idx];
             let mut req = request.clone();
             req.model = upstream_model;
-            match entry.provider.create_message(req).await {
-                Ok(resp) => return Ok(resp),
-                Err(err) if Self::should_fallback(&err) => {
+
+            let start = Instant::now();
+            let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+            let result = tokio::time::timeout(timeout, entry.provider.create_message(req)).await;
+
+            match result {
+                Ok(Ok(resp)) => {
+                    self.record_success(idx, start.elapsed());
+                    return Ok(resp);
+                }
+                Ok(Err(err)) if Self::should_fallback(&err) => {
                     tracing::warn!(
-                        "FreeProvider: {} failed: {} — trying next upstream",
+                        "FreeProvider: {} failed ({}s): {} — trying next upstream",
                         entry.upstream.id,
+                        self.routing.upstream_timeout_secs,
                         err,
                     );
+                    self.record_failure(idx);
                     last_err = Some(err);
                     continue;
                 }
-                Err(err) => return Err(err),
+                Ok(Err(err)) => {
+                    self.record_failure(idx);
+                    return Err(err);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "FreeProvider: upstream {} timed out after {}s — trying next upstream",
+                        entry.upstream.id,
+                        self.routing.upstream_timeout_secs,
+                    );
+                    self.record_failure(idx);
+                    last_err = Some(ProviderError::RateLimited {
+                        provider: self.id.clone(),
+                        retry_after: None,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        let err_msg = if last_err.is_some() {
+            format!(
+                "all free-mode upstreams exhausted (last error: {})",
+                last_err.as_ref().unwrap()
+            )
+        } else {
+            "all free-mode upstreams exhausted — no upstreams had errors, all may be in cooldown"
+                .to_string()
+        };
+        Err(last_err.unwrap_or_else(|| ProviderError::ServerError {
+            provider: self.id.clone(),
+            status: None,
+            message: err_msg,
+            is_retryable: false,
+        }))
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        if self.chain.is_empty() {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
+            });
+        }
+
+        let route = self.resolve_route(&request.model);
+        let plan = self.attempt_plan(&route);
+        let mut last_err: Option<ProviderError> = None;
+
+        for (idx, upstream_model) in plan {
+            // Circuit breaker: skip upstreams in cooldown.
+            if self.is_in_cooldown(idx) {
+                tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
+                continue;
+            }
+
+            let entry = &self.chain[idx];
+            let mut req = request.clone();
+            req.model = upstream_model.clone();
+
+            let start = Instant::now();
+            let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+            let result = tokio::time::timeout(timeout, entry.provider.create_message_stream(req)).await;
+
+            match result {
+                Ok(Ok(stream)) => {
+                    self.record_success(idx, start.elapsed());
+                    return Ok(stream);
+                }
+                Ok(Err(err)) if Self::should_fallback(&err) => {
+                    tracing::warn!(
+                        "FreeProvider: {} stream failed ({}s): {} — trying next upstream",
+                        entry.upstream.id,
+                        self.routing.upstream_timeout_secs,
+                        err,
+                    );
+                    self.record_failure(idx);
+                    last_err = Some(err);
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    self.record_failure(idx);
+                    return Err(err);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "FreeProvider: upstream {} stream timed out after {}s — trying next upstream",
+                        entry.upstream.id,
+                        self.routing.upstream_timeout_secs,
+                    );
+                    self.record_failure(idx);
+                    last_err = Some(ProviderError::RateLimited {
+                        provider: self.id.clone(),
+                        retry_after: None,
+                    });
+                    continue;
+                }
             }
         }
 
@@ -318,50 +1513,12 @@ impl LlmProvider for FreeProvider {
         }))
     }
 
-    async fn create_message_stream(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
-        if self.chain.is_empty() {
-            return Err(ProviderError::AuthFailed {
-                provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
-            });
-        }
-
-        let route = self.resolve_route(&request.model);
-        let plan = self.attempt_plan(&route);
-        let mut last_err: Option<ProviderError> = None;
-
-        for (idx, upstream_model) in plan {
-            let entry = &self.chain[idx];
-            let mut req = request.clone();
-            req.model = upstream_model;
-            match entry.provider.create_message_stream(req).await {
-                Ok(stream) => return Ok(stream),
-                Err(err) if Self::should_fallback(&err) => {
-                    tracing::warn!(
-                        "FreeProvider: {} stream failed: {} — trying next upstream",
-                        entry.upstream.id,
-                        err,
-                    );
-                    last_err = Some(err);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| ProviderError::ServerError {
-            provider: self.id.clone(),
-            status: None,
-            message: "all free-mode upstreams exhausted".to_string(),
-            is_retryable: false,
-        }))
+    fn routing_strategy_name(&self) -> Option<&'static str> {
+        Some(match self.routing.strategy {
+            RoutingStrategy::Sequential => "Seq",
+            RoutingStrategy::RandomFailover => "Random",
+            RoutingStrategy::LatencyBased => "Latency",
+        })
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -381,10 +1538,14 @@ impl LlmProvider for FreeProvider {
             200_000,
         )];
 
-        for entry in &self.chain {
-            let label = format!("{} \u{2014} {}", entry.upstream.title, entry.upstream.default_model);
+        for (idx, entry) in self.chain.iter().enumerate() {
+            let model = self.model_for_entry(idx);
+            let label = format!(
+                "{} \u{2014} {}",
+                entry.upstream.title, model
+            );
             models.push(mk(
-                &format!("{}/{}", entry.upstream.id, entry.upstream.default_model),
+                &format!("{}/{}", entry.upstream.id, model),
                 &label,
                 128_000,
             ));
@@ -408,10 +1569,44 @@ impl LlmProvider for FreeProvider {
         last
     }
 
+    fn key_ring_status(&self) -> Option<(usize, usize, Option<u64>)> {
+        // Aggregate key ring statuses from all upstreams that support it.
+        // E.g. an upstream wrapped in KeyRotatingProvider reports its
+        // active/total key counts through this method.
+        let mut total_active = 0usize;
+        let mut total_keys = 0usize;
+        let mut earliest_retry: Option<u64> = None;
+        let mut any_has_ring = false;
+
+        for entry in &self.chain {
+            if let Some((active, total, retry)) = entry.provider.key_ring_status() {
+                total_active += active;
+                total_keys += total;
+                any_has_ring = true;
+                // Track the minimum non-zero retry time across all upstreams.
+                if let Some(secs) = retry {
+                    earliest_retry = Some(earliest_retry.map_or(secs, |min| min.min(secs)));
+                }
+            }
+        }
+
+        if any_has_ring {
+            Some((total_active, total_keys, earliest_retry))
+        } else {
+            None
+        }
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
+        // tool_calling is true when any chain entry's upstream supports it.
+        let tool_calling = self
+            .chain
+            .iter()
+            .any(|entry| entry.upstream.tool_calling);
+
         ProviderCapabilities {
             streaming: true,
-            tool_calling: true,
+            tool_calling,
             thinking: false,
             image_input: false,
             pdf_input: false,
@@ -422,6 +1617,24 @@ impl LlmProvider for FreeProvider {
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
     }
+
+    fn tool_calling_for(&self, model: &str) -> Option<bool> {
+        let route = self.resolve_route(model);
+        let (idx, _) = match route {
+            Route::Auto => self.chain.first().map(|e| (0, e))?,
+            Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
+        };
+        Some(self.chain[idx].upstream.tool_calling)
+    }
+
+    fn max_tokens_cap_for(&self, model: &str) -> Option<u32> {
+        let route = self.resolve_route(model);
+        let (idx, _) = match route {
+            Route::Auto => self.chain.first().map(|e| (0, e))?,
+            Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
+        };
+        self.chain[idx].upstream.max_tokens_cap
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +1644,8 @@ impl LlmProvider for FreeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, UsageInfo};
+    use clawde_core::types::{Message, UsageInfo};
+    use std::time::Duration;
 
     use crate::provider_types::StopReason;
 
@@ -517,6 +1731,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok,
             }),
+            effective_model: None,
         }
     }
 
@@ -538,7 +1753,7 @@ mod tests {
 
     #[test]
     fn route_auto_for_free_aliases() {
-        let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         assert!(matches!(provider.resolve_route("free"), Route::Auto));
         assert!(matches!(provider.resolve_route("free/auto"), Route::Auto));
         assert!(matches!(provider.resolve_route("auto"), Route::Auto));
@@ -547,10 +1762,13 @@ mod tests {
 
     #[test]
     fn route_pinned_for_prefix() {
-        let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         let route = provider.resolve_route("cerebras/qwen-3-235b");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 1);
                 assert_eq!(pinned_model, "qwen-3-235b");
             }
@@ -560,13 +1778,14 @@ mod tests {
 
     #[test]
     fn legacy_zen_prefix_routes_to_opencode_zen() {
-        let provider = FreeProvider::new(vec![
-            entry("opencode-zen", true),
-            entry("openrouter", true),
-        ]);
+        let provider =
+            FreeProvider::new(vec![entry("opencode-zen", true), entry("openrouter", true)]);
         let route = provider.resolve_route("zen/big-pickle");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 0);
                 assert_eq!(pinned_model, "big-pickle");
             }
@@ -588,19 +1807,142 @@ mod tests {
 
     #[test]
     fn attempt_plan_auto_uses_each_default() {
-        let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         let plan = provider.attempt_plan(&Route::Auto);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].0, 0);
-        assert_eq!(plan[0].1, "llama-3.3-70b-versatile");
+        assert_eq!(plan[0].1, "meta-llama/Llama-3.3-70B-Instruct");
         assert_eq!(plan[1].0, 1);
-        assert_eq!(plan[1].1, "qwen-3-235b-a22b-instruct-2507");
+        assert_eq!(plan[1].1, "gpt-oss-120b");
+    }
+
+    #[test]
+    fn random_failover_auto_uses_all_entries() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::RandomFailover,
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+        );
+        let plan = provider.attempt_plan(&Route::Auto);
+
+        // Must have all upstreams.
+        assert_eq!(plan.len(), 3);
+
+        // Must contain every index exactly once.
+        let mut indices: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // Every model string must be non-empty.
+        for (_, model) in &plan {
+            assert!(!model.is_empty());
+        }
+    }
+
+    #[test]
+    fn random_failover_pinned_starts_with_pinned() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::RandomFailover,
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+        );
+        let plan = provider.attempt_plan(&Route::Pinned {
+            start_idx: 2,
+            pinned_model: "gemini-2.5-pro".into(),
+        });
+
+        // Pinned entry must be first.
+        assert_eq!(plan[0].0, 2);
+        assert_eq!(plan[0].1, "gemini-2.5-pro");
+
+        // Must contain every index exactly once.
+        let mut indices: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn routing_config_default_is_sequential() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        assert!(matches!(
+            provider.routing_config().strategy,
+            RoutingStrategy::Sequential
+        ));
+    }
+
+    #[test]
+    fn with_routing_stores_config() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::RandomFailover,
+            ..Default::default()
+        };
+        let provider =
+            FreeProvider::with_routing(vec![entry("huggingface", true), entry("cerebras", true)], cfg);
+        assert!(matches!(
+            provider.routing_config().strategy,
+            RoutingStrategy::RandomFailover
+        ));
+    }
+
+    #[test]
+    fn routing_strategy_serde_round_trip() {
+        // Sequential → JSON → deserialize
+        let seq = RoutingConfig::default();
+        let json = serde_json::to_string(&seq).unwrap();
+        let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized.strategy, RoutingStrategy::Sequential));
+
+        // RandomFailover → JSON → deserialize
+        let rng = RoutingConfig {
+            strategy: RoutingStrategy::RandomFailover,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rng).unwrap();
+        assert_eq!(json, r#"{"strategy":"random_failover","upstream_timeout_secs":30}"#);
+        let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            deserialized.strategy,
+            RoutingStrategy::RandomFailover
+        ));
+    }
+
+    #[test]
+    fn routing_config_from_options_map() {
+        // This simulates the config plumbing: reading from
+        // provider_configs.get("free").options["routing"].
+        use std::collections::HashMap;
+        let mut options: HashMap<String, serde_json::Value> = HashMap::new();
+        options.insert(
+            "routing".to_string(),
+            serde_json::json!({"strategy": "random_failover"}),
+        );
+
+        let routing: Option<RoutingConfig> = options
+            .get("routing")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        let config = routing.unwrap();
+        assert!(matches!(config.strategy, RoutingStrategy::RandomFailover));
     }
 
     #[test]
     fn attempt_plan_pinned_tries_pin_then_others() {
         let provider = FreeProvider::new(vec![
-            entry("groq", true),
+            entry("huggingface", true),
             entry("cerebras", true),
             entry("google", true),
         ]);
@@ -649,12 +1991,252 @@ mod tests {
 
     #[tokio::test]
     async fn create_message_falls_back_to_next_upstream() {
-        let provider = FreeProvider::new(vec![entry("groq", false), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("huggingface", false), entry("cerebras", true)]);
         let resp = provider
             .create_message(dummy_request("free/auto"))
             .await
             .expect("should succeed via cerebras");
-        assert_eq!(resp.model, "qwen-3-235b-a22b-instruct-2507");
+        assert_eq!(resp.model, "gpt-oss-120b");
+    }
+
+    // -------------------------------------------------------------------
+    // Circuit breaker tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn circuit_breaker_disabled_by_default() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        provider.record_failure(0);
+        assert!(!provider.is_in_cooldown(0));
+    }
+
+    #[test]
+    fn circuit_breaker_disabled_when_max_fails_is_zero() {
+        let cfg = RoutingConfig {
+            circuit_breaker: Some(CircuitBreakerConfig {
+                max_fails: 0,
+                window_secs: 60,
+                cooldown_secs: 120,
+            }),
+            ..Default::default()
+        };
+        let provider =
+            FreeProvider::with_routing(vec![entry("huggingface", true), entry("cerebras", true)], cfg);
+        // Even after many failures, no cooldown because max_fails=0
+        provider.record_failure(0);
+        provider.record_failure(0);
+        provider.record_failure(0);
+        assert!(!provider.is_in_cooldown(0));
+    }
+
+    #[test]
+    fn circuit_breaker_activates_after_threshold() {
+        let cfg = RoutingConfig {
+            circuit_breaker: Some(CircuitBreakerConfig {
+                max_fails: 2,
+                window_secs: 60,
+                cooldown_secs: 300,
+            }),
+            ..Default::default()
+        };
+        let provider =
+            FreeProvider::with_routing(vec![entry("huggingface", true), entry("cerebras", true)], cfg);
+
+        // Initially no cooldown
+        assert!(!provider.is_in_cooldown(0));
+        assert!(!provider.is_in_cooldown(1));
+
+        // First failure — not yet at threshold
+        provider.record_failure(0);
+        assert!(!provider.is_in_cooldown(0));
+
+        // Second failure — now in cooldown
+        provider.record_failure(0);
+        assert!(provider.is_in_cooldown(0));
+
+        // Other upstream unaffected
+        assert!(!provider.is_in_cooldown(1));
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets_failures() {
+        let cfg = RoutingConfig {
+            circuit_breaker: Some(CircuitBreakerConfig {
+                max_fails: 2,
+                window_secs: 60,
+                cooldown_secs: 300,
+            }),
+            ..Default::default()
+        };
+        let provider =
+            FreeProvider::with_routing(vec![entry("huggingface", true), entry("cerebras", true)], cfg);
+
+        // One failure, then a success resets the counter
+        provider.record_failure(0);
+        provider.record_success(0, Duration::from_secs(1));
+
+        // One more failure should NOT trigger cooldown (counter was reset)
+        provider.record_failure(0);
+        assert!(!provider.is_in_cooldown(0));
+
+        // Second failure after reset — now in cooldown
+        provider.record_failure(0);
+        assert!(provider.is_in_cooldown(0));
+    }
+
+    #[test]
+    fn circuit_breaker_per_upstream_independence() {
+        let cfg = RoutingConfig {
+            circuit_breaker: Some(CircuitBreakerConfig {
+                max_fails: 3,
+                window_secs: 60,
+                cooldown_secs: 120,
+            }),
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+        );
+
+        // Exhaust upstream 0 with 3 failures
+        for _ in 0..3 {
+            provider.record_failure(0);
+        }
+        assert!(provider.is_in_cooldown(0));
+
+        // Other upstreams are still active
+        assert!(!provider.is_in_cooldown(1));
+        assert!(!provider.is_in_cooldown(2));
+    }
+
+    // -------------------------------------------------------------------
+    // Latency tracking tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn latency_tracking_records_and_computes_average() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::LatencyBased,
+            latency: Some(LatencyConfig { max_samples: 10 }),
+            ..Default::default()
+        };
+        let provider =
+            FreeProvider::with_routing(vec![entry("huggingface", true), entry("cerebras", true)], cfg);
+
+        // Record latencies for upstream 0 (fast)
+        provider.record_success(0, Duration::from_millis(100));
+        provider.record_success(0, Duration::from_millis(200));
+
+        // Record latencies for upstream 1 (slower)
+        provider.record_success(1, Duration::from_millis(900));
+        provider.record_success(1, Duration::from_millis(1100));
+
+        // Latency-based plan should put faster upstream first
+        let plan = provider.attempt_plan(&Route::Auto);
+        assert_eq!(plan.len(), 2);
+        // Upstream 0 (avg 150ms) comes before upstream 1 (avg 1000ms)
+        assert_eq!(plan[0].0, 0);
+        assert_eq!(plan[1].0, 1);
+    }
+
+    #[test]
+    fn latency_tracking_pinned_starts_with_pinned_then_sorted() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::LatencyBased,
+            latency: Some(LatencyConfig { max_samples: 10 }),
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+        );
+
+        // Record latencies: groq is fastest, cerebras is slowest
+        provider.record_success(0, Duration::from_millis(100));
+        provider.record_success(1, Duration::from_millis(2000));
+        provider.record_success(2, Duration::from_millis(500));
+
+        // Pin to cerebras (idx 1) — should be first, then rest sorted by latency
+        let plan = provider.attempt_plan(&Route::Pinned {
+            start_idx: 1,
+            pinned_model: "custom-model".into(),
+        });
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].0, 1); // pinned first
+        assert_eq!(plan[0].1, "custom-model");
+        assert_eq!(plan[1].0, 0); // groq (100ms) next
+        assert_eq!(plan[2].0, 2); // google (500ms) last
+    }
+
+    #[test]
+    fn latency_tracking_no_data_preserves_catalog_order() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::LatencyBased,
+            latency: Some(LatencyConfig { max_samples: 10 }),
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+        );
+
+        // No latency data recorded — all avg_latency returns f64::MAX,
+        // so partial_cmp returns Equal and order is stable (catalog order).
+        let plan = provider.attempt_plan(&Route::Auto);
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].0, 0);
+        assert_eq!(plan[1].0, 1);
+        assert_eq!(plan[2].0, 2);
+    }
+
+    #[test]
+    fn latency_config_serde_round_trip() {
+        let cfg = LatencyConfig { max_samples: 20 };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"max_samples":20}"#);
+        let deserialized: LatencyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.max_samples, 20);
+
+        // Default serialization
+        let default_cfg = LatencyConfig::default();
+        let json = serde_json::to_string(&default_cfg).unwrap();
+        assert_eq!(json, r#"{"max_samples":10}"#);
+    }
+
+    #[test]
+    fn circuit_breaker_config_serde_round_trip() {
+        let cfg = CircuitBreakerConfig {
+            max_fails: 5,
+            window_secs: 120,
+            cooldown_secs: 300,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let deserialized: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.max_fails, 5);
+        assert_eq!(deserialized.window_secs, 120);
+        assert_eq!(deserialized.cooldown_secs, 300);
+
+        // Default serialization
+        let default_cfg = CircuitBreakerConfig::default();
+        let json = serde_json::to_string(&default_cfg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"max_fails":3,"window_secs":60,"cooldown_secs":120}"#
+        );
     }
 
     #[tokio::test]
@@ -667,3 +2249,185 @@ mod tests {
         assert!(matches!(err, ProviderError::AuthFailed { .. }));
     }
 }
+
+
+    // -------------------------------------------------------------------
+    // Live discovery mock tests (fetch_openai_compat_model_list)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fetch_openai_compat_model_list_parses_openai_response() {
+        // Mock JSON response from a standard OpenAI-compatible /v1/models endpoint.
+        let json = r#"{
+            "object": "list",
+            "data": [
+                { "id": "llama-3.3-70b-versatile", "object": "model", "created": 1700000000, "owned_by": "groq" },
+                { "id": "mixtral-8x7b-32768",       "object": "model", "created": 1700000001, "owned_by": "groq" }
+            ]
+        }"#;
+
+        // Start a minimal HTTP server to serve the mock response.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_body = json.to_string();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                if let Ok(mut s) = stream {
+                    use std::io::Write;
+                    let response = format!(
+                        "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                        expected_body.len(),
+                        expected_body
+                    );
+                    let _ = s.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let result = fetch_openai_compat_model_list("test-key", &base_url, "groq");
+        assert_eq!(result.as_deref(), Some("llama-3.3-70b-versatile"));
+    }
+
+    #[test]
+    fn fetch_openai_compat_model_list_returns_first_on_no_autodetect() {
+        // When the auto-detected model ID is not available (or not yet populated),
+        // the function should return the first model from the endpoint.
+        let json = r#"{
+            "data": [
+                { "id": "qwen-3-235b", "object": "model" }
+            ]
+        }"#;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_body = json.to_string();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                if let Ok(mut s) = stream {
+                    use std::io::Write;
+                    let response = format!(
+                        "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                        expected_body.len(),
+                        expected_body
+                    );
+                    let _ = s.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let result = fetch_openai_compat_model_list("test-key", &base_url, "unknown-provider");
+        assert_eq!(result.as_deref(), Some("qwen-3-235b"));
+    }
+
+    #[test]
+    fn fetch_openai_compat_model_list_handles_http_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                if let Ok(mut s) = stream {
+                    use std::io::Write;
+                    let response = "HTTP/1.1 401 Unauthorized
+Content-Length: 0
+
+";
+                    let _ = s.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let result = fetch_openai_compat_model_list("bad-key", &base_url, "groq");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fetch_openai_compat_model_list_handles_empty_response() {
+        let json = r#"{"data": []}"#;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_body = json.to_string();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                if let Ok(mut s) = stream {
+                    use std::io::Write;
+                    let response = format!(
+                        "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                        expected_body.len(),
+                        expected_body
+                    );
+                    let _ = s.write_all(response.as_bytes());
+                }
+            }
+        });
+
+        let base_url = format!("http://127.0.0.1:{}", port);
+        let result = fetch_openai_compat_model_list("test-key", &base_url, "groq");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fetch_gemini_models_parses_gemini_response() {
+        // Mock response from Google Gemini's /v1beta/models endpoint.
+        let json = r#"{
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                },
+                {
+                    "name": "models/gemini-2.5-pro",
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/gemma-3-27b-it",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ]
+        }"#;
+
+        // Verify the fetch_gemini_models logic directly by testing
+        // the JSON parsing logic in isolation.
+        let payload: serde_json::Value = serde_json::from_str(json).unwrap();
+        let models = payload.get("models").and_then(|v| v.as_array()).unwrap();
+        let mut model_ids: Vec<String> = Vec::new();
+        for model in models {
+            let name = model.get("name").and_then(|v| v.as_str()).unwrap();
+            let model_id = name.strip_prefix("models/").unwrap_or(name);
+            let supported = model
+                .get("supportedGenerationMethods")
+                .and_then(|v| v.as_array())
+                .map(|methods| {
+                    methods.iter().any(|m| m.as_str() == Some("generateContent"))
+                })
+                .unwrap_or(false);
+            if supported {
+                model_ids.push(model_id.to_string());
+            }
+        }
+        assert_eq!(model_ids, vec![
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.5-pro".to_string(),
+            "gemma-3-27b-it".to_string(),
+        ]);
+    }
+

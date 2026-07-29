@@ -1,18 +1,18 @@
-//! End-to-end smoke test: spawn the `claurst` binary in ACP mode, send a
+//! End-to-end smoke test: spawn the `clawde` binary in ACP mode, send a
 //! short JSON-RPC conversation over its stdin, and verify the responses on
 //! stdout match what the Agent Client Protocol spec mandates.
 //!
 //! This guards the wire-format and capability surface that registry-listed
 //! ACP clients (Zed, Neovim, JetBrains, …) rely on. Runs against the
 //! debug binary produced by `cargo build` — Cargo provides the path via
-//! `CARGO_BIN_EXE_claurst`.
+//! `CARGO_BIN_EXE_clawde`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn binary_path() -> String {
-    env!("CARGO_BIN_EXE_claurst").to_string()
+    env!("CARGO_BIN_EXE_clawde").to_string()
 }
 
 fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
@@ -22,11 +22,13 @@ fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn claurst acp");
+        .expect("spawn clawde acp");
 
     {
         let mut stdin_handle = child.stdin.take().expect("stdin");
-        stdin_handle.write_all(stdin.as_bytes()).expect("write stdin");
+        stdin_handle
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
         // Dropping stdin signals EOF — the agent will finish in-flight work
         // and then exit cleanly.
     }
@@ -37,7 +39,7 @@ fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
             Some(_status) => break,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                panic!("claurst acp did not exit within {timeout:?}");
+                panic!("clawde acp did not exit within {timeout:?}");
             }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
@@ -75,7 +77,7 @@ fn initialize_returns_spec_compliant_response() {
     let result = &resp["result"];
     assert_eq!(result["protocolVersion"], 1);
     // Agent identifies itself.
-    assert_eq!(result["agentInfo"]["name"], "claurst");
+    assert_eq!(result["agentInfo"]["name"], "clawde");
     assert!(result["agentInfo"]["version"].is_string());
     // authMethods MUST be an array (even if empty).
     assert!(result["authMethods"].is_array());
@@ -101,7 +103,10 @@ fn session_new_returns_session_id() {
     let session_id = resp["result"]["sessionId"]
         .as_str()
         .expect("sessionId should be a string");
-    assert!(session_id.starts_with("acp-"), "sessionId not prefixed: {session_id}");
+    assert!(
+        session_id.starts_with("acp-"),
+        "sessionId not prefixed: {session_id}"
+    );
 }
 
 #[test]
@@ -130,5 +135,8 @@ fn cancel_notification_is_silent() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
         .count();
-    assert_eq!(response_count, 1, "unexpected extra responses in:\n{stdout}");
+    assert_eq!(
+        response_count, 1,
+        "unexpected extra responses in:\n{stdout}"
+    );
 }

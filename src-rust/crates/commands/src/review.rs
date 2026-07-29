@@ -11,8 +11,12 @@ pub struct ReviewCommand;
 
 #[async_trait]
 impl SlashCommand for ReviewCommand {
-    fn name(&self) -> &str { "review" }
-    fn description(&self) -> &str { "Review code changes via LLM and optionally post to GitHub PR" }
+    fn name(&self) -> &str {
+        "review"
+    }
+    fn description(&self) -> &str {
+        "Review code changes via LLM and optionally post to GitHub PR"
+    }
     fn help(&self) -> &str {
         "Usage: /review [base-ref]\n\n\
          Runs `git diff <base>...HEAD` (or `git diff --cached` when no base is given),\n\
@@ -33,14 +37,14 @@ impl SlashCommand for ReviewCommand {
         // ------------------------------------------------------------------
         // 1. Collect the diff
         // ------------------------------------------------------------------
-        let repo_root = claurst_core::git_utils::get_repo_root(&ctx.working_dir)
+        let repo_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
             .unwrap_or_else(|| ctx.working_dir.clone());
 
         let diff = if base.is_empty() {
             // No base given — use staged changes; fall back to unstaged if empty.
-            let staged = claurst_core::git_utils::get_staged_diff(&repo_root);
+            let staged = clawde_core::git_utils::get_staged_diff(&repo_root);
             if staged.is_empty() {
-                claurst_core::git_utils::get_unstaged_diff(&repo_root)
+                clawde_core::git_utils::get_unstaged_diff(&repo_root)
             } else {
                 staged
             }
@@ -56,10 +60,7 @@ impl SlashCommand for ReviewCommand {
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    return CommandResult::Error(format!(
-                        "git diff failed: {}",
-                        stderr.trim()
-                    ));
+                    return CommandResult::Error(format!("git diff failed: {}", stderr.trim()));
                 }
                 Err(e) => return CommandResult::Error(format!("Failed to run git: {}", e)),
             }
@@ -145,10 +146,10 @@ impl SlashCommand for ReviewCommand {
             file_summary, diff_for_llm
         );
 
-        let request = claurst_api::ProviderRequest {
+        let request = clawde_api::ProviderRequest {
             model,
             messages: vec![Message::user(review_prompt)],
-            system_prompt: Some(claurst_api::SystemPrompt::Text(
+            system_prompt: Some(clawde_api::SystemPrompt::Text(
                 "You are a thorough, constructive code reviewer. \
                  Be concise but precise. Focus on correctness, security, and maintainability."
                     .to_string(),
@@ -222,14 +223,11 @@ impl SlashCommand for ReviewCommand {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let body = resp.text().await.unwrap_or_default();
-                            github_post_result = Some(format!(
-                                "\nGitHub API returned {}: {}",
-                                status, body
-                            ));
+                            github_post_result =
+                                Some(format!("\nGitHub API returned {}: {}", status, body));
                         }
                         Err(e) => {
-                            github_post_result =
-                                Some(format!("\nFailed to post to GitHub: {}", e));
+                            github_post_result = Some(format!("\nFailed to post to GitHub: {}", e));
                         }
                     }
                 } else {

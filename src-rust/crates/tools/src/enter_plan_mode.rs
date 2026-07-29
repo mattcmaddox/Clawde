@@ -17,7 +17,7 @@ struct EnterPlanModeInput {
 #[async_trait]
 impl Tool for EnterPlanModeTool {
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_ENTER_PLAN_MODE
+        clawde_core::constants::TOOL_NAME_ENTER_PLAN_MODE
     }
 
     fn description(&self) -> &str {
@@ -44,9 +44,8 @@ impl Tool for EnterPlanModeTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        let params: EnterPlanModeInput = serde_json::from_value(input).unwrap_or(EnterPlanModeInput {
-            reason: None,
-        });
+        let params: EnterPlanModeInput =
+            serde_json::from_value(input).unwrap_or(EnterPlanModeInput { reason: None });
 
         debug!(reason = ?params.reason, "Entering plan mode");
 

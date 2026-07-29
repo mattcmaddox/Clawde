@@ -327,20 +327,6 @@ impl Tool for GrepTool {
 }
 
 impl GrepTool {
-    /// Test-only helper: expose search_file for testing.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn search_file_test(
-        &self,
-        path: &PathBuf,
-        regex: &regex::Regex,
-        output_mode: &str,
-        context_lines: usize,
-        show_line_numbers: bool,
-    ) -> ToolResult {
-        self.search_file(path, regex, output_mode, context_lines, show_line_numbers)
-    }
-
     fn search_file(
         &self,
         path: &PathBuf,
@@ -618,6 +604,114 @@ mod tests {
         assert!(
             res.content.contains("after"),
             "context should include line after"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_non_ascii_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.txt");
+        std::fs::write(
+            &path,
+            "Hello 世界!\ncafé résumé naïve\n日本語 特殊文字\nemoji 👋 test\nplain english\n",
+        )
+        .unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "世界",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep non-ASCII failed: {}", res.content);
+        assert!(res.content.contains("世界"), "should match CJK chars");
+        assert!(
+            res.content.contains("Hello"),
+            "should include full matching line"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": ".*",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep empty file failed: {}", res.content);
+        assert!(
+            res.content.contains("No matches"),
+            "empty file should report no matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_regex_special_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regex_special.txt");
+        std::fs::write(&path, "a+b*c\nfoo.bar\nfooXbar\n[test]\n(special)\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // Test dot as literal (escaped)
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "foo\\.bar",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "content",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep literal dot failed: {}", res.content);
+        assert!(res.content.contains("foo.bar"), "should match literal dot");
+        assert!(
+            !res.content.contains("fooXbar"),
+            "should not match with dot as literal"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_matches_at_line_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start_anchor.txt");
+        std::fs::write(&path, "start here\nnot start\nstart again\nmiddle start\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GrepTool
+            .execute(
+                json!({
+                    "pattern": "^start",
+                    "path": path.to_string_lossy(),
+                    "output_mode": "count",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "grep line start failed: {}", res.content);
+        assert!(
+            res.content.contains(":2"),
+            "expected 2 matches for '^start': {:?}",
+            res.content
         );
     }
 }

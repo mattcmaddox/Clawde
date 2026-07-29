@@ -1,12 +1,13 @@
 [package]
-name = "claurst-bridge"
+name = "clawde-bridge"
 version.workspace = true
+description = "WebSocket/SSE bridge protocol for cloud-synced sessions and IDE connectivity"
 edition.workspace = true
 
 [dependencies]
-claurst-core = { workspace = true }
-claurst-api = { workspace = true }
-claurst-query = { workspace = true }
+clawde-core = { workspace = true }
+clawde-api = { workspace = true }
+clawde-query = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

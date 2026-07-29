@@ -73,7 +73,7 @@ pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
 
     // 1. User-defined skills: <claurst home>/skills/*.md + {project_root}/.claurst/skills/*.md
     let search_dirs: Vec<std::path::PathBuf> = vec![
-        claurst_core::config::Settings::config_dir().join("skills"),
+        clawde_core::config::Settings::config_dir().join("skills"),
         project_root.join(".claurst").join("skills"),
     ];
 
@@ -194,7 +194,10 @@ pub fn format_skill_listing(index: &SkillIndex) -> String {
         } else {
             format!(" [{}]", skill.tags.join(", "))
         };
-        out.push_str(&format!("  /{} — {}{}\n", skill.name, skill.description, tags));
+        out.push_str(&format!(
+            "  /{} — {}{}\n",
+            skill.name, skill.description, tags
+        ));
     }
     out
 }

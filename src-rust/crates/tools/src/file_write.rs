@@ -17,10 +17,12 @@ struct FileWriteInput {
 #[async_trait]
 impl Tool for FileWriteTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_FILE_WRITE
+        clawde_core::constants::TOOL_NAME_FILE_WRITE
     }
 
     fn description(&self) -> &str {
@@ -60,11 +62,9 @@ impl Tool for FileWriteTool {
         debug!(path = %path.display(), "Writing file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
-            self.name(),
-            &format!("Write {}", path.display()),
-            false,
-        ) {
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Write {}", path.display()), false)
+        {
             return ToolResult::error(e.to_string());
         }
 
@@ -100,11 +100,7 @@ impl Tool for FileWriteTool {
 
         // Write the file
         if let Err(e) = crate::write_atomic(&path, params.content.as_bytes()).await {
-            return ToolResult::error(format!(
-                "Failed to write file {}: {}",
-                path.display(),
-                e
-            ));
+            return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
         }
 
         ctx.record_file_change(
@@ -134,5 +130,146 @@ impl Tool for FileWriteTool {
             "lines": line_count,
             "bytes": byte_count,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn write_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": "hello world"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "write failed: {}", res.content);
+        assert!(path.exists(), "file should exist");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn write_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, "original content").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": "replaced content"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "overwrite failed: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced content");
+    }
+
+    #[tokio::test]
+    async fn write_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subdir").join("nested").join("deep.txt");
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": "nested file content"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "write failed: {}", res.content);
+        assert!(path.exists(), "nested file should exist");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "nested file content"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": ""
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "write failed: {}", res.content);
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn write_returns_line_and_byte_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi_line.txt");
+        let content = "line one\nline two\nline three\n";
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "content": content
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "write failed: {}", res.content);
+        assert!(
+            res.content.contains("3 lines"),
+            "expected 3 lines, got: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("bytes"),
+            "expected byte count, got: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("Created"),
+            "expected 'Created', got: {}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_invalid_input_missing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileWriteTool
+            .execute(json!({"file_path": "some/path.txt"}), &ctx)
+            .await;
+
+        assert!(res.is_error, "expected error for missing content");
+        assert!(res.content.contains("Invalid input"));
     }
 }

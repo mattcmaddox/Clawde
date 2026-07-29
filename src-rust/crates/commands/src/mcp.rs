@@ -19,14 +19,46 @@ impl SlashCommand for McpCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "list".into(), description: "List configured servers with live status".into(), available: true },
-            ArgCompletion { value: "status".into(), description: "View detailed connection status for all servers".into(), available: true },
-            ArgCompletion { value: "auth".into(), description: "Display OAuth instructions for a server".into(), available: true },
-            ArgCompletion { value: "connect".into(), description: "Reconnect a specific server".into(), available: true },
-            ArgCompletion { value: "logs".into(), description: "Show recent logs/errors for a server".into(), available: true },
-            ArgCompletion { value: "resources".into(), description: "List available resources from servers".into(), available: true },
-            ArgCompletion { value: "prompts".into(), description: "List available prompt templates".into(), available: true },
-            ArgCompletion { value: "get-prompt".into(), description: "Expand a specific prompt template".into(), available: true },
+            ArgCompletion {
+                value: "list".into(),
+                description: "List configured servers with live status".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "status".into(),
+                description: "View detailed connection status for all servers".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "auth".into(),
+                description: "Display OAuth instructions for a server".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "connect".into(),
+                description: "Reconnect a specific server".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "logs".into(),
+                description: "Show recent logs/errors for a server".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "resources".into(),
+                description: "List available resources from servers".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "prompts".into(),
+                description: "List available prompt templates".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "get-prompt".into(),
+                description: "Expand a specific prompt template".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

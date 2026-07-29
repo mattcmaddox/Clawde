@@ -1,0 +1,1929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rustle Animation Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d0d12;
+    --surface: #18181f;
+    --surface2: #22222b;
+    --border: #2e2e3a;
+    --text: #e0e0e8;
+    --muted: #808090;
+    --accent: #00ff00;
+    --cell: 22px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', 'Fira Code', 'DejaVu Sans Mono', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  /* Header */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  header h1 {
+    font-size: 15px;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent), #00ff88);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header .sub {
+    color: var(--muted);
+    font-size: 10px;
+    -webkit-text-fill-color: var(--muted);
+    font-weight: 400;
+  }
+  .header-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .ctrl {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .ctrl label {
+    font-size: 9px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .ctrl input[type="number"] {
+    width: 40px;
+    padding: 2px 4px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11px;
+    text-align: center;
+  }
+  .ctrl input[type="number"]:focus { outline: none; border-color: var(--accent); }
+  .ctrl input[type="color"] {
+    width: 26px; height: 26px;
+    padding: 0; border: 2px solid var(--border);
+    border-radius: 4px; cursor: pointer; background: none;
+  }
+  .ctrl input[type="color"]:hover { border-color: var(--accent); }
+  .ctrl input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+  .ctrl input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
+
+  .sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
+
+  .btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--surface2);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .btn:hover { background: #2a2a36; border-color: var(--muted); }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary {
+    background: var(--accent); color: #000;
+    border-color: var(--accent); font-weight: 600;
+  }
+  .btn-primary:hover { background: #00cc00; border-color: #00cc00; }
+  .btn-danger { border-color: #ff4444; color: #ff4444; }
+  .btn-danger:hover { background: #ff444411; }
+
+  /* ─── FRAME STRIP ─────────────────────────────────────────────── */
+  .frame-strip-wrap {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 20px;
+  }
+  .frame-strip-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .frame-strip-header .label {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+  }
+  .frame-strip-header .frame-count {
+    font-size: 9px;
+    color: var(--muted);
+  }
+  .frame-strip {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .frame-thumb {
+    flex-shrink: 0;
+    width: 130px;
+    background: #000;
+    border: 2px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    padding: 6px;
+    transition: all 0.15s ease;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .frame-thumb:hover {
+    border-color: var(--muted);
+    background: #0a0a10;
+  }
+  .frame-thumb.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 12px #00ff0040;
+    background: #0d1a0d;
+  }
+  .frame-thumb .thumb-label {
+    font-size: 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .frame-thumb .thumb-label .idx-badge {
+    background: var(--surface2);
+    padding: 0 5px;
+    border-radius: 3px;
+    color: var(--accent);
+  }
+  .frame-thumb .thumb-art {
+    width: 100%;
+    background: #000;
+    border-radius: 3px;
+    overflow: hidden;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+    font-size: 6px;
+    line-height: 1.1;
+    font-weight: bold;
+    white-space: pre;
+    text-align: center;
+    color: var(--accent);
+    padding: 2px 0;
+    letter-spacing: 0;
+  }
+  .frame-thumb .thumb-actions {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    display: none;
+    gap: 3px;
+  }
+  .frame-thumb:hover .thumb-actions { display: flex; }
+  .frame-thumb.active .thumb-actions { display: flex; }
+  .frame-thumb .thumb-btn {
+    width: 18px; height: 18px;
+    border: none; border-radius: 50%;
+    font-size: 10px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1; transition: background 0.1s;
+  }
+  .frame-thumb .dup-btn {
+    background: #4488ffdd; color: #fff;
+  }
+  .frame-thumb .dup-btn:hover { background: #2266dd; }
+  .frame-thumb .delete-btn {
+    background: #ff4444dd; color: #fff;
+  }
+  .frame-thumb .delete-btn:hover { background: #ff0000; }
+
+  /* ─── Drag and drop ──────────────────────────────────────────── */
+  .frame-thumb.dragging {
+    opacity: 0.4;
+    border-style: dashed;
+  }
+  .frame-thumb.drag-over {
+    border-color: var(--accent);
+    box-shadow: 0 0 16px #00ff0060;
+    background: #0d1a0d;
+    transform: scale(1.05);
+  }
+  .frame-thumb.drag-over-left {
+    border-left: 3px solid var(--accent);
+  }
+  .frame-thumb.drag-over-right {
+    border-right: 3px solid var(--accent);
+  }
+
+  .add-frame-btn {
+    flex-shrink: 0;
+    width: 130px;
+    min-height: 100px;
+    border: 2px dashed var(--border);
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 24px;
+    font-family: inherit;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    transition: all 0.15s ease;
+  }
+  .add-frame-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: #00ff0008;
+  }
+  .add-frame-btn small {
+    font-size: 9px;
+    opacity: 0.5;
+  }
+
+  /* ─── ANIMATION PREVIEW ────────────────────────────────────────── */
+  .anim-preview-bar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 6px 20px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .anim-preview-bar .anim-label {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+  }
+  .tui-frame {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    position: relative;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+  }
+  .tui-frame pre {
+    margin: 0;
+    padding: 2px 6px;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.0;
+    font-weight: bold;
+    letter-spacing: 0;
+    white-space: pre;
+    color: var(--accent);
+    background: transparent;
+  }
+
+  /* Color palette presets */
+  .color-presets {
+    display: flex;
+    gap: 3px;
+    align-items: center;
+  }
+  .color-swatch {
+    width: 18px; height: 18px;
+    border: 2px solid var(--border);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: all 0.1s;
+    flex-shrink: 0;
+  }
+  .color-swatch:hover { transform: scale(1.15); border-color: var(--text); }
+  .color-swatch.active { border-color: #fff; box-shadow: 0 0 6px currentColor; }
+  .anim-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .anim-controls .play-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: var(--surface2);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.12s;
+  }
+  .anim-controls .play-btn:hover { background: #2a2a36; border-color: var(--accent); }
+  .anim-controls .play-btn.playing { background: var(--accent); color: #000; border-color: var(--accent); }
+
+  /* Character palette */
+  .char-bar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 4px 20px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .char-group-label {
+    font-size: 8px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    padding-right: 4px;
+    border-right: 1px solid var(--border);
+    margin-right: 2px;
+  }
+  .char-palette { display: flex; gap: 2px; align-items: center; flex-shrink: 0; }
+  .char-btn {
+    width: 24px; height: 24px;
+    border: 2px solid transparent;
+    border-radius: 3px;
+    background: var(--surface2);
+    cursor: pointer;
+    font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text);
+    line-height: 1;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+    transition: all 0.1s ease;
+    flex-shrink: 0;
+  }
+  .char-btn:hover { background: #2a2a36; border-color: var(--muted); }
+  .char-btn.active {
+    border-color: var(--accent);
+    background: #00ff0022;
+    box-shadow: 0 0 8px #00ff0044;
+  }
+  .char-btn .pc { color: var(--accent); font-weight: bold; }
+
+  /* Brush */
+  .brush { display: flex; gap: 2px; }
+  .brush button {
+    width: 22px; height: 22px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface2);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 10px;
+    font-family: inherit;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .brush button:hover { background: #2a2a36; }
+  .brush button.active { border-color: var(--accent); background: #00ff0022; }
+
+  /* Main layout */
+  .main {
+    display: flex;
+    gap: 16px;
+    padding: 14px 20px;
+    flex: 1;
+    min-height: 0;
+  }
+  @media (max-width: 900px) { .main { flex-direction: column; } }
+
+  .editor-panel {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .panel-title {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .panel-title .badge {
+    font-size: 8px;
+    background: var(--surface2);
+    padding: 1px 6px;
+    border-radius: 8px;
+    color: var(--muted);
+  }
+
+  .grid-wrapper {
+    flex: 1;
+    overflow: auto;
+    background: #000;
+    padding: 8px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+  }
+  /* TUI-style editor frame */
+  .tui-editor-frame {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    min-height: 180px;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+  }
+  .tui-editor-frame .tui-editor-title-bar {
+    display: flex;
+    align-items: center;
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 9px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .tui-editor-frame .tui-editor-title-bar .tui-editor-title {
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .tui-editor-frame .tui-editor-title-bar .tui-editor-dims {
+    font-size: 8px;
+    color: var(--muted);
+    font-weight: 400;
+    letter-spacing: 0.5px;
+    text-transform: none;
+  }
+  .tui-editor-frame .tui-editor-size-marker {
+    display: flex;
+    gap: 6px;
+    padding: 2px 8px;
+    background: var(--surface);
+    font-size: 7px;
+    color: #404050;
+    letter-spacing: 0.5px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .tui-editor-frame .tui-editor-size-marker span {
+    color: var(--muted);
+  }
+  .px {
+    width: var(--cell);
+    height: var(--cell);
+    background: transparent;
+    border: 1px solid rgba(255,255,255,0.04);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+    font-size: 14px;
+    font-weight: bold;
+    line-height: 1;
+    color: transparent;
+    overflow: hidden;
+    border-radius: 1px;
+  }
+  .pixel-grid {
+    display: grid;
+    gap: 1px;
+    background: #0d0d14;
+    user-select: none;
+    cursor: crosshair;
+    touch-action: none;
+    padding: 1px;
+  }
+  .px.on {
+    background: var(--accent);
+    color: #000;
+    border-color: rgba(0, 255, 0, 0.15);
+  }
+  .px:hover {
+    background: rgba(255, 255, 255, 0.08);
+    opacity: 1;
+  }
+  .px.on:hover {
+    opacity: 0.8;
+    background: var(--accent);
+  }
+  .px.selected {
+    box-shadow: inset 0 0 0 2px #fff, 0 0 6px rgba(255,255,255,0.3);
+    z-index: 2;
+    position: relative;
+    border-radius: 1px;
+  }
+  .px.selected.on {
+    opacity: 0.7;
+    box-shadow: inset 0 0 0 2px #fff, 0 0 8px rgba(255,255,255,0.4);
+  }
+
+  .side-panel {
+    width: 300px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  @media (max-width: 900px) { .side-panel { width: 100%; } }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .card-header {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .preview-body {
+    padding: 12px;
+    min-height: 80px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+  }
+  .preview-body pre {
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', 'Cascadia Code', monospace;
+    font-size: 15px;
+    line-height: 1;
+    font-weight: bold;
+    margin: 0;
+    padding: 6px;
+    text-align: center;
+    letter-spacing: 0;
+    white-space: pre;
+    overflow: auto;
+  }
+
+  .export-card { flex: 1; display: flex; flex-direction: column; }
+  .export-body { flex: 1; position: relative; min-height: 80px; }
+  .export-body textarea {
+    width: 100%; height: 100%; min-height: 80px;
+    background: #08080c;
+    border: none;
+    color: var(--accent);
+    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    padding: 10px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.5;
+    tab-size: 2;
+  }
+  .export-body textarea::selection { background: #00ff0044; }
+
+  .toast {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%) translateY(60px);
+    background: var(--accent);
+    color: #000;
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 12px;
+    opacity: 0;
+    transition: all 0.25s ease;
+    pointer-events: none;
+    z-index: 100;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  footer {
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 6px 20px;
+    font-size: 9px;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  footer kbd {
+    background: var(--surface2);
+    padding: 1px 4px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    font-family: inherit;
+    font-size: 8px;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Rustle Animation Studio <span class="sub">Frame Editor</span></h1>
+  </div>
+  <div class="header-controls">
+    <div class="ctrl">
+      <label>Rows</label>
+      <input type="number" id="rowsInput" value="8" min="3" max="16">
+    </div>
+    <div class="ctrl">
+      <label>Cols</label>
+      <input type="number" id="colsInput" value="29" min="3" max="30">
+    </div>
+    <div class="sep"></div>
+    <div class="ctrl">
+      <label>FG</label>
+      <input type="color" id="colorPicker" value="#00ff00">
+    </div>
+    <div class="ctrl">
+      <label>BG</label>
+      <input type="color" id="bgColorPicker" value="#000000">
+    </div>
+    <div class="sep"></div>
+    <div class="color-presets" id="colorPresets"></div>
+    <div class="sep"></div>
+    <div class="brush">
+      <label style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-right:2px">Brush</label>
+      <button data-brush="1" class="active">1</button>
+      <button data-brush="2">2</button>
+      <button data-brush="3">3</button>
+    </div>
+    <div class="sep"></div>
+    <button class="btn" id="selectBtn">Select</button>
+    <div class="sep"></div>
+    <button class="btn btn-danger" id="clearBtn">Clear</button>
+    <button class="btn" id="fillBtn">Fill</button>
+  </div>
+</header>
+
+<!-- ─── FRAME STRIP ─────────────────────────────────────────────── -->
+<div class="frame-strip-wrap">
+  <div class="frame-strip-header">
+    <span class="label">Frames</span>
+    <span class="frame-count" id="frameCount">0 frames</span>
+  </div>
+  <div class="frame-strip" id="frameStrip"></div>
+</div>
+
+<!-- ─── ANIMATION PREVIEW BAR ────────────────────────────────────── -->
+<div class="anim-preview-bar">
+  <span class="anim-label">Animation</span>
+  <div class="tui-frame" id="animPreview">
+    <pre id="animPre"></pre>
+  </div>
+  <div class="anim-controls">
+    <button class="play-btn" id="playBtn" title="Play/Pause">▶</button>
+    <button class="btn" id="speedDown" title="Slower">−</button>
+    <span id="speedLabel" style="font-size:9px;color:var(--muted);min-width:30px;text-align:center">1s</span>
+    <button class="btn" id="speedUp" title="Faster">+</button>
+  </div>
+</div>
+
+<!-- Character palette bar -->
+<div class="char-bar" id="charBar"></div>
+
+<div class="main">
+  <div class="editor-panel">
+    <div class="panel-title">
+      <span>Editor</span>
+      <span class="badge" id="editFrameLabel">Editing: Frame 1</span>
+      <span class="badge" id="gridSize">8 × 29</span>
+      <span class="badge">Click paint · Drag draw · Right-click erase</span>
+    </div>
+    <div class="tui-editor-frame">
+      <div class="tui-editor-title-bar">
+        <span class="tui-editor-title">Pixel Grid</span>
+        <span style="flex:1"></span>
+        <span class="tui-editor-dims" id="tuiEditorDims">8 × 29</span>
+      </div>
+      <div class="grid-wrapper" id="gridWrapper">
+        <div class="pixel-grid" id="pixelGrid"></div>
+      </div>
+      <div class="tui-editor-size-marker">
+        <span>rows: <span id="tuiEditorRows">1–8</span></span>
+        <span style="flex:1"></span>
+        <span>cols: <span id="tuiEditorCols">1–29</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="side-panel">
+    <div class="card">
+      <div class="card-header">
+        <span>Preview (terminal)</span>
+        <span style="font-size:8px;color:var(--muted)">actual chars</span>
+      </div>
+      <div class="preview-body">
+        <pre id="preview"></pre>
+      </div>
+    </div>
+
+    <div class="card export-card">
+      <div class="card-header">
+        <span>Rust Code — All Frames</span>
+        <button class="btn btn-primary" id="copyBtn" style="font-size:9px;padding:2px 7px">Copy</button>
+      </div>
+      <div class="export-body">
+        <textarea id="exportCode" readonly spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <!-- ─── IMPORT FRAME ─────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-header">
+        <span>Import Frame</span>
+        <button class="btn" id="importToggleBtn" style="font-size:9px;padding:2px 7px">▼</button>
+      </div>
+      <div class="export-body" id="importSection">
+        <textarea id="importCode" spellcheck="false" placeholder="Paste Rust frame array here..." style="height:100px;min-height:50px"></textarea>
+        <div style="display:flex;gap:6px;padding:6px 10px;border-top:1px solid var(--border)">
+          <button class="btn btn-primary" id="importLoadBtn" style="font-size:9px;padding:3px 10px">Load into current frame</button>
+          <button class="btn" id="importNewBtn" style="font-size:9px;padding:3px 10px">Add as new frame</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <span>Click thumbnails to select · <kbd>↑↓</kbd> navigate · Paint: Click/Drag draw · Right-click erase</span>
+  <span><kbd>Ctrl+Z</kbd> undo · <kbd>Space</kbd> play/pause · <kbd>C</kbd> copy · <kbd>D</kbd> dup frame · <kbd>R</kbd> clear</span>
+</footer>
+
+<div class="toast" id="toast">Copied!</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  FRAME DATA — the 6 Rustle mascot animation frames
+// ═══════════════════════════════════════════════════════════════════
+const DEFAULT_FRAMES = [
+  { // Frame 1 — Rest claw
+    name: 'Rest claw',
+    rows: 8, cols: 29,
+    grid: [
+      "                             ",
+      "                             ",
+      "                   ▄▛▜▛▜▄    ",
+      "                 ▟▛▜▙▟▙▟▛▜▙  ",
+      "                 █▙▟▛▔▔▜▙▟█  ",
+      "                 ▜██▌▗▖▐██▛  ",
+      "                  ▝▜████▛▘   ",
+      "                   ▝████▘    ",
+    ].map(r => [...r]),
+  },
+  { // Frame 2 — Rest claw (copy)
+    name: 'Rest claw (copy)',
+    rows: 8, cols: 29,
+    grid: [
+      "                             ",
+      "                   ▄▛▜▛▜▄    ",
+      "                 ▟▛▜▙▟▙▟▛▜▙  ",
+      "                 █▙▟▛▔▔▜▙▟█  ",
+      "                 ▜██▌▗▖▐██▛  ",
+      "                  ▝▜████▛▘   ",
+      "                   ▝████▘    ",
+      "                    ████     ",
+    ].map(r => [...r]),
+  },
+  { // Frame 3 — Extend + stairs
+    name: 'Extend + stairs',
+    rows: 8, cols: 29,
+    grid: [
+      "                  ▗ ▐  ▌ ▖   ",
+      "                  ▐▄▛▜▛▜▄▌   ",
+      "                 ▟▛▜▙▟▙▟▛▜▙  ",
+      "                 █▙▟▛▔▔▜▙▟█  ",
+      "                 ▜██▌▗▖▐██▛  ",
+      "                  ▝▜████▛▘   ",
+      "                   ▝████▘    ",
+      "                    ████     ",
+    ].map(r => [...r]),
+  },
+  { // Frame 4 — Extend + stairs (copy)
+    name: 'Extend + stairs (copy)',
+    rows: 8, cols: 29,
+    grid: [
+      "                  ▗ ▐  ▌ ▖   ",
+      "    ▚  ▚          ▐▄▛▜▛▜▄▌   ",
+      "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
+      "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
+      " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
+      "  ▚  ▚  ▚         ▝▜████▛▘   ",
+      "   ▚  ▚            ▝████▘    ",
+      "                    ████     ",
+    ].map(r => [...r]),
+  },
+  { // Frame 5 — Extend + stairs (copy) (copy)
+    name: 'Extend + stairs (copy) (copy)',
+    rows: 8, cols: 29,
+    grid: [
+      "                             ",
+      "    ▚  ▚           ▄▛▜▛▜▄    ",
+      "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
+      "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
+      " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
+      "  ▚  ▚  ▚         ▝▜████▛▘   ",
+      "   ▚  ▚            ▝████▘    ",
+      "                    ████     ",
+    ].map(r => [...r]),
+  },
+  { // Frame 6 — Extend + stairs (loop back)
+    name: 'Extend + stairs',
+    rows: 8, cols: 29,
+    grid: [
+      "                             ",
+      "                   ▄▛▜▛▜▄    ",
+      "                 ▟▛▜▙▟▙▟▛▜▙  ",
+      "                 █▙▟▛▔▔▜▙▟█  ",
+      "                 ▜██▌▗▖▐██▛  ",
+      "                  ▝▜████▛▘   ",
+      "                   ▝████▘    ",
+      "                    ████     ",
+    ].map(r => [...r]),
+  },
+];
+
+// ═══════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════
+let frames = [];           // { name, rows, cols, grid: string[][] }
+let selectedIdx = 0;       // which frame is being edited
+let rows = 8;
+let cols = 29;
+let fgColor = '#00ff00';
+let bgColor = '#000000';
+let selectedChar = '█';
+let brushSize = 1;
+let painting = false;
+let erasing = false;
+let undoStack = [];
+const MAX_UNDO = 80;
+let grid = [];     // active grid = frames[selectedIdx].grid
+
+// Animation
+let animPlaying = false;
+let animTimer = null;
+let animFrameIdx = 0;
+let animSpeed = 1000; // ms per frame
+
+// Selection
+let selectMode = false;
+let selection = null;
+let selecting = false;
+let moving = false;
+let moveOrig = null;
+let moveClick = null;
+let moveSnapshot = [];
+
+// Drag-and-drop
+let dragFromIdx = -1;
+
+// ─── DOM refs ─────────────────────────────────────────────────────
+const $grid = document.getElementById('pixelGrid');
+const $preview = document.getElementById('preview');
+const $export = document.getElementById('exportCode');
+const $rowsIn = document.getElementById('rowsInput');
+const $colsIn = document.getElementById('colsInput');
+const $color = document.getElementById('colorPicker');
+const $bgColor = document.getElementById('bgColorPicker');
+const $gridSize = document.getElementById('gridSize');
+const $toast = document.getElementById('toast');
+const $selectBtn = document.getElementById('selectBtn');
+const $frameStrip = document.getElementById('frameStrip');
+const $frameCount = document.getElementById('frameCount');
+const $editLabel = document.getElementById('editFrameLabel');
+const $animPre = document.getElementById('animPre');
+const $playBtn = document.getElementById('playBtn');
+const $speedLabel = document.getElementById('speedLabel');
+const $tuiEditorDims = document.getElementById('tuiEditorDims');
+const $tuiEditorRows = document.getElementById('tuiEditorRows');
+const $tuiEditorCols = document.getElementById('tuiEditorCols');
+
+// ─── PERSISTENCE ────────────────────────────────────────────────
+const STORAGE_KEY = 'rustle-studio-data';
+const STORAGE_VERSION = 3;  // bump when DEFAULT_FRAMES changes
+
+function saveState() {
+  try {
+    const data = {
+      version: STORAGE_VERSION,
+      frames: frames.map(f => ({
+        name: f.name, rows: f.rows, cols: f.cols,
+        grid: f.grid,
+      })),
+      selectedIdx,
+      fgColor, bgColor,
+      animSpeed,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (e) { /* storage full or unavailable */ }
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    // Discard saved state if the version doesn't match (frames have changed)
+    if (data.version !== STORAGE_VERSION) return false;
+    if (!data.frames || !data.frames.length) return false;
+    frames = data.frames.map(f => ({
+      name: f.name, rows: f.rows, cols: f.cols,
+      grid: f.grid,
+    }));
+    if (data.fgColor) fgColor = data.fgColor;
+    if (data.bgColor) bgColor = data.bgColor;
+    if (data.animSpeed) animSpeed = data.animSpeed;
+    selectedIdx = data.selectedIdx || 0;
+    if (selectedIdx >= frames.length) selectedIdx = 0;
+    return true;
+  } catch (e) { return false; }
+}
+
+function autoSave() {
+  // Debounced save — called after every mutation
+  saveState();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  CHARACTERS
+// ═══════════════════════════════════════════════════════════════════
+const CHAR_GROUPS = [
+  { label: 'Blocks', chars: [
+    { c: '█', l: 'Full' }, { c: '▀', l: 'Upper half' }, { c: '▄', l: 'Lower half' },
+    { c: '▌', l: 'Left half' }, { c: '▐', l: 'Right half' },
+  ]},
+  { label: 'Quarters', chars: [
+    { c: '▘', l: 'Quadrant TL' }, { c: '▝', l: 'Quadrant TR' }, { c: '▖', l: 'Quadrant BL' },
+    { c: '▗', l: 'Quadrant BR' }, { c: '▚', l: 'Quadrant TL+BR' }, { c: '▞', l: 'Quadrant TR+BL' },
+    { c: '▜', l: 'Quadrant TL+TR+BR' }, { c: '▟', l: 'Quadrant TR+BR+BL' },
+    { c: '▙', l: 'Quadrant TL+BL+BR' }, { c: '▛', l: 'Quadrant TL+TR+BL' },
+  ]},
+  { label: 'Eighths', chars: [
+    { c: '▔', l: 'Upper 1/8' }, { c: '▁', l: 'Lower 1/8' }, { c: '▂', l: 'Lower 2/8' },
+    { c: '▃', l: 'Lower 3/8' }, { c: '▄', l: 'Lower 4/8' }, { c: '▅', l: 'Lower 5/8' },
+    { c: '▆', l: 'Lower 6/8' }, { c: '▇', l: 'Lower 7/8' }, { c: '▉', l: 'Left 7/8' },
+    { c: '▊', l: 'Left 6/8' }, { c: '▋', l: 'Left 5/8' }, { c: '▌', l: 'Left 4/8' },
+    { c: '▍', l: 'Left 3/8' }, { c: '▎', l: 'Left 2/8' }, { c: '▏', l: 'Left 1/8' },
+    { c: '▕', l: 'Right 1/8' },
+  ]},
+  { label: 'Shade', chars: [
+    { c: '░', l: 'Light shade' }, { c: '▒', l: 'Medium shade' }, { c: '▓', l: 'Dark shade' },
+  ]},
+  { label: 'Box', chars: [
+    { c: '─', l: 'Horizontal' }, { c: '│', l: 'Vertical' }, { c: '┌', l: 'Corner TL' },
+    { c: '┐', l: 'Corner TR' }, { c: '└', l: 'Corner BL' }, { c: '┘', l: 'Corner BR' },
+    { c: '├', l: 'T right' }, { c: '┤', l: 'T left' }, { c: '┬', l: 'T down' },
+    { c: '┴', l: 'T up' }, { c: '┼', l: 'Cross' }, { c: '═', l: 'Double horiz' },
+    { c: '║', l: 'Double vert' }, { c: '╔', l: 'Dbl corner TL' }, { c: '╗', l: 'Dbl corner TR' },
+    { c: '╚', l: 'Dbl corner BL' }, { c: '╝', l: 'Dbl corner BR' },
+  ]},
+  { label: 'Shapes', chars: [
+    { c: '●', l: 'Circle filled' }, { c: '○', l: 'Circle hollow' }, { c: '◆', l: 'Diamond filled' },
+    { c: '◇', l: 'Diamond hollow' }, { c: '■', l: 'Square filled' }, { c: '□', l: 'Square hollow' },
+    { c: '▲', l: 'Triangle up' }, { c: '△', l: 'Triangle up hollow' }, { c: '▼', l: 'Triangle down' },
+    { c: '▽', l: 'Triangle down hollow' }, { c: '►', l: 'Triangle right' }, { c: '◄', l: 'Triangle left' },
+    { c: '◐', l: 'Circle left half' }, { c: '◑', l: 'Circle right half' },
+    { c: '◒', l: 'Circle top half' }, { c: '◓', l: 'Circle bottom half' },
+  ]},
+  { label: 'Braille', chars: [
+    { c: '⠀', l: 'Braille blank' }, { c: '⠁', l: 'Braille dot 1' }, { c: '⠂', l: 'Braille dot 2' },
+    { c: '⠄', l: 'Braille dot 3' }, { c: '⠈', l: 'Braille dot 4' }, { c: '⠐', l: 'Braille dot 5' },
+    { c: '⠠', l: 'Braille dot 6' }, { c: '⡀', l: 'Braille dot 7' }, { c: '⢀', l: 'Braille dot 8' },
+    { c: '⣀', l: 'Braille dots 7+8' }, { c: '⠇', l: 'Braille dots 1+2+3' }, { c: '⠎', l: 'Braille dots 1+2+4' },
+    { c: '⠙', l: 'Braille dots 1+5+2' }, { c: '⠟', l: 'Braille dots 1+2+3+4+5' },
+    { c: '⠷', l: 'Braille dots 1+2+3+4+5+6' }, { c: '⠿', l: 'Braille all 6' }, { c: '⣿', l: 'Braille all 8' },
+  ]},
+  { label: 'Misc', chars: [
+    { c: '·', l: 'Middle dot' }, { c: '•', l: 'Bullet' }, { c: '⋆', l: 'Star' },
+    { c: '✦', l: 'Sparkle' }, { c: '◆', l: 'Diamond' }, { c: '○', l: 'Circle' },
+    { c: '¤', l: 'Currency' }, { c: '§', l: 'Section' }, { c: '¶', l: 'Pilcrow' },
+    { c: '×', l: 'Multiply' }, { c: '÷', l: 'Divide' }, { c: '±', l: 'Plus-minus' },
+  ]},
+];
+
+// ═══════════════════════════════════════════════════════════════════
+//  PALETTE INIT
+// ═══════════════════════════════════════════════════════════════════
+(function initPalette() {
+  const bar = document.getElementById('charBar');
+  CHAR_GROUPS.forEach(group => {
+    const label = document.createElement('span');
+    label.className = 'char-group-label';
+    label.textContent = group.label;
+    bar.appendChild(label);
+    const pal = document.createElement('div');
+    pal.className = 'char-palette';
+    group.chars.forEach(({ c, l }) => {
+      const b = document.createElement('button');
+      b.className = 'char-btn' + (c === '█' ? ' active' : '');
+      b.title = l + ' (' + c + ')';
+      b.dataset.char = c;
+      b.innerHTML = `<span class="pc">${c}</span>`;
+      b.onclick = () => {
+        document.querySelectorAll('.char-btn').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        selectedChar = c;
+        updatePreview();
+        updateExport();
+      };
+      pal.appendChild(b);
+    });
+    bar.appendChild(pal);
+  });
+})();
+
+// Brush
+document.querySelectorAll('[data-brush]').forEach(b => {
+  b.onclick = () => {
+    document.querySelectorAll('[data-brush]').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    brushSize = +b.dataset.brush;
+  };
+});
+
+// ═══════════════════════════════════════════════════════════════════
+//  FRAME MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+function deepCopyGrid(g) {
+  return g.map(row => [...row]);
+}
+
+function emptyGrid(r, c) {
+  return Array.from({ length: r }, () => Array(c).fill(null));
+}
+
+function saveCurrentFrame() {
+  frames[selectedIdx].rows = rows;
+  frames[selectedIdx].cols = cols;
+  frames[selectedIdx].grid = grid;
+}
+
+function loadActiveGrid() {
+  const f = frames[selectedIdx];
+  rows = f.rows;
+  cols = f.cols;
+  grid = f.grid;
+  $rowsIn.value = rows;
+  $colsIn.value = cols;
+  renderGrid();
+}
+
+function selectFrame(idx) {
+  if (idx < 0 || idx >= frames.length) return;
+  saveCurrentFrame();
+
+  selectedIdx = idx;
+  loadActiveGrid();
+  renderFrameStrip();
+  updateAnimPreview();
+  updateExport();
+  $editLabel.textContent = `Editing: ${frames[idx].name} (Frame ${idx + 1})`;
+  autoSave();
+}
+
+function addFrame() {
+  const blank = {
+    name: `Frame ${frames.length + 1}`,
+    rows,
+    cols,
+    grid: emptyGrid(rows, cols),
+  };
+  frames.push(blank);
+  selectFrame(frames.length - 1);
+  toast('Frame added!');
+  autoSave();
+}
+
+function deleteFrame(idx) {
+  if (frames.length <= 1) { toast('Need at least 1 frame!', '#ff4444'); return; }
+  const wasActive = idx === selectedIdx;
+  frames.splice(idx, 1);
+  if (wasActive || selectedIdx >= frames.length) {
+    selectFrame(Math.min(idx, frames.length - 1));
+  } else if (selectedIdx > idx) {
+    selectedIdx--;
+    selectFrame(selectedIdx);
+  } else {
+    renderFrameStrip();
+    updateExport();
+  }
+  autoSave();
+}
+
+function duplicateFrame(idx) {
+  const orig = frames[idx];
+  const dup = {
+    name: orig.name + ' (copy)',
+    rows: orig.rows,
+    cols: orig.cols,
+    grid: deepCopyGrid(orig.grid),
+  };
+  frames.splice(idx + 1, 0, dup);
+  selectFrame(idx + 1);
+  toast('Frame duplicated!');
+  autoSave();
+}
+
+function moveFrame(fromIdx, toIdx) {
+  if (fromIdx === toIdx || fromIdx < 0 || fromIdx >= frames.length || toIdx < 0 || toIdx > frames.length) return;
+  saveCurrentFrame();
+  const [moved] = frames.splice(fromIdx, 1);
+  const adjustedTo = toIdx > fromIdx ? toIdx - 1 : toIdx;
+  frames.splice(adjustedTo, 0, moved);
+  selectedIdx = adjustedTo;
+  loadActiveGrid();
+  renderFrameStrip();
+  updateAnimPreview();
+  updateExport();
+  $editLabel.textContent = `Editing: ${frames[selectedIdx].name} (Frame ${selectedIdx + 1})`;
+  autoSave();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RENDER FRAME STRIP
+// ═══════════════════════════════════════════════════════════════════
+function renderFrameStrip() {
+  $frameStrip.innerHTML = '';
+  frames.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'frame-thumb' + (i === selectedIdx ? ' active' : '');
+    div.draggable = true;
+    div.onclick = () => { stopAnim(); selectFrame(i); };
+
+    // Drag-and-drop
+    div.ondragstart = (e) => {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(i));
+      dragFromIdx = i;
+      div.classList.add('dragging');
+    };
+    div.ondragend = () => {
+      div.classList.remove('dragging');
+      dragFromIdx = -1;
+      document.querySelectorAll('.frame-thumb').forEach(el => {
+        el.classList.remove('drag-over', 'drag-over-left', 'drag-over-right');
+      });
+    };
+    div.ondragover = (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      if (dragFromIdx === i) return;
+      // Determine if drop should go left or right of this thumbnail
+      const rect = div.getBoundingClientRect();
+      const midX = rect.left + rect.width / 2;
+      const isLeft = e.clientX < midX;
+      document.querySelectorAll('.frame-thumb').forEach(el => {
+        el.classList.remove('drag-over', 'drag-over-left', 'drag-over-right');
+      });
+      div.classList.add('drag-over', isLeft ? 'drag-over-left' : 'drag-over-right');
+    };
+    div.ondragleave = () => {
+      div.classList.remove('drag-over', 'drag-over-left', 'drag-over-right');
+    };
+    div.ondrop = (e) => {
+      e.preventDefault();
+      const fromIdx = dragFromIdx;
+      if (fromIdx < 0 || fromIdx === i) return;
+      const rect = div.getBoundingClientRect();
+      const midX = rect.left + rect.width / 2;
+      const toIdx = e.clientX < midX ? i : i + 1;
+      stopAnim();
+      moveFrame(fromIdx, toIdx);
+    };
+
+    const label = document.createElement('div');
+    label.className = 'thumb-label';
+    label.innerHTML = `<span class="idx-badge">#${i + 1}</span> ${f.name}`;
+    div.appendChild(label);
+
+    const art = document.createElement('div');
+    art.className = 'thumb-art';
+    art.textContent = f.grid.map(r => r.map(ch => ch || ' ').join('')).join('\n');
+    art.style.color = fgColor;
+    div.appendChild(art);
+
+      const actions = document.createElement('div');
+    actions.className = 'thumb-actions';
+
+    const dup = document.createElement('button');
+    dup.className = 'thumb-btn dup-btn';
+    dup.textContent = '⧉';
+    dup.title = 'Duplicate frame';
+    dup.onclick = (e) => { e.stopPropagation(); duplicateFrame(i); };
+    actions.appendChild(dup);
+
+    const del = document.createElement('button');
+    del.className = 'thumb-btn delete-btn';
+    del.textContent = '×';
+    del.title = 'Delete frame';
+    del.onclick = (e) => { e.stopPropagation(); deleteFrame(i); };
+    actions.appendChild(del);
+
+    div.appendChild(actions);
+
+    $frameStrip.appendChild(div);
+  });
+
+  // Add button
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-frame-btn';
+  addBtn.innerHTML = '+<small>New frame</small>';
+  addBtn.title = 'Add new frame';
+  addBtn.onclick = () => { stopAnim(); addFrame(); };
+  $frameStrip.appendChild(addBtn);
+
+  $frameCount.textContent = `${frames.length} frame${frames.length !== 1 ? 's' : ''}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ANIMATION
+// ═══════════════════════════════════════════════════════════════════
+function updateAnimPreview() {
+  const f = frames[animFrameIdx];
+  if (!f) return;
+
+  const LEFT_W = 29;   // mascot canvas width
+  const RIGHT_W = 48;  // tips column width
+  const TOTAL = 1 + LEFT_W + 1 + RIGHT_W + 1; // 80
+
+  // Center mascot art within LEFT_W canvas
+  const pad = Math.max(0, Math.floor((LEFT_W - f.cols) / 2));
+  const rightPad = Math.max(0, LEFT_W - f.cols - pad);
+  const mascot = f.grid.map(r =>
+    ' '.repeat(pad) + r.map(c => c || ' ').join('') + ' '.repeat(rightPad)
+  );
+
+  // Left column (10 rows: welcome + blank + 8 mascot rows)
+  const left = [
+    ('Welcome back, user!' + ' '.repeat(LEFT_W)).slice(0, LEFT_W),
+    ' '.repeat(LEFT_W),
+    ...mascot,
+  ];
+
+  // Right column (10 rows: tips + recent activity + blanks)
+  const rightTips = [
+    ' Tips for getting started',
+    ' Edit AGENTS.md to add',
+    ' instructions for Clawde',
+    '',
+    ' Recent activity',
+    ' No recent activity',
+    '', '', '', '',
+  ];
+  const right = rightTips.map(r => (r + ' '.repeat(RIGHT_W)).slice(0, RIGHT_W));
+
+  // Build full TUI layout as text
+  const title = ' Clawde v0.1.7 ';
+  const dashes = TOTAL - 2 - title.length;
+  const lines = [];
+  lines.push('╭' + title + '─'.repeat(dashes) + '╮');
+
+  for (let i = 0; i < 10; i++) {
+    const l = (left[i] || ' '.repeat(LEFT_W)).slice(0, LEFT_W);
+    const r = (right[i] || ' '.repeat(RIGHT_W)).slice(0, RIGHT_W);
+    lines.push('│' + l + '│' + r + '│');
+  }
+
+  lines.push('╰' + '─'.repeat(TOTAL - 2) + '╯');
+
+  $animPre.textContent = lines.join('\n');
+  $animPre.style.color = fgColor;
+}
+
+function animStep() {
+  if (!animPlaying || frames.length === 0) return;
+  animFrameIdx = (animFrameIdx + 1) % frames.length;
+  updateAnimPreview();
+}
+
+function startAnim() {
+  if (animPlaying) return;
+  animPlaying = true;
+  $playBtn.textContent = '⏸';
+  $playBtn.classList.add('playing');
+  animTimer = setInterval(animStep, animSpeed);
+}
+
+function stopAnim() {
+  animPlaying = false;
+  if (animTimer) { clearInterval(animTimer); animTimer = null; }
+  $playBtn.textContent = '▶';
+  $playBtn.classList.remove('playing');
+}
+
+function toggleAnim() {
+  if (animPlaying) stopAnim();
+  else startAnim();
+}
+
+function setAnimSpeed(ms) {
+  animSpeed = Math.max(100, Math.min(5000, ms));
+  $speedLabel.textContent = (animSpeed / 1000).toFixed(1) + 's';
+  if (animPlaying) {
+    clearInterval(animTimer);
+    animTimer = setInterval(animStep, animSpeed);
+  }
+  autoSave();
+}
+
+$playBtn.onclick = toggleAnim;
+document.getElementById('speedDown').onclick = () => setAnimSpeed(animSpeed * 1.5);
+document.getElementById('speedUp').onclick = () => setAnimSpeed(animSpeed / 1.5);
+
+// ═══════════════════════════════════════════════════════════════════
+//  SELECTION
+// ═══════════════════════════════════════════════════════════════════
+function setSelectMode(on) {
+  selectMode = on;
+  $selectBtn.classList.toggle('btn-primary', on);
+  $grid.style.cursor = on ? 'cell' : 'crosshair';
+  if (!on) clearSelection();
+}
+$selectBtn.onclick = () => setSelectMode(!selectMode);
+
+function clearSelection() {
+  selection = null; selecting = false; moving = false;
+  moveOrig = null; moveClick = null; moveSnapshot = [];
+  applySelectionVisuals();
+}
+
+function applySelectionVisuals() {
+  $grid.querySelectorAll('.px.selected').forEach(el => el.classList.remove('selected'));
+  if (!selection) return;
+  const { r1, c1, r2, c2 } = selection;
+  for (let r = r1; r <= r2; r++)
+    for (let c = c1; c <= c2; c++) {
+      const cell = $grid.children[r * cols + c];
+      if (cell) cell.classList.add('selected');
+    }
+}
+
+function inSelection(r, c) {
+  if (!selection) return false;
+  return r >= selection.r1 && r <= selection.r2 && c >= selection.c1 && c <= selection.c2;
+}
+
+function normalizeRect(r1, c1, r2, c2) {
+  return { r1: Math.min(r1, r2), r2: Math.max(r1, r2), c1: Math.min(c1, c2), c2: Math.max(c1, c2) };
+}
+
+function snapshotSelection() {
+  if (!selection) return [];
+  const { r1, c1, r2, c2 } = selection;
+  const snap = [];
+  for (let r = r1; r <= r2; r++) { const row = []; for (let c = c1; c <= c2; c++) row.push(grid[r][c]); snap.push(row); }
+  return snap;
+}
+
+function moveSelection(dr, dc) {
+  if (!moveOrig || !moveSnapshot.length) return;
+  const { r1: or1, c1: oc1, r2: or2, c2: oc2 } = moveOrig;
+  const h = or2 - or1 + 1, w = oc2 - oc1 + 1;
+  for (let r = or1; r <= or2; r++) for (let c = oc1; c <= oc2; c++) grid[r][c] = null;
+  let nr1 = or1 + dr, nc1 = oc1 + dc;
+  nr1 = Math.max(0, Math.min(nr1, rows - h));
+  nc1 = Math.max(0, Math.min(nc1, cols - w));
+  for (let r = 0; r < h; r++)
+    for (let c = 0; c < w; c++) {
+      const tr = nr1 + r, tc = nc1 + c;
+      if (tr >= 0 && tr < rows && tc >= 0 && tc < cols) grid[tr][tc] = moveSnapshot[r][c];
+    }
+  selection = { r1: nr1, c1: nc1, r2: nr1 + h - 1, c2: nc1 + w - 1 };
+  syncGridDOM(); applySelectionVisuals(); updatePreview(); updateExport();
+}
+
+function nudgeSelection(dr, dc) {
+  if (!selection) return;
+  moveOrig = { ...selection }; moveSnapshot = snapshotSelection(); moveSelection(dr, dc);
+}
+
+function syncGridDOM() {
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++) {
+      const cell = $grid.children[r * cols + c];
+      if (!cell) continue;
+      const ch = grid[r][c];
+      cell.classList.toggle('on', ch !== null);
+      cell.textContent = ch || '';
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  GRID RENDER
+// ═══════════════════════════════════════════════════════════════════
+function pushUndo() {
+  undoStack.push(grid.map(r => [...r]));
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+}
+
+function renderGrid() {
+  $grid.innerHTML = '';
+  $grid.style.gridTemplateColumns = `repeat(${cols}, var(--cell))`;
+  $grid.style.gridTemplateRows = `repeat(${rows}, var(--cell))`;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const cell = document.createElement('div');
+      const ch = grid[r][c];
+      cell.className = 'px' + (ch ? ' on' : '');
+      cell.textContent = ch || '';
+      cell.dataset.r = r;
+      cell.dataset.c = c;
+      $grid.appendChild(cell);
+    }
+  }
+  $gridSize.textContent = `${rows} × ${cols}`;
+  $tuiEditorDims.textContent = `${rows} × ${cols}`;
+  $tuiEditorRows.textContent = `1–${rows}`;
+  $tuiEditorCols.textContent = `1–${cols}`;
+  updatePreview();
+  updateExport();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PAINT
+// ═══════════════════════════════════════════════════════════════════
+function paint(r, c, fill) {
+  const half = Math.floor(brushSize / 2);
+  for (let dr = -half; dr <= half; dr++)
+    for (let dc = -half; dc <= half; dc++) {
+      const rr = r + dr, cc = c + dc;
+      if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+      if (fill === null && grid[rr][cc] === null) continue;
+      if (fill !== null && grid[rr][cc] === fill) continue;
+      grid[rr][cc] = fill;
+      const cell = $grid.children[rr * cols + cc];
+      if (cell) { cell.classList.toggle('on', fill !== null); cell.textContent = fill || ''; }
+    }
+}
+
+function cellFromEvent(e) {
+  const t = e.target.closest('.px');
+  if (!t) return null;
+  return { r: +t.dataset.r, c: +t.dataset.c };
+}
+
+$grid.addEventListener('mousedown', e => {
+  e.preventDefault();
+  const pos = cellFromEvent(e);
+  if (!pos) return;
+  if (selectMode) {
+    if (selection && inSelection(pos.r, pos.c)) {
+      pushUndo(); moving = true; selecting = false;
+      moveOrig = { ...selection }; moveClick = { r: pos.r, c: pos.c }; moveSnapshot = snapshotSelection();
+    } else {
+      selecting = true; moving = false;
+      selection = { r1: pos.r, c1: pos.c, r2: pos.r, c2: pos.c };
+      applySelectionVisuals();
+    }
+    return;
+  }
+  pushUndo();
+  if (e.button === 2 || e.shiftKey) { erasing = true; painting = false; }
+  else { painting = true; erasing = false; }
+  paint(pos.r, pos.c, erasing ? null : selectedChar);
+  updatePreview(); updateExport();
+});
+
+$grid.addEventListener('mousemove', e => {
+  const pos = cellFromEvent(e);
+  if (!pos) return;
+  if (selectMode) {
+    if (selecting) {
+      selection = normalizeRect(selection.r1, selection.c1, pos.r, pos.c);
+      applySelectionVisuals();
+    } else if (moving && moveClick) {
+      moveSelection(pos.r - moveClick.r, pos.c - moveClick.c);
+    }
+    return;
+  }
+  if (!painting && !erasing) return;
+  paint(pos.r, pos.c, erasing ? null : selectedChar);
+  updatePreview(); updateExport();
+});
+
+document.addEventListener('mouseup', () => {
+  painting = false; erasing = false; selecting = false; moving = false; moveClick = null;
+  autoSave();
+});
+$grid.addEventListener('contextmenu', e => e.preventDefault());
+
+$grid.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  const el = document.elementFromPoint(t.clientX, t.clientY)?.closest('.px');
+  if (!el) return;
+  pushUndo(); painting = true; erasing = false;
+  paint(+el.dataset.r, +el.dataset.c, selectedChar);
+  updatePreview(); updateExport();
+}, { passive: false });
+
+$grid.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!painting) return;
+  const t = e.touches[0];
+  const el = document.elementFromPoint(t.clientX, t.clientY)?.closest('.px');
+  if (!el) return;
+  paint(+el.dataset.r, +el.dataset.c, selectedChar);
+  updatePreview(); updateExport();
+}, { passive: false });
+
+document.addEventListener('touchend', () => { painting = false; });
+
+// ═══════════════════════════════════════════════════════════════════
+//  RESIZE
+// ═══════════════════════════════════════════════════════════════════
+function resize(nr, nc) {
+  saveCurrentFrame();
+  pushUndo();
+  const ng = Array.from({ length: nr }, (_, r) =>
+    Array.from({ length: nc }, (_, c) => r < rows && c < cols ? grid[r][c] : null)
+  );
+  rows = nr; cols = nc; grid = ng;
+  frames[selectedIdx].rows = rows;
+  frames[selectedIdx].cols = cols;
+  frames[selectedIdx].grid = grid;
+  renderGrid();
+  autoSave();
+}
+
+$rowsIn.onchange = () => {
+  const v = Math.max(3, Math.min(16, +$rowsIn.value || 8));
+  $rowsIn.value = v;
+  resize(v, cols);
+};
+$colsIn.onchange = () => {
+  const v = Math.max(3, Math.min(30, +$colsIn.value || 29));
+  $colsIn.value = v;
+  resize(rows, v);
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  COLOR
+// ═══════════════════════════════════════════════════════════════════
+$color.oninput = () => {
+  fgColor = $color.value;
+  document.documentElement.style.setProperty('--accent', fgColor);
+  updatePreview(); updateExport();
+  renderFrameStrip();
+  autoSave();
+};
+$bgColor.oninput = () => {
+  bgColor = $bgColor.value;
+  updatePreview();
+  autoSave();
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  CLEAR / FILL
+// ═══════════════════════════════════════════════════════════════════
+document.getElementById('clearBtn').onclick = () => {
+  saveCurrentFrame();
+  pushUndo();
+  grid = Array.from({ length: rows }, () => Array(cols).fill(null));
+  frames[selectedIdx].grid = grid;
+  renderGrid();
+  autoSave();
+};
+document.getElementById('fillBtn').onclick = () => {
+  saveCurrentFrame();
+  pushUndo();
+  grid = Array.from({ length: rows }, () => Array(cols).fill(selectedChar));
+  frames[selectedIdx].grid = grid;
+  renderGrid();
+  autoSave();
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  UNDO
+// ═══════════════════════════════════════════════════════════════════
+function undo() {
+  if (!undoStack.length) return;
+  saveCurrentFrame();
+  grid = undoStack.pop();
+  frames[selectedIdx].grid = grid;
+  renderGrid();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KEYBOARD
+// ═══════════════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  if (e.target.closest('input,textarea')) return;
+  if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); return; }
+  if ((e.key === 'c' || e.key === 'C') && (e.ctrlKey || e.metaKey)) {
+    if (!window.getSelection().toString()) { e.preventDefault(); copyCode(); }
+    return;
+  }
+  if (e.key === 'c' && !e.ctrlKey && !e.metaKey) {
+    if (!window.getSelection().toString()) { e.preventDefault(); copyCode(); }
+    return;
+  }
+  if (e.key === 'r' || e.key === 'R') {
+    if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); document.getElementById('clearBtn').click(); }
+    return;
+  }
+  if ((e.key === 'd' || e.key === 'D') && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault(); duplicateFrame(selectedIdx); return;
+  }
+  if (e.key === 's' || e.key === 'S') {
+    if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); setSelectMode(!selectMode); }
+    return;
+  }
+  // Space: play/pause
+  if (e.key === ' ' || e.key === 'Space') {
+    e.preventDefault(); toggleAnim(); return;
+  }
+  // Up/Down: navigate frames
+  if (e.key === 'ArrowUp' && e.ctrlKey) {
+    e.preventDefault();
+    if (selectedIdx > 0) selectFrame(selectedIdx - 1);
+    return;
+  }
+  if (e.key === 'ArrowDown' && e.ctrlKey) {
+    e.preventDefault();
+    if (selectedIdx < frames.length - 1) selectFrame(selectedIdx + 1);
+    return;
+  }
+  // Escape
+  if (e.key === 'Escape') { clearSelection(); return; }
+  // Arrow keys: nudge selection
+  if (selectMode && selection) {
+    let dr = 0, dc = 0;
+    if (e.key === 'ArrowUp') dr = -1;
+    else if (e.key === 'ArrowDown') dr = 1;
+    else if (e.key === 'ArrowLeft') dc = -1;
+    else if (e.key === 'ArrowRight') dc = 1;
+    if (dr !== 0 || dc !== 0) { e.preventDefault(); pushUndo(); nudgeSelection(dr, dc); return; }
+  }
+  if (selectMode && selection && (e.key === 'Delete' || e.key === 'Backspace')) {
+    e.preventDefault(); pushUndo();
+    const { r1, c1, r2, c2 } = selection;
+    for (let r = r1; r <= r2; r++) for (let c = c1; c <= c2; c++) grid[r][c] = null;
+    syncGridDOM(); applySelectionVisuals(); updatePreview(); updateExport();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+//  PREVIEW
+// ═══════════════════════════════════════════════════════════════════
+function updatePreview() {
+  const lines = [];
+  for (let r = 0; r < rows; r++) {
+    let line = '';
+    for (let c = 0; c < cols; c++) line += grid[r][c] || ' ';
+    lines.push(line);
+  }
+  $preview.textContent = lines.join('\n');
+  $preview.style.color = fgColor;
+  $preview.style.backgroundColor = bgColor;
+  document.querySelector('.preview-body').style.background = bgColor;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXPORT — all frames as a single FRAMES array
+// ═══════════════════════════════════════════════════════════════════
+function updateExport() {
+  const allUsed = new Set();
+  const frameArrays = frames.map((f, i) => {
+    const lines = [];
+    const rows2 = f.rows || rows;
+    const cols2 = f.cols || cols;
+    const g = f.grid || grid;
+    for (let r = 0; r < rows2; r++) {
+      let line = '';
+      for (let c = 0; c < cols2; c++) {
+        const ch = g[r] && g[r][c];
+        if (ch) { line += ch; allUsed.add(ch); }
+        else line += ' ';
+      }
+      lines.push(`        \"${line}\",`);
+    }
+    return `    // Frame ${i + 1} — ${f.name}\n    [\n${lines.join('\n')}\n    ]`;
+  });
+
+  const hex = fgColor.replace('#', '');
+  const rr = parseInt(hex.substr(0, 2), 16);
+  const gg = parseInt(hex.substr(2, 2), 16);
+  const bb = parseInt(hex.substr(4, 2), 16);
+  const charList = [...allUsed].join(' ');
+
+  $export.value =
+    `/// Animation frames for the mascot. Each frame is ${frames[0]?.rows || rows} rows × ${frames[0]?.cols || cols} cols.\n` +
+    `/// chars used: ${charList}  |  color: rgb(${rr}, ${gg}, ${bb})\n` +
+    `const FRAMES: [[&str; ${frames[0]?.rows || rows}]; ${frames.length}] = [\n` +
+    frameArrays.join(',\n') +
+    `\n];\n`;
+}
+
+function copyCode() {
+  $export.select();
+  navigator.clipboard?.writeText($export.value).catch(() => document.execCommand('copy'));
+  toast('Copied!');
+}
+document.getElementById('copyBtn').onclick = copyCode;
+
+function toast(msg, bg) {
+  $toast.textContent = msg;
+  if (bg) $toast.style.background = bg;
+  else $toast.style.background = '';
+  $toast.classList.add('show');
+  setTimeout(() => $toast.classList.remove('show'), 1500);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  COLOR PRESETS
+// ═══════════════════════════════════════════════════════════════════
+const PRESET_COLORS = [
+  '#00ff00', '#00ff88', '#44ff44', '#88ff00', // greens
+  '#ff4444', '#ff6600', '#ffaa00', '#ffff44', // reds/oranges
+  '#4488ff', '#00ccff', '#44ffcc', '#8888ff', // blues
+  '#ff44ff', '#ff88cc', '#cc44ff', '#ffffff', // purples/white
+];
+
+function initColorPresets() {
+  const container = document.getElementById('colorPresets');
+  PRESET_COLORS.forEach(hex => {
+    const swatch = document.createElement('div');
+    swatch.className = 'color-swatch' + (hex === '#00ff00' ? ' active' : '');
+    swatch.style.background = hex;
+    swatch.title = hex;
+    swatch.onclick = () => {
+      $color.value = hex;
+      $color.dispatchEvent(new Event('input'));
+      document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+    };
+    container.appendChild(swatch);
+  });
+
+  // Update active swatch when color picker changes
+  $color.addEventListener('input', () => {
+    document.querySelectorAll('.color-swatch').forEach(s => {
+      s.classList.toggle('active', s.title === $color.value);
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  IMPORT FRAME from Rust array code
+// ═══════════════════════════════════════════════════════════════════
+function parseFrameArray(text) {
+  // Extract quoted strings between [ and ] — handles the Rust array syntax
+  const lines = [];
+  const regex = /"([^"]*)"/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    lines.push(match[1]);
+  }
+  if (lines.length === 0) {
+    // Try splitting by newlines and looking for quoted strings
+    for (const line of text.split('\n')) {
+      const m = line.match(/"(.*)"/);
+      if (m) lines.push(m[1]);
+    }
+  }
+  if (lines.length === 0) return null;
+
+  const r = lines.length;
+  const c = Math.max(...lines.map(l => l.length));
+  const grid = lines.map(row => {
+    const chars = [];
+    for (let i = 0; i < c; i++) {
+      const ch = row[i] || ' ';
+      chars.push(ch === ' ' ? null : ch);
+    }
+    return chars;
+  });
+  return { rows: r, cols: c, grid };
+}
+
+function importLoad() {
+  const text = document.getElementById('importCode').value;
+  if (!text.trim()) { toast('Paste some frame code first!', '#ff4444'); return; }
+  const parsed = parseFrameArray(text);
+  if (!parsed) { toast('Could not parse frame data!', '#ff4444'); return; }
+  pushUndo();
+  frames[selectedIdx].grid = parsed.grid;
+  frames[selectedIdx].rows = parsed.rows;
+  frames[selectedIdx].cols = parsed.cols;
+  rows = parsed.rows;
+  cols = parsed.cols;
+  $rowsIn.value = rows;
+  $colsIn.value = cols;
+  grid = parsed.grid;
+  frames[selectedIdx].grid = grid;
+  renderGrid();
+  renderFrameStrip();
+  updateExport();
+  updateAnimPreview();
+  toast('Frame loaded!');
+  autoSave();
+}
+
+function importNew() {
+  const text = document.getElementById('importCode').value;
+  if (!text.trim()) { toast('Paste some frame code first!', '#ff4444'); return; }
+  const parsed = parseFrameArray(text);
+  if (!parsed) { toast('Could not parse frame data!', '#ff4444'); return; }
+  const newFrame = {
+    name: `Imported Frame ${frames.length + 1}`,
+    rows: parsed.rows,
+    cols: parsed.cols,
+    grid: deepCopyGrid(parsed.grid),
+  };
+  frames.push(newFrame);
+  selectFrame(frames.length - 1);
+  toast('Imported as new frame!');
+  autoSave();
+}
+
+// Import toggle
+let importVisible = true;
+document.getElementById('importToggleBtn').onclick = () => {
+  importVisible = !importVisible;
+  document.getElementById('importSection').style.display = importVisible ? 'block' : 'none';
+  document.getElementById('importToggleBtn').textContent = importVisible ? '▼' : '▶';
+};
+document.getElementById('importLoadBtn').onclick = importLoad;
+document.getElementById('importNewBtn').onclick = importNew;
+
+// ═══════════════════════════════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════════════════════════════
+function init() {
+  // Try restoring saved state, fall back to defaults
+  const restored = loadState();
+  if (!restored) {
+    frames = DEFAULT_FRAMES.map(f => ({
+      name: f.name,
+      rows: f.rows,
+      cols: f.cols,
+      grid: deepCopyGrid(f.grid).map(row => row.map(ch => ch === ' ' ? null : ch)),
+    }));
+    selectedIdx = 0;
+    grid = frames[0].grid;
+    rows = frames[0].rows;
+    cols = frames[0].cols;
+  } else {
+    $color.value = fgColor;
+    $bgColor.value = bgColor;
+    document.documentElement.style.setProperty('--accent', fgColor);
+    grid = frames[selectedIdx].grid;
+    rows = frames[selectedIdx].rows;
+    cols = frames[selectedIdx].cols;
+    $rowsIn.value = rows;
+    $colsIn.value = cols;
+    $speedLabel.textContent = (animSpeed / 1000).toFixed(1) + 's';
+    $color.dispatchEvent(new Event('input'));
+  }
+
+  renderFrameStrip();
+  loadActiveGrid();
+  updateAnimPreview();
+  initColorPresets();
+  $editLabel.textContent = `Editing: ${frames[selectedIdx].name} (Frame ${selectedIdx + 1})`;
+
+  // Start animation by default
+  setTimeout(() => { animFrameIdx = 0; startAnim(); }, 500);
+}
+
+init();
+</script>
+</body>
+</html>

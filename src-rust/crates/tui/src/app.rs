@@ -88,6 +88,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("mcp", "Browse configured MCP servers"),
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
+    ("models", "Browse free upstream models"),
     (
         "move",
         "Re-home this session to another worktree of the same project",
@@ -135,7 +136,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 
 fn help_command_category(name: &str) -> &'static str {
     match name {
-        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => {
+        "connect" | "model" | "models" | "providers" | "refresh" | "fast" | "effort" | "voice" => {
             "Model & Provider"
         }
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => {
@@ -213,6 +214,8 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "upstage" => "UPSTAGE_API_KEY",
         "stepfun" => "STEPFUN_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
+        "cline" => "CLINE_API_KEY",
+        "github-models" => "GITHUB_TOKEN",
         _ => "API_KEY",
     }
 }
@@ -243,6 +246,8 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "nvidia" => "build.nvidia.com",
         "venice" => "venice.ai/settings/api",
         "zai" => "z.ai/manage-apikey/apikey-list",
+        "cline" => "app.cline.bot/settings",
+        "github-models" => "github.com/settings/tokens",
         _ => "the provider's website",
     }
 }
@@ -400,6 +405,13 @@ fn provider_picker_items() -> Vec<SelectItem> {
             description: "Hosted open weights - energy-efficient".into(),
             category: "Popular".into(),
             badge: None,
+        },
+        SelectItem {
+            id: "cline".into(),
+            title: "Cline".into(),
+            description: "Free rotating model pool via API key".into(),
+            category: "Popular".into(),
+            badge: Some("FREE".into()),
         },
         SelectItem {
             id: "cerebras".into(),
@@ -1470,7 +1482,19 @@ pub struct App {
     pub status_line_override: Option<String>,
     /// Callback for argument-level slash-command completions.
     /// Set by the CLI entry-point to avoid a circular dep on clawde-commands.
-    pub arg_completions: Option<std::sync::Arc<dyn Fn(&str, &str) -> Vec<crate::prompt_input::TypeaheadSuggestion> + Send + Sync>>,
+    /// Callback for computing key health rows for the /ctx-viz overlay.
+    /// Set once at startup from the CLI layer; polled each render frame.
+    pub key_ring_data_fn:
+        Option<std::sync::Arc<dyn Fn() -> Vec<crate::context_viz::KeyRingRow> + Send + Sync>>,
+    /// Auto-detected free model defaults, computed once at startup.
+    /// Each entry is `(upstream_title, effective_model_id)` for a
+    /// configured upstream in the free-mode fallback chain.
+    pub free_model_defaults: Vec<(String, String)>,
+    pub arg_completions: Option<
+        std::sync::Arc<
+            dyn Fn(&str, &str) -> Vec<crate::prompt_input::TypeaheadSuggestion> + Send + Sync,
+        >,
+    >,
     /// Whether auto-compact is enabled (from settings).
     pub auto_compact_enabled: bool,
     /// Context threshold (0-100) at which to auto-compact.
@@ -1506,10 +1530,17 @@ pub struct App {
     pub context_window_size: u64,
     /// How many tokens are currently used in the context window.
     pub context_used_tokens: u64,
-    /// Rate limit info — 5-hour window usage percentage (0–100).
+    /// Anthropic footer rate limit — 5-hour token usage (0.0–1.0).
+    /// Populated from Anthropic API headers. Rendered in the status bar.
+    /// (See provider_http_rates for the /ctx-viz key health table.)
     pub rate_limit_5h_pct: Option<f32>,
-    /// Rate limit info — 7-day window usage percentage (0–100).
+    /// Anthropic footer rate limit — 7-day request usage (0.0–1.0).
+    /// Populated from Anthropic API headers. Rendered in the status bar.
+    /// (See provider_http_rates for the /ctx-viz key health table.)
     pub rate_limit_7day_pct: Option<f32>,
+    /// Per-provider HTTP rate limit percentages from the most recent response.
+    /// Keyed by provider id (e.g. "anthropic", "groq").
+    pub provider_http_rates: std::collections::HashMap<String, (f32, f32)>,
     /// Active worktree name (if in a worktree).
     pub worktree_name: Option<String>,
     /// Active worktree branch (if in a worktree).
@@ -1809,6 +1840,8 @@ impl App {
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
+            key_ring_data_fn: None,
+            free_model_defaults: Vec::new(),
             arg_completions: None,
             auto_compact_enabled: false,
             auto_compact_threshold: 95,
@@ -1849,6 +1882,7 @@ impl App {
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
             rate_limit_7day_pct: None,
+            provider_http_rates: std::collections::HashMap::new(),
             worktree_name: None,
             worktree_branch: None,
             agent_type_badge: None,
@@ -2245,9 +2279,7 @@ impl App {
             let anim_frame = crate::rustle::loading_frame_for_elapsed(
                 self.session_start.elapsed().as_millis() as u64,
             );
-            self.rustle_current_pose = crate::rustle::RustlePose::Loading {
-                frame: anim_frame,
-            };
+            self.rustle_current_pose = crate::rustle::RustlePose::Loading { frame: anim_frame };
         } else {
             self.rustle_current_pose = crate::rustle::RustlePose::Default;
         }
@@ -2455,6 +2487,15 @@ impl App {
                 self.open_model_picker_for_provider(&provider, None);
                 true
             }
+            "models" => {
+                self.open_model_picker_for_provider("free", Some("Free models".to_string()));
+                // Free models are hardcoded in free_provider_models() —
+                // not fetched from a live endpoint, so clear loading state.
+                self.model_picker.loading_models = false;
+                self.model_picker.models_loaded = true;
+                self.model_picker_fetch_pending = false;
+                true
+            }
             "session" | "resume" => {
                 self.session_browser.open(vec![]);
                 self.session_list_pending = true;
@@ -2630,7 +2671,7 @@ impl App {
                 self.export_dialog.open();
                 true
             }
-            "context" => {
+            "context" | "ctx-viz" | "ctx" | "context-visualizer" => {
                 self.context_viz.toggle();
                 true
             }
@@ -6092,22 +6133,34 @@ impl App {
     fn get_active_popup_rect(&self) -> Option<ratatui::layout::Rect> {
         if self.key_input_dialog.visible {
             let r = self.key_input_dialog.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.device_auth_dialog.visible {
             let r = self.device_auth_dialog.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.custom_provider_dialog.visible {
             let r = self.custom_provider_dialog.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.free_mode_dialog.visible {
             let r = self.free_mode_dialog.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.elicitation.visible {
             let r = self.elicitation.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.ask_user_dialog.visible {
             let r = self.ask_user_dialog.last_rect.get();
-            if r.area() > 0 { return Some(r); }
+            if r.area() > 0 {
+                return Some(r);
+            }
         }
         None
     }
@@ -6636,10 +6689,9 @@ impl App {
                             && mouse_event.column >= input_area.x
                             && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                        let outside_dialog = self.get_active_popup_rect()
-                            .map_or(false, |rect| {
-                                !Self::point_in_rect(mouse_event.column, mouse_event.row, rect)
-                            });
+                        let outside_dialog = self.get_active_popup_rect().map_or(false, |rect| {
+                            !Self::point_in_rect(mouse_event.column, mouse_event.row, rect)
+                        });
 
                         if outside_dialog || in_input {
                             self.close_secondary_views();
@@ -6691,7 +6743,8 @@ impl App {
                     } else if self.diff_viewer.visible {
                         self.diff_viewer.scroll_detail_down();
                     } else if self.help_overlay.visible {
-                        self.help_overlay.scroll_down(self.help_overlay.scroll_offset.saturating_add(50));
+                        self.help_overlay
+                            .scroll_down(self.help_overlay.scroll_offset.saturating_add(50));
                     }
                 }
                 _ => {}
@@ -7155,6 +7208,17 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            QueryEvent::RateLimitUpdate {
+                provider_id,
+                tokens_pct_used,
+                requests_pct_used,
+            } => {
+                self.rate_limit_5h_pct = Some(tokens_pct_used);
+                self.rate_limit_7day_pct = Some(requests_pct_used);
+                // Store per-provider for the /ctx-viz key health table.
+                self.provider_http_rates
+                    .insert(provider_id, (tokens_pct_used, requests_pct_used));
             }
         }
 

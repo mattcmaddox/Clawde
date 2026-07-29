@@ -4,7 +4,7 @@
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tracing::debug;
 
 pub struct FileEditTool;
@@ -21,10 +21,12 @@ struct FileEditInput {
 #[async_trait]
 impl Tool for FileEditTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_FILE_EDIT
+        clawde_core::constants::TOOL_NAME_FILE_EDIT
     }
 
     fn description(&self) -> &str {
@@ -228,5 +230,145 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, "line one\nLINE TWO\nline three\n");
         assert!(!after.contains('\r'), "LF file gained a CR: {:?}", after);
+    }
+
+    #[tokio::test]
+    async fn edit_basic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        std::fs::write(&path, "before\nhello world\nafter\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "hello world",
+                    "new_string": "goodbye moon",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "before\ngoodbye moon\nafter\n");
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace_all.txt");
+        std::fs::write(&path, "foo\nbar\nfoo\nbar\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "foo",
+                    "new_string": "baz",
+                    "replace_all": true,
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "baz\nbar\nbaz\nbar\n");
+    }
+
+    #[tokio::test]
+    async fn edit_fails_when_old_string_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notfound.txt");
+        std::fs::write(&path, "existing content\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "this does not exist",
+                    "new_string": "replacement",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "expected error for missing old_string");
+        assert!(res.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn edit_fails_on_duplicate_without_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.txt");
+        std::fs::write(&path, "repeat\nrepeat\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "repeat",
+                    "new_string": "unique",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "expected error for duplicate old_string");
+        assert!(res.content.contains("appears"));
+    }
+
+    #[tokio::test]
+    async fn edit_fails_when_old_equals_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        std::fs::write(&path, "content\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "same",
+                    "new_string": "same",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "expected error for identical strings");
+    }
+
+    #[tokio::test]
+    async fn edit_fails_on_empty_old_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_old.txt");
+        std::fs::write(&path, "content\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": "",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "expected error for empty old_string");
+    }
+
+    #[tokio::test]
+    async fn edit_invalid_input_missing_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileEditTool
+            .execute(json!({"file_path": "some/path"}), &ctx)
+            .await;
+        assert!(res.is_error, "expected error for missing fields");
+        assert!(res.content.contains("Invalid input"));
     }
 }

@@ -208,7 +208,7 @@ pub async fn marketplace_update(name: &str) -> Result<Option<String>, String> {
 
 /// List all installed plugins.
 pub fn list_installed() -> Vec<InstalledPlugin> {
-    let plugins_dir = claurst_core::config::Settings::config_dir().join("plugins");
+    let plugins_dir = clawde_core::config::Settings::config_dir().join("plugins");
 
     let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
         return Vec::new();
@@ -228,8 +228,8 @@ pub fn list_installed() -> Vec<InstalledPlugin> {
 
             let (version, description) = if yaml_path.exists() {
                 let content = std::fs::read_to_string(&yaml_path).unwrap_or_default();
-                let version = extract_yaml_str(&content, "version")
-                    .unwrap_or_else(|| "0.0.0".to_string());
+                let version =
+                    extract_yaml_str(&content, "version").unwrap_or_else(|| "0.0.0".to_string());
                 let description = extract_yaml_str(&content, "description").unwrap_or_default();
                 (version, description)
             } else if json_path.exists() {
@@ -266,7 +266,7 @@ pub fn marketplace_uninstall(name: &str) -> Result<(), String> {
 }
 
 fn plugin_install_dir(name: &str) -> std::path::PathBuf {
-    claurst_core::config::Settings::config_dir()
+    clawde_core::config::Settings::config_dir()
         .join("plugins")
         .join(name)
 }
@@ -274,12 +274,7 @@ fn plugin_install_dir(name: &str) -> std::path::PathBuf {
 fn extract_yaml_str(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix(&format!("{key}:")) {
-            return Some(
-                rest.trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
+            return Some(rest.trim().trim_matches('"').trim_matches('\'').to_string());
         }
     }
     None

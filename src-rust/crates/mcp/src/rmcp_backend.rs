@@ -1,17 +1,17 @@
 use crate::backend::{McpBackendKind, McpClientBackend, McpClientSnapshot};
 use crate::transport;
 use crate::types::{
-    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptArgument,
-    McpResource, McpTool, PromptMessage, PromptMessageContent, PromptsCapability,
-    ResourceContents, ResourcesCapability, ServerCapabilities, ServerInfo, ToolsCapability,
+    CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptArgument, McpResource,
+    McpTool, PromptMessage, PromptMessageContent, PromptsCapability, ResourceContents,
+    ResourcesCapability, ServerCapabilities, ServerInfo, ToolsCapability,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use rmcp::model as rmcp_model;
 use rmcp::service::RunningService;
 use rmcp::transport::{
-    ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
-    streamable_http_client::StreamableHttpClientTransportConfig,
+    streamable_http_client::StreamableHttpClientTransportConfig, ConfigureCommandExt,
+    StreamableHttpClientTransport, TokioChildProcess,
 };
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use serde_json::{json, Value};
@@ -73,10 +73,7 @@ impl ClientHandler for RmcpNotificationClient {
         self.send_notification("notifications/resources/list_changed", Some(json!({})));
     }
 
-    async fn on_tool_list_changed(
-        &self,
-        _context: rmcp::service::NotificationContext<RoleClient>,
-    ) {
+    async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
         self.send_notification("notifications/tools/list_changed", Some(json!({})));
     }
 
@@ -102,25 +99,30 @@ pub struct RmcpClientBackend {
 
 impl RmcpClientBackend {
     pub async fn connect_stdio(
-        config: &claurst_core::config::McpServerConfig,
+        config: &clawde_core::config::McpServerConfig,
     ) -> anyhow::Result<Self> {
-        let command = config
-            .command
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no command configured", config.name))?;
+        let command = config.command.clone().ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' has no command configured", config.name)
+        })?;
 
         let transport = TokioChildProcess::new(Command::new(&command).configure(|cmd| {
             cmd.args(&config.args);
             cmd.envs(&config.env);
         }))
-        .map_err(|e| anyhow::anyhow!("failed to spawn rmcp stdio child for '{}': {}", config.name, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn rmcp stdio child for '{}': {}",
+                config.name,
+                e
+            )
+        })?;
 
         let client_info = build_client_info(rmcp_model::ProtocolVersion::default());
         Self::connect_with_transport(config, transport, client_info, "stdio").await
     }
 
     pub async fn connect_http(
-        config: &claurst_core::config::McpServerConfig,
+        config: &clawde_core::config::McpServerConfig,
         auth_token: Option<String>,
         protocol_version: rmcp_model::ProtocolVersion,
     ) -> anyhow::Result<Self> {
@@ -140,7 +142,7 @@ impl RmcpClientBackend {
     }
 
     pub async fn connect_legacy_sse(
-        config: &claurst_core::config::McpServerConfig,
+        config: &clawde_core::config::McpServerConfig,
         auth_token: Option<String>,
     ) -> anyhow::Result<Self> {
         // Legacy SSE servers still expose the real POST endpoint via
@@ -152,7 +154,7 @@ impl RmcpClientBackend {
     }
 
     async fn connect_with_transport<T, E, A>(
-        config: &claurst_core::config::McpServerConfig,
+        config: &clawde_core::config::McpServerConfig,
         transport: T,
         client_info: rmcp_model::ClientInfo,
         transport_label: &str,
@@ -191,8 +193,8 @@ fn build_client_info(protocol_version: rmcp_model::ProtocolVersion) -> rmcp_mode
         list_changed: Some(false),
     });
     client_info.client_info = rmcp_model::Implementation::new(
-        claurst_core::constants::APP_NAME,
-        claurst_core::constants::APP_VERSION,
+        clawde_core::constants::APP_NAME,
+        clawde_core::constants::APP_VERSION,
     );
     client_info
 }
@@ -216,7 +218,7 @@ struct LegacySseRmcpTransport {
 
 impl LegacySseRmcpTransport {
     async fn connect(
-        config: &claurst_core::config::McpServerConfig,
+        config: &clawde_core::config::McpServerConfig,
         auth_token: Option<String>,
     ) -> anyhow::Result<Self> {
         let sse_url = config
@@ -281,7 +283,8 @@ impl LegacySseRmcpTransport {
             let result = transport::process_sse_response(response, |event, data| {
                 if matches!(event, Some("endpoint")) {
                     let endpoint = transport::resolve_legacy_endpoint(&sse_url, data)?;
-                    *post_endpoint.lock().expect("endpoint mutex poisoned") = Some(endpoint.clone());
+                    *post_endpoint.lock().expect("endpoint mutex poisoned") =
+                        Some(endpoint.clone());
                     if let Some(tx) = endpoint_tx_for_task
                         .lock()
                         .expect("endpoint sender mutex poisoned")
@@ -321,7 +324,10 @@ impl LegacySseRmcpTransport {
                 )));
             }
         });
-        self.background_tasks.lock().expect("task mutex poisoned").push(task);
+        self.background_tasks
+            .lock()
+            .expect("task mutex poisoned")
+            .push(task);
 
         let endpoint = tokio::time::timeout(std::time::Duration::from_secs(10), endpoint_rx)
             .await
@@ -406,7 +412,8 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
 
     fn receive(
         &mut self,
-    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<RoleClient>>> + Send {
+    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<RoleClient>>> + Send
+    {
         let incoming_rx = Arc::clone(&self.incoming_rx);
         async move {
             let mut rx = incoming_rx.lock().await;
@@ -476,7 +483,10 @@ async fn handle_legacy_sse_http_response(
                 tracing::warn!(server = %server_name_for_task, error = %e, "legacy SSE POST stream closed with error");
             }
         });
-        background_tasks.lock().expect("task mutex poisoned").push(task);
+        background_tasks
+            .lock()
+            .expect("task mutex poisoned")
+            .push(task);
         return Ok(());
     }
 
@@ -547,11 +557,10 @@ impl McpClientBackend for RmcpClientBackend {
             .read_resource(rmcp_model::ReadResourceRequestParams::new(uri.to_string()))
             .await
             .map_err(|e| anyhow::anyhow!("rmcp read_resource '{}' failed: {}", uri, e))?;
-        let first = result
-            .contents
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("rmcp read_resource '{}' returned no contents", uri))?;
+        let first =
+            result.contents.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("rmcp read_resource '{}' returned no contents", uri)
+            })?;
         Ok(convert_resource_contents(first))
     }
 
@@ -623,19 +632,19 @@ impl McpClientBackend for RmcpClientBackend {
 }
 
 async fn build_snapshot(
-    config: &claurst_core::config::McpServerConfig,
+    config: &clawde_core::config::McpServerConfig,
     peer: &rmcp::Peer<RoleClient>,
 ) -> anyhow::Result<McpClientSnapshot> {
-    let server_info = peer.peer_info().cloned();
+    let server_info = peer.peer_info().as_ref().cloned();
 
     let (server_info_value, capabilities, instructions) = match server_info {
         Some(info) => (
             Some(ServerInfo {
-                name: info.server_info.name,
-                version: info.server_info.version,
+                name: info.server_info.name.clone(),
+                version: info.server_info.version.clone(),
             }),
-            convert_server_capabilities(info.capabilities),
-            info.instructions,
+            convert_server_capabilities(info.capabilities.clone()),
+            info.instructions.clone(),
         ),
         None => (None, ServerCapabilities::default(), None),
     };
@@ -833,7 +842,6 @@ fn convert_content(content: rmcp_model::Content) -> McpContent {
     }
 }
 
-
 fn json_value_to_object(value: Value) -> anyhow::Result<rmcp_model::JsonObject> {
     match value {
         Value::Object(map) => Ok(map),
@@ -847,10 +855,10 @@ fn json_value_to_object(value: Value) -> anyhow::Result<rmcp_model::JsonObject> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::config::McpServerConfig;
+    use clawde_core::config::McpServerConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     fn test_sse_config(url: String) -> McpServerConfig {
         McpServerConfig {
@@ -864,11 +872,7 @@ mod tests {
         }
     }
 
-    async fn serve_single_response(
-        status_line: &str,
-        content_type: &str,
-        body: &str,
-    ) -> String {
+    async fn serve_single_response(status_line: &str, content_type: &str, body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -890,7 +894,11 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn fetch_response(status_line: &str, content_type: &str, body: &str) -> reqwest::Response {
+    async fn fetch_response(
+        status_line: &str,
+        content_type: &str,
+        body: &str,
+    ) -> reqwest::Response {
         let url = serve_single_response(status_line, content_type, body).await;
         reqwest::Client::new()
             .get(url)
@@ -902,9 +910,15 @@ mod tests {
     #[test]
     fn build_client_info_sets_expected_protocol_and_identity() {
         let info = build_client_info(rmcp_model::ProtocolVersion::V_2024_11_05);
-        assert_eq!(info.protocol_version, rmcp_model::ProtocolVersion::V_2024_11_05);
-        assert_eq!(info.client_info.name, claurst_core::constants::APP_NAME);
-        assert_eq!(info.client_info.version, claurst_core::constants::APP_VERSION);
+        assert_eq!(
+            info.protocol_version,
+            rmcp_model::ProtocolVersion::V_2024_11_05
+        );
+        assert_eq!(info.client_info.name, clawde_core::constants::APP_NAME);
+        assert_eq!(
+            info.client_info.version,
+            clawde_core::constants::APP_VERSION
+        );
         assert_eq!(
             info.capabilities
                 .roots
@@ -952,7 +966,10 @@ mod tests {
             .await
             .expect("json response timeout")
             .expect("json response message");
-        assert!(matches!(message, rmcp::service::RxJsonRpcMessage::<RoleClient>::Response(_)));
+        assert!(matches!(
+            message,
+            rmcp::service::RxJsonRpcMessage::<RoleClient>::Response(_)
+        ));
     }
 
     #[tokio::test]
@@ -974,7 +991,10 @@ mod tests {
             .await
             .expect("sse response timeout")
             .expect("sse response message");
-        assert!(matches!(message, rmcp::service::RxJsonRpcMessage::<RoleClient>::Response(_)));
+        assert!(matches!(
+            message,
+            rmcp::service::RxJsonRpcMessage::<RoleClient>::Response(_)
+        ));
     }
 
     #[tokio::test]

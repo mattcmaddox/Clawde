@@ -8,7 +8,7 @@ pub struct PostSamplingHookResult {
     /// Error messages produced by hooks with non-zero exit codes.
     /// These are injected into the conversation as user messages before the
     /// next model turn so the model can react to them.
-    pub blocking_errors: Vec<claurst_core::types::Message>,
+    pub blocking_errors: Vec<clawde_core::types::Message>,
     /// When `true` the query loop must not continue and should surface the
     /// error messages to the caller.  Set when any hook exits with code > 1.
     pub prevent_continuation: bool,
@@ -22,11 +22,11 @@ pub struct PostSamplingHookResult {
 /// If the exit code is **strictly greater than 1** `prevent_continuation` is
 /// set so the query loop can return early.
 pub fn fire_post_sampling_hooks(
-    _turn_result: &claurst_core::types::Message,
-    config: &claurst_core::config::Config,
+    _turn_result: &clawde_core::types::Message,
+    config: &clawde_core::config::Config,
 ) -> PostSamplingHookResult {
-    use claurst_core::config::HookEvent;
-    use claurst_core::types::Message;
+    use clawde_core::config::HookEvent;
+    use clawde_core::types::Message;
 
     let mut result = PostSamplingHookResult::default();
 
@@ -59,7 +59,11 @@ pub fn fire_post_sampling_hooks(
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let body = if !stderr.trim().is_empty() { stderr } else { stdout };
+        let body = if !stderr.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
 
         tracing::warn!(
             command = %entry.command,
@@ -87,11 +91,11 @@ pub fn fire_post_sampling_hooks(
 /// Stop hooks are non-blocking by design: the caller does not wait for them.
 /// Returns an empty `Vec` immediately; results (if any) are lost.
 pub fn stop_hooks_with_full_behavior(
-    turn_result: &claurst_core::types::Message,
-    config: &claurst_core::config::Config,
+    turn_result: &clawde_core::types::Message,
+    config: &clawde_core::config::Config,
     working_dir: std::path::PathBuf,
-) -> Vec<claurst_core::types::Message> {
-    use claurst_core::config::HookEvent;
+) -> Vec<clawde_core::types::Message> {
+    use clawde_core::config::HookEvent;
 
     let entries = match config.hooks.get(&HookEvent::Stop) {
         Some(e) if !e.is_empty() => e.clone(),

@@ -150,14 +150,19 @@ mod tests {
 
     #[test]
     fn html_escape_handles_specials() {
-        assert_eq!(html_escape("<a href=\"x\">&amp;</a>"),
-                   "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;");
+        assert_eq!(
+            html_escape("<a href=\"x\">&amp;</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;"
+        );
     }
 
     // Both viewer-url scenarios live in one test because they manipulate a
     // process-wide env var; running them in parallel would race.
     #[test]
     fn viewer_url_default_and_override() {
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_SHARE_VIEWER_URL);
         assert_eq!(
             share_viewer_url("deadbeef"),

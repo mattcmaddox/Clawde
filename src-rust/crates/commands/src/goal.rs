@@ -36,11 +36,31 @@ impl SlashCommand for GoalCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "status".into(), description: "Show current goal status".into(), available: true },
-            ArgCompletion { value: "pause".into(), description: "Pause the active goal".into(), available: true },
-            ArgCompletion { value: "resume".into(), description: "Resume a paused goal".into(), available: true },
-            ArgCompletion { value: "clear".into(), description: "Delete the current goal".into(), available: true },
-            ArgCompletion { value: "complete".into(), description: "Request a completion audit".into(), available: true },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show current goal status".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "pause".into(),
+                description: "Pause the active goal".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "resume".into(),
+                description: "Resume a paused goal".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "clear".into(),
+                description: "Delete the current goal".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "complete".into(),
+                description: "Request a completion audit".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

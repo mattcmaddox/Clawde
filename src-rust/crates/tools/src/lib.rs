@@ -1,4 +1,4 @@
-// claurst-tools: All tool implementations for Claurst.
+// clawde-tools: All tool implementations for Claurst.
 //
 // Each tool maps to a capability the LLM can invoke: running shell commands,
 // reading/writing/editing files, searching codebases, fetching web pages, etc.
@@ -8,10 +8,10 @@
 #![allow(clippy::type_complexity)]
 
 use async_trait::async_trait;
-use claurst_core::config::PermissionMode;
-use claurst_core::cost::CostTracker;
-use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
-use claurst_core::types::ToolDefinition;
+use clawde_core::config::PermissionMode;
+use clawde_core::cost::CostTracker;
+use clawde_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+use clawde_core::types::ToolDefinition;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -19,84 +19,87 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Sub-modules – each contains a full tool implementation.
+pub mod apply_patch;
 pub mod ask_user;
-pub mod pty_bash;
+pub mod batch_edit;
 pub mod brief;
+pub mod bundled_skills;
+pub mod computer_use;
 pub mod config_tool;
 pub mod cron;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
-pub mod apply_patch;
-pub mod batch_edit;
 pub mod file_edit;
-pub mod line_endings;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
+pub mod formatter;
 pub mod glob_tool;
+pub mod goal_complete;
 pub mod grep_tool;
+pub mod line_endings;
 pub mod lsp_tool;
+pub mod mcp_auth_tool;
 pub mod mcp_resources;
-pub mod todo_write;
+pub mod monitor_tool;
 pub mod notebook_edit;
 pub mod powershell;
+pub mod pty_bash;
+pub mod remote_trigger;
+pub mod repl_tool;
 pub mod send_message;
-pub mod bundled_skills;
 pub mod skill_tool;
 pub mod sleep;
+pub mod synthetic_output;
 pub mod tasks;
+pub mod team_tool;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod todo_write;
 pub mod tool_search;
 pub mod web_fetch;
 pub mod web_search;
 pub mod worktree;
-pub mod computer_use;
-pub mod mcp_auth_tool;
-pub mod repl_tool;
-pub mod synthetic_output;
-pub mod team_tool;
-pub mod remote_trigger;
-pub mod formatter;
-pub mod monitor_tool;
-pub mod goal_complete;
 
 // Re-exports for convenience.
-pub use formatter::try_format_file;
+pub use apply_patch::ApplyPatchTool;
 pub use ask_user::AskUserQuestionTool;
-pub use pty_bash::PtyBashTool;
+pub use batch_edit::BatchEditTool;
 pub use brief::BriefTool;
+pub use computer_use::ComputerUseTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use exit_plan_mode::ExitPlanModeTool;
-pub use apply_patch::ApplyPatchTool;
-pub use batch_edit::BatchEditTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use formatter::try_format_file;
 pub use glob_tool::GlobTool;
+pub use goal_complete::GoalCompleteTool;
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
+pub use mcp_auth_tool::McpAuthTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
-pub use todo_write::TodoWriteTool;
+pub use monitor_tool::MonitorTool;
 pub use notebook_edit::NotebookEditTool;
 pub use powershell::PowerShellTool;
-pub use send_message::{SendMessageTool, drain_inbox, peek_inbox};
+pub use pty_bash::PtyBashTool;
+pub use remote_trigger::RemoteTriggerTool;
+pub use repl_tool::ReplTool;
+pub use send_message::{drain_inbox, peek_inbox, SendMessageTool};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
-pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, Task, TaskStatus, TASK_STORE};
+pub use synthetic_output::SyntheticOutputTool;
+pub use tasks::{
+    Task, TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStatus, TaskStopTool,
+    TaskUpdateTool, TASK_STORE,
+};
+pub use team_tool::{register_agent_runner, AgentRunFn, TeamCreateTool, TeamDeleteTool};
+pub use todo_write::TodoWriteTool;
 pub use tool_search::ToolSearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use worktree::{EnterWorktreeTool, ExitWorktreeTool};
-pub use computer_use::ComputerUseTool;
-pub use mcp_auth_tool::McpAuthTool;
-pub use repl_tool::ReplTool;
-pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
-pub use remote_trigger::RemoteTriggerTool;
-pub use monitor_tool::MonitorTool;
-pub use goal_complete::GoalCompleteTool;
 
 // ---------------------------------------------------------------------------
 // AskUser question channel
@@ -174,7 +177,7 @@ pub enum PermissionLevel {
 #[derive(Debug)]
 pub struct PendingPermissionRequest {
     pub tool_use_id: String,
-    pub request: claurst_core::permissions::PermissionRequest,
+    pub request: clawde_core::permissions::PermissionRequest,
     pub reason: String,
     pub decision_tx: Option<tokio::sync::oneshot::Sender<PermissionDecision>>,
 }
@@ -209,8 +212,9 @@ impl ShellState {
 /// Process-global registry of shell states keyed by session_id.
 /// This lets us persist cwd/env across Bash invocations without changing
 /// the `ToolContext` struct (which is constructed in places we cannot modify).
-static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<ShellState>>>> =
-    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<
+    dashmap::DashMap<String, Arc<parking_lot::Mutex<ShellState>>>,
+> = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
 /// Return the persistent `ShellState` for the given session, creating one if needed.
 pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellState>> {
@@ -227,27 +231,26 @@ pub fn clear_session_shell_state(session_id: &str) {
 
 /// Return the `ShadowSnapshot` for `working_dir`, creating it on first call.
 /// Returns `None` when git is unavailable or the directory is not in a git repo.
-pub fn session_shadow(working_dir: &std::path::Path) -> Option<Arc<claurst_core::snapshot::ShadowSnapshot>> {
-    claurst_core::snapshot::get_or_create(working_dir)
+pub fn session_shadow(
+    working_dir: &std::path::Path,
+) -> Option<Arc<clawde_core::snapshot::ShadowSnapshot>> {
+    clawde_core::snapshot::get_or_create(working_dir)
 }
 
 /// Drop the cached shadow snapshot for `working_dir` (e.g. when a session ends).
 pub fn clear_session_shadow(working_dir: &std::path::Path) {
-    claurst_core::snapshot::remove(working_dir);
+    clawde_core::snapshot::remove(working_dir);
 }
 
 /// Write `contents` to `path` atomically: write to a temp file in the same
 /// directory, then rename over the destination. A crash or disk-full mid-write
 /// can never leave the destination truncated or half-written.
-pub(crate) async fn write_atomic(
-    path: &std::path::Path,
-    contents: &[u8],
-) -> std::io::Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{}.claurst-tmp-{}", file_name, std::process::id()));
+    let tmp = path.with_file_name(format!(".{}.clawde-tmp-{}", file_name, std::process::id()));
 
     tokio::fs::write(&tmp, contents).await?;
     // Preserve the original file's permissions (e.g. the executable bit on
@@ -263,7 +266,6 @@ pub(crate) async fn write_atomic(
         }
     }
 }
-
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
 /// Used by background tasks with `notify_on_complete` to signal completion without polling.
@@ -287,23 +289,24 @@ pub struct ToolContext {
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
     pub session_id: String,
-    pub file_history: Arc<parking_lot::Mutex<claurst_core::file_history::FileHistory>>,
+    pub file_history: Arc<parking_lot::Mutex<clawde_core::file_history::FileHistory>>,
     pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
     pub non_interactive: bool,
     /// Optional MCP manager for ListMcpResources / ReadMcpResource tools.
-    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
-    pub config: claurst_core::config::Config,
+    pub config: clawde_core::config::Config,
     /// Managed agent (manager-executor) configuration, if active.
-    pub managed_agent_config: Option<claurst_core::config::ManagedAgentConfig>,
+    pub managed_agent_config: Option<clawde_core::config::ManagedAgentConfig>,
     /// Optional notifier for injecting completion messages into the next agent turn.
     /// Set when the query loop has a command queue wired up.
     pub completion_notifier: Option<CompletionNotifier>,
     /// Queue used by interactive mode to surface permission dialogs to the TUI.
     pub pending_permissions: Option<Arc<parking_lot::Mutex<PendingPermissionStore>>>,
     /// Shared permission manager so the interactive loop can record session/persistent approvals.
-    pub permission_manager: Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
+    pub permission_manager:
+        Option<Arc<std::sync::Mutex<clawde_core::permissions::PermissionManager>>>,
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
@@ -355,21 +358,21 @@ impl ToolContext {
     fn request_permission_inner(
         &self,
         request: PermissionRequest,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
+    ) -> Result<(), clawde_core::error::ClaudeError> {
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
-            PermissionDecision::Ask { reason } if self.non_interactive => Err(
-                claurst_core::error::ClaudeError::PermissionDenied(format!(
+            PermissionDecision::Ask { reason } if self.non_interactive => {
+                Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
                     "Permission denied for tool '{}': {}",
                     request.tool_name,
                     interactive_reason.unwrap_or(reason)
-                )),
-            ),
+                )))
+            }
             PermissionDecision::Ask { reason } => {
                 let Some(queue) = &self.pending_permissions else {
-                    return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                    return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
                         "Permission denied for tool '{}'",
                         request.tool_name
                     )));
@@ -390,12 +393,12 @@ impl ToolContext {
                 let decision = tokio::task::block_in_place(|| rx.blocking_recv());
                 match decision {
                     Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => Ok(()),
-                    _ => Err(claurst_core::error::ClaudeError::PermissionDenied(
+                    _ => Err(clawde_core::error::ClaudeError::PermissionDenied(
                         "Permission denied by user".to_string(),
                     )),
                 }
             }
-            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+            _ => Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}'",
                 request.tool_name
             ))),
@@ -408,8 +411,9 @@ impl ToolContext {
         tool_name: &str,
         description: &str,
         is_read_only: bool,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
-        let request = self.build_permission_request(tool_name, description, None, is_read_only, None);
+    ) -> Result<(), clawde_core::error::ClaudeError> {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, None);
         self.request_permission_inner(request)
     }
 
@@ -419,8 +423,9 @@ impl ToolContext {
         description: &str,
         path: PathBuf,
         is_read_only: bool,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
-        let request = self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
+    ) -> Result<(), clawde_core::error::ClaudeError> {
+        let request =
+            self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
         self.request_permission_inner(request)
     }
 
@@ -432,7 +437,7 @@ impl ToolContext {
         description: &str,
         details: &str,
         is_read_only: bool,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
+    ) -> Result<(), clawde_core::error::ClaudeError> {
         let request = self.build_permission_request(
             tool_name,
             description,
@@ -441,7 +446,7 @@ impl ToolContext {
             None,
         );
         self.request_permission_inner(request).map_err(|_| {
-            claurst_core::error::ClaudeError::PermissionDenied(format!(
+            clawde_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}': {}",
                 tool_name, details
             ))
@@ -450,9 +455,9 @@ impl ToolContext {
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut roots = vec![
-            std::fs::canonicalize(&self.working_dir).unwrap_or_else(|_| self.working_dir.clone()),
-        ];
+        let mut roots =
+            vec![std::fs::canonicalize(&self.working_dir)
+                .unwrap_or_else(|_| self.working_dir.clone())];
         roots.extend(
             self.permission_allowed_roots()
                 .into_iter()
@@ -468,7 +473,7 @@ impl ToolContext {
         details: &str,
         path: PathBuf,
         is_read_only: bool,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
+    ) -> Result<(), clawde_core::error::ClaudeError> {
         let request = self.build_permission_request(
             tool_name,
             description,
@@ -477,7 +482,7 @@ impl ToolContext {
             Some(path),
         );
         self.request_permission_inner(request).map_err(|_| {
-            claurst_core::error::ClaudeError::PermissionDenied(format!(
+            clawde_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}': {}",
                 tool_name, details
             ))
@@ -508,7 +513,7 @@ impl ToolContext {
 /// The trait every tool must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Human-readable name (matches the constant in claurst_core::constants).
+    /// Human-readable name (matches the constant in clawde_core::constants).
     fn name(&self) -> &str;
 
     /// One-line description shown to the LLM.
@@ -633,37 +638,37 @@ mod tests {
         reason: String,
     }
 
-    impl claurst_core::permissions::PermissionHandler for AskPermissionHandler {
+    impl clawde_core::permissions::PermissionHandler for AskPermissionHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Ask {
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Ask {
                 reason: self.reason.clone(),
             }
         }
 
         fn request_permission(
             &self,
-            request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
             self.check_permission(request)
         }
     }
 
     fn test_tool_context(
-        handler: Arc<dyn claurst_core::permissions::PermissionHandler>,
+        handler: Arc<dyn clawde_core::permissions::PermissionHandler>,
     ) -> ToolContext {
-        use claurst_core::config::Config;
+        use clawde_core::config::Config;
 
         ToolContext {
             working_dir: PathBuf::from("/workspace"),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
@@ -683,7 +688,10 @@ mod tests {
     #[test]
     fn test_all_tools_non_empty() {
         let tools = all_tools();
-        assert!(!tools.is_empty(), "all_tools() must return at least one tool");
+        assert!(
+            !tools.is_empty(),
+            "all_tools() must return at least one tool"
+        );
     }
 
     #[test]
@@ -749,9 +757,16 @@ mod tests {
     #[test]
     fn test_core_tools_present() {
         let expected = [
-            "Bash", "Read", "Edit", "Write", "Glob", "Grep",
-            "WebFetch", "WebSearch",
-            "TodoWrite", "Skill",
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
+            "Skill",
         ];
         for name in &expected {
             assert!(
@@ -792,10 +807,10 @@ mod tests {
 
     #[test]
     fn test_resolve_path_absolute() {
-        use claurst_core::permissions::AutoPermissionHandler;
+        use clawde_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: claurst_core::config::PermissionMode::Default,
+            mode: clawde_core::config::PermissionMode::Default,
         });
         let ctx = test_tool_context(handler);
 
@@ -806,10 +821,10 @@ mod tests {
 
     #[test]
     fn test_resolve_path_relative() {
-        use claurst_core::permissions::AutoPermissionHandler;
+        use clawde_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: claurst_core::config::PermissionMode::Default,
+            mode: clawde_core::config::PermissionMode::Default,
         });
         let ctx = test_tool_context(handler);
 
@@ -831,7 +846,10 @@ mod tests {
             Some(PathBuf::from("Set-ExecutionPolicy RemoteSigned")),
         );
 
-        let error = ctx.request_permission_inner(request).unwrap_err().to_string();
+        let error = ctx
+            .request_permission_inner(request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("[High risk] This may modify system-wide security policy."));
         assert!(!error.contains("generic reason"));
     }
@@ -849,7 +867,10 @@ mod tests {
             Some(PathBuf::from("ls -la")),
         );
 
-        let error = ctx.request_permission_inner(request).unwrap_err().to_string();
+        let error = ctx
+            .request_permission_inner(request)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("generic reason"));
     }
 
@@ -900,16 +921,12 @@ mod tests {
     // its contract: it writes the exact bytes and never leaves a temp file
     // behind on success — the guarantee that makes those tools crash-safe.
 
-    /// Count the `.claurst-tmp-*` scratch files left in `dir`.
+    /// Count the `.clawde-tmp-*` scratch files left in `dir`.
     fn count_atomic_tmp_files(dir: &std::path::Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".claurst-tmp-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".clawde-tmp-"))
             .count()
     }
 
@@ -926,7 +943,11 @@ mod tests {
         // Overwrite an existing file (the crash-truncation scenario #226 fixes).
         write_atomic(&path, b"replaced").await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
-        assert_eq!(count_atomic_tmp_files(dir.path()), 0, "no tmp after overwrite");
+        assert_eq!(
+            count_atomic_tmp_files(dir.path()),
+            0,
+            "no tmp after overwrite"
+        );
     }
 
     /// The executable bit (and other permissions) must survive an atomic

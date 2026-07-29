@@ -358,13 +358,41 @@ impl SlashCommand for ChromeCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "connect".into(), description: "Connect to Chrome".into(), available: true },
-            ArgCompletion { value: "navigate".into(), description: "Navigate to a URL".into(), available: true },
-            ArgCompletion { value: "screenshot".into(), description: "Take a screenshot".into(), available: true },
-            ArgCompletion { value: "click".into(), description: "Click a CSS selector".into(), available: true },
-            ArgCompletion { value: "fill".into(), description: "Fill an input field".into(), available: true },
-            ArgCompletion { value: "eval".into(), description: "Evaluate JavaScript".into(), available: true },
-            ArgCompletion { value: "disconnect".into(), description: "Disconnect from Chrome".into(), available: true },
+            ArgCompletion {
+                value: "connect".into(),
+                description: "Connect to Chrome".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "navigate".into(),
+                description: "Navigate to a URL".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "screenshot".into(),
+                description: "Take a screenshot".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "click".into(),
+                description: "Click a CSS selector".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "fill".into(),
+                description: "Fill an input field".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "eval".into(),
+                description: "Evaluate JavaScript".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "disconnect".into(),
+                description: "Disconnect from Chrome".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

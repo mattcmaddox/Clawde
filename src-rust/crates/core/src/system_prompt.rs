@@ -5,8 +5,8 @@
 //! volatile, session-specific sections follow it.
 
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Dynamic boundary marker
@@ -47,7 +47,11 @@ pub struct SystemPromptSection {
 impl SystemPromptSection {
     /// Create a memoizable (cacheable) section.
     pub fn cached(tag: &'static str, content: impl Into<String>) -> Self {
-        Self { tag, content: Some(content.into()), cache_break: false }
+        Self {
+            tag,
+            content: Some(content.into()),
+            cache_break: false,
+        }
     }
 
     /// Create a volatile section that re-evaluates every turn.
@@ -97,9 +101,9 @@ impl OutputStyle {
                 "Be maximally concise. Skip preamble, summaries, and filler. \
                 Lead with the answer. One sentence is better than three.",
             ),
-            OutputStyle::Formal => Some(
-                "Maintain a formal, professional tone. Use precise technical language.",
-            ),
+            OutputStyle::Formal => {
+                Some("Maintain a formal, professional tone. Use precise technical language.")
+            }
             OutputStyle::Casual => Some("Use a casual, conversational tone."),
             OutputStyle::Default => None,
         }
@@ -174,15 +178,12 @@ impl SystemPromptPrefix {
     pub fn attribution_text(self) -> &'static str {
         match self {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
-                "You are Claurst, Anthropic's official CLI for Claude."
+                "You are Clawde, a CLI coding agent for software engineering tasks."
             }
             Self::SdkPreset => {
-                "You are Claurst, Anthropic's official CLI for Claude, \
-                running within the Claude Agent SDK."
+                "You are Clawde, a CLI coding agent running within the Agent SDK."
             }
-            Self::Sdk => {
-                "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-            }
+            Self::Sdk => "You are a coding agent built on the Agent SDK.",
         }
     }
 }
@@ -251,14 +252,9 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         }
     }
 
-    let prefix = opts
-        .prefix
-        .unwrap_or_else(|| {
-            SystemPromptPrefix::detect(
-                opts.is_non_interactive,
-                opts.has_append_system_prompt,
-            )
-        });
+    let prefix = opts.prefix.unwrap_or_else(|| {
+        SystemPromptPrefix::detect(opts.is_non_interactive, opts.has_append_system_prompt)
+    });
 
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
@@ -320,10 +316,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // 12. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
-        parts.push(format!(
-            "\n<memory>\n{}\n</memory>",
-            opts.memory_content
-        ));
+        parts.push(format!("\n<memory>\n{}\n</memory>", opts.memory_content));
     }
 
     // 13. Active goal addendum (dynamic — changes each session)
@@ -632,7 +625,10 @@ mod tests {
     #[test]
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
-        assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
+        assert!(
+            prompt.contains("Clawde"),
+            "Default prompt must contain attribution"
+        );
     }
 
     #[test]
@@ -722,14 +718,14 @@ mod tests {
     fn test_sdk_prefix_non_interactive_no_append() {
         let prefix = SystemPromptPrefix::detect(true, false);
         assert_eq!(prefix, SystemPromptPrefix::Sdk);
-        assert!(prefix.attribution_text().contains("Claude agent"));
+        assert!(prefix.attribution_text().contains("coding agent"));
     }
 
     #[test]
     fn test_sdk_preset_prefix_non_interactive_with_append() {
         let prefix = SystemPromptPrefix::detect(true, true);
         assert_eq!(prefix, SystemPromptPrefix::SdkPreset);
-        assert!(prefix.attribution_text().contains("Claude Agent SDK"));
+        assert!(prefix.attribution_text().contains("Agent SDK"));
     }
 
     #[test]

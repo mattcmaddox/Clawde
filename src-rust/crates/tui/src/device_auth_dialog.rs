@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::cell::Cell;
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
 
@@ -52,6 +53,8 @@ pub struct DeviceAuthDialogState {
     /// OAuth URL for browser-based flows (Codex). Shown in the dialog so the
     /// user can copy-paste it when automatic browser launch fails.
     pub auth_url: String,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
 }
 
 impl Default for DeviceAuthDialogState {
@@ -72,6 +75,7 @@ impl DeviceAuthDialogState {
             device_code: String::new(),
             interval: 5,
             auth_url: String::new(),
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -148,9 +152,7 @@ pub enum DeviceAuthEvent {
     },
     /// Browser-based OAuth URL is ready — display it so the user can open it
     /// manually if the automatic browser launch failed.
-    GotBrowserUrl {
-        url: String,
-    },
+    GotBrowserUrl { url: String },
     /// Access token obtained — auth succeeded.
     TokenReceived(String),
     /// Something went wrong.
@@ -163,11 +165,7 @@ pub enum DeviceAuthEvent {
 
 /// Render the device auth dialog overlay — OpenCode-style: dark overlay, no
 /// border, minimal and polished.
-pub fn render_device_auth_dialog(
-    frame: &mut Frame,
-    state: &DeviceAuthDialogState,
-    area: Rect,
-) {
+pub fn render_device_auth_dialog(frame: &mut Frame, state: &DeviceAuthDialogState, area: Rect) {
     if !state.visible {
         return;
     }
@@ -182,13 +180,17 @@ pub fn render_device_auth_dialog(
 
     // ── Dialog size — taller when showing a browser URL ──
     let width = 64u16.min(area.width.saturating_sub(4));
-    let height = if matches!(state.status, DeviceAuthStatus::BrowserAuth) && !state.auth_url.is_empty() {
-        let url_lines = (state.auth_url.len() as u16).saturating_add(width.saturating_sub(4) - 1) / width.saturating_sub(4).max(1);
+    let height = if matches!(state.status, DeviceAuthStatus::BrowserAuth)
+        && !state.auth_url.is_empty()
+    {
+        let url_lines = (state.auth_url.len() as u16).saturating_add(width.saturating_sub(4) - 1)
+            / width.saturating_sub(4).max(1);
         (14 + url_lines + 2).min(area.height.saturating_sub(4))
     } else {
         14u16
     };
     let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
 
     // ── Fill dialog background (no border) ──
     render_dialog_bg(frame, dialog_area);
@@ -249,9 +251,7 @@ pub fn render_device_auth_dialog(
                 Span::styled(" at ", Style::default().fg(dim)),
                 Span::styled(
                     state.verification_uri.clone(),
-                    Style::default()
-                        .fg(pink)
-                        .add_modifier(Modifier::UNDERLINED),
+                    Style::default().fg(pink).add_modifier(Modifier::UNDERLINED),
                 ),
             ]));
             lines.push(Line::from(""));
@@ -279,9 +279,7 @@ pub fn render_device_auth_dialog(
                     let s = String::from_utf8_lossy(chunk).into_owned();
                     lines.push(Line::from(Span::styled(
                         format!(" {}", s),
-                        Style::default()
-                            .fg(pink)
-                            .add_modifier(Modifier::UNDERLINED),
+                        Style::default().fg(pink).add_modifier(Modifier::UNDERLINED),
                     )));
                 }
                 lines.push(Line::from(""));
@@ -305,9 +303,7 @@ pub fn render_device_auth_dialog(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 " \u{2714} Connected successfully!",
-                Style::default()
-                    .fg(green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(green).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

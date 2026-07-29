@@ -9,10 +9,10 @@ use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
-use std::time::Duration;
 #[allow(unused_imports)]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Core trait
@@ -306,8 +306,12 @@ mod usage;
 pub use usage::*;
 mod extras;
 pub use extras::*;
+mod keys;
+pub use keys::*;
 mod ui_settings;
 use ui_settings::*;
+mod routing;
+pub use routing::*;
 mod new_move;
 pub use new_move::*;
 
@@ -547,7 +551,7 @@ fn command_category(name: &str) -> &'static str {
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
-        "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
+        "login" | "logout" | "refresh" | "permissions" | "keys" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review"
         | "import-config" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
@@ -555,7 +559,9 @@ fn command_category(name: &str) -> &'static str {
             "Sessions & Remote"
         }
         "help" | "exit" => "General",
-        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "auto-compact" => "AI & Thinking",
+        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "auto-compact" => {
+            "AI & Thinking"
+        }
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
         | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
@@ -718,8 +724,7 @@ async fn try_compact(
         None => return Err(CompactError::NoProvider),
     };
 
-    let compact_prompt_text =
-        clawde_query::compact::get_compact_prompt(custom_instructions, None);
+    let compact_prompt_text = clawde_query::compact::get_compact_prompt(custom_instructions, None);
 
     let system_prompt_text =
         "You are an expert conversation summariser that creates thorough, structured          summaries preserving all technical details, file names, code snippets, and          decisions. Follow the instructions carefully and respond with the structured          format requested.";
@@ -734,7 +739,9 @@ async fn try_compact(
     let request = clawde_api::ProviderRequest {
         model: compact_model.to_string(),
         messages: vec![clawde_core::types::Message::user(user_content)],
-        system_prompt: Some(clawde_api::SystemPrompt::Text(system_prompt_text.to_string())),
+        system_prompt: Some(clawde_api::SystemPrompt::Text(
+            system_prompt_text.to_string(),
+        )),
         tools: vec![],
         max_tokens: 8192,
         temperature: None,
@@ -842,7 +849,8 @@ impl SlashCommand for CompactCommand {
             Err(CompactError::Timeout) => {
                 if is_send {
                     CommandResult::Error(
-                        "Compact send timed out after 120 seconds. Try /compact first to preview.".to_string(),
+                        "Compact send timed out after 120 seconds. Try /compact first to preview."
+                            .to_string(),
                     )
                 } else {
                     CommandResult::Message(
@@ -1081,11 +1089,7 @@ impl SlashCommand for ModelCommand {
                 }
                 completions.push(ArgCompletion {
                     value: id,
-                    description: format!(
-                        "{} ({}K ctx)",
-                        m.info.name,
-                        m.info.context_window / 1000
-                    ),
+                    description: format!("{} ({}K ctx)", m.info.name, m.info.context_window / 1000),
                     available: true,
                 });
             }
@@ -1300,8 +1304,16 @@ impl SlashCommand for DiffCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "--stat".into(), description: "Summary of changed files".into(), available: true },
-            ArgCompletion { value: "--staged".into(), description: "Diff of staged changes".into(), available: true },
+            ArgCompletion {
+                value: "--stat".into(),
+                description: "Summary of changed files".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "--staged".into(),
+                description: "Diff of staged changes".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
@@ -1520,8 +1532,16 @@ impl SlashCommand for AutoCompactCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "on".into(), description: "Enable automatic compaction".into(), available: true },
-            ArgCompletion { value: "off".into(), description: "Disable automatic compaction".into(), available: true },
+            ArgCompletion {
+                value: "on".into(),
+                description: "Enable automatic compaction".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "off".into(),
+                description: "Disable automatic compaction".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
@@ -1551,7 +1571,8 @@ impl SlashCommand for AutoCompactCommand {
 
         if new_value == current {
             return CommandResult::Message(format!(
-                "Auto-compact is already {}.", if current { "enabled" } else { "disabled" }
+                "Auto-compact is already {}.",
+                if current { "enabled" } else { "disabled" }
             ));
         }
 
@@ -1787,6 +1808,22 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ManagedAgentsCommand),
         // Durable long-running goals
         Box::new(GoalCommand),
+        // Multi-key management
+        Box::new(KeysCommand),
+        // Routing strategy for free mode
+        Box::new(RoutingCommand),
+        Box::new(RoutingAlias {
+            name: "sr",
+            target: "sequential",
+        }),
+        Box::new(RoutingAlias {
+            name: "rr",
+            target: "random_failover",
+        }),
+        Box::new(RoutingAlias {
+            name: "lr",
+            target: "latency_based",
+        }),
         // Session navigation ported from opencode: /new (lazy home) + /move.
         Box::new(NewCommand),
         Box::new(MoveCommand),
@@ -2544,7 +2581,9 @@ mod tests {
             }
             CommandResult::Error(msg) => {
                 assert!(
-                    msg.contains("No provider") || msg.contains("timed out") || msg.contains("Compact send failed"),
+                    msg.contains("No provider")
+                        || msg.contains("timed out")
+                        || msg.contains("Compact send failed"),
                     "Expected provider or timeout error, got: {}",
                     msg
                 );
@@ -2669,10 +2708,12 @@ mod tests {
         match result {
             CommandResult::Message(msg) => {
                 assert!(
-                    msg.contains("Context Visualization"),
-                    "Expected 'Context Visualization' header, got: {}",
+                    msg.starts_with("Context:"),
+                    "Expected 'Context:' prefix, got: {}",
                     msg
                 );
+                assert!(msg.contains("tokens"), "Expected token info in: {}", msg);
+                assert!(msg.contains("msgs"), "Expected msg count in: {}", msg);
             }
             other => panic!("expected Message, got {:?}", other),
         }
@@ -2685,8 +2726,8 @@ mod tests {
         let result = cmd.execute("", &mut ctx).await;
         match result {
             CommandResult::Message(msg) => {
-                assert!(msg.contains("Model:"), "No Model line");
-                assert!(msg.contains("Context window:"), "No Context window line");
+                assert!(msg.contains("tokens"), "No token info in: {}", msg);
+                assert!(msg.contains("tools"), "No tool count in: {}", msg);
             }
             other => panic!("expected Message, got {:?}", other),
         }
@@ -2926,99 +2967,99 @@ mod tests {
         }
     }
 }
-    // ---- arg_completions system tests ----------------------------------
+// ---- arg_completions system tests ----------------------------------
 
-    #[test]
-    fn get_arg_completions_filters_case_insensitive() {
-        let completions = crate::get_arg_completions("effort", "m");
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"medium"), "should match 'medium'");
-        assert!(values.contains(&"minimal"), "should match 'minimal'");
-        assert!(values.contains(&"max"), "should match 'max'");
-        assert!(!values.contains(&"low"), "should not match 'low'");
-        assert!(!values.contains(&"high"), "should not match 'high'");
-    }
-
-    #[test]
-    fn get_arg_completions_empty_partial_returns_all() {
-        let completions = crate::get_arg_completions("effort", "");
-        assert_eq!(completions.len(), 8, "should return all 8 levels");
-    }
-
-    #[test]
-    fn get_arg_completions_unknown_command_returns_empty() {
-        let completions = crate::get_arg_completions("nonexistent", "x");
-        assert!(completions.is_empty());
-    }
-
-    #[test]
-    fn get_arg_completions_exact_match() {
-        let completions = crate::get_arg_completions("effort", "high");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].value, "high");
-    }
-
-    #[test]
-    fn get_arg_completions_no_match_returns_empty() {
-        let completions = crate::get_arg_completions("effort", "zzz");
-        assert!(completions.is_empty());
-    }
-
-    #[test]
-    fn auto_compact_completions_on_off() {
-        let completions = crate::get_arg_completions("auto-compact", "");
-        assert_eq!(completions.len(), 2);
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"on"));
-        assert!(values.contains(&"off"));
-    }
-
-    #[test]
-    fn theme_completions_all_four() {
-        let completions = crate::get_arg_completions("theme", "");
-        assert_eq!(completions.len(), 4);
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"default"));
-        assert!(values.contains(&"dark"));
-        assert!(values.contains(&"light"));
-        assert!(values.contains(&"catppuccin"));
-    }
-
-    #[test]
-    fn diff_completions_flags() {
-        let completions = crate::get_arg_completions("diff", "");
-        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"--stat"));
-        assert!(values.contains(&"--staged"));
-    }
-
-    #[test]
-    fn get_arg_completions_cmd_name_is_case_sensitive() {
-        // find_command is case-sensitive but get_arg_completions uses it directly.
-        // Commands are always lowercase, so this tests the normal path.
-        let completions = crate::get_arg_completions("EFFORT", "HIGH");
-        // "EFFORT" won't match "effort" in find_command's case-sensitive comparison
-        assert!(completions.is_empty(), "EFFORT != effort in case-sensitive find_command");
-    }
-
-    #[test]
-    fn arg_completions_all_available_by_default() {
-        let completions = crate::get_arg_completions("effort", "");
-        for c in &completions {
-            assert!(c.available, "{} should be available by default", c.value);
-        }
-    }
-
-    #[test]
-    fn once_lock_caches_command_list() {
-        // Call twice — the second call reuses the cached list.
-        let first = crate::get_arg_completions("effort", "");
-        let second = crate::get_arg_completions("effort", "");
-        assert_eq!(first.len(), second.len());
-        for (a, b) in first.iter().zip(second.iter()) {
-            assert_eq!(a.value, b.value);
-        }
-
+#[test]
+fn get_arg_completions_filters_case_insensitive() {
+    let completions = crate::get_arg_completions("effort", "m");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(values.contains(&"medium"), "should match 'medium'");
+    assert!(values.contains(&"minimal"), "should match 'minimal'");
+    assert!(values.contains(&"max"), "should match 'max'");
+    assert!(!values.contains(&"low"), "should not match 'low'");
+    assert!(!values.contains(&"high"), "should not match 'high'");
 }
 
+#[test]
+fn get_arg_completions_empty_partial_returns_all() {
+    let completions = crate::get_arg_completions("effort", "");
+    assert_eq!(completions.len(), 8, "should return all 8 levels");
+}
 
+#[test]
+fn get_arg_completions_unknown_command_returns_empty() {
+    let completions = crate::get_arg_completions("nonexistent", "x");
+    assert!(completions.is_empty());
+}
+
+#[test]
+fn get_arg_completions_exact_match() {
+    let completions = crate::get_arg_completions("effort", "high");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].value, "high");
+}
+
+#[test]
+fn get_arg_completions_no_match_returns_empty() {
+    let completions = crate::get_arg_completions("effort", "zzz");
+    assert!(completions.is_empty());
+}
+
+#[test]
+fn auto_compact_completions_on_off() {
+    let completions = crate::get_arg_completions("auto-compact", "");
+    assert_eq!(completions.len(), 2);
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(values.contains(&"on"));
+    assert!(values.contains(&"off"));
+}
+
+#[test]
+fn theme_completions_all_four() {
+    let completions = crate::get_arg_completions("theme", "");
+    assert_eq!(completions.len(), 4);
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(values.contains(&"default"));
+    assert!(values.contains(&"dark"));
+    assert!(values.contains(&"light"));
+    assert!(values.contains(&"catppuccin"));
+}
+
+#[test]
+fn diff_completions_flags() {
+    let completions = crate::get_arg_completions("diff", "");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(values.contains(&"--stat"));
+    assert!(values.contains(&"--staged"));
+}
+
+#[test]
+fn get_arg_completions_cmd_name_is_case_sensitive() {
+    // find_command is case-sensitive but get_arg_completions uses it directly.
+    // Commands are always lowercase, so this tests the normal path.
+    let completions = crate::get_arg_completions("EFFORT", "HIGH");
+    // "EFFORT" won't match "effort" in find_command's case-sensitive comparison
+    assert!(
+        completions.is_empty(),
+        "EFFORT != effort in case-sensitive find_command"
+    );
+}
+
+#[test]
+fn arg_completions_all_available_by_default() {
+    let completions = crate::get_arg_completions("effort", "");
+    for c in &completions {
+        assert!(c.available, "{} should be available by default", c.value);
+    }
+}
+
+#[test]
+fn once_lock_caches_command_list() {
+    // Call twice — the second call reuses the cached list.
+    let first = crate::get_arg_completions("effort", "");
+    let second = crate::get_arg_completions("effort", "");
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.value, b.value);
+    }
+}

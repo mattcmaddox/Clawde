@@ -16,10 +16,10 @@
 //     Use the `monitor` tool to check completion status/output.
 
 use async_trait::async_trait;
-use claurst_api::client::ClientConfig;
-use claurst_api::{AnthropicClient, ModelRegistry, ProviderRegistry};
-use claurst_core::types::Message;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use clawde_api::client::ClientConfig;
+use clawde_api::{AnthropicClient, ModelRegistry, ProviderRegistry};
+use clawde_core::types::Message;
+use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -104,7 +104,8 @@ fn resolve_subagent_model(params: &AgentInput, ctx: &ToolContext) -> String {
         .clone()
         .filter(|m| !m.is_empty())
         .or_else(|| {
-            ctx.managed_agent_config.as_ref()
+            ctx.managed_agent_config
+                .as_ref()
                 .map(|c| c.executor_model.clone())
                 .filter(|m| !m.is_empty())
         })
@@ -153,7 +154,7 @@ struct AgentInput {
 #[async_trait]
 impl Tool for AgentTool {
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_AGENT
+        clawde_core::constants::TOOL_NAME_AGENT
     }
 
     fn description(&self) -> &str {
@@ -245,14 +246,14 @@ impl Tool for AgentTool {
 
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
-        let all = claurst_tools::all_tools();
+        let all = clawde_tools::all_tools();
         let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
             all.into_iter()
                 .filter(|t| allowed.contains(&t.name().to_string()))
                 .collect()
         } else {
             all.into_iter()
-                .filter(|t| t.name() != claurst_core::constants::TOOL_NAME_AGENT)
+                .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
                 .collect()
         };
 
@@ -266,7 +267,7 @@ impl Tool for AgentTool {
 
             // Append plugin-contributed agent definitions so the sub-agent
             // is aware of any specialised agents declared by plugins.
-            if let Some(registry) = claurst_plugins::global_plugin_registry() {
+            if let Some(registry) = clawde_plugins::global_plugin_registry() {
                 let mut agent_defs = String::new();
                 for agent_dir in registry.all_agent_paths() {
                     if let Ok(entries) = std::fs::read_dir(&agent_dir) {
@@ -274,10 +275,8 @@ impl Tool for AgentTool {
                             let p = entry.path();
                             if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
-                                    let name = p
-                                        .file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("agent");
+                                    let name =
+                                        p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
                                     agent_defs.push_str(&format!(
                                         "\n\n## Agent: {}\n{}",
                                         name,
@@ -299,14 +298,20 @@ impl Tool for AgentTool {
 
         // Resolve max_turns: explicit > managed config executor_max_turns > default.
         let resolved_max_turns = params.max_turns.unwrap_or_else(|| {
-            ctx.managed_agent_config.as_ref()
+            ctx.managed_agent_config
+                .as_ref()
                 .map(|c| c.executor_max_turns)
                 .unwrap_or(10)
         });
 
         // Resolve isolation: explicit param > managed config executor_isolation.
         let resolved_isolation = params.isolation.clone().or_else(|| {
-            if ctx.managed_agent_config.as_ref().map(|c| c.executor_isolation).unwrap_or(false) {
+            if ctx
+                .managed_agent_config
+                .as_ref()
+                .map(|c| c.executor_isolation)
+                .unwrap_or(false)
+            {
                 Some("worktree".to_string())
             } else {
                 None
@@ -346,7 +351,7 @@ impl Tool for AgentTool {
 
         let query_config = QueryConfig {
             model,
-            max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
+            max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: resolved_max_turns,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
@@ -377,7 +382,7 @@ impl Tool for AgentTool {
         // Background mode: spawn and return agent_id immediately.
         // -----------------------------------------------------------------------
         if params.run_in_background {
-            let mut task = claurst_core::tasks::BackgroundTask::new(format!(
+            let mut task = clawde_core::tasks::BackgroundTask::new(format!(
                 "subagent: {}",
                 params.description
             ));
@@ -390,12 +395,12 @@ impl Tool for AgentTool {
             // the registry can still cancel this sub-agent independently (#218).
             let cancel = ctx.cancel_token.child_token();
             task.cancel_token = Some(cancel.clone());
-            let _ = claurst_core::tasks::global_registry().register(task);
+            let _ = clawde_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
-            let agent_tools_bg: Vec<Box<dyn Tool>> = claurst_tools::all_tools()
+            let agent_tools_bg: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
                 .into_iter()
-                .filter(|t| t.name() != claurst_core::constants::TOOL_NAME_AGENT)
+                .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
                 .collect();
 
             let client_bg = client.clone();
@@ -428,24 +433,24 @@ impl Tool for AgentTool {
 
                 // Respect a prior external cancellation mark from monitor cancel.
                 let cancelled = matches!(
-                    claurst_core::tasks::global_registry()
+                    clawde_core::tasks::global_registry()
                         .get(&agent_id_bg)
                         .map(|t| t.status),
-                    Some(claurst_core::tasks::TaskStatus::Cancelled)
+                    Some(clawde_core::tasks::TaskStatus::Cancelled)
                 );
 
                 let result_text = format_outcome(outcome);
-                claurst_core::tasks::global_registry().append_output(&agent_id_bg, &result_text);
+                clawde_core::tasks::global_registry().append_output(&agent_id_bg, &result_text);
 
                 if !cancelled {
                     let status = if result_text.starts_with("[Agent error:")
                         || result_text.starts_with("[Agent stopped:")
                     {
-                        claurst_core::tasks::TaskStatus::Failed(result_text.clone())
+                        clawde_core::tasks::TaskStatus::Failed(result_text.clone())
                     } else {
-                        claurst_core::tasks::TaskStatus::Completed
+                        clawde_core::tasks::TaskStatus::Completed
                     };
-                    claurst_core::tasks::global_registry().update_status(&agent_id_bg, status);
+                    clawde_core::tasks::global_registry().update_status(&agent_id_bg, status);
                 }
 
                 debug!(
@@ -504,25 +509,21 @@ impl Tool for AgentTool {
                 );
                 ToolResult::success(text)
             }
-            QueryOutcome::MaxTokens { partial_message, .. } => {
+            QueryOutcome::MaxTokens {
+                partial_message, ..
+            } => {
                 let text = partial_message.get_all_text();
-                ToolResult::success(format!(
-                    "{}\n\n[Note: Agent hit max_tokens limit]",
-                    text
-                ))
+                ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text))
             }
-            QueryOutcome::Cancelled => {
-                ToolResult::error("Sub-agent was cancelled".to_string())
-            }
-            QueryOutcome::Error(e) => {
-                ToolResult::error(format!("Sub-agent error: {}", e))
-            }
-            QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                ToolResult::error(format!(
-                    "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
-                    cost_usd, limit_usd
-                ))
-            }
+            QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
+            QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
+            QueryOutcome::BudgetExceeded {
+                cost_usd,
+                limit_usd,
+            } => ToolResult::error(format!(
+                "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
+                cost_usd, limit_usd
+            )),
         }
     }
 }
@@ -534,13 +535,18 @@ impl Tool for AgentTool {
 fn format_outcome(outcome: QueryOutcome) -> String {
     match outcome {
         QueryOutcome::EndTurn { message, .. } => message.get_all_text(),
-        QueryOutcome::MaxTokens { partial_message, .. } => format!(
+        QueryOutcome::MaxTokens {
+            partial_message, ..
+        } => format!(
             "{}\n\n[Note: Agent hit max_tokens limit]",
             partial_message.get_all_text()
         ),
         QueryOutcome::Cancelled => "[Agent was cancelled]".to_string(),
         QueryOutcome::Error(e) => format!("[Agent error: {}]", e),
-        QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => format!(
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => format!(
             "[Agent stopped: budget ${:.4} exceeded (limit ${:.4})]",
             cost_usd, limit_usd
         ),
@@ -563,34 +569,35 @@ fn format_outcome(outcome: QueryOutcome) -> String {
 /// # Panics
 /// Panics if the runner was already registered.
 pub fn init_team_swarm_runner() {
-    let runner: claurst_tools::AgentRunFn = Arc::new(
+    let runner: clawde_tools::AgentRunFn = Arc::new(
         |description: String,
          prompt: String,
          tools: Option<Vec<String>>,
          system: Option<String>,
          max_turns: Option<u32>,
-         ctx: Arc<claurst_tools::ToolContext>| {
+         ctx: Arc<clawde_tools::ToolContext>| {
             // We must return a Pin<Box<dyn Future<...> + Send>>.
             Box::pin(async move {
                 let anthropic_key = ctx.config.resolve_anthropic_api_key().unwrap_or_default();
                 let anthropic_base = ctx.config.resolve_anthropic_api_base();
-                let client = match claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
-                    api_key: anthropic_key.clone(),
-                    api_base: anthropic_base,
-                    ..Default::default()
-                }) {
-                    Ok(c) => Arc::new(c),
-                    Err(e) => {
-                        return format!(
-                            "[Agent '{}' failed to create client: {}]",
-                            description, e
-                        )
-                    }
-                };
+                let client =
+                    match clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+                        api_key: anthropic_key.clone(),
+                        api_base: anthropic_base,
+                        ..Default::default()
+                    }) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            return format!(
+                                "[Agent '{}' failed to create client: {}]",
+                                description, e
+                            )
+                        }
+                    };
 
                 let provider_registry = ProviderRegistry::from_config(
                     &ctx.config,
-                    claurst_api::client::ClientConfig {
+                    clawde_api::client::ClientConfig {
                         api_key: anthropic_key,
                         api_base: ctx.config.resolve_anthropic_api_base(),
                         ..Default::default()
@@ -599,17 +606,17 @@ pub fn init_team_swarm_runner() {
                 let model_registry = Arc::new(build_model_registry());
 
                 // Build the tool list, filtering to the allowlist if provided.
-                let all = claurst_tools::all_tools();
-                let agent_tools: Vec<Box<dyn claurst_tools::Tool>> =
-                    if let Some(ref allowed) = tools {
-                        all.into_iter()
-                            .filter(|t| allowed.contains(&t.name().to_string()))
-                            .collect()
-                    } else {
-                        all.into_iter()
-                            .filter(|t| t.name() != claurst_core::constants::TOOL_NAME_AGENT)
-                            .collect()
-                    };
+                let all = clawde_tools::all_tools();
+                let agent_tools: Vec<Box<dyn clawde_tools::Tool>> = if let Some(ref allowed) = tools
+                {
+                    all.into_iter()
+                        .filter(|t| allowed.contains(&t.name().to_string()))
+                        .collect()
+                } else {
+                    all.into_iter()
+                        .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
+                        .collect()
+                };
 
                 let model = resolve_subagent_model(
                     &AgentInput {
@@ -633,7 +640,7 @@ pub fn init_team_swarm_runner() {
 
                 let query_config = crate::QueryConfig {
                     model,
-                    max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
+                    max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
@@ -643,16 +650,14 @@ pub fn init_team_swarm_runner() {
                     model_registry: Some(model_registry),
                     // Progressive tool disclosure (issue #233): only emit
                     // per-tool guidance for tools this team sub-agent has.
-                    enabled_tools: Some(
-                        agent_tools.iter().map(|t| t.name().to_string()).collect(),
-                    ),
+                    enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
                     ..Default::default()
                 };
 
                 // Child of the parent's token so a parent cancel propagates into
                 // this team sub-agent as well (issue #218).
                 let cancel = ctx.cancel_token.child_token();
-                let mut messages = vec![claurst_core::types::Message::user(prompt)];
+                let mut messages = vec![clawde_core::types::Message::user(prompt)];
                 let outcome = crate::run_query_loop(
                     client.as_ref(),
                     &mut messages,
@@ -671,5 +676,5 @@ pub fn init_team_swarm_runner() {
         },
     );
 
-    claurst_tools::register_agent_runner(runner);
+    clawde_tools::register_agent_runner(runner);
 }

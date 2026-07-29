@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::cell::Cell;
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
 
@@ -23,6 +24,8 @@ pub struct KeyInputDialogState {
     pub provider_name: String,
     pub input: String,
     pub cursor_pos: usize,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
 }
 
 impl Default for KeyInputDialogState {
@@ -39,6 +42,7 @@ impl KeyInputDialogState {
             provider_name: String::new(),
             input: String::new(),
             cursor_pos: 0,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -92,11 +96,7 @@ impl KeyInputDialogState {
 
 /// Render the key input dialog overlay — OpenCode-style: dark overlay, no
 /// border, minimal and polished.
-pub fn render_key_input_dialog(
-    frame: &mut Frame,
-    state: &KeyInputDialogState,
-    area: Rect,
-) {
+pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, area: Rect) {
     if !state.visible {
         return;
     }
@@ -112,6 +112,7 @@ pub fn render_key_input_dialog(
     let width = 60u16.min(area.width.saturating_sub(4));
     let height = 9u16;
     let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
 
     // ── Fill dialog background (no border) ──
     render_dialog_bg(frame, dialog_area);
@@ -157,11 +158,7 @@ pub fn render_key_input_dialog(
         if len <= 4 {
             state.input.clone()
         } else {
-            format!(
-                "{}{}",
-                "\u{2022}".repeat(len - 4),
-                &state.input[len - 4..]
-            )
+            format!("{}{}", "\u{2022}".repeat(len - 4), &state.input[len - 4..])
         }
     };
 

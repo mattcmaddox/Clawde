@@ -87,6 +87,10 @@ pub use update_check::{check_for_updates, UpdateInfo};
 // Self-contained HTML export of a session, used by the `/share` slash command.
 pub mod share_export;
 
+// In-memory key rotation state machine with cooldown tracking.
+pub mod key_ring;
+pub use key_ring::{KeyRing, KeyStatus};
+
 // Re-export commonly used types at the crate root
 pub use config::{
     builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
@@ -1571,6 +1575,7 @@ pub mod config {
                         .iter()
                         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
+                .or_else(|| crate::AuthStore::load().api_key_for("anthropic"))
                 // Support {env:VAR_NAME} patterns in the resolved value
                 .map(|key| substitute_env_vars(&key))
         }
@@ -1938,30 +1943,30 @@ pub mod config {
                 for name in &["settings.json", "settings.jsonc"] {
                     for dir_name in &[".clawde", ".claurst"] {
                         let candidate = dir.join(dir_name).join(name);
-                    if candidate.exists() && candidate != global_path {
-                        if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
-                            let stripped = strip_jsonc_comments(&content);
-                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
-                                // SECURITY: tag every server defined by this
-                                // repository as project-origin so it gets gated
-                                // behind explicit approval before launching.
-                                // `origin` is `#[serde(skip)]`, so the file can
-                                // never set it itself — we always assign here.
-                                for server in &mut s.config.mcp_servers {
-                                    server.origin = McpServerOrigin::Project;
-                                }
-                                for ps in s.projects.values_mut() {
-                                    for server in &mut ps.mcp_servers {
+                        if candidate.exists() && candidate != global_path {
+                            if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
+                                let stripped = strip_jsonc_comments(&content);
+                                if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                    // SECURITY: tag every server defined by this
+                                    // repository as project-origin so it gets gated
+                                    // behind explicit approval before launching.
+                                    // `origin` is `#[serde(skip)]`, so the file can
+                                    // never set it itself — we always assign here.
+                                    for server in &mut s.config.mcp_servers {
                                         server.origin = McpServerOrigin::Project;
                                     }
+                                    for ps in s.projects.values_mut() {
+                                        for server in &mut ps.mcp_servers {
+                                            server.origin = McpServerOrigin::Project;
+                                        }
+                                    }
+                                    return Some(s);
                                 }
-                                return Some(s);
                             }
+                            // Found a file but couldn't parse — stop here, don't go up.
+                            return None;
                         }
-                        // Found a file but couldn't parse — stop here, don't go up.
-                        return None;
                     }
-                }
                 }
                 match dir.parent() {
                     Some(parent) => dir = parent,
@@ -4960,7 +4965,9 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
-        let _lock = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
@@ -5563,7 +5570,9 @@ mod tests {
         let legacy = dir.path().join(".claurst");
         std::fs::create_dir_all(&legacy).unwrap();
 
-        let _lock = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", dir.path());
 
@@ -5582,10 +5591,7 @@ mod tests {
             "Expected config_dir() to migrate .claurst -> .clawde, got {}",
             result.display()
         );
-        assert!(
-            migrated.is_dir(),
-            "~/.clawde must exist after migration"
-        );
+        assert!(migrated.is_dir(), "~/.clawde must exist after migration");
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),

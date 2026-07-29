@@ -73,11 +73,13 @@ impl ProviderId {
     pub const NOVITA: &'static str = "novita";
     pub const MINIMAX: &'static str = "minimax";
     pub const CODEX: &'static str = "codex";
+    pub const GITHUB_MODELS: &'static str = "github-models";
     pub const OPENCODE_GO: &'static str = "opencode-go";
     pub const OPENCODE_ZEN: &'static str = "opencode-zen";
     pub const SYNTHETIC: &'static str = "synthetic";
     pub const ROUTING: &'static str = "routing";
     pub const NEURALWATT: &'static str = "neuralwatt";
+    pub const CLINE: &'static str = "cline";
     pub const FREE: &'static str = "free";
 }
 

@@ -2,7 +2,7 @@
 ///
 /// Ported from the TS "enabled plugins" concept in `pluginLoader.ts` and the
 /// app-state plugin arrays.
-use crate::hooks::{HookRegistry, register_plugin_hooks};
+use crate::hooks::{register_plugin_hooks, HookRegistry};
 use crate::plugin::{LoadedPlugin, PluginCommandDef, PluginError, ReloadDiff};
 use std::collections::HashMap;
 
@@ -184,11 +184,11 @@ impl PluginRegistry {
     }
 
     /// Collect all MCP server configs contributed by enabled plugins.
-    pub fn all_mcp_servers(&self) -> Vec<claurst_core::config::McpServerConfig> {
-        let mut servers: Vec<claurst_core::config::McpServerConfig> = Vec::new();
+    pub fn all_mcp_servers(&self) -> Vec<clawde_core::config::McpServerConfig> {
+        let mut servers: Vec<clawde_core::config::McpServerConfig> = Vec::new();
         for plugin in self.enabled() {
             for mcp in &plugin.manifest.mcp_servers {
-                servers.push(claurst_core::config::McpServerConfig {
+                servers.push(clawde_core::config::McpServerConfig {
                     name: mcp.name.clone(),
                     command: mcp.command.clone(),
                     args: mcp.args.clone(),
@@ -276,8 +276,8 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin::PluginSource;
     use crate::manifest::PluginManifest;
+    use crate::plugin::PluginSource;
     use std::path::PathBuf;
 
     fn make_plugin(name: &str) -> LoadedPlugin {

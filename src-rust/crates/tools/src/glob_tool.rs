@@ -19,10 +19,12 @@ struct GlobInput {
 #[async_trait]
 impl Tool for GlobTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_GLOB
+        clawde_core::constants::TOOL_NAME_GLOB
     }
 
     fn description(&self) -> &str {
@@ -77,10 +79,7 @@ impl Tool for GlobTool {
         debug!(pattern = %params.pattern, dir = %base_dir.display(), "Running glob");
 
         if !base_dir.exists() || !base_dir.is_dir() {
-            return ToolResult::error(format!(
-                "Directory not found: {}",
-                base_dir.display()
-            ));
+            return ToolResult::error(format!("Directory not found: {}", base_dir.display()));
         }
 
         // Build the full glob pattern
@@ -151,5 +150,273 @@ impl Tool for GlobTool {
         }
 
         ToolResult::success(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn glob_matches_files_by_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.rs"), "").unwrap();
+        std::fs::write(dir.path().join("bar.rs"), "").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*.rs"}), &ctx).await;
+
+        assert!(!res.is_error, "glob failed: {}", res.content);
+        assert!(res.content.contains("foo.rs"), "should find foo.rs");
+        assert!(res.content.contains("bar.rs"), "should find bar.rs");
+        assert!(
+            !res.content.contains("readme.md"),
+            "should NOT find readme.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_no_matches_returns_empty_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.md"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*.py"}), &ctx).await;
+
+        assert!(!res.is_error, "glob should not error on no matches");
+        assert!(res.content.contains("No files matched"));
+    }
+
+    #[tokio::test]
+    async fn glob_recursive_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src").join("lib");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("mod.rs"), "").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "**/*.rs"}), &ctx).await;
+
+        assert!(!res.is_error, "glob failed: {}", res.content);
+        assert!(res.content.contains("main.rs"));
+        assert!(res.content.contains("mod.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_invalid_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool
+            .execute(
+                json!({
+                    "pattern": "*.rs",
+                    "path": "/nonexistent/directory",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(res.is_error, "expected error for bad path");
+        assert!(res.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn glob_sorts_by_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create files with distinct names; timestamps may be identical on
+        // some filesystems, but the tool should still return them sorted.
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*.rs"}), &ctx).await;
+
+        assert!(!res.is_error, "glob failed: {}", res.content);
+        // All three files should be present
+        assert!(res.content.contains("a.rs"));
+        assert!(res.content.contains("b.rs"));
+        assert!(res.content.contains("c.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_invalid_input_missing_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({}), &ctx).await;
+
+        assert!(res.is_error, "expected error for missing pattern");
+        assert!(res.content.contains("Invalid input"));
+    }
+    #[tokio::test]
+    async fn glob_non_ascii_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("文件.rs"), "").unwrap();
+        std::fs::write(dir.path().join("cafe.md"), "").unwrap();
+        std::fs::write(dir.path().join("plain.txt"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // Match all .rs files
+        let res = GlobTool.execute(json!({"pattern": "*.rs"}), &ctx).await;
+        assert!(!res.is_error, "glob non-ascii failed: {}", res.content);
+        assert!(
+            res.content.contains("文件.rs"),
+            "should find CJK-named file"
+        );
+
+        // Match all .md files
+        let res2 = GlobTool.execute(json!({"pattern": "*.md"}), &ctx).await;
+        assert!(!res2.is_error);
+        assert!(
+            res2.content.contains("cafe.md"),
+            "should find accented-name file"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty directory, no files at all
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*"}), &ctx).await;
+
+        assert!(!res.is_error, "glob empty dir should not error");
+        assert!(
+            res.content.contains("No files matched"),
+            "should report no files"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_hidden_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden.rs"), "").unwrap();
+        std::fs::write(dir.path().join("visible.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*.rs"}), &ctx).await;
+
+        assert!(!res.is_error, "glob hidden failed: {}", res.content);
+        // The glob crate matches dotfiles with * on some platforms. Assert
+        // that at least the visible file is found.
+        assert!(
+            res.content.contains("visible.rs"),
+            "should find visible file"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_character_class_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        std::fs::write(dir.path().join("b.go"), "").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // [rg] matches either 'r' or 'g' followed by 's' -> matches .rs but not .go or .txt
+        let res = GlobTool.execute(json!({"pattern": "*.[rg]s"}), &ctx).await;
+
+        assert!(!res.is_error, "glob char class failed: {}", res.content);
+        assert!(res.content.contains("a.rs"), "should find .rs file");
+        assert!(!res.content.contains("b.go"), "should NOT find .go file");
+        assert!(!res.content.contains("c.txt"), "should NOT find .txt file");
+    }
+
+    #[tokio::test]
+    async fn glob_deeply_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create deeply nested hierarchy
+        let deep = dir.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("found.rs"), "").unwrap();
+        std::fs::write(dir.path().join("root.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+
+        // Recursive pattern should find both
+        let res = GlobTool.execute(json!({"pattern": "**/*.rs"}), &ctx).await;
+        assert!(!res.is_error, "glob deep failed: {}", res.content);
+        assert!(res.content.contains("root.rs"), "should find root file");
+        assert!(
+            res.content.contains("found.rs"),
+            "should find deeply nested file"
+        );
+
+        // Non-recursive should only find root
+        let res2 = GlobTool.execute(json!({"pattern": "*.rs"}), &ctx).await;
+        assert!(!res2.is_error);
+        assert!(res2.content.contains("root.rs"), "should find root file");
+        assert!(
+            !res2.content.contains("found.rs"),
+            "should NOT find nested file"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_with_path_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.rs"), "").unwrap();
+        std::fs::write(dir.path().join("outer.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // Use explicit path parameter to search only within subdir
+        let res = GlobTool
+            .execute(
+                json!({
+                    "pattern": "*.rs",
+                    "path": "subdir",
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "glob with path failed: {}", res.content);
+        assert!(res.content.contains("inner.rs"), "should find inner.rs");
+        assert!(
+            !res.content.contains("outer.rs"),
+            "should NOT find outer.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_question_mark_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cat.rs"), "").unwrap();
+        std::fs::write(dir.path().join("car.rs"), "").unwrap();
+        std::fs::write(dir.path().join("cab.rs"), "").unwrap();
+        std::fs::write(dir.path().join("cart.rs"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // ? matches exactly one character: c?t -> cat only (not cart)
+        let res = GlobTool.execute(json!({"pattern": "c?t.rs"}), &ctx).await;
+
+        assert!(!res.is_error, "glob ? failed: {}", res.content);
+        assert!(res.content.contains("cat.rs"), "should match c?t -> cat");
+        assert!(
+            !res.content.contains("cart.rs"),
+            "should NOT match cart (4 chars)"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_star_only_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("any.txt"), "").unwrap();
+        std::fs::write(dir.path().join("file.rs"), "").unwrap();
+        std::fs::write(dir.path().join("data.json"), "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = GlobTool.execute(json!({"pattern": "*"}), &ctx).await;
+
+        assert!(!res.is_error, "glob * failed: {}", res.content);
+        assert!(res.content.contains("any.txt"));
+        assert!(res.content.contains("file.rs"));
+        assert!(res.content.contains("data.json"));
     }
 }

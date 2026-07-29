@@ -12,7 +12,9 @@ pub struct LspTool;
 #[async_trait]
 impl Tool for LspTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "LSP"
@@ -86,20 +88,15 @@ impl Tool for LspTool {
         }
 
         // line/column only required for position-based actions
-        let line = input
-            .get("line")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
-        let column = input
-            .get("column")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+        let line = input.get("line").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        let column = input.get("column").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
         // --- Seed the global LSP manager with configs from current session ---
-        let lsp_manager_arc = claurst_core::lsp::global_lsp_manager();
+        let lsp_manager_arc = clawde_core::lsp::global_lsp_manager();
         {
             let mut manager = lsp_manager_arc.lock().await;
             manager.seed_from_config(&ctx.config.lsp_servers);
+            manager.seed_with_defaults();
         }
 
         // Check that at least one server is registered for this file before
@@ -214,7 +211,7 @@ impl Tool for LspTool {
                     ));
                 }
 
-                let output = claurst_core::lsp::LspManager::format_diagnostics(&diagnostics);
+                let output = clawde_core::lsp::LspManager::format_diagnostics(&diagnostics);
                 ToolResult::success(output)
             }
 

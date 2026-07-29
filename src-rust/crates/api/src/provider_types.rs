@@ -4,13 +4,13 @@
 // These types form a provider-agnostic layer that every concrete provider
 // adapter (Anthropic, OpenAI, Google, …) maps to/from.
 
-use claurst_core::types::{ContentBlock, Message, ToolDefinition, UsageInfo};
+use clawde_core::types::{ContentBlock, Message, ToolDefinition, UsageInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // Re-export ThinkingConfig and SystemPrompt from the api types module so
 // callers only need to import from this module.
-pub use crate::types::{ThinkingConfig, SystemPrompt};
+pub use crate::types::{SystemPrompt, ThinkingConfig};
 
 // ---------------------------------------------------------------------------
 // StopReason
@@ -35,7 +35,6 @@ pub enum StopReason {
     /// The provider returned an unknown or unrecognised stop reason.
     Other(String),
 }
-
 
 // ---------------------------------------------------------------------------
 // ProviderRequest
@@ -137,33 +136,19 @@ pub enum StreamEvent {
     },
 
     /// Incremental text delta for an in-progress block.
-    TextDelta {
-        index: usize,
-        text: String,
-    },
+    TextDelta { index: usize, text: String },
 
     /// Incremental thinking / reasoning delta.
-    ThinkingDelta {
-        index: usize,
-        thinking: String,
-    },
+    ThinkingDelta { index: usize, thinking: String },
 
     /// Incremental delta for tool-call JSON arguments.
-    InputJsonDelta {
-        index: usize,
-        partial_json: String,
-    },
+    InputJsonDelta { index: usize, partial_json: String },
 
     /// Incremental delta for a cryptographic signature block.
-    SignatureDelta {
-        index: usize,
-        signature: String,
-    },
+    SignatureDelta { index: usize, signature: String },
 
     /// An in-progress content block is now complete.
-    ContentBlockStop {
-        index: usize,
-    },
+    ContentBlockStop { index: usize },
 
     /// Final message-level delta carrying the stop reason and updated usage.
     MessageDelta {
@@ -175,15 +160,19 @@ pub enum StreamEvent {
     MessageStop,
 
     /// A provider-level error occurred mid-stream.
-    Error {
-        error_type: String,
-        message: String,
-    },
+    Error { error_type: String, message: String },
 
     /// Incremental reasoning / scratchpad delta (alias used by some providers).
-    ReasoningDelta {
-        index: usize,
-        reasoning: String,
+    ReasoningDelta { index: usize, reasoning: String },
+    /// Rate-limit usage metadata extracted from response headers.
+    /// Sent once per request before any stream content.
+    RateLimitHeaders {
+        /// Which provider returned these headers (e.g. "anthropic", "groq").
+        provider_id: String,
+        /// Fraction of the tokens budget used (0.0–1.0).
+        tokens_pct_used: f32,
+        /// Fraction of the requests budget used (0.0–1.0).
+        requests_pct_used: f32,
     },
 }
 
@@ -224,11 +213,19 @@ impl PartialBlock {
     fn from_start(block: ContentBlock) -> Self {
         match block {
             ContentBlock::Text { text } => PartialBlock::Text(text),
-            ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => PartialBlock::Thinking {
                 thinking_buf: thinking,
                 signature_buf: signature,
             },
-            ContentBlock::ToolUse { id, name, thought_signature, .. } => PartialBlock::ToolUse {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                thought_signature,
+                ..
+            } => PartialBlock::ToolUse {
                 id,
                 name,
                 json_buf: String::new(),
@@ -248,10 +245,20 @@ impl PartialBlock {
                 thinking: thinking_buf,
                 signature: signature_buf,
             },
-            PartialBlock::ToolUse { id, name, json_buf, thought_signature } => {
+            PartialBlock::ToolUse {
+                id,
+                name,
+                json_buf,
+                thought_signature,
+            } => {
                 let input =
                     serde_json::from_str(&json_buf).unwrap_or(Value::Object(Default::default()));
-                ContentBlock::ToolUse { id, name, input, thought_signature }
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                }
             }
             PartialBlock::Passthrough(block) => block,
         }
@@ -420,15 +427,10 @@ pub enum ProviderStatus {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum AuthMethod {
     /// A static API key sent as an HTTP header.
-    ApiKey {
-        key: String,
-        header: ApiKeyHeader,
-    },
+    ApiKey { key: String, header: ApiKeyHeader },
 
     /// A bearer token sent in the `Authorization` header.
-    Bearer {
-        token: String,
-    },
+    Bearer { token: String },
 
     /// AWS Signature V4 credentials for Amazon Bedrock.
     AwsCredentials {
@@ -543,7 +545,10 @@ mod tests {
         // appended non-text blocks last (usize::MAX), so thinking would have
         // landed *after* the text block.
         match &blocks[0] {
-            ContentBlock::Thinking { thinking, signature } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
                 assert_eq!(thinking, "Let me reason.", "thinking text captured");
                 assert_eq!(signature, "sig-abc123", "signature preserved verbatim");
             }
@@ -554,7 +559,12 @@ mod tests {
             other => panic!("expected Text block second, got {other:?}"),
         }
         match &blocks[2] {
-            ContentBlock::ToolUse { id, name, input, thought_signature } => {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => {
                 assert_eq!(id, "tool_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(

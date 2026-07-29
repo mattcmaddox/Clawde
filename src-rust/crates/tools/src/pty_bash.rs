@@ -10,10 +10,10 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
+use crate::{session_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
-use claurst_core::tasks::{BackgroundTask, global_registry};
+use clawde_core::bash_classifier::{classify_bash_command, BashRiskLevel};
+use clawde_core::tasks::{global_registry, BackgroundTask};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -72,8 +72,15 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
             let key = line[..eq].to_string();
             let val = line[eq + 1..].to_string();
             if !key.starts_with('_')
-                && !["SHLVL", "BASH_LINENO", "BASH_SOURCE", "FUNCNAME", "PIPESTATUS", "OLDPWD"]
-                    .contains(&key.as_str())
+                && ![
+                    "SHLVL",
+                    "BASH_LINENO",
+                    "BASH_SOURCE",
+                    "FUNCNAME",
+                    "PIPESTATUS",
+                    "OLDPWD",
+                ]
+                .contains(&key.as_str())
             {
                 env_vars.insert(key, val);
             }
@@ -85,10 +92,9 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
 
 #[cfg(unix)]
 fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
-    let re = Regex::new(
-        r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#,
-    )
-    .unwrap();
+    let re =
+        Regex::new(r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#)
+            .unwrap();
     let mut map = HashMap::new();
     for cap in re.captures_iter(command) {
         let key = cap[1].to_string();
@@ -209,7 +215,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                             let code = status.code().unwrap_or(-1);
                             global_registry().update_status(
                                 &task_id_clone,
-                                claurst_core::tasks::TaskStatus::Failed(format!(
+                                clawde_core::tasks::TaskStatus::Failed(format!(
                                     "exit code {}",
                                     code
                                 )),
@@ -218,7 +224,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                         Err(e) => {
                             global_registry().update_status(
                                 &task_id_clone,
-                                claurst_core::tasks::TaskStatus::Failed(e.to_string()),
+                                clawde_core::tasks::TaskStatus::Failed(e.to_string()),
                             );
                         }
                     }
@@ -226,7 +232,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                 Err(e) => {
                     global_registry().update_status(
                         &task_id_clone,
-                        claurst_core::tasks::TaskStatus::Failed(e.to_string()),
+                        clawde_core::tasks::TaskStatus::Failed(e.to_string()),
                     );
                 }
             }
@@ -236,10 +242,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
         if result.is_err() {
             global_registry().update_status(
                 &task_id_clone,
-                claurst_core::tasks::TaskStatus::Failed(format!(
-                    "timed out after {}ms",
-                    timeout_ms
-                )),
+                clawde_core::tasks::TaskStatus::Failed(format!("timed out after {}ms", timeout_ms)),
             );
         }
     });
@@ -265,7 +268,7 @@ fn strip_ansi(s: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next(); // consume '['
-                    // CSI: consume parameter + intermediate bytes, stop at final byte
+                                  // CSI: consume parameter + intermediate bytes, stop at final byte
                     for c in &mut chars {
                         if c.is_ascii_alphabetic() || c == '@' {
                             break;
@@ -336,7 +339,10 @@ struct PtyKillGuard {
 #[cfg(unix)]
 impl PtyKillGuard {
     fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) -> Self {
-        Self { killer, armed: true }
+        Self {
+            killer,
+            armed: true,
+        }
     }
 
     /// The command finished on its own — there is nothing left to kill.
@@ -370,7 +376,7 @@ async fn run_in_pty(
     env_vars: &HashMap<String, String>,
     timeout: Duration,
 ) -> PtyOutcome {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let pty_system = native_pty_system();
 
@@ -647,7 +653,10 @@ fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
     }
 
     if exit_code != 0 {
-        ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
+        ToolResult::error(format!(
+            "Command exited with code {}\n{}",
+            exit_code, output
+        ))
     } else {
         ToolResult::success(output)
     }
@@ -660,10 +669,12 @@ fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
 #[async_trait]
 impl Tool for PtyBashTool {
     // Gates itself: calls `ctx.check_permission*` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_BASH
+        clawde_core::constants::TOOL_NAME_BASH
     }
 
     fn description(&self) -> &str {
@@ -786,8 +797,7 @@ impl Tool for PtyBashTool {
                     let cleaned = strip_ansi(&raw_output);
 
                     // Split into user-visible lines and state block
-                    let all_lines: Vec<String> =
-                        cleaned.lines().map(|l| l.to_string()).collect();
+                    let all_lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
 
                     let sentinel_pos = all_lines
                         .iter()
@@ -800,9 +810,7 @@ impl Tool for PtyBashTool {
 
                     // Update persistent shell state
                     if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(state_lines)
-                        {
+                        if let Some((new_cwd, env_delta)) = parse_shell_state_block(state_lines) {
                             let mut state = shell_state_arc.lock();
                             state.cwd = Some(new_cwd);
                             for (k, v) in env_delta {
@@ -829,9 +837,7 @@ impl Tool for PtyBashTool {
 
                     truncate_output(output, exit_code)
                 }
-                PtyOutcome::Failed(e) => {
-                    ToolResult::error(format!("PTY execution failed: {}", e))
-                }
+                PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
                 PtyOutcome::TimedOut => {
                     ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
                 }
@@ -858,9 +864,10 @@ mod tests {
         state
             .env_vars
             .insert("SECRET".to_string(), "topsecret".to_string());
-        state
-            .env_vars
-            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "aws-argv-leak".to_string());
+        state.env_vars.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "aws-argv-leak".to_string(),
+        );
 
         let base = PathBuf::from("/tmp");
         let script = build_wrapper_script("echo hi", &state, &base);
@@ -917,36 +924,36 @@ mod tests {
     /// Permission handler that allows everything — for exercising `execute`.
     struct AllowAllHandler;
 
-    impl claurst_core::permissions::PermissionHandler for AllowAllHandler {
+    impl clawde_core::permissions::PermissionHandler for AllowAllHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Allow
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
         }
 
         fn request_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Allow
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
         }
     }
 
     fn allow_all_context() -> ToolContext {
         ToolContext {
             working_dir: std::env::temp_dir(),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: std::sync::Arc::new(AllowAllHandler),
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "pty-bash-test".to_string(),
             file_history: std::sync::Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
-            config: claurst_core::config::Config::default(),
+            config: clawde_core::config::Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,
@@ -1029,13 +1036,11 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let result =
-            tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
         let elapsed = started.elapsed();
 
-        let result = result.expect(
-            "execute hung waiting on the detached grandchild's pty (regression of #184)",
-        );
+        let result = result
+            .expect("execute hung waiting on the detached grandchild's pty (regression of #184)");
         assert!(
             !result.is_error,
             "command should have succeeded, got: {}",

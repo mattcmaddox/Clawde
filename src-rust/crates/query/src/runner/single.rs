@@ -6,7 +6,7 @@ use crate::*;
 
 /// Run a single (non-agentic) query – no tool loop, just one API call.
 pub async fn run_single_query(
-    client: &claurst_api::AnthropicClient,
+    client: &clawde_api::AnthropicClient,
     messages: Vec<Message>,
     config: &QueryConfig,
 ) -> Result<Message, ClaudeError> {
@@ -18,7 +18,7 @@ pub async fn run_single_query(
         .system(system)
         .build();
 
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
+    let handler: Arc<dyn StreamHandler> = Arc::new(clawde_api::streaming::NullStreamHandler);
 
     let mut rx = client.create_message_stream(request, handler).await?;
     let mut acc = StreamAccumulator::new();

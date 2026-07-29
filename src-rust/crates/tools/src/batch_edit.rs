@@ -31,10 +31,12 @@ struct BatchEditInput {
 #[async_trait]
 impl Tool for BatchEditTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_BATCH_EDIT
+        clawde_core::constants::TOOL_NAME_BATCH_EDIT
     }
 
     fn description(&self) -> &str {
@@ -226,9 +228,11 @@ impl Tool for BatchEditTool {
                     // rollback in reverse order to preserve original file state
                     for (rb_path, rb_original, rb_new_content) in unique_writings[0..i].iter().rev()
                     {
-                        if let Err(re) =
-                            crate::write_atomic(std::path::Path::new(rb_path), rb_original.as_bytes())
-                                .await
+                        if let Err(re) = crate::write_atomic(
+                            std::path::Path::new(rb_path),
+                            rb_original.as_bytes(),
+                        )
+                        .await
                         {
                             rollback_errors.push(format!("  rollback {}: {}", rb_path, re));
                         } else {
@@ -312,7 +316,7 @@ mod tests {
 
     /// #226: BatchEdit writes (and its rollback path) go through `write_atomic`.
     /// A successful multi-file batch must land the right content in every file
-    /// and leave no `.claurst-tmp-*` scratch file behind. Because each file is
+    /// and leave no `.clawde-tmp-*` scratch file behind. Because each file is
     /// swapped in atomically via rename, a mid-write crash can never leave one
     /// of these files partially written — so the rollback only ever has to
     /// restore fully-written files, never repair a torn one.
@@ -343,7 +347,7 @@ mod tests {
         let tmp_left = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
+            .any(|e| e.file_name().to_string_lossy().contains(".clawde-tmp-"));
         assert!(!tmp_left, "atomic write must not leave a temp file behind");
     }
 }

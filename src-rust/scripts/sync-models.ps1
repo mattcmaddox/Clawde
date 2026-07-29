@@ -49,4 +49,4 @@ try {
 }
 
 Write-Host "Wrote $dest"
-Write-Host "Now run: cargo test -p claurst-api --lib model_registry"
+Write-Host "Now run: cargo test -p clawde-api --lib model_registry"

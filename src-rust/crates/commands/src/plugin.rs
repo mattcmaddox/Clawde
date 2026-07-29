@@ -23,12 +23,36 @@ impl SlashCommand for PluginCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "list".into(), description: "List all installed plugins".into(), available: true },
-            ArgCompletion { value: "reload".into(), description: "Reload plugins from disk".into(), available: true },
-            ArgCompletion { value: "info".into(), description: "Show detailed info about a plugin".into(), available: true },
-            ArgCompletion { value: "enable".into(), description: "Enable a plugin".into(), available: true },
-            ArgCompletion { value: "disable".into(), description: "Disable a plugin".into(), available: true },
-            ArgCompletion { value: "install".into(), description: "Install a plugin from a local directory".into(), available: true },
+            ArgCompletion {
+                value: "list".into(),
+                description: "List all installed plugins".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "reload".into(),
+                description: "Reload plugins from disk".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "info".into(),
+                description: "Show detailed info about a plugin".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "enable".into(),
+                description: "Enable a plugin".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "disable".into(),
+                description: "Disable a plugin".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "install".into(),
+                description: "Install a plugin from a local directory".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

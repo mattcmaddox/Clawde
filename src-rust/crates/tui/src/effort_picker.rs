@@ -1,7 +1,7 @@
 // effort_picker.rs — horizontal, model-adaptive Effort selector for `/effort`.
 //
 // A horizontal "Faster → Smarter" track (issue #268). The selectable levels are
-// model-adaptive: they come from `claurst_api::supported_efforts(provider,
+// model-adaptive: they come from `clawde_api::supported_efforts(provider,
 // model, registry)`, which returns the model's supported ladder (ascending) with
 // `Ultracode` always last. `Ultracode` is separated from the native levels by a
 // `│` divider and rendered specially.
@@ -24,7 +24,7 @@
 // highlighted; the top native tier (`max`, or `xhigh` on models that don't
 // expose `max`) is a per-character SOFT, DIFFUSED rainbow that gently animates
 // with `frame_count` — so when a model exposes both, only `max` shimmers and
-// `xhigh` stays a plain highlight; and `ultracode`, when selected, paints a bold claurst-red
+// `xhigh` stays a plain highlight; and `ultracode`, when selected, paints a bold clawde-red
 // spectrum-analyzer audio wave as a background-color gradient (glowing bar tips,
 // so text still sits cleanly on top, no cut-out boxes) framed by a gently
 // breathing red outline.
@@ -35,6 +35,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
+use std::cell::Cell;
 
 use crate::model_picker::EffortLevel;
 
@@ -77,6 +78,8 @@ const SEP: usize = 3;
 /// Interactive state for the horizontal `/effort` selector.
 #[derive(Debug, Default, Clone)]
 pub struct EffortPickerState {
+    /// The area used by this picker in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     pub visible: bool,
     /// The model-adaptive ordered ladder (ascending, `Ultracode` last).
     pub levels: Vec<EffortLevel>,
@@ -90,7 +93,7 @@ impl EffortPickerState {
     }
 
     /// Open the picker for the `current` effort, using `levels` as the
-    /// model-adaptive ladder (as returned by `claurst_api::supported_efforts`).
+    /// model-adaptive ladder (as returned by `clawde_api::supported_efforts`).
     ///
     /// If `levels` is empty a sane default ladder is used. The selection is
     /// placed on `current` if present, otherwise on the nearest level at or below
@@ -202,6 +205,7 @@ pub fn render_effort_picker(
     frame_count: u64,
 ) {
     if !state.visible || state.levels.is_empty() || area.width < 4 || area.height < 3 {
+        state.last_rect.set(area);
         return;
     }
     let selected = state.selected.min(state.levels.len() - 1);
@@ -265,15 +269,36 @@ pub fn render_effort_picker(
     let controls_row = inner.height.saturating_sub(1);
 
     // Faster / Smarter ends, spanning the full usable width.
-    blit_str(buf, x0, row(0), "Faster", Style::default().fg(FASTER_FG), inner);
+    blit_str(
+        buf,
+        x0,
+        row(0),
+        "Faster",
+        Style::default().fg(FASTER_FG),
+        inner,
+    );
     let smarter = "Smarter";
     let sm_x = x0 + usable.saturating_sub(smarter.chars().count() as u16);
     let smarter_fg = if on_spectrum { LABEL_ON_WAVE } else { RED_DIM };
-    blit_str(buf, sm_x, row(0), smarter, Style::default().fg(smarter_fg), inner);
+    blit_str(
+        buf,
+        sm_x,
+        row(0),
+        smarter,
+        Style::default().fg(smarter_fg),
+        inner,
+    );
 
     // Full-width track line.
     for dx in 0..usable {
-        set_cell(buf, x0 + dx, row(1), '\u{2500}', Style::default().fg(TRACK_FG), inner);
+        set_cell(
+            buf,
+            x0 + dx,
+            row(1),
+            '\u{2500}',
+            Style::default().fg(TRACK_FG),
+            inner,
+        );
     }
 
     // Level labels (centered track).
@@ -319,7 +344,14 @@ pub fn render_effort_picker(
     }
 
     // Controls hint, anchored to the bottom inner row.
-    blit_str(buf, x0, row(controls_row), CONTROLS, Style::default().fg(text_fg), inner);
+    blit_str(
+        buf,
+        x0,
+        row(controls_row),
+        CONTROLS,
+        Style::default().fg(text_fg),
+        inner,
+    );
 }
 
 /// Whether a level should get the per-character shimmering rainbow treatment.
@@ -367,7 +399,10 @@ fn layout_labels(
             if !first {
                 col += SEP;
             }
-            placed.push((col, Span::styled("\u{2502}".to_string(), Style::default().fg(TRACK_FG))));
+            placed.push((
+                col,
+                Span::styled("\u{2502}".to_string(), Style::default().fg(TRACK_FG)),
+            ));
             col += 1;
             first = false;
         }
@@ -423,7 +458,9 @@ fn styled_label(
     }
     vec![Span::styled(
         text.to_string(),
-        Style::default().fg(SELECTED_FG).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(SELECTED_FG)
+            .add_modifier(Modifier::BOLD),
     )]
 }
 
@@ -505,7 +542,9 @@ fn level_description(level: EffortLevel, levels: &[EffortLevel]) -> String {
             .to_string(),
         EffortLevel::Ultracode => {
             let top = top_native_label(levels);
-            format!("{top} + workflows: bounded delegation across native primitives with verification.")
+            format!(
+                "{top} + workflows: bounded delegation across native primitives with verification."
+            )
         }
     }
 }
@@ -598,8 +637,8 @@ fn paint_spectrum(buf: &mut Buffer, inner: Rect, frame_count: u64) {
         let x = inner.left() + gx;
         for r in 0..inner.height {
             let rf = r as f32; // rows up from the bottom (0 = bottom)
-            // The field: a dim red below the crest (a touch brighter near it) and
-            // a darker wash above — always low so text stays dominant.
+                               // The field: a dim red below the crest (a touch brighter near it) and
+                               // a darker wash above — always low so text stays dominant.
             let field = if rf <= crest {
                 let depth = (crest - rf) / crest.max(1.0); // 0 at crest -> 1 at base
                 0.30 - 0.12 * depth
@@ -628,13 +667,12 @@ fn paint_spectrum(buf: &mut Buffer, inner: Rect, frame_count: u64) {
 fn spectrum_amp(gx: u16, frame: u64) -> f32 {
     let fx = gx as f32;
     let t = frame as f32;
-    let a = 0.60 * (fx * 0.28 - t * 0.055).sin()
-        + 0.40 * (fx * 0.13 + t * 0.035 + 1.1).sin();
+    let a = 0.60 * (fx * 0.28 - t * 0.055).sin() + 0.40 * (fx * 0.13 + t * 0.035 + 1.1).sin();
     // Map the [-1, 1] wave into [0.25, 0.85] of the panel height.
     0.25 + 0.60 * (0.5 + 0.5 * a)
 }
 
-/// A claurst-red whose brightness scales with `lit` in `[0, 1]`: a deep-red wash
+/// A clawde-red whose brightness scales with `lit` in `[0, 1]`: a deep-red wash
 /// at the base brightening to a vivid claurst red at the crest. Used as a
 /// BACKGROUND color for the wave (so it can be richly red while text stays
 /// readable on top). Always red-dominant (`r > g` and `r > b`) — never purple.
@@ -673,6 +711,7 @@ mod tests {
             visible: true,
             levels,
             selected,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -769,7 +808,10 @@ mod tests {
         let mut s2 = EffortPickerState::new();
         s2.open(EffortLevel::XHigh, xhigh_top_ladder());
         assert_eq!(s2.current(), EffortLevel::XHigh);
-        assert!(s2.wants_animation(), "xhigh shimmers when it is the top tier");
+        assert!(
+            s2.wants_animation(),
+            "xhigh shimmers when it is the top tier"
+        );
     }
 
     #[test]
@@ -788,9 +830,15 @@ mod tests {
         let y = label_y as u16;
         let c0 = a.cell((start as u16, y)).unwrap().fg;
         let c1 = a.cell((start as u16 + 1, y)).unwrap().fg;
-        assert_ne!(c0, c1, "top-tier xhigh rainbow chars must differ: {c0:?} vs {c1:?}");
+        assert_ne!(
+            c0, c1,
+            "top-tier xhigh rainbow chars must differ: {c0:?} vs {c1:?}"
+        );
         let cb = b.cell((start as u16, y)).unwrap().fg;
-        assert_ne!(c0, cb, "top-tier xhigh rainbow should animate: {c0:?} vs {cb:?}");
+        assert_ne!(
+            c0, cb,
+            "top-tier xhigh rainbow should animate: {c0:?} vs {cb:?}"
+        );
 
         // Ladder WITH max: xhigh is no longer the top → plain solid highlight
         // (all chars share one color; the rainbow is reserved for max).
@@ -805,7 +853,10 @@ mod tests {
         let y2 = ly2 as u16;
         let d0 = f.cell((sx as u16, y2)).unwrap().fg;
         let d1 = f.cell((sx as u16 + 1, y2)).unwrap().fg;
-        assert_eq!(d0, d1, "xhigh with max present should be a solid color: {d0:?} vs {d1:?}");
+        assert_eq!(
+            d0, d1,
+            "xhigh with max present should be a solid color: {d0:?} vs {d1:?}"
+        );
     }
 
     #[test]
@@ -837,7 +888,12 @@ mod tests {
         // fill exactly that rect (full width at the docked y), NOT be centered.
         let state = state_with(full_ladder(), 5); // ultracode
         let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        let area = Rect { x: 0, y: 5, width: 60, height: DOCK_HEIGHT };
+        let area = Rect {
+            x: 0,
+            y: 5,
+            width: 60,
+            height: DOCK_HEIGHT,
+        };
         terminal
             .draw(|f| render_effort_picker(f, &state, area, 0))
             .unwrap();
@@ -845,16 +901,35 @@ mod tests {
 
         // Border corners sit exactly on the rect edges — a bottom-docked panel,
         // not a small centered modal.
-        assert_eq!(buf.cell((0, 5)).unwrap().symbol(), "\u{250c}", "top-left at rect origin");
-        assert_eq!(buf.cell((59, 5)).unwrap().symbol(), "\u{2510}", "top-right at rect edge");
-        assert_eq!(buf.cell((0, 13)).unwrap().symbol(), "\u{2514}", "bottom-left at rect bottom");
-        assert_eq!(buf.cell((59, 13)).unwrap().symbol(), "\u{2518}", "bottom-right at rect corner");
+        assert_eq!(
+            buf.cell((0, 5)).unwrap().symbol(),
+            "\u{250c}",
+            "top-left at rect origin"
+        );
+        assert_eq!(
+            buf.cell((59, 5)).unwrap().symbol(),
+            "\u{2510}",
+            "top-right at rect edge"
+        );
+        assert_eq!(
+            buf.cell((0, 13)).unwrap().symbol(),
+            "\u{2514}",
+            "bottom-left at rect bottom"
+        );
+        assert_eq!(
+            buf.cell((59, 13)).unwrap().symbol(),
+            "\u{2518}",
+            "bottom-right at rect corner"
+        );
 
         // Nothing is drawn above the docked rect (a centered modal would).
         let top_row: String = (0..60)
             .map(|x| buf.cell((x, 0)).unwrap().symbol().to_string())
             .collect();
-        assert!(top_row.trim().is_empty(), "no content above the dock: {top_row:?}");
+        assert!(
+            top_row.trim().is_empty(),
+            "no content above the dock: {top_row:?}"
+        );
 
         // The selector content is present within the panel.
         let rows = buffer_rows(&buf);
@@ -875,7 +950,10 @@ mod tests {
             .expect("label row present");
 
         for lbl in ["low", "medium", "high", "xhigh", "max"] {
-            assert!(label_row.contains(lbl), "labels row missing {lbl}: {label_row:?}");
+            assert!(
+                label_row.contains(lbl),
+                "labels row missing {lbl}: {label_row:?}"
+            );
         }
         // A divider must sit between `max` and `ultracode`.
         let max_end = label_row.find("max").unwrap() + "max".len();
@@ -926,9 +1004,18 @@ mod tests {
         let colors: Vec<Color> = (0..3u16)
             .map(|dx| buf.cell((start as u16 + dx, y)).expect("max cell").fg)
             .collect();
-        assert_ne!(colors[0], colors[1], "rainbow chars must differ: {colors:?}");
-        assert_ne!(colors[1], colors[2], "rainbow chars must differ: {colors:?}");
-        assert_ne!(colors[0], colors[2], "rainbow chars must differ: {colors:?}");
+        assert_ne!(
+            colors[0], colors[1],
+            "rainbow chars must differ: {colors:?}"
+        );
+        assert_ne!(
+            colors[1], colors[2],
+            "rainbow chars must differ: {colors:?}"
+        );
+        assert_ne!(
+            colors[0], colors[2],
+            "rainbow chars must differ: {colors:?}"
+        );
     }
 
     #[test]
@@ -946,7 +1033,10 @@ mod tests {
         let y = label_y as u16;
         let ca = a.cell((start as u16, y)).unwrap().fg;
         let cb = b.cell((start as u16, y)).unwrap().fg;
-        assert_ne!(ca, cb, "max rainbow should animate between frames {ca:?} vs {cb:?}");
+        assert_ne!(
+            ca, cb,
+            "max rainbow should animate between frames {ca:?} vs {cb:?}"
+        );
     }
 
     #[test]
@@ -956,7 +1046,10 @@ mod tests {
         for lit in [0.0f32, 0.35, 0.6, 1.0] {
             match red_shade(lit) {
                 Color::Rgb(r, g, b) => {
-                    assert!(r > g && r > b, "shade must be red-dominant: {r},{g},{b} @ {lit}")
+                    assert!(
+                        r > g && r > b,
+                        "shade must be red-dominant: {r},{g},{b} @ {lit}"
+                    )
                 }
                 other => panic!("expected Rgb, got {other:?}"),
             }

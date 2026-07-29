@@ -210,8 +210,16 @@ impl SlashCommand for LinksCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "list".into(), description: "Print a numbered list of all URLs".into(), available: true },
-            ArgCompletion { value: "last".into(), description: "Open the most recent URL".into(), available: true },
+            ArgCompletion {
+                value: "list".into(),
+                description: "Print a numbered list of all URLs".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "last".into(),
+                description: "Open the most recent URL".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

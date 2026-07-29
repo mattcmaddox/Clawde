@@ -1,20 +1,21 @@
 [package]
-name = "claurst-commands"
+name = "clawde-commands"
 version.workspace = true
+description = "Slash command system implementing /help, /clear, /compact, /model, /config, and many other commands"
 edition.workspace = true
 
 [features]
 # Pass-through features from cc-core
-ultraplan = ["claurst-core/ultraplan"]
+ultraplan = ["clawde-core/ultraplan"]
 
 [dependencies]
-claurst-core = { workspace = true }
-claurst-api = { workspace = true }
-claurst-tools = { workspace = true }
-claurst-query = { workspace = true }
-claurst-mcp = { workspace = true }
-claurst-tui = { workspace = true }
-claurst-plugins = { workspace = true }
+clawde-core = { workspace = true }
+clawde-api = { workspace = true }
+clawde-tools = { workspace = true }
+clawde-query = { workspace = true }
+clawde-mcp = { workspace = true }
+clawde-tui = { workspace = true }
+clawde-plugins = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,7 +30,7 @@ arboard = { version = "3", default-features = false }
 urlencoding = { workspace = true }
 open = { workspace = true }
 qrcode = { workspace = true }
-claurst-bridge = { workspace = true }
+clawde-bridge = { workspace = true }
 hostname = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures = { workspace = true }

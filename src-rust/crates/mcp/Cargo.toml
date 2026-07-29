@@ -1,10 +1,11 @@
 [package]
-name = "claurst-mcp"
+name = "clawde-mcp"
 version.workspace = true
+description = "Model Context Protocol (MCP) client for connecting to MCP servers that expose tools and resources"
 edition.workspace = true
 
 [dependencies]
-claurst-core = { workspace = true }
+clawde-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

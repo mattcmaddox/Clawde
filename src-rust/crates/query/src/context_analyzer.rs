@@ -2,7 +2,7 @@
 //! Mirrors src/utils/analyzeContext.ts (1,382 lines).
 //! Used by the /ctx-viz slash command.
 
-use claurst_core::types::{ContentBlock, Message, MessageContent};
+use clawde_core::types::{ContentBlock, Message, MessageContent};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -69,7 +69,10 @@ pub enum CompactionStrategy {
     /// Full history compaction — all messages summarised.
     FullCompact { expected_reduction_pct: f64 },
     /// Partial compaction — only oldest N messages.
-    PartialCompact { messages_to_compact: usize, expected_reduction_pct: f64 },
+    PartialCompact {
+        messages_to_compact: usize,
+        expected_reduction_pct: f64,
+    },
     /// Collapse repeated file reads.
     CollapseReads { expected_reduction_pct: f64 },
     /// Nothing needed.
@@ -87,29 +90,33 @@ fn estimate_chars(s: &str) -> u64 {
 fn content_tokens(content: &MessageContent) -> u64 {
     match content {
         MessageContent::Text(s) => estimate_chars(s),
-        MessageContent::Blocks(blocks) => {
-            blocks.iter().map(|b| match b {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .map(|b| match b {
                 ContentBlock::Text { text } => estimate_chars(text),
                 ContentBlock::Thinking { thinking, .. } => estimate_chars(thinking),
                 ContentBlock::ToolUse { name, input, .. } => {
                     estimate_chars(name) + estimate_chars(&input.to_string())
                 }
                 ContentBlock::ToolResult { content, .. } => {
-                    use claurst_core::types::ToolResultContent;
+                    use clawde_core::types::ToolResultContent;
                     match content {
                         ToolResultContent::Text(t) => estimate_chars(t),
-                        ToolResultContent::Blocks(inner) => inner.iter().map(|ib| {
-                            if let ContentBlock::Text { text } = ib {
-                                estimate_chars(text)
-                            } else {
-                                10
-                            }
-                        }).sum(),
+                        ToolResultContent::Blocks(inner) => inner
+                            .iter()
+                            .map(|ib| {
+                                if let ContentBlock::Text { text } = ib {
+                                    estimate_chars(text)
+                                } else {
+                                    10
+                                }
+                            })
+                            .sum(),
                     }
                 }
                 _ => 10,
-            }).sum()
-        }
+            })
+            .sum(),
     }
 }
 
@@ -217,8 +224,14 @@ pub fn suggest_compaction(analysis: &ContextAnalysis, context_limit: u64) -> Com
 pub fn format_ctx_viz(analysis: &ContextAnalysis, context_limit: u64) -> String {
     let categories = [
         (ContextCategory::SystemPrompt, analysis.system_prompt_tokens),
-        (ContextCategory::ToolDefinitions, analysis.tool_definitions_tokens),
-        (ContextCategory::ConversationHistory, analysis.conversation_history_tokens),
+        (
+            ContextCategory::ToolDefinitions,
+            analysis.tool_definitions_tokens,
+        ),
+        (
+            ContextCategory::ConversationHistory,
+            analysis.conversation_history_tokens,
+        ),
         (ContextCategory::ToolResults, analysis.tool_results_tokens),
         (ContextCategory::Attachments, analysis.attachments_tokens),
     ];
@@ -260,7 +273,7 @@ pub fn format_ctx_viz(analysis: &ContextAnalysis, context_limit: u64) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, MessageContent, Role};
+    use clawde_core::types::{Message, MessageContent, Role};
 
     fn text_msg(role: Role, text: &str) -> Message {
         Message {

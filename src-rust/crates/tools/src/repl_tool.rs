@@ -14,7 +14,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
+use clawde_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -107,8 +107,8 @@ async fn get_or_spawn_session(
     }
 
     // Spawn a new interpreter
-    let (cmd, args) = interpreter_for(language)
-        .ok_or_else(|| format!("Unsupported language: {}", language))?;
+    let (cmd, args) =
+        interpreter_for(language).ok_or_else(|| format!("Unsupported language: {}", language))?;
 
     let mut child = tokio::process::Command::new(cmd)
         .args(&args)
@@ -203,7 +203,9 @@ struct ReplInput {
 #[async_trait]
 impl Tool for ReplTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "REPL"
@@ -243,11 +245,7 @@ impl Tool for ReplTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let language = params
-            .language
-            .as_deref()
-            .unwrap_or("bash")
-            .to_lowercase();
+        let language = params.language.as_deref().unwrap_or("bash").to_lowercase();
 
         // ── Security gate (issue #209) ───────────────────────────────────────
         // REPL executes arbitrary, model-supplied code in a live interpreter, so
@@ -256,7 +254,12 @@ impl Tool for ReplTool {
         // on our behalf, so we gate here.  `is_read_only = false` ensures the
         // action is treated as arbitrary execution (never auto-approved in
         // Default/Plan/AcceptEdits modes).
-        let preview: String = params.code.chars().take(80).collect::<String>().replace('\n', " ");
+        let preview: String = params
+            .code
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .replace('\n', " ");
         let reason = format!("REPL ({}): {}", language, preview);
         if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
             return ToolResult::error(e.to_string());
@@ -306,57 +309,57 @@ mod tests {
     /// Handler that always asks; combined with `non_interactive = true` this
     /// resolves to a permission denial (mirrors `AskPermissionHandler` in lib.rs).
     struct DenyHandler;
-    impl claurst_core::permissions::PermissionHandler for DenyHandler {
+    impl clawde_core::permissions::PermissionHandler for DenyHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Ask {
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Ask {
                 reason: "denied in test".to_string(),
             }
         }
         fn request_permission(
             &self,
-            request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
             self.check_permission(request)
         }
     }
 
     /// Handler that allows everything — used to exercise the Critical-block path.
     struct AllowHandler;
-    impl claurst_core::permissions::PermissionHandler for AllowHandler {
+    impl clawde_core::permissions::PermissionHandler for AllowHandler {
         fn check_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Allow
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
         }
         fn request_permission(
             &self,
-            _request: &claurst_core::permissions::PermissionRequest,
-        ) -> claurst_core::permissions::PermissionDecision {
-            claurst_core::permissions::PermissionDecision::Allow
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
         }
     }
 
     fn ctx_with(
-        handler: Arc<dyn claurst_core::permissions::PermissionHandler>,
+        handler: Arc<dyn clawde_core::permissions::PermissionHandler>,
         session_id: &str,
     ) -> ToolContext {
         ToolContext {
             working_dir: std::env::temp_dir(),
-            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: claurst_core::cost::CostTracker::new(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: session_id.to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                claurst_core::file_history::FileHistory::new(),
+                clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
             mcp_manager: None,
-            config: claurst_core::config::Config::default(),
+            config: clawde_core::config::Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,

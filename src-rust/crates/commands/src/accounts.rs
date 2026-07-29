@@ -27,10 +27,7 @@ impl SlashCommand for LoginCommand {
         // filter (which matches the full partial text) works correctly.
         if trimmed == "--label" || trimmed.starts_with("--label ") {
             let registry = clawde_core::accounts::AccountRegistry::load();
-            let after = trimmed
-                .strip_prefix("--label")
-                .unwrap_or("")
-                .trim();
+            let after = trimmed.strip_prefix("--label").unwrap_or("").trim();
             let mut results = Vec::new();
             for provider in [
                 clawde_core::accounts::PROVIDER_ANTHROPIC,
@@ -38,10 +35,7 @@ impl SlashCommand for LoginCommand {
             ] {
                 for profile in registry.list(provider) {
                     if after.is_empty()
-                        || profile
-                            .id
-                            .to_lowercase()
-                            .starts_with(&after.to_lowercase())
+                        || profile.id.to_lowercase().starts_with(&after.to_lowercase())
                     {
                         results.push(ArgCompletion {
                             value: format!("--label {}", profile.id),
@@ -60,9 +54,21 @@ impl SlashCommand for LoginCommand {
 
         // Otherwise offer the flags.
         vec![
-            ArgCompletion { value: "--console".into(), description: "Login with API key (Console)".into(), available: true },
-            ArgCompletion { value: "--codex".into(), description: "Login with ChatGPT/Codex account".into(), available: true },
-            ArgCompletion { value: "--label".into(), description: "Set a profile label for the saved account".into(), available: true },
+            ArgCompletion {
+                value: "--console".into(),
+                description: "Login with API key (Console)".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "--codex".into(),
+                description: "Login with ChatGPT/Codex account".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "--label".into(),
+                description: "Set a profile label for the saved account".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
@@ -122,8 +128,16 @@ impl SlashCommand for LogoutCommand {
 
         // Base flags always shown.
         let mut results: Vec<ArgCompletion> = vec![
-            ArgCompletion { value: "--codex".into(), description: "Log out the Codex account".into(), available: true },
-            ArgCompletion { value: "--all".into(), description: "Log out all accounts".into(), available: true },
+            ArgCompletion {
+                value: "--codex".into(),
+                description: "Log out the Codex account".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "--all".into(),
+                description: "Log out all accounts".into(),
+                available: true,
+            },
         ];
 
         // Show active Anthropic profile name as informational hint when no
@@ -327,7 +341,9 @@ impl SlashCommand for SwitchCommand {
                 })
                 .filter(|c| {
                     after.is_empty()
-                        || c.value.to_lowercase().starts_with(&format!("--codex {}", after))
+                        || c.value
+                            .to_lowercase()
+                            .starts_with(&format!("--codex {}", after))
                 })
                 .collect();
         }
@@ -436,8 +452,7 @@ mod tests {
                 providers: {
                     let mut pm = std::collections::BTreeMap::new();
 
-                    let mut anthropic =
-                        clawde_core::accounts::ProviderAccounts::default();
+                    let mut anthropic = clawde_core::accounts::ProviderAccounts::default();
                     anthropic.active = Some("work".to_string());
                     anthropic.profiles.insert(
                         "work".to_string(),
@@ -456,13 +471,11 @@ mod tests {
                         },
                     );
                     pm.insert(
-                        clawde_core::accounts::PROVIDER_ANTHROPIC
-                            .to_string(),
+                        clawde_core::accounts::PROVIDER_ANTHROPIC.to_string(),
                         anthropic,
                     );
 
-                    let mut codex =
-                        clawde_core::accounts::ProviderAccounts::default();
+                    let mut codex = clawde_core::accounts::ProviderAccounts::default();
                     codex.active = Some("gpt".to_string());
                     codex.profiles.insert(
                         "gpt".to_string(),
@@ -472,11 +485,7 @@ mod tests {
                             ..Default::default()
                         },
                     );
-                    pm.insert(
-                        clawde_core::accounts::PROVIDER_CODEX
-                            .to_string(),
-                        codex,
-                    );
+                    pm.insert(clawde_core::accounts::PROVIDER_CODEX.to_string(), codex);
                     pm
                 },
             };
@@ -544,9 +553,18 @@ mod tests {
         let completions = cmd.arg_completions("--label wo");
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         // Should only match "work" (starts with "wo")
-        assert!(values.contains(&"--label work"), "expected --label work to match");
-        assert!(!values.contains(&"--label pro"), "pro should not match 'wo'");
-        assert!(!values.contains(&"--label gpt"), "gpt should not match 'wo'");
+        assert!(
+            values.contains(&"--label work"),
+            "expected --label work to match"
+        );
+        assert!(
+            !values.contains(&"--label pro"),
+            "pro should not match 'wo'"
+        );
+        assert!(
+            !values.contains(&"--label gpt"),
+            "gpt should not match 'wo'"
+        );
     }
 
     #[test]
@@ -572,9 +590,16 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"--codex"), "should offer --codex flag");
         assert!(values.contains(&"work"), "should list Anthropic profiles");
-        assert!(values.contains(&"pro"), "should list both Anthropic profiles");
+        assert!(
+            values.contains(&"pro"),
+            "should list both Anthropic profiles"
+        );
         assert!(!values.contains(&"gpt"), "should NOT list Codex profiles");
-        assert_eq!(completions.len(), 3, "expected --codex + 2 Anthropic profiles");
+        assert_eq!(
+            completions.len(),
+            3,
+            "expected --codex + 2 Anthropic profiles"
+        );
     }
 
     #[test]
@@ -588,10 +613,22 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         // The method returns --codex + all Anthropic profiles; prefix
         // filtering happens at the get_arg_completions layer.
-        assert!(values.contains(&"--codex"), "raw arg_completions always includes flag");
-        assert!(values.contains(&"work"), "raw results include all Anthropic profiles");
-        assert!(values.contains(&"pro"), "raw results include all Anthropic profiles");
-        assert!(values.len() >= 3, "expected at least 3 items (flag + 2 profiles)");
+        assert!(
+            values.contains(&"--codex"),
+            "raw arg_completions always includes flag"
+        );
+        assert!(
+            values.contains(&"work"),
+            "raw results include all Anthropic profiles"
+        );
+        assert!(
+            values.contains(&"pro"),
+            "raw results include all Anthropic profiles"
+        );
+        assert!(
+            values.len() >= 3,
+            "expected at least 3 items (flag + 2 profiles)"
+        );
     }
 
     #[test]
@@ -600,9 +637,18 @@ mod tests {
         let cmd = SwitchCommand;
         let completions = cmd.arg_completions("--codex");
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-        assert!(values.contains(&"--codex gpt"), "should return prefixed Codex profile");
-        assert!(!values.contains(&"--codex"), "should NOT return bare --codex flag");
-        assert!(!values.contains(&"work"), "should NOT return Anthropic profiles");
+        assert!(
+            values.contains(&"--codex gpt"),
+            "should return prefixed Codex profile"
+        );
+        assert!(
+            !values.contains(&"--codex"),
+            "should NOT return bare --codex flag"
+        );
+        assert!(
+            !values.contains(&"work"),
+            "should NOT return Anthropic profiles"
+        );
         assert_eq!(completions.len(), 1, "expected exactly 1 Codex profile");
     }
 
@@ -638,11 +684,17 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"--codex"), "should offer --codex flag");
         assert!(values.contains(&"--all"), "should offer --all flag");
-        assert!(values.contains(&"work"), "should show active Anthropic profile");
+        assert!(
+            values.contains(&"work"),
+            "should show active Anthropic profile"
+        );
         // The active hint should be dimmed (not selectable)
         let work_hint = completions.iter().find(|c| c.value == "work").unwrap();
         assert!(!work_hint.available, "active hint should be dimmed");
-        assert!(!values.contains(&"gpt"), "should NOT show active Codex profile");
+        assert!(
+            !values.contains(&"gpt"),
+            "should NOT show active Codex profile"
+        );
         assert_eq!(completions.len(), 3, "expected 2 flags + 1 active hint");
     }
 
@@ -657,7 +709,10 @@ mod tests {
         assert!(values.contains(&"gpt"), "should show active Codex profile");
         let gpt_hint = completions.iter().find(|c| c.value == "gpt").unwrap();
         assert!(!gpt_hint.available, "Codex hint should be dimmed");
-        assert!(!values.contains(&"work"), "should NOT show Anthropic profile");
+        assert!(
+            !values.contains(&"work"),
+            "should NOT show Anthropic profile"
+        );
         // 2 flags + 1 codex hint = 3. (--all stays because arg_completions adds
         // it unconditionally; get_arg_completions would filter it out.)
         assert_eq!(completions.len(), 3, "expected 2 flags + 1 codex hint");

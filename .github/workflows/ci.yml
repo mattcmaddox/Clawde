@@ -2,27 +2,77 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - 'src-rust/**'
+      - '.github/workflows/ci.yml'
   pull_request:
-    branches: [ main ]
+    branches: [main]
+    paths:
+      - 'src-rust/**'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
-    name: Build and Test
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
+          components: clippy, rustfmt
 
-      - name: Build Clawde
-        run: cargo build --workspace --all
+      # ALSA headers for the voice feature's cpal dependency (same setup as
+      # release.yml). cmake — required by btls-sys/BoringSSL via wreq — is
+      # preinstalled on all GitHub-hosted runners.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: ci-${{ matrix.os }}-cargo-${{ hashFiles('src-rust/Cargo.lock') }}
+          restore-keys: ci-${{ matrix.os }}-cargo-
 
       - name: Run tests
-        run: cargo test --workspace --all
+        working-directory: src-rust
+        # Run serially: a number of tests mutate process-global state (env vars
+        # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
+        # parallel execution, flaking non-deterministically across runners.
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      # Advisory for now: the codebase has pre-existing clippy warnings and
+      # rustfmt drift. Flip continue-on-error off once they are cleaned up.
+      - name: Clippy (advisory)
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: rustfmt (advisory)
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        continue-on-error: true
+        run: cargo fmt --all --check

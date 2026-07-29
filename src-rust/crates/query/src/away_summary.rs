@@ -6,8 +6,8 @@
 // `generate_away_summary` to get a short 1-3 sentence recap of what was
 // happening before they left.
 
-use claurst_api::{AnthropicClient, CreateMessageRequest};
-use claurst_core::types::Message;
+use clawde_api::{AnthropicClient, CreateMessageRequest};
+use clawde_core::types::Message;
 use tokio_util::sync::CancellationToken;
 
 /// Recap only needs recent context — truncate to avoid "prompt too long" on
@@ -91,8 +91,10 @@ pub async fn generate_away_summary(
     let conversation = crate::sanitize::sanitize_history(conversation);
 
     // Convert to API messages.
-    let api_messages: Vec<claurst_api::ApiMessage> =
-        conversation.iter().map(claurst_api::ApiMessage::from).collect();
+    let api_messages: Vec<clawde_api::ApiMessage> = conversation
+        .iter()
+        .map(clawde_api::ApiMessage::from)
+        .collect();
 
     let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
         .messages(api_messages)
@@ -138,7 +140,10 @@ mod tests {
     #[test]
     fn default_config_uses_haiku() {
         let cfg = AwaySummaryConfig::default();
-        assert!(cfg.model.contains("haiku"), "default model should be a Haiku variant");
+        assert!(
+            cfg.model.contains("haiku"),
+            "default model should be a Haiku variant"
+        );
         assert_eq!(cfg.max_tokens, 300);
     }
 

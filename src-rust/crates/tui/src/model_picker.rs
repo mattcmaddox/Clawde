@@ -16,21 +16,20 @@ use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
 
 /// The effort level shown by the /model and /effort pickers.
 ///
-/// This is a re-export of the single canonical [`claurst_core::effort::EffortLevel`]
+/// This is a re-export of the single canonical [`clawde_core::effort::EffortLevel`]
 /// (`Low, Medium, High, XHigh, Max, Ultracode`). The former TUI-local enum's
 /// `Normal` variant is now [`EffortLevel::Medium`]; `symbol()`, `label()`,
 /// `next()`, and `prev()` all live on the core enum. Effort controls the
 /// extended-thinking budget / reasoning-effort sent to the API; only models that
 /// support reasoning honour it.
-pub use claurst_core::effort::EffortLevel;
-
+pub use clawde_core::effort::EffortLevel;
 
 // ---------------------------------------------------------------------------
 // Model capability helpers — driven by the opencode variants() ladder
 // ---------------------------------------------------------------------------
 //
 // Both the /effort command and this /model picker now derive their effort
-// tiers from the single source of truth, `claurst_api::variant_ladder`
+// tiers from the single source of truth, `clawde_api::variant_ladder`
 // (a faithful port of opencode's `ProviderTransform.variants()`), instead of
 // the old name-string heuristics that disagreed between the two surfaces.
 
@@ -42,9 +41,9 @@ pub use claurst_core::effort::EffortLevel;
 /// snapshot here. The `/effort` command path (`app.rs`) passes the *live*
 /// registry and is therefore exact; both funnel through the same port, so they
 /// agree tier-for-tier for every catalog model.
-fn picker_registry() -> &'static claurst_api::ModelRegistry {
-    static REG: std::sync::OnceLock<claurst_api::ModelRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(claurst_api::ModelRegistry::new)
+fn picker_registry() -> &'static clawde_api::ModelRegistry {
+    static REG: std::sync::OnceLock<clawde_api::ModelRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(clawde_api::ModelRegistry::new)
 }
 
 /// The reasoning-effort ladder (ascending, no ultracode) a model exposes, per
@@ -64,7 +63,7 @@ fn picker_variant_ladder(id: &str) -> Vec<EffortLevel> {
             .map(|p| p.to_string())
             .unwrap_or_default(),
     };
-    claurst_api::variant_ladder(&provider, id, Some(reg))
+    clawde_api::variant_ladder(&provider, id, Some(reg))
 }
 
 /// Returns `true` when the model exposes more than one reasoning-effort tier —
@@ -130,7 +129,11 @@ pub fn format_context_window(context_window: u32) -> String {
 /// Format a model display line with optional context window and cost info.
 ///
 /// Example: `"gpt-4o  128K ctx  $5.00/M"`
-pub fn format_model_line(model_str: &str, context_window: Option<u32>, cost_per_1m: Option<f64>) -> String {
+pub fn format_model_line(
+    model_str: &str,
+    context_window: Option<u32>,
+    cost_per_1m: Option<f64>,
+) -> String {
     let mut parts = vec![model_str.to_string()];
     if let Some(ctx) = context_window {
         parts.push(format_context_window(ctx).replace(" context", " ctx"));
@@ -247,7 +250,7 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
 /// picker isn't blank.
 pub fn models_for_provider_from_registry(
     provider_id: &str,
-    registry: &claurst_api::ModelRegistry,
+    registry: &clawde_api::ModelRegistry,
 ) -> Vec<ModelEntry> {
     // "free" is the composite Zen → OpenRouter provider; the upstream
     // models.dev catalog has nothing under this id, so serve a curated list
@@ -324,7 +327,7 @@ pub fn models_for_provider_from_registry(
 /// a synthetic `free/auto` default that the wrapper translates per upstream.
 pub fn default_model_for_provider(
     provider_id: &str,
-    registry: &claurst_api::ModelRegistry,
+    registry: &clawde_api::ModelRegistry,
 ) -> String {
     if provider_id == "free" {
         return "free/auto".to_string();
@@ -336,7 +339,7 @@ pub fn default_model_for_provider(
         return format!(
             "{}/{}",
             provider_id,
-            claurst_core::codex_oauth::DEFAULT_CODEX_MODEL
+            clawde_core::codex_oauth::DEFAULT_CODEX_MODEL
         );
     }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
@@ -404,11 +407,11 @@ fn is_codex_provider(provider_id: &str) -> bool {
 /// 400K limit. Falls back to the curated [`CODEX_MODELS`] constant only if the
 /// catalog yields nothing (e.g. an empty/old snapshot).
 ///
-/// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
-fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
-    use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
+/// [`codex_model_allowed`]: clawde_core::codex_oauth::codex_model_allowed
+fn codex_provider_models(registry: &clawde_api::ModelRegistry) -> Vec<ModelEntry> {
+    use clawde_core::codex_oauth::{codex_limit_override, codex_model_allowed};
 
-    let mut entries: Vec<&claurst_api::ModelEntry> = registry
+    let mut entries: Vec<&clawde_api::ModelEntry> = registry
         .list_by_provider("openai")
         .into_iter()
         .filter(|e| codex_model_allowed(&e.info.id))
@@ -450,8 +453,8 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
 
 /// Static fallback used when the models.dev `openai` catalog is unavailable.
 fn codex_fallback_models() -> Vec<ModelEntry> {
-    use claurst_core::codex_oauth::codex_limit_override;
-    claurst_core::codex_oauth::CODEX_MODELS
+    use clawde_core::codex_oauth::codex_limit_override;
+    clawde_core::codex_oauth::CODEX_MODELS
         .iter()
         .map(|(id, name)| {
             let ctx = codex_limit_override(id)
@@ -481,7 +484,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
         is_current: false,
     }];
 
-    for upstream in claurst_api::FREE_CATALOG {
+    for upstream in clawde_api::FREE_CATALOG {
         entries.push(ModelEntry {
             id: format!("{}/{}", upstream.id, upstream.default_model),
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
@@ -521,7 +524,7 @@ impl ModelPickerState {
     /// Create a new picker (not yet visible).
     ///
     /// The model list starts empty; it is populated purely from the
-    /// models.dev-backed [`ModelRegistry`](claurst_api::ModelRegistry) via
+    /// models.dev-backed [`ModelRegistry`](clawde_api::ModelRegistry) via
     /// [`set_models`](Self::set_models) (see
     /// `models_for_provider_from_registry`) each time the picker opens for a
     /// provider. There is deliberately no hardcoded fallback list — a hardcoded
@@ -566,11 +569,7 @@ impl ModelPickerState {
         for m in &mut self.models {
             m.is_current = m.id == current_model;
         }
-        self.selected_idx = self
-            .models
-            .iter()
-            .position(|m| m.is_current)
-            .unwrap_or(0);
+        self.selected_idx = self.models.iter().position(|m| m.is_current).unwrap_or(0);
         self.title = title.into();
         self.filter.clear();
         self.effort_level = effort;
@@ -592,7 +591,9 @@ impl ModelPickerState {
     /// Move selection up one row (wraps to last if at top).
     pub fn select_prev(&mut self) {
         let count = self.filtered_models().len();
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
         if self.selected_idx == 0 {
             self.selected_idx = count - 1;
         } else {
@@ -603,7 +604,9 @@ impl ModelPickerState {
     /// Move selection down one row (wraps to first if at bottom).
     pub fn select_next(&mut self) {
         let count = self.filtered_models().len();
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
         self.selected_idx = (self.selected_idx + 1) % count;
     }
 
@@ -766,7 +769,9 @@ impl ModelPickerState {
 }
 
 impl Default for ModelPickerState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -857,13 +862,26 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // Title row: "Select model" left, "esc" right
     let title_pad = inner.width.saturating_sub(state.title.len() as u16 + 5) as usize;
     header_lines.push(Line::from(vec![
-        Span::styled(format!(" {}", state.title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:>w$}", "esc ", w = title_pad), Style::default().fg(dim)),
+        Span::styled(
+            format!(" {}", state.title),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:>w$}", "esc ", w = title_pad),
+            Style::default().fg(dim),
+        ),
     ]));
 
     // Search field
     header_lines.push(Line::from(""));
-    header_lines.push(modal_search_line(&state.filter, "Search", dim, Color::White));
+    header_lines.push(modal_search_line(
+        &state.filter,
+        "Search",
+        dim,
+        Color::White,
+    ));
 
     let header_para = Paragraph::new(header_lines).bg(dialog_bg);
     header_para.render(header_area, buf);
@@ -898,7 +916,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     }
 
     if filtered.is_empty() {
-        lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
+        lines.push(Line::from(vec![Span::styled(
+            " No results found",
+            Style::default().fg(dim),
+        )]));
         if !state.filter.trim().is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 " Press Enter to use custom model",
@@ -924,12 +945,18 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
             // Current model indicator
             if model.is_current {
-                spans.push(Span::styled(" \u{25cf} ", Style::default().fg(Color::Green).bg(bg)));
+                spans.push(Span::styled(
+                    " \u{25cf} ",
+                    Style::default().fg(Color::Green).bg(bg),
+                ));
             } else {
                 spans.push(Span::styled("   ", Style::default().bg(bg)));
             }
 
-            spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
+            spans.push(Span::styled(
+                model.display_name.clone(),
+                Style::default().fg(fg).bg(bg),
+            ));
 
             // Effort indicator — show the effort clamped onto this model's
             // variants ladder so it never displays a tier the model can't do.
@@ -943,7 +970,11 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
             // Description
             if !model.description.is_empty() {
-                let desc_fg = if is_selected { Color::Rgb(200, 200, 200) } else { dim };
+                let desc_fg = if is_selected {
+                    Color::Rgb(200, 200, 200)
+                } else {
+                    dim
+                };
                 spans.push(Span::styled(
                     format!("  {}", model.description),
                     Style::default().fg(desc_fg).bg(bg),
@@ -955,7 +986,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
                 let pad = inner.width.saturating_sub(text_len as u16) as usize;
                 if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(highlight_bg)));
+                    spans.push(Span::styled(
+                        " ".repeat(pad),
+                        Style::default().bg(highlight_bg),
+                    ));
                 }
             }
 
@@ -990,9 +1024,14 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         }
     }
     footer_spans.push(Span::raw("  "));
-    footer_spans.push(Span::styled(" /connect", Style::default().fg(Color::Rgb(233, 30, 99))));
+    footer_spans.push(Span::styled(
+        " /connect",
+        Style::default().fg(Color::Rgb(233, 30, 99)),
+    ));
     footer_spans.push(Span::styled(" providers", Style::default().fg(dim)));
-    Paragraph::new(Line::from(footer_spans)).bg(dialog_bg).render(footer_area, buf);
+    Paragraph::new(Line::from(footer_spans))
+        .bg(dialog_bg)
+        .render(footer_area, buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,7 +1088,7 @@ mod tests {
     //    hardcoded set — regression guard for #228 ("latest model won't show").
     #[test]
     fn newly_added_registry_model_surfaces_in_picker() {
-        let mut registry = claurst_api::ModelRegistry::new();
+        let mut registry = clawde_api::ModelRegistry::new();
 
         // A fabricated future id that cannot already be in the bundled snapshot.
         let novel_id = "claude-opus-9-9-20991231";
@@ -1093,7 +1132,13 @@ mod tests {
         p.open("claude-sonnet-4-6");
         let current_count = p.models.iter().filter(|m| m.is_current).count();
         assert_eq!(current_count, 1);
-        assert!(p.models.iter().find(|m| m.id == "claude-sonnet-4-6").unwrap().is_current);
+        assert!(
+            p.models
+                .iter()
+                .find(|m| m.id == "claude-sonnet-4-6")
+                .unwrap()
+                .is_current
+        );
     }
 
     #[test]
@@ -1145,14 +1190,23 @@ mod tests {
     #[test]
     fn filter_reduces_results() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        for c in "sonnet".chars() { p.push_filter_char(c); }
+        for c in "sonnet".chars() {
+            p.push_filter_char(c);
+        }
         let all = p.models.len();
         let filtered = p.filtered_models();
-        assert!(filtered.len() < all, "filter should reduce the result count");
+        assert!(
+            filtered.len() < all,
+            "filter should reduce the result count"
+        );
         assert!(!filtered.is_empty(), "at least one sonnet model must match");
         for m in &filtered {
             let haystack = format!("{} {} {}", m.id, m.display_name, m.description).to_lowercase();
-            assert!(haystack.contains("sonnet"), "model '{}' does not match filter", m.id);
+            assert!(
+                haystack.contains("sonnet"),
+                "model '{}' does not match filter",
+                m.id
+            );
         }
     }
 
@@ -1160,7 +1214,9 @@ mod tests {
     #[test]
     fn pop_filter_char_removes_last() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        p.push_filter_char('h'); p.push_filter_char('a'); p.push_filter_char('i');
+        p.push_filter_char('h');
+        p.push_filter_char('a');
+        p.push_filter_char('i');
         assert_eq!(p.filter, "hai");
         p.pop_filter_char();
         assert_eq!(p.filter, "ha");
@@ -1218,8 +1274,14 @@ mod tests {
     fn ladders_match_opencode_for_known_models() {
         use EffortLevel::*;
         // 4.6-era opus/sonnet: low/medium/high/max.
-        assert_eq!(picker_variant_ladder("claude-opus-4-6"), vec![Low, Medium, High, Max]);
-        assert_eq!(picker_variant_ladder("claude-sonnet-4-6"), vec![Low, Medium, High, Max]);
+        assert_eq!(
+            picker_variant_ladder("claude-opus-4-6"),
+            vec![Low, Medium, High, Max]
+        );
+        assert_eq!(
+            picker_variant_ladder("claude-sonnet-4-6"),
+            vec![Low, Medium, High, Max]
+        );
         // Haiku 4.5 is a thinking model: budget-based high/max.
         assert_eq!(picker_variant_ladder("claude-haiku-4-5"), vec![High, Max]);
         // gpt-4o is non-reasoning → no ladder, no selector.
@@ -1239,7 +1301,10 @@ mod tests {
             let ladder = picker_variant_ladder(id);
             assert!(ladder.len() > 1, "{id} should support effort: {ladder:?}");
             assert!(model_supports_effort(id), "{id} should support effort");
-            assert!(ladder.contains(&XHigh), "{id} should reach xhigh: {ladder:?}");
+            assert!(
+                ladder.contains(&XHigh),
+                "{id} should reach xhigh: {ladder:?}"
+            );
         }
         // Version-less gpt-5-pro exposes only the fixed `high` tier → no selector.
         assert_eq!(picker_variant_ladder("gpt-5-pro"), vec![High]);
@@ -1260,7 +1325,11 @@ mod tests {
         );
         assert!(model_supports_effort("claude-haiku-4-5"));
         let mut p = make_picker_with_current("claude-haiku-4-5");
-        p.selected_idx = p.models.iter().position(|m| m.id == "claude-haiku-4-5").unwrap();
+        p.selected_idx = p
+            .models
+            .iter()
+            .position(|m| m.id == "claude-haiku-4-5")
+            .unwrap();
         let confirmed = p.confirm();
         assert!(
             confirmed.is_some_and(|(_, e)| e.is_some()),
@@ -1286,7 +1355,11 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_model_picker(&p, area, &mut buf);
         for cell in buf.content() {
-            assert_eq!(cell.symbol(), " ", "buffer should be empty when picker is hidden");
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "buffer should be empty when picker is hidden"
+            );
         }
     }
 
@@ -1296,7 +1369,7 @@ mod tests {
     //     instead we check the family / provider-namespace shape.
     #[test]
     fn models_for_provider_anthropic() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let models = models_for_provider_from_registry("anthropic", &registry);
         assert!(!models.is_empty(), "anthropic must yield models");
         assert!(
@@ -1307,14 +1380,16 @@ mod tests {
 
     #[test]
     fn models_for_provider_openai() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let models = models_for_provider_from_registry("openai", &registry);
         assert!(!models.is_empty());
         // Must NOT contain Claude models
         assert!(!models.iter().any(|m| m.id.contains("claude")));
         // Should contain at least one gpt-* or o-series id
         assert!(
-            models.iter().any(|m| m.id.starts_with("gpt-") || m.id.starts_with("o3") || m.id.starts_with("o4")),
+            models.iter().any(|m| m.id.starts_with("gpt-")
+                || m.id.starts_with("o3")
+                || m.id.starts_with("o4")),
             "openai should expose at least one gpt/o-series model"
         );
     }
@@ -1325,7 +1400,7 @@ mod tests {
     // a fresh claude-opus point-release surface the moment the snapshot ships.
     #[test]
     fn picker_list_equals_registry_projection_for_catalog_providers() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
 
         // Catalog-backed providers skip live discovery; live ones do not.
         // Anthropic now discovers via GET /v1/models, so it's on the live side;
@@ -1350,7 +1425,10 @@ mod tests {
             });
             let proj_ids: Vec<String> = proj.iter().map(|e| e.info.id.to_string()).collect();
 
-            assert_eq!(picker_ids, proj_ids, "{pid} picker must equal catalog projection");
+            assert_eq!(
+                picker_ids, proj_ids,
+                "{pid} picker must equal catalog projection"
+            );
         }
 
         // Headline: the newest Opus is in the projected anthropic list.
@@ -1369,22 +1447,40 @@ mod tests {
     // catalog — never the empty-registry "default" placeholder.
     #[test]
     fn models_for_provider_codex_aliases() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         for pid in ["codex", "openai-codex"] {
             let models = models_for_provider_from_registry(pid, &registry);
             assert!(!models.is_empty(), "{pid} must yield Codex models");
-            assert_ne!(models[0].id, "default", "{pid} must not fall back to default");
+            assert_ne!(
+                models[0].id, "default",
+                "{pid} must not fall back to default"
+            );
 
             let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
             // Opencode's exact allow-list (from the current snapshot).
             assert!(ids.contains(&"gpt-5.5"), "{pid} must list gpt-5.5: {ids:?}");
             assert!(ids.contains(&"gpt-5.4"), "{pid} must list gpt-5.4: {ids:?}");
-            assert!(ids.contains(&"gpt-5.4-mini"), "{pid} must list gpt-5.4-mini: {ids:?}");
+            assert!(
+                ids.contains(&"gpt-5.4-mini"),
+                "{pid} must list gpt-5.4-mini: {ids:?}"
+            );
             // gpt-5.5 is the newest -> sorts first -> is the default highlight.
-            assert_eq!(models[0].id, "gpt-5.5", "{pid} newest model should sort first");
+            assert_eq!(
+                models[0].id, "gpt-5.5",
+                "{pid} newest model should sort first"
+            );
             // Legacy / disallowed models must be gone.
-            for legacy in ["gpt-5.5-pro", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5.4-nano", "gpt-5"] {
-                assert!(!ids.contains(&legacy), "{pid} must not list {legacy}: {ids:?}");
+            for legacy in [
+                "gpt-5.5-pro",
+                "gpt-5.2-codex",
+                "gpt-5.1-codex",
+                "gpt-5.4-nano",
+                "gpt-5",
+            ] {
+                assert!(
+                    !ids.contains(&legacy),
+                    "{pid} must not list {legacy}: {ids:?}"
+                );
             }
         }
     }
@@ -1393,21 +1489,24 @@ mod tests {
     // "<id>/default") for both id spellings, preserving the caller's prefix.
     #[test]
     fn default_model_for_provider_codex_aliases() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         for pid in ["codex", "openai-codex"] {
             let m = default_model_for_provider(pid, &registry);
             assert_eq!(
                 m,
-                format!("{}/{}", pid, claurst_core::codex_oauth::DEFAULT_CODEX_MODEL),
+                format!("{}/{}", pid, clawde_core::codex_oauth::DEFAULT_CODEX_MODEL),
                 "{pid} default must pin the curated flagship Codex model"
             );
-            assert!(!m.ends_with("/default"), "{pid} must not fall back to /default");
+            assert!(
+                !m.ends_with("/default"),
+                "{pid} must not fall back to /default"
+            );
         }
     }
 
     #[test]
     fn models_for_provider_unknown_returns_default() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let models = models_for_provider_from_registry("some-unknown-provider", &registry);
         assert!(!models.is_empty());
         assert_eq!(models[0].id, "default");
@@ -1416,23 +1515,29 @@ mod tests {
     // 17. default_model_for_provider returns prefixed models for non-anthropic.
     #[test]
     fn default_model_for_provider_openai() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let m = default_model_for_provider("openai", &registry);
-        assert!(m.starts_with("openai/"), "openai default must be prefixed: {m}");
+        assert!(
+            m.starts_with("openai/"),
+            "openai default must be prefixed: {m}"
+        );
     }
 
     #[test]
     fn default_model_for_provider_anthropic_bare() {
         // Anthropic models are bare (no prefix) for backwards compat.
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let m = default_model_for_provider("anthropic", &registry);
         assert!(!m.contains('/'), "anthropic default must be bare: {m}");
-        assert!(m.starts_with("claude"), "anthropic default must be a claude variant: {m}");
+        assert!(
+            m.starts_with("claude"),
+            "anthropic default must be a claude variant: {m}"
+        );
     }
 
     #[test]
     fn default_model_for_provider_unknown_falls_back() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         assert_eq!(
             default_model_for_provider("some-self-hosted-thing", &registry),
             "some-self-hosted-thing/default"
@@ -1442,7 +1547,7 @@ mod tests {
     // 18. set_models replaces the model list.
     #[test]
     fn set_models_replaces_list() {
-        let registry = claurst_api::ModelRegistry::new();
+        let registry = clawde_api::ModelRegistry::new();
         let mut p = ModelPickerState::new();
         let openai_models = models_for_provider_from_registry("openai", &registry);
         p.set_models(openai_models);
@@ -1491,7 +1596,11 @@ mod tests {
             "new live id must be appended"
         );
         assert!(
-            p.models.iter().filter(|m| m.id == "claude-opus-4-6").count() == 1,
+            p.models
+                .iter()
+                .filter(|m| m.id == "claude-opus-4-6")
+                .count()
+                == 1,
             "no duplicate for a shared id"
         );
         // All three original catalog ids are still present.
@@ -1506,7 +1615,11 @@ mod tests {
         let mut p = ModelPickerState::new();
         p.set_models(sample_models());
         p.merge_models(Vec::new());
-        assert_eq!(p.models.len(), 3, "empty live merge must not clear the list");
+        assert_eq!(
+            p.models.len(),
+            3,
+            "empty live merge must not clear the list"
+        );
         assert!(!p.loading_models);
     }
 

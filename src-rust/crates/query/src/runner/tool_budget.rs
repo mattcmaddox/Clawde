@@ -9,18 +9,25 @@ use crate::*;
 pub(crate) fn total_tool_result_chars(messages: &[Message]) -> usize {
     messages
         .iter()
-        .filter(|m| m.role == claurst_core::types::Role::User)
+        .filter(|m| m.role == clawde_core::types::Role::User)
         .flat_map(|m| match &m.content {
-            claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+            clawde_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
             _ => &[],
         })
         .filter_map(|b| {
             if let ContentBlock::ToolResult { content, .. } = b {
                 Some(match content {
                     ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(blocks) => blocks.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
+                    ToolResultContent::Blocks(blocks) => blocks
+                        .iter()
+                        .map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                text.len()
+                            } else {
+                                0
+                            }
+                        })
+                        .sum(),
                 })
             } else {
                 None
@@ -38,7 +45,10 @@ pub(crate) fn total_tool_result_chars(messages: &[Message]) -> usize {
 /// Mirrors the spirit of the TypeScript `applyToolResultBudget` /
 /// `enforceToolResultBudget` logic, simplified to a straightforward
 /// oldest-first eviction without the session-persistence layer.
-pub(crate) fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Message>, usize) {
+pub(crate) fn apply_tool_result_budget(
+    messages: Vec<Message>,
+    budget: usize,
+) -> (Vec<Message>, usize) {
     let total = total_tool_result_chars(&messages);
     if total <= budget {
         return (messages, 0);
@@ -49,27 +59,33 @@ pub(crate) fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) ->
     let mut result = messages;
 
     'outer: for msg in result.iter_mut() {
-        if msg.role != claurst_core::types::Role::User {
+        if msg.role != clawde_core::types::Role::User {
             continue;
         }
         let blocks = match &mut msg.content {
-            claurst_core::types::MessageContent::Blocks(b) => b,
+            clawde_core::types::MessageContent::Blocks(b) => b,
             _ => continue,
         };
         for block in blocks.iter_mut() {
             if let ContentBlock::ToolResult { content, .. } = block {
                 let size = match &*content {
                     ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(inner) => inner.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
+                    ToolResultContent::Blocks(inner) => inner
+                        .iter()
+                        .map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                text.len()
+                            } else {
+                                0
+                            }
+                        })
+                        .sum(),
                 };
                 if size == 0 {
                     continue;
                 }
-                *content = ToolResultContent::Text(
-                    "[tool result truncated to save context]".to_string(),
-                );
+                *content =
+                    ToolResultContent::Text("[tool result truncated to save context]".to_string());
                 truncated += 1;
                 if size > to_shed {
                     break 'outer;

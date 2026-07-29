@@ -1,6 +1,7 @@
 [package]
 name = "clawde-api"
 version.workspace = true
+description = "Multi-provider LLM API abstraction layer with provider registry, model registry, and streaming support"
 edition.workspace = true
 
 [dependencies]
@@ -31,3 +32,4 @@ urlencoding = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
+rand = { workspace = true }

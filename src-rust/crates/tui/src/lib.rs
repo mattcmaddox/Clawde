@@ -1,4 +1,4 @@
-// claurst-tui: Terminal UI using ratatui + crossterm for Claurst.
+// clawde-tui: Terminal UI using ratatui + crossterm for Clawde.
 //
 // This crate provides the interactive terminal interface including:
 // - Message display with syntax highlighting
@@ -18,8 +18,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 // EnableBracketedPaste is enabled on macOS and Linux only. On Windows, it causes
 // Windows Terminal to wrap Ctrl+V content in VT escape sequences that crossterm's
@@ -63,150 +63,181 @@ static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(true);
 // Sub-modules
 // ---------------------------------------------------------------------------
 
-/// Figure/icon constants matching src/constants/figures.ts
-pub mod figures;
-/// Rustle mascot rendering.
-pub mod rustle;
-/// Context window and rate-limit visualization overlay (/context).
-pub mod context_viz;
-/// Export format picker dialog (/export).
-pub mod export_dialog;
-/// Clipboard image paste and Ctrl+V text paste.
-pub mod image_paste;
-/// Inline image rendering via the Kitty graphics protocol (with text fallback).
-pub mod kitty_image;
-/// Application state and main event loop.
-pub mod app;
-/// Input helpers: slash command parsing.
-pub mod input;
-/// All ratatui rendering logic.
-pub mod render;
-/// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
-pub mod osc8;
-/// Permission dialogs and confirmation dialogs.
-pub mod dialogs;
-/// Notification / banner system.
-pub mod notifications;
-/// Help overlay, history search, message selector, rewind flow.
-pub mod overlays;
-/// Bridge connection state and status badge.
-pub mod bridge_state;
-/// Plugin hint/recommendation UI.
-pub mod plugin_views;
-/// Full-screen tabbed settings interface.
-pub mod settings_screen;
-/// Theme picker overlay.
-pub mod theme_screen;
-/// Color palette management for different themes and accessibility support.
-pub mod theme_colors;
-/// Diff viewer dialog (two-pane: file list + unified diff detail).
-pub mod diff_viewer;
-/// Read-only viewer for [Pasted text #N ...] placeholders.
-pub mod paste_viewer;
-/// Virtual scrollable list for efficient message rendering.
-pub mod virtual_list;
-/// Message type renderers (assistant, user, tool use, etc.).
-pub mod messages;
-/// Turn-aware transcript grouping and metadata helpers.
-pub mod transcript_turn;
 /// Agent definitions list and coordinator progress view.
 pub mod agents_view;
-/// Stats dialog with token usage and cost charts.
-pub mod stats_dialog;
-/// MCP server management UI.
-pub mod mcp_view;
-/// Complete prompt input with vim mode, history, typeahead, and paste handling.
-pub mod prompt_input;
-/// Session quality feedback survey overlay.
-pub mod feedback_survey;
-/// Memory file selector overlay (AGENTS.md browser).
-pub mod memory_file_selector;
-/// Read-only hooks configuration browser.
-pub mod hooks_config_menu;
-/// Overage credit upsell banner (shown when user exceeds free-tier limit).
-pub mod overage_upsell;
-/// Voice mode availability notice (shown when voice is available but not enabled).
-pub mod voice_mode_notice;
-/// Message copy utilities for different formatting options (markdown, plaintext, code, JSON).
-pub mod message_copy;
-/// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
-pub mod desktop_upsell_startup;
-/// Memory update notification banner (shown after Claurst updates a AGENTS.md file).
-pub mod memory_update_notification;
-/// MCP elicitation dialog (form-based user input requested by MCP servers).
-pub mod elicitation_dialog;
-/// Model picker overlay (/model command).
-pub mod model_picker;
-/// Session browser overlay (/session, /resume, /rename, /export).
-pub mod session_browser;
-/// Startup dialog for malformed settings.json or AGENTS.md.
-pub mod invalid_config_dialog;
-/// Startup confirmation dialog for --dangerously-skip-permissions mode.
-pub mod bypass_permissions_dialog;
-/// First-launch onboarding / welcome dialog.
-pub mod onboarding_dialog;
-/// Effort-level picker dialog (/effort).
-pub mod effort_picker;
-/// Reusable fuzzy-search selection dialog widget.
-pub mod dialog_select;
-/// Masked text input overlay for entering API keys.
-pub mod key_input_dialog;
-/// Modal dialog for entering custom provider URL + API key.
-pub mod custom_provider_dialog;
-/// Setup dialog for the composite "Free" provider (Zen → OpenRouter).
-pub mod free_mode_dialog;
-/// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
-pub mod device_auth_dialog;
-/// Push-to-talk voice capture and Whisper transcription.
-pub mod voice_capture;
-/// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
-pub mod tasks_overlay;
-/// Import-config preview and confirmation dialog.
-pub mod import_config_dialog;
-/// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
-pub mod session_branching;
+/// Application state and main event loop.
+pub mod app;
 /// Model-initiated question dialog (AskUserQuestion tool).
 pub mod ask_user_dialog;
+/// Bridge connection state and status badge.
+pub mod bridge_state;
+/// Startup confirmation dialog for --dangerously-skip-permissions mode.
+pub mod bypass_permissions_dialog;
+/// Context window and rate-limit visualization overlay (/context).
+pub mod context_viz;
+/// Modal dialog for entering custom provider URL + API key.
+pub mod custom_provider_dialog;
+/// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
+pub mod desktop_upsell_startup;
+/// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
+pub mod device_auth_dialog;
+/// Reusable fuzzy-search selection dialog widget.
+pub mod dialog_select;
+/// Permission dialogs and confirmation dialogs.
+pub mod dialogs;
+/// Diff viewer dialog (two-pane: file list + unified diff detail).
+pub mod diff_viewer;
+/// Effort-level picker dialog (/effort).
+pub mod effort_picker;
+/// MCP elicitation dialog (form-based user input requested by MCP servers).
+pub mod elicitation_dialog;
+/// Export format picker dialog (/export).
+pub mod export_dialog;
+/// Session quality feedback survey overlay.
+pub mod feedback_survey;
+/// Figure/icon constants matching src/constants/figures.ts
+pub mod figures;
 /// File injection utilities for parsing @file references.
 pub mod file_injection;
 /// File injection warning dialog (shown when oversized files detected).
 pub mod file_injection_dialog;
+/// Setup dialog for the composite "Free" provider (Zen → OpenRouter).
+pub mod free_mode_dialog;
+/// Read-only hooks configuration browser.
+pub mod hooks_config_menu;
+/// Clipboard image paste and Ctrl+V text paste.
+pub mod image_paste;
+/// Import-config preview and confirmation dialog.
+pub mod import_config_dialog;
+/// Input helpers: slash command parsing.
+pub mod input;
+/// Startup dialog for malformed settings.json or AGENTS.md.
+pub mod invalid_config_dialog;
+/// Masked text input overlay for entering API keys.
+pub mod key_input_dialog;
+/// Inline image rendering via the Kitty graphics protocol (with text fallback).
+pub mod kitty_image;
+/// MCP server management UI.
+pub mod mcp_view;
+/// Memory file selector overlay (AGENTS.md browser).
+pub mod memory_file_selector;
+/// Memory update notification banner (shown after Clawde updates a AGENTS.md file).
+pub mod memory_update_notification;
+/// Message copy utilities for different formatting options (markdown, plaintext, code, JSON).
+pub mod message_copy;
+/// Message type renderers (assistant, user, tool use, etc.).
+pub mod messages;
+/// Model picker overlay (/model command).
+pub mod model_picker;
+/// Notification / banner system.
+pub mod notifications;
+/// First-launch onboarding / welcome dialog.
+pub mod onboarding_dialog;
+/// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
+pub mod osc8;
+/// Overage credit upsell banner (shown when user exceeds free-tier limit).
+pub mod overage_upsell;
+/// Help overlay, history search, message selector, rewind flow.
+pub mod overlays;
+/// Read-only viewer for [Pasted text #N ...] placeholders.
+pub mod paste_viewer;
+/// Plugin hint/recommendation UI.
+pub mod plugin_views;
+/// Complete prompt input with vim mode, history, typeahead, and paste handling.
+pub mod prompt_input;
+/// All ratatui rendering logic.
+pub mod render;
+/// Rustle mascot rendering.
+pub mod rustle;
+/// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
+pub mod session_branching;
+/// Session browser overlay (/session, /resume, /rename, /export).
+pub mod session_browser;
+/// Full-screen tabbed settings interface.
+pub mod settings_screen;
+/// Stats dialog with token usage and cost charts.
+pub mod stats_dialog;
+/// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
+pub mod tasks_overlay;
+/// Color palette management for different themes and accessibility support.
+pub mod theme_colors;
+/// Theme picker overlay.
+pub mod theme_screen;
+/// Turn-aware transcript grouping and metadata helpers.
+pub mod transcript_turn;
+/// Virtual scrollable list for efficient message rendering.
+pub mod virtual_list;
+/// Push-to-talk voice capture and Whisper transcription.
+pub mod voice_capture;
+/// Voice mode availability notice (shown when voice is available but not enabled).
+pub mod voice_mode_notice;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
 // ---------------------------------------------------------------------------
 
-pub use app::{App, try_copy_to_clipboard};
-pub use notifications::NotificationKind;
+pub use agents_view::{
+    load_agent_definitions, render_agents_menu, render_coordinator_status, AgentDefinition,
+    AgentInfo, AgentStatus, AgentsMenuState,
+};
+pub use app::{try_copy_to_clipboard, App};
+pub use bypass_permissions_dialog::{
+    render_bypass_permissions_dialog, BypassPermissionsDialogState,
+};
+pub use custom_provider_dialog::{
+    render_custom_provider_dialog, CustomProviderDialogState, CustomProviderField,
+};
+pub use desktop_upsell_startup::{
+    render_desktop_upsell_startup, DesktopUpsellSelection, DesktopUpsellStartupState,
+};
+pub use dialog_select::{render_dialog_select, DialogSelectState, SelectItem};
+pub use diff_viewer::{
+    load_git_diff, parse_unified_diff, render_diff_dialog, DiffPane, DiffType, DiffViewerState,
+};
+pub use elicitation_dialog::{
+    render_elicitation_dialog, ElicitationDialogState, ElicitationField, ElicitationFieldKind,
+    ElicitationResult,
+};
+pub use feedback_survey::{FeedbackResponse, FeedbackSurveyStage, FeedbackSurveyState};
+pub use free_mode_dialog::{render_free_mode_dialog, FreeModeDialogState, FreeModeField};
+pub use hooks_config_menu::{HookEntry, HooksConfigMenuState};
+pub use import_config_dialog::{render_import_config_dialog, ImportConfigDialogState};
 pub use input::{is_slash_command, parse_slash_command};
-pub use feedback_survey::{FeedbackSurveyState, FeedbackSurveyStage, FeedbackResponse};
-pub use memory_file_selector::{MemoryFileSelectorState, MemoryFile, MemoryFileType};
-pub use hooks_config_menu::{HooksConfigMenuState, HookEntry};
-pub use overage_upsell::{OverageCreditUpsellState, render_overage_upsell};
-pub use voice_mode_notice::{VoiceModeNoticeState, render_voice_mode_notice};
-pub use desktop_upsell_startup::{DesktopUpsellStartupState, DesktopUpsellSelection, render_desktop_upsell_startup};
-pub use memory_update_notification::{MemoryUpdateNotificationState, render_memory_update_notification, get_relative_memory_path};
-pub use elicitation_dialog::{ElicitationDialogState, ElicitationField, ElicitationFieldKind, ElicitationResult, render_elicitation_dialog};
-pub use diff_viewer::{DiffViewerState, DiffPane, DiffType, load_git_diff, parse_unified_diff, render_diff_dialog};
-pub use agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentDefinition, render_agents_menu, render_coordinator_status, load_agent_definitions};
-pub use stats_dialog::{StatsDialogState, StatsTab, load_stats, render_stats_dialog};
-pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, render_mcp_view};
-pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
-pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
-pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
-pub use import_config_dialog::{ImportConfigDialogState, render_import_config_dialog};
-pub use session_branching::{SessionBranchingState, BranchBrowserMode, BranchInfo, render_session_branching};
-pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
-pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};
-pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
-pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
-pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
-pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
-pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_dialog};
+pub use invalid_config_dialog::{
+    render_invalid_config_dialog, InvalidConfigDialogState, InvalidConfigKind,
+};
+pub use key_input_dialog::{render_key_input_dialog, KeyInputDialogState};
+pub use mcp_view::{render_mcp_view, McpServerView, McpToolView, McpViewState, McpViewStatus};
+pub use memory_file_selector::{MemoryFile, MemoryFileSelectorState, MemoryFileType};
+pub use memory_update_notification::{
+    get_relative_memory_path, render_memory_update_notification, MemoryUpdateNotificationState,
+};
+pub use model_picker::{
+    model_supports_effort, render_model_picker, EffortLevel, ModelEntry, ModelPickerState,
+};
+pub use notifications::NotificationKind;
+pub use onboarding_dialog::{render_onboarding_dialog, OnboardingDialogState};
+pub use overage_upsell::{render_overage_upsell, OverageCreditUpsellState};
+pub use prompt_input::{
+    compute_typeahead, handle_paste, render_prompt_input, InputMode, PromptInputState, VimFindKind,
+    VimMode, VimOperator, VimPendingState,
+};
+pub use session_branching::{
+    render_session_branching, BranchBrowserMode, BranchInfo, SessionBranchingState,
+};
+pub use session_browser::{
+    render_session_browser, SessionBrowserMode, SessionBrowserState, SessionEntry,
+};
+pub use stats_dialog::{load_stats, render_stats_dialog, StatsDialogState, StatsTab};
+pub use voice_mode_notice::{render_voice_mode_notice, VoiceModeNoticeState};
 // (FreeModeField type is now per-provider; legacy callers may still import both names.)
-pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
-pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
-pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
+pub use device_auth_dialog::{
+    render_device_auth_dialog, DeviceAuthDialogState, DeviceAuthEvent, DeviceAuthStatus,
+};
+pub use file_injection::{build_file_blocks, parse_at_refs, AtFileIssue, AtFileRef};
+pub use file_injection_dialog::{
+    render_file_injection_dialog, FileInjectionDialogState, FileInjectionOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)
@@ -325,7 +356,7 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
     let kitty_active = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     KEYBOARD_ENHANCEMENT_ACTIVE.store(kitty_active, Ordering::Relaxed);
 
-    set_terminal_title("\u{1f980} Claurst");
+    set_terminal_title("\u{1f980} Clawde");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -337,10 +368,7 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
     set_terminal_progress(false);
     // Restore the original title by clearing it (terminals fall back to default).
-    let _ = execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::SetTitle(""),
-    );
+    let _ = execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(""),);
     restore_terminal_cleanup()?;
     terminal.show_cursor()?;
     Ok(())
@@ -393,18 +421,22 @@ pub fn set_terminal_progress(active: bool) {
     use std::io::Write;
     // state 3 = indeterminate/busy, state 0 = clear; the progress value is
     // unused for the indeterminate state.
-    let seq: &[u8] = if active { b"\x1b]9;4;3;0\x07" } else { b"\x1b]9;4;0;0\x07" };
+    let seq: &[u8] = if active {
+        b"\x1b]9;4;3;0\x07"
+    } else {
+        b"\x1b]9;4;0;0\x07"
+    };
     let mut out = io::stdout();
     let _ = out.write_all(seq);
     let _ = out.flush();
 }
 
 /// Update the terminal title to reflect the current session context.
-/// Format: "🦀 | <topic>" or just "🦀 Claurst" when no topic is set.
+/// Format: "🦀 | <topic>" or just "🦀 Clawde" when no topic is set.
 pub fn update_terminal_title(topic: Option<&str>) {
     match topic {
         Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1f980} | {}", t)),
-        _ => set_terminal_title("\u{1f980} Claurst"),
+        _ => set_terminal_title("\u{1f980} Clawde"),
     }
 }
 
@@ -416,10 +448,10 @@ pub fn update_terminal_title(topic: Option<&str>) {
 mod tests {
     use super::*;
     use app::{App, HistorySearch, ToolStatus, ToolUseBlock};
-    use claurst_core::config::Config;
-    use claurst_core::cost::CostTracker;
-    use claurst_core::file_history::FileHistory;
-    use claurst_core::types::{ContentBlock, Role, ToolResultContent};
+    use clawde_core::config::Config;
+    use clawde_core::cost::CostTracker;
+    use clawde_core::file_history::FileHistory;
+    use clawde_core::types::{ContentBlock, Role, ToolResultContent};
     use dialogs::PermissionRequest;
     use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
@@ -528,12 +560,18 @@ mod tests {
         assert!(app.intercept_slash_command("agents"));
         assert!(app.agents_menu.visible);
         assert_eq!(app.agents_menu.active_agents.len(), 3);
-        assert_eq!(app.agents_menu.active_agents[0].status, AgentStatus::Running);
+        assert_eq!(
+            app.agents_menu.active_agents[0].status,
+            AgentStatus::Running
+        );
         assert_eq!(
             app.agents_menu.active_agents[1].status,
             AgentStatus::WaitingForTool
         );
-        assert_eq!(app.agents_menu.active_agents[2].status, AgentStatus::Complete);
+        assert_eq!(
+            app.agents_menu.active_agents[2].status,
+            AgentStatus::Complete
+        );
     }
 
     #[test]
@@ -548,12 +586,19 @@ mod tests {
 
         app.handle_key_event(ctrl(KeyCode::Char('s')));
 
-        let saved = temp.path().join(".claurst").join("agents").join("planner.md");
+        let saved = temp
+            .path()
+            .join(".clawde")
+            .join("agents")
+            .join("planner.md");
         assert!(saved.exists());
         let content = std::fs::read_to_string(saved).unwrap();
         assert!(content.contains("name: Planner"));
         assert!(content.contains("Help break work into steps."));
-        assert!(matches!(app.agents_menu.route, agents_view::AgentsRoute::Detail(_)));
+        assert!(matches!(
+            app.agents_menu.route,
+            agents_view::AgentsRoute::Detail(_)
+        ));
     }
 
     #[test]
@@ -566,7 +611,12 @@ mod tests {
         state.editor.description = "Builds code".to_string();
         state.editor.prompt = "Ship the feature.".to_string();
 
-        let area = Rect { x: 0, y: 0, width: 90, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 24,
+        };
         let mut buf = Buffer::empty(area);
         agents_view::render_agents_menu(&state, area, &mut buf);
 
@@ -661,8 +711,8 @@ mod tests {
         assert!(app.last_exit_key_warning.is_some());
 
         // Manually expire the timer by setting it to >2 seconds ago
-        app.last_exit_key_warning = Some(std::time::Instant::now()
-            - std::time::Duration::from_millis(2100));
+        app.last_exit_key_warning =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(2100));
 
         // Second Ctrl+C after timeout: should show warning again, not exit
         app.handle_key_event(ctrl(KeyCode::Char('c')));
@@ -850,7 +900,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
-        app.push_message(claurst_core::types::Message::user("hello".to_string()));
+        app.push_message(clawde_core::types::Message::user("hello".to_string()));
 
         terminal
             .draw(|frame| crate::render::render_app(frame, &app))
@@ -866,7 +916,7 @@ mod tests {
             .join("");
 
         // The compact banner (title + hint) and the message both render.
-        assert!(rendered.contains("Claurst"));
+        assert!(rendered.contains("Clawde"));
         assert!(rendered.contains("? for shortcuts"));
         assert!(rendered.contains("hello"));
         // The full welcome box's recent-activity panel must NOT be drawn during
@@ -1077,7 +1127,12 @@ mod tests {
         let mut state = DiffViewerState::new();
         state.visible = true;
         state.diff_type = DiffType::TurnDiff;
-        let area = Rect { x: 0, y: 0, width: 80, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
         let mut buf = Buffer::empty(area);
 
         diff_viewer::render_diff_dialog(&mut state, area, &mut buf);
@@ -1186,7 +1241,12 @@ mod tests {
         state.switch_pane();
         state.switch_pane();
 
-        let area = Rect { x: 0, y: 0, width: 120, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
         let mut buf = Buffer::empty(area);
         mcp_view::render_mcp_view(&state, area, &mut buf);
         let rendered = buf
@@ -1281,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_use_and_thinking_blocks() {
-        let msg = claurst_core::types::Message::assistant_blocks(vec![
+        let msg = clawde_core::types::Message::assistant_blocks(vec![
             ContentBlock::Thinking {
                 thinking: "reasoning".to_string(),
                 signature: "sig".to_string(),
@@ -1300,7 +1360,12 @@ mod tests {
         let rendered = messages::render_message(&msg, &messages::RenderContext::default());
         let text = rendered
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect::<String>())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.clone())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1311,7 +1376,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_result_errors() {
-        let msg = claurst_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
+        let msg = clawde_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             content: ToolResultContent::Text("boom".to_string()),
             is_error: Some(true),
@@ -1320,7 +1385,12 @@ mod tests {
         let rendered = messages::render_message(&msg, &messages::RenderContext::default());
         let text = rendered
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.clone()).collect::<String>())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.clone())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1333,7 +1403,7 @@ mod tests {
     #[test]
     fn test_handle_status_event() {
         let mut app = make_app();
-        app.handle_query_event(claurst_query::QueryEvent::Status("working".to_string()));
+        app.handle_query_event(clawde_query::QueryEvent::Status("working".to_string()));
         assert_eq!(app.status_message.as_deref(), Some("working"));
     }
 
@@ -1341,7 +1411,7 @@ mod tests {
     fn test_handle_error_event() {
         let mut app = make_app();
         app.is_streaming = true;
-        app.handle_query_event(claurst_query::QueryEvent::Error("oops".to_string()));
+        app.handle_query_event(clawde_query::QueryEvent::Error("oops".to_string()));
         assert!(!app.is_streaming);
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].get_all_text().contains("oops"));
@@ -1350,7 +1420,7 @@ mod tests {
     #[test]
     fn test_handle_tool_start_and_end() {
         let mut app = make_app();
-        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
+        app.handle_query_event(clawde_query::QueryEvent::ToolStart {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             input_json: r#"{"command":"ls -la"}"#.to_string(),
@@ -1359,7 +1429,7 @@ mod tests {
         assert_eq!(app.tool_use_blocks[0].turn_index, None);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
 
-        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
+        app.handle_query_event(clawde_query::QueryEvent::ToolEnd {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             result: "output".to_string(),
@@ -1379,7 +1449,7 @@ mod tests {
             output_preview: None,
             input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
         });
-        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
+        app.handle_query_event(clawde_query::QueryEvent::ToolEnd {
             tool_name: "Read".to_string(),
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
@@ -1394,7 +1464,7 @@ mod tests {
         let mut app = make_app();
         app.is_streaming = true;
         app.streaming_text = "partial response".to_string();
-        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+        app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,
@@ -1410,7 +1480,7 @@ mod tests {
         let mut app = make_app();
         app.is_streaming = true;
         app.streaming_thinking = "outline the fix".to_string();
-        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+        app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,
@@ -1428,8 +1498,10 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
-        app.push_message(claurst_core::types::Message::user("hello".to_string()));
-        app.push_message(claurst_core::types::Message::assistant("hi there".to_string()));
+        app.push_message(clawde_core::types::Message::user("hello".to_string()));
+        app.push_message(clawde_core::types::Message::assistant(
+            "hi there".to_string(),
+        ));
         // Mode/model/duration moved to the status line, so the turn-metadata
         // line (the ▣ glyph) now renders only for interrupted turns. Mark this
         // turn interrupted to exercise that metadata path.
@@ -1497,4 +1569,3 @@ mod tests {
         assert_eq!(pr.options[3].key, 'n');
     }
 }
-

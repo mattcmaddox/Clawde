@@ -185,11 +185,17 @@ mod tests {
             "settings.json must be in the migrated dir"
         );
         assert_eq!(resolved, new, "config_dir must return the migrated path");
-        assert!(!legacy.exists(), "~/.claurst must not exist after migration");
+        assert!(
+            !legacy.exists(),
+            "~/.claurst must not exist after migration"
+        );
 
         // Verify file content survived the rename.
         let content = std::fs::read_to_string(new.join("settings.json")).unwrap();
-        assert_eq!(content, "{\"auto_compact\":true}", "file content must survive migration");
+        assert_eq!(
+            content, "{\"auto_compact\":true}",
+            "file content must survive migration"
+        );
     }
 }
 

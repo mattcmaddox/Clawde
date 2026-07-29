@@ -35,9 +35,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use claurst_api::{FreeUpstream, FREE_CATALOG};
+use clawde_api::{FreeUpstream, FREE_CATALOG};
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use std::cell::Cell;
 
 /// One row in the dialog — one provider's name, URL, and the user's
 /// (possibly empty) typed key.
@@ -49,6 +50,8 @@ pub struct FreeModeField {
 
 pub struct FreeModeDialogState {
     pub visible: bool,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     pub fields: Vec<FreeModeField>,
     pub active_idx: usize,
     /// First visible field index (for scrolling when fields > viewport).
@@ -75,6 +78,7 @@ impl FreeModeDialogState {
             fields,
             active_idx: 0,
             scroll_offset: 0,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
@@ -158,7 +162,10 @@ impl FreeModeDialogState {
     }
 
     pub fn filled_count(&self) -> usize {
-        self.fields.iter().filter(|f| !f.key.trim().is_empty()).count()
+        self.fields
+            .iter()
+            .filter(|f| !f.key.trim().is_empty())
+            .count()
     }
 
     /// Consume the dialog state, returning every non-empty `(provider_id, key)`
@@ -215,6 +222,7 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
     let width = 84u16.min(area.width.saturating_sub(4));
     let height = 24u16.min(area.height.saturating_sub(2));
     let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
 
     let inner = Rect {
@@ -226,15 +234,20 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
 
     let total = state.fields.len();
     let filled = state.filled_count();
-    let title_text = format!("Connect Free (multi-provider \u{2014} {}/{} keys)", filled, total);
+    let title_text = format!(
+        "Connect Free (multi-provider \u{2014} {}/{} keys)",
+        filled, total
+    );
     let title_pad = inner
         .width
         .saturating_sub(title_text.chars().count() as u16 + 5) as usize;
 
     let confirm_hint = if state.can_submit() {
-        format!(" enter confirm ({} key{} — more = better)",
+        format!(
+            " enter confirm ({} key{} — more = better)",
             filled,
-            if filled == 1 { "" } else { "s" })
+            if filled == 1 { "" } else { "s" }
+        )
     } else {
         " paste at least 1 key — as many as you can add is better".to_string()
     };
@@ -260,7 +273,10 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
         Style::default().fg(muted),
     )]));
     lines.push(Line::from(vec![
-        Span::styled(" TIP ", Style::default().fg(tip).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " TIP ",
+            Style::default().fg(tip).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             "More keys = better availability and higher caps.",
             Style::default().fg(tip),
@@ -291,14 +307,15 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
         let active = idx == state.active_idx;
         let marker = if active { "\u{25b8}" } else { " " };
         let label_style = if active {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(muted)
         };
         let url_style = Style::default().fg(dim);
 
-        let label_padded =
-            format!("{:<width$}", field.upstream.title, width = row_label_width);
+        let label_padded = format!("{:<width$}", field.upstream.title, width = row_label_width);
         lines.push(Line::from(vec![
             Span::styled(format!(" {} ", marker), Style::default().fg(pink)),
             Span::styled(label_padded, label_style),
@@ -310,7 +327,9 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
         let input_style = if field.key.is_empty() {
             Style::default().fg(dim)
         } else if active {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };

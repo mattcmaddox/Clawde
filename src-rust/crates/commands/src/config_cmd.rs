@@ -22,27 +22,84 @@ impl SlashCommand for ConfigCommand {
     }
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
         let mut completions = vec![
-            ArgCompletion { value: "show".into(), description: "Show current configuration".into(), available: true },
-            ArgCompletion { value: "get".into(), description: "Get a config key value".into(), available: true },
-            ArgCompletion { value: "set".into(), description: "Set a config key".into(), available: true },
-            ArgCompletion { value: "unset".into(), description: "Unset a config key (revert to default)".into(), available: true },
+            ArgCompletion {
+                value: "show".into(),
+                description: "Show current configuration".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "get".into(),
+                description: "Get a config key value".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "set".into(),
+                description: "Set a config key".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "unset".into(),
+                description: "Unset a config key (revert to default)".into(),
+                available: true,
+            },
         ];
         // Second-level: /config set <key>, /config get <key>, /config unset <key>
         if partial == "set" || partial.starts_with("set ") {
-            completions.push(ArgCompletion { value: "set theme".into(), description: "Set the UI theme (default, dark, light)".into(), available: true });
-            completions.push(ArgCompletion { value: "set output-style".into(), description: "Set the output style".into(), available: true });
-            completions.push(ArgCompletion { value: "set model".into(), description: "Set the active model".into(), available: true });
-            completions.push(ArgCompletion { value: "set permission-mode".into(), description: "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(), available: true });
+            completions.push(ArgCompletion {
+                value: "set theme".into(),
+                description: "Set the UI theme (default, dark, light)".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set output-style".into(),
+                description: "Set the output style".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set model".into(),
+                description: "Set the active model".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "set permission-mode".into(),
+                description:
+                    "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(),
+                available: true,
+            });
         }
         if partial == "get" || partial.starts_with("get ") {
-            completions.push(ArgCompletion { value: "get theme".into(), description: "Show current theme".into(), available: true });
-            completions.push(ArgCompletion { value: "get output-style".into(), description: "Show current output style".into(), available: true });
-            completions.push(ArgCompletion { value: "get model".into(), description: "Show current model".into(), available: true });
-            completions.push(ArgCompletion { value: "get permission-mode".into(), description: "Show current permission mode".into(), available: true });
+            completions.push(ArgCompletion {
+                value: "get theme".into(),
+                description: "Show current theme".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "get output-style".into(),
+                description: "Show current output style".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "get model".into(),
+                description: "Show current model".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "get permission-mode".into(),
+                description: "Show current permission mode".into(),
+                available: true,
+            });
         }
         if partial == "unset" || partial.starts_with("unset ") {
-            completions.push(ArgCompletion { value: "unset model".into(), description: "Reset model to default".into(), available: true });
-            completions.push(ArgCompletion { value: "unset output-style".into(), description: "Reset output style to default".into(), available: true });
+            completions.push(ArgCompletion {
+                value: "unset model".into(),
+                description: "Reset model to default".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "unset output-style".into(),
+                description: "Reset output style to default".into(),
+                available: true,
+            });
         }
         completions
     }

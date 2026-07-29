@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use claurst_core::provider_id::{ModelId, ProviderId};
+use clawde_core::provider_id::{ModelId, ProviderId};
 
 use crate::provider::ModelInfo;
 
@@ -65,7 +65,6 @@ pub enum ModelStatus {
     Alpha,
     Deprecated,
 }
-
 
 impl ModelStatus {
     /// Whether to surface this model in default UI listings.
@@ -293,7 +292,9 @@ pub struct ModelEntry {
     pub headers: HashMap<String, String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl ModelEntry {
     /// Whether this model accepts image input.  Derived from `modalities_input`.
@@ -466,7 +467,9 @@ mod md {
         pub headers: HashMap<String, String>,
     }
 
-    fn default_true() -> bool { true }
+    fn default_true() -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,14 +532,17 @@ fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
         let provider_id = remap_provider_id(&raw_provider_id).to_string();
         let pid = ProviderId::new(provider_id.clone());
 
-        out.providers.insert(provider_id.clone(), ProviderEntry {
-            id: pid.clone(),
-            name: p.name,
-            env: p.env,
-            api: normalize_provider_api(&provider_id, p.api),
-            npm: p.npm,
-            doc: p.doc,
-        });
+        out.providers.insert(
+            provider_id.clone(),
+            ProviderEntry {
+                id: pid.clone(),
+                name: p.name,
+                env: p.env,
+                api: normalize_provider_api(&provider_id, p.api),
+                npm: p.npm,
+                doc: p.doc,
+            },
+        );
 
         for (model_id, m) in p.models.into_iter() {
             let mid = ModelId::new(model_id.clone());
@@ -775,7 +781,7 @@ pub struct ModelRegistry {
     /// User-supplied metadata overrides, keyed by `"provider/model"`. Re-applied
     /// after every catalog merge so they stay authoritative across cache reloads
     /// and network refreshes (issue #309).
-    overrides: HashMap<String, claurst_core::config::ModelOverride>,
+    overrides: HashMap<String, clawde_core::config::ModelOverride>,
 }
 
 impl ModelRegistry {
@@ -886,9 +892,7 @@ impl ModelRegistry {
 
         // Prefix match (handles version suffixes)
         for entry in self.entries.values() {
-            if (*entry.info.id).starts_with(model_name)
-                || model_name.starts_with(&*entry.info.id)
-            {
+            if (*entry.info.id).starts_with(model_name) || model_name.starts_with(&*entry.info.id) {
                 return Some(entry.info.provider_id.clone());
             }
         }
@@ -1223,10 +1227,10 @@ impl ModelRegistry {
     /// Keys without a `'/'` separator are skipped: the registry is keyed by
     /// `"provider/model"` and a bare id cannot be placed unambiguously.
     ///
-    /// [`ModelOverride`]: claurst_core::config::ModelOverride
+    /// [`ModelOverride`]: clawde_core::config::ModelOverride
     pub fn apply_model_overrides(
         &mut self,
-        overrides: &HashMap<String, claurst_core::config::ModelOverride>,
+        overrides: &HashMap<String, clawde_core::config::ModelOverride>,
     ) {
         for (key, ov) in overrides {
             self.overrides.insert(key.clone(), ov.clone());
@@ -1243,6 +1247,62 @@ impl ModelRegistry {
         }
         apply_overrides_to_entries(&mut self.entries, &self.overrides);
     }
+
+    /// Register synthetic model entries for every upstream in the
+    /// [`FREE_CATALOG`] so the model registry can resolve per-upstream
+    /// metadata (tool_calling, context window, max output tokens) even
+    /// for models that don't exist in the models.dev catalog.
+    ///
+    /// Each entry is keyed `"{upstream_id}/{default_model}"`, matching the
+    /// lookup pattern in the query loop when a free upstream is dispatched
+    /// directly (pin mode) or via the FreeProvider's own per-model override
+    /// methods.
+    ///
+    /// [`FREE_CATALOG`]: crate::providers::free::FREE_CATALOG
+    pub fn register_free_upstream_models(&mut self) {
+        for upstream in crate::providers::free::FREE_CATALOG {
+            let key = format!("{}/{}", upstream.id, upstream.default_model);
+            // Don't overwrite a real catalog entry if one exists.
+            if self.entries.contains_key(&key) {
+                continue;
+            }
+            let entry = ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(upstream.default_model),
+                    provider_id: ProviderId::new(upstream.id),
+                    name: format!("{} — {}", upstream.title, upstream.default_model),
+                    context_window: 128_000,
+                    max_output_tokens: upstream.max_tokens_cap.unwrap_or(8_192),
+                    release_date: None,
+                    status: None,
+                },
+                family: None,
+                status: ModelStatus::Active,
+                release_date: None,
+                last_updated: None,
+                knowledge: None,
+                open_weights: false,
+                tool_calling: upstream.tool_calling,
+                reasoning: false,
+                structured_output: false,
+                temperature: true,
+                attachment: false,
+                interleaved: None,
+                modalities_input: vec![Modality::Text],
+                modalities_output: vec![Modality::Text],
+                cost_input: Some(0.0),
+                cost_output: Some(0.0),
+                cost_cache_read: None,
+                cost_cache_write: None,
+                cost: CostBreakdown::default(),
+                provider_override: None,
+                experimental_modes: HashMap::new(),
+                options: HashMap::new(),
+                headers: HashMap::new(),
+            };
+            self.entries.insert(key, entry);
+        }
+    }
 }
 
 /// Layer `overrides` onto `entries`: patch existing catalog rows in place and
@@ -1250,7 +1310,7 @@ impl ModelRegistry {
 /// Malformed keys (no `'/'`, or an empty half) and empty overrides are skipped.
 fn apply_overrides_to_entries(
     entries: &mut HashMap<String, ModelEntry>,
-    overrides: &HashMap<String, claurst_core::config::ModelOverride>,
+    overrides: &HashMap<String, clawde_core::config::ModelOverride>,
 ) {
     for (key, ov) in overrides {
         if ov.is_empty() {
@@ -1389,19 +1449,19 @@ fn is_local_runtime(provider_id: &str) -> bool {
 /// generic `"-pro"`/`"-max"` tier markers at the end catch flagship tiers for
 /// providers without an explicit family entry (e.g. Google's `gemini-*-pro`).
 const PREFERRED_FLAGSHIPS: &[&str] = &[
-    "claude-opus",       // Anthropic flagship
-    "gpt-5",             // OpenAI flagship family
-    "grok-4",            // xAI
-    "command-a",         // Cohere
-    "glm-5",             // Z.ai
-    "deepseek-v4",       // DeepSeek
+    "claude-opus", // Anthropic flagship
+    "gpt-5",       // OpenAI flagship family
+    "grok-4",      // xAI
+    "command-a",   // Cohere
+    "glm-5",       // Z.ai
+    "deepseek-v4", // DeepSeek
     "deepseek-reasoner",
     "mistral-large",
     "mistral-medium",
-    "sonar-pro",         // Perplexity
-    "claude-sonnet",     // Anthropic mid-tier (below opus, above haiku)
-    "-pro",              // generic flagship tier (Gemini pro, gpt-5-pro, …)
-    "-max",              // generic flagship tier (qwen3.6-max, …)
+    "sonar-pro",     // Perplexity
+    "claude-sonnet", // Anthropic mid-tier (below opus, above haiku)
+    "-pro",          // generic flagship tier (Gemini pro, gpt-5-pro, …)
+    "-max",          // generic flagship tier (qwen3.6-max, …)
 ];
 
 /// Capability priority for local runtimes (coder-first), kept from the old
@@ -1510,13 +1570,15 @@ fn cmp_ids_newest_first(a: &str, b: &str) -> std::cmp::Ordering {
 /// Substring patterns marking a model as the lightweight/cheap default.
 fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
     match provider_id {
-        "anthropic" | "amazon-bedrock" | "github-copilot" | "azure" => &[
-            "claude-haiku-4",
-            "claude-haiku-3-5",
-            "claude-haiku",
-        ],
+        "anthropic" | "amazon-bedrock" | "github-copilot" | "azure" => {
+            &["claude-haiku-4", "claude-haiku-3-5", "claude-haiku"]
+        }
         "openai" => &["gpt-5-mini", "gpt-4o-mini", "o4-mini", "o3-mini"],
-        "google" => &["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
+        "google" => &[
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+        ],
         "deepseek" => &["deepseek-v4-flash", "deepseek-chat"],
         "mistral" => &["mistral-small", "mistral-nemo"],
         "xai" => &["grok-3-mini", "grok-2-mini"],
@@ -1544,7 +1606,7 @@ fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
 ///  2. Consult the model registry for the configured provider's best model.
 ///  3. Fall back to the hardcoded table in [`Config::effective_model()`].
 pub fn effective_model_for_config(
-    config: &claurst_core::config::Config,
+    config: &clawde_core::config::Config,
     registry: &ModelRegistry,
 ) -> String {
     if config.model.is_some() {
@@ -1596,7 +1658,10 @@ mod tests {
         let reg = ModelRegistry::new();
         let models = reg.list_by_provider("anthropic");
         let has_claude = models.iter().any(|m| (*m.info.id).starts_with("claude"));
-        assert!(has_claude, "anthropic should have at least one claude model");
+        assert!(
+            has_claude,
+            "anthropic should have at least one claude model"
+        );
     }
 
     #[test]
@@ -1613,7 +1678,8 @@ mod tests {
     #[test]
     fn modalities_drive_vision() {
         let reg = ModelRegistry::new();
-        if let Some(opus) = reg.list_by_provider("anthropic")
+        if let Some(opus) = reg
+            .list_by_provider("anthropic")
             .iter()
             .find(|m| (*m.info.id).contains("opus"))
         {
@@ -1723,11 +1789,17 @@ mod tests {
 
         // provider.body keys are snake_case → camelCase converted.
         assert_eq!(
-            synth.options.get("maxOutputTokens").and_then(|v| v.as_u64()),
+            synth
+                .options
+                .get("maxOutputTokens")
+                .and_then(|v| v.as_u64()),
             Some(1024)
         );
         assert_eq!(
-            synth.options.get("reasoningEffort").and_then(|v| v.as_str()),
+            synth
+                .options
+                .get("reasoningEffort")
+                .and_then(|v| v.as_str()),
             Some("low")
         );
 
@@ -1790,7 +1862,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                reg.provider(provider_id).and_then(|provider| provider.api.as_deref()),
+                reg.provider(provider_id)
+                    .and_then(|provider| provider.api.as_deref()),
                 Some(expected_api),
                 "{provider_id} must expose the Anthropic base URL without /v1"
             );
@@ -1850,9 +1923,15 @@ mod tests {
     fn version_aware_id_compare() {
         use std::cmp::Ordering;
         // Newer point-release sorts first.
-        assert_eq!(cmp_ids_newest_first("claude-opus-4-8", "claude-opus-4-7"), Ordering::Less);
+        assert_eq!(
+            cmp_ids_newest_first("claude-opus-4-8", "claude-opus-4-7"),
+            Ordering::Less
+        );
         // Numeric, not lexical: 4-10 is newer than 4-9.
-        assert_eq!(cmp_ids_newest_first("claude-opus-4-10", "claude-opus-4-9"), Ordering::Less);
+        assert_eq!(
+            cmp_ids_newest_first("claude-opus-4-10", "claude-opus-4-9"),
+            Ordering::Less
+        );
         // A clean alias beats its date-pinned sibling.
         assert_eq!(
             cmp_ids_newest_first("claude-opus-4-5", "claude-opus-4-5-20251101"),
@@ -1893,7 +1972,10 @@ mod tests {
             r#"{"anthropic":{"id":"anthropic","name":"Anthropic","env":[],"models":{"claude-opus-9-9":{"id":"claude-opus-9-9","name":"Claude Opus 9.9","limit":{"context":200000,"output":32000}}}}}"#,
         );
         assert!(
-            reg.get("anthropic", "claude-opus-9-9").unwrap().release_date.is_none(),
+            reg.get("anthropic", "claude-opus-9-9")
+                .unwrap()
+                .release_date
+                .is_none(),
             "fixture must have no release_date"
         );
         assert_eq!(
@@ -1912,7 +1994,10 @@ mod tests {
             r#"{"anthropic":{"id":"anthropic","name":"Anthropic","env":[],"models":{"claude-sonnet-9-9":{"id":"claude-sonnet-9-9","name":"Claude Sonnet 9.9","release_date":"2099-01-01","limit":{"context":200000,"output":32000}}}}}"#,
         );
         let best = reg.best_model_for_provider("anthropic").expect("a default");
-        assert!(best.contains("opus"), "expected an opus default, got {best}");
+        assert!(
+            best.contains("opus"),
+            "expected an opus default, got {best}"
+        );
     }
 
     #[test]
@@ -1930,7 +2015,7 @@ mod tests {
         );
 
         // The single resolver agrees when only the provider (no model) is set.
-        let cfg = claurst_core::config::Config {
+        let cfg = clawde_core::config::Config {
             provider: Some("qwen".to_string()),
             model: None,
             ..Default::default()
@@ -1961,7 +2046,10 @@ mod tests {
             Some(before.as_str()),
             "an incoming None must not clobber the existing release_date"
         );
-        assert_eq!(after.info.name, "Claude Opus 4.8 REFRESHED", "present fields still win");
+        assert_eq!(
+            after.info.name, "Claude Opus 4.8 REFRESHED",
+            "present fields still win"
+        );
     }
 
     /// Guardrail: the model-surfacing contract must not silently regress.
@@ -2003,7 +2091,7 @@ mod tests {
 
     // ---- model overrides (issue #309) --------------------------------------
 
-    use claurst_core::config::ModelOverride;
+    use clawde_core::config::ModelOverride;
 
     fn overrides(pairs: Vec<(&str, ModelOverride)>) -> HashMap<String, ModelOverride> {
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -2022,7 +2110,10 @@ mod tests {
         let key = format!("anthropic/{model}");
 
         let original = reg.get("anthropic", &model).unwrap();
-        assert_ne!(original.info.context_window, 12_345, "test value must differ");
+        assert_ne!(
+            original.info.context_window, 12_345,
+            "test value must differ"
+        );
 
         reg.apply_model_overrides(&overrides(vec![(
             key.as_str(),
@@ -2055,7 +2146,10 @@ mod tests {
         // Only context_window is set; max_output_tokens and name must survive.
         reg.apply_model_overrides(&overrides(vec![(
             format!("anthropic/{model}").as_str(),
-            ModelOverride { context_window: Some(500_000), ..Default::default() },
+            ModelOverride {
+                context_window: Some(500_000),
+                ..Default::default()
+            },
         )]));
 
         let patched = reg.get("anthropic", &model).unwrap();
@@ -2103,12 +2197,34 @@ mod tests {
             // Empty override — nothing to apply.
             ("custom-openai/noop", ModelOverride::default()),
             // No provider/model separator — cannot be placed.
-            ("bare-id", ModelOverride { context_window: Some(1_000), ..Default::default() }),
+            (
+                "bare-id",
+                ModelOverride {
+                    context_window: Some(1_000),
+                    ..Default::default()
+                },
+            ),
             // Empty provider / model halves.
-            ("/model", ModelOverride { context_window: Some(1_000), ..Default::default() }),
-            ("provider/", ModelOverride { context_window: Some(1_000), ..Default::default() }),
+            (
+                "/model",
+                ModelOverride {
+                    context_window: Some(1_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "provider/",
+                ModelOverride {
+                    context_window: Some(1_000),
+                    ..Default::default()
+                },
+            ),
         ]));
-        assert_eq!(reg.len(), before, "malformed/empty overrides must not add entries");
+        assert_eq!(
+            reg.len(),
+            before,
+            "malformed/empty overrides must not add entries"
+        );
         assert!(reg.get("custom-openai", "noop").is_none());
     }
 }

@@ -1,7 +1,7 @@
 // managed_orchestrator.rs — System-prompt injection and helpers for
 // the manager-executor managed agent architecture.
 
-use claurst_core::ManagedAgentConfig;
+use clawde_core::ManagedAgentConfig;
 
 /// Build the managed-agent section appended to the system prompt when managed mode is active.
 pub fn managed_agent_system_prompt(config: &ManagedAgentConfig) -> String {
@@ -12,11 +12,15 @@ pub fn managed_agent_system_prompt(config: &ManagedAgentConfig) -> String {
     };
 
     let budget_note = match config.total_budget_usd {
-        Some(b) => format!("Total session budget: ${:.2}. Monitor your spend carefully.", b),
+        Some(b) => format!(
+            "Total session budget: ${:.2}. Monitor your spend carefully.",
+            b
+        ),
         None => "No hard budget cap set. Be cost-conscious.".to_string(),
     };
 
-    format!(r#"
+    format!(
+        r#"
 ## Managed Agent Mode
 
 You are the MANAGER in a manager-executor architecture.
@@ -60,7 +64,7 @@ You are the MANAGER in a manager-executor architecture.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::ManagedAgentConfig;
+    use clawde_core::ManagedAgentConfig;
 
     fn test_config() -> ManagedAgentConfig {
         ManagedAgentConfig {
@@ -69,7 +73,7 @@ mod tests {
             executor_model: "anthropic/claude-sonnet-4-6".to_string(),
             executor_max_turns: 8,
             max_concurrent_executors: 3,
-            budget_split: claurst_core::BudgetSplitPolicy::SharedPool,
+            budget_split: clawde_core::BudgetSplitPolicy::SharedPool,
             total_budget_usd: Some(10.0),
             preset_name: None,
             executor_isolation: true,

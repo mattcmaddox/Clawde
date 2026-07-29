@@ -11,7 +11,7 @@
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct UiSettings {
     #[serde(default)]
-    pub editor_mode: Option<String>,       // "vim" or "normal"
+    pub editor_mode: Option<String>, // "vim" or "normal"
     #[serde(default)]
     pub fast_mode: Option<bool>,
     #[serde(default)]
@@ -35,7 +35,7 @@ pub(crate) struct UiSettings {
 }
 
 pub(crate) fn ui_settings_path() -> std::path::PathBuf {
-    claurst_core::config::Settings::config_dir().join("ui-settings.json")
+    clawde_core::config::Settings::config_dir().join("ui-settings.json")
 }
 
 pub(crate) fn load_ui_settings() -> UiSettings {

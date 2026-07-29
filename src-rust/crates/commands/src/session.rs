@@ -82,8 +82,16 @@ impl SlashCommand for PlanCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "open".into(), description: "Open the plan file in your $EDITOR".into(), available: true },
-            ArgCompletion { value: "exit".into(), description: "Leave plan mode and resume normal execution".into(), available: true },
+            ArgCompletion {
+                value: "open".into(),
+                description: "Open the plan file in your $EDITOR".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "exit".into(),
+                description: "Leave plan mode and resume normal execution".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
@@ -110,7 +118,9 @@ impl SlashCommand for PlanCommand {
 
             // Create a default plan template if the file does not exist yet.
             if !path.exists() {
-                let template = "# Plan\n\n## Objective\n\n\n## Steps\n\n1. \n2. \n3. \n\n## Notes\n\n".to_string();
+                let template =
+                    "# Plan\n\n## Objective\n\n\n## Steps\n\n1. \n2. \n3. \n\n## Notes\n\n"
+                        .to_string();
                 if let Err(e) = std::fs::write(&path, &template) {
                     return CommandResult::Error(format!("Failed to create plan file: {}", e));
                 }
@@ -235,9 +245,11 @@ impl SlashCommand for SessionCommand {
         "Show or manage conversation sessions"
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
-            ArgCompletion { value: "list".into(), description: "List all saved sessions".into(), available: true },
-        ]
+        vec![ArgCompletion {
+            value: "list".into(),
+            description: "List all saved sessions".into(),
+            available: true,
+        }]
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {

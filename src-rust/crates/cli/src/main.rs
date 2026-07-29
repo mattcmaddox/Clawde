@@ -281,6 +281,10 @@ struct Cli {
     /// Named agent to use (e.g., build, plan, explore)
     #[arg(long, short = 'A')]
     agent: Option<String>,
+
+    /// List all available models from the bundled registry and exit
+    #[arg(long = "list-models", action = clap::ArgAction::SetTrue)]
+    list_models: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -519,6 +523,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref m) = cli.model {
         config.model = Some(m.clone());
+        // When model is "provider/model", derive the provider from the model prefix
+        // (e.g., "free/auto" → provider="free"). Explicit --provider still wins.
+        normalize_provider_from_model(&mut config);
     }
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
@@ -573,6 +580,11 @@ async fn main() -> anyhow::Result<()> {
             .entry(provider_id)
             .or_default()
             .api_base = Some(base.clone());
+    }
+
+    // --list-models fast path: print all models and exit
+    if cli.list_models {
+        return run_models_command(&[]).await;
     }
 
     // --dump-system-prompt fast path
@@ -1222,6 +1234,10 @@ fn load_cached_model_registry(config: &Config) -> Arc<clawde_api::ModelRegistry>
     // Layer user metadata overrides on top of the catalog (issue #309). Stored
     // in the registry, so any later cache reload re-asserts them automatically.
     reg.apply_model_overrides(&config.model_overrides);
+    // Register FreeProvider upstream models so the model registry can resolve
+    // per-upstream metadata (tool_calling, context window) for models not in
+    // the models.dev catalog.
+    reg.register_free_upstream_models();
     Arc::new(reg)
 }
 
@@ -1346,12 +1362,10 @@ struct RefreshedProviderRuntime {
 async fn refresh_provider_runtime_state(
     current_config: &Config,
 ) -> anyhow::Result<RefreshedProviderRuntime> {
-    remove_file_if_exists(&clawde_core::AuthStore::path())
-        .await
-        .context("Failed to clear auth store")?;
-    remove_file_if_exists(&clawde_core::oauth::OAuthTokens::token_file_path())
-        .await
-        .context("Failed to clear OAuth token cache")?;
+    // Clear model caches so the next request re-fetches fresh model metadata.
+    // Credentials (auth store, OAuth tokens) are NOT deleted — they are
+    // preserved across rebuilds so that free/auto and other credential-
+    // dependent modes keep working.
     remove_file_if_exists(&models_cache_path())
         .await
         .context("Failed to clear model cache")?;
@@ -1937,6 +1951,58 @@ async fn run_interactive(
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     // Wire argument-level slash-command completions from the commands crate.
+    // Wire key-ring data callback for the /ctx-viz overlay.
+    {
+        let reg = base_query_config.provider_registry.clone();
+        app.key_ring_data_fn = Some(std::sync::Arc::new(
+            move || -> Vec<clawde_tui::context_viz::KeyRingRow> {
+                reg.as_ref()
+                    .map(|r| {
+                        r.key_ring_summaries()
+                            .into_iter()
+                            .map(|(name, active, total, retry)| {
+                                clawde_tui::context_viz::KeyRingRow {
+                                    provider_name: name,
+                                    active,
+                                    total,
+                                    retry_secs: retry,
+                                    tokens_pct: None,
+                                    requests_pct: None,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            },
+        ));
+        // Wire free-model defaults for the /ctx-viz overlay.
+        // These are computed during build_free_provider and stored via
+        // store_free_model_defaults; read them back now for the TUI.
+        app.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
+
+        // Set startup status message showing auto-detected free models.
+        if !app.free_model_defaults.is_empty() {
+            let count = app.free_model_defaults.len();
+            let summary: Vec<String> = app.free_model_defaults.iter().take(3).map(|(name, model)| {
+                // Shorten model name: trim after first '/' or to 18 chars
+                let short = if model.len() > 18 {
+                    let after_slash = model.rsplit('/').next().unwrap_or(model);
+                    if after_slash.len() <= 18 { after_slash.to_string() }
+                    else { format!("{}…", &after_slash[..16]) }
+                } else {
+                    model.clone()
+                };
+                format!("{} → {}", name, short)
+            }).collect();
+            let suffix = if count > 3 { format!(" (+{} more)", count - 3) } else { String::new() };
+            app.status_message = Some(format!(
+                "Free mode — {}{}",
+                summary.join(", "),
+                suffix,
+            ));
+        }
+    }
+
     app.arg_completions = Some(std::sync::Arc::new(
         |cmd_name: &str, partial: &str| -> Vec<clawde_tui::prompt_input::TypeaheadSuggestion> {
             clawde_commands::get_arg_completions(cmd_name, partial)
@@ -2253,7 +2319,6 @@ async fn run_interactive(
     }
 
     'main: loop {
-
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
         app.notifications.tick();
@@ -3324,6 +3389,16 @@ async fn run_interactive(
                             // Paste into API key input dialog
                             for ch in data.chars() {
                                 app.key_input_dialog.insert_char(ch);
+                            }
+                        } else if app.free_mode_dialog.visible {
+                            // Paste into Free Mode multi-provider dialog
+                            for ch in data.chars() {
+                                app.free_mode_dialog.insert_char(ch);
+                            }
+                        } else if app.custom_provider_dialog.visible {
+                            // Paste into Custom OpenAI-compatible dialog
+                            for ch in data.chars() {
+                                app.custom_provider_dialog.insert_char(ch);
                             }
                         } else {
                             // Paste into the main prompt through the shared path

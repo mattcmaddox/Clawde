@@ -287,6 +287,7 @@ render_prompt_suggestions() in render.rs
 | `/output-style` | (dynamic — from disk, OnceLock-cached) | `appearance.rs` |
 | `/diff` | --stat, --staged | `lib.rs` |
 | `/agent` | (built-in visible agents, OnceLock-cached) | `providers.rs` |
+| `/routing` | sequential, random, latency, sr, rr, lr | `routing.rs` |
 | `/model` | (~4500 model IDs from bundled snapshot, OnceLock-cached) | `lib.rs` |
 | `/managed-agents` | status, presets, preset, setup, configure, enable, disable, reset, budget + 6 preset names | `managed_agents.rs` |
 | `/permissions` | set (→ default, accept-edits, bypass-permissions, plan), allow (→ 40+ tool names), deny (→ tool names), reset | `permissions.rs` |

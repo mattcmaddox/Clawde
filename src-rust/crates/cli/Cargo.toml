@@ -1,6 +1,7 @@
 [package]
 name = "clawde-cli"
 version.workspace = true
+description = "Binary entry point with CLI argument parsing, TUI launch, headless mode, and ACP server mode"
 edition.workspace = true
 
 [[bin]]

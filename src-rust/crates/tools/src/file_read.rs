@@ -20,10 +20,12 @@ struct FileReadInput {
 #[async_trait]
 impl Tool for FileReadTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_FILE_READ
+        clawde_core::constants::TOOL_NAME_FILE_READ
     }
 
     fn description(&self) -> &str {
@@ -128,10 +130,7 @@ impl Tool for FileReadTool {
         };
 
         if content.is_empty() {
-            return ToolResult::success(format!(
-                "[File {} exists but is empty]",
-                path.display()
-            ));
+            return ToolResult::success(format!("[File {} exists but is empty]", path.display()));
         }
 
         let lines: Vec<&str> = content.lines().collect();
@@ -170,5 +169,137 @@ impl Tool for FileReadTool {
         }
 
         ToolResult::success(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn read_existing_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(json!({"file_path": path.to_string_lossy()}), &ctx)
+            .await;
+
+        assert!(!res.is_error, "read failed: {}", res.content);
+        assert!(res.content.contains("line one"));
+        assert!(res.content.contains("line two"));
+        assert!(res.content.contains("line three"));
+    }
+
+    #[tokio::test]
+    async fn read_with_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        let content = (1..=100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        // Read lines 10-14 (1-based offset 10, limit 5)
+        let res = FileReadTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "offset": 10,
+                    "limit": 5
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!res.is_error, "read failed: {}", res.content);
+        assert!(res.content.contains("10\tline 10"));
+        assert!(res.content.contains("14\tline 14"));
+        assert!(!res.content.contains("9\tline 9"));
+        assert!(!res.content.contains("15\tline 15"));
+    }
+
+    #[tokio::test]
+    async fn read_nonexistent_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(json!({"file_path": "/nonexistent/path/file.txt"}), &ctx)
+            .await;
+
+        assert!(res.is_error, "expected error for nonexistent file");
+        assert!(res.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn read_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(json!({"file_path": dir.path().to_string_lossy()}), &ctx)
+            .await;
+
+        assert!(res.is_error, "expected error for directory");
+        assert!(res.content.contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn read_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(json!({"file_path": path.to_string_lossy()}), &ctx)
+            .await;
+
+        assert!(!res.is_error, "read failed: {}", res.content);
+        assert!(res.content.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn read_with_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("numbered.txt");
+        std::fs::write(&path, "alpha\nbeta\ncharlie\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(json!({"file_path": path.to_string_lossy()}), &ctx)
+            .await;
+
+        assert!(!res.is_error, "read failed: {}", res.content);
+        // Line numbers should be present (1-based)
+        assert!(res.content.contains("1\talpha"));
+        assert!(res.content.contains("2\tbeta"));
+        assert!(res.content.contains("3\tcharlie"));
+    }
+
+    #[tokio::test]
+    async fn read_offset_exceeds_total_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.txt");
+        std::fs::write(&path, "only one line\n").unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = FileReadTool
+            .execute(
+                json!({
+                    "file_path": path.to_string_lossy(),
+                    "offset": 100,
+                    "limit": 5
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(res.is_error, "expected error for offset past end");
     }
 }

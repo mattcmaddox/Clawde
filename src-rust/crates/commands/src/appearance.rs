@@ -23,16 +23,56 @@ impl SlashCommand for ColorCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "default".into(), description: "Reset to default color".into(), available: true },
-            ArgCompletion { value: "red".into(), description: "Red prompt bar".into(), available: true },
-            ArgCompletion { value: "green".into(), description: "Green prompt bar".into(), available: true },
-            ArgCompletion { value: "blue".into(), description: "Blue prompt bar".into(), available: true },
-            ArgCompletion { value: "yellow".into(), description: "Yellow prompt bar".into(), available: true },
-            ArgCompletion { value: "cyan".into(), description: "Cyan prompt bar".into(), available: true },
-            ArgCompletion { value: "magenta".into(), description: "Magenta prompt bar".into(), available: true },
-            ArgCompletion { value: "white".into(), description: "White prompt bar".into(), available: true },
-            ArgCompletion { value: "orange".into(), description: "Orange prompt bar".into(), available: true },
-            ArgCompletion { value: "purple".into(), description: "Purple prompt bar".into(), available: true },
+            ArgCompletion {
+                value: "default".into(),
+                description: "Reset to default color".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "red".into(),
+                description: "Red prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "green".into(),
+                description: "Green prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "blue".into(),
+                description: "Blue prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "yellow".into(),
+                description: "Yellow prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "cyan".into(),
+                description: "Cyan prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "magenta".into(),
+                description: "Magenta prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "white".into(),
+                description: "White prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "orange".into(),
+                description: "Orange prompt bar".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "purple".into(),
+                description: "Purple prompt bar".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
@@ -99,10 +139,26 @@ impl SlashCommand for ThemeCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
         vec![
-            super::ArgCompletion { value: "default".into(), description: "System terminal default".into(), available: true },
-            super::ArgCompletion { value: "dark".into(), description: "Dark color scheme".into(), available: true },
-            super::ArgCompletion { value: "light".into(), description: "Light color scheme".into(), available: true },
-            super::ArgCompletion { value: "catppuccin".into(), description: "Catppuccin Mocha theme".into(), available: true },
+            super::ArgCompletion {
+                value: "default".into(),
+                description: "System terminal default".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "dark".into(),
+                description: "Dark color scheme".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "light".into(),
+                description: "Light color scheme".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "catppuccin".into(),
+                description: "Catppuccin Mocha theme".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

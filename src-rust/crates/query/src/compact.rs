@@ -1568,7 +1568,6 @@ pub async fn context_collapse(
     provider: &dyn LlmProvider,
     config: &crate::QueryConfig,
 ) -> Result<CompactResult, clawde_core::error::ClaudeError> {
-
     let total = messages.len();
     if total == 0 {
         return Ok(CompactResult {
@@ -2404,7 +2403,8 @@ mod tests {
             &self,
             _request: clawde_api::ProviderRequest,
         ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
-            self.called.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.called
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             Err(clawde_api::ProviderError::ServerError {
                 provider: clawde_core::ProviderId::new("mock"),
                 status: Some(500),
@@ -2419,8 +2419,9 @@ mod tests {
         ) -> Result<
             std::pin::Pin<
                 Box<
-                    dyn futures::Stream<Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>>
-                        + Send,
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
                 >,
             >,
             clawde_api::ProviderError,
@@ -2428,7 +2429,9 @@ mod tests {
             unimplemented!("mock does not support streaming")
         }
 
-        async fn health_check(&self) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
             Ok(clawde_api::ProviderStatus::Healthy)
         }
 
@@ -2461,10 +2464,21 @@ mod tests {
         };
 
         // 95% of a 200k window = 190k — above the 90% threshold.
-        let result = auto_compact_if_needed(&provider, &messages, 190_000, "test-model", 200_000, &mut state).await;
+        let result = auto_compact_if_needed(
+            &provider,
+            &messages,
+            190_000,
+            "test-model",
+            200_000,
+            &mut state,
+        )
+        .await;
 
         assert!(result.is_none(), "gate must return None when disabled");
-        assert!(!provider.was_called(), "provider must NOT be called when gate is disabled");
+        assert!(
+            !provider.was_called(),
+            "provider must NOT be called when gate is disabled"
+        );
     }
 
     /// When auto-compact is enabled but the token count is below the 90% threshold,
@@ -2476,10 +2490,24 @@ mod tests {
         let mut state = AutoCompactState::default();
 
         // 50% of a 200k window = 100k — below the 90% threshold.
-        let result = auto_compact_if_needed(&provider, &messages, 100_000, "test-model", 200_000, &mut state).await;
+        let result = auto_compact_if_needed(
+            &provider,
+            &messages,
+            100_000,
+            "test-model",
+            200_000,
+            &mut state,
+        )
+        .await;
 
-        assert!(result.is_none(), "gate must return None when below threshold");
-        assert!(!provider.was_called(), "provider must NOT be called below threshold");
+        assert!(
+            result.is_none(),
+            "gate must return None when below threshold"
+        );
+        assert!(
+            !provider.was_called(),
+            "provider must NOT be called below threshold"
+        );
     }
 
     /// When auto-compact is enabled AND the threshold is met (first compaction,
@@ -2499,11 +2527,25 @@ mod tests {
         state.turns_since_last_compact = 10; // bypass turn-gap debounce
 
         // 95% — above threshold. First compaction has no debounce history.
-        let result = auto_compact_if_needed(&provider, &messages, 190_000, "test-model", 200_000, &mut state).await;
+        let result = auto_compact_if_needed(
+            &provider,
+            &messages,
+            190_000,
+            "test-model",
+            200_000,
+            &mut state,
+        )
+        .await;
 
         // The mock provider returns an error, so auto_compact_if_needed returns None.
         assert!(result.is_none(), "compaction yields None on provider error");
-        assert!(provider.was_called(), "provider WAS called — gate allowed compaction to proceed");
-        assert_eq!(state.consecutive_failures, 1, "provider error increments failure count");
+        assert!(
+            provider.was_called(),
+            "provider WAS called — gate allowed compaction to proceed"
+        );
+        assert_eq!(
+            state.consecutive_failures, 1,
+            "provider error increments failure count"
+        );
     }
 }

@@ -30,6 +30,79 @@ When no provider is specified, Clawde defaults to **Anthropic**.
 
 ---
 
+## Multi-Key Rotation
+
+Clawde supports configuring **multiple API keys** for a single provider. When one
+key is exhausted (rate limited, quota exceeded, or auth failure), the system
+automatically rotates to the next available key. This is especially useful for
+free-tier providers with low per-key rate limits.
+
+### Managing keys with `/keys`
+
+Use the `/keys` slash command to manage keys:
+
+| Command | Description |
+|---|---|
+| `/keys` | List all providers with configured keys |
+| `/keys list [provider]` | Show keys (optionally filtered to one provider) |
+| `/keys set <provider> <key1> [key2 ...]` | Replace all keys (clears previous) |
+| `/keys add <provider> <key>` | Append a single key |
+| `/keys remove <provider> <index>` | Remove key at 1-based index |
+
+**Examples:**
+
+```
+/keys set groq gsk_key1 gsk_key2 gsk_key3
+/keys add groq gsk_key4
+/keys remove groq 1
+/keys list groq
+```
+
+### Key rotation behavior
+
+- **Rate limited (429):** The exhausted key cools down for 60 seconds (or the
+  `Retry-After` value from the response, whichever is more precise).
+- **Quota exceeded:** The key cools down for 1 hour by default.
+- **Auth failure (401/403):** The key cools down for 5 minutes.
+- When **all keys** for a provider are in cooldown, requests fail with a
+  `RateLimited` error containing the time until the earliest key recovers.
+- Keys with 2+ configured keys show a rotation indicator in the status bar
+  when any keys are exhausted (e.g. `groq:2/3 keys` in yellow/red).
+
+### Storage
+
+Keys are stored in `~/.clawde/auth.json` under the `"keys"` map, separate from
+single-key credentials. The `/keys` command manages this automatically.
+
+### Managing routing with `/routing`
+
+Use the `/routing` slash command to view or change how the free-mode router
+selects upstream providers:
+
+| Command | Description |
+|---|---|
+| `/routing` | Show the current routing strategy |
+| `/routing sequential` | Try upstreams in catalog priority order (default) |
+| `/routing random` | Randomize upstream order each request |
+| `/routing latency` | Route to the lowest-latency upstream first |
+| `/routing sr` / `/sr` | Quick alias for sequential |
+| `/routing rr` / `/rr` | Quick alias for random |
+| `/routing lr` / `/lr` | Quick alias for latency |
+
+**Examples:**
+
+```
+/routing
+/routing random
+/rr
+```
+
+The setting is persisted in `~/.clawde/settings.json` under
+`providers.free.options.routing.strategy` and takes effect after a restart
+or `/refresh`.
+
+---
+
 ## Provider Reference
 
 ### Anthropic (default)

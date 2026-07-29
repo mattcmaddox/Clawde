@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use claurst_core::provider_id::ProviderId;
+use clawde_core::provider_id::ProviderId;
 
 use crate::provider_error::ProviderError;
 
@@ -262,8 +262,7 @@ impl RetryConfig {
     /// Applies exponential back-off with ±10 % jitter derived from the
     /// current system time (no external `rand` dependency required).
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let base = self.initial_delay.as_secs_f64()
-            * self.backoff_multiplier.powi(attempt as i32);
+        let base = self.initial_delay.as_secs_f64() * self.backoff_multiplier.powi(attempt as i32);
         let jitter = base * 0.1 * time_jitter_f64();
         Duration::from_secs_f64((base + jitter).min(self.max_delay.as_secs_f64()))
     }

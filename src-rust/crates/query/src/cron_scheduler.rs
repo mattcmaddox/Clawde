@@ -8,13 +8,13 @@
 // One-shot tasks (recurring=false) are automatically removed from the store
 // by `pop_due_tasks` after they are returned.
 
-use crate::{QueryConfig, QueryOutcome, run_query_loop};
-use claurst_core::types::Message;
-use claurst_tools::Tool;
-use claurst_tools::ToolContext;
+use crate::{run_query_loop, QueryConfig, QueryOutcome};
 use chrono::Timelike;
+use clawde_core::types::Message;
+use clawde_tools::Tool;
+use clawde_tools::ToolContext;
 use std::sync::Arc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 /// Returns immediately; the scheduler runs as a detached tokio task.
 /// Call `cancel.cancel()` to stop it gracefully.
 pub fn start_cron_scheduler(
-    client: Arc<claurst_api::AnthropicClient>,
+    client: Arc<clawde_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
@@ -35,7 +35,7 @@ pub fn start_cron_scheduler(
 }
 
 async fn run_scheduler_loop(
-    client: Arc<claurst_api::AnthropicClient>,
+    client: Arc<clawde_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn Tool>>>,
     tool_ctx: ToolContext,
     query_config: QueryConfig,
@@ -66,7 +66,7 @@ async fn run_scheduler_loop(
         debug!(time = %tick_time.format("%H:%M"), "Cron scheduler tick");
 
         // Find tasks due at this minute.
-        let due = claurst_tools::cron::pop_due_tasks(&tick_time).await;
+        let due = clawde_tools::cron::pop_due_tasks(&tick_time).await;
 
         for task in due {
             info!(id = %task.id, cron = %task.cron, "Firing cron task");
@@ -108,7 +108,10 @@ async fn run_scheduler_loop(
                     QueryOutcome::Cancelled => {
                         debug!(id = %task_id, "Cron task cancelled");
                     }
-                    QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                    QueryOutcome::BudgetExceeded {
+                        cost_usd,
+                        limit_usd,
+                    } => {
                         eprintln!(
                             "[cron] task {} budget exceeded: spent ${:.4} of ${:.4}",
                             task_id, cost_usd, limit_usd

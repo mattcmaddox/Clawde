@@ -22,10 +22,26 @@ impl SlashCommand for SandboxToggleCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "on".into(), description: "Enable sandbox mode".into(), available: true },
-            ArgCompletion { value: "off".into(), description: "Disable sandbox mode".into(), available: true },
-            ArgCompletion { value: "status".into(), description: "Show current state".into(), available: true },
-            ArgCompletion { value: "exclude".into(), description: "Add a command pattern to exclusions".into(), available: true },
+            ArgCompletion {
+                value: "on".into(),
+                description: "Enable sandbox mode".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "off".into(),
+                description: "Disable sandbox mode".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show current state".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "exclude".into(),
+                description: "Add a command pattern to exclusions".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

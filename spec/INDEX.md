@@ -1,5 +1,11 @@
 # Claude Code — Spec Index
 
+> **Historical Reference:** This `spec/` directory contains behavioral specifications
+> derived from the original TypeScript codebase (Claude Code). The current Rust
+> implementation follows these specs but has diverged in many areas. Use these
+> documents as a behavioral guide, not an exact architecture reference.
+> For the actual Rust architecture, see `CLAWDE_REFERENCE.md` at the repo root.
+
 > Quick-reference index across all spec documents.
 > Total spec coverage: ~990 KB across 15 markdown files.
 

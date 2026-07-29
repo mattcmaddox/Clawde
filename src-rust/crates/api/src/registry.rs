@@ -6,15 +6,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use claurst_core::ProviderId;
+use clawde_core::ProviderId;
 
 use crate::client::ClientConfig;
 use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
-    OpenAiProvider,
+    CopilotProvider, FreeEntry, FreeProvider, GoogleProvider, KeyRotatingProvider, MinimaxProvider,
+    OpenAiProvider, RoutingConfig, FREE_CATALOG,
 };
 
 fn normalize_openai_compat_base(override_base: &str) -> String {
@@ -36,7 +36,7 @@ fn normalize_openai_base(override_base: &str) -> String {
 }
 
 pub fn resolve_provider_api_base(
-    config: &claurst_core::config::Config,
+    config: &clawde_core::config::Config,
     provider_id: &str,
 ) -> Option<String> {
     let base = config.resolve_provider_api_base(provider_id)?;
@@ -64,9 +64,10 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 
     match provider_id {
-        "anthropic" => Some(Arc::new(AnthropicProvider::from_config(
-            ClientConfig { api_key: key, ..Default::default() },
-        ))),
+        "anthropic" => Some(Arc::new(AnthropicProvider::from_config(ClientConfig {
+            api_key: key,
+            ..Default::default()
+        }))),
         "minimax" => Some(Arc::new(MinimaxProvider::new(key))),
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
@@ -78,9 +79,8 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         }
         "cohere" => Some(Arc::new(CohereProvider::new(key))),
         "custom-openai" => Some(Arc::new(p::custom_openai().with_api_key(key))),
-        // "free" needs two keys (Zen + OpenRouter) — single-key path doesn't
-        // apply.  The auth-store-aware path `runtime_provider_for` handles it.
-        "free" => build_free_provider(),
+        // "free" is handled by `build_free_provider` and `runtime_provider_for`
+        // because it needs to iterate the full catalog, not a single key.
         _ => None,
     }
 }
@@ -89,21 +89,93 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
 /// the user has stored in the auth store. Each catalog entry whose upstream
 /// has a key becomes one link in the fallback chain.
 ///
+/// When an upstream has **multiple** keys in the auth store's multi-key store
+/// (set via `set_keys` / `add_key`), that upstream is wrapped in a
+/// [`KeyRotatingProvider`] so keys are automatically rotated on exhaustion.
+/// Single-key entries work exactly as before.
+///
 /// Returns `None` only if *no* catalog entry has a configured key — a single
 /// key is enough to run, and more is better.
-pub fn build_free_provider() -> Option<Arc<dyn LlmProvider>> {
-    let auth_store = claurst_core::AuthStore::load();
+pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<dyn LlmProvider>> {
+    let auth_store = clawde_core::AuthStore::load();
     let mut chain: Vec<FreeEntry> = Vec::new();
 
+    // Parse optional routing config from `settings.json` → `providers.free.options.routing`.
+    // If absent or malformed, the default (Sequential) is used.
+    let routing = config
+        .provider_configs
+        .get("free")
+        .and_then(|pc| pc.options.get("routing"))
+        .and_then(|v| serde_json::from_value::<RoutingConfig>(v.clone()).ok());
+
+    // Auto-detect the best free model for each upstream from models.dev.
+    // Falls back to the hardcoded default_model when models.dev is unreachable
+    // or no free model is found for a given upstream.
+    let auto_defaults = crate::providers::free::fetch_best_free_models_from_modelsdev();
+    let effective_model = |upstream_id: &str| {
+        auto_defaults.get(upstream_id).cloned()
+    };
+
     for upstream in FREE_CATALOG {
-        let key = match upstream.id {
-            // OpenCode Zen and Go share `OPENCODE_API_KEY`; accept either slot.
+        // --- multi-key path (2+ keys → wrap in KeyRotatingProvider) ---
+        let multi_keys: Option<Vec<String>> = match upstream.id {
+            // OpenCode Zen and Go share the same key env var; accept either slot.
             "opencode-zen" => auth_store
-                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
-                .or_else(|| auth_store.api_key_for(claurst_core::ProviderId::OPENCODE_GO)),
+                .keys_for("opencode-zen")
+                .or_else(|| auth_store.keys_for("opencode-go"))
+                .filter(|k| k.len() > 1)
+                .map(|k| k.to_vec()),
+            other => auth_store
+                .keys_for(other)
+                .filter(|k| k.len() > 1)
+                .map(|k| k.to_vec()),
+        };
+
+        if let Some(keys) = multi_keys {
+            let upstream_id = upstream.id.to_string();
+            let upstream_name = upstream.title.to_string();
+            let rotating = KeyRotatingProvider::new_with_persistence(
+                upstream_id.clone(),
+                upstream_name,
+                keys,
+                move |key| {
+                    let key_owned = key.to_string();
+                    match upstream_id.as_str() {
+                        "google" => {
+                            Arc::new(GoogleProvider::new(key_owned)) as Arc<dyn LlmProvider>
+                        }
+                        "cohere" => {
+                            Arc::new(CohereProvider::new(key_owned)) as Arc<dyn LlmProvider>
+                        }
+                        id => {
+                            let p = crate::providers::openai_compat_providers::provider_for_id(id)
+                                .unwrap_or_else(|| {
+                                    panic!("KeyRotatingProvider: no upstream factory for '{}'", id)
+                                });
+                            Arc::new(p.with_api_key(key_owned)) as Arc<dyn LlmProvider>
+                        }
+                    }
+                },
+            );
+            chain.push(FreeEntry {
+                upstream: *upstream,
+                provider: Arc::new(rotating),
+                effective_model: effective_model(upstream.id),
+            });
+            continue;
+        }
+
+        // --- single-key path (existing logic) ---
+        let key = match upstream.id {
+            "opencode-zen" => auth_store
+                .api_key_for(clawde_core::ProviderId::OPENCODE_ZEN)
+                .or_else(|| auth_store.api_key_for(clawde_core::ProviderId::OPENCODE_GO)),
             other => auth_store.api_key_for(other),
         }
-        .filter(|k| !k.trim().is_empty());
+        .filter(|k| !k.trim().is_empty())
+        // Cloud API keys are always at least 8 characters. Shorter values
+        // are placeholders or test artifacts that would fail with AuthFailed.
+        .filter(|k| k.len() >= 8);
 
         let Some(key) = key else {
             continue;
@@ -120,18 +192,34 @@ pub fn build_free_provider() -> Option<Arc<dyn LlmProvider>> {
             chain.push(FreeEntry {
                 upstream: *upstream,
                 provider,
+                effective_model: effective_model(upstream.id),
             });
+        }
+    }
+
+    // Run live free-model discovery for any upstream that supports it.
+    // This is the extensible pattern for providers like Cline whose free
+    // models change frequently and can be queried via a live API endpoint.
+    // To add a new provider: add a variant to FreeModelDiscovery, wire it
+    // in discovery_for() and run_live_discovery() in free.rs.
+    for idx in 0..chain.len() {
+        let upstream_id = chain[idx].upstream.id;
+        if let Some(free_model) = crate::providers::free::run_live_discovery(upstream_id, &auth_store) {
+            chain[idx].effective_model = Some(free_model);
         }
     }
 
     if chain.is_empty() {
         return None;
     }
-    Some(Arc::new(FreeProvider::new(chain)) as Arc<dyn LlmProvider>)
+    let provider = FreeProvider::with_routing(chain, routing.unwrap_or_default());
+    // Store free model defaults for the TUI /ctx-viz overlay
+    crate::providers::free::store_free_model_defaults(provider.free_model_defaults());
+    Some(Arc::new(provider) as Arc<dyn LlmProvider>)
 }
 
 pub fn provider_from_config(
-    config: &claurst_core::config::Config,
+    config: &clawde_core::config::Config,
     provider_id: &str,
 ) -> Option<Arc<dyn LlmProvider>> {
     let provider_cfg = config.provider_configs.get(provider_id);
@@ -148,7 +236,7 @@ pub fn provider_from_config(
         "anthropic" => None,
         // Composite "Free" provider — two keys are pulled internally from the
         // auth store; the `api_key` resolved above is ignored.
-        "free" => build_free_provider(),
+        "free" => build_free_provider(config),
         "openai" => {
             let mut provider = OpenAiProvider::new(api_key.unwrap_or_default());
             if let Some(base) = api_base {
@@ -184,9 +272,9 @@ pub fn provider_from_config(
                 });
 
             match (resource_name, api_key) {
-                (Some(resource_name), Some(key)) => Some(
-                    Arc::new(AzureProvider::new(resource_name, key)) as Arc<dyn LlmProvider>
-                ),
+                (Some(resource_name), Some(key)) => {
+                    Some(Arc::new(AzureProvider::new(resource_name, key)) as Arc<dyn LlmProvider>)
+                }
                 _ => None,
             }
         }
@@ -281,11 +369,37 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
         // "free" pulls two keys (Zen + OpenRouter) from the auth store and
         // wraps them in a fallback composite — handled here so the generic
         // single-key path below doesn't short-circuit on a missing key.
-        "free" => return build_free_provider(),
+        // Load the settings config so routing strategy can be threaded through.
+        "free" => {
+            let cfg = clawde_core::config::Settings::load_sync()
+                .map(|s| s.effective_config())
+                .unwrap_or_default();
+            return build_free_provider(&cfg);
+        }
         _ => {}
     }
 
-    let auth_store = claurst_core::AuthStore::load();
+    let auth_store = clawde_core::AuthStore::load();
+
+    // Check for multi-key setup first: when 2+ keys are configured, wrap
+    // the provider in a KeyRotatingProvider for automatic rotation.
+    if let Some(keys) = auth_store.keys_for(provider_id) {
+        if keys.len() > 1 {
+            let keys_vec: Vec<String> = keys.to_vec();
+            let pid_owned = provider_id.to_string();
+            let rotating = KeyRotatingProvider::new_with_persistence(
+                pid_owned.clone(),
+                pid_owned.clone(),
+                keys_vec,
+                move |key| {
+                    provider_from_key(&pid_owned, key.to_string())
+                        .expect("runtime_provider_for: provider_from_key failed")
+                },
+            );
+            return Some(Arc::new(rotating));
+        }
+    }
+
     let key = auth_store.api_key_for(provider_id)?;
     if key.is_empty() {
         return None;
@@ -343,6 +457,24 @@ impl ProviderRegistry {
         self.providers.keys().collect()
     }
 
+    /// Collect key-ring summaries from all registered providers that support
+    /// automatic key rotation. Each entry is `(provider_name, active_count,
+    /// total_keys, earliest_retry_secs)` where `earliest_retry_secs` is the
+    /// seconds until the next key becomes available, or `None` when all keys
+    /// are active.
+    pub fn key_ring_summaries(&self) -> Vec<(String, usize, usize, Option<u64>)> {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            if let Some((active, total, retry)) = provider.key_ring_status() {
+                if total > 0 {
+                    summaries.push((id.to_string(), active, total, retry));
+                }
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
     /// Check health of all providers sequentially.
     /// Returns `(provider_id, status)` pairs.
     pub async fn check_all_health(&self) -> Vec<(ProviderId, ProviderStatus)> {
@@ -372,7 +504,7 @@ impl ProviderRegistry {
     }
 
     pub fn from_config(
-        config: &claurst_core::config::Config,
+        config: &clawde_core::config::Config,
         anthropic_config: ClientConfig,
     ) -> Self {
         // Apply the user-configured request timeout (issue #175) before any
@@ -384,12 +516,12 @@ impl ProviderRegistry {
         let mut registry = Self::from_environment_with_auth_store(anthropic_config);
         let active_provider = config.selected_provider_id();
 
-        let mut configured_provider_ids: Vec<String> = config
-            .provider_configs
-            .keys()
-            .cloned()
-            .collect();
-        if configured_provider_ids.iter().all(|id| id != active_provider) {
+        let mut configured_provider_ids: Vec<String> =
+            config.provider_configs.keys().cloned().collect();
+        if configured_provider_ids
+            .iter()
+            .all(|id| id != active_provider)
+        {
             configured_provider_ids.push(active_provider.to_string());
         }
 
@@ -405,6 +537,44 @@ impl ProviderRegistry {
         }
 
         registry
+    }
+
+    /// Register providers from the auth store's multi-key store (`keys` map)
+    /// that weren't already registered from credentials or env vars.
+    ///
+    /// Providers with 2+ keys get wrapped in a [`KeyRotatingProvider`] for
+    /// automatic key rotation on exhaustion. Single-key entries are registered
+    /// directly as normal providers.
+    fn register_key_store_providers(&mut self, auth_store: &clawde_core::AuthStore) {
+        for provider_id in auth_store.keys.keys() {
+            let pid = clawde_core::ProviderId::new(provider_id);
+            if self.get(&pid).is_some() {
+                continue;
+            }
+
+            let Some(keys) = auth_store.keys_for(provider_id) else {
+                continue;
+            };
+
+            if keys.len() > 1 {
+                let keys_vec: Vec<String> = keys.to_vec();
+                let pid_owned = provider_id.clone();
+                let rotating = KeyRotatingProvider::new_with_persistence(
+                    pid_owned.clone(),
+                    pid_owned.clone(),
+                    keys_vec,
+                    move |key| {
+                        provider_from_key(&pid_owned, key.to_string())
+                            .expect("KeyRotatingProvider: provider_from_key failed")
+                    },
+                );
+                self.register(Arc::new(rotating));
+            } else if let Some(key) = keys.first() {
+                if let Some(p) = provider_from_key(provider_id, key.clone()) {
+                    self.register(p);
+                }
+            }
+        }
     }
 
     /// Register [`GoogleProvider`] if `GOOGLE_API_KEY` or
@@ -502,17 +672,17 @@ impl ProviderRegistry {
     /// `from_environment` for providers that only support env-var config, and
     /// adds any extra providers that have keys in the auth store.
     ///
-    /// [`AuthStore`]: claurst_core::AuthStore
+    /// [`AuthStore`]: clawde_core::AuthStore
     pub fn from_environment_with_auth_store(anthropic_config: ClientConfig) -> Self {
         // Start with env-based registration.
         let mut registry = Self::from_environment(anthropic_config);
 
         // Now check the auth store for providers that weren't registered from
         // env vars.
-        let auth_store = claurst_core::AuthStore::load();
+        let auth_store = clawde_core::AuthStore::load();
 
         for provider_id in auth_store.credentials.keys() {
-            let pid = claurst_core::ProviderId::new(provider_id.as_str());
+            let pid = clawde_core::ProviderId::new(provider_id.as_str());
             // Skip if already registered from env vars.
             if registry.get(&pid).is_some() {
                 continue;
@@ -528,6 +698,9 @@ impl ProviderRegistry {
                 }
             }
         }
+
+        // Register multi-key providers from the keys store (not in credentials).
+        registry.register_key_store_providers(&auth_store);
 
         registry
     }
@@ -551,96 +724,198 @@ impl ProviderRegistry {
         self.register(Arc::new(p::llama_cpp()));
 
         // Remote providers — only register when an API key is present.
-        if std::env::var("DEEPSEEK_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPSEEK_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepseek()));
         }
-        if std::env::var("GROQ_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("GROQ_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::groq()));
         }
-        if std::env::var("XAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("XAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::xai()));
         }
-        if std::env::var("OPENROUTER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OPENROUTER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::openrouter()));
         }
-        if std::env::var("TOGETHER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("TOGETHER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::together_ai()));
         }
-        if std::env::var("PERPLEXITY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("PERPLEXITY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::perplexity()));
         }
-        if std::env::var("CEREBRAS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("CEREBRAS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::cerebras()));
         }
-        if std::env::var("DEEPINFRA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPINFRA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepinfra()));
         }
-        if std::env::var("VENICE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VENICE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::venice()));
         }
-        if std::env::var("DASHSCOPE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DASHSCOPE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::qwen()));
         }
-        if std::env::var("MISTRAL_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MISTRAL_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::mistral()));
         }
-        if std::env::var("SAMBANOVA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SAMBANOVA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::sambanova()));
         }
-        if std::env::var("HF_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("HF_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::huggingface()));
         }
-        if std::env::var("MINIMAX_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MINIMAX_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
             self.register(Arc::new(MinimaxProvider::new(key)));
         }
-        if std::env::var("NVIDIA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NVIDIA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nvidia()));
         }
-        if std::env::var("SILICONFLOW_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SILICONFLOW_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::siliconflow()));
         }
-        if std::env::var("MOONSHOT_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MOONSHOT_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::moonshot()));
         }
-        if std::env::var("ZHIPU_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("ZHIPU_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::zhipu()));
         }
-        if std::env::var("ZAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("ZAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::zai()));
         }
-        if std::env::var("NEBIUS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NEBIUS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nebius()));
         }
-        if std::env::var("NOVITA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NOVITA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::novita()));
         }
-        if std::env::var("OVHCLOUD_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OVHCLOUD_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::ovhcloud()));
         }
-        if std::env::var("SCALEWAY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SCALEWAY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::scaleway()));
         }
-        if std::env::var("VULTR_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VULTR_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::vultr_ai()));
         }
-        if std::env::var("BASETEN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("BASETEN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::baseten()));
         }
-        if std::env::var("FRIENDLI_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FRIENDLI_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::friendli()));
         }
-        if std::env::var("UPSTAGE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("UPSTAGE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::upstage()));
         }
-        if std::env::var("STEPFUN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("STEPFUN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::stepfun()));
         }
-        if std::env::var("FIREWORKS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FIREWORKS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::fireworks()));
         }
-        if std::env::var("OPENCODE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OPENCODE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::opencode_go()));
+        }
+        if std::env::var("CLINE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            self.register(Arc::new(p::cline()));
+        }
+        if std::env::var("GITHUB_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            self.register(Arc::new(p::github_models()));
         }
         self
     }

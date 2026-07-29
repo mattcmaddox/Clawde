@@ -1,11 +1,11 @@
 // desktop_upsell_startup.rs — DesktopUpsellStartup surface.
 //
 // Shown at startup on supported platforms (macOS / Windows x64) when the user
-// hasn't yet tried the Claurst Code Desktop app.  Mirrors the behavior of
+// hasn't yet tried the Clawde Code Desktop app.  Mirrors the behavior of
 // src/components/DesktopUpsell/DesktopUpsellStartup.tsx:
 //
 //   - Shown at most 3 times per user (seen_count guard).
-//   - Three choices: "Open in Claurst Code Desktop" (Try), "Not now", "Don't ask again".
+//   - Three choices: "Open in Clawde Code Desktop" (Try), "Not now", "Don't ask again".
 //   - "Try" acknowledges and closes (CLI cannot actually launch the desktop app,
 //     so we treat it the same as "Not now" but could be extended).
 //   - "Don't ask again" sets the dismissed flag permanently.
@@ -16,15 +16,15 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use std::cell::Cell;
 
 // ---------------------------------------------------------------------------
 // Platform guard
 // ---------------------------------------------------------------------------
 
-/// Returns true when Claurst Desktop is a supported platform option.
+/// Returns true when Clawde Desktop is a supported platform option.
 pub fn is_desktop_supported_platform() -> bool {
-    cfg!(target_os = "macos")
-        || (cfg!(target_os = "windows") && cfg!(target_arch = "x86_64"))
+    cfg!(target_os = "macos") || (cfg!(target_os = "windows") && cfg!(target_arch = "x86_64"))
 }
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ pub enum DesktopUpsellSelection {
 impl DesktopUpsellSelection {
     fn label(self) -> &'static str {
         match self {
-            Self::Try => "Open in Claurst Code Desktop",
+            Self::Try => "Open in Clawde Code Desktop",
             Self::NotNow => "Not now",
             Self::Never => "Don't ask again",
         }
@@ -57,6 +57,8 @@ impl DesktopUpsellSelection {
 pub struct DesktopUpsellStartupState {
     /// Whether the dialog is currently visible.
     pub visible: bool,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     /// Which option is highlighted.
     pub selection: DesktopUpsellSelection,
     /// How many times the dialog has been shown this session.
@@ -123,7 +125,11 @@ impl DesktopUpsellStartupState {
 
     /// Height the dialog occupies (0 if not visible).
     pub fn height(&self) -> u16 {
-        if self.visible { 12 } else { 0 }
+        if self.visible {
+            12
+        } else {
+            0
+        }
     }
 }
 
@@ -145,13 +151,19 @@ pub fn render_desktop_upsell_startup(
     let dialog_h = 12u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
     let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-    let dialog_area = Rect { x, y, width: dialog_w, height: dialog_h };
+    let dialog_area = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
+    state.last_rect.set(dialog_area);
 
     Clear.render(dialog_area, buf);
 
     Block::default()
         .title(Span::styled(
-            " Claurst Code Desktop ",
+            " Clawde Code Desktop ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -171,7 +183,7 @@ pub fn render_desktop_upsell_startup(
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "Same Claurst features with visual diffs, live app",
+            "Same Clawde features with visual diffs, live app",
             Style::default().fg(Color::White),
         )]),
         Line::from(vec![Span::styled(
@@ -292,20 +304,40 @@ mod tests {
     fn desktop_upsell_render_smoke() {
         let mut state = DesktopUpsellStartupState::new();
         state.visible = true;
-        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         render_desktop_upsell_startup(&state, area, &mut buf);
-        let rendered = buf.content.iter().map(|c| c.symbol()).collect::<Vec<_>>().join("");
-        assert!(rendered.contains("Claurst Code Desktop") || rendered.contains("visual diffs"));
+        let rendered = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("Clawde Code Desktop") || rendered.contains("visual diffs"));
     }
 
     #[test]
     fn desktop_upsell_not_rendered_when_invisible() {
         let state = DesktopUpsellStartupState::new();
-        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let mut buf = ratatui::buffer::Buffer::empty(area);
         render_desktop_upsell_startup(&state, area, &mut buf);
-        let rendered = buf.content.iter().map(|c| c.symbol()).collect::<Vec<_>>().join("");
+        let rendered = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
         assert!(!rendered.contains("visual diffs"));
     }
 }

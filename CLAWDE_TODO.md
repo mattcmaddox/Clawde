@@ -89,7 +89,13 @@ All six gaps identified in the auto-compact research have been implemented and t
 - [ ] Commands crate tests are many but many are basic registry checks
 
 ### [tui] Context visualization
-- [ ] The `context_viz.rs` module exists but needs hooks from the query loop to populate real-time token data
+- [x] The `context_viz.rs` module now shows a FreeProvider key health table.
+  - Replaced Anthropic-only 5h/7d rate limit bars with a per-upstream key health table
+  - Table shows Provider, Keys (active/total with green/yellow/red), and Retry columns
+  - Data sourced from KeyRing via `key_ring_summaries()` → callback on App → polled per render frame
+  - Works for all FreeProvider upstreams (Groq, Cerebras, Gemini, etc.) — not just Anthropic
+  - Old Anthropic rate limit headers still populate footer display; overlay shows the broader table
+  - Spec: `spec/free_provider_key_health_table.md`
 
 ---
 

@@ -1,13 +1,14 @@
 [package]
-name = "claurst-query"
+name = "clawde-query"
 version.workspace = true
+description = "Agent orchestration: query loop, conversation compaction, tool execution, memory management, and goal-driven workflows"
 edition.workspace = true
 
 [dependencies]
-claurst-core = { workspace = true }
-claurst-api = { workspace = true }
-claurst-plugins = { workspace = true }
-claurst-tools = { workspace = true }
+clawde-core = { workspace = true }
+clawde-api = { workspace = true }
+clawde-plugins = { workspace = true }
+clawde-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

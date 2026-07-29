@@ -42,16 +42,24 @@ impl ColorPalette {
             "nord" => Self::nord(),
             "dracula" => Self::dracula(),
             "monokai" => Self::monokai(),
-            _ => Self::default_theme(),
+            "catppuccin" => Self::catppuccin(),
+            unknown => {
+                // Try loading a custom theme from ~/.clawde/themes/<name>.json
+                if let Ok(custom) = Self::from_json_file(unknown) {
+                    custom
+                } else {
+                    Self::default_theme()
+                }
+            }
         }
     }
 
-    /// Default Claurst theme
+    /// Default Clawde theme
     fn default_theme() -> Self {
         Self {
-            error: Color::Rgb(255, 87, 51),        // Bright red-orange
-            success: Color::Rgb(76, 175, 80),      // Green
-            warning: Color::Rgb(255, 152, 0),      // Orange
+            error: Color::Rgb(255, 87, 51),   // Bright red-orange
+            success: Color::Rgb(76, 175, 80), // Green
+            warning: Color::Rgb(255, 152, 0), // Orange
             info: Color::Cyan,
             action: Color::Cyan,
             disabled: Color::DarkGray,
@@ -66,10 +74,10 @@ impl ColorPalette {
     /// Dark theme
     fn dark() -> Self {
         Self {
-            error: Color::Rgb(239, 83, 80),        // Light red
-            success: Color::Rgb(129, 199, 132),    // Light green
-            warning: Color::Rgb(255, 171, 64),     // Light orange
-            info: Color::Rgb(100, 181, 246),       // Light blue
+            error: Color::Rgb(239, 83, 80),     // Light red
+            success: Color::Rgb(129, 199, 132), // Light green
+            warning: Color::Rgb(255, 171, 64),  // Light orange
+            info: Color::Rgb(100, 181, 246),    // Light blue
             action: Color::Rgb(100, 181, 246),
             disabled: Color::Rgb(97, 97, 97),
             accent: Color::Rgb(100, 181, 246),
@@ -83,10 +91,10 @@ impl ColorPalette {
     /// Light theme
     fn light() -> Self {
         Self {
-            error: Color::Rgb(211, 47, 47),        // Dark red
-            success: Color::Rgb(27, 94, 32),       // Dark green
-            warning: Color::Rgb(230, 124, 13),     // Dark orange
-            info: Color::Rgb(13, 71, 161),         // Dark blue
+            error: Color::Rgb(211, 47, 47),    // Dark red
+            success: Color::Rgb(27, 94, 32),   // Dark green
+            warning: Color::Rgb(230, 124, 13), // Dark orange
+            info: Color::Rgb(13, 71, 161),     // Dark blue
             action: Color::Blue,
             disabled: Color::Rgb(189, 189, 189),
             accent: Color::Blue,
@@ -100,10 +108,10 @@ impl ColorPalette {
     /// Solarized Dark theme
     fn solarized() -> Self {
         Self {
-            error: Color::Rgb(220, 50, 47),        // Solarized red
-            success: Color::Rgb(133, 153, 0),      // Solarized green
-            warning: Color::Rgb(181, 137, 0),      // Solarized yellow
-            info: Color::Rgb(38, 139, 210),        // Solarized blue
+            error: Color::Rgb(220, 50, 47),   // Solarized red
+            success: Color::Rgb(133, 153, 0), // Solarized green
+            warning: Color::Rgb(181, 137, 0), // Solarized yellow
+            info: Color::Rgb(38, 139, 210),   // Solarized blue
             action: Color::Rgb(38, 139, 210),
             disabled: Color::Rgb(88, 110, 117),
             accent: Color::Rgb(38, 139, 210),
@@ -117,10 +125,10 @@ impl ColorPalette {
     /// Nord theme
     fn nord() -> Self {
         Self {
-            error: Color::Rgb(191, 97, 106),       // Nord red
-            success: Color::Rgb(163, 190, 140),    // Nord green
-            warning: Color::Rgb(235, 203, 139),    // Nord yellow
-            info: Color::Rgb(136, 192, 208),       // Nord blue
+            error: Color::Rgb(191, 97, 106),    // Nord red
+            success: Color::Rgb(163, 190, 140), // Nord green
+            warning: Color::Rgb(235, 203, 139), // Nord yellow
+            info: Color::Rgb(136, 192, 208),    // Nord blue
             action: Color::Rgb(136, 192, 208),
             disabled: Color::Rgb(76, 86, 106),
             accent: Color::Rgb(136, 192, 208),
@@ -134,10 +142,10 @@ impl ColorPalette {
     /// Dracula theme
     fn dracula() -> Self {
         Self {
-            error: Color::Rgb(255, 85, 85),        // Dracula red
-            success: Color::Rgb(80, 250, 123),     // Dracula green
-            warning: Color::Rgb(241, 250, 140),    // Dracula yellow
-            info: Color::Rgb(139, 233, 253),       // Dracula blue
+            error: Color::Rgb(255, 85, 85),     // Dracula red
+            success: Color::Rgb(80, 250, 123),  // Dracula green
+            warning: Color::Rgb(241, 250, 140), // Dracula yellow
+            info: Color::Rgb(139, 233, 253),    // Dracula blue
             action: Color::Rgb(139, 233, 253),
             disabled: Color::Rgb(98, 114, 164),
             accent: Color::Rgb(139, 233, 253),
@@ -151,10 +159,10 @@ impl ColorPalette {
     /// Monokai theme
     fn monokai() -> Self {
         Self {
-            error: Color::Rgb(249, 38, 114),       // Monokai magenta (used for errors)
-            success: Color::Rgb(166, 226, 46),     // Monokai green
-            warning: Color::Rgb(253, 151, 31),     // Monokai orange
-            info: Color::Rgb(102, 217, 239),       // Monokai cyan
+            error: Color::Rgb(249, 38, 114), // Monokai magenta (used for errors)
+            success: Color::Rgb(166, 226, 46), // Monokai green
+            warning: Color::Rgb(253, 151, 31), // Monokai orange
+            info: Color::Rgb(102, 217, 239), // Monokai cyan
             action: Color::Rgb(102, 217, 239),
             disabled: Color::Rgb(117, 113, 94),
             accent: Color::Rgb(102, 217, 239),
@@ -164,23 +172,80 @@ impl ColorPalette {
             border: Color::Rgb(75, 75, 75),
         }
     }
-
     /// Deuteranopia (red-green color blind) theme
     /// Uses blue, yellow, and gray to avoid red/green distinction
     fn deuteranopia() -> Self {
         Self {
-            error: Color::Rgb(255, 140, 0),        // Orange (not red)
-            success: Color::Rgb(0, 150, 200),      // Blue (not green)
-            warning: Color::Rgb(255, 180, 0),      // Gold/Yellow
+            error: Color::Rgb(255, 140, 0),   // Orange (not red)
+            success: Color::Rgb(0, 150, 200), // Blue (not green)
+            warning: Color::Rgb(255, 180, 0), // Gold/Yellow
             info: Color::Cyan,
-            action: Color::Rgb(0, 150, 200),       // Blue action buttons
-            disabled: Color::Rgb(120, 120, 120),   // Neutral gray
-            accent: Color::Rgb(0, 150, 200),       // Blue accent
+            action: Color::Rgb(0, 150, 200), // Blue action buttons
+            disabled: Color::Rgb(120, 120, 120), // Neutral gray
+            accent: Color::Rgb(0, 150, 200), // Blue accent
             secondary_accent: Color::Rgb(180, 140, 255), // Purple accent
             text_light: Color::Rgb(220, 220, 220),
             text_dark: Color::Rgb(40, 40, 40),
             border: Color::Rgb(100, 100, 100),
         }
+    }
+
+    /// Catppuccin Mocha theme (warm, popular dark theme)
+    fn catppuccin() -> Self {
+        Self {
+            error: Color::Rgb(243, 139, 168),   // Catppuccin red/mauve
+            success: Color::Rgb(166, 227, 161), // Catppuccin green
+            warning: Color::Rgb(249, 226, 175), // Catppuccin yellow
+            info: Color::Rgb(137, 180, 250),    // Catppuccin blue
+            action: Color::Rgb(137, 180, 250),
+            disabled: Color::Rgb(108, 112, 134),
+            accent: Color::Rgb(203, 166, 247), // Catppuccin mauve
+            secondary_accent: Color::Rgb(245, 194, 231), // Catppuccin pink
+            text_light: Color::Rgb(205, 214, 244),
+            text_dark: Color::Rgb(30, 30, 46),
+            border: Color::Rgb(69, 71, 90),
+        }
+    }
+
+    /// Load a custom theme from a JSON file in ~/.clawde/themes/<name>.json.
+    fn from_json_file(name: &str) -> Result<Self, ()> {
+        // Sanitize: only allow alphanumeric and underscore for theme names
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(());
+        }
+        let dir = clawde_core::Settings::config_dir().join("themes");
+        let file = dir.join(format!("{}.json", name));
+        if !file.exists() {
+            return Err(());
+        }
+        let data = std::fs::read_to_string(&file).map_err(|_| ())?;
+        let v: serde_json::Value = serde_json::from_str(&data).map_err(|_| ())?;
+
+        let color = |key: &str| -> Result<Color, ()> {
+            if let Some(arr) = v.get(key).and_then(|v| v.as_array()) {
+                if arr.len() == 3 {
+                    let r = arr[0].as_u64().unwrap_or(0) as u8;
+                    let g = arr[1].as_u64().unwrap_or(0) as u8;
+                    let b = arr[2].as_u64().unwrap_or(0) as u8;
+                    return Ok(Color::Rgb(r, g, b));
+                }
+            }
+            Err(())
+        };
+
+        Ok(Self {
+            error: color("error")?,
+            success: color("success")?,
+            warning: color("warning")?,
+            info: color("info")?,
+            action: color("action")?,
+            disabled: color("disabled")?,
+            accent: color("accent")?,
+            secondary_accent: color("secondary_accent")?,
+            text_light: color("text_light")?,
+            text_dark: color("text_dark")?,
+            border: color("border")?,
+        })
     }
 }
 

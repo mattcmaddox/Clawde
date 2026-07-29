@@ -22,9 +22,21 @@ impl SlashCommand for VoiceCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "on".into(), description: "Enable voice mode".into(), available: true },
-            ArgCompletion { value: "off".into(), description: "Disable voice mode".into(), available: true },
-            ArgCompletion { value: "status".into(), description: "Show current voice mode and endpoint info".into(), available: true },
+            ArgCompletion {
+                value: "on".into(),
+                description: "Enable voice mode".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "off".into(),
+                description: "Disable voice mode".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show current voice mode and endpoint info".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

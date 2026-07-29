@@ -33,4 +33,4 @@ else
 fi
 
 echo "Wrote $dest"
-echo "Now run: cargo test -p claurst-api --lib model_registry"
+echo "Now run: cargo test -p clawde-api --lib model_registry"

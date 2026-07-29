@@ -46,7 +46,10 @@ async fn toggle_on_produces_config_change_message() {
 
     match result {
         CommandResult::ConfigChangeMessage(new_cfg, msg) => {
-            assert!(new_cfg.auto_compact, "auto_compact must be true after /auto-compact on");
+            assert!(
+                new_cfg.auto_compact,
+                "auto_compact must be true after /auto-compact on"
+            );
             assert!(
                 msg.to_lowercase().contains("enabled"),
                 "status message must contain 'enabled', got: {msg}"
@@ -66,7 +69,10 @@ async fn toggle_off_produces_config_change_message() {
 
     match result {
         CommandResult::ConfigChangeMessage(new_cfg, msg) => {
-            assert!(!new_cfg.auto_compact, "auto_compact must be false after /auto-compact off");
+            assert!(
+                !new_cfg.auto_compact,
+                "auto_compact must be false after /auto-compact off"
+            );
             assert!(
                 msg.to_lowercase().contains("disabled"),
                 "status message must contain 'disabled', got: {msg}"
@@ -156,10 +162,7 @@ fn effective_config_merges_top_level_auto_compact() {
 fn effective_config_auto_compact_false_by_default() {
     let settings = Settings::default();
     let config = settings.effective_config();
-    assert!(
-        !config.auto_compact,
-        "auto_compact must default to false"
-    );
+    assert!(!config.auto_compact, "auto_compact must default to false");
 }
 
 #[test]
@@ -249,7 +252,10 @@ fn debounce_on_success_resets_counters() {
 
     assert_eq!(state.compaction_count, 1);
     assert_eq!(state.consecutive_failures, 0);
-    assert_eq!(state.turns_since_last_compact, 0, "on_success must reset turn counter");
+    assert_eq!(
+        state.turns_since_last_compact, 0,
+        "on_success must reset turn counter"
+    );
     assert!(
         state.last_compact_at.is_some(),
         "on_success must record timestamp"
@@ -300,7 +306,10 @@ fn debounce_success_resets_failure_count() {
     assert!(!state.disabled);
 
     state.on_success();
-    assert_eq!(state.consecutive_failures, 0, "success must reset failure counter");
+    assert_eq!(
+        state.consecutive_failures, 0,
+        "success must reset failure counter"
+    );
 }
 
 #[test]
@@ -439,10 +448,7 @@ fn derive_footer_state(used_pct: u64, auto_compact_enabled: bool) -> FooterConte
 
 #[test]
 fn footer_state_critical_at_95_percent() {
-    assert_eq!(
-        derive_footer_state(95, true),
-        FooterContextState::Critical
-    );
+    assert_eq!(derive_footer_state(95, true), FooterContextState::Critical);
     assert_eq!(
         derive_footer_state(99, false),
         FooterContextState::Critical,
@@ -452,10 +458,7 @@ fn footer_state_critical_at_95_percent() {
 
 #[test]
 fn footer_state_elevated_at_85_to_94_percent() {
-    assert_eq!(
-        derive_footer_state(85, true),
-        FooterContextState::Elevated
-    );
+    assert_eq!(derive_footer_state(85, true), FooterContextState::Elevated);
     assert_eq!(
         derive_footer_state(90, false),
         FooterContextState::Elevated,
@@ -465,10 +468,7 @@ fn footer_state_elevated_at_85_to_94_percent() {
 
 #[test]
 fn footer_state_warning_at_70_to_84_percent() {
-    assert_eq!(
-        derive_footer_state(70, true),
-        FooterContextState::Warning
-    );
+    assert_eq!(derive_footer_state(70, true), FooterContextState::Warning);
     assert_eq!(
         derive_footer_state(84, false),
         FooterContextState::Warning,
@@ -478,18 +478,9 @@ fn footer_state_warning_at_70_to_84_percent() {
 
 #[test]
 fn footer_state_healthy_below_70_with_auto_compact_on() {
-    assert_eq!(
-        derive_footer_state(0, true),
-        FooterContextState::Healthy
-    );
-    assert_eq!(
-        derive_footer_state(50, true),
-        FooterContextState::Healthy
-    );
-    assert_eq!(
-        derive_footer_state(69, true),
-        FooterContextState::Healthy
-    );
+    assert_eq!(derive_footer_state(0, true), FooterContextState::Healthy);
+    assert_eq!(derive_footer_state(50, true), FooterContextState::Healthy);
+    assert_eq!(derive_footer_state(69, true), FooterContextState::Healthy);
 }
 
 #[test]

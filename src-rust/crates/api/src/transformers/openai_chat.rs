@@ -9,7 +9,7 @@ use crate::provider_error::ProviderError;
 use crate::provider_types::{ProviderRequest, ProviderResponse};
 use crate::providers::OpenAiProvider;
 use crate::transform::MessageTransformer;
-use claurst_core::provider_id::ProviderId;
+use clawde_core::provider_id::ProviderId;
 
 // ---------------------------------------------------------------------------
 // OpenAiChatTransformer
@@ -31,8 +31,10 @@ impl MessageTransformer for OpenAiChatTransformer {
     ) -> Result<serde_json::Value, ProviderError> {
         use serde_json::json;
 
-        let messages =
-            OpenAiProvider::to_openai_messages_pub(&request.messages, request.system_prompt.as_ref());
+        let messages = OpenAiProvider::to_openai_messages_pub(
+            &request.messages,
+            request.system_prompt.as_ref(),
+        );
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
         let mut body = json!({

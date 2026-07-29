@@ -1,6 +1,6 @@
 // Diagnostic commands: `/btw`, `/ctx-viz`, `/heapdump`, `/insights`.
 //
-// Extracted from lib.rs (issue #232). Behavior-preserving move.
+// Extracted from lib.rs (issue #232).
 
 use super::*;
 use async_trait::async_trait;
@@ -14,8 +14,12 @@ pub struct InsightsCommand;
 
 #[async_trait]
 impl SlashCommand for BtwCommand {
-    fn name(&self) -> &str { "btw" }
-    fn description(&self) -> &str { "Ask a side question without adding it to conversation history" }
+    fn name(&self) -> &str {
+        "btw"
+    }
+    fn description(&self) -> &str {
+        "Ask a side question without adding it to conversation history"
+    }
     fn help(&self) -> &str {
         "Usage: /btw <question>\n\n\
          Submits a background question to the model without it becoming part of\n\
@@ -44,75 +48,73 @@ impl SlashCommand for BtwCommand {
 }
 
 // ---- /ctx-viz (context visualizer) ---------------------------------------
+// In interactive mode the TUI intercepts /ctx-viz and opens the real-time
+// overlay (see app.rs intercept_slash_command).  This command only runs in
+// headless/non-TUI mode and returns a compact one-line summary.
 
 #[async_trait]
 impl SlashCommand for CtxVizCommand {
-    fn name(&self) -> &str { "ctx-viz" }
-    fn aliases(&self) -> Vec<&str> { vec!["context-visualizer", "ctx"] }
-    fn description(&self) -> &str { "Visualize context window usage breakdown by category" }
+    fn name(&self) -> &str {
+        "ctx-viz"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["context-visualizer", "ctx"]
+    }
+    fn description(&self) -> &str {
+        "Open the context window & usage overlay (or print summary in headless mode)"
+    }
     fn help(&self) -> &str {
         "Usage: /ctx-viz\n\n\
-         Shows a detailed breakdown of how the context window is being used:\n\
-         - System prompt token estimate\n\
-         - Conversation messages token estimate\n\
-         - Tool results token estimate\n\
-         - Total vs context window limit"
+         Opens an interactive overlay showing context-window usage, rate\n\
+         limits, message counts, tool-call stats, and session cost.\n\
+         In headless mode, prints a compact one-line summary."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let model = ctx.config.effective_model().to_string();
-        let context_window: u64 = 200_000; // all current Claude models
+        let provider_id = ctx.config.selected_provider_id();
+        let registry = clawde_api::ModelRegistry::new();
+        let context_window =
+            clawde_query::compact::resolve_context_window(Some(&registry), provider_id, &model);
 
-        // Estimate system prompt tokens: rough chars/4 approximation
-        // Build a minimal system prompt to estimate its size.
-        let sys_prompt_chars: usize = ctx.config.custom_system_prompt
-            .as_deref()
-            .map(|s| s.len())
-            .unwrap_or(2400 * 4); // fallback: ~2400 tokens worth
-        let sys_prompt_tokens = (sys_prompt_chars / 4).max(1) as u64;
+        let tracker = &ctx.cost_tracker;
+        let total_tokens = tracker.total_tokens();
+        let total_cost = tracker.total_cost_usd();
 
-        // Estimate conversation tokens from messages
-        let (conv_chars, tool_chars): (usize, usize) = ctx.messages.iter().fold(
-            (0, 0),
-            |(conv, tool), msg| {
-                let text = msg.get_all_text();
-                // Heuristic: if the message looks like a tool result, count separately
-                if msg.role == claurst_core::types::Role::User && text.starts_with('[') {
-                    (conv, tool + text.len())
-                } else {
-                    (conv + text.len(), tool)
-                }
-            },
-        );
+        let msg_count = ctx.messages.len();
+        let user_msgs = ctx
+            .messages
+            .iter()
+            .filter(|m| m.role == clawde_core::types::Role::User)
+            .count();
+        let assistant_msgs = ctx
+            .messages
+            .iter()
+            .filter(|m| m.role == clawde_core::types::Role::Assistant)
+            .count();
+        let tool_calls: usize = ctx
+            .messages
+            .iter()
+            .flat_map(|m| m.get_tool_use_blocks())
+            .count();
 
-        let conv_tokens = (conv_chars / 4) as u64;
-        let tool_tokens = (tool_chars / 4) as u64;
-        let total_tokens = sys_prompt_tokens + conv_tokens + tool_tokens;
-        let pct = (total_tokens as f64 / context_window as f64) * 100.0;
-
-        let bar_width = 40usize;
-        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-        let bar = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
+        let pct = if context_window > 0 {
+            (total_tokens as f64 / context_window as f64) * 100.0
+        } else {
+            0.0
+        };
 
         CommandResult::Message(format!(
-            "Context Window Usage\n\
-             ────────────────────────────────────────\n\
-             Model:            {model}\n\
-             System prompt:    ~{sys:>7} tokens\n\
-             Conversation:     ~{conv:>7} tokens\n\
-             Tool results:     ~{tool:>7} tokens\n\
-             ────────────────────────────────────────\n\
-             Total:            ~{total:>7} / {window} tokens ({pct:.1}%)\n\
-             [{bar}] {pct:.1}%\n\n\
-             Use /compact to reduce context usage.",
-            model = model,
-            sys = sys_prompt_tokens,
-            conv = conv_tokens,
-            tool = tool_tokens,
-            total = total_tokens,
-            window = context_window,
+            "Context: ~{total:.0}K / {window:.0}K tokens ({pct:.1}%) — \
+             {msgs} msgs ({user}U/{asst}A, {tc} tools) — ${cost:.4}",
+            total = total_tokens as f64 / 1000.0,
+            window = context_window as f64 / 1000.0,
             pct = pct,
-            bar = bar,
+            msgs = msg_count,
+            user = user_msgs,
+            asst = assistant_msgs,
+            tc = tool_calls,
+            cost = total_cost,
         ))
     }
 }
@@ -121,8 +123,12 @@ impl SlashCommand for CtxVizCommand {
 
 #[async_trait]
 impl SlashCommand for HeapdumpCommand {
-    fn name(&self) -> &str { "heapdump" }
-    fn description(&self) -> &str { "Show process memory and diagnostic information" }
+    fn name(&self) -> &str {
+        "heapdump"
+    }
+    fn description(&self) -> &str {
+        "Show process memory and diagnostic information"
+    }
     fn help(&self) -> &str {
         "Usage: /heapdump\n\n\
          Displays a diagnostic snapshot of the current process:\n\
@@ -179,8 +185,12 @@ impl SlashCommand for HeapdumpCommand {
 
 #[async_trait]
 impl SlashCommand for InsightsCommand {
-    fn name(&self) -> &str { "insights" }
-    fn description(&self) -> &str { "Generate a session analysis report with conversation statistics" }
+    fn name(&self) -> &str {
+        "insights"
+    }
+    fn description(&self) -> &str {
+        "Generate a session analysis report with conversation statistics"
+    }
     fn help(&self) -> &str {
         "Usage: /insights\n\n\
          Analyses the current conversation and prints a statistics report:\n\
@@ -191,11 +201,13 @@ impl SlashCommand for InsightsCommand {
         let messages = &ctx.messages;
 
         // Count turns (user / assistant pairs)
-        let user_turns: usize = messages.iter()
-            .filter(|m| matches!(m.role, claurst_core::types::Role::User))
+        let user_turns: usize = messages
+            .iter()
+            .filter(|m| matches!(m.role, clawde_core::types::Role::User))
             .count();
-        let assistant_turns: usize = messages.iter()
-            .filter(|m| matches!(m.role, claurst_core::types::Role::Assistant))
+        let assistant_turns: usize = messages
+            .iter()
+            .filter(|m| matches!(m.role, clawde_core::types::Role::Assistant))
             .count();
         let total_turns = user_turns.min(assistant_turns);
 
@@ -204,7 +216,7 @@ impl SlashCommand for InsightsCommand {
             std::collections::HashMap::new();
         for msg in messages {
             for block in msg.get_tool_use_blocks() {
-                if let claurst_core::types::ContentBlock::ToolUse { name, .. } = block {
+                if let clawde_core::types::ContentBlock::ToolUse { name, .. } = block {
                     *tool_counts.entry(name.clone()).or_insert(0) += 1;
                 }
             }

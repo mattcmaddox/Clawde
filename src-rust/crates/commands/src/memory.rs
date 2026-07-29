@@ -19,8 +19,16 @@ impl SlashCommand for MemoryCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "edit".into(), description: "Open project AGENTS.md in editor".into(), available: true },
-            ArgCompletion { value: "clear".into(), description: "Clear project AGENTS.md".into(), available: true },
+            ArgCompletion {
+                value: "edit".into(),
+                description: "Open project AGENTS.md in editor".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "clear".into(),
+                description: "Clear project AGENTS.md".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

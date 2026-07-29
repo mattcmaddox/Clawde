@@ -1,12 +1,13 @@
 [package]
-name = "claurst-tools"
+name = "clawde-tools"
 version.workspace = true
+description = "Agent tool implementations: file operations, shell execution, search, web access, sub-agent spawning, and 40+ other tools"
 edition.workspace = true
 
 [dependencies]
-claurst-core = { workspace = true }
-claurst-api = { workspace = true }
-claurst-mcp = { workspace = true }
+clawde-core = { workspace = true }
+clawde-api = { workspace = true }
+clawde-mcp = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

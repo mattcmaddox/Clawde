@@ -21,7 +21,9 @@ struct GoalCompleteInput {
 
 #[async_trait]
 impl Tool for GoalCompleteTool {
-    fn name(&self) -> &str { "GoalComplete" }
+    fn name(&self) -> &str {
+        "GoalComplete"
+    }
 
     fn description(&self) -> &str {
         "Mark the active goal as complete. ONLY call this after a genuine completion audit:\n\
@@ -31,7 +33,9 @@ impl Tool for GoalCompleteTool {
          Calling this without a real audit is a goal contract violation."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -71,9 +75,9 @@ impl Tool for GoalCompleteTool {
 
         let session_id = &ctx.session_id;
 
-        match claurst_core::GoalStore::open_default() {
+        match clawde_core::GoalStore::open_default() {
             None => ToolResult::error("Could not open goal store.".to_string()),
-            Some(store) => match store.set_status(session_id, claurst_core::GoalStatus::Complete) {
+            Some(store) => match store.set_status(session_id, clawde_core::GoalStatus::Complete) {
                 Ok(()) => ToolResult::success(format!(
                     "Goal marked complete.\n\nAudit summary: {}\n\nEvidence: {}",
                     params.audit_summary, params.evidence,

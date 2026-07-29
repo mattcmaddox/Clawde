@@ -1,16 +1,16 @@
 [package]
-name = "claurst-acp"
+name = "clawde-acp"
 version.workspace = true
 edition.workspace = true
-description = "Agent Client Protocol (ACP) server for Claurst — JSON-RPC 2.0 over stdio"
+description = "Agent Client Protocol (ACP) server for Clawde — JSON-RPC 2.0 over stdio"
 
 [dependencies]
-claurst-core = { workspace = true }
-claurst-api = { workspace = true }
-claurst-tools = { workspace = true }
-claurst-query = { workspace = true }
-claurst-mcp = { workspace = true }
-claurst-plugins = { workspace = true }
+clawde-core = { workspace = true }
+clawde-api = { workspace = true }
+clawde-tools = { workspace = true }
+clawde-query = { workspace = true }
+clawde-mcp = { workspace = true }
+clawde-plugins = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

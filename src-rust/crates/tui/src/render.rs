@@ -51,6 +51,7 @@ use crate::transcript_turn::{build_transcript_turns, TranscriptTurn};
 use crate::virtual_list::{VirtualItem, VirtualList};
 use crate::voice_mode_notice::render_voice_mode_notice;
 use clawde_core::constants::APP_VERSION;
+use clawde_core::format_utils::format_duration_ms;
 use clawde_core::types::Role;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -882,9 +883,38 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             size,
             app.context_used_tokens,
             app.context_window_size,
-            app.rate_limit_5h_pct,
-            app.rate_limit_7day_pct,
+            {
+                let mut rows = app
+                    .key_ring_data_fn
+                    .as_ref()
+                    .map(|f| f())
+                    .unwrap_or_default();
+                // Merge per-provider HTTP rate limit data into the table rows.
+                for row in &mut rows {
+                    if let Some(&(tokens, requests)) =
+                        app.provider_http_rates.get(&row.provider_name.to_lowercase())
+                    {
+                        row.tokens_pct = Some(tokens);
+                        row.requests_pct = Some(requests);
+                    }
+                }
+                rows
+            },
             app.cost_usd,
+            app.messages.len(),
+            app.messages
+                .iter()
+                .filter(|m| m.role == clawde_core::types::Role::User)
+                .count(),
+            app.messages
+                .iter()
+                .filter(|m| m.role == clawde_core::types::Role::Assistant)
+                .count(),
+            app.messages
+                .iter()
+                .flat_map(|m| m.get_tool_use_blocks())
+                .count(),
+            app.free_model_defaults.clone(),
         );
     }
 
@@ -2503,6 +2533,14 @@ fn should_render_status_row(app: &App) -> bool {
         })
         .unwrap_or(false);
 
+    // Check if any provider has exhausted API keys — keep the status row
+    // visible so the user sees the key exhaustion indicator even while idle.
+    let has_exhausted_keys = app.provider_registry.as_ref().map_or(false, |reg| {
+        reg.key_ring_summaries()
+            .iter()
+            .any(|(_, active, total, _)| *active < *total)
+    });
+
     // Note: a completed turn's "Worked for Xs" summary (`last_turn_elapsed`) is
     // intentionally NOT a reason to keep the status row on — it stays set until
     // the next submit, so gating on it pinned the idle spinner glyph on screen
@@ -2511,6 +2549,7 @@ fn should_render_status_row(app: &App) -> bool {
     app.voice_recording
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
+        || has_exhausted_keys
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
@@ -2518,7 +2557,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let spans = if app.voice_recording {
+    let mut spans = if app.voice_recording {
         vec![Span::styled(
             format!(
                 "{} Recording... press Alt+V to transcribe",
@@ -2571,6 +2610,49 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
+
+    // Append key-ring status when any keys are exhausted.
+    if let Some(ref registry) = app.provider_registry {
+        let summaries = registry.key_ring_summaries();
+        let has_exhausted = summaries
+            .iter()
+            .any(|(_, active, total, _)| *active < *total);
+        if has_exhausted && !spans.is_empty() {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            for (provider, active, total, retry_secs) in &summaries {
+                if *active < *total {
+                    let color = if *active == 0 {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    };
+                    let retry_label =
+                        retry_secs.map(|s| format!("retry in {}", format_duration_ms(s * 1000)));
+                    let label = match retry_label {
+                        Some(r) => format!("{}:{}/{} ({})", provider, active, total, r),
+                        None => format!("{}:{}/{}", provider, active, total),
+                    };
+                    spans.push(Span::styled(label, Style::default().fg(color)));
+                    spans.push(Span::raw(" "));
+                }
+            }
+        }
+
+        // Show active routing strategy when the active provider exposes one.
+        let active_pid = app.config.selected_provider_id();
+        if let Some(provider) = registry.get(&clawde_core::provider_id::ProviderId::new(active_pid))
+        {
+            if let Some(strategy_name) = provider.routing_strategy_name() {
+                if !spans.is_empty() {
+                    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                }
+                spans.push(Span::styled(
+                    format!("\u{2699} {}", strategy_name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+    }
 
     if spans.is_empty() {
         return;
@@ -3167,10 +3249,7 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
             TypeaheadSource::ArgCompletion => {
-                let value = suggestion
-                    .arg_value
-                    .as_deref()
-                    .unwrap_or(&suggestion.text);
+                let value = suggestion.arg_value.as_deref().unwrap_or(&suggestion.text);
                 let display_name = truncate_text(value, label_width);
                 let label_style = if suggestion.faded {
                     Style::default()

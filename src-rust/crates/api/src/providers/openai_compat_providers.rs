@@ -6,8 +6,8 @@
 // variable is absent or empty the provider is still constructed but
 // `health_check()` will return `ProviderStatus::Unavailable`.
 
-use claurst_core::config::Settings;
-use claurst_core::provider_id::ProviderId;
+use clawde_core::config::Settings;
+use clawde_core::provider_id::ProviderId;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
@@ -50,6 +50,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
+        "cline" => Some(cline()),            "github-models" => Some(github_models()),
         _ => None,
     }
 }
@@ -136,12 +137,8 @@ pub fn llama_cpp() -> OpenAiCompatProvider {
 pub fn custom_openai_with_url(base_url: impl Into<String>) -> OpenAiCompatProvider {
     let key = std::env::var("CUSTOM_OPENAI_API_KEY").unwrap_or_default();
 
-    OpenAiCompatProvider::new(
-        "custom-openai",
-        "Custom OpenAI-Compatible",
-        base_url.into(),
-    )
-    .with_api_key(key)
+    OpenAiCompatProvider::new("custom-openai", "Custom OpenAI-Compatible", base_url.into())
+        .with_api_key(key)
 }
 
 /// Custom OpenAI-compatible provider supplied by the user.
@@ -187,6 +184,7 @@ pub fn groq() -> OpenAiCompatProvider {
         .with_quirks(ProviderQuirks {
             overflow_patterns: vec!["reduce the length of the messages".to_string()],
             include_usage_in_stream: true,
+            max_tokens_cap: Some(512),
             ..Default::default()
         })
 }
@@ -549,16 +547,12 @@ pub fn opencode_zen() -> OpenAiCompatProvider {
 /// Reads `CROF_API_KEY` for authentication.
 pub fn crof() -> OpenAiCompatProvider {
     let key = std::env::var("CROF_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::CROF,
-        "Crof.ai",
-        "https://api.crof.ai/v1",
-    )
-    .with_api_key(key)
-    .with_quirks(ProviderQuirks {
-        include_usage_in_stream: true,
-        ..Default::default()
-    })
+    OpenAiCompatProvider::new(ProviderId::CROF, "Crof.ai", "https://api.crof.ai/v1")
+        .with_api_key(key)
+        .with_quirks(ProviderQuirks {
+            include_usage_in_stream: true,
+            ..Default::default()
+        })
 }
 
 /// Synthetic.dev — OpenAI-compatible endpoint with curated model selection.
@@ -585,6 +579,40 @@ pub fn routing() -> OpenAiCompatProvider {
         ProviderId::ROUTING,
         "routing.run",
         "https://api.routing.run/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// GitHub Models — free tier models via GitHub's inference API.
+/// Uses the same `GITHUB_TOKEN` as the Copilot provider.
+/// Rate-limited free tier (10-15 RPM, 50-150 RPD) — good fallback.
+/// Requires a GitHub PAT with `models:read` permission.
+pub fn github_models() -> OpenAiCompatProvider {
+    let key = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::GITHUB_MODELS,
+        "GitHub Models",
+        "https://models.github.ai/inference",
+    )
+    .with_api_key(key)
+    .with_header("Accept", "application/vnd.github+json")
+    .with_header("X-GitHub-Api-Version", "2026-03-10")
+}
+
+/// Cline (cline.bot) — OpenAI-compatible proxy with frequently rotating
+/// free model selection. Provides unified access to various models via
+/// a single API key. Free tier models rotate regularly.
+/// Reads `CLINE_API_KEY` for authentication.
+pub fn cline() -> OpenAiCompatProvider {
+    let key = std::env::var("CLINE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::CLINE,
+        "Cline",
+        "https://api.cline.bot/api/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {

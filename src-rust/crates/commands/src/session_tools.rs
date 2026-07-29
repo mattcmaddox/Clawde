@@ -439,14 +439,46 @@ impl SlashCommand for EffortCommand {
 
     fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
         vec![
-            super::ArgCompletion { value: "none".into(), description: "No reasoning at all".into(), available: true },
-            super::ArgCompletion { value: "minimal".into(), description: "Smallest reasoning budget".into(), available: true },
-            super::ArgCompletion { value: "low".into(), description: "Quick, straightforward implementation".into(), available: true },
-            super::ArgCompletion { value: "medium".into(), description: "Balanced approach (default)".into(), available: true },
-            super::ArgCompletion { value: "high".into(), description: "Comprehensive with extensive testing".into(), available: true },
-            super::ArgCompletion { value: "xhigh".into(), description: "Extended reasoning, higher thinking budget".into(), available: true },
-            super::ArgCompletion { value: "max".into(), description: "Maximum capability, deepest reasoning".into(), available: true },
-            super::ArgCompletion { value: "ultracode".into(), description: "Top reasoning + delegation workflow".into(), available: true },
+            super::ArgCompletion {
+                value: "none".into(),
+                description: "No reasoning at all".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "minimal".into(),
+                description: "Smallest reasoning budget".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "low".into(),
+                description: "Quick, straightforward implementation".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "medium".into(),
+                description: "Balanced approach (default)".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "high".into(),
+                description: "Comprehensive with extensive testing".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "xhigh".into(),
+                description: "Extended reasoning, higher thinking budget".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "max".into(),
+                description: "Maximum capability, deepest reasoning".into(),
+                available: true,
+            },
+            super::ArgCompletion {
+                value: "ultracode".into(),
+                description: "Top reasoning + delegation workflow".into(),
+                available: true,
+            },
         ]
     }
 
@@ -497,8 +529,16 @@ impl SlashCommand for SummaryCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "decisions".into(), description: "Highlight key decisions made".into(), available: true },
-            ArgCompletion { value: "files".into(), description: "Focus on files created or modified".into(), available: true },
+            ArgCompletion {
+                value: "decisions".into(),
+                description: "Highlight key decisions made".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "files".into(),
+                description: "Focus on files created or modified".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

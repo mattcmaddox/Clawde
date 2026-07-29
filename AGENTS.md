@@ -56,9 +56,15 @@ tmux send-keys -t clawde-test "./target/debug/clawde" Enter
 sleep 2 && tmux capture-pane -t clawde-test -p
 
 # Drive input
-tmux send-keys -t clawde-test "your prompt here" Enter
+tmux send-keys -t clawde-test "your prompt here" C-m   # C-m submits (ENTER key is interpreted as newline!)
 tmux send-keys -t clawde-test Escape
 tmux send-keys -t clawde-test C-o   # ctrl+o
+
+# TIP: Use C-m instead of Enter for submitting text in the TUI prompt.
+# The tmux `send-keys ... Enter` command inserts a newline into the
+# multi-line prompt buffer instead of submitting it — the prompt_input
+# widget treats plain Enter as Shift+Enter (newline), not as submit.
+# Carriage return (C-m) triggers the actual submit action.
 
 # Cleanup
 tmux kill-session -t clawde-test
@@ -170,3 +176,89 @@ git pull --rebase && git push
 ### User Override
 
 If the user's instructions conflict with the rules above, ask for confirmation that they want to override the rules. Only then execute their instructions.
+
+## Multi-Key Rotation & FreeProvider Architecture
+
+### Two-Level Fallback Hierarchy
+
+```
+Level 1: FreeProvider (across providers)
+  ├── upstream[0]:  Groq
+  ├── upstream[1]:  Cerebras
+  ├── upstream[2]:  Google Gemini
+  ├── upstream[3]:  Mistral
+  ├── upstream[4]:  SambaNova
+  ├── upstream[5]:  NVIDIA
+  ├── upstream[6]:  Cohere
+  ├── upstream[7]:  OpenRouter
+  ├── upstream[8]:  OpenCode Zen
+  ├── upstream[9]:  Z.AI
+  └── upstream[10]: Zhipu
+
+Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
+  └── key[0], key[1], key[2], ...  (round-robins on exhaustion)
+```
+
+### Component Locations
+
+| Component | File | Role |
+|---|---|---|
+| **KeyRing** | `crates/core/src/key_ring.rs` | In-memory key state machine with cooldown tracking, round-robin, disk persistence |
+| **KeyRotatingProvider** | `crates/api/src/providers/key_rotating.rs` | `LlmProvider` wrapper for automatic rotation on exhaustion |
+| **AuthStore** | `crates/core/src/auth_store.rs` | JSON store at `~/.clawde/auth.json` — `credentials` (single-key) + `keys` (multi-key) maps |
+| **KeysCommand** | `crates/commands/src/keys.rs` | `/keys` command: set, add, remove, list, health |
+| **ProviderRegistry** | `crates/api/src/registry.rs` | Wires `KeyRotatingProvider` when 2+ keys detected |
+| **FreeProvider** | `crates/api/src/providers/free.rs` | Composite aggregator chaining upstreams with ordered fallback |
+| **time_extract** | `crates/api/src/time_extract.rs` | Cooldown extraction from Retry-After headers, error bodies, ISO 8601 timestamps |
+
+### Key Algorithms
+
+1. **`build_free_provider()`** (registry.rs:100-195) — Iterates `FREE_CATALOG` in priority order. For each upstream: if 2+ keys → `KeyRotatingProvider`, else if 1 key → single provider, else skip.
+
+2. **`resolve_route()`** (free.rs:188-226) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID.
+
+3. **`attempt_plan()`** (free.rs:229-252) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
+
+4. **`should_fallback()`** (free.rs:254-258) — Falls through on everything EXCEPT `InvalidRequest` and `ContentFiltered` (user errors that fail identically on every upstream).
+
+5. **Fallback loop** (free.rs:282-361) — Iterates plan, clones request per attempt replacing model, dispatches. Returns first success, falls through on transient errors.
+
+6. **`key_ring_status()`** (free.rs:410-436) — Aggregates across upstreams: active=sum, total=sum, retry=min. Returns `None` if no upstream has a KeyRotatingProvider.
+
+7. **`key_ring_summaries()`** (registry.rs:429-440) — Collects all registered providers' status, filters to `total > 0`, sorts alphabetically.
+
+### Error-Triggered Rotation
+
+| Error | Default Cooldown | Classification |
+|---|---|---|
+| `QuotaExceeded` | 3600s (1 hour) | Quota |
+| `RateLimited` | 60s (1 minute) | RateLimit |
+| `AuthFailed` | 300s (5 minutes) | Auth |
+| `Other { status: 429 }` | 60s (from body/header) | RateLimit |
+| `Other { status: 401\|403 }` | 300s (from body/header) | Auth |
+
+Cooldown estimation priority: (1) error's `retry_after` field, (2) HTTP `Retry-After` header, (3) error body text parsing, (4) default per signal type.
+
+### Thread Safety
+
+`KeyRing` behind `Arc<Mutex<>>` — lock scope never held across `.await`. Lock → get key → unlock → dispatch. Lock → mark exhausted → save → unlock.
+
+### Discover Models (FreeProvider)
+
+Synthetic only — never calls upstream `discover_models()`. Produces one `free/auto` entry (200K context) plus one per configured upstream with `<id>/<default_model>` (128K context, 8192 max output tokens). All pinned to `provider_id: "free"`.
+
+### TUI Status Display
+
+- `active == total`: hidden (all healthy)
+- `0 < active < total`: yellow indicator
+- `active == 0`: red indicator with retry time
+- Reading: `provider:active/total (retry in Xs)`
+- Location: `crates/tui/src/render.rs:2510-2613`
+
+### Chain Assembly (`build_free_provider`)
+
+- `FREE_CATALOG` constant at free.rs:54-158 defines 11 upstreams by priority
+- Each `FreeUpstream` has: id, title, key_url, default_model, note
+- OpenCode Zen/Go key sharing: checks both auth store slots
+- Silent skip for unconfigured upstreams (no error)
+- Catalog order = fallback priority (Groq first as fastest/most generous)

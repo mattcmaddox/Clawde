@@ -17,7 +17,7 @@ struct ExitPlanModeInput {
 #[async_trait]
 impl Tool for ExitPlanModeTool {
     fn name(&self) -> &str {
-        claurst_core::constants::TOOL_NAME_EXIT_PLAN_MODE
+        clawde_core::constants::TOOL_NAME_EXIT_PLAN_MODE
     }
 
     fn description(&self) -> &str {
@@ -43,9 +43,8 @@ impl Tool for ExitPlanModeTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        let params: ExitPlanModeInput = serde_json::from_value(input).unwrap_or(ExitPlanModeInput {
-            summary: None,
-        });
+        let params: ExitPlanModeInput =
+            serde_json::from_value(input).unwrap_or(ExitPlanModeInput { summary: None });
 
         debug!(summary = ?params.summary, "Exiting plan mode");
 

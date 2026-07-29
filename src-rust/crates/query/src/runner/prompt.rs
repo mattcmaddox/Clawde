@@ -5,7 +5,7 @@ use crate::*;
 
 /// Build the system prompt from config.
 ///
-/// Delegates to `claurst_core::system_prompt::build_system_prompt` so that all
+/// Delegates to `clawde_core::system_prompt::build_system_prompt` so that all
 /// default content (capabilities, safety guidelines, dynamic-boundary marker,
 /// etc.) is assembled in one place.  The `QueryConfig` fields map directly to
 /// `SystemPromptOptions`:
@@ -13,7 +13,7 @@ use crate::*;
 /// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
 /// - `append_system_prompt` → `append_system_prompt` (added after boundary)
 pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
-    use claurst_core::system_prompt::SystemPromptOptions;
+    use clawde_core::system_prompt::SystemPromptOptions;
 
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
@@ -32,6 +32,6 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         ..Default::default()
     };
 
-    let text = claurst_core::system_prompt::build_system_prompt(&opts);
+    let text = clawde_core::system_prompt::build_system_prompt(&opts);
     SystemPrompt::Text(text)
 }

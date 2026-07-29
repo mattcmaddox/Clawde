@@ -25,7 +25,9 @@ struct McpAuthInput {
 #[async_trait]
 impl Tool for McpAuthTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "mcp__auth"
@@ -78,7 +80,7 @@ impl Tool for McpAuthTool {
             }
         };
 
-        use claurst_mcp::McpServerStatus;
+        use clawde_mcp::McpServerStatus;
 
         // 1. Check current connection status.
         match manager.server_status(&params.server_name) {

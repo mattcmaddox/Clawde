@@ -3397,7 +3397,9 @@ impl PromptInputState {
                     return; // unavailable options are not selectable
                 }
                 let new_cursor = match s.source {
-                    TypeaheadSource::SlashCommand | TypeaheadSource::History | TypeaheadSource::ArgCompletion => {
+                    TypeaheadSource::SlashCommand
+                    | TypeaheadSource::History
+                    | TypeaheadSource::ArgCompletion => {
                         // Replace entire text; discard anything after cursor too.
                         self.text = s.text.clone();
                         self.text.len()
@@ -3671,7 +3673,7 @@ struct KeywordGradient {
     dither: bool,
 }
 
-/// Claurst-red gradient for `ultracode` (matches the `/effort` selector's red
+/// Clawde-red gradient for `ultracode` (matches the `/effort` selector's red
 /// theme): the signature red fading into a deeper red. Unchanged.
 const ULTRACODE_GRADIENT: KeywordGradient = KeywordGradient {
     start: (233, 30, 99),
@@ -3798,7 +3800,7 @@ pub(crate) fn styled_spans_with_keyword_gradient(
     spans
 }
 
-/// Render the prompt input widget in the same low-chrome style as Claurst:
+/// Render the prompt input widget in the same low-chrome style as Clawde:
 /// multi-line input rows (one per logical line in the text) plus an accent
 /// underline. Suggestions are rendered by the footer, not as a boxed dropdown
 /// here.

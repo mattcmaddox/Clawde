@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use std::cell::Cell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomProviderField {
@@ -20,6 +21,8 @@ pub enum CustomProviderField {
 
 pub struct CustomProviderDialogState {
     pub visible: bool,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     pub provider_id: String,
     pub provider_name: String,
     pub url_input: String,
@@ -42,10 +45,16 @@ impl CustomProviderDialogState {
             url_input: String::new(),
             api_key_input: String::new(),
             active_field: CustomProviderField::Url,
+            last_rect: Cell::new(Rect::default()),
         }
     }
 
-    pub fn open(&mut self, provider_id: String, provider_name: String, current_url: Option<String>) {
+    pub fn open(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        current_url: Option<String>,
+    ) {
         self.visible = true;
         self.provider_id = provider_id;
         self.provider_name = provider_name;
@@ -69,7 +78,7 @@ impl CustomProviderDialogState {
     }
 
     pub fn move_prev_field(&mut self) {
-                self.active_field = match self.active_field {
+        self.active_field = match self.active_field {
             CustomProviderField::Url => CustomProviderField::ApiKey,
             CustomProviderField::ApiKey => CustomProviderField::Url,
         };
@@ -124,6 +133,7 @@ pub fn render_custom_provider_dialog(
     let width = 76u16.min(area.width.saturating_sub(4));
     let height = 13u16;
     let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
 
     let inner = Rect {
@@ -137,12 +147,16 @@ pub fn render_custom_provider_dialog(
     let title_pad = inner.width.saturating_sub(title_text.len() as u16 + 5) as usize;
 
     let url_style = if state.active_field == CustomProviderField::Url {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
     let key_style = if state.active_field == CustomProviderField::ApiKey {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
@@ -183,20 +197,34 @@ pub fn render_custom_provider_dialog(
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(" URL:", Style::default().fg(muted))]));
+    lines.push(Line::from(vec![Span::styled(
+        " URL:",
+        Style::default().fg(muted),
+    )]));
     lines.push(Line::from(vec![
         Span::styled(format!(" {}", url_text), url_style),
         Span::styled(
-            if state.active_field == CustomProviderField::Url { "_" } else { "" },
+            if state.active_field == CustomProviderField::Url {
+                "_"
+            } else {
+                ""
+            },
             Style::default().fg(pink),
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(" API Key:", Style::default().fg(muted))]));
+    lines.push(Line::from(vec![Span::styled(
+        " API Key:",
+        Style::default().fg(muted),
+    )]));
     lines.push(Line::from(vec![
         Span::styled(format!(" {}", masked_key), key_style),
         Span::styled(
-            if state.active_field == CustomProviderField::ApiKey { "_" } else { "" },
+            if state.active_field == CustomProviderField::ApiKey {
+                "_"
+            } else {
+                ""
+            },
             Style::default().fg(pink),
         ),
     ]));

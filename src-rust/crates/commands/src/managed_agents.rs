@@ -23,14 +23,46 @@ impl SlashCommand for ManagedAgentsCommand {
         COMPLETIONS
             .get_or_init(|| {
                 let mut out = vec![
-                    ArgCompletion { value: "status".into(), description: "Show current config".into(), available: true },
-                    ArgCompletion { value: "presets".into(), description: "List built-in presets".into(), available: true },
-                    ArgCompletion { value: "setup".into(), description: "Show setup instructions".into(), available: true },
-                    ArgCompletion { value: "configure".into(), description: "Set manager/executor options".into(), available: true },
-                    ArgCompletion { value: "enable".into(), description: "Enable managed agents".into(), available: true },
-                    ArgCompletion { value: "disable".into(), description: "Disable managed agents".into(), available: true },
-                    ArgCompletion { value: "reset".into(), description: "Remove config entirely".into(), available: true },
-                    ArgCompletion { value: "budget".into(), description: "Set total budget in USD (0 to clear)".into(), available: true },
+                    ArgCompletion {
+                        value: "status".into(),
+                        description: "Show current config".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "presets".into(),
+                        description: "List built-in presets".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "setup".into(),
+                        description: "Show setup instructions".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "configure".into(),
+                        description: "Set manager/executor options".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "enable".into(),
+                        description: "Enable managed agents".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "disable".into(),
+                        description: "Disable managed agents".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "reset".into(),
+                        description: "Remove config entirely".into(),
+                        available: true,
+                    },
+                    ArgCompletion {
+                        value: "budget".into(),
+                        description: "Set total budget in USD (0 to clear)".into(),
+                        available: true,
+                    },
                 ];
                 // Second-level: preset <name>
                 for preset in clawde_core::builtin_managed_agent_presets() {

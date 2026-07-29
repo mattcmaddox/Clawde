@@ -11,7 +11,7 @@
 //   │  How should the tests be run?                   │
 //   │                                                 │
 //   │  ▶ 1  cargo test --workspace                    │
-//   │    2  cargo test -p claurst-api                 │
+//   │    2  cargo test -p clawde-api                 │
 //   │    3  cargo test --features dev_full            │
 //   │                                                 │
 //   │  ❯ _                              (custom)      │
@@ -24,6 +24,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use std::cell::Cell;
 
 use crate::overlays::{centered_rect, CLAURST_PANEL_BG};
 
@@ -42,6 +43,8 @@ const NUMBER_FG: Color = Color::Rgb(150, 150, 200);
 pub struct AskUserDialogState {
     /// Whether the dialog is currently visible.
     pub visible: bool,
+    /// The area used by this dialog in the last render (for click-outside detection).
+    pub last_rect: Cell<Rect>,
     /// The question text from the model.
     pub question: String,
     /// Optional predefined choices.
@@ -56,7 +59,6 @@ pub struct AskUserDialogState {
     /// Pending reply channel sender — set when the dialog opens, consumed on submit.
     pub(crate) reply_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
-
 
 impl AskUserDialogState {
     pub fn new() -> Self {
@@ -155,6 +157,10 @@ impl AskUserDialogState {
 
     /// Dismiss without answering (sends an empty string so the tool result
     /// signals "user dismissed").
+    pub fn close(&mut self) {
+        self.dismiss();
+    }
+
     pub fn dismiss(&mut self) -> bool {
         self.send_reply(String::new())
     }
@@ -197,10 +203,15 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
 
     // ---- size estimate ----
     let question_lines = word_wrap(&state.question, 52).len() as u16;
-    let options_lines = state.options.as_ref().map(|v| v.len() as u16 + 1).unwrap_or(0);
+    let options_lines = state
+        .options
+        .as_ref()
+        .map(|v| v.len() as u16 + 1)
+        .unwrap_or(0);
     let height = (5 + question_lines + options_lines + 3).min(area.height.saturating_sub(2));
     let width = 58u16.min(area.width.saturating_sub(4));
     let modal_area = centered_rect(width, height, area);
+    state.last_rect.set(modal_area);
 
     // ---- background ----
     for y in modal_area.top()..modal_area.bottom() {
@@ -240,7 +251,10 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     // ---- title ----
     let title = " Question ";
     let title_x = modal_area.left() + 2;
-    let title_style = Style::default().fg(TITLE_FG).bg(CLAURST_PANEL_BG).add_modifier(Modifier::BOLD);
+    let title_style = Style::default()
+        .fg(TITLE_FG)
+        .bg(CLAURST_PANEL_BG)
+        .add_modifier(Modifier::BOLD);
     for (i, ch) in title.chars().enumerate() {
         let x = title_x + i as u16;
         if x < modal_area.right() - 1 {
@@ -264,7 +278,12 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     macro_rules! write_line {
         ($row:expr, $line:expr) => {{
             if $row < inner.y + inner.height {
-                let r = Rect { x: inner.x, y: $row, width: inner.width, height: 1 };
+                let r = Rect {
+                    x: inner.x,
+                    y: $row,
+                    width: inner.width,
+                    height: 1,
+                };
                 Paragraph::new($line).render(r, buf);
             }
         }};
@@ -275,7 +294,10 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     for wrap_line in word_wrap(&state.question, inner_w) {
         write_line!(
             row,
-            Line::from(Span::styled(wrap_line, Style::default().fg(QUESTION_FG).bg(CLAURST_PANEL_BG)))
+            Line::from(Span::styled(
+                wrap_line,
+                Style::default().fg(QUESTION_FG).bg(CLAURST_PANEL_BG)
+            ))
         );
         row += 1;
         if row >= inner.y + inner.height {
@@ -296,12 +318,34 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             let prefix = if is_sel { "▶ " } else { "  " };
             let num_str = format!("{}", i + 1);
             let label = format!(" {}", opt);
-            let style_bg = if is_sel { SELECTED_BG } else { CLAURST_PANEL_BG };
-            write_line!(row, Line::from(vec![
-                Span::styled(prefix, Style::default().fg(if is_sel { SELECTED_FG } else { HINT_FG }).bg(style_bg)),
-                Span::styled(num_str, Style::default().fg(NUMBER_FG).bg(style_bg)),
-                Span::styled(label, Style::default().fg(if is_sel { SELECTED_FG } else { OPTION_FG }).bg(style_bg).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
-            ]));
+            let style_bg = if is_sel {
+                SELECTED_BG
+            } else {
+                CLAURST_PANEL_BG
+            };
+            write_line!(
+                row,
+                Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        Style::default()
+                            .fg(if is_sel { SELECTED_FG } else { HINT_FG })
+                            .bg(style_bg)
+                    ),
+                    Span::styled(num_str, Style::default().fg(NUMBER_FG).bg(style_bg)),
+                    Span::styled(
+                        label,
+                        Style::default()
+                            .fg(if is_sel { SELECTED_FG } else { OPTION_FG })
+                            .bg(style_bg)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            })
+                    ),
+                ])
+            );
             row += 1;
         }
         row += 1; // spacer before custom row
@@ -312,10 +356,17 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         let is_sel = state.in_custom_input || state.options.is_none();
         let prefix = if is_sel { "❯ " } else { "  " };
         let cursor = if is_sel { "█" } else { "" };
-        let style_bg = if is_sel { SELECTED_BG } else { CLAURST_PANEL_BG };
-        let mut spans = vec![
-            Span::styled(prefix, Style::default().fg(if is_sel { SELECTED_FG } else { HINT_FG }).bg(style_bg)),
-        ];
+        let style_bg = if is_sel {
+            SELECTED_BG
+        } else {
+            CLAURST_PANEL_BG
+        };
+        let mut spans = vec![Span::styled(
+            prefix,
+            Style::default()
+                .fg(if is_sel { SELECTED_FG } else { HINT_FG })
+                .bg(style_bg),
+        )];
         if state.custom_text.is_empty() && !is_sel && state.options.is_some() {
             // Not yet active: show a subtle prompt so user knows they can type
             spans.push(Span::styled(
@@ -324,7 +375,10 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             ));
         } else {
             let display_text = format!("{}{}", state.custom_text, cursor);
-            spans.push(Span::styled(display_text, Style::default().fg(INPUT_FG).bg(style_bg)));
+            spans.push(Span::styled(
+                display_text,
+                Style::default().fg(INPUT_FG).bg(style_bg),
+            ));
         }
         write_line!(row, Line::from(spans));
         row += 1;
@@ -338,7 +392,13 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         } else {
             "  Type answer, then Enter to confirm   Esc: skip"
         };
-        write_line!(row, Line::from(Span::styled(hint, Style::default().fg(HINT_FG).bg(CLAURST_PANEL_BG))));
+        write_line!(
+            row,
+            Line::from(Span::styled(
+                hint,
+                Style::default().fg(HINT_FG).bg(CLAURST_PANEL_BG)
+            ))
+        );
     }
 
     let _ = row;

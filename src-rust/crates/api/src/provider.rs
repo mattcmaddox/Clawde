@@ -5,13 +5,15 @@
 // and report capabilities.  Auth concerns live in `auth.rs`.
 
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use clawde_core::provider_id::{ModelId, ProviderId};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
 use crate::provider_error::ProviderError;
-use crate::provider_types::{ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent};
+use crate::provider_types::{
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
+};
 
 // ---------------------------------------------------------------------------
 // ModelInfo
@@ -90,10 +92,7 @@ pub trait LlmProvider: Send + Sync {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 
     /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
     /// a local Ollama/LM Studio server, or a Copilot entitlement query).
@@ -119,4 +118,46 @@ pub trait LlmProvider: Send + Sync {
     /// This must not make a network call — it describes the provider's known
     /// feature set as compiled in.
     fn capabilities(&self) -> ProviderCapabilities;
+
+    /// Return whether a specific model supports tool/function calling.
+    ///
+    /// Returns `None` when the provider doesn't have per-model differentiation
+    /// (callers fall back to [`capabilities().tool_calling`](Self::capabilities)).
+    /// Returns `Some(bool)` when the provider can answer for a specific model.
+    ///
+    /// Compositing providers (e.g. `FreeProvider`) override this to give an
+    /// accurate answer for the currently-routed upstream rather than the union
+    /// of all upstreams.
+    fn tool_calling_for(&self, _model: &str) -> Option<bool> {
+        None
+    }
+
+    /// Return the max output tokens cap for a specific model, if one exists.
+    ///
+    /// Returns `None` when the provider doesn't have a per-model cap (callers
+    /// use the request's `max_tokens` as-is). Returns `Some(cap)` when the
+    /// provider knows the model has a lower output ceiling.
+    fn max_tokens_cap_for(&self, _model: &str) -> Option<u32> {
+        None
+    }
+
+    /// Return key rotation status if this provider supports automatic key
+    /// rotation. Returns `(active_count, total_keys, earliest_retry_secs)`:
+    /// - `active_count`: number of keys not in cooldown
+    /// - `total_keys`: total number of keys in the ring
+    /// - `earliest_retry_secs`: seconds until the next key becomes available,
+    ///    or `None` when all keys are active (no cooldowns).
+    ///
+    /// The default implementation returns `None` — most providers do not
+    /// have a key ring.
+    fn key_ring_status(&self) -> Option<(usize, usize, Option<u64>)> {
+        None
+    }
+
+    /// Return the name of the active routing strategy, if this provider
+    /// supports multiple routing strategies (e.g. sequential, random,
+    /// latency-based). The default implementation returns `None`.
+    fn routing_strategy_name(&self) -> Option<&'static str> {
+        None
+    }
 }

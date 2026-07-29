@@ -1,4 +1,4 @@
-// auth_store.rs — JSON-based credential store at ~/.claurst/auth.json.
+// auth_store.rs — JSON-based credential store at ~/.clawde/auth.json.
 //
 // Stores API keys and OAuth tokens for providers so users don't have to rely
 // solely on environment variables.
@@ -21,10 +21,26 @@ pub enum StoredCredential {
     },
 }
 
-/// Persistent credential store backed by `~/.claurst/auth.json`.
+/// Persistent credential store backed by `~/.clawde/auth.json`.
+///
+/// Supports both single-key storage (`credentials`) and multi-key storage
+/// (`keys`). The two maps are independent — a provider can have a single
+/// credential *and* multiple keys, or just one or the other.
+///
+/// Backward-compatible: old `auth.json` files with only `credentials`
+/// deserialize correctly (the `keys` field defaults to empty), and new files
+/// omit the `keys` field entirely when it is empty.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AuthStore {
     pub credentials: HashMap<String, StoredCredential>,
+    /// Multi-key storage: a provider can have multiple API keys. The system
+    /// rotates through these automatically when one is exhausted.
+    ///
+    /// Serialisation: `#[serde(default)]` and `#[serde(skip_serializing_if)]`
+    /// ensure that old auth.json files without this field are loaded correctly
+    /// and that the field is omitted from saved files when empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub keys: HashMap<String, Vec<String>>,
 }
 
 impl AuthStore {
@@ -75,7 +91,7 @@ impl AuthStore {
             Ok(j) => j,
             Err(_) => return,
         };
-        let tmp = path.with_file_name(format!(".auth.json.claurst-tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(format!(".auth.json.clawde-tmp-{}", std::process::id()));
         if std::fs::write(&tmp, &json).is_ok() {
             // auth.json holds API keys + OAuth tokens. Lock the temp file to
             // 0o600 *before* the rename so the live credential file is never
@@ -104,8 +120,79 @@ impl AuthStore {
         self.save();
     }
 
-    /// Get the API key for a provider, checking stored credentials first then
-    /// falling back to the relevant environment variable.
+    // -----------------------------------------------------------------------
+    // Multi-key helpers
+    // -----------------------------------------------------------------------
+
+    /// Replace all keys for a provider (persists immediately).
+    ///
+    /// Empty keys in the input are stripped. If the resulting list is empty the
+    /// provider's key entry is removed entirely.
+    pub fn set_keys(&mut self, provider_id: &str, keys: Vec<String>) {
+        let clean: Vec<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
+        if clean.is_empty() {
+            self.keys.remove(provider_id);
+        } else {
+            self.keys.insert(provider_id.to_string(), clean);
+        }
+        self.save();
+    }
+
+    /// Append a single key to the provider's key list (persists immediately).
+    /// Silently ignores empty keys.
+    pub fn add_key(&mut self, provider_id: &str, key: String) {
+        if key.is_empty() {
+            return;
+        }
+        self.keys
+            .entry(provider_id.to_string())
+            .or_default()
+            .push(key);
+        self.save();
+    }
+
+    /// Remove the key at `index` for a provider (persists immediately).
+    /// Returns `true` if a key was removed, `false` if the index was out of
+    /// bounds or the provider has no keys.
+    pub fn remove_key(&mut self, provider_id: &str, index: usize) -> bool {
+        let removed = self
+            .keys
+            .get_mut(provider_id)
+            .and_then(|keys| {
+                if index < keys.len() {
+                    Some(keys.remove(index))
+                } else {
+                    None
+                }
+            })
+            .is_some();
+        if removed {
+            // Clean up empty vectors.
+            if self.keys.get(provider_id).map_or(true, |k| k.is_empty()) {
+                self.keys.remove(provider_id);
+            }
+            self.save();
+        }
+        removed
+    }
+
+    /// Get all keys stored for a provider, or `None` if none are configured.
+    pub fn keys_for(&self, provider_id: &str) -> Option<&[String]> {
+        self.keys.get(provider_id).map(|v| v.as_slice())
+    }
+
+    // -----------------------------------------------------------------------
+    // Key resolution
+    // -----------------------------------------------------------------------
+
+    /// Get the API key for a provider, checking stored credentials first, then
+    /// the multi-key store, then falling back to the relevant environment
+    /// variable.
+    ///
+    /// Precedence:
+    ///   1. `credentials[provider_id]` — a single stored credential (legacy)
+    ///   2. `keys[provider_id][0]` — first key from the multi-key store
+    ///   3. Environment variable
     pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
         // Check stored credentials first
         if let Some(stored) = self.get(provider_id) {
@@ -126,6 +213,12 @@ impl AuthStore {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Check the multi-key store (first key).
+        if let Some(first) = self.keys.get(provider_id).and_then(|k| k.first()) {
+            if !first.is_empty() {
+                return Some(first.clone());
             }
         }
         // Fall back to environment variable.
@@ -152,6 +245,7 @@ impl AuthStore {
             "deepinfra" => "DEEPINFRA_API_KEY",
             "venice" => "VENICE_API_KEY",
             "github-copilot" => "GITHUB_TOKEN",
+            "github-models" => "GITHUB_TOKEN",
             "azure" => "AZURE_API_KEY",
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
@@ -181,6 +275,7 @@ impl AuthStore {
             "synthetic" => "SYNTHETIC_API_KEY",
             "routing" => "ROUTING_API_KEY",
             "neuralwatt" => "NEURALWATT_API_KEY",
+            "cline" => "CLINE_API_KEY",
             "custom-openai" => "CUSTOM_OPENAI_API_KEY",
             "ollama" | "lm-studio" | "llama-cpp" => "", // No API key required
             _ => return None,
@@ -226,5 +321,165 @@ mod tests {
         );
 
         assert_eq!(store.api_key_for("openrouter").as_deref(), Some("or-key"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-key tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_keys_is_empty() {
+        let store = AuthStore::default();
+        assert!(store.keys.is_empty());
+        assert!(store.keys_for("groq").is_none());
+    }
+
+    #[test]
+    fn set_keys_stores_and_overwrites() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
+
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], "k1");
+        assert_eq!(keys[1], "k2");
+        assert_eq!(keys[2], "k3");
+
+        // Overwrite
+        store.set_keys("groq", vec!["k4".into()]);
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], "k4");
+    }
+
+    #[test]
+    fn set_keys_strips_empty() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["k1".into(), "".into(), "k2".into()]);
+
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "k1");
+        assert_eq!(keys[1], "k2");
+    }
+
+    #[test]
+    fn set_keys_all_empty_removes_entry() {
+        let mut store = AuthStore::default();
+        store.keys.insert("groq".to_string(), vec!["k1".into()]);
+        store.set_keys("groq", vec!["".into(), "".into()]);
+        assert!(store.keys_for("groq").is_none());
+    }
+
+    #[test]
+    fn add_key_appends() {
+        let mut store = AuthStore::default();
+        store.add_key("groq", "k1".into());
+        store.add_key("groq", "k2".into());
+
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "k1");
+        assert_eq!(keys[1], "k2");
+    }
+
+    #[test]
+    fn add_key_ignores_empty() {
+        let mut store = AuthStore::default();
+        store.add_key("groq", "".into());
+        assert!(store.keys_for("groq").is_none());
+    }
+
+    #[test]
+    fn remove_key_removes_at_index() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
+
+        assert!(store.remove_key("groq", 1));
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "k1");
+        assert_eq!(keys[1], "k3");
+    }
+
+    #[test]
+    fn remove_key_out_of_bounds_returns_false() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["k1".into()]);
+        assert!(!store.remove_key("groq", 5));
+        assert!(store.keys_for("groq").is_some());
+    }
+
+    #[test]
+    fn remove_key_last_removes_entry() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["k1".into()]);
+        assert!(store.remove_key("groq", 0));
+        assert!(store.keys_for("groq").is_none());
+    }
+
+    #[test]
+    fn api_key_for_falls_through_to_keys() {
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["gsk-key1".into(), "gsk-key2".into()]);
+
+        assert_eq!(store.api_key_for("groq").as_deref(), Some("gsk-key1"));
+    }
+
+    #[test]
+    fn api_key_for_prefers_credentials_over_keys() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "anthropic".to_string(),
+            StoredCredential::ApiKey {
+                key: "sk-credential".into(),
+            },
+        );
+        store.set_keys("anthropic", vec!["sk-keys-first".into()]);
+
+        // Credential wins over keys
+        assert_eq!(
+            store.api_key_for("anthropic").as_deref(),
+            Some("sk-credential")
+        );
+    }
+
+    #[test]
+    fn serialization_round_trip_old_format() {
+        // Old format with only credentials — keys should deserialize as empty.
+        let old_json = r#"{"credentials":{"openai":{"type":"api","key":"sk-old"}}}"#;
+        let store: AuthStore = serde_json::from_str(old_json).unwrap();
+        assert_eq!(store.credentials.len(), 1);
+        assert!(store.keys.is_empty());
+    }
+
+    #[test]
+    fn serialization_round_trip_new_format() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "anthropic".into(),
+            StoredCredential::ApiKey {
+                key: "sk-ant".into(),
+            },
+        );
+        store.set_keys("groq", vec!["gsk-1".into(), "gsk-2".into()]);
+
+        let json = serde_json::to_string_pretty(&store).unwrap();
+        let restored: AuthStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.credentials.len(), 1);
+        assert_eq!(restored.keys_for("groq").map(|k| k.len()), Some(2));
+        assert_eq!(restored.keys_for("groq").unwrap()[0], "gsk-1");
+    }
+
+    #[test]
+    fn serialization_omits_keys_when_empty() {
+        let store = AuthStore::default();
+        let json = serde_json::to_string_pretty(&store).unwrap();
+        // Old-format: no "keys" key.
+        assert!(
+            !json.contains("\"keys\""),
+            "JSON should not contain keys field when empty: {}",
+            json
+        );
     }
 }

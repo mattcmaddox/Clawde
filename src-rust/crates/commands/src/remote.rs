@@ -23,9 +23,21 @@ impl SlashCommand for RemoteControlCommand {
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
-            ArgCompletion { value: "start".into(), description: "Start the remote-control bridge listener".into(), available: true },
-            ArgCompletion { value: "stop".into(), description: "Stop the bridge listener".into(), available: true },
-            ArgCompletion { value: "status".into(), description: "Show bridge connection status".into(), available: true },
+            ArgCompletion {
+                value: "start".into(),
+                description: "Start the remote-control bridge listener".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "stop".into(),
+                description: "Stop the bridge listener".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show bridge connection status".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {

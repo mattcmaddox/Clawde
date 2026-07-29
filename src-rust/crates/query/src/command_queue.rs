@@ -111,7 +111,11 @@ impl CommandQueue {
             .unwrap_or_default()
             .as_millis() as u64;
         let mut heap = self.0.lock().unwrap();
-        heap.push(QueueEntry { command, priority, timestamp: ts });
+        heap.push(QueueEntry {
+            command,
+            priority,
+            timestamp: ts,
+        });
     }
 
     /// Drain all pending commands in priority order (highest first).
@@ -145,8 +149,8 @@ impl Default for CommandQueue {
 /// Commands that are handled purely by the TUI/app layer (Compact, Clear,
 /// SetModel, TriggerSkill) are silently dropped here — the query loop does
 /// not need to act on them directly.
-pub fn drain_command_queue(queue: &CommandQueue) -> Vec<claurst_core::types::Message> {
-    use claurst_core::types::Message;
+pub fn drain_command_queue(queue: &CommandQueue) -> Vec<clawde_core::types::Message> {
+    use clawde_core::types::Message;
 
     let commands = queue.drain();
     let mut messages = Vec::new();

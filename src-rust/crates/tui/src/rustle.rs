@@ -19,7 +19,9 @@ use ratatui::text::{Line, Span};
 pub enum RustlePose {
     Default,
     /// Loading / error spinner — `frame` drives the animation.
-    Loading { frame: u64 },
+    Loading {
+        frame: u64,
+    },
 }
 
 /// Mascot style: bold green foreground rgb(0, 255, 0).
@@ -147,9 +149,7 @@ pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 8] {
         RustlePose::Loading { frame } => (*frame as usize) % FRAME_COUNT,
     };
 
-    FRAMES[idx].map(|row| {
-        Line::from(vec![Span::styled(row.to_string(), body_style())])
-    })
+    FRAMES[idx].map(|row| Line::from(vec![Span::styled(row.to_string(), body_style())]))
 }
 
 #[cfg(test)]
@@ -166,10 +166,7 @@ mod tests {
 
     #[test]
     fn all_poses_produce_8_lines() {
-        let poses = [
-            RustlePose::Default,
-            RustlePose::Loading { frame: 0 },
-        ];
+        let poses = [RustlePose::Default, RustlePose::Loading { frame: 0 }];
         for pose in &poses {
             let lines = rustle_lines(pose);
             assert_eq!(lines.len(), 8, "pose {:?} should produce 8 lines", pose);
