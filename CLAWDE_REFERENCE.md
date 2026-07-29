@@ -7,7 +7,7 @@ reimplements the behavior of Claude Code (from its leaked sourcemap spec) as a c
 reimplementation. It features a TUI pair programmer, multi-provider support, plugin system,
 chat forking, memory consolidation, sub-agent delegation, and much more.
 
-**Version:** 0.1.7  
+**Version:** 0.1.8  
 **License:** GPL-3.0  
 **Repository:** https://github.com/mattcmaddox/Clawde  
 **Binary:** `clawde` (formerly `claurst`)  
