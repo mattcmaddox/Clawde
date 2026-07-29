@@ -248,6 +248,29 @@ impl Default for TasksOverlay {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// Render a small progress bar (eg. "[###·····] 50%") into a Line.
+fn progress_bar(fraction: f32, width: usize) -> Vec<Span<'static>> {
+    let frac = fraction.clamp(0.0, 1.0);
+    let filled = (frac * width as f32) as usize;
+    let empty = width.saturating_sub(filled);
+    let bar_fg = if frac > 0.75 {
+        Color::Yellow
+    } else if frac > 0.0 {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    vec![
+        Span::styled("[", Style::default().fg(Color::DarkGray)),
+        Span::styled("\u{2588}".repeat(filled), Style::default().fg(bar_fg)),
+        Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("] {:.0}%", frac * 100.0),
+            Style::default().fg(bar_fg),
+        ),
+    ]
+}
+
 /// Render the tasks overlay into the frame.
 pub fn render_tasks_overlay(frame: &mut Frame, overlay: &TasksOverlay, area: Rect) {
     if !overlay.visible {
@@ -283,6 +306,14 @@ pub fn render_tasks_overlay(frame: &mut Frame, overlay: &TasksOverlay, area: Rec
 
     // Build task lines
     let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Progress summary bar        let (_pending, _in_progress, completed) = overlay.stats();
+        let total = overlay.tasks.len();
+        if total > 0 {
+            let done_frac = completed as f32 / total as f32;
+        lines.push(Line::from(progress_bar(done_frac, (inner.width as usize).saturating_sub(10).min(30))));
+        lines.push(Line::from(""));
+    }
 
     if overlay.tasks.is_empty() {
         lines.push(Line::from(Span::styled(

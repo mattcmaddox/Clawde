@@ -153,28 +153,28 @@ pub fn render_feedback_survey(state: &FeedbackSurveyState, area: Rect, buf: &mut
                         "1",
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" Bad   "),
+                    Span::raw(" \u{1f629} Bad   "),
                     Span::styled(
                         "2",
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" Fine   "),
+                    Span::raw(" \u{1f610} Fine   "),
                     Span::styled(
                         "3",
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" Good   "),
+                    Span::raw(" \u{1f44d} Good   "),
                     Span::styled(
                         "0",
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" Dismiss"),
+                    Span::raw(" \u{2716} Dismiss"),
                 ]),
             ],
         ),

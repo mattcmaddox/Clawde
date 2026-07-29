@@ -22,6 +22,7 @@ pub enum ExportFormat {
     #[default]
     Json,
     Markdown,
+    Clipboard,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -47,7 +48,8 @@ impl ExportDialogState {
     pub fn toggle(&mut self) {
         self.selected = match self.selected {
             ExportFormat::Json => ExportFormat::Markdown,
-            ExportFormat::Markdown => ExportFormat::Json,
+            ExportFormat::Markdown => ExportFormat::Clipboard,
+            ExportFormat::Clipboard => ExportFormat::Json,
         };
     }
 }
@@ -91,8 +93,16 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
             layout.body_area.width,
         ),
         Line::from(""),
+        export_option_row(
+            "3",
+            "Clipboard",
+            "Copy transcript to system clipboard",
+            state.selected == ExportFormat::Clipboard,
+            layout.body_area.width,
+        ),
+        Line::from(""),
         Line::from(vec![Span::styled(
-            " Saved to ./claude-export-<timestamp>.<ext>",
+            " Saved to ./claude-export-<timestamp>.<ext>  or  copy to clipboard",
             Style::default().fg(CLAURST_MUTED),
         )]),
     ];
@@ -229,6 +239,8 @@ mod tests {
         assert_eq!(state.selected, ExportFormat::Json);
         state.toggle();
         assert_eq!(state.selected, ExportFormat::Markdown);
+        state.toggle();
+        assert_eq!(state.selected, ExportFormat::Clipboard);
         state.toggle();
         assert_eq!(state.selected, ExportFormat::Json);
     }

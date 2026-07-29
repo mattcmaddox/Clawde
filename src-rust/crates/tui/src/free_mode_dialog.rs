@@ -46,6 +46,14 @@ use std::cell::Cell;
 pub struct FreeModeField {
     pub upstream: &'static FreeUpstream,
     pub key: String,
+    /// When `true`, this upstream is hidden behind the "show all" toggle.
+    pub collapsed: bool,
+    /// Whether this upstream is enabled in the free provider chain.
+    /// Disabled upstreams are skipped by `take_values()` even if they have keys.
+    pub enabled: bool,
+    /// Result of key validation: `None` = not tested, `Some(Ok(()))` = valid,
+    /// `Some(Err(reason))` = invalid.
+    pub validation_status: Option<Result<(), String>>,
 }
 
 pub struct FreeModeDialogState {
@@ -56,6 +64,10 @@ pub struct FreeModeDialogState {
     pub active_idx: usize,
     /// First visible field index (for scrolling when fields > viewport).
     pub scroll_offset: usize,
+    /// When `true`, all upstreams are shown (none collapsed).
+    pub show_all: bool,
+    /// When `true`, a key validation is in progress (prevents rapid Ctrl+V).
+    pub is_validating: bool,
 }
 
 impl Default for FreeModeDialogState {
@@ -71,6 +83,9 @@ impl FreeModeDialogState {
             .map(|upstream| FreeModeField {
                 upstream,
                 key: String::new(),
+                collapsed: true,
+                enabled: true,
+                validation_status: None,
             })
             .collect();
         Self {
@@ -78,75 +93,214 @@ impl FreeModeDialogState {
             fields,
             active_idx: 0,
             scroll_offset: 0,
+            show_all: false,
+            is_validating: false,
             last_rect: Cell::new(Rect::default()),
         }
     }
 
     /// Open the dialog, pre-populating each row from `existing[upstream.id]`
-    /// when present.
+    /// when present. Fields with keys are expanded; empty fields are collapsed.
+    /// Also reads `disabled_upstreams` from settings to set the enabled state.
     pub fn open(&mut self, existing: &[(&str, String)]) {
         self.visible = true;
-        for field in &mut self.fields {
-            field.key.clear();
-        }
+        self.show_all = false;
+        // Preserve any existing keys rather than clearing (incremental editing).
         for (id, key) in existing {
             if let Some(field) = self.fields.iter_mut().find(|f| f.upstream.id == *id) {
                 field.key = key.clone();
             }
         }
-        // Start on the first empty field, or the first field if none are empty.
-        self.active_idx = self
-            .fields
+        // Read disabled upstreams from settings so toggle state persists.
+        let disabled_upstreams: Vec<String> =
+            clawde_core::config::Settings::load_sync()
+                .map(|s| s.effective_config())
+                .unwrap_or_default()
+                .provider_configs
+                .get("free")
+                .and_then(|pc| pc.options.get("routing"))
+                .and_then(|v| v.get("disabled_upstreams"))
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                .unwrap_or_default();
+
+        // Collapse empty fields, expand fields with keys.
+        for field in &mut self.fields {
+            field.collapsed = field.key.trim().is_empty();
+            field.enabled = !disabled_upstreams.contains(&field.upstream.id.to_string());
+        }
+        // Start on the first empty (non-collapsed visible) field, or the first
+        // field if none are empty.
+        let visible = self.visible_field_indices();
+        self.active_idx = visible
             .iter()
-            .position(|f| f.key.is_empty())
-            .unwrap_or(0);
+            .find(|&&i| self.fields[i].key.trim().is_empty())
+            .copied()
+            .unwrap_or(*visible.first().unwrap_or(&0));
         self.scroll_offset = 0;
         self.ensure_active_visible();
     }
 
+    /// Spawn background validation pings for every non-empty, enabled upstream.
+    /// Returns a receiver the caller drains in the main loop. Each received
+    /// `(idx, result)` should be passed to `set_validation_result()`.
+    pub fn start_auto_pings(&mut self) -> Option<std::sync::mpsc::Receiver<(usize, Result<(), String>)>> {
+        let targets: Vec<(usize, String, String)> = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.enabled && !f.key.trim().is_empty())
+            .map(|(i, f)| (i, f.upstream.id.to_string(), f.key.trim().to_string()))
+            .collect();
+
+        if targets.is_empty() {
+            return None;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (idx, upstream_id, key) in targets {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = clawde_api::providers::free::validate_upstream_key(&upstream_id, &key);
+                let _ = tx.send((idx, result));
+            });
+        }
+        drop(tx);
+
+        Some(rx)
+    }
+
     pub fn close(&mut self) {
         self.visible = false;
-        for field in &mut self.fields {
-            field.key.clear();
-        }
+        // Don't clear keys — preserves state for incremental editing if the
+        // user re-opens the dialog.
         self.active_idx = 0;
         self.scroll_offset = 0;
+        self.show_all = false;
+        self.is_validating = false; // Clear any pending validation state
+        // Reset all collapsed flags so the next open() recalculates.
+        for field in &mut self.fields {
+            field.collapsed = false;
+        }
     }
 
     /// Number of rows shown at once in the scrolling viewport.
     pub const VISIBLE_ROWS: usize = 4;
 
+    /// Return indices of fields that are currently visible (non-collapsed or
+    /// show_all is active).
+    pub fn visible_field_indices(&self) -> Vec<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| self.show_all || !f.collapsed)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Toggle whether the active upstream is enabled/disabled.
+    /// Disabled upstreams are skipped by `take_values()` even if they have keys.
+    /// The disabled list is persisted to settings.json immediately, preserving
+    /// any existing routing strategy.
+    pub fn toggle_enabled(&mut self) {
+        if let Some(field) = self.fields.get_mut(self.active_idx) {
+            field.enabled = !field.enabled;
+            // Persist the disabled upstreams to settings.json.
+            let disabled: Vec<String> = self
+                .fields
+                .iter()
+                .filter(|f| !f.enabled)
+                .map(|f| f.upstream.id.to_string())
+                .collect();
+            if let Ok(mut settings) = clawde_core::config::Settings::load_sync() {
+                // Preserve existing routing configuration (strategy, etc.)
+                let mut cfg = settings
+                    .config
+                    .provider_configs
+                    .get("free")
+                    .and_then(|pc| pc.options.get("routing"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"strategy": "sequential"}));
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.insert("disabled_upstreams".to_string(), serde_json::json!(disabled));
+                }
+                settings
+                    .config
+                    .provider_configs
+                    .entry("free".to_string())
+                    .or_default()
+                    .options
+                    .insert("routing".to_string(), cfg);
+                let _ = settings.save_sync();
+            }
+        }
+    }
+
+    /// Toggle between showing only non-collapsed fields and all fields.
+    pub fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
+        // If hiding collapsed fields, ensure active_idx is still on a visible one.
+        if !self.show_all {
+            let visible = self.visible_field_indices();
+            if !visible.contains(&self.active_idx) {
+                self.active_idx = visible.first().copied().unwrap_or(0);
+            }
+        }
+        self.scroll_offset = 0;
+        self.ensure_active_visible();
+    }
+
+    /// Collapsed count (unconfigured upstreams currently hidden).
+    pub fn collapsed_count(&self) -> usize {
+        self.fields.iter().filter(|f| f.collapsed).count()
+    }
+
     pub fn move_next(&mut self) {
-        if self.fields.is_empty() {
+        let visible = self.visible_field_indices();
+        if visible.is_empty() {
             return;
         }
-        self.active_idx = (self.active_idx + 1) % self.fields.len();
+        let pos = visible.iter().position(|i| *i == self.active_idx);
+        match pos {
+            Some(p) if p + 1 < visible.len() => self.active_idx = visible[p + 1],
+            _ => self.active_idx = visible[0],
+        }
         self.ensure_active_visible();
     }
 
     pub fn move_prev(&mut self) {
-        if self.fields.is_empty() {
+        let visible = self.visible_field_indices();
+        if visible.is_empty() {
             return;
         }
-        self.active_idx = if self.active_idx == 0 {
-            self.fields.len() - 1
-        } else {
-            self.active_idx - 1
-        };
+        let pos = visible.iter().position(|i| *i == self.active_idx);
+        match pos {
+            Some(p) if p > 0 => self.active_idx = visible[p - 1],
+            _ => self.active_idx = *visible.last().unwrap(),
+        }
         self.ensure_active_visible();
     }
 
     fn ensure_active_visible(&mut self) {
-        if self.active_idx < self.scroll_offset {
-            self.scroll_offset = self.active_idx;
-        } else if self.active_idx >= self.scroll_offset + Self::VISIBLE_ROWS {
-            self.scroll_offset = self.active_idx + 1 - Self::VISIBLE_ROWS;
+        let visible = self.visible_field_indices();
+        if visible.is_empty() {
+            return;
+        }
+        // Convert absolute active_idx to its position within visible fields.
+        let pos = visible.iter().position(|i| *i == self.active_idx).unwrap_or(0);
+        if pos < self.scroll_offset {
+            self.scroll_offset = pos;
+        } else if pos >= self.scroll_offset + Self::VISIBLE_ROWS {
+            self.scroll_offset = pos + 1 - Self::VISIBLE_ROWS;
         }
     }
 
     pub fn insert_char(&mut self, c: char) {
         if let Some(field) = self.fields.get_mut(self.active_idx) {
             field.key.push(c);
+            // Auto-expand collapsed field when user starts typing.
+            if field.collapsed && !field.key.trim().is_empty() {
+                field.collapsed = false;
+            }
         }
     }
 
@@ -156,9 +310,48 @@ impl FreeModeDialogState {
         }
     }
 
-    /// Enabling Free mode requires at least one non-empty key. More is better.
+    /// Start validating the active field's API key in the background.
+    /// Returns a `Receiver` that the caller (App) must drain in the main loop.
+    /// Only one validation runs at a time.
+    pub fn start_validate(&mut self) -> Option<std::sync::mpsc::Receiver<(usize, Result<(), String>)>> {
+        if self.is_validating {
+            return None;
+        }
+        let field = self.fields.get(self.active_idx)?;
+        let key = field.key.trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        let upstream_id = field.upstream.id.to_string();
+        let idx = self.active_idx;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.is_validating = true;
+
+        std::thread::spawn(move || {
+            let result = clawde_api::providers::free::validate_upstream_key(&upstream_id, &key);
+            // Best-effort send; silently fails if the dialog was closed.
+            let _ = tx.send((idx, result));
+        });
+
+        Some(rx)
+    }
+
+    /// Set the validation result for a given field index.
+    /// Called from the main loop when a validation result arrives.
+    pub fn set_validation_result(&mut self, idx: usize, result: Result<(), String>) {
+        self.is_validating = false;
+        if let Some(field) = self.fields.get_mut(idx) {
+            field.validation_status = Some(result);
+        }
+    }
+
+    /// Enabling Free mode requires at least one non-empty key on an enabled
+    /// upstream. More is better.
     pub fn can_submit(&self) -> bool {
-        self.fields.iter().any(|f| !f.key.trim().is_empty())
+        self.fields
+            .iter()
+            .any(|f| f.enabled && !f.key.trim().is_empty())
     }
 
     pub fn filled_count(&self) -> usize {
@@ -169,12 +362,16 @@ impl FreeModeDialogState {
     }
 
     /// Consume the dialog state, returning every non-empty `(provider_id, key)`
-    /// pair the user entered.
+    /// pair the user entered. Does NOT close the dialog — the caller closes it
+    /// explicitly so incremental editing preserves state.
+    /// Disabled upstreams are excluded even if they have keys.
     pub fn take_values(&mut self) -> Vec<(&'static str, String)> {
-        let out: Vec<(&'static str, String)> = self
-            .fields
+        self.fields
             .iter()
             .filter_map(|f| {
+                if !f.enabled {
+                    return None;
+                }
                 let trimmed = f.key.trim();
                 if trimmed.is_empty() {
                     None
@@ -182,9 +379,22 @@ impl FreeModeDialogState {
                     Some((f.upstream.id, trimmed.to_string()))
                 }
             })
-            .collect();
-        self.close();
-        out
+            .collect()
+    }
+
+    /// Apply the current values to the auth store without closing the dialog.
+    /// This lets users add keys incrementally: type a key, press Ctrl+S to save
+    /// it, then move to the next field and repeat.
+    /// Returns the number of keys saved.
+    pub fn apply_values(&mut self) -> usize {
+        let values = self.take_values();
+        let count = values.len();
+        let mut auth_store = clawde_core::AuthStore::load();
+        for (provider_id, key) in values {
+            auth_store.set(provider_id, clawde_core::StoredCredential::ApiKey { key });
+        }
+        auth_store.save();
+        count
     }
 }
 
@@ -284,9 +494,52 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
     ]));
     lines.push(Line::from(""));
 
-    // Field viewport
-    let start = state.scroll_offset;
-    let end = (start + FreeModeDialogState::VISIBLE_ROWS).min(state.fields.len());
+    // Determine which fields are visible
+    let visible_indices = state.visible_field_indices();
+    let visible_count = visible_indices.len();
+
+    // Show collapse hint when there are collapsed fields and we're not showing all
+    if !state.show_all {
+        let collapsed = state.collapsed_count();
+        if collapsed > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("   \u{2192} {} upstream{} collapsed",
+                        collapsed,
+                        if collapsed == 1 { "" } else { "s" }),
+                    Style::default().fg(dim).add_modifier(Modifier::ITALIC),
+                ),
+                Span::styled(
+                    "  [tab to show all]",
+                    Style::default().fg(Color::Rgb(120, 120, 140)).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
+    // Key health summary bar
+    let valid_count = state.fields.iter().filter(|f| matches!(f.validation_status, Some(Ok(())))).count();
+    let invalid_count = state.fields.iter().filter(|f| matches!(f.validation_status, Some(Err(_)))).count();
+    let untested_count = state.fields.iter().filter(|f| !f.key.trim().is_empty() && f.validation_status.is_none()).count();
+    if valid_count > 0 || invalid_count > 0 || untested_count > 0 {
+        let health_text = if valid_count > 0 && invalid_count == 0 && untested_count == 0 {
+            format!("   \u{2713} {} key{} valid", valid_count, if valid_count == 1 { "" } else { "s" })
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if valid_count > 0 { parts.push(format!("\u{2713} {} ok", valid_count)); }
+            if invalid_count > 0 { parts.push(format!("\u{2717} {} bad", invalid_count)); }
+            if untested_count > 0 { parts.push(format!("\u{231b} {} pending", untested_count)); }
+            format!("   {}", parts.join("  "))
+        };
+        lines.push(Line::from(vec![Span::styled(
+            health_text,
+            Style::default().fg(if invalid_count > 0 { Color::Yellow } else { tip }),
+        )]));
+    }
+
+    // Field viewport: use visible indices only
+    let start = state.scroll_offset.min(visible_count.saturating_sub(1));
+    let end = (start + FreeModeDialogState::VISIBLE_ROWS).min(visible_count);
     if start > 0 {
         lines.push(Line::from(vec![Span::styled(
             format!("   \u{2191} {} above", start),
@@ -302,16 +555,25 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
         .unwrap_or(0)
         .max(8);
 
-    for idx in start..end {
+    for rel in start..end {
+        let idx = visible_indices[rel];
         let field = &state.fields[idx];
         let active = idx == state.active_idx;
         let marker = if active { "\u{25b8}" } else { " " };
         let label_style = if active {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
+            if field.enabled {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(140, 80, 80))
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else if field.enabled {
             Style::default().fg(muted)
+        } else {
+            Style::default().fg(dim)
         };
         let url_style = Style::default().fg(dim);
 
@@ -334,17 +596,61 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
             Style::default().fg(Color::White)
         };
         let cursor = if active { "_" } else { "" };
-        lines.push(Line::from(vec![
+        let mut input_line = vec![
             Span::styled("     ", Style::default()),
             Span::styled(masked, input_style),
             Span::styled(cursor.to_string(), Style::default().fg(pink)),
-        ]));
+        ];
+
+        // Validation status indicator
+        if let Some(ref status) = field.validation_status {
+            match status {
+                Ok(()) => {
+                    input_line.push(Span::styled(
+                        "  \u{2713}",
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Err(reason) => {
+                    input_line.push(Span::styled(
+                        "  \u{2717}",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                    if active {
+                        let short = if reason.len() > 20 {
+                            format!("{}…", &reason[..20])
+                        } else {
+                            reason.clone()
+                        };
+                        input_line.push(Span::styled(
+                            format!(" {}", short),
+                            Style::default().fg(Color::Rgb(255, 100, 100)),
+                        ));
+                    }
+                }
+            }
+        }
+
+        lines.push(Line::from(input_line));
     }
 
-    if end < state.fields.len() {
+    if end < visible_count {
         lines.push(Line::from(vec![Span::styled(
-            format!("   \u{2193} {} more", state.fields.len() - end),
+            format!("   \u{2193} {} more", visible_count - end),
             Style::default().fg(dim),
+        )]));
+    }
+
+    // Show-all / collapse toggle when there are collapsed upstreams
+    if !state.show_all && state.collapsed_count() > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            "   [tab] show all upstreams",
+            Style::default().fg(Color::Rgb(100, 100, 140)).add_modifier(Modifier::DIM),
+        )]));
+    } else if state.show_all {
+        lines.push(Line::from(vec![Span::styled(
+            "   [tab] show configured only",
+            Style::default().fg(Color::Rgb(100, 100, 140)).add_modifier(Modifier::DIM),
         )]));
     }
 
@@ -353,7 +659,11 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
     // Footer
     lines.push(Line::from(vec![
         Span::styled(" \u{2191}/\u{2193}", Style::default().fg(dim)),
-        Span::styled(" next field   ", Style::default().fg(dim)),
+        Span::styled(" next   ", Style::default().fg(dim)),
+        Span::styled("ctrl+d", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled(" toggle on/off   ", Style::default().fg(dim)),
+        Span::styled("tab", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled(" collapsed   ", Style::default().fg(dim)),
         Span::styled(confirm_hint, Style::default().fg(dim)),
     ]));
 
@@ -377,47 +687,85 @@ mod tests {
         let mut s = FreeModeDialogState::new();
         s.open(&[]);
         assert!(s.visible);
+        // All fields are empty and collapsed; open() falls back to index 0.
         assert_eq!(s.active_idx, 0);
     }
 
     #[test]
-    fn open_seeds_existing_keys_and_skips_to_first_empty() {
+    fn open_seeds_existing_keys_and_shows_only_configured() {
         let mut s = FreeModeDialogState::new();
         s.open(&[(FREE_CATALOG[0].id, "existing-key".to_string())]);
         assert_eq!(s.fields[0].key, "existing-key");
-        // First empty is the second field.
-        assert_eq!(s.active_idx, 1);
+        // Field 0 has a key (not collapsed). Other fields are collapsed.
+        // visible = [0]; no empty visible fields, so active_idx = visible[0] = 0.
+        assert_eq!(s.active_idx, 0);
+        // Collapsed upstreams are hidden.
+        assert!(s.fields[0].collapsed == false, "configured field should be expanded");
+        assert!(s.fields[1].collapsed, "empty field should be collapsed");
     }
 
     #[test]
-    fn move_next_wraps() {
+    fn open_with_show_all_shows_all_fields() {
         let mut s = FreeModeDialogState::new();
         s.open(&[]);
+        s.toggle_show_all();
+        assert!(s.show_all);
+        assert_eq!(s.visible_field_indices().len(), s.fields.len());
+    }
+
+    #[test]
+    fn move_next_wraps_within_visible() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[]);
+        s.toggle_show_all(); // All fields visible
         let n = s.fields.len();
         s.active_idx = n - 1;
         s.move_next();
-        assert_eq!(s.active_idx, 0);
+        assert_eq!(s.active_idx, 0, "should wrap to first field");
     }
 
     #[test]
-    fn move_prev_wraps() {
+    fn move_prev_wraps_within_visible() {
         let mut s = FreeModeDialogState::new();
         s.open(&[]);
+        s.toggle_show_all(); // All fields visible
         s.active_idx = 0;
         s.move_prev();
-        assert_eq!(s.active_idx, s.fields.len() - 1);
+        assert_eq!(s.active_idx, s.fields.len() - 1, "should wrap to last field");
     }
 
     #[test]
-    fn scroll_offset_follows_active() {
+    fn move_next_skips_collapsed_fields() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[(FREE_CATALOG[0].id, "k1".into()), (FREE_CATALOG[2].id, "k3".into())]);
+        // Only fields 0 and 2 are expanded (have keys).
+        let visible = s.visible_field_indices();
+        assert_eq!(visible, vec![0, 2], "only configured fields should be visible");
+        // active_idx = first empty visible field → none with keys → first visible = 0
+        assert_eq!(s.active_idx, 0);
+        s.move_next();
+        assert_eq!(s.active_idx, 2, "should skip to field 2 (next visible)");
+        s.move_next();
+        assert_eq!(s.active_idx, 0, "should wrap to first visible");
+    }
+
+    #[test]
+    fn toggle_show_all_expands_all_fields() {
         let mut s = FreeModeDialogState::new();
         s.open(&[]);
-        for _ in 0..FreeModeDialogState::VISIBLE_ROWS {
-            s.move_next();
-        }
-        assert!(s.scroll_offset > 0);
-        assert!(s.active_idx >= s.scroll_offset);
-        assert!(s.active_idx < s.scroll_offset + FreeModeDialogState::VISIBLE_ROWS);
+        // Initially all collapsed.
+        assert_eq!(s.visible_field_indices().len(), 0);
+        s.toggle_show_all();
+        assert_eq!(s.visible_field_indices().len(), s.fields.len());
+    }
+
+    #[test]
+    fn collapsed_count_reflects_empty_fields() {
+        let mut s = FreeModeDialogState::new();
+        s.open(&[]);
+        assert_eq!(s.collapsed_count(), s.fields.len());
+        s.open(&[(FREE_CATALOG[0].id, "k1".into())]);
+        assert_eq!(s.collapsed_count(), s.fields.len() - 1);
     }
 
     #[test]
@@ -441,9 +789,10 @@ mod tests {
     }
 
     #[test]
-    fn take_values_returns_only_non_empty_trimmed_pairs_and_closes() {
+    fn take_values_returns_only_non_empty_trimmed_pairs_and_does_not_close() {
         let mut s = FreeModeDialogState::new();
         s.open(&[]);
+        s.toggle_show_all(); // Show all fields so move_next works
         s.insert_char(' ');
         s.insert_char('a');
         s.insert_char(' ');
@@ -453,6 +802,9 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0], (FREE_CATALOG[0].id, "a".to_string()));
         assert_eq!(values[1], (FREE_CATALOG[1].id, "b".to_string()));
+        // take_values no longer closes — caller is responsible.
+        assert!(s.visible);
+        s.close();
         assert!(!s.visible);
     }
 

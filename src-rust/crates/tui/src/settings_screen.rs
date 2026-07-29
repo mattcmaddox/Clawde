@@ -10,6 +10,7 @@ use crate::overlays::{
 };
 use clawde_core::config::{Config, Settings};
 use clawde_core::output_styles::{builtin_styles, find_style};
+use clawde_tools::web_search::check_backend_configured;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -72,6 +73,16 @@ pub struct SettingsScreen {
     pub file_autocomplete_limit: String,
     pub file_autocomplete_show_hidden_files: bool,
     pub file_injection_max_size: String,
+    /// Current free-mode routing strategy ("sequential", "random_failover", "latency_based").
+    pub routing_strategy: String,
+    /// Comma-separated list of disabled free upstream IDs.
+    pub disabled_upstreams: String,
+    /// Preferred web search backend.
+    pub preferred_search_backend: String,
+    /// Health warning message for the search backend (shown in description area).
+    pub health_warning: String,
+    /// When true, the user is asked to confirm before discarding pending changes.
+    pub confirming_discard: bool,
 }
 
 impl SettingsScreen {
@@ -106,6 +117,11 @@ impl SettingsScreen {
             file_autocomplete_limit: "15".to_string(),
             file_autocomplete_show_hidden_files: false,
             file_injection_max_size: "100".to_string(),
+            routing_strategy: "sequential".to_string(),
+            disabled_upstreams: String::new(),
+            preferred_search_backend: "auto".to_string(),
+            health_warning: String::new(),
+            confirming_discard: false,
         };
         // Apply settings from snapshot immediately on initialization
         screen.apply_settings_from_snapshot();
@@ -155,6 +171,60 @@ impl SettingsScreen {
             .config
             .file_injection_max_size
             .to_string();
+
+        // Read routing strategy from provider config
+        self.routing_strategy = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("strategy"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("sequential")
+            .to_string();
+
+        // Read disabled upstreams from provider config
+        self.disabled_upstreams = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("disabled_upstreams"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        // Read preferred search backend from settings
+        self.preferred_search_backend = self
+            .settings_snapshot
+            .preferred_search_backend
+            .clone();
+
+        // Sync the env var so web_search.rs respects the stored preference immediately.
+        let val = self.preferred_search_backend.trim();
+        if val == "auto" || val.is_empty() {
+            std::env::remove_var("PREFERRED_SEARCH_BACKEND");
+            self.health_warning.clear();
+        } else {
+            std::env::set_var("PREFERRED_SEARCH_BACKEND", val);
+            // Check if the selected backend is properly configured
+            match check_backend_configured(val) {
+                Ok(()) => self.health_warning.clear(),
+                Err(msg) => {
+                    self.health_warning = format!(
+                        "Warning: {} not configured — {}",
+                        val, msg
+                    );
+                }
+            }
+        }
     }
 
     pub fn open(&mut self) {
@@ -252,6 +322,24 @@ impl SettingsScreen {
                         config.file_injection_max_size = n;
                         self.file_injection_max_size = value.clone();
                     }
+                }
+                "disabled_upstreams" => {
+                    self.disabled_upstreams = value.clone();
+                    let parsed: Vec<String> = value
+                        .split(|c: char| c == ',' || c == ' ')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let routing = serde_json::json!({
+                        "disabled_upstreams": parsed,
+                        "strategy": self.routing_strategy
+                    });
+                    config
+                        .provider_configs
+                        .entry("free".to_string())
+                        .or_default()
+                        .options
+                        .insert("routing".to_string(), routing);
                 }
                 _ => {}
             }
@@ -398,6 +486,31 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Ignore CLAUDE.md files in projects (use defaults instead).",
             kind: SettingKind::Bool,
             value: if screen.disable_claude_mds { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "routing_strategy",
+            label: "Free routing",
+            description: "How free-mode selects upstream providers (sequential/random/latency).",
+            kind: SettingKind::Enum {
+                options: vec!["sequential", "random_failover", "latency_based"],
+            },
+            value: screen.routing_strategy.clone(),
+        },
+        SettingsEntry {
+            key: "disabled_upstreams",
+            label: "Disabled upstreams",
+            description: "Free upstreams to skip (comma-separated IDs, e.g. nvidia, cohere).",
+            kind: SettingKind::Number,
+            value: screen.disabled_upstreams.clone(),
+        },
+        SettingsEntry {
+            key: "preferredSearchBackend",
+            label: "Search backend",
+            description: "Preferred web search backend (auto, searxng, firecrawl, duckduckgo).",
+            kind: SettingKind::Enum {
+                options: vec!["auto", "searxng", "firecrawl", "duckduckgo"],
+            },
+            value: screen.preferred_search_backend.clone(),
         },
         SettingsEntry {
             key: "fileInjectionEnabled",
@@ -572,7 +685,13 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     } else {
         String::new()
     };
-    let desc_para = Paragraph::new(desc_text)
+    // Append health warning to description if present
+    let display_desc = if !screen.health_warning.is_empty() {
+        format!("{}\n\n{}", desc_text, screen.health_warning)
+    } else {
+        desc_text
+    };
+    let desc_para = Paragraph::new(display_desc)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Left)
         .block(Block::default().padding(ratatui::widgets::Padding::new(1, 0, 1, 0)));
@@ -738,9 +857,14 @@ pub fn handle_settings_key(
             toggle_or_cycle_current(screen);
         }
         KeyCode::Esc => {
-            if !screen.search_query.is_empty() {
+            if screen.confirming_discard {
+                screen.confirming_discard = false;
+                screen.close();
+            } else if !screen.search_query.is_empty() {
                 screen.search_query.clear();
                 screen.selected_idx = 0;
+            } else if !screen.pending_changes.is_empty() {
+                screen.confirming_discard = true;
             } else {
                 screen.close();
             }
@@ -902,6 +1026,51 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                         };
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "routing_strategy" => {
+                        screen.routing_strategy = new_value.to_string();
+                        // Persist the routing strategy in settings.json under
+                        // providers.free.options.routing.strategy.
+                        let routing = serde_json::json!({
+                            "strategy": new_value
+                        });
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "preferredSearchBackend" => {
+                        screen.preferred_search_backend = new_value.to_string();
+                        screen.settings_snapshot.preferred_search_backend =
+                            new_value.to_string();
+                        // Also set the env var so it takes effect immediately.
+                        if new_value == "auto" {
+                            std::env::remove_var("PREFERRED_SEARCH_BACKEND");
+                        } else {
+                            std::env::set_var("PREFERRED_SEARCH_BACKEND", new_value);
+                        }
+                        // Check if the selected backend is properly configured
+                        if new_value != "auto" {
+                            match check_backend_configured(new_value) {
+                                Ok(()) => {
+                                    screen.health_warning = String::new();
+                                }
+                                Err(msg) => {
+                                    screen.health_warning = format!(
+                                        "Warning: {} not configured — {}",
+                                        new_value, msg
+                                    );
+                                }
+                            }
+                        } else {
+                            screen.health_warning.clear();
+                        }
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     _ => {}
                 }
             }
@@ -941,8 +1110,8 @@ mod tests {
             entries.len()
         );
         assert!(
-            entries.len() <= 20,
-            "Should have at most 20 editable settings, got {}",
+            entries.len() <= 21,
+            "Should have at most 21 editable settings, got {}",
             entries.len()
         );
     }

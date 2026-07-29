@@ -12,8 +12,8 @@ use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::model_picker::{EffortLevel, ModelPickerState};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
-    GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
-    RewindFlowOverlay, SelectorMessage,
+    GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, KeybindingsOverlayState,
+    MessageSelectorOverlay, RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
@@ -170,86 +170,17 @@ fn help_overlay_entries() -> Vec<HelpEntry> {
 // ---------------------------------------------------------------------------
 
 /// Return the environment variable name for a given provider ID.
+/// Delegates to the shared ProviderMetadata table in the API crate.
 #[allow(dead_code)]
 fn get_env_var_for_provider(id: &str) -> &'static str {
-    match id {
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "openai" => "OPENAI_API_KEY",
-        "google" | "google-vertex" => "GOOGLE_API_KEY",
-        "github-copilot" => "GITHUB_TOKEN",
-        "groq" => "GROQ_API_KEY",
-        "cerebras" => "CEREBRAS_API_KEY",
-        "sambanova" => "SAMBANOVA_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "mistral" => "MISTRAL_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "togetherai" => "TOGETHER_API_KEY",
-        "perplexity" => "PERPLEXITY_API_KEY",
-        "cohere" => "COHERE_API_KEY",
-        "xai" => "XAI_API_KEY",
-        "deepinfra" => "DEEPINFRA_API_KEY",
-        "azure" => "AZURE_API_KEY",
-        "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
-        "sap-ai-core" => "AICORE_SERVICE_KEY",
-        "gitlab" => "GITLAB_TOKEN",
-        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => "CLOUDFLARE_API_TOKEN",
-        "vercel" => "AI_GATEWAY_API_KEY",
-        "helicone" => "HELICONE_API_KEY",
-        "huggingface" => "HF_TOKEN",
-        "nvidia" => "NVIDIA_API_KEY",
-        "alibaba" => "DASHSCOPE_API_KEY",
-        "venice" => "VENICE_API_KEY",
-        "moonshotai" => "MOONSHOT_API_KEY",
-        "zhipuai" => "ZHIPU_API_KEY",
-        "zai" => "ZAI_API_KEY",
-        "siliconflow" => "SILICONFLOW_API_KEY",
-        "nebius" => "NEBIUS_API_KEY",
-        "novita" => "NOVITA_API_KEY",
-        "minimax" => "MINIMAX_API_KEY",
-        "ovhcloud" => "OVHCLOUD_API_KEY",
-        "scaleway" => "SCALEWAY_API_KEY",
-        "vultr" => "VULTR_API_KEY",
-        "baseten" => "BASETEN_API_KEY",
-        "friendli" => "FRIENDLI_TOKEN",
-        "upstage" => "UPSTAGE_API_KEY",
-        "stepfun" => "STEPFUN_API_KEY",
-        "fireworks" => "FIREWORKS_API_KEY",
-        "cline" => "CLINE_API_KEY",
-        "github-models" => "GITHUB_TOKEN",
-        _ => "API_KEY",
-    }
+    clawde_api::providers::env_var_for(id)
 }
 
 /// Return a URL hint for obtaining an API key from a given provider.
+/// Delegates to the shared ProviderMetadata table in the API crate.
 #[allow(dead_code)]
 fn get_url_for_provider(id: &str) -> &'static str {
-    match id {
-        "anthropic" => "console.anthropic.com",
-        "openai" => "platform.openai.com/api-keys",
-        "google" => "aistudio.google.com/apikey",
-        "github-copilot" => "github.com/settings/tokens",
-        "groq" => "console.groq.com/keys",
-        "cerebras" => "cloud.cerebras.ai",
-        "sambanova" => "cloud.sambanova.ai",
-        "deepseek" => "platform.deepseek.com/api_keys",
-        "mistral" => "console.mistral.ai/api-keys",
-        "openrouter" => "openrouter.ai/keys",
-        "togetherai" => "api.together.xyz/settings/api-keys",
-        "perplexity" => "perplexity.ai/settings/api",
-        "cohere" => "dashboard.cohere.com/api-keys",
-        "xai" => "console.x.ai",
-        "deepinfra" => "deepinfra.com/dash/api_keys",
-        "azure" => "portal.azure.com",
-        "amazon-bedrock" => "console.aws.amazon.com/bedrock",
-        "minimax" => "platform.minimaxi.com",
-        "huggingface" => "huggingface.co/settings/tokens",
-        "nvidia" => "build.nvidia.com",
-        "venice" => "venice.ai/settings/api",
-        "zai" => "z.ai/manage-apikey/apikey-list",
-        "cline" => "app.cline.bot/settings",
-        "github-models" => "github.com/settings/tokens",
-        _ => "the provider's website",
-    }
+    clawde_api::providers::key_url_for(id)
 }
 
 fn import_config_picker_items() -> Vec<SelectItem> {
@@ -280,55 +211,130 @@ fn import_config_picker_items() -> Vec<SelectItem> {
 
 fn provider_picker_items() -> Vec<SelectItem> {
     vec![
+        // ── Quick start ──
         SelectItem {
             id: "free".into(),
-            title: "Free Mode".into(),
-            description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(),
-            category: "Popular".into(),
+            title: "Quick start — Free Mode".into(),
+            description: "Multi-tier free fallback — configure key(s) to begin (no spend)".into(),
+            category: "Quick start".into(),
             badge: Some("FREE".into()),
+        },
+        // ── Free Tier Providers ──
+        SelectItem {
+            id: "groq".into(),
+            title: "Groq".into(),
+            description: "Fast hosted inference — free tier".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "cerebras".into(),
+            title: "Cerebras".into(),
+            description: "Fast hosted inference — free tier".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "sambanova".into(),
+            title: "SambaNova".into(),
+            description: "Fast hosted inference — free tier".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "cline".into(),
+            title: "Cline".into(),
+            description: "Free rotating model pool via API key".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "opencode-zen".into(),
+            title: "OpenCode Zen".into(),
+            description: "Free models + paid · Nemotron · MiniMax · DeepSeek".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "opencode-go".into(),
+            title: "OpenCode Go".into(),
+            description: "Flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(),
+            category: "Free".into(),
+            badge: None,
+        },
+        // ── Popular Paid Providers ──
+        SelectItem {
+            id: "anthropic".into(),
+            title: "Anthropic".into(),
+            description: "Claude models (API key)".into(),
+            category: "Paid".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "anthropic-oauth".into(),
+            title: "Anthropic (Claude Pro/Max)".into(),
+            description: "Subscription — browser login".into(),
+            category: "Paid".into(),
+            badge: None,
         },
         SelectItem {
             id: "openai".into(),
             title: "OpenAI".into(),
-            description: "(API key)".into(),
-            category: "Popular".into(),
+            description: "GPT models (API key)".into(),
+            category: "Paid".into(),
             badge: None,
         },
         SelectItem {
             id: "openai-codex".into(),
             title: "OpenAI Codex".into(),
-            description: "(ChatGPT Plus/Pro — browser login)".into(),
-            category: "Popular".into(),
+            description: "ChatGPT Plus/Pro — browser login".into(),
+            category: "Paid".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "google".into(),
+            title: "Google".into(),
+            description: "Gemini models (API key)".into(),
+            category: "Paid".into(),
             badge: None,
         },
         SelectItem {
             id: "github-copilot".into(),
             title: "GitHub Copilot".into(),
             description: "(GitHub subscription or token)".into(),
-            category: "Popular".into(),
+            category: "Paid".into(),
             badge: None,
         },
         SelectItem {
-            id: "google".into(),
-            title: "Google".into(),
-            description: "(API key)".into(),
-            category: "Popular".into(),
+            id: "openrouter".into(),
+            title: "OpenRouter".into(),
+            description: "100+ models with one key".into(),
+            category: "Paid".into(),
+            badge: None,
+        },
+        // ── Local Providers ──
+        SelectItem {
+            id: "ollama".into(),
+            title: "Ollama".into(),
+            description: "Local inference — no API key required".into(),
+            category: "Local".into(),
             badge: None,
         },
         SelectItem {
-            id: "anthropic".into(),
-            title: "Anthropic".into(),
-            description: "(API key)".into(),
-            category: "Popular".into(),
-            badge: None,
+            id: "lmstudio".into(),
+            title: "LM Studio".into(),
+            description: "Local model server — no API key required".into(),
+            category: "Local".into(),
+            badge: Some("LOCAL".into()),
         },
         SelectItem {
-            id: "anthropic-oauth".into(),
-            title: "Anthropic (Claude Pro/Max)".into(),
-            description: "(subscription — browser login; draws from extra-usage)".into(),
-            category: "Popular".into(),
-            badge: None,
+            id: "llamacpp".into(),
+            title: "llama.cpp".into(),
+            description: "Local inference server — no API key required".into(),
+            category: "Local".into(),
+            badge: Some("LOCAL".into()),
         },
+        // ── Advanced ──
         SelectItem {
             id: "custom-openai".into(),
             title: "Custom OpenAI-Compatible".into(),
@@ -337,109 +343,61 @@ fn provider_picker_items() -> Vec<SelectItem> {
             badge: None,
         },
         SelectItem {
-            id: "openrouter".into(),
-            title: "OpenRouter".into(),
-            description: "100+ models with one key".into(),
-            category: "Popular".into(),
+            id: "azure".into(),
+            title: "Azure OpenAI".into(),
+            description: "Enterprise OpenAI deployments".into(),
+            category: "Advanced".into(),
             badge: None,
         },
+        SelectItem {
+            id: "amazon-bedrock".into(),
+            title: "AWS Bedrock".into(),
+            description: "Enterprise foundation models".into(),
+            category: "Advanced".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "google-vertex".into(),
+            title: "Google Vertex AI".into(),
+            description: "Enterprise Google models".into(),
+            category: "Advanced".into(),
+            badge: None,
+        },
+        // ── Other Providers ──
         SelectItem {
             id: "vercel".into(),
             title: "Vercel AI Gateway".into(),
             description: "Gateway for AI SDK models".into(),
-            category: "Popular".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "groq".into(),
-            title: "Groq".into(),
-            description: "Fast hosted inference".into(),
-            category: "Popular".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
-            id: "ollama".into(),
-            title: "Ollama".into(),
-            description: "Local inference + cloud models".into(),
-            category: "Popular".into(),
+            category: "Other".into(),
             badge: None,
         },
         SelectItem {
             id: "zai".into(),
             title: "Z.AI".into(),
             description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(),
-            category: "Popular".into(),
+            category: "Other".into(),
             badge: None,
-        },
-        SelectItem {
-            id: "opencode-go".into(),
-            title: "OpenCode Go".into(),
-            description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(),
-            category: "Popular".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "opencode-zen".into(),
-            title: "OpenCode Zen".into(),
-            description: "Free models + paid · Nemotron · Ring · MiniMax · DeepSeek".into(),
-            category: "Popular".into(),
-            badge: Some("FREE".into()),
         },
         SelectItem {
             id: "synthetic".into(),
             title: "Synthetic.dev".into(),
             description: "Hosted open weights".into(),
-            category: "Popular".into(),
+            category: "Other".into(),
             badge: None,
         },
         SelectItem {
             id: "routing".into(),
             title: "routing.run".into(),
             description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(),
-            category: "Popular".into(),
+            category: "Other".into(),
             badge: None,
         },
         SelectItem {
             id: "neuralwatt".into(),
             title: "NeuralWatt".into(),
             description: "Hosted open weights - energy-efficient".into(),
-            category: "Popular".into(),
+            category: "Other".into(),
             badge: None,
-        },
-        SelectItem {
-            id: "cline".into(),
-            title: "Cline".into(),
-            description: "Free rotating model pool via API key".into(),
-            category: "Popular".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
-            id: "cerebras".into(),
-            title: "Cerebras".into(),
-            description: "Fast hosted inference".into(),
-            category: "Other".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
-            id: "sambanova".into(),
-            title: "SambaNova".into(),
-            description: "Fast hosted inference".into(),
-            category: "Other".into(),
-            badge: Some("FREE".into()),
-        },
-        SelectItem {
-            id: "lmstudio".into(),
-            title: "LM Studio".into(),
-            description: "Local model server".into(),
-            category: "Other".into(),
-            badge: Some("LOCAL".into()),
-        },
-        SelectItem {
-            id: "llamacpp".into(),
-            title: "llama.cpp".into(),
-            description: "Local inference server".into(),
-            category: "Other".into(),
-            badge: Some("LOCAL".into()),
         },
         SelectItem {
             id: "deepseek".into(),
@@ -487,27 +445,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             id: "deepinfra".into(),
             title: "DeepInfra".into(),
             description: "Hosted open models".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "azure".into(),
-            title: "Azure OpenAI".into(),
-            description: "Enterprise OpenAI deployments".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "amazon-bedrock".into(),
-            title: "AWS Bedrock".into(),
-            description: "Enterprise foundation models".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "google-vertex".into(),
-            title: "Google Vertex AI".into(),
-            description: "Enterprise Google models".into(),
             category: "Other".into(),
             badge: None,
         },
@@ -601,6 +538,83 @@ fn provider_picker_items() -> Vec<SelectItem> {
             description: "Cloud inference".into(),
             category: "Other".into(),
             badge: None,
+        },
+        SelectItem {
+            id: "novita".into(),
+            title: "Novita".into(),
+            description: "Cloud inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "minimax".into(),
+            title: "MiniMax".into(),
+            description: "Claude-compatible (M3)".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "ovhcloud".into(),
+            title: "OVHcloud".into(),
+            description: "EU-hosted AI".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "scaleway".into(),
+            title: "Scaleway".into(),
+            description: "EU cloud AI".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "vultr".into(),
+            title: "Vultr".into(),
+            description: "Cloud inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "baseten".into(),
+            title: "Baseten".into(),
+            description: "Model serving".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "friendli".into(),
+            title: "Friendli".into(),
+            description: "Serverless inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "upstage".into(),
+            title: "Upstage".into(),
+            description: "Hosted Upstage models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "stepfun".into(),
+            title: "StepFun".into(),
+            description: "Hosted reasoning models".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "fireworks".into(),
+            title: "Fireworks AI".into(),
+            description: "Fast inference".into(),
+            category: "Other".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "github-models".into(),
+            title: "GitHub Models".into(),
+            description: "Free + paid via GitHub token".into(),
+            category: "Other".into(),
+            badge: Some("FREE".into()),
         },
         SelectItem {
             id: "novita".into(),
@@ -1284,6 +1298,8 @@ pub struct App {
     // ---- New overlay / notification fields --------------------------------
     /// Full-screen help overlay (? / F1).
     pub help_overlay: HelpOverlay,
+    /// Keybinding cheat-sheet overlay (Ctrl+/).
+    pub keybindings_overlay: KeybindingsOverlayState,
     /// Ctrl+R history search overlay.
     pub history_search_overlay: HistorySearchOverlay,
     /// Global ripgrep search / quick-open overlay.
@@ -1524,6 +1540,11 @@ pub struct App {
         Option<tokio::sync::mpsc::UnboundedReceiver<clawde_tools::UserQuestionEvent>>,
     /// State for the model-initiated ask-user question dialog.
     pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
+    /// Receiver for non-blocking key validation results (from free mode dialog).
+    /// Drained each frame so validation status updates as soon as the HTTP
+    /// request completes.
+    pub validation_rx:
+        Option<std::sync::mpsc::Receiver<(usize, Result<(), String>)>>,
 
     // ---- Context window & rate limit info ----------------------------------
     /// Total context window size for the current model (tokens).
@@ -1731,6 +1752,7 @@ impl App {
                 overlay.populate_from_commands(help_overlay_entries());
                 overlay
             },
+            keybindings_overlay: KeybindingsOverlayState::new(),
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
@@ -1877,6 +1899,7 @@ impl App {
             pending_key: None,
             model_fetch_rx: None,
             user_question_rx: None,
+            validation_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             context_window_size: 0,
             context_used_tokens: 0,
@@ -2109,6 +2132,25 @@ impl App {
 
     fn display_default_model_for_provider(&self, provider_id: &str) -> String {
         crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
+    }
+
+    /// Poll the free dialog validation channel (called from main loop).
+    /// Drains any completed validation results and updates the dialog UI.
+    pub fn poll_free_dialog_validation(&mut self) {
+        if let Some(ref rx) = self.validation_rx {
+            match rx.try_recv() {
+                Ok((idx, result)) => {
+                    self.free_mode_dialog.set_validation_result(idx, result);
+                    // Don't clear validation_rx — auto-ping may send
+                    // multiple results (one per upstream). Only clear
+                    // on Disconnected (all threads done).
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.validation_rx = None;
+                }
+            }
+        }
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
@@ -2740,6 +2782,7 @@ impl App {
         self.permission_request.is_some()
             || self.rewind_flow.visible
             || self.tasks_overlay.visible
+            || self.keybindings_overlay.visible
             || self.help_overlay.visible
             || self.show_help
             || self.history_search_overlay.visible
@@ -2793,6 +2836,7 @@ impl App {
     /// Perform the export based on the selected format. Returns the path written.
     pub fn perform_export(&mut self) -> Option<String> {
         use crate::export_dialog::{export_as_json, export_as_markdown};
+        use crate::message_copy::copy_to_clipboard;
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let (filename, content) = match self.export_dialog.selected {
             ExportFormat::Json => {
@@ -2803,6 +2847,16 @@ impl App {
             ExportFormat::Markdown => {
                 let md = export_as_markdown(&self.messages, self.session_title.as_deref());
                 (format!("claude-export-{}.md", ts), md)
+            }
+            ExportFormat::Clipboard => {
+                let md = export_as_markdown(&self.messages, self.session_title.as_deref());
+                if copy_to_clipboard(&md) {
+                    self.status_message = Some("Copied to clipboard!".to_string());
+                } else {
+                    self.status_message = Some("Failed to copy to clipboard".to_string());
+                }
+                self.export_dialog.dismiss();
+                return Some("clipboard".to_string());
             }
         };
         if std::fs::write(&filename, &content).is_ok() {
@@ -3829,7 +3883,11 @@ impl App {
                 KeyCode::Esc => {
                     self.free_mode_dialog.close();
                 }
-                KeyCode::Tab | KeyCode::Down => {
+                KeyCode::Tab => {
+                    // Tab toggles between show-all and show-configured-only view
+                    self.free_mode_dialog.toggle_show_all();
+                }
+                KeyCode::Down => {
                     self.free_mode_dialog.move_next();
                 }
                 KeyCode::BackTab | KeyCode::Up => {
@@ -3842,6 +3900,7 @@ impl App {
                             self.auth_store
                                 .set(provider_id, clawde_core::StoredCredential::ApiKey { key });
                         }
+                        self.free_mode_dialog.close();
                         self.activate_provider(
                             "free".to_string(),
                             "Free Mode".to_string(),
@@ -3853,6 +3912,23 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     self.free_mode_dialog.backspace();
+                }
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' => {
+                    // Ctrl+S: Apply/save keys without closing the dialog
+                    let saved = self.free_mode_dialog.apply_values();
+                    if saved > 0 {
+                        self.status_message = Some(format!("\u{2713} Saved {} key(s)", saved));
+                    }
+                }
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'v' => {
+                    // Start non-blocking key validation
+                    if let Some(rx) = self.free_mode_dialog.start_validate() {
+                        self.validation_rx = Some(rx);
+                    }
+                }
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'd' => {
+                    // Toggle enabled/disabled for the active upstream
+                    self.free_mode_dialog.toggle_enabled();
                 }
                 KeyCode::Char(c) => {
                     let c = self.shift_normalize(c, key.modifiers);
@@ -3969,6 +4045,10 @@ impl App {
                                         })
                                         .collect();
                                 self.free_mode_dialog.open(&existing);
+                                // Auto-ping: validate all non-empty keys in background
+                                if let Some(rx) = self.free_mode_dialog.start_auto_pings() {
+                                    self.validation_rx = Some(rx);
+                                }
                             }
                             "anthropic" => {
                                 // Anthropic: API key from console.anthropic.com.
@@ -4200,6 +4280,24 @@ impl App {
                         self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
                     }
                 }
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'r' => {
+                    // Ctrl+R: Refresh model list from registry
+                    self.model_picker.loading_models = true;
+                    if let Some(ref provider_id) = self.model_picker_provider_id {
+                        let models = crate::model_picker::models_for_provider_from_registry(
+                            provider_id,
+                            &self.model_registry,
+                        );
+                        let count = models.len();
+                        self.model_picker.set_models(models);
+                        self.status_message = Some(format!(
+                            "\u{2713} Refreshed {} models",
+                            count
+                        ));
+                    } else {
+                        self.model_picker.loading_models = false;
+                    }
+                }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
@@ -4261,6 +4359,8 @@ impl App {
                     KeyCode::Up => self.session_browser.select_prev(),
                     KeyCode::Down => self.session_browser.select_next(),
                     KeyCode::Char('r') => self.session_browser.start_rename(),
+                    KeyCode::Backspace => self.session_browser.pop_search_char(),
+                    KeyCode::Char(c) => self.session_browser.push_search_char(c),
                     _ => {}
                 },
                 SessionBrowserMode::Rename => match key.code {
@@ -4282,6 +4382,25 @@ impl App {
                     }
                     _ => {}
                 },
+            }
+            return false;
+        }
+
+        // Keybindings overlay: Esc or q to close
+        if self.keybindings_overlay.visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.keybindings_overlay.close();
+                }
+                KeyCode::Up => self.keybindings_overlay.scroll_up(),
+                KeyCode::Down => self.keybindings_overlay.scroll_down(u16::MAX),
+                KeyCode::PageUp => self.keybindings_overlay.page_up(),
+                KeyCode::PageDown => self.keybindings_overlay.page_down(u16::MAX),
+                KeyCode::Home => self.keybindings_overlay.scroll_to_top(),
+                KeyCode::End => self.keybindings_overlay.scroll_to_bottom(u16::MAX),
+                KeyCode::Backspace => self.keybindings_overlay.pop_filter_char(),
+                KeyCode::Char(c) => self.keybindings_overlay.push_filter_char(c),
+                _ => {}
             }
             return false;
         }
@@ -4333,6 +4452,9 @@ impl App {
                 }
                 KeyCode::Char('2') => {
                     self.export_dialog.selected = ExportFormat::Markdown;
+                }
+                KeyCode::Char('3') => {
+                    self.export_dialog.selected = ExportFormat::Clipboard;
                 }
                 _ => {}
             }
@@ -5792,6 +5914,34 @@ impl App {
             "openCommandPalette" => {
                 if !self.is_streaming {
                     self.command_palette.open();
+                }
+                false
+            }
+            "showKeybindings" => {
+                self.keybindings_overlay.toggle();
+                if self.keybindings_overlay.visible {
+                    self.keybindings_overlay.open_frame = self.frame_count;
+                }
+                false
+            }
+            "showSources" => {
+                let backend = clawde_tools::web_search::get_last_search_backend();
+                if backend.is_empty() {
+                    self.status_message = Some(
+                        "No web search performed yet. Backends: SearXNG, Firecrawl, DuckDuckGo (in priority order)."
+                            .to_string(),
+                    );
+                } else {
+                    self.status_message = Some(format!(
+                        "Last search backend: {} (press Ctrl+Shift+S again or /sources)",
+                        backend,
+                    ));
+                }
+                false
+            }
+            "compact" => {
+                if !self.is_streaming {
+                    self.intercept_slash_command("compact");
                 }
                 false
             }

@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::Frame;
 
+use clawde_tools::web_search::{collect_firecrawl_keys, firecrawl_key_health};
+
 use crate::overlays::{
     begin_modal_frame, modal_header_line_area, render_modal_title_frame, CLAURST_ACCENT,
     CLAURST_MUTED, CLAURST_PANEL_BG,
@@ -115,6 +117,20 @@ pub fn render_context_viz(
         Color::Green
     };
 
+    let ctx_warning = if ctx_pct > 0.95 {
+        Some(Span::styled(
+            " \u{26a0} CRITICAL — consider compacting or starting a new session",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+    } else if ctx_pct > 0.80 {
+        Some(Span::styled(
+            " \u{26a0} High usage — compact soon to free space",
+            Style::default().fg(Color::Yellow),
+        ))
+    } else {
+        None
+    };
+
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // -- Context window ----------------------------------------------------------
@@ -141,6 +157,11 @@ pub fn render_context_viz(
             Style::default().fg(ctx_color),
         ),
     ]));
+
+    if let Some(warning) = ctx_warning {
+        lines.push(Line::from(vec![warning]));
+        lines.push(Line::from(""));
+    }
 
     lines.push(Line::from(""));
 
@@ -249,6 +270,64 @@ pub fn render_context_viz(
     }
 
     lines.push(Line::from(""));
+
+    // -- Firecrawl keys ---------------------------------------------------------
+    let fc_keys = collect_firecrawl_keys();
+    if !fc_keys.is_empty() {
+        let fc_health = firecrawl_key_health();
+        let exhausted: std::collections::HashMap<&str, u64> = fc_health
+            .iter()
+            .filter(|(_, active, _)| !active)
+            .map(|(k, _, remaining)| (k.as_str(), *remaining))
+            .collect();
+
+        lines.push(Line::from(vec![Span::styled(
+            " Firecrawl keys",
+            Style::default()
+                .fg(CLAURST_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {:<16} {:>5} {:>7}", "Key", "Status", "Retry"),
+            Style::default().fg(CLAURST_MUTED),
+        )]));
+
+        for (_i, key) in fc_keys.iter().enumerate() {
+            let preview = if key.len() > 16 {
+                format!("{}..{}", &key[..8], &key[key.len() - 4..])
+            } else {
+                key.clone()
+            };
+
+            if let Some(&remaining) = exhausted.get(key.as_str()) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<16}", truncate_name(&preview, 16)),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(" EXHAU", Style::default().fg(Color::Red)),
+                    Span::styled(
+                        format!(" {:>6}s", remaining),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<16}", truncate_name(&preview, 16)),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(" ACTIVE", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        format!(" {:>6}", "\u{2014}"),
+                        Style::default().fg(CLAURST_MUTED),
+                    ),
+                ]));
+            }
+        }
+        lines.push(Line::from(""));
+    }
 
     // -- Messages ---------------------------------------------------------------
     lines.push(Line::from(vec![Span::styled(
