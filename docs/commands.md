@@ -133,7 +133,7 @@ Resume a previous session from the session store. Displays a list of recent sess
 ---
 
 ### /session
-**Aliases:** `remote`
+**Aliases:** `remote`, `history`
 
 Manage active and stored sessions. Subcommands allow listing, switching, deleting, and attaching to remote sessions.
 
@@ -143,6 +143,10 @@ Manage active and stored sessions. Subcommands allow listing, switching, deletin
 /session delete <session-id>
 /session attach <session-id>
 ```
+
+`/history` is an alias for `/session` that opens the session browser in the TUI; the prompt autocomplete shows `/session` as if it had been typed.
+
+Aliases are defined per-command in the commands crate (`SlashCommand::aliases`). Every declared alias is picked up automatically as a **hidden alias**: typing its prefix in the prompt suggests the canonical command name, and executing it resolves to the canonical command.
 
 ---
 
@@ -200,6 +204,48 @@ Open the interactive model picker. Displays a searchable list of available model
 /model claude-opus-4-5
 /model claude-sonnet-4-6
 ```
+
+#### Capability filtering (`--capability`)
+
+Filter the model picker to only show models that support a specific capability.
+
+```
+/model --capability vision        # only vision-capable models
+/model --capability audio          # only audio-capable models
+/model --capability tools          # only models with tool/function calling
+/model --capability reasoning      # only models with extended thinking
+/model --capability json           # only models with structured JSON output
+/model --capability vision,tools   # AND: models with both capabilities
+/model --capability vision|audio   # OR: models with either capability
+```
+
+Available capabilities:
+
+| Value | Aliases | Description |
+|---|---|---|
+| `vision` | `image` | Image understanding & processing |
+| `audio` | — | Audio input & processing |
+| `pdf` | — | PDF document processing |
+| `video` | — | Video input & processing |
+| `tools` | `tool_calling`, `tool-calling` | Tool / function calling |
+| `reasoning` | — | Extended reasoning / chain-of-thought |
+| `json` | `structured_output`, `structured-output` | Structured JSON-schema output |
+
+---
+
+### /image
+
+Switch to a model with a specific capability (defaults to vision). After switching, paste an image with Ctrl+V to include it in your prompt.
+
+```
+/image                                    — switch to a vision-capable model
+/image --capability audio                  — switch to an audio-capable model
+/image --capability tools                  — switch to a tool-calling model
+/image --capability pdf                    — switch to a PDF-capable model
+/image --capability reasoning|video        — switch to a model with reasoning OR video
+```
+
+Available capabilities are the same as [/model --capability](#capability-filtering---capability).
 
 ---
 
@@ -396,7 +442,16 @@ Select how the model's output is rendered in the terminal. Choices include `auto
 
 ### /theme
 
-Open the interactive theme picker. Preview and select a color theme for the Clawde TUI.
+Open the theme quick-pick popup. Browse the built-in and custom themes with
+live swatches and select one for the Clawde TUI.
+
+Inside the popup:
+
+- `j`/`k` (or arrow keys) — navigate; the highlighted theme applies live
+- `enter` — apply the selected theme and close
+- `n` — jump straight into the theme creator's new-theme editor
+- `d` — delete the selected custom theme (press `d`/`y` again to confirm; `esc` cancels)
+- `esc` — close without changing the theme
 
 ```
 /theme
@@ -404,6 +459,52 @@ Open the interactive theme picker. Preview and select a color theme for the Claw
 /theme light
 /theme solarized
 ```
+
+In the TUI, `/theme create` opens the interactive theme creator: browse
+built-in + custom themes in a scrollable list, create new themes from the
+full ANSI 256-color grid, edit or delete custom themes, and apply on enter.
+Custom themes are saved to `~/.clawde/themes/<name>.json`.
+
+```
+/theme create
+/theme list
+/theme delete <name>
+```
+
+#### Palette slots
+
+Every theme (built-in or custom) defines **17 colour slots**. In the theme
+creator's editor, `j`/`k` highlight a slot and `enter`/`space` (or `o` to stay)
+assigns the grid cursor colour to it; `r` randomises the whole palette and `u`
+undoes the last change. The slots are saved by name to
+`~/.clawde/themes/<name>.json` (each value is either an ANSI 256 index
+`0–255` or an `[r, g, b]` array).
+
+| Slot | JSON key | Colours |
+|---|---|---|
+| `error` | `error` | Errors and alerts |
+| `success` | `success` | Success indicators |
+| `warning` | `warning` | Warnings and cautions |
+| `info` | `info` | Informational messages |
+| `action` | `action` | Interactive elements and action buttons |
+| `disabled` | `disabled` | Dimmed or disabled states |
+| `accent` | `accent` | Primary accent |
+| `secondary_accent` | `secondary_accent` | Secondary accent |
+| `panel_bg` | `panel_bg` | Main panel / dialog background |
+| `text_light` | `text_light` | Text on dark backgrounds |
+| `text_dark` | `text_dark` | Text on light backgrounds |
+| `border` | `border` | Borders and dividers |
+| `model_name` | `model_name` | Active model name in the prompt status line |
+| `hint` | `hint` | Muted hint / shortcut text (e.g. `? shortcuts · Ctrl+/ keys`) |
+| `effort` | `effort` | Effort-level indicator in the status line |
+| `routing` | `routing` | Free-provider routing-strategy badge |
+| `vim_hint` | `vim_hint` | Vim-mode navigation hint (`K↑J↓H↑L↓`) |
+
+Older theme files that predate the `model_name`/`hint`/`effort`/`routing`/
+`vim_hint` keys still load — the missing slots fall back to a sensible
+existing colour (`text_light` for `model_name`, `disabled` for `hint`,
+`secondary_accent` for `effort`, `action` for `routing`, `success` for
+`vim_hint`).
 
 ---
 

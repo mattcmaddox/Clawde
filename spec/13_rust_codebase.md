@@ -644,11 +644,13 @@ Input schema: `{ url: string, prompt: optional string }`
 Input schema: `{ query: string, num_results: optional u32 (default 5) }`
 
 **Algorithm:**
-1. Checks `BRAVE_SEARCH_API_KEY` env var:
-   - If set: calls Brave Search API at `https://api.search.brave.com/res/v1/web/search`
+1. Checks `SEARXNG_URL` env var:
+   - If set: calls the SearXNG JSON API for results
+2. Checks `FIRECRAWL_API_KEY` env var:
+   - If set: calls Firecrawl Search API v2 at `https://api.firecrawl.dev/v2/search`
    - Returns title + URL + description for each result
-2. Fallback: DuckDuckGo Instant Answer API at `https://api.duckduckgo.com/?q=...&format=json`
-3. Returns up to `num_results` formatted results
+3. Fallback: DuckDuckGo Instant Answer API at `https://api.duckduckgo.com/?q=...&format=json`
+4. Returns up to `num_results` formatted results
 
 ### Tool: `NotebookEditTool` (`notebook_edit.rs`)
 
@@ -1521,6 +1523,33 @@ Three `DashMap`/`RwLock` singletons using `once_cell::sync::Lazy`:
 
 ### Logging
 `tracing` + `tracing-subscriber` with `EnvFilter`. Default level WARN; `--verbose` enables DEBUG. Structured fields on all log calls.
+
+### Model Capability System
+
+The Rust codebase defines a `ModelCapability` enum in `crates/api/src/model_registry.rs` that
+categorises model capabilities into 7 variants:
+
+| Variant | Aliases | Description |
+|---|---|---|
+| `Vision` | `image`, `vision` | Image input (modality) |
+| `Audio` | `audio` | Audio input (modality) |
+| `Pdf` | `pdf` | PDF input (modality) |
+| `Video` | `video` | Video input (modality) |
+| `ToolCalling` | `tools`, `tool_calling`, `tool-calling` | Tool / function calling |
+| `Reasoning` | `reasoning` | Extended thinking / chain-of-thought |
+| `StructuredOutput` | `json`, `structured_output`, `structured-output` | JSON-schema output |
+
+The enum provides:
+- `from_name(s)` — parse a string alias into a variant (returns `Option`)
+- `FromStr` trait impl — same logic via `.parse()` (returns `Result`)
+- `label()` — human-friendly display label
+- `help_text()` — formatted help block for CLI/TUI `--help`
+- `all_entries()` — all `(value, description)` pairs for typeahead completions
+
+The `ModelRegistry::list_by_capability()` method filters all catalog models by a
+capability, reading `modalities_input` for modality-based variants and boolean
+fields for feature flags. This powers `clawde models --capability <cap>` in the
+CLI and `/model --capability <cap>` in the TUI.
 
 ### TypeScript Parity Summary
 

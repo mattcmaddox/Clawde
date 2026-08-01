@@ -1,0 +1,71 @@
+# Clawde ACP TCP Server — systemd service unit
+# ===============================================
+#
+# Place this file at:
+#   /etc/systemd/system/clawde-acp.service   (system-wide)
+#   ~/.config/systemd/user/clawde-acp.service (per-user)
+#
+# Then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable clawde-acp
+#   sudo systemctl start clawde-acp
+#
+# For per-user (user-level) services (no sudo needed):
+#   systemctl --user daemon-reload
+#   systemctl --user enable clawde-acp
+#   systemctl --user start clawde-acp
+#
+# View logs:  sudo journalctl -u clawde-acp -f
+# Restart:    sudo systemctl restart clawde-acp
+# Status:     sudo systemctl status clawde-acp
+
+[Unit]
+Description=Clawde ACP AI Coding Agent Server
+Documentation=https://github.com/user/clawde
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# -- Path to the clawde binary (update to match your install) ---------------
+# TLS: pass --tls-cert and --tls-key to enable encrypted connections.
+# Omit both lines for plain TCP (e.g. localhost-only).
+ExecStart=/usr/local/bin/clawde acp --listen 0.0.0.0:9876 \
+    --tls-cert /home/user/.clawde/certs/server.crt \
+    --tls-key /home/user/.clawde/certs/server.key
+
+# -- User to run as (read your ~/.clawde/auth.json for provider keys) -------
+User=user
+Group=user
+
+# -- Working directory (used by tools like Read, Glob, Bash) ----------------
+WorkingDirectory=/home/user
+
+# -- Environment (API keys are read from ~/.clawde/auth.json by default) ----
+# If you prefer env vars instead of auth.json, uncomment:
+# Environment=ANTHROPIC_API_KEY=sk-ant-...
+# Environment=GROQ_API_KEY=gsk_...
+
+# -- Restart behaviour ------------------------------------------------------
+Restart=on-failure
+RestartSec=10
+
+# -- Logging (ACP JSON-RPC goes to stdout; server logs go to stderr) -------
+StandardOutput=journal
+StandardError=journal
+
+# -- Hardening (see systemd.exec(5) for details) ----------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/user
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# -- Resource limits --------------------------------------------------------
+LimitNOFILE=65536
+
+# -- Timeout for graceful shutdown (systemd sends SIGTERM) ------------------
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

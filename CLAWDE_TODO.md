@@ -238,6 +238,40 @@ on parse failure, and the default theme is used as fallback.
 
 ---
 
+## 🟡 Free-Mode Reliability — Empty-Completion Cooldowns — Complete
+
+### [free] Retry empty completions across upstreams (spec §6.2)
+- [x] `RetryingFreeStream` detects an empty-but-successful completion (HTTP 200 + zero content + `end_turn`) and re-dispatches the identical request to the next plan entry instead of dead-ending the turn
+- [x] Emits a placeholder + attempt-summary text so the turn never ends silently on an empty upstream
+- [x] Wired into the query loop's accumulator/transcript so the placeholder renders correctly
+
+### [free] Cool down upstreams after repeated empties (spec §6.3)
+- [x] `CooldownState` gains a consecutive-empties track: after 3 empties in a row an upstream is cooled for 60s (independent of the circuit breaker)
+- [x] `EmptyCooldownConfig` (`max_consecutive: 3`, `cooldown_secs: 60`) in `RoutingConfig` with serde defaults
+- [x] Pre-stream loop and `start_next_attempt` skip cooled upstreams
+- [x] 45 `free::` unit tests pass, including threshold/reset/disable and cooldown-summary-note gating
+
+### [tui] Empty-cooldown visibility
+- [x] TUI status row shows `provider:upstream empty-cooldown (retry in ...)` badges while an upstream is cooled (row stays visible when idle)
+- [x] `/keys health` appends a live `Free Upstream Empty-Cooldowns` section (COOLED w/ retry, or consecutive-empties count pre-threshold); per-upstream filtering (`/keys health groq` shows only groq)
+- [x] `ProviderRegistry::empty_cooldown_summaries()` + `LlmProvider::upstream_empty_cooldowns()` trait default
+- [x] `CommandContext.provider_registry` threaded through cli/main.rs construction + refresh; 5 `cmd_health` unit tests (None / `free` / upstream-id filter / no-registry)
+
+### [free] Persist empty-cooldowns across restarts
+- [x] Empty-cooldown track persisted to `{clawde_home}/empty-cooldown-state/free.json` (atomic tmp+rename, mirrors KeyRing state files); restored at `FreeProvider::with_routing` construction
+- [x] Persisted keyed by upstream id (not index) — survives chain reordering; stale/unknown ids ignored
+- [x] `FreeProvider::with_routing` takes a `persist: bool`; production (`build_free_provider`) enables it, tests pass `false` so unit tests never touch the real config dir
+- [x] Round-trip unit test (`empty_cooldown_persists_and_restores_across_instances`)
+
+### [tests] CLAWDE_HOME serialization for parallel tests
+- [x] Fixed flaky `accounts::tests` (`switch_arg_completions_*`, `logout_*`) + `theme_completions_all_four` failures: tests setting the process-global `CLAWDE_HOME` raced in parallel (one test's `save()` targeted another's cleaned-up temp dir)
+- [x] Shared `CLAWDE_HOME_LOCK: OnceLock<Mutex<()>>` in the commands test module; `TestAccounts` (accounts.rs) and `TestHome` (keys.rs) hold the guard for their lifetime
+- [x] Theme completion test updated for the current 12 completions (9 built-ins + list/create/delete) with temp-home isolation
+- [x] Fixed `CommandContext` construction in `crates/cli/tests/auto_compact_integration.rs` (missing `provider_registry` field)
+- [x] Full workspace suite green (commands 138, api 220, tui 738, core 546, query 143, tools 151, + integration targets)
+
+---
+
 ## 🧪 Experimental Features
 
 Marked as `[EXPERIMENTAL]` in the README. May be unstable or incomplete:
