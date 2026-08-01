@@ -56,7 +56,12 @@ impl SlashCommand for DoctorCommand {
         let provider_registry =
             clawde_api::ProviderRegistry::from_config(&ctx.config, client_config);
         let provider_id = clawde_core::ProviderId::new(ctx.config.selected_provider_id());
-        match provider_registry.get(&provider_id) {
+        // Fall back to the registry's default provider when the configured one
+        // isn't registered, so /doctor still reports on something usable.
+        let provider = provider_registry
+            .get(&provider_id)
+            .or_else(|| provider_registry.default_provider());
+        match provider {
             Some(provider) => match provider.health_check().await {
                 Ok(clawde_api::provider_types::ProviderStatus::Healthy) => {
                     lines.push(format!("  ✓ {} is healthy", provider.name()));
@@ -90,6 +95,21 @@ impl SlashCommand for DoctorCommand {
                     hint
                 ));
             }
+        }
+        // Sweep every registered provider for a compact health summary.
+        let all_health = provider_registry.check_all_health().await;
+        if !all_health.is_empty() {
+            let healthy = all_health
+                .iter()
+                .filter(|(_, status)| {
+                    matches!(status, clawde_api::provider_types::ProviderStatus::Healthy)
+                })
+                .count();
+            lines.push(format!(
+                "  • {}/{} registered providers healthy",
+                healthy,
+                all_health.len()
+            ));
         }
         // Show which model is active
         lines.push(format!(

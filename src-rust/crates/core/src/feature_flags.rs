@@ -95,6 +95,7 @@ impl FeatureFlagManager {
     /// 2. If cache is stale, fetches from GrowthBook API
     /// 3. Saves the response to the cache file
     /// 4. Updates the in-memory flags
+    #[allow(dead_code)]
     pub async fn fetch_flags_async(&self) -> Result<()> {
         // Try to load from cache first
         if let Ok(cached) = self.load_cached_flags().await {

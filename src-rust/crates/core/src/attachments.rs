@@ -210,6 +210,7 @@ fn scan_modified_files(dir: &Path, since_secs: u64, out: &mut Vec<String>, depth
 }
 
 /// Build a hook result attachment message.
+#[allow(dead_code)]
 pub fn make_hook_result_attachment(hook_name: &str, output: &str, success: bool) -> Attachment {
     let kind = if success {
         AttachmentKind::HookSuccess
@@ -221,6 +222,7 @@ pub fn make_hook_result_attachment(hook_name: &str, output: &str, success: bool)
 }
 
 /// Compute the diff of available tools between two turns.
+#[allow(dead_code)]
 pub fn get_deferred_tools_delta(prev_tools: &[String], curr_tools: &[String]) -> Vec<String> {
     curr_tools
         .iter()

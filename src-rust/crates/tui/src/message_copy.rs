@@ -12,6 +12,7 @@ use serde_json::json;
 use std::io::Write;
 
 /// Copy message as markdown (preserving formatting)
+#[allow(dead_code)]
 pub fn copy_as_markdown(message: &Message) -> String {
     let content = match &message.content {
         clawde_core::MessageContent::Text(text) => text.clone(),
@@ -75,6 +76,7 @@ pub fn copy_as_markdown(message: &Message) -> String {
 }
 
 /// Copy message as plaintext (no markdown formatting)
+#[allow(dead_code)]
 pub fn copy_as_plaintext(message: &Message) -> String {
     let content = match &message.content {
         clawde_core::MessageContent::Text(text) => strip_markdown(text),
@@ -125,6 +127,7 @@ pub fn copy_as_plaintext(message: &Message) -> String {
 }
 
 /// Extract and copy only code blocks from message
+#[allow(dead_code)]
 pub fn copy_code_blocks(message: &Message) -> String {
     let mut code_blocks = Vec::new();
 
@@ -149,6 +152,7 @@ pub fn copy_code_blocks(message: &Message) -> String {
 }
 
 /// Copy message as JSON
+#[allow(dead_code)]
 pub fn copy_as_json(message: &Message) -> String {
     let role_str = match message.role {
         clawde_core::Role::User => "user",
@@ -177,6 +181,7 @@ pub fn copy_as_json(message: &Message) -> String {
 }
 
 /// Extract plaintext from selected text (identity function, for consistency)
+#[allow(dead_code)]
 pub fn copy_selection(selected_text: &str) -> String {
     selected_text.to_string()
 }

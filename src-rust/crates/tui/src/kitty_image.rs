@@ -76,6 +76,7 @@ pub fn detect_image_protocol() -> ImageProtocol {
 }
 
 // Kept for backward compatibility
+#[allow(dead_code)]
 pub fn supports_kitty_graphics() -> bool {
     detect_image_protocol() == ImageProtocol::Kitty
 }

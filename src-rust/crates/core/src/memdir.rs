@@ -277,6 +277,7 @@ pub fn memory_age_days(modified_secs: u64) -> u64 {
 /// ISO timestamp does not trigger staleness reasoning the way "47 days ago" does.
 ///
 /// Mirrors `memoryAge` in `memoryAge.ts`.
+#[allow(dead_code)]
 pub fn memory_age(modified_secs: u64) -> String {
     let d = memory_age_days(modified_secs);
     match d {
@@ -535,6 +536,7 @@ pub fn ensure_memory_dir_exists(memory_dir: &Path) {
 /// The full Sonnet side-query (`findRelevantMemories` in TypeScript) lives
 /// in `cc-query`; this function provides a cheaper fallback for contexts
 /// where an API call is not available.
+#[allow(dead_code)]
 pub fn find_relevant_memories_simple(
     memory_dir: &Path,
     query: &str,
@@ -592,6 +594,7 @@ pub fn find_relevant_memories_simple(
 
 /// Return the team-memory sub-directory path.
 /// Mirrors `getTeamMemPath` in `teamMemPaths.ts`.
+#[allow(dead_code)]
 pub fn team_memory_path(auto_memory_dir: &Path) -> PathBuf {
     auto_memory_dir.join("team")
 }

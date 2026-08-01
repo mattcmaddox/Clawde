@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlays::centered_rect;
+use crate::overlays::{centered_rect, modal_search_line, CLAURST_MUTED};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,6 +45,11 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
+    /// Live search/filter query for session titles.
+    pub search_query: String,
+    /// The actual session ID captured when entering rename mode (to avoid
+    /// filtered-index mismatch when confirming the rename).
+    rename_session_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +65,8 @@ impl SessionBrowserState {
             sessions: Vec::new(),
             mode: SessionBrowserMode::Browse,
             rename_input: String::new(),
+            search_query: String::new(),
+            rename_session_id: String::new(),
         }
     }
 
@@ -69,7 +76,34 @@ impl SessionBrowserState {
         self.selected_idx = 0;
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
+        self.search_query.clear();
+        self.rename_session_id.clear();
         self.visible = true;
+    }
+
+    /// Append a character to the search filter.
+    pub fn push_search_char(&mut self, c: char) {
+        self.search_query.push(c);
+        self.selected_idx = 0;
+    }
+
+    /// Remove the last character from the search filter.
+    pub fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        self.selected_idx = 0;
+    }
+
+    /// Return sessions whose titles contain the search query (case-insensitive).
+    /// When query is empty, returns all sessions.
+    pub fn filtered_sessions(&self) -> Vec<&SessionEntry> {
+        if self.search_query.is_empty() {
+            return self.sessions.iter().collect();
+        }
+        let q = self.search_query.to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|s| s.title.to_lowercase().contains(&q))
+            .collect()
     }
 
     /// Close the browser entirely.
@@ -77,6 +111,8 @@ impl SessionBrowserState {
         self.visible = false;
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
+        self.search_query.clear();
+        self.rename_session_id.clear();
     }
 
     /// Move selection up one row, wrapping to the end.
@@ -102,14 +138,21 @@ impl SessionBrowserState {
     }
 
     /// Return a reference to the currently selected session, if any.
+    /// Respects the active search filter — uses `filtered_sessions()` so
+    /// `selected_idx` always maps to the correct session.
     pub fn selected_session(&self) -> Option<&SessionEntry> {
-        self.sessions.get(self.selected_idx)
+        self.filtered_sessions().get(self.selected_idx).copied()
     }
 
     /// Switch to rename mode, pre-populating the input with the current title.
+    /// Captures the session ID so `confirm_rename()` can find the right session
+    /// even when a search filter is active (filtered-index mismatch guard).
     pub fn start_rename(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected_idx) {
-            self.rename_input = session.title.clone();
+        if let Some(session) = self.filtered_sessions().get(self.selected_idx).copied() {
+            let title = session.title.clone();
+            let sid = session.id.clone();
+            self.rename_input = title;
+            self.rename_session_id = sid;
             self.mode = SessionBrowserMode::Rename;
         }
     }
@@ -130,21 +173,24 @@ impl SessionBrowserState {
 
     /// Confirm the rename. Returns `(session_id, new_name)` when in rename mode
     /// with a non-empty name and a valid selection. Resets to browse mode.
+    /// Uses the captured `rename_session_id` to find the right session even
+    /// when a search filter was active when renaming started.
     pub fn confirm_rename(&mut self) -> Option<(String, String)> {
         if self.mode != SessionBrowserMode::Rename {
             return None;
         }
         let new_name = self.rename_input.trim().to_string();
-        if new_name.is_empty() {
+        if new_name.is_empty() || self.rename_session_id.is_empty() {
             return None;
         }
-        let session_id = self.sessions.get(self.selected_idx)?.id.clone();
+        let session_id = self.rename_session_id.clone();
         // Apply the rename in the local list immediately for UI consistency.
-        if let Some(session) = self.sessions.get_mut(self.selected_idx) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             session.title = new_name.clone();
         }
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
+        self.rename_session_id.clear();
         Some((session_id, new_name))
     }
 
@@ -236,11 +282,28 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
     let inner_w = dialog_area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
 
-    // --- Session list -----------------------------------------------------
-    if state.sessions.is_empty() {
+    // --- Search line (always shown in Browse mode) -------------------------
+    if state.mode == SessionBrowserMode::Browse {
+        let search_line = modal_search_line(
+            &state.search_query,
+            "Type to filter sessions...",
+            CLAURST_MUTED,
+            Color::Cyan,
+        );
+        lines.push(search_line);
         lines.push(Line::from(""));
+    }
+
+    // --- Session list -----------------------------------------------------
+    let filtered = state.filtered_sessions();
+
+    if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  No sessions found.",
+            if state.search_query.is_empty() {
+                "  No sessions found."
+            } else {
+                "  No sessions match your search."
+            },
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
@@ -271,7 +334,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         )]));
         lines.push(Line::from(""));
 
-        for (i, session) in state.sessions.iter().enumerate() {
+        for (i, session) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
 
             let title_cell = truncate_display(&session.title, title_w);

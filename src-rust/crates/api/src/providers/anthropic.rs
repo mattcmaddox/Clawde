@@ -30,7 +30,7 @@ use super::message_normalization::normalize_anthropic_messages;
 // AnthropicProvider
 // ---------------------------------------------------------------------------
 
-/// Wraps [`AnthropicClient`] so it can be held in a [`ProviderRegistry`] behind
+/// Wraps [`AnthropicClient`] so it can be held in a `ProviderRegistry` behind
 /// `Arc<dyn LlmProvider>`.
 pub struct AnthropicProvider {
     client: Arc<AnthropicClient>,
@@ -156,9 +156,15 @@ impl AnthropicProvider {
                 message,
             }),
             AnthropicStreamEvent::Ping => None,
-            AnthropicStreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
-                Some(StreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used })
-            }
+            AnthropicStreamEvent::RateLimitHeaders {
+                provider_id,
+                tokens_pct_used,
+                requests_pct_used,
+            } => Some(StreamEvent::RateLimitHeaders {
+                provider_id,
+                tokens_pct_used,
+                requests_pct_used,
+            }),
         }
     }
 }

@@ -63,6 +63,19 @@ jobs:
         # parallel execution, flaking non-deterministically across runners.
         run: cargo test --workspace --locked -- --test-threads=1
 
+      # Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+      # so every workspace crate carries a `test_no_unreferenced_pub_functions_in_workspace`
+      # test (shared logic in clawde-core::dead_code_guard) that fails when a
+      # `pub fn` declared in that crate has no caller anywhere in the workspace.
+      # Run them as a dedicated fail-fast check so a silently-rotted `pub fn`
+      # breaks CI loudly rather than only being caught by a full test run.
+      # Linux-only: the guard is platform-independent and the full test job
+      # above already runs it on the other OSes.
+      - name: Dead-code guard
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        run: cargo test --workspace --locked test_no_unreferenced_pub_functions_in_workspace -- --test-threads=1
+
       # Advisory for now: the codebase has pre-existing clippy warnings and
       # rustfmt drift. Flip continue-on-error off once they are cleaned up.
       - name: Clippy (advisory)

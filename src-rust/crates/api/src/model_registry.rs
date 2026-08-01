@@ -54,6 +54,111 @@ pub enum Modality {
     Pdf,
 }
 
+/// A discoverable model capability, used to filter models by what they
+/// support. Each variant maps to one or more fields on [`ModelEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelCapability {
+    /// Accepts image input (via `modalities_input`).
+    Vision,
+    /// Accepts audio input.
+    Audio,
+    /// Accepts PDF input.
+    Pdf,
+    /// Accepts video input.
+    Video,
+    /// Supports tool / function calling.
+    ToolCalling,
+    /// Supports extended thinking / reasoning.
+    Reasoning,
+    /// Supports structured (JSON-schema) output.
+    StructuredOutput,
+}
+
+impl ModelCapability {
+    /// Parse a capability name string (or alias) into the corresponding
+    /// [`ModelCapability`] value.  Returns `None` for unknown strings.
+    ///
+    /// Accepted names and aliases:
+    /// ```text
+    /// image | vision       → Vision
+    /// audio               → Audio
+    /// pdf                 → Pdf
+    /// video               → Video
+    /// tools | tool_calling | tool-calling → ToolCalling
+    /// reasoning           → Reasoning
+    /// json | structured_output | structured-output → StructuredOutput
+    /// ```
+    ///
+    /// Named `from_name` (not `from_str`) to avoid clashing with the
+    /// `std::str::FromStr` trait method; the trait impl delegates here.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "image" | "vision" => Some(Self::Vision),
+            "audio" => Some(Self::Audio),
+            "pdf" => Some(Self::Pdf),
+            "video" => Some(Self::Video),
+            "tools" | "tool_calling" | "tool-calling" => Some(Self::ToolCalling),
+            "reasoning" => Some(Self::Reasoning),
+            "json" | "structured_output" | "structured-output" => Some(Self::StructuredOutput),
+            _ => None,
+        }
+    }
+
+    /// Return a human-friendly display label for this capability.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Vision => "vision",
+            Self::Audio => "audio",
+            Self::Pdf => "PDF",
+            Self::Video => "video",
+            Self::ToolCalling => "tools",
+            Self::Reasoning => "reasoning",
+            Self::StructuredOutput => "structured output",
+        }
+    }
+
+    /// Return a formatted help-text block listing all available capability values
+    /// with their descriptions.
+    pub fn help_text() -> String {
+        let entries = Self::all_entries();
+        let mut out = String::from("Available capabilities for --capability:\n");
+        for (value, desc) in entries {
+            out.push_str(&format!("  {:<12} {}\n", value, desc));
+        }
+        out
+    }
+
+    /// Return all capability (value, description) pairs, in display order.
+    pub fn all_entries() -> &'static [(&'static str, &'static str)] {
+        use std::sync::OnceLock;
+        static ENTRIES: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+        ENTRIES.get_or_init(|| {
+            vec![
+                ("vision", "Image understanding & processing"),
+                ("audio", "Audio input & processing"),
+                ("pdf", "PDF document processing"),
+                ("video", "Video input & processing"),
+                ("tools", "Tool calling / function calling"),
+                ("reasoning", "Extended reasoning"),
+                ("json", "Structured output (JSON mode)"),
+            ]
+        })
+    }
+}
+
+impl std::str::FromStr for ModelCapability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_name(s).ok_or_else(|| {
+            format!(
+                "Unknown capability '{}'. Valid values: image, audio, pdf, video, tools, reasoning, json, structured_output",
+                s
+            )
+        })
+    }
+}
+
 /// Model lifecycle status as reported by models.dev.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -281,7 +386,7 @@ pub struct ModelEntry {
     pub experimental_modes: HashMap<String, ExperimentalMode>,
     /// Default request-body options for this model, camelCase-keyed. Populated
     /// for entries synthesized from an [`ExperimentalMode`] (opencode
-    /// `provider.body`, see [`expand_experimental_modes`]); empty for base
+    /// `provider.body`, see `expand_experimental_modes`); empty for base
     /// catalog models.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, serde_json::Value>,
@@ -806,11 +911,38 @@ impl ModelRegistry {
 
     fn load_bundled_snapshot(&mut self) {
         if let Some(parsed) = parse_snapshot_bytes(BUNDLED_SNAPSHOT) {
+            let model_count = parsed.models.len();
             self.entries = parsed.models;
             self.providers = parsed.providers;
+            // Remove guard/safety models and non-chat models.
+            // Guard models are content classifiers, not chat models.
+            // Non-chat models (e.g. whisper) are audio-only speech models.
+            // Groq compound/router models are internal load balancers,
+            // not actual chat completion endpoints.
+            self.entries.retain(|key, entry| {
+                if key.contains("prompt-guard") || key.contains("llama-guard") {
+                    return false;
+                }
+                // Skip Groq compound/router models.
+                if key.contains("groq/compound") {
+                    return false;
+                }
+                // Skip models that explicitly lack text modality
+                // (whisper, embedding models, etc.). Models with
+                // omitted modalities default to `[Text]`, so only
+                // explicit non-text modalities indicate non-chat.
+                if !entry.modalities_input.is_empty()
+                    && !entry.modalities_input.contains(&Modality::Text)
+                {
+                    return false;
+                }
+                true
+            });
+            let removed = model_count - self.entries.len();
             tracing::debug!(
                 providers = self.providers.len(),
                 models = self.entries.len(),
+                removed = removed,
                 "Loaded bundled models.dev snapshot"
             );
         } else {
@@ -903,7 +1035,7 @@ impl ModelRegistry {
     /// List all models for a given provider.
     ///
     /// The provider id is canonicalized to its models.dev snapshot key first
-    /// (see [`canonical_snapshot_key`]), so a runtime id that differs from the
+    /// (see `canonical_snapshot_key`), so a runtime id that differs from the
     /// catalog key (e.g. `"qwen"` → `"alibaba"`) still resolves instead of
     /// silently returning nothing.
     pub fn list_by_provider(&self, provider_id: &str) -> Vec<&ModelEntry> {
@@ -934,12 +1066,12 @@ impl ModelRegistry {
     /// **Selection rule** (opencode-style — the priority list governs the
     /// default, *not* `release_date`):
     ///   1. Prefer non-alpha, non-deprecated models.
-    ///   2. Rank by a small, provider-agnostic [`PREFERRED_FLAGSHIPS`] priority
+    ///   2. Rank by a small, provider-agnostic `PREFERRED_FLAGSHIPS` priority
     ///      list (local runtimes use their capability list instead). This is
     ///      version-agnostic on purpose: `"claude-opus"` always beats
     ///      `"claude-sonnet"`/`"claude-haiku"`, so a new Opus point-release
     ///      surfaces with no code change.
-    ///   3. Tie-break by [`cmp_ids_newest_first`] — a version-aware id compare,
+    ///   3. Tie-break by `cmp_ids_newest_first` — a version-aware id compare,
     ///      so `opus-4-8` > `opus-4-7` > `opus-4-10`-vs-`4-9` (numeric), and a
     ///      brand-new high-version id with *no* `release_date` still wins.
     ///
@@ -978,6 +1110,50 @@ impl ModelRegistry {
                 //    rolling "-latest"/clean alias win over a date-pinned
                 //    sibling, without a separate (and footgun-prone) "latest"
                 //    bonus that mis-fires on ids like "gpt-5.3-chat-latest".
+                .then_with(|| cmp_ids_newest_first(id_a, id_b))
+        });
+
+        models.first().map(|e| e.info.id.to_string())
+    }
+
+    /// Pick the best vision-capable model for a provider.
+    /// Filters to models with `vision() == true`, then applies flagship
+    /// priority ordering (most capable first).
+    pub fn best_vision_model_for_provider(&self, provider_id: &str) -> Option<String> {
+        let provider_id = canonical_snapshot_key(provider_id);
+        let mut models: Vec<&ModelEntry> = self
+            .list_visible_by_provider(provider_id)
+            .into_iter()
+            .filter(|m| m.vision())
+            .collect();
+        if models.is_empty() {
+            models = self
+                .list_by_provider(provider_id)
+                .into_iter()
+                .filter(|m| m.vision())
+                .collect();
+        }
+        if models.is_empty() {
+            return None;
+        }
+
+        let priority_patterns = flagship_patterns_for(provider_id);
+
+        models.sort_by(|a, b| {
+            let id_a: &str = &a.info.id;
+            let id_b: &str = &b.info.id;
+
+            let prio_a = priority_patterns
+                .iter()
+                .position(|pat| id_a.contains(pat))
+                .unwrap_or(usize::MAX);
+            let prio_b = priority_patterns
+                .iter()
+                .position(|pat| id_b.contains(pat))
+                .unwrap_or(usize::MAX);
+
+            prio_a
+                .cmp(&prio_b)
                 .then_with(|| cmp_ids_newest_first(id_a, id_b))
         });
 
@@ -1026,6 +1202,26 @@ impl ModelRegistry {
     /// List every entry in the registry.
     pub fn list_all(&self) -> Vec<&ModelEntry> {
         self.entries.values().collect()
+    }
+
+    /// List entries that support a given capability.
+    ///
+    /// Returns all models (across all providers) whose metadata indicates
+    /// they satisfy the requested capability — e.g. `Vision` filters to
+    /// models with `modalities_input` containing `Modality::Image`.
+    pub fn list_by_capability(&self, capability: ModelCapability) -> Vec<&ModelEntry> {
+        self.entries
+            .values()
+            .filter(|m| match capability {
+                ModelCapability::Vision => m.vision(),
+                ModelCapability::Audio => m.audio_input(),
+                ModelCapability::Pdf => m.pdf_input(),
+                ModelCapability::Video => m.video_input(),
+                ModelCapability::ToolCalling => m.tool_calling,
+                ModelCapability::Reasoning => m.reasoning,
+                ModelCapability::StructuredOutput => m.structured_output,
+            })
+            .collect()
     }
 
     /// Number of models in the registry.
@@ -1189,6 +1385,22 @@ impl ModelRegistry {
     /// refresh *does* specify wins.
     fn merge_entries(&mut self, incoming: HashMap<String, ModelEntry>) {
         for (key, mut entry) in incoming {
+            // Skip guard/safety models and non-chat models.
+            if key.contains("prompt-guard") || key.contains("llama-guard") {
+                continue;
+            }
+            // Skip Groq compound/router models — internal load balancers,
+            // not actual chat completion endpoints.
+            if key.contains("groq/compound") {
+                continue;
+            }
+            // Skip models that explicitly lack text modality
+            // (whisper, embedding models, etc.).
+            if !entry.modalities_input.is_empty()
+                && !entry.modalities_input.contains(&Modality::Text)
+            {
+                continue;
+            }
             if let Some(existing) = self.entries.get(&key) {
                 entry.release_date = entry.release_date.or_else(|| existing.release_date.clone());
                 entry.last_updated = entry.last_updated.or_else(|| existing.last_updated.clone());
@@ -1480,6 +1692,12 @@ const LOCAL_CAPABILITY_PATTERNS: &[&str] = &[
 fn flagship_patterns_for(provider_id: &str) -> &'static [&'static str] {
     if is_local_runtime(provider_id) {
         LOCAL_CAPABILITY_PATTERNS
+    } else if provider_id == "groq" {
+        // Groq's production chat models: Llama 3.3 70B is the most capable,
+        // Llama 3.1 8B is the fast/cheap alternative, GPT-OSS is also
+        // available. Avoids picking preview-only or non-chat models
+        // (qwen/qwen3-32b, groq/compound, etc.) via the generic tie-break.
+        &["llama-3.3-70b", "llama-3.1-8b", "gpt-oss", "-pro", "-max"]
     } else {
         PREFERRED_FLAGSHIPS
     }
@@ -1598,13 +1816,13 @@ fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
 // Dynamic model resolution helper
 // ---------------------------------------------------------------------------
 
-/// Resolve the effective model for a [`Config`], using the model registry to
+/// Resolve the effective model for a `Config`, using the model registry to
 /// dynamically pick the best available model for the active provider.
 ///
 /// **Resolution order**:
 ///  1. If the user explicitly set `config.model`, use it verbatim.
 ///  2. Consult the model registry for the configured provider's best model.
-///  3. Fall back to the hardcoded table in [`Config::effective_model()`].
+///  3. Fall back to the hardcoded table in `Config::effective_model()`.
 pub fn effective_model_for_config(
     config: &clawde_core::config::Config,
     registry: &ModelRegistry,
@@ -1706,6 +1924,34 @@ mod tests {
         assert_eq!(
             reg.find_provider_for_model("gemini-2.5-pro"),
             Some(ProviderId::new("google"))
+        );
+    }
+
+    #[test]
+    fn groq_compound_models_filtered_from_registry() {
+        let reg = ModelRegistry::new();
+        // groq/compound and groq/compound-mini should be filtered out
+        let groq_models = reg.list_by_provider("groq");
+        assert!(
+            !groq_models
+                .iter()
+                .any(|m| (*m.info.id).contains("compound")),
+            "groq/compound models must be filtered from the registry"
+        );
+        // best_model_for_provider should return a valid Groq model (not groq/compound)
+        let best = reg.best_model_for_provider("groq");
+        assert!(best.is_some(), "groq must have a default model");
+        let best = best.unwrap();
+        assert!(
+            !best.contains("compound"),
+            "best model for groq must not be groq/compound"
+        );
+        // The Groq-specific flagship priority ensures llama-3.3-70b is
+        // selected over non-production models like qwen/qwen3-32b.
+        assert!(
+            best.contains("llama-3.3-70b"),
+            "best model for groq should be llama-3.3-70b-versatile, got: {}",
+            best
         );
     }
 
@@ -2226,5 +2472,159 @@ mod tests {
             "malformed/empty overrides must not add entries"
         );
         assert!(reg.get("custom-openai", "noop").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ModelCapability helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_capability_from_str_vision() {
+        assert_eq!(
+            ModelCapability::from_name("vision"),
+            Some(ModelCapability::Vision)
+        );
+        assert_eq!(
+            ModelCapability::from_name("image"),
+            Some(ModelCapability::Vision)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_audio() {
+        assert_eq!(
+            ModelCapability::from_name("audio"),
+            Some(ModelCapability::Audio)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_pdf() {
+        assert_eq!(
+            ModelCapability::from_name("pdf"),
+            Some(ModelCapability::Pdf)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_video() {
+        assert_eq!(
+            ModelCapability::from_name("video"),
+            Some(ModelCapability::Video)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_tool_calling() {
+        assert_eq!(
+            ModelCapability::from_name("tools"),
+            Some(ModelCapability::ToolCalling)
+        );
+        assert_eq!(
+            ModelCapability::from_name("tool_calling"),
+            Some(ModelCapability::ToolCalling)
+        );
+        assert_eq!(
+            ModelCapability::from_name("tool-calling"),
+            Some(ModelCapability::ToolCalling)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_reasoning() {
+        assert_eq!(
+            ModelCapability::from_name("reasoning"),
+            Some(ModelCapability::Reasoning)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_structured_output() {
+        assert_eq!(
+            ModelCapability::from_name("json"),
+            Some(ModelCapability::StructuredOutput)
+        );
+        assert_eq!(
+            ModelCapability::from_name("structured_output"),
+            Some(ModelCapability::StructuredOutput)
+        );
+        assert_eq!(
+            ModelCapability::from_name("structured-output"),
+            Some(ModelCapability::StructuredOutput)
+        );
+    }
+
+    #[test]
+    fn model_capability_from_str_unknown() {
+        assert_eq!(ModelCapability::from_name(""), None);
+        assert_eq!(ModelCapability::from_name("unknown"), None);
+        assert_eq!(ModelCapability::from_name("Vision"), None, "case-sensitive");
+        assert_eq!(ModelCapability::from_name("TOOLS"), None, "case-sensitive");
+    }
+
+    #[test]
+    fn model_capability_label_all_variants() {
+        assert_eq!(ModelCapability::Vision.label(), "vision");
+        assert_eq!(ModelCapability::Audio.label(), "audio");
+        assert_eq!(ModelCapability::Pdf.label(), "PDF");
+        assert_eq!(ModelCapability::Video.label(), "video");
+        assert_eq!(ModelCapability::ToolCalling.label(), "tools");
+        assert_eq!(ModelCapability::Reasoning.label(), "reasoning");
+        assert_eq!(
+            ModelCapability::StructuredOutput.label(),
+            "structured output"
+        );
+    }
+
+    #[test]
+    fn model_capability_all_entries_covers_all_variants() {
+        let entries = ModelCapability::all_entries();
+        assert_eq!(entries.len(), 7, "one entry per capability variant");
+        let values: Vec<&str> = entries.iter().map(|(v, _)| *v).collect();
+        assert!(values.contains(&"vision"));
+        assert!(values.contains(&"audio"));
+        assert!(values.contains(&"pdf"));
+        assert!(values.contains(&"video"));
+        assert!(values.contains(&"tools"));
+        assert!(values.contains(&"reasoning"));
+        assert!(values.contains(&"json"));
+    }
+
+    #[test]
+    fn model_capability_help_text_mentions_each_capability() {
+        let text = ModelCapability::help_text();
+        for (value, _) in ModelCapability::all_entries() {
+            assert!(text.contains(value), "help_text must mention '{}'", value);
+        }
+    }
+
+    #[test]
+    fn model_capability_from_str_trait_works_via_parse() {
+        let parsed: ModelCapability = "vision".parse().unwrap();
+        assert_eq!(parsed, ModelCapability::Vision);
+
+        let parsed: ModelCapability = "tools".parse().unwrap();
+        assert_eq!(parsed, ModelCapability::ToolCalling);
+
+        let result: Result<ModelCapability, _> = "bogus".parse();
+        assert!(result.is_err(), "unknown string should fail");
+    }
+
+    #[test]
+    fn model_capability_from_str_via_inherent_matches_trait() {
+        let via_inherent = ModelCapability::from_name("json");
+        let via_trait: Result<ModelCapability, _> = "json".parse();
+        assert_eq!(via_inherent, via_trait.ok());
+    }
+
+    #[test]
+    fn model_capability_from_str_trait_error_message() {
+        let result: Result<ModelCapability, _> = "bogus".parse();
+        let err = result.unwrap_err();
+        assert!(err.contains("bogus"), "error should mention the bad input");
+        assert!(
+            err.contains("Valid values"),
+            "error should list valid values"
+        );
     }
 }

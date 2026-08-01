@@ -31,17 +31,6 @@ const DEFAULT_MAX_RETRIES: u32 = 5;
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
-// Free-code stub: no remote settings fetching
-// ---------------------------------------------------------------------------
-
-/// Stub: Returns empty managed settings.
-/// The free/OSS build does not fetch server-pushed security overlays or
-/// enterprise-managed settings from Anthropic's API.
-pub async fn fetch_remote_managed_settings() -> Value {
-    serde_json::json!({})
-}
-
-// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -52,7 +41,7 @@ pub struct RemoteSettingsConfig {
     pub api_key: Option<String>,
     /// OAuth bearer token (Authorization: Bearer …).
     pub oauth_token: Option<String>,
-    /// Base URL for the Anthropic API (default: https://api.anthropic.com).
+    /// Base URL for the Anthropic API (default: <https://api.anthropic.com>).
     pub base_url: String,
     /// How often to poll for new settings in the background.
     pub polling_interval: Duration,
@@ -155,6 +144,7 @@ impl RemoteSettingsManager {
 
     /// Load settings cached to disk (without hitting the network).
     /// Returns `None` if the cache file doesn't exist or is malformed.
+    #[allow(dead_code)]
     pub async fn load_cached(&self) -> Option<Value> {
         match tokio::fs::read_to_string(&self.cache_path).await {
             Ok(text) => serde_json::from_str::<Value>(&text).ok(),
@@ -174,6 +164,7 @@ impl RemoteSettingsManager {
     }
 
     /// Delete the on-disk cache file.
+    #[allow(dead_code)]
     pub async fn clear_cache(&self) {
         let _ = tokio::fs::remove_file(&self.cache_path).await;
     }
@@ -309,6 +300,7 @@ impl RemoteSettingsManager {
     ///
     /// Polls every `config.polling_interval`, gracefully degrading on failures.
     /// Stops when `cancel` is triggered.
+    #[allow(dead_code)]
     pub async fn start_polling(self: Arc<Self>, cancel: CancellationToken) {
         let mut interval = tokio::time::interval(self.config.polling_interval);
         // The first tick fires immediately; skip it so we don't double-fetch at startup.

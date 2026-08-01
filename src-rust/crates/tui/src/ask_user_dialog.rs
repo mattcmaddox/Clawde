@@ -52,6 +52,8 @@ pub struct AskUserDialogState {
     /// Index of the currently highlighted option (0 = custom-text row when
     /// options is None, or indices into options vec, with the custom row last).
     pub selected_idx: usize,
+    /// Scroll offset for the options list (for viewport when options exceed height).
+    pub scroll_offset: usize,
     /// Custom text the user is typing (if they choose not to pick an option).
     pub custom_text: String,
     /// Whether cursor is in the custom-text input row.
@@ -75,11 +77,15 @@ impl AskUserDialogState {
         self.question = question;
         self.options = options;
         self.selected_idx = 0;
+        self.scroll_offset = 0;
         self.custom_text.clear();
         self.in_custom_input = self.options.is_none();
         self.reply_tx = Some(reply_tx);
         self.visible = true;
     }
+
+    /// Max visible option rows in the dialog viewport.
+    const VISIBLE_OPTION_ROWS: usize = 8;
 
     /// Navigate selection up.
     pub fn select_prev(&mut self) {
@@ -94,6 +100,7 @@ impl AskUserDialogState {
             self.selected_idx -= 1;
             self.in_custom_input = self.selected_idx >= self.options_len();
         }
+        self.ensure_visible();
     }
 
     /// Navigate selection down.
@@ -109,6 +116,20 @@ impl AskUserDialogState {
             self.selected_idx += 1;
             self.in_custom_input = self.selected_idx >= self.options_len();
         }
+        self.ensure_visible();
+    }
+
+    /// Adjust scroll_offset so the selected option (non-custom) is visible.
+    fn ensure_visible(&mut self) {
+        let opts_len = self.options_len();
+        if opts_len == 0 || self.in_custom_input {
+            return;
+        }
+        if self.selected_idx < self.scroll_offset {
+            self.scroll_offset = self.selected_idx;
+        } else if self.selected_idx >= self.scroll_offset + Self::VISIBLE_OPTION_ROWS {
+            self.scroll_offset = self.selected_idx + 1 - Self::VISIBLE_OPTION_ROWS;
+        }
     }
 
     /// Select an option directly by 1-based number key.
@@ -117,6 +138,7 @@ impl AskUserDialogState {
             if n >= 1 && n <= opts.len() {
                 self.selected_idx = n - 1;
                 self.in_custom_input = false;
+                self.ensure_visible();
             }
         }
     }
@@ -203,12 +225,17 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
 
     // ---- size estimate ----
     let question_lines = word_wrap(&state.question, 52).len() as u16;
-    let options_lines = state
-        .options
-        .as_ref()
-        .map(|v| v.len() as u16 + 1)
-        .unwrap_or(0);
-    let height = (5 + question_lines + options_lines + 3).min(area.height.saturating_sub(2));
+    let options_count = state.options.as_ref().map(|v| v.len() as u16).unwrap_or(0);
+    // Cap visible options to viewport; if options exceed it, show scroll indicators.
+    let visible_options = options_count.min(AskUserDialogState::VISIBLE_OPTION_ROWS as u16);
+    let has_scroll_up = state.scroll_offset > 0;
+    let has_scroll_down =
+        state.options_len() > state.scroll_offset + AskUserDialogState::VISIBLE_OPTION_ROWS;
+    let scroll_indicators = (has_scroll_up as u16) + (has_scroll_down as u16);
+    let options_lines = visible_options + scroll_indicators + 1; // +1 for spacer after options
+    let height = (5 + question_lines + options_lines + 3)
+        .min(area.height.saturating_sub(2))
+        .max(10);
     let width = 58u16.min(area.width.saturating_sub(4));
     let modal_area = centered_rect(width, height, area);
     state.last_rect.set(modal_area);
@@ -308,9 +335,31 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     // Spacer
     row += 1;
 
-    // Option rows
+    // Option rows (scrollable viewport)
     if let Some(ref opts) = state.options {
-        for (i, opt) in opts.iter().enumerate() {
+        let opts_len = opts.len();
+        let end = (state.scroll_offset + AskUserDialogState::VISIBLE_OPTION_ROWS).min(opts_len);
+
+        // Scroll-up indicator
+        if state.scroll_offset > 0 {
+            write_line!(
+                row,
+                Line::from(Span::styled(
+                    format!("   \u{2191} {} more above", state.scroll_offset),
+                    Style::default()
+                        .fg(Color::Rgb(90, 90, 110))
+                        .bg(CLAURST_PANEL_BG),
+                ))
+            );
+            row += 1;
+        }
+
+        for (i, opt) in opts
+            .iter()
+            .enumerate()
+            .skip(state.scroll_offset)
+            .take(end - state.scroll_offset)
+        {
             if row >= inner.y + inner.height - 2 {
                 break;
             }
@@ -348,6 +397,22 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             );
             row += 1;
         }
+
+        // Scroll-down indicator
+        let remaining = opts_len.saturating_sub(end);
+        if remaining > 0 {
+            write_line!(
+                row,
+                Line::from(Span::styled(
+                    format!("   \u{2193} {} more below", remaining),
+                    Style::default()
+                        .fg(Color::Rgb(90, 90, 110))
+                        .bg(CLAURST_PANEL_BG),
+                ))
+            );
+            row += 1;
+        }
+
         row += 1; // spacer before custom row
     }
 

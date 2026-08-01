@@ -41,6 +41,11 @@ pub struct AuthStore {
     /// and that the field is omitted from saved files when empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub keys: HashMap<String, Vec<String>>,
+    /// True when [`Self::load`] fell back to an empty store because the file
+    /// was corrupt or unreadable. Guards [`Self::save`] from persisting that
+    /// fallback state over the real (possibly recoverable) file.
+    #[serde(skip)]
+    from_fallback: bool,
 }
 
 impl AuthStore {
@@ -63,12 +68,12 @@ impl AuthStore {
                             path.display(),
                             e
                         );
-                        Self::default()
+                        Self::from_fallback()
                     }
                 },
                 Err(e) => {
                     tracing::warn!("failed to read auth store at {}: {}", path.display(), e);
-                    Self::default()
+                    Self::from_fallback()
                 }
             }
         } else {
@@ -76,13 +81,45 @@ impl AuthStore {
         }
     }
 
+    /// An empty store that marks itself as having failed to load from disk,
+    /// so [`Self::save`] will refuse to clobber the real file.
+    fn from_fallback() -> Self {
+        Self {
+            from_fallback: true,
+            ..Self::default()
+        }
+    }
+
+    /// Reload state from disk, discarding any in-memory changes.
+    ///
+    /// Long-lived `AuthStore` instances (e.g. held by the TUI) go stale when
+    /// another process writes `auth.json`. Mutating a stale snapshot and
+    /// saving it would clobber the newer on-disk keys, so call this
+    /// immediately before any read-modify-write that originates from a long-
+    /// lived instance.
+    pub fn reload(&mut self) {
+        *self = Self::load();
+    }
+
     /// Persist the store to disk (best-effort).
     ///
     /// Writes to a temp file then renames over the destination so a crash or
     /// disk-full mid-write can never truncate `auth.json` (which would
     /// silently wipe the user's stored credentials on the next load).
+    ///
+    /// Refuses to write when the in-memory store is an empty fallback that
+    /// failed to load from disk — overwriting the real file would destroy
+    /// keys that may still be recoverable from it.
     pub fn save(&self) {
         let path = Self::path();
+        if self.from_fallback && self.credentials.is_empty() && self.keys.is_empty() {
+            tracing::warn!(
+                "refusing to persist empty auth store over existing {} (store failed to load); \
+                 not saving",
+                path.display()
+            );
+            return;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
             crate::accounts::set_user_only_dir_perms(parent);
@@ -168,7 +205,7 @@ impl AuthStore {
             .is_some();
         if removed {
             // Clean up empty vectors.
-            if self.keys.get(provider_id).map_or(true, |k| k.is_empty()) {
+            if self.keys.get(provider_id).is_none_or(|k| k.is_empty()) {
                 self.keys.remove(provider_id);
             }
             self.save();
@@ -179,6 +216,30 @@ impl AuthStore {
     /// Get all keys stored for a provider, or `None` if none are configured.
     pub fn keys_for(&self, provider_id: &str) -> Option<&[String]> {
         self.keys.get(provider_id).map(|v| v.as_slice())
+    }
+
+    /// Build a deduplicated rotation pool by merging an existing single key
+    /// into a list of prior rotation keys together with a freshly typed key.
+    ///
+    /// Order is preserved: `existing` is first, then `prior` entries in
+    /// their original order (with duplicates dropped), then `new_key`
+    /// (skipped if it already appears in the merged list). The caller is
+    /// expected to call [`Self::set_keys`] with the returned vector and
+    /// remove the legacy single-key credential afterwards.
+    pub fn merge_keys_for_rotation(existing: &str, prior: &[String], new_key: &str) -> Vec<String> {
+        let mut merged: Vec<String> = Vec::with_capacity(prior.len() + 2);
+        if !existing.is_empty() {
+            merged.push(existing.to_string());
+        }
+        for k in prior {
+            if !merged.iter().any(|m| m == k) {
+                merged.push(k.clone());
+            }
+        }
+        if !new_key.is_empty() && !merged.contains(&new_key.to_string()) {
+            merged.push(new_key.to_string());
+        }
+        merged
     }
 
     // -----------------------------------------------------------------------
@@ -292,6 +353,50 @@ impl AuthStore {
 mod tests {
     use super::{AuthStore, StoredCredential};
 
+    /// Redirect `CLAWDE_HOME` to a temp dir for the lifetime of the guard so
+    /// that `AuthStore` persistence can never touch the real
+    /// `~/.clawde/auth.json`. Restores the original env var on drop — even
+    /// during unwinding from a panic.
+    ///
+    /// Serialized against every other env-mutating test in this crate via
+    /// `crate::paths::ENV_LOCK` (unix). Without this, the store-level tests
+    /// below (`set_keys`, `add_key`, `remove_key`, `remove`, `set`) all call
+    /// `save()`, which writes placeholder keys into the user's real config
+    /// dir whenever `cargo test` runs.
+    struct TestHome {
+        _tmp: tempfile::TempDir,
+        prev_clawde_home: Option<std::ffi::OsString>,
+        #[cfg(unix)]
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            #[cfg(unix)]
+            let _lock = crate::paths::ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            TestHome {
+                _tmp: tmp,
+                prev_clawde_home: prev,
+                #[cfg(unix)]
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.prev_clawde_home {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn github_copilot_oauth_prefers_refresh_token() {
         let mut store = AuthStore::default();
@@ -336,6 +441,7 @@ mod tests {
 
     #[test]
     fn set_keys_stores_and_overwrites() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
 
@@ -354,6 +460,7 @@ mod tests {
 
     #[test]
     fn set_keys_strips_empty() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["k1".into(), "".into(), "k2".into()]);
 
@@ -365,6 +472,7 @@ mod tests {
 
     #[test]
     fn set_keys_all_empty_removes_entry() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.keys.insert("groq".to_string(), vec!["k1".into()]);
         store.set_keys("groq", vec!["".into(), "".into()]);
@@ -373,6 +481,7 @@ mod tests {
 
     #[test]
     fn add_key_appends() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.add_key("groq", "k1".into());
         store.add_key("groq", "k2".into());
@@ -385,13 +494,86 @@ mod tests {
 
     #[test]
     fn add_key_ignores_empty() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.add_key("groq", "".into());
         assert!(store.keys_for("groq").is_none());
     }
 
     #[test]
+    fn merge_keys_for_rotation_empty_prior() {
+        let merged = AuthStore::merge_keys_for_rotation("existing", &[], "new");
+        assert_eq!(merged, vec!["existing", "new"]);
+    }
+
+    #[test]
+    fn merge_keys_for_rotation_dedupes_overlap_with_prior() {
+        let prior = vec!["a".to_string(), "b".to_string()];
+        let merged = AuthStore::merge_keys_for_rotation("a", &prior, "c");
+        assert_eq!(merged, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_keys_for_rotation_dedupes_typed_key_against_existing() {
+        let prior = vec!["p".to_string()];
+        let merged = AuthStore::merge_keys_for_rotation("e", &prior, "e");
+        assert_eq!(merged, vec!["e", "p"]);
+    }
+
+    #[test]
+    fn merge_keys_for_rotation_dedupes_typed_key_against_prior() {
+        let prior = vec!["p".to_string()];
+        let merged = AuthStore::merge_keys_for_rotation("e", &prior, "p");
+        assert_eq!(merged, vec!["e", "p"]);
+    }
+
+    #[test]
+    fn merge_keys_for_rotation_preserves_prior_order() {
+        let prior = vec![
+            "k1".to_string(),
+            "k2".to_string(),
+            "k3".to_string(),
+            "k1".to_string(), // duplicate mid-list
+        ];
+        let merged = AuthStore::merge_keys_for_rotation("anchor", &prior, "k2");
+        assert_eq!(merged, vec!["anchor", "k1", "k2", "k3"]);
+    }
+
+    #[test]
+    fn merge_keys_for_rotation_skips_empty_inputs() {
+        let prior = vec!["p".to_string()];
+        let merged = AuthStore::merge_keys_for_rotation("", &prior, "");
+        assert_eq!(merged, vec!["p"]);
+    }
+
+    #[test]
+    fn merge_then_set_keys_matches_round_trip() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "groq".into(),
+            crate::auth_store::StoredCredential::ApiKey {
+                key: "anchor".into(),
+            },
+        );
+        store.set_keys("groq", vec!["a".into(), "b".into()]);
+
+        let prior = store.keys_for("groq").unwrap_or(&[]).to_vec();
+        let existing_key = match store.get("groq").cloned() {
+            Some(crate::auth_store::StoredCredential::ApiKey { key }) => key,
+            _ => String::new(),
+        };
+        let merged = AuthStore::merge_keys_for_rotation(&existing_key, &prior, "typed");
+        store.set_keys("groq", merged);
+        store.remove("groq");
+
+        let keys = store.keys_for("groq").expect("should have keys");
+        assert_eq!(keys, &["anchor", "a", "b", "typed"]);
+    }
+
+    #[test]
     fn remove_key_removes_at_index() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
 
@@ -404,6 +586,7 @@ mod tests {
 
     #[test]
     fn remove_key_out_of_bounds_returns_false() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["k1".into()]);
         assert!(!store.remove_key("groq", 5));
@@ -412,6 +595,7 @@ mod tests {
 
     #[test]
     fn remove_key_last_removes_entry() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["k1".into()]);
         assert!(store.remove_key("groq", 0));
@@ -420,6 +604,7 @@ mod tests {
 
     #[test]
     fn api_key_for_falls_through_to_keys() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.set_keys("groq", vec!["gsk-key1".into(), "gsk-key2".into()]);
 
@@ -428,6 +613,7 @@ mod tests {
 
     #[test]
     fn api_key_for_prefers_credentials_over_keys() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.credentials.insert(
             "anthropic".to_string(),
@@ -455,6 +641,7 @@ mod tests {
 
     #[test]
     fn serialization_round_trip_new_format() {
+        let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.credentials.insert(
             "anthropic".into(),
@@ -481,5 +668,39 @@ mod tests {
             "JSON should not contain keys field when empty: {}",
             json
         );
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_real_file_after_failed_load() {
+        let _home = TestHome::new();
+        // Seed a real store, then corrupt the file on disk.
+        let mut store = AuthStore::default();
+        store.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-real".into(),
+            },
+        );
+        assert!(AuthStore::path().exists());
+
+        // Corrupt the file (truncate) so load() falls back to an empty store.
+        std::fs::write(AuthStore::path(), "{ not valid json ").unwrap();
+        let mut failed = AuthStore::load();
+        assert!(failed.credentials.is_empty() && failed.keys.is_empty());
+
+        // save() must NOT overwrite the (possibly recoverable) real file.
+        failed.save();
+        let on_disk = std::fs::read_to_string(AuthStore::path()).unwrap();
+        assert_eq!(on_disk, "{ not valid json ");
+
+        // Once the user deliberately adds a key, saving proceeds.
+        failed.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-real".into(),
+            },
+        );
+        let on_disk = std::fs::read_to_string(AuthStore::path()).unwrap();
+        assert!(on_disk.contains("gsk-real"));
     }
 }

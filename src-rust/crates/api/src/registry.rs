@@ -107,29 +107,41 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         .get("free")
         .and_then(|pc| pc.options.get("routing"))
         .and_then(|v| serde_json::from_value::<RoutingConfig>(v.clone()).ok());
+    let disabled_upstreams: Vec<&str> = routing
+        .as_ref()
+        .map(|r| r.disabled_upstreams.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
 
     // Auto-detect the best free model for each upstream from models.dev.
     // Falls back to the hardcoded default_model when models.dev is unreachable
     // or no free model is found for a given upstream.
     let auto_defaults = crate::providers::free::fetch_best_free_models_from_modelsdev();
-    let effective_model = |upstream_id: &str| {
-        auto_defaults.get(upstream_id).cloned()
-    };
+    let effective_model = |upstream_id: &str| auto_defaults.get(upstream_id).cloned();
 
     for upstream in FREE_CATALOG {
+        // Skip disabled upstreams even if they have keys configured.
+        if disabled_upstreams.contains(&upstream.id) {
+            continue;
+        }
         // --- multi-key path (2+ keys → wrap in KeyRotatingProvider) ---
         let multi_keys: Option<Vec<String>> = match upstream.id {
             // OpenCode Zen and Go share the same key env var; accept either slot.
             "opencode-zen" => auth_store
                 .keys_for("opencode-zen")
-                .or_else(|| auth_store.keys_for("opencode-go"))
-                .filter(|k| k.len() > 1)
-                .map(|k| k.to_vec()),
-            other => auth_store
-                .keys_for(other)
-                .filter(|k| k.len() > 1)
-                .map(|k| k.to_vec()),
-        };
+                .or_else(|| auth_store.keys_for("opencode-go")),
+            other => auth_store.keys_for(other),
+        }
+        .map(|k| k.to_vec())
+        // Cloud API keys are always at least 8 characters. Shorter values
+        // are placeholders or test artifacts that would fail with AuthFailed.
+        .filter(|k| k.iter().any(|k| k.trim().len() >= 8))
+        .map(|keys| {
+            keys.into_iter()
+                .map(|k| k.trim().to_string())
+                .filter(|k| k.len() >= 8)
+                .collect::<Vec<String>>()
+        })
+        .filter(|k| k.len() > 1);
 
         if let Some(keys) = multi_keys {
             let upstream_id = upstream.id.to_string();
@@ -202,17 +214,23 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
     // models change frequently and can be queried via a live API endpoint.
     // To add a new provider: add a variant to FreeModelDiscovery, wire it
     // in discovery_for() and run_live_discovery() in free.rs.
-    for idx in 0..chain.len() {
-        let upstream_id = chain[idx].upstream.id;
-        if let Some(free_model) = crate::providers::free::run_live_discovery(upstream_id, &auth_store) {
-            chain[idx].effective_model = Some(free_model);
+    for entry in &mut chain {
+        let upstream_id = entry.upstream.id;
+        if let Some(free_model) =
+            crate::providers::free::run_live_discovery(upstream_id, &auth_store)
+        {
+            entry.effective_model = Some(free_model);
         }
     }
 
     if chain.is_empty() {
         return None;
     }
-    let provider = FreeProvider::with_routing(chain, routing.unwrap_or_default());
+    let provider = FreeProvider::with_routing(
+        chain,
+        routing.unwrap_or_default(),
+        FreeProvider::ENABLE_EMPTY_COOLDOWN_PERSISTENCE,
+    );
     // Store free model defaults for the TUI /ctx-viz overlay
     crate::providers::free::store_free_model_defaults(provider.free_model_defaults());
     Some(Arc::new(provider) as Arc<dyn LlmProvider>)
@@ -384,13 +402,20 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     // Check for multi-key setup first: when 2+ keys are configured, wrap
     // the provider in a KeyRotatingProvider for automatic rotation.
     if let Some(keys) = auth_store.keys_for(provider_id) {
-        if keys.len() > 1 {
-            let keys_vec: Vec<String> = keys.to_vec();
+        // Cloud API keys are always at least 8 characters. Shorter values
+        // are placeholders or test artifacts that would fail with AuthFailed
+        // and poison the whole rotation pool (see key_ring.rs).
+        let real_keys: Vec<String> = keys
+            .iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| k.len() >= 8)
+            .collect();
+        if real_keys.len() > 1 {
             let pid_owned = provider_id.to_string();
             let rotating = KeyRotatingProvider::new_with_persistence(
                 pid_owned.clone(),
                 pid_owned.clone(),
-                keys_vec,
+                real_keys,
                 move |key| {
                     provider_from_key(&pid_owned, key.to_string())
                         .expect("runtime_provider_for: provider_from_key failed")
@@ -404,8 +429,16 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     if key.is_empty() {
         return None;
     }
+    // Cloud API keys are always at least 8 characters. Shorter values are
+    // placeholders or test artifacts that would fail with AuthFailed.
+    if key.trim().len() < 8 {
+        return None;
+    }
     provider_from_key(provider_id, key)
 }
+
+/// Type alias for the empty-cooldown summaries returned by [`ProviderRegistry::empty_cooldown_summaries`].
+pub type EmptyCooldownSummaries = Vec<(String, Vec<(String, u32, Option<u64>)>)>;
 
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
@@ -469,6 +502,23 @@ impl ProviderRegistry {
                 if total > 0 {
                     summaries.push((id.to_string(), active, total, retry));
                 }
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect empty-completion cooldown summaries from all registered
+    /// providers that multiplex upstreams. Each entry is
+    /// `(provider_name, Vec<(upstream_id, consecutive_empties, retry_secs)>)`
+    /// and only includes upstreams with at least one recorded empty
+    /// completion. Sorted by provider name.
+    pub fn empty_cooldown_summaries(&self) -> EmptyCooldownSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_empty_cooldowns();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
             }
         }
         summaries.sort_by(|a, b| a.0.cmp(&b.0));

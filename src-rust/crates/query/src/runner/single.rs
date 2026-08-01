@@ -5,6 +5,7 @@
 use crate::*;
 
 /// Run a single (non-agentic) query – no tool loop, just one API call.
+#[allow(dead_code)]
 pub async fn run_single_query(
     client: &clawde_api::AnthropicClient,
     messages: Vec<Message>,

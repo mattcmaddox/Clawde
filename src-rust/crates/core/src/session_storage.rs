@@ -843,6 +843,7 @@ pub fn active_branch_messages(entries: &[TranscriptEntry]) -> Vec<Message> {
 /// Filter transcript entries by agent role ("manager" or "executor").
 ///
 /// Returns only User and Assistant entries whose `agent_role` matches `role`.
+#[allow(dead_code)]
 pub fn filter_by_agent_role<'a>(
     entries: &'a [TranscriptEntry],
     role: &str,

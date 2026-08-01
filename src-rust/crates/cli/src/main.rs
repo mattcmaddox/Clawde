@@ -417,8 +417,65 @@ async fn main() -> anyhow::Result<()> {
         return upgrade::run_upgrade(&raw_args[2..]).await;
     }
 
-    // Fast-path: `claude acp` — start the Agent Client Protocol stdio server.
+    // Fast-path: `claude acp` — start the Agent Client Protocol server.
+    // With `--listen <addr>`, starts in TCP mode for LAN access.
+    // Optional `--tls-cert <path> --tls-key <path>` enables TLS.
     if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
+        let listen = raw_args
+            .iter()
+            .position(|a| a == "--listen")
+            .and_then(|pos| raw_args.get(pos + 1).map(|s| s.to_string()));
+        if let Some(addr) = listen {
+            // Standalone mode: load base config from settings, then apply CLI overrides.
+            let settings = clawde_core::config::Settings::load()
+                .await
+                .unwrap_or_default();
+            let mut acp_config = settings.acp_server.clone();
+
+            // Parse --tls-cert / --tls-key from raw args (if provided, they override settings).
+            let tls_cert = raw_args
+                .iter()
+                .position(|a| a == "--tls-cert")
+                .and_then(|pos| raw_args.get(pos + 1).cloned());
+            let tls_key = raw_args
+                .iter()
+                .position(|a| a == "--tls-key")
+                .and_then(|pos| raw_args.get(pos + 1).cloned());
+            if let Some(cert) = tls_cert {
+                acp_config.tls_cert_path = Some(cert);
+            }
+            if let Some(key) = tls_key {
+                acp_config.tls_key_path = Some(key);
+            }
+            if acp_config.tls_cert_path.is_some() != acp_config.tls_key_path.is_some() {
+                eprintln!(
+                    "Warning: --tls-cert and --tls-key must be used together; TLS not enabled"
+                );
+                acp_config.tls_cert_path = None;
+                acp_config.tls_key_path = None;
+            }
+
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let int_cancel = cancel.clone();
+            let term_cancel = cancel.clone();
+            // Wire SIGINT (Ctrl-C) to cancel the server for graceful shutdown.
+            tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.ok();
+                info!("ACP: received SIGINT, shutting down...");
+                int_cancel.cancel();
+            });
+            // Wire SIGTERM (systemd stop / kill) for systemd integration.
+            #[cfg(unix)]
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+                sigterm.recv().await;
+                info!("ACP: received SIGTERM, shutting down...");
+                term_cancel.cancel();
+            });
+            return clawde_acp::run_acp_server_tcp(addr, Some(&acp_config), cancel).await;
+        }
         return clawde_acp::run_acp_server().await;
     }
 
@@ -449,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
                     remote_session_url: None,
                     mcp_manager: None,
                     mcp_auth_runner: None,
+                    provider_registry: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -924,6 +982,16 @@ async fn main() -> anyhow::Result<()> {
 
     // --print mode (headless)
     let result = if is_headless {
+        // Fire-and-forget startup health probe (non-blocking — the poll
+        // runs in the background so the user's prompt is answered without
+        // waiting for every upstream to be probed).
+        let free_provider = provider_registry
+            .get(&clawde_core::ProviderId::new("free"))
+            .cloned();
+        tokio::spawn(clawde_api::health_poller::run_health_poller(
+            0,
+            free_provider,
+        ));
         run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
     } else {
         let auth_store = clawde_core::AuthStore::load();
@@ -1035,25 +1103,37 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
     let mut verbose = false;
     let mut as_json = false;
     let mut provider_filter: Option<String> = None;
+    let mut capability_filter: Option<String> = None;
 
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
             "--refresh" | "-r" => refresh = true,
             "--verbose" | "-v" => verbose = true,
             "--json" => as_json = true,
+            "--capability" | "-c" => {
+                i += 1;
+                let val = args.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--capability requires a value (image, audio, pdf, video, tools, reasoning, structured_output)")
+                })?;
+                capability_filter = Some(val.to_string());
+            }
             s if s.starts_with("--") => {
                 eprintln!("clawde models: unknown flag: {}", s);
-                eprintln!("Usage: clawde models [<provider>] [--refresh] [--verbose] [--json]");
+                eprintln!("Usage: clawde models [<provider>] [--refresh] [--verbose] [--json] [--capability <cap>]");
                 std::process::exit(2);
             }
             s => {
                 if provider_filter.is_some() {
                     eprintln!("clawde models: only one provider id may be supplied");
+                    eprintln!("Usage: clawde models [<provider>] [--refresh] [--verbose] [--json] [--capability <cap>]");
                     std::process::exit(2);
                 }
                 provider_filter = Some(s.to_string());
             }
         }
+        i += 1;
     }
 
     let mut registry = clawde_api::ModelRegistry::new().with_cache_path(models_cache_path());
@@ -1083,6 +1163,20 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         Some(pid) => registry.list_by_provider(pid),
         None => registry.list_all(),
     };
+
+    // Apply capability filter (runs across all providers).
+    if let Some(cap_str) = &capability_filter {
+        let cap: clawde_api::ModelCapability = cap_str
+            .to_lowercase()
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("{}", e))?;
+        entries = registry.list_by_capability(cap);
+        // Re-apply provider filter on top of capability filter.
+        if let Some(pid) = &provider_filter {
+            let pid_ref: &str = pid;
+            entries.retain(|e| &*e.info.provider_id == pid_ref);
+        }
+    }
 
     // Stable order: provider id, then by descending release_date so newest
     // models appear first.
@@ -1129,24 +1223,31 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
 
         let mut flags = Vec::new();
         if entry.tool_calling {
-            flags.push("tools");
+            flags.push(('\u{1f6e0}', "tools")); // 🛠
         }
         if entry.reasoning {
-            flags.push("reasoning");
+            flags.push(('\u{1f9e0}', "reasoning")); // 🧠
         }
         if entry.vision() {
-            flags.push("vision");
+            flags.push(('\u{1f5bc}', "vision")); // 🖼
         }
         if entry.audio_input() {
-            flags.push("audio");
+            flags.push(('\u{1f50a}', "audio")); // 🔊
         }
         if entry.pdf_input() {
-            flags.push("pdf");
+            flags.push(('\u{1f4c4}', "pdf")); // 📄
+        }
+        if entry.structured_output {
+            flags.push(('{', "json")); // {}
+        }
+        if entry.video_input() {
+            flags.push(('\u{1f3ac}', "video")); // 🎬
         }
         let flags_str = if flags.is_empty() {
             String::new()
         } else {
-            format!(" [{}]", flags.join(","))
+            let icons: String = flags.iter().map(|&(icon, _)| icon).collect();
+            format!(" {}", icons)
         };
 
         if verbose {
@@ -1908,6 +2009,9 @@ async fn run_interactive(
     };
     let mut last_auto_save = std::time::Instant::now();
     let initial_messages = session.messages.clone();
+    // Extract provider_registry before query_config is moved below.
+    let provider_registry = query_config.provider_registry.clone();
+
     let mut base_query_config = query_config;
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
@@ -1930,6 +2034,10 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+
+    // Start the embedded ACP TCP server if enabled in settings.
+    let _acp_cancel = clawde_acp::start_embedded_acp_server(&settings.acp_server);
+
     // Gate input shift-normalization on whether the terminal speaks the kitty
     // keyboard protocol (detected in setup_terminal). On terminals that don't —
     // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
@@ -1979,28 +2087,6 @@ async fn run_interactive(
         // These are computed during build_free_provider and stored via
         // store_free_model_defaults; read them back now for the TUI.
         app.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
-
-        // Set startup status message showing auto-detected free models.
-        if !app.free_model_defaults.is_empty() {
-            let count = app.free_model_defaults.len();
-            let summary: Vec<String> = app.free_model_defaults.iter().take(3).map(|(name, model)| {
-                // Shorten model name: trim after first '/' or to 18 chars
-                let short = if model.len() > 18 {
-                    let after_slash = model.rsplit('/').next().unwrap_or(model);
-                    if after_slash.len() <= 18 { after_slash.to_string() }
-                    else { format!("{}…", &after_slash[..16]) }
-                } else {
-                    model.clone()
-                };
-                format!("{} → {}", name, short)
-            }).collect();
-            let suffix = if count > 3 { format!(" (+{} more)", count - 3) } else { String::new() };
-            app.status_message = Some(format!(
-                "Free mode — {}{}",
-                summary.join(", "),
-                suffix,
-            ));
-        }
     }
 
     app.arg_completions = Some(std::sync::Arc::new(
@@ -2017,6 +2103,40 @@ async fn run_interactive(
                 .collect()
         },
     ));
+    // Seed the prompt typeahead with every command alias (alias → canonical).
+    // This makes hidden aliases like `/history` autocomplete to `/session`
+    // and lets the TUI intercept fire UI screens for alias names.
+    app.slash_aliases = clawde_commands::all_command_aliases();
+    // Surface user-defined template commands and discovered skill commands in
+    // the help overlay so custom commands are discoverable, not just
+    // executable. The TUI cannot depend on the commands crate (circular), so
+    // the CLI computes the (name, description, category) triples here and
+    // seeds them, mirroring how slash_aliases is seeded. Collisions with
+    // built-in commands are filtered during overlay construction (dispatch
+    // resolves built-ins first).
+    {
+        let mut user_help_entries: Vec<(String, String, String)> = Vec::new();
+        for cmd in clawde_commands::commands_from_settings(&live_config) {
+            user_help_entries.push((
+                cmd.name().to_string(),
+                cmd.description().to_string(),
+                "User-defined".to_string(),
+            ));
+        }
+        for cmd in clawde_commands::commands_from_discovered_skills(
+            &tool_ctx.working_dir,
+            &live_config.skills,
+        ) {
+            user_help_entries.push((
+                cmd.name().to_string(),
+                cmd.description().to_string(),
+                "Skills".to_string(),
+            ));
+        }
+        app.user_help_entries = user_help_entries;
+    }
+    // Surface command aliases (e.g. /history → /session) in the help overlay.
+    app.refresh_help_overlay();
     app.refresh_context_window_size();
     app.auto_compact_enabled = live_config.auto_compact;
 
@@ -2026,6 +2146,26 @@ async fn run_interactive(
     // from disk whenever the /model picker opens. Non-blocking.
     {
         spawn_models_cache_refresh_loop();
+    }
+
+    // Background: zero-token health poller — probes every configured free
+    // upstream key at startup and every 5 min so dead keys are surfaced
+    // before the first user request hits them (spec §6.4).
+    if let Some(ref provider_registry) = provider_registry {
+        let free_provider = provider_registry
+            .get(&clawde_core::ProviderId::new("free"))
+            .cloned();
+        let poll_interval = config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|routing| routing.get("health_poll_interval_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(clawde_api::health_poller::DEFAULT_HEALTH_POLL_INTERVAL_SECS);
+        tokio::spawn(clawde_api::health_poller::run_health_poller(
+            poll_interval,
+            free_provider,
+        ));
     }
 
     // Wire the ask-user question channel into the app so the TUI can show
@@ -2215,6 +2355,7 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
+        provider_registry: base_query_config.provider_registry.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2540,8 +2681,6 @@ async fn run_interactive(
                                         | "vim"
                                         | "vi"
                                         | "voice"
-                                        | "fast"
-                                        | "speed"
                                 );
                             let handled_by_tui = if skip_tui_for_args {
                                 false
@@ -2740,6 +2879,8 @@ async fn run_interactive(
                                             Ok(refreshed) => {
                                                 cmd_ctx.config = refreshed.config.clone();
                                                 tool_ctx.config = refreshed.config.clone();
+                                                cmd_ctx.provider_registry =
+                                                    Some(refreshed.provider_registry.clone());
                                                 base_query_config.provider_registry =
                                                     Some(refreshed.provider_registry.clone());
                                                 base_query_config.model_registry =
@@ -3009,7 +3150,57 @@ async fn run_interactive(
                         }
 
                         // Regular user message (with optional image attachments + file injection)
-                        let pending_imgs = app.prompt_input.clear_images();
+                        let mut pending_imgs = app.prompt_input.clear_images();
+
+                        // Scan for @image-path references in the prompt and auto-attach images.
+                        // This works without clipboard tools (xclip/wl-paste) — the user can
+                        // type (or paste as text) @/path/to/screenshot.png and Clawde will
+                        // attach it as an image before sending. Critical for SSH users.
+                        for word in input.split_whitespace() {
+                            if !word.starts_with('@') {
+                                continue;
+                            }
+                            let mut token = word.to_string();
+                            // Strip trailing punctuation so @/tmp/img.png. still resolves.
+                            while token.len() > 1
+                                && token.ends_with(|c: char| c.is_ascii_punctuation())
+                                && !token.ends_with('/')
+                            {
+                                token.pop();
+                            }
+                            let path_part = &token[1..]; // skip '@'
+                            if path_part.is_empty() {
+                                continue;
+                            }
+                            let path = if let Some(rest) = path_part.strip_prefix("~/") {
+                                if let Some(home) = dirs::home_dir() {
+                                    home.join(rest)
+                                } else {
+                                    continue;
+                                }
+                            } else if path_part.starts_with('/') {
+                                std::path::PathBuf::from(path_part)
+                            } else {
+                                continue; // relative paths: skip, too ambiguous
+                            };
+                            if path.exists()
+                                && clawde_tui::image_paste::is_image_path(&path)
+                                && !pending_imgs.iter().any(
+                                    |img: &clawde_tui::image_paste::PastedImage| img.path == path,
+                                )
+                            {
+                                let label = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("image")
+                                    .to_string();
+                                pending_imgs.push(clawde_tui::image_paste::PastedImage {
+                                    path,
+                                    label,
+                                    dimensions: None,
+                                });
+                            }
+                        }
 
                         // Check for file injection if enabled
                         if app.config.file_injection_enabled {
@@ -3026,13 +3217,17 @@ async fn run_interactive(
                             } else {
                                 app.config.file_injection_max_size
                             };
-                            let (within_limit, mut oversized) =
+                            let (mut within_limit, mut oversized) =
                                 parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
                             if was_force {
                                 oversized.retain(|f| {
                                     !matches!(f.issue, Some(clawde_tui::AtFileIssue::IsDirectory))
                                 });
                             }
+
+                            // Images are attached via pending_imgs, not text-injected.
+                            within_limit
+                                .retain(|f| !clawde_tui::image_paste::is_image_path(&f.path));
 
                             if !oversized.is_empty() {
                                 // Show either the directory warning or the file warning, never both.
@@ -3964,6 +4159,10 @@ async fn run_interactive(
             }
         }
 
+        // Drain free dialog key validation results (non-blocking).
+        app.poll_free_dialog_validation();
+        app.poll_image_results();
+
         // Drain ask-user question events (non-blocking).
         // When the AskUserQuestion tool fires, it sends a UserQuestionEvent
         // here.  We open the dialog and the user's answer travels back via
@@ -4053,6 +4252,8 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        reasoning: false,
+                                                        capabilities: Vec::new(),
                                                     }
                                                 })
                                             })
@@ -4070,6 +4271,8 @@ async fn run_interactive(
                                                         ),
                                                     id,
                                                     is_current: false,
+                                                    reasoning: false,
+                                                    capabilities: Vec::new(),
                                                 }
                                             })
                                             .collect()

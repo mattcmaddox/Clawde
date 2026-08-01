@@ -105,6 +105,7 @@ impl RemoteSessionManager {
 
     /// Start background sync loop: pushes local transcript to cloud every 30s.
     /// Returns a JoinHandle; caller should keep it alive.
+    #[allow(dead_code)]
     pub fn start_background_sync(
         self: std::sync::Arc<Self>,
         session_id: String,

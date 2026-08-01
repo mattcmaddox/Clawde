@@ -282,6 +282,7 @@ pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
 }
 
 /// Concatenate all memory file contents into a single system-prompt fragment.
+#[allow(dead_code)]
 pub fn build_memory_prompt(files: &[MemoryFileInfo]) -> String {
     files
         .iter()

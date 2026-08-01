@@ -19,16 +19,19 @@ pub enum AutoApproveMode {
 
 impl AutoApproveMode {
     /// True if this mode auto-approves bash/shell command execution.
+    #[allow(dead_code)]
     pub fn auto_approves_bash(&self) -> bool {
         matches!(self, Self::BypassPermissions)
     }
 
     /// True if this mode auto-approves file edits.
+    #[allow(dead_code)]
     pub fn auto_approves_edits(&self) -> bool {
         matches!(self, Self::AcceptEdits | Self::BypassPermissions)
     }
 
     /// True if this mode shows a plan before tool execution.
+    #[allow(dead_code)]
     pub fn is_plan_mode(&self) -> bool {
         matches!(self, Self::Plan)
     }
@@ -68,6 +71,7 @@ impl AutoModeState {
     }
 
     /// Activate bypass mode; requires warning to have been accepted.
+    #[allow(dead_code)]
     pub fn activate_bypass(&mut self, session_id: &str, turn: u32) {
         self.mode = AutoApproveMode::BypassPermissions;
         self.warning_accepted = true;

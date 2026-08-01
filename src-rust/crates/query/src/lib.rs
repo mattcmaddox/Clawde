@@ -475,7 +475,7 @@ pub async fn run_query_loop(
         let from_registry = config
             .provider_registry
             .as_ref()
-            .and_then(|reg| reg.get(&clawde_core::ProviderId::new(&*pid)).cloned());
+            .and_then(|reg| reg.get(&clawde_core::ProviderId::new(pid)).cloned());
         if from_registry.is_some() {
             from_registry
         } else {
@@ -2253,6 +2253,16 @@ mod tests {
     use super::*;
     use clawde_api::SystemPrompt;
 
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+        // so a `pub fn` that nothing calls silently rots. The shared
+        // implementation in `clawde_core::dead_code_guard` scans the workspace
+        // and fails if any `pub fn` / `pub async fn` declared in this crate has
+        // no reference anywhere except its own declaration.
+        clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
+
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
             model: "claude-sonnet-4-6".to_string(),
@@ -3033,18 +3043,19 @@ mod tests {
     /// Drive `run_query_loop` against the recording provider. Returns the
     /// outcome, the per-request "tools were empty" record, and the final
     /// message history.
-    async fn drive_loop_with_mock(
-        always_end_turn: bool,
-        max_turns: u32,
+    /// Shared driver: run `run_query_loop` against a registered provider and
+    /// return the outcome plus the final message history.
+    ///
+    /// The loop resolves the provider by the id `"mockprov"` (see
+    /// `config.provider`), so `provider.id()` MUST be `"mockprov"` for the
+    /// registry lookup to hit — otherwise the loop silently falls through to
+    /// the Anthropic client path.
+    async fn drive_loop_with_provider(
+        provider: Arc<dyn clawde_api::LlmProvider>,
         tools: Vec<Box<dyn Tool>>,
+        max_turns: u32,
         continuation: crate::continuation::ContinuationMode,
-    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
-        let recorded = Arc::new(StdMutex::new(Vec::new()));
-        let provider = Arc::new(RecordingProvider {
-            id: clawde_core::provider_id::ProviderId::new("mockprov"),
-            tools_empty_per_request: recorded.clone(),
-            always_end_turn,
-        });
+    ) -> (QueryOutcome, Vec<Message>) {
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
         let registry = Arc::new(registry);
@@ -3086,8 +3097,223 @@ mod tests {
         .await
         .expect("loop must not hang");
 
+        (outcome, messages)
+    }
+
+    async fn drive_loop_with_mock(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded.clone(),
+            always_end_turn,
+        });
+        let (outcome, messages) =
+            drive_loop_with_provider(provider, tools, max_turns, continuation).await;
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    // ---- Spec §6.2: RetryingFreeStream placeholder/summary wiring --------
+
+    /// A provider that replays a scripted `StreamEvent` sequence, mirroring the
+    /// event shape `RetryingFreeStream` emits for the free-mode empty-completion
+    /// fallback: a bare placeholder `TextDelta` with no preceding
+    /// `ContentBlockStart`, then the retried upstream's real deltas, then the
+    /// final `MessageStop`. Proves the query loop accumulates the placeholder
+    /// AND the retried answer into the transcript.
+    struct ScriptedStreamProvider {
+        id: clawde_core::provider_id::ProviderId,
+        events: Vec<Result<clawde_api::StreamEvent, clawde_api::ProviderError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for ScriptedStreamProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-stream"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            let events = self.events.clone();
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// Drive `run_query_loop` against a scripted-stream provider. Returns the
+    /// outcome and the final message history.
+    async fn drive_loop_with_scripted(
+        provider: Arc<dyn clawde_api::LlmProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> (QueryOutcome, Vec<Message>) {
+        drive_loop_with_provider(
+            provider,
+            tools,
+            1,
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await
+    }
+
+    /// The placeholder emitted by `RetryingFreeStream` (a bare `TextDelta` with
+    /// no preceding `ContentBlockStart`) must land in the transcript alongside
+    /// the retried upstream's real answer — the turn must NOT end on the
+    /// placeholder (spec §6.2).
+    #[tokio::test]
+    async fn retrying_placeholder_and_answer_flow_into_transcript() {
+        use clawde_api::provider_types::StopReason;
+        use clawde_api::StreamEvent;
+
+        let provider = Arc::new(ScriptedStreamProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            events: vec![
+                Ok(StreamEvent::MessageStart {
+                    id: "m1".to_string(),
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                // Empty first attempt: bare placeholder delta, no block start.
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "(no response from groq/llama-3.3-70b-versatile — model ended the turn with stop_reason \"end_turn\")".to_string(),
+                }),
+                // Retried upstream's real answer.
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Hello from cerebras".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: None,
+                }),
+                Ok(StreamEvent::MessageStop),
+            ],
+        });
+
+        let (outcome, messages) = drive_loop_with_scripted(provider, noop_tools()).await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "a completed turn must yield EndTurn"
+        );
+        let final_text = messages.last().expect("assistant message").get_all_text();
+        assert!(
+            final_text.contains("no response from groq"),
+            "transcript must keep the placeholder, got: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("Hello from cerebras"),
+            "transcript must include the retried answer, got: {}",
+            final_text
+        );
+        // The wrapper's placeholder lands in text_chunks, so the query loop's
+        // own empty-turn fallback (lib.rs) must NOT emit a second placeholder.
+        assert_eq!(
+            final_text.matches("no response from").count(),
+            1,
+            "exactly one placeholder expected, got: {}",
+            final_text
+        );
+    }
+
+    /// Worst case (all upstreams failed): the §6.6 one-line-per-attempt summary
+    /// must land in the transcript and the turn must still terminate — never a
+    /// blank/placeholder-only dead-end.
+    #[tokio::test]
+    async fn retrying_all_fail_summary_flows_into_transcript() {
+        use clawde_api::provider_types::StopReason;
+        use clawde_api::StreamEvent;
+
+        let provider = Arc::new(ScriptedStreamProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            events: vec![
+                Ok(StreamEvent::MessageStart {
+                    id: "m1".to_string(),
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "(no response from groq/llama-3.3-70b-versatile — model ended the turn with stop_reason \"end_turn\")".to_string(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "(all free upstreams failed: groq: empty (3s, stop_reason \"end_turn\"); cerebras: empty (2s, stop_reason \"end_turn\")) — run /keys health for key status.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: None,
+                }),
+                Ok(StreamEvent::MessageStop),
+            ],
+        });
+
+        let (outcome, messages) = drive_loop_with_scripted(provider, noop_tools()).await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the all-fail turn must still complete, not hang or error"
+        );
+        let final_text = messages.last().expect("assistant message").get_all_text();
+        // Both the per-attempt placeholder AND the §6.6 summary must be in the
+        // transcript, in order — the turn never dead-ends on the placeholder.
+        assert!(
+            final_text.contains("no response from groq"),
+            "transcript must keep the placeholder, got: {}",
+            final_text
+        );
+        assert!(
+            final_text.contains("all free upstreams failed"),
+            "transcript must keep the §6.6 summary, got: {}",
+            final_text
+        );
     }
 
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one

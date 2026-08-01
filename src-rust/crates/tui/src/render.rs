@@ -35,8 +35,8 @@ use crate::notifications::{render_notification_banner, Notification, Notificatio
 use crate::onboarding_dialog::render_onboarding_dialog;
 use crate::overage_upsell::render_overage_upsell;
 use crate::overlays::{
-    render_global_search, render_help_overlay, render_history_search_overlay, render_rewind_flow,
-    CLAURST_ACCENT,
+    render_global_search, render_help_overlay, render_history_search_overlay,
+    render_keybindings_overlay, render_rewind_flow,
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::prompt_input::{input_height, render_prompt_input, InputMode, TypeaheadSource, VimMode};
@@ -46,6 +46,7 @@ use crate::session_browser::render_session_browser;
 use crate::settings_screen::render_settings_screen;
 use crate::stats_dialog::render_stats_dialog;
 use crate::tasks_overlay::render_tasks_overlay;
+use crate::theme_creator::render_theme_creator;
 use crate::theme_screen::render_theme_screen;
 use crate::transcript_turn::{build_transcript_turns, TranscriptTurn};
 use crate::virtual_list::{VirtualItem, VirtualList};
@@ -61,29 +62,33 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-// Spinner frames matching the TypeScript SpinnerGlyph: platform-specific base
-// characters mirrored (forward + reverse) for a smooth pulse effect.
-// Windows uses '*' instead of '✳'/'✽' for better font coverage.
-#[cfg(target_os = "windows")]
+// Default spinner: classic braille dot rotation — universally supported,
+// always renders cleanly with solid color. Shows during normal processing.
 const SPINNER: &[char] = &[
-    '\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
-    '\u{2736}', '*', '\u{2722}', '\u{00b7}',
+    '\u{280b}', // ⠋
+    '\u{2819}', // ⠙
+    '\u{2839}', // ⠹
+    '\u{2838}', // ⠸
+    '\u{283c}', // ⠼
+    '\u{2834}', // ⠴
+    '\u{2826}', // ⠦
+    '\u{2827}', // ⠧
+    '\u{2807}', // ⠇
+    '\u{280f}', // ⠏
 ];
-#[cfg(not(target_os = "windows"))]
-const SPINNER: &[char] = &[
-    '\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
-    '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}',
+
+// Attention-grabbing snowflake spinner, used when a modal dialog needs
+// the user's response (permission requests, AskUser questions, etc.).
+// Deliberately more eye-catching than the subtle braille dots.
+const SPINNER_SNOWFLAKE: &[char] = &[
+    '\u{00b7}', '\u{2722}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}', '\u{2722}', '\u{00b7}',
 ];
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 const WELCOME_BOX_HEIGHT: u16 = 12;
 const STATUS_THINKING: &str = "thinking";
 const STATUS_THINKING_ELLIPSIS: &str = "thinking\u{2026}";
 
-fn spinner_char(frame_count: u64) -> char {
-    SPINNER[(frame_count as usize) % SPINNER.len()]
-}
-
-/// Returns the colour to use for the streaming spinner: claurst red normally,
+/// Returns the colour to use for the streaming spinner: pink normally,
 /// brightening to a hot red when no stream data has arrived for over 3 seconds.
 fn spinner_color(app: &App) -> Color {
     if let Some(start) = app.stall_start {
@@ -551,13 +556,22 @@ fn reset_render_caches() {
 
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
+    // Sync the thread-local palette so all CLAURST_* constants resolve to
+    // the active theme without threading `app` through every sub-function.
+    // While the theme creator's editor is open, the whole UI (creator modal
+    // included) is themed by the work-in-progress palette so colour
+    // assignments preview live against the main TUI.
+    let live_palette = app.theme_creator.editor_palette().unwrap_or(app.palette);
+    crate::theme_colors::CURRENT_PALETTE.with(|p| *p.borrow_mut() = live_palette);
+
     let size = frame.area();
     app.last_selectable_area.set(size);
 
-    // Fill the entire frame with a black background so the terminal's default
-    // color (blue on Windows) doesn't bleed through cells not covered by widgets.
+    // Fill the entire frame with the theme's panel background so the terminal's
+    // default color (blue on Windows) doesn't bleed through cells not covered by widgets.
+    let p = crate::theme_colors::current_palette();
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black).fg(Color::White)),
+        Block::default().style(Style::default().bg(p.panel_bg).fg(p.text_light)),
         size,
     );
 
@@ -660,6 +674,17 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_tasks_overlay(frame, &app.tasks_overlay, size);
     }
 
+    // Keybinding cheat-sheet overlay (Ctrl+/)
+    if app.keybindings_overlay.visible {
+        render_keybindings_overlay(
+            frame,
+            &app.keybindings_overlay,
+            size,
+            app.frame_count,
+            app.accent_color,
+        );
+    }
+
     // New help overlay
     if app.help_overlay.visible {
         render_help_overlay(frame, &app.help_overlay, size);
@@ -689,6 +714,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Theme picker overlay
     if app.theme_screen.visible {
         render_theme_screen(frame, &app.theme_screen, size);
+    }
+    // Theme creator overlay
+    if app.theme_creator.visible {
+        render_theme_creator(frame, &app.theme_creator, size);
     }
 
     if app.stats_dialog.visible {
@@ -891,8 +920,9 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                     .unwrap_or_default();
                 // Merge per-provider HTTP rate limit data into the table rows.
                 for row in &mut rows {
-                    if let Some(&(tokens, requests)) =
-                        app.provider_http_rates.get(&row.provider_name.to_lowercase())
+                    if let Some(&(tokens, requests)) = app
+                        .provider_http_rates
+                        .get(&row.provider_name.to_lowercase())
                     {
                         row.tokens_pct = Some(tokens);
                         row.requests_pct = Some(requests);
@@ -1118,7 +1148,7 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 30)))
-            .border_style(Style::default().fg(CLAURST_ACCENT));
+            .border_style(Style::default().fg(crate::theme_colors::current_palette().accent));
         menu_block.render(menu_area, frame.buffer_mut());
 
         // Render menu items
@@ -1149,7 +1179,7 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
 
             let bg_color = if is_selected {
                 if *enabled {
-                    CLAURST_ACCENT
+                    crate::theme_colors::current_palette().accent
                 } else {
                     Color::Rgb(24, 24, 30)
                 }
@@ -1949,6 +1979,25 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         right_lines.push(Line::from(chunk.iter().collect::<String>()));
     }
     right_lines.push(Line::from(""));
+
+    // Free mode health badge — shows key count when free mode has keys
+    let free_filled = app.free_mode_dialog.filled_count();
+    let free_total = app.free_mode_dialog.fields.len();
+    if free_filled > 0 {
+        right_lines.push(Line::from(vec![
+            Span::styled(
+                " Free mode ",
+                Style::default()
+                    .fg(Color::Rgb(120, 210, 150))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} / {} keys", free_filled, free_total),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
     right_lines.push(Line::from(Span::styled(
         "Recent activity",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
@@ -2005,14 +2054,14 @@ fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let box_w = width as usize;
     let inner_w = box_w.saturating_sub(4); // "│ " + content + " │"
 
-    // Top border with an embedded title: ╭─ Clawde vX.Y ─…─╮
-    // Span widths: "╭─"=2, " Clawde "=9, "v{ver} "=ver+2, dashes=fill, "╮"=1.
-    let used = 2 + 9 + (APP_VERSION.len() + 2) + 1;
+    // Top border with an embedded title: ╭─ 🐾Clawde vX.Y ─…─╮
+    // Span widths: "╭─"=2, " 🐾Clawde "=10, "v{ver} "=ver+2, dashes=fill, "╮"=1.
+    let used = 2 + 10 + (APP_VERSION.len() + 2) + 1;
     let fill = box_w.saturating_sub(used);
     let top = Line::from(vec![
         Span::styled("\u{256d}\u{2500}", Style::default().fg(accent)),
         Span::styled(
-            " Clawde ",
+            " \u{1F43E}Clawde ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -2412,7 +2461,10 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         };
 
         let pink = app.accent_color;
-        let dim = Color::Rgb(110, 110, 124);
+        // Dim secondary text (provider, badges, shortcut hints) and the bold
+        // model name are themeable slots (hint / model_name), not hardcoded.
+        let p = crate::theme_colors::current_palette();
+        let dim = p.hint;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -2422,12 +2474,31 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             .split(status_area);
 
         let left_line = if app.has_credentials {
-            let (provider, model_short) =
+            let (mut provider, mut model_short) =
                 if let Some((provider, model)) = app.model_name.split_once('/') {
                     (provider.to_string(), model.to_string())
                 } else {
                     ("local".to_string(), app.model_name.clone())
                 };
+            // For the free composite provider, cycle through upstreams or
+            // show the abstract "auto" label based on free_upstream_index.
+            // 0 = auto, 1..N = upstream from free_model_defaults.
+            if provider == "free" && !app.free_model_defaults.is_empty() {
+                let idx = app.free_upstream_index;
+                let upstream_count = app.free_model_defaults.len();
+                let safe_idx = if idx == 0 || idx > upstream_count {
+                    None
+                } else {
+                    Some(idx - 1)
+                };
+                if let Some(ui) = safe_idx {
+                    if let Some((upstream, upstream_model)) = app.free_model_defaults.get(ui) {
+                        provider = upstream.clone();
+                        model_short = upstream_model.clone();
+                    }
+                }
+                // idx == 0: keep the abstract "auto" / "free" labels
+            }
             let mut spans = vec![
                 Span::styled(
                     format!(" {} ", agent_mode.to_uppercase()),
@@ -2440,7 +2511,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                 Span::styled(
                     model_short,
                     Style::default()
-                        .fg(Color::White)
+                        .fg(p.model_name)
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -2454,6 +2525,16 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                     Style::default().fg(dim),
                 ));
             }
+            // Effort level indicator (thinking level) — shown for all providers.
+            let effort_color = p.effort;
+            spans.push(Span::styled(
+                format!(
+                    " · {} {}",
+                    app.effort_level.symbol(),
+                    app.effort_level.label()
+                ),
+                Style::default().fg(effort_color),
+            ));
             Line::from(spans)
         } else {
             Line::from(vec![
@@ -2468,19 +2549,75 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             ])
         };
 
-        // `?` opens the shortcuts overlay which already lists Ctrl+A / Ctrl+K
-        // and friends — surfacing them again here is redundant clutter. It is
-        // also suppressed once the prompt has text, so the hint doesn't compete
-        // with what the user is typing (matches the footer contract).
-        let right_hint = if app.has_credentials && app.prompt_input.text.is_empty() {
-            Line::from(vec![Span::styled("? shortcuts", Style::default().fg(dim))])
-        } else if app.prompt_input.has_expandable_paste_ref() {
+        // Context-sensitive hints in the right slot. These are suppressed
+        // once the prompt has text so they don't compete with typing, and
+        // during streaming when the input is readonly.
+        let right_hint = if app.prompt_input.has_expandable_paste_ref() {
             // A [Pasted text #N ...] placeholder is in the buffer — tell the
             // user how to view the full pasted body before submitting.
             Line::from(vec![Span::styled(
                 "click to view paste · alt+e expands",
                 Style::default().fg(dim),
             )])
+        } else if app.has_credentials && app.prompt_input.text.is_empty() && !app.is_streaming {
+            // Build a set of state badges + a shortcut hint.
+            // State badges show persistent config info (goal, effort, modes).
+            let mut badge_spans: Vec<Span<'static>> = Vec::new();
+
+            // Effort level symbol + label (when not default Medium)
+            if app.effort_level != clawde_core::effort::EffortLevel::Medium {
+                let effort_color = p.effort;
+                badge_spans.push(Span::styled(
+                    format!("{} {}", app.effort_level.symbol(), app.effort_level.label()),
+                    Style::default().fg(effort_color),
+                ));
+            } // Routing strategy badge (only for free provider).
+            if app.config.selected_provider_id() == "free" {
+                if let Some(ref registry) = app.provider_registry {
+                    let active_pid = app.config.selected_provider_id();
+                    if let Some(provider) =
+                        registry.get(&clawde_core::provider_id::ProviderId::new(active_pid))
+                    {
+                        if let Some(strategy_name) = provider.routing_strategy_name() {
+                            badge_spans
+                                .push(Span::styled(strategy_name, Style::default().fg(p.routing)));
+                        }
+                    }
+                }
+            }
+
+            // Vim navigation hint (Shift+K/J/H/L) when in Normal mode.
+            if app.prompt_input.vim_enabled && app.prompt_input.vim_mode == VimMode::Normal {
+                badge_spans.push(Span::styled("K↑J↓H↑L↓", Style::default().fg(p.vim_hint)));
+            }
+
+            // Shortcut hint: pick the most relevant actionable hint.
+            let shortcut = if app.voice_recorder.is_some() {
+                "Alt+V speak"
+            } else if app.config.selected_provider_id() == "free"
+                && app.free_model_defaults.len() > 1
+            {
+                "Alt+U cycle"
+            } else {
+                "? shortcuts · Ctrl+/ keys"
+            };
+
+            // Join badges with · separator, then append shortcut.
+            let mut spans: Vec<Span> = Vec::new();
+            let mut first = true;
+            for s in &badge_spans {
+                if !first {
+                    spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                }
+                spans.push(s.clone());
+                first = false;
+            }
+            if !first {
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(shortcut, Style::default().fg(dim)));
+
+            Line::from(spans)
         } else {
             Line::from(Vec::<Span>::new())
         };
@@ -2535,21 +2672,35 @@ fn should_render_status_row(app: &App) -> bool {
 
     // Check if any provider has exhausted API keys — keep the status row
     // visible so the user sees the key exhaustion indicator even while idle.
-    let has_exhausted_keys = app.provider_registry.as_ref().map_or(false, |reg| {
+    let has_exhausted_keys = app.provider_registry.as_ref().is_some_and(|reg| {
         reg.key_ring_summaries()
             .iter()
             .any(|(_, active, total, _)| *active < *total)
+    });
+
+    // Also keep the row visible while any upstream is in empty-completion
+    // cooldown (spec §6.3) so the user sees which upstreams are cooled down
+    // for repeated empty completions.
+    let has_empty_cooldowns = app.provider_registry.as_ref().is_some_and(|reg| {
+        reg.empty_cooldown_summaries()
+            .iter()
+            .any(|(_, entries)| entries.iter().any(|(_, _, retry)| retry.is_some()))
     });
 
     // Note: a completed turn's "Worked for Xs" summary (`last_turn_elapsed`) is
     // intentionally NOT a reason to keep the status row on — it stays set until
     // the next submit, so gating on it pinned the idle spinner glyph on screen
     // permanently after the first turn. The row now shows only while actually
-    // active (voice, streaming, or an idle status message).
+    // active (voice, streaming, or an idle status message). Free-mode routing
+    // and key health are shown in the prompt config row (Row 2) instead.
     app.voice_recording
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
         || has_exhausted_keys
+        || has_empty_cooldowns
+        || app.fast_mode
+        || app.plan_mode
+        || app.active_goal_badge.is_some()
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
@@ -2581,8 +2732,25 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             .or(app.spinner_verb.as_deref())
             .unwrap_or("Thinking");
 
+        let needs_attention = app.permission_request.is_some()
+            || app.ask_user_dialog.visible
+            || app.mcp_approval.visible
+            || app.elicitation.visible;
+
+        // Pick the spinner set: braille during normal streaming,
+        // snowflake during attention dialogs (more eye-catching).
+        let spinner_set = if needs_attention {
+            SPINNER_SNOWFLAKE
+        } else {
+            SPINNER
+        };
+        // Braille slows down to every 3 frames so the rotation is visible;
+        // snowflake stays at frame-by-frame speed to grab attention.
+        let rate = if needs_attention { 1 } else { 3 };
+        let spinner = spinner_set[((app.frame_count as usize) / rate) % spinner_set.len()];
+
         let mut s = vec![Span::styled(
-            spinner_char(app.frame_count).to_string(),
+            spinner.to_string(),
             Style::default()
                 .fg(spinner_color(app))
                 .add_modifier(Modifier::BOLD),
@@ -2638,19 +2806,74 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // Show active routing strategy when the active provider exposes one.
-        let active_pid = app.config.selected_provider_id();
-        if let Some(provider) = registry.get(&clawde_core::provider_id::ProviderId::new(active_pid))
-        {
-            if let Some(strategy_name) = provider.routing_strategy_name() {
-                if !spans.is_empty() {
-                    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-                }
-                spans.push(Span::styled(
-                    format!("\u{2699} {}", strategy_name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                ));
+        // Empty-completion cooldowns (spec §6.3): show which upstreams are
+        // cooled down for repeated empty completions, with the remaining
+        // retry time. Only upstreams currently in cooldown are shown here;
+        // sub-threshold counters are visible via /keys health. The badge
+        // renders even when the row is otherwise empty (idle cooldown).
+        let cooldowns = registry.empty_cooldown_summaries();
+        let has_cooled = cooldowns
+            .iter()
+            .any(|(_, entries)| entries.iter().any(|(_, _, retry)| retry.is_some()));
+        if has_cooled {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
             }
+            for (provider, entries) in &cooldowns {
+                for (upstream, _, retry_secs) in entries {
+                    if let Some(secs) = retry_secs {
+                        let label = format!(
+                            "{}:{} empty-cooldown (retry in {})",
+                            provider,
+                            upstream,
+                            format_duration_ms(secs * 1000)
+                        );
+                        spans.push(Span::styled(label, Style::default().fg(Color::Yellow)));
+                        spans.push(Span::raw(" "));
+                    }
+                }
+            }
+        }
+
+        // Routing strategy and aggregate key health moved to the prompt
+        // config row (Row 2, render_input) so the transient status row only
+        // shows live activity (streaming, exhaustion, errors).
+    }
+
+    // Append agent/task state badges (goal, fast mode, plan mode) to Row 1.
+    // These are persistent config indicators that describe how the agent
+    // behaves, not how the model is configured (those go in Row 2).
+    if app.active_goal_badge.is_some() || app.fast_mode || app.plan_mode {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        if let Some(ref badge) = app.active_goal_badge {
+            spans.push(Span::styled(
+                format!("\u{1f3af} {}", badge),
+                Style::default().fg(Color::Rgb(120, 200, 120)),
+            ));
+        }
+        if app.fast_mode {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(
+                "Fast",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if app.plan_mode {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            }
+            spans.push(Span::styled(
+                "Plan",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
     }
 
@@ -2675,12 +2898,16 @@ fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
         return Vec::new();
     }
 
-    // Cycle length = text_len + 20 (10 off-screen on each side)
-    let cycle_len = len + 20;
-    // One step every 4 frames (~200ms at 50ms/frame)
-    let cycle_pos = (frame_count as usize / 4) % cycle_len;
-    // Glimmer sweeps right→left: starts at len+10 (off right), ends at -10 (off left)
-    let glimmer_center = (len + 10).saturating_sub(cycle_pos) as isize;
+    // Cycle length = text_len + 5 (~2-3 off-screen on each side)
+    // Small off-screen padding keeps the pause between sweeps short.
+    let cycle_len = len + 5;
+    // One step every 3 frames (~150ms at 50ms/frame) — slower sweep
+    let cycle_pos = (frame_count as usize / 3) % cycle_len;
+    // Glimmer sweeps right→left: starts at len+2 (off right), ends at -3 (off left)
+    // Uses raw subtraction (not saturating) so the center wraps past 0 into
+    // negative territory and goes off-screen left before the cycle resets,
+    // avoiding a "stuck shimmer" on the leftmost characters.
+    let glimmer_center = (len + 2) as isize - cycle_pos as isize;
 
     let base = Style::default().fg(Color::DarkGray);
     let bright = Style::default().fg(Color::White);
@@ -2691,7 +2918,8 @@ fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
     let mut run_bright = false;
 
     for (i, &ch) in chars.iter().enumerate() {
-        let is_bright = (i as isize - glimmer_center).abs() <= 1
+        // Wider bright band: 5 characters glow (center ± 2) instead of 3
+        let is_bright = (i as isize - glimmer_center).abs() <= 2
             && glimmer_center >= 0
             && glimmer_center < len as isize;
 
@@ -2795,6 +3023,18 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(
                 format!("\u{27f3} {}", task_status),
                 Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        // Last search backend indicator — shows which search backend was used.
+        let search_backend = clawde_tools::web_search::get_last_search_backend();
+        if !search_backend.is_empty() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("search:{search_backend}"),
+                Style::default().fg(Color::DarkGray),
             ));
         }
 
@@ -3067,7 +3307,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
             parts.push(Span::styled(
                 format!("[{}]", badge),
-                Style::default().fg(CLAURST_ACCENT),
+                Style::default().fg(crate::theme_colors::current_palette().accent),
             ));
         }
 
@@ -3504,6 +3744,7 @@ pub struct StatusLineData {
     pub goal_badge: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn render_full_status_line(
     data: &StatusLineData,
     area: Rect,
@@ -3691,6 +3932,7 @@ pub fn render_agent_progress_line(
 /// * `agent_count`   — total number of sub-agents spawned
 /// * `completed`     — number of agents that have finished
 /// * `active_agents` — slice of agent ID strings currently running
+#[allow(dead_code)]
 pub fn render_coordinator_status_lines(
     agent_count: usize,
     completed: usize,
@@ -3748,6 +3990,7 @@ pub fn render_coordinator_status_lines(
 /// # Arguments
 /// * `teammate_id`  — teammate identifier string
 /// * `session_info` — optional session info snippet to append
+#[allow(dead_code)]
 pub fn render_teammate_header(teammate_id: &str, session_info: Option<&str>) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
@@ -4361,5 +4604,180 @@ mod recent_activity_tests {
             "header rendered: present"
         );
         assert!(screen.contains("Sortable label"), "session label rendered");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status row: fast / plan / goal badges
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_row_badge_tests {
+    use super::*;
+    use crate::app::App;
+    use clawde_core::config::Config;
+    use clawde_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render_screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fast_badge_appears_when_fast_mode_enabled() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        // Enable fast_mode AND set a status message so the status row renders.
+        app.fast_mode = true;
+        app.status_message = Some("Testing fast mode.".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Fast"),
+            "'Fast' badge should appear in the status row when fast_mode=true. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn plan_badge_appears_when_plan_mode_enabled() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.plan_mode = true;
+        app.status_message = Some("Testing plan mode.".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Plan"),
+            "'Plan' badge should appear in the status row when plan_mode=true. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn goal_badge_appears_when_active_goal_set() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.active_goal_badge = Some("active · 5m · 3 turns".to_string());
+        app.status_message = Some("Testing goal.".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("active"),
+            "Goal badge should appear in the status row when active_goal_badge is set. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn fast_and_plan_badges_appear_together() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.fast_mode = true;
+        app.plan_mode = true;
+        app.status_message = Some("Testing both.".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Fast"),
+            "'Fast' badge should appear. Output: {:?}",
+            out
+        );
+        assert!(
+            out.contains("Plan"),
+            "'Plan' badge should appear. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn status_row_hidden_when_no_reason_to_show() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        // No streaming, no status message, no modes, no exhausted keys.
+        app.is_streaming = false;
+        app.status_message = None;
+        app.fast_mode = false;
+        app.plan_mode = false;
+        app.active_goal_badge = None;
+        let out = render_screen(&app);
+        // The status row line is at chunk[2]; when hidden `status_height` is 0
+        // and the row is not rendered. We can't check for absence of something
+        // that is not there, but we can verify the screen doesn't have unexpected
+        // text from a spuriously rendered status row.
+        assert!(
+            !out.contains("Thinking") && !out.contains("Fast"),
+            "Status row should be hidden when there is no reason to show it"
+        );
+    }
+
+    #[test]
+    fn fast_badge_appears_with_last_turn_verb() {
+        // Simulate the idle state: a completed turn with last_turn_verb and
+        // last_turn_elapsed set, plus fast_mode enabled.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.last_turn_verb = Some("Purred");
+        app.last_turn_elapsed = Some("5s".to_string());
+        app.fast_mode = true;
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Purred"),
+            "Turn verb should be visible. Output: {:?}",
+            out
+        );
+        assert!(
+            out.contains("Fast"),
+            "'Fast' badge should appear after the turn verb. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn fast_on_sets_fast_mode_and_shows_badge() {
+        // The on/off args path: set fast_mode via intercept_slash_command_with_args.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        assert!(app.intercept_slash_command_with_args("fast", "on"));
+        assert!(app.fast_mode);
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Fast"),
+            "'Fast' badge should appear after /fast on. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn fast_off_clears_fast_mode() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.fast_mode = true;
+        assert!(app.intercept_slash_command_with_args("fast", "off"));
+        assert!(!app.fast_mode);
+        let out = render_screen(&app);
+        // The status message "Fast mode off." contains "Fast", so check for
+        // the badge separator pattern instead.
+        let badge_marker = " · Fast";
+        assert!(
+            !out.contains(badge_marker),
+            "'Fast' badge should NOT appear after /fast off. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn model_picker_does_not_clear_fast_mode() {
+        // fast_mode is now decoupled from model selection.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.fast_mode = true;
+        // Simulate the model picker close path — confirm fast_mode survives.
+        app.set_model("claude-sonnet-4-20250514".to_string());
+        app.status_message = Some("Model changed.".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("Fast"),
+            "'Fast' badge should survive a model change. Output: {:?}",
+            out
+        );
     }
 }

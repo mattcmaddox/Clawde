@@ -27,7 +27,7 @@
 //!   `Ultracode` rung on top of whatever this module returns.
 //! - The minimax-m3 adaptive variant map is `{ none, thinking }`; claurst has no
 //!   dedicated "thinking" rung, so `thinking` maps to the nearest rung (`High`).
-//!   See the `// NOTE:` at [`effort_key_to_level`].
+//!   See the `// NOTE:` at `effort_key_to_level`.
 
 use clawde_core::effort::EffortLevel;
 use once_cell::sync::Lazy;

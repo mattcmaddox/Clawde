@@ -62,6 +62,7 @@ fn content_to_blocks(content: &MessageContent) -> Vec<ContentBlock> {
 ///
 /// Every `ContentBlock` is serialised to its Anthropic API JSON
 /// representation; no information is discarded.
+#[allow(dead_code)]
 pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) -> CloudMessage {
     let role = match msg.role {
         Role::User => "user".to_string(),
@@ -87,6 +88,7 @@ pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) 
 /// Each element of `content` is deserialised as a `ContentBlock`.  Elements
 /// that cannot be parsed are silently skipped so that unknown future block
 /// types do not crash older clients.
+#[allow(dead_code)]
 pub fn cloud_to_message(cloud: &CloudMessage) -> Message {
     let role = if cloud.role == "assistant" {
         Role::Assistant
@@ -162,29 +164,6 @@ impl CloudSessionClient {
             .await
             .map_err(|e| e.to_string())?;
         resp.json().await.map_err(|e| e.to_string())
-    }
-
-    /// Push new messages to a cloud session.
-    pub async fn push_messages(
-        &self,
-        session_id: &str,
-        messages: &[CloudMessage],
-    ) -> Result<(), String> {
-        let resp = self
-            .http
-            .post(format!(
-                "{}/api/sessions/{}/messages",
-                self.base_url, session_id
-            ))
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .json(messages)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-        Ok(())
     }
 
     /// Create a new cloud session.

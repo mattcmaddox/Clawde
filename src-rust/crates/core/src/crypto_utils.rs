@@ -35,6 +35,7 @@ pub fn generate_uuid() -> String {
 }
 
 /// Generate a cryptographically random work secret (32 bytes, base64url-encoded).
+#[allow(dead_code)]
 pub fn generate_work_secret() -> String {
     let mut bytes = [0u8; 32];
     if getrandom::getrandom(&mut bytes).is_err() {

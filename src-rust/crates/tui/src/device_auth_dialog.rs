@@ -121,6 +121,7 @@ impl DeviceAuthDialogState {
 
     /// Transition to the polling state (code has been shown, now waiting for
     /// the user to complete authorization).
+    #[allow(dead_code)]
     pub fn set_polling(&mut self) {
         self.status = DeviceAuthStatus::Polling;
     }

@@ -161,6 +161,8 @@ pub mod stats_dialog;
 pub mod tasks_overlay;
 /// Color palette management for different themes and accessibility support.
 pub mod theme_colors;
+/// Interactive theme creator + CRUD manager (list + 256-color grid editor).
+pub mod theme_creator;
 /// Theme picker overlay.
 pub mod theme_screen;
 /// Turn-aware transcript grouping and metadata helpers.
@@ -356,7 +358,7 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
     let kitty_active = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     KEYBOARD_ENHANCEMENT_ACTIVE.store(kitty_active, Ordering::Relaxed);
 
-    set_terminal_title("\u{1f980} Clawde");
+    set_terminal_title("\u{1F63C} Clawde");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -432,11 +434,11 @@ pub fn set_terminal_progress(active: bool) {
 }
 
 /// Update the terminal title to reflect the current session context.
-/// Format: "🦀 | <topic>" or just "🦀 Clawde" when no topic is set.
+/// Format: "😼 | \<topic>" or just "😼 Clawde" when no topic is set.
 pub fn update_terminal_title(topic: Option<&str>) {
     match topic {
-        Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1f980} | {}", t)),
-        _ => set_terminal_title("\u{1f980} Clawde"),
+        Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1F63C} | {}", t)),
+        _ => set_terminal_title("\u{1F63C} Clawde"),
     }
 }
 
@@ -448,6 +450,16 @@ pub fn update_terminal_title(topic: Option<&str>) {
 mod tests {
     use super::*;
     use app::{App, HistorySearch, ToolStatus, ToolUseBlock};
+
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+        // so a `pub fn` that nothing calls silently rots. The shared
+        // implementation in `clawde_core::dead_code_guard` scans the workspace
+        // and fails if any `pub fn` / `pub async fn` declared in this crate has
+        // no reference anywhere except its own declaration.
+        clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
     use clawde_core::config::Config;
     use clawde_core::cost::CostTracker;
     use clawde_core::file_history::FileHistory;

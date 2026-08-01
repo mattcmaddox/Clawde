@@ -106,6 +106,9 @@ const MAX_COOLDOWN_RETRIES: u32 = 3;
 // KeyRotatingProvider
 // ---------------------------------------------------------------------------
 
+/// Factory function type that builds a provider instance from an API key.
+pub type ProviderFactory = Arc<dyn Fn(&str) -> Arc<dyn LlmProvider> + Send + Sync>;
+
 /// Wraps API keys with automatic rotation on exhaustion.
 ///
 /// On each request, the next available key is fetched from the [`KeyRing`],
@@ -117,7 +120,7 @@ pub struct KeyRotatingProvider {
     provider_id: ProviderId,
     provider_name: String,
     ring: Arc<Mutex<KeyRing>>,
-    build_provider: Arc<dyn Fn(&str) -> Arc<dyn LlmProvider> + Send + Sync>,
+    build_provider: ProviderFactory,
     /// Path to persisted cooldown state file. `None` = no persistence.
     state_path: Option<PathBuf>,
 }
@@ -177,14 +180,16 @@ impl KeyRotatingProvider {
         self.ring.lock().unwrap().statuses()
     }
 
-    /// Number of active (non-exhausted) keys.
+    /// Number of active (non-exhausted) keys. Poison-safe: a poisoned lock
+    /// reports zero rather than panicking, so status aggregation never crashes
+    /// the query path.
     pub fn active_key_count(&self) -> usize {
-        self.ring.lock().unwrap().active_count()
+        self.ring.lock().map(|r| r.active_count()).unwrap_or(0)
     }
 
-    /// Number of exhausted keys.
+    /// Number of exhausted keys. Poison-safe, see [`Self::active_key_count`].
     pub fn exhausted_key_count(&self) -> usize {
-        self.ring.lock().unwrap().exhausted_count()
+        self.ring.lock().map(|r| r.exhausted_count()).unwrap_or(0)
     }
 
     /// Reference to the key ring (for inspection).
@@ -390,9 +395,26 @@ impl LlmProvider for KeyRotatingProvider {
     }
 
     fn key_ring_status(&self) -> Option<(usize, usize, Option<u64>)> {
+        // Every key is either active or in cooldown, so the total is the sum of
+        // the two public counters (both poison-safe).
+        let active = self.active_key_count();
+        let total = active + self.exhausted_key_count();
         match self.ring.lock() {
-            Ok(ring) => Some((ring.active_count(), ring.len(), ring.earliest_retry_secs())),
+            Ok(ring) => Some((active, total, ring.earliest_retry_secs())),
             Err(_) => None,
+        }
+    }
+
+    fn mark_key_exhausted(
+        &self,
+        _upstream_id: Option<&str>,
+        key_idx: usize,
+        cooldown_secs: u64,
+        reason: Option<String>,
+    ) -> bool {
+        match self.ring.lock() {
+            Ok(mut ring) => ring.mark_exhausted(key_idx, cooldown_secs, reason),
+            Err(_) => false,
         }
     }
 

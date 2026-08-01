@@ -164,7 +164,7 @@ fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("     › ", Style::default().fg(pink)),
             Span::styled(
-                "claurst auth login",
+                "clawde auth login",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -278,7 +278,7 @@ fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("     › ", Style::default().fg(pink)),
             Span::styled(
-                "claurst --provider ollama",
+                "clawde --provider ollama",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -292,7 +292,7 @@ fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
                 Style::default().fg(Color::Rgb(120, 120, 120)),
             ),
             Span::styled(
-                "claurst --help",
+                "clawde --help",
                 Style::default().fg(Color::Rgb(150, 150, 150)),
             ),
         ]),
@@ -303,7 +303,7 @@ fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
             Span::styled("/providers", Style::default().fg(Color::Rgb(150, 150, 150))),
         ]),
         Line::from(vec![Span::styled(
-            "  → 20+ more providers: claurst --help",
+            "  → 20+ more providers: clawde --help",
             Style::default().fg(Color::DarkGray),
         )]),
         Line::from(""),

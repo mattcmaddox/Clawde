@@ -186,31 +186,9 @@ impl Analytics {
     }
 }
 
-/// No-op analytics stub. The OSS/free build intentionally ships without
-/// product telemetry. All call sites compile unchanged; all data is discarded.
-pub fn log_event(_event_name: &str, _metadata: &[(&str, &str)]) {}
-
-pub async fn log_event_async(_event_name: &str, _metadata: &[(&str, &str)]) {}
-
-/// No-op. The Rust port does not initialize OpenTelemetry exporters.
-pub fn initialize_telemetry() {}
-
-/// No-op. Nothing to flush.
-pub async fn flush_telemetry() {}
-
 /// Always returns false. Enhanced telemetry is disabled.
 pub fn is_enhanced_telemetry_enabled() -> bool {
     false
-}
-
-/// Returns telemetry status based on environment variable.
-/// Defaults to off; users can opt-in with CLAURST_ENABLE_TELEMETRY=1.
-/// The free/OSS build respects this preference but does not phone home.
-pub fn is_telemetry_enabled() -> bool {
-    std::env::var("CLAURST_ENABLE_TELEMETRY")
-        .as_deref()
-        .unwrap_or("0")
-        == "1"
 }
 
 #[cfg(test)]

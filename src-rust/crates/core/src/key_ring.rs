@@ -101,6 +101,7 @@ impl KeyRing {
     }
 
     /// The key string at `index`, or `None` if out of bounds.
+    #[allow(dead_code)]
     pub fn key_at(&self, index: usize) -> Option<&str> {
         self.entries.get(index).map(|e| e.key.as_str())
     }

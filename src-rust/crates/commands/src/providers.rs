@@ -41,16 +41,23 @@ impl SlashCommand for ProvidersCommand {
                 .push(entry);
         }
 
-        // Sort providers alphabetically for stable output
-        let mut provider_keys: Vec<String> = by_provider.keys().cloned().collect();
-        provider_keys.sort();
+        // Enumerate providers from the registry's canonical provider table
+        // (sorted by id), filtered to those that actually have models.
+        let provider_entries = registry.list_providers();
 
         let mut lines = vec!["Available providers:\n".to_string()];
-        for provider in &provider_keys {
-            let models = &by_provider[provider];
+        for entry in &provider_entries {
+            let provider = entry.id.to_string();
+            let Some(models) = by_provider.get(&provider) else {
+                continue;
+            };
             lines.push(format!(
                 "\n{} ({} model{})",
-                provider.to_uppercase(),
+                if entry.name.is_empty() {
+                    provider.to_uppercase()
+                } else {
+                    entry.name.to_uppercase()
+                },
                 models.len(),
                 if models.len() == 1 { "" } else { "s" }
             ));

@@ -50,7 +50,8 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
-        "cline" => Some(cline()),            "github-models" => Some(github_models()),
+        "cline" => Some(cline()),
+        "github-models" => Some(github_models()),
         _ => None,
     }
 }
@@ -185,6 +186,15 @@ pub fn groq() -> OpenAiCompatProvider {
             overflow_patterns: vec!["reduce the length of the messages".to_string()],
             include_usage_in_stream: true,
             max_tokens_cap: Some(512),
+            // Groq's free tier limits to 12,000 TPM. The Clawde system prompt
+            // is extremely code-dense (AGENTS.md rules + tool definitions +
+            // JSON examples), tokenizing at ~1.07 bytes/token on Llama BPE.
+            // Set max_total_tokens to 8,500 so the truncation budget of
+            // (8,500-512)*1.3 = 10,384 bytes produces at most ~9,705 prompt
+            // tokens (10,384/1.07) + 512 output = ~10,217 total — well under
+            // the 12,000 limit with 1,783 tokens of headroom.
+            max_total_tokens: Some(8_500),
+            bytes_per_token: 1.3,
             ..Default::default()
         })
 }
@@ -609,16 +619,12 @@ pub fn github_models() -> OpenAiCompatProvider {
 /// Reads `CLINE_API_KEY` for authentication.
 pub fn cline() -> OpenAiCompatProvider {
     let key = std::env::var("CLINE_API_KEY").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::CLINE,
-        "Cline",
-        "https://api.cline.bot/api/v1",
-    )
-    .with_api_key(key)
-    .with_quirks(ProviderQuirks {
-        include_usage_in_stream: true,
-        ..Default::default()
-    })
+    OpenAiCompatProvider::new(ProviderId::CLINE, "Cline", "https://api.cline.bot/api/v1")
+        .with_api_key(key)
+        .with_quirks(ProviderQuirks {
+            include_usage_in_stream: true,
+            ..Default::default()
+        })
 }
 
 /// NeuralWatt — OpenAI-compatible endpoint for fast inference.
@@ -641,6 +647,23 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
 mod tests {
     use super::*;
     use crate::provider::LlmProvider;
+
+    #[test]
+    fn groq_factory_sets_bytes_per_token() {
+        let p = groq();
+        assert_eq!(
+            p.max_tokens_cap_for(""),
+            Some(512),
+            "expected Groq max_tokens_cap=512"
+        );
+        // Verify bytes_per_token is set to 1.3 (code-heavy ratio, tuned for
+        // ~1.3 bytes/token density of the Clawde system prompt on Llama BPE).
+        assert!(
+            (p.quirks.bytes_per_token - 1.3).abs() < f64::EPSILON,
+            "expected Groq bytes_per_token=1.3, got {}",
+            p.quirks.bytes_per_token
+        );
+    }
 
     #[test]
     fn alibaba_resolves_to_qwen_backend() {

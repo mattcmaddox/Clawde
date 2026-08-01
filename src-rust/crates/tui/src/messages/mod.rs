@@ -849,6 +849,7 @@ pub fn render_transcript_assistant_message_tagged(
     out
 }
 
+#[allow(dead_code)]
 pub fn render_transcript_assistant_message(
     msg: &Message,
     ctx: &RenderContext,
@@ -1067,9 +1068,9 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
             let cmd = str_field(input, "command");
             truncate(cmd.lines().next().unwrap_or(""), 60)
         }
-        "read" => truncate(str_field(input, "file_path"), 60),
-        "edit" => truncate(str_field(input, "file_path"), 60),
-        "write" => truncate(str_field(input, "file_path"), 60),
+        "read" => clawde_core::truncate::truncate_path(str_field(input, "file_path"), 60),
+        "edit" => clawde_core::truncate::truncate_path(str_field(input, "file_path"), 60),
+        "write" => clawde_core::truncate::truncate_path(str_field(input, "file_path"), 60),
         "glob" => truncate(str_field(input, "pattern"), 60),
         "grep" => truncate(str_field(input, "pattern"), 60),
         "webfetch" => truncate(str_field(input, "url"), 60),
@@ -1877,7 +1878,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
     lines
 }
 
-/// Render a system API error block (red-bordered, first 5 lines with [expand] hint,
+/// Render a system API error block (red-bordered, first 5 lines with \[expand] hint,
 /// optional retry countdown).
 pub fn render_system_api_error(msg: &str, retry_secs: Option<u32>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();

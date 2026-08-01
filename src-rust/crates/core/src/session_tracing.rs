@@ -84,9 +84,6 @@ pub fn start_hook_span(_hook_name: &str) -> Arc<NoopSpan> {
 /// End a hook execution span (no-op).
 pub fn end_hook_span(_span: Arc<NoopSpan>) {}
 
-/// Add tool content event to span (no-op).
-pub fn add_tool_content_event(_span: &Arc<NoopSpan>, _label: &str, _content: &str) {}
-
 /// Execute an async operation within a span (no-op wrapper).
 pub async fn execute_in_span<F, T>(f: F) -> T
 where

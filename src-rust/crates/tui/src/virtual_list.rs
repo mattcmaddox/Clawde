@@ -85,6 +85,7 @@ impl<T: VirtualItem> VirtualList<T> {
     }
 
     /// Push a single item and optionally scroll to bottom.
+    #[allow(dead_code)]
     pub fn push_item(&mut self, item: T) {
         self.search_index.push(item.search_text());
         self.items.push(item);
@@ -94,6 +95,7 @@ impl<T: VirtualItem> VirtualList<T> {
     }
 
     /// Notify that the terminal has been resized; invalidate the height cache.
+    #[allow(dead_code)]
     pub fn on_resize(&mut self, new_viewport_height: u16) {
         self.viewport_height = new_viewport_height;
         self.height_cache.clear();
@@ -278,6 +280,7 @@ impl<T: VirtualItem> VirtualList<T> {
     }
 
     /// Build/rebuild the search index (idempotent).
+    #[allow(dead_code)]
     pub fn warm_search_index(&mut self) {
         self.search_index = self.items.iter().map(|i| i.search_text()).collect();
     }
@@ -300,6 +303,7 @@ impl<T: VirtualItem> VirtualList<T> {
     }
 
     /// Scroll to the next search match after `current_idx`.
+    #[allow(dead_code)]
     pub fn next_match(&mut self, query: &str, current_idx: usize, width: u16) -> Option<usize> {
         let matches = self.find_matches(query).to_vec();
         let next = matches
@@ -314,6 +318,7 @@ impl<T: VirtualItem> VirtualList<T> {
     }
 
     /// Scroll to the previous search match before `current_idx`.
+    #[allow(dead_code)]
     pub fn prev_match(&mut self, query: &str, current_idx: usize, width: u16) -> Option<usize> {
         let matches = self.find_matches(query).to_vec();
         let prev = matches

@@ -129,66 +129,165 @@ impl SlashCommand for ColorCommand {
 
 // ---- /theme --------------------------------------------------------------
 
+/// Names of the built-in themes (kept in sync with theme_colors.rs).
+const BUILTIN_THEMES: &[&str] = &[
+    "default",
+    "dark",
+    "light",
+    "solarized",
+    "nord",
+    "dracula",
+    "monokai",
+    "catppuccin",
+    "deuteranopia",
+];
+
+/// List custom theme names from ~/.clawde/themes/*.json.
+fn custom_theme_names() -> Vec<String> {
+    let dir = Settings::config_dir().join("themes");
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !stem.is_empty() && stem.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
 #[async_trait]
 impl SlashCommand for ThemeCommand {
     fn name(&self) -> &str {
         "theme"
     }
     fn description(&self) -> &str {
-        "Show or change the current theme"
+        "Show, change, or create themes"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<super::ArgCompletion> {
-        vec![
-            super::ArgCompletion {
-                value: "default".into(),
-                description: "System terminal default".into(),
+    fn arg_completions(&self, partial: &str) -> Vec<super::ArgCompletion> {
+        let p = partial.to_lowercase();
+        let mut out: Vec<super::ArgCompletion> = Vec::new();
+        for name in BUILTIN_THEMES {
+            out.push(super::ArgCompletion {
+                value: (*name).into(),
+                description: "Built-in theme".into(),
                 available: true,
-            },
-            super::ArgCompletion {
-                value: "dark".into(),
-                description: "Dark color scheme".into(),
+            });
+        }
+        for name in custom_theme_names() {
+            out.push(super::ArgCompletion {
+                value: name.clone(),
+                description: "Custom theme".into(),
                 available: true,
-            },
-            super::ArgCompletion {
-                value: "light".into(),
-                description: "Light color scheme".into(),
-                available: true,
-            },
-            super::ArgCompletion {
-                value: "catppuccin".into(),
-                description: "Catppuccin Mocha theme".into(),
-                available: true,
-            },
-        ]
+            });
+        }
+        out.push(super::ArgCompletion {
+            value: "list".into(),
+            description: "List all themes".into(),
+            available: true,
+        });
+        out.push(super::ArgCompletion {
+            value: "create".into(),
+            description: "Open the interactive theme creator (TUI)".into(),
+            available: true,
+        });
+        out.push(super::ArgCompletion {
+            value: "delete".into(),
+            description: "Delete a custom theme".into(),
+            available: true,
+        });
+        out.retain(|c| c.value.to_lowercase().starts_with(&p));
+        out
     }
     fn help(&self) -> &str {
-        "Usage: /theme [default|dark|light]\n\
-         Without arguments, shows the active theme. With an argument, updates the theme for this and future sessions."
+        "Usage: /theme [<name>|list|delete <name>]\n\n\
+         In the TUI:\n\
+           /theme             - quick-pick popup: browse built-in + custom\n\
+                                themes (j/k or arrows navigate, n opens the\n\
+                                creator, d deletes a custom theme with\n\
+                                confirmation)\n\
+           /theme create      - interactive theme creator with the ANSI\n\
+                                256-color grid (create / edit / delete\n\
+                                custom themes, scrollable list)\n\n\
+         In non-interactive contexts:\n\
+           /theme                - show the active theme\n\
+           /theme <name>         - switch to a built-in or custom theme\n\
+           /theme list           - list built-in and custom themes\n\
+           /theme delete <name>  - delete a custom theme file\n\
+         Custom themes live in ~/.clawde/themes/<name>.json."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
+
         if args.is_empty() {
             return CommandResult::Message(format!(
-                "Current theme: {:?}\nUse /theme <default|dark|light> to change it.",
+                "Current theme: {:?}\nUse /theme <name> to change it, or open the TUI theme creator from the interactive prompt.",
                 ctx.config.theme
             ));
         }
 
-        let Some(theme) = parse_theme(args) else {
-            return CommandResult::Error("Theme must be one of: default, dark, light".to_string());
-        };
-
-        let mut new_config = ctx.config.clone();
-        new_config.theme = theme.clone();
-        if let Err(err) = save_settings_mutation(|settings| settings.config.theme = theme.clone()) {
-            return CommandResult::Error(format!("Failed to save theme: {}", err));
+        if args == "list" {
+            let mut lines = String::from("Themes:\n");
+            for name in BUILTIN_THEMES {
+                lines.push_str(&format!("  {} (built-in)\n", name));
+            }
+            for name in custom_theme_names() {
+                lines.push_str(&format!("  {} (custom)\n", name));
+            }
+            lines.push_str("\nUse /theme <name> to switch, or the TUI creator to make new ones.");
+            return CommandResult::Message(lines);
         }
 
-        CommandResult::ConfigChangeMessage(
-            new_config,
-            format!("Theme set to {}.", args.to_lowercase()),
-        )
+        if let Some(name) = args.strip_prefix("delete ") {
+            let name = name.trim();
+            if BUILTIN_THEMES.contains(&name) {
+                return CommandResult::Error("Built-in themes can't be deleted.".to_string());
+            }
+            let file = Settings::config_dir()
+                .join("themes")
+                .join(format!("{}.json", name));
+            if !file.exists() {
+                return CommandResult::Error(format!("No custom theme named '{}'.", name));
+            }
+            match std::fs::remove_file(&file) {
+                Ok(()) => CommandResult::Message(format!("Deleted custom theme '{}'.", name)),
+                Err(e) => CommandResult::Error(format!("Failed to delete theme: {}", e)),
+            }
+        } else if args.starts_with("delete") {
+            CommandResult::Error("Usage: /theme delete <name>".to_string())
+        } else if args == "create" {
+            CommandResult::Message(
+                "The interactive theme creator opens from /theme in the TUI.\n\
+                 Use /theme <name> to apply an existing theme here."
+                    .to_string(),
+            )
+        } else {
+            let Some(theme) = parse_theme(args) else {
+                return CommandResult::Error(
+                    "Unknown theme. Use /theme list to see available themes.".to_string(),
+                );
+            };
+
+            let mut new_config = ctx.config.clone();
+            new_config.theme = theme.clone();
+            if let Err(err) =
+                save_settings_mutation(|settings| settings.config.theme = theme.clone())
+            {
+                return CommandResult::Error(format!("Failed to save theme: {}", err));
+            }
+
+            CommandResult::ConfigChangeMessage(
+                new_config,
+                format!("Theme set to {}.", args.to_lowercase()),
+            )
+        }
     }
 }
 

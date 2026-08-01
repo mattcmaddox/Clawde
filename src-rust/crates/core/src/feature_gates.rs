@@ -76,6 +76,7 @@ pub fn get_dynamic_config<T: DeserializeOwned>(name: &str, default: T) -> T {
 /// experience.  It is enabled by either:
 ///   - The `CLAURST_SIMPLE=1` environment variable, OR
 ///   - The `--bare` flag in `std::env::args()`.
+#[allow(dead_code)]
 pub fn is_bare_mode() -> bool {
     // Check env var
     if is_env_truthy(std::env::var("CLAURST_SIMPLE").ok().as_deref()) {

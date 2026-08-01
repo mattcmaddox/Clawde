@@ -275,6 +275,7 @@ pub fn codex_token_path(profile_id: &str) -> PathBuf {
 }
 
 /// Backup directory for the previous live token file (rotated on each switch).
+#[allow(dead_code)]
 pub fn backup_dir(provider: &str) -> PathBuf {
     claurst_dir()
         .join("accounts")
@@ -525,7 +526,6 @@ mod tests {
     #[test]
     fn real_codex_save_path_writes_0600_token_file() {
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
         let _lock = crate::paths::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

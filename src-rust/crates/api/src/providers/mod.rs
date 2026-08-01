@@ -24,6 +24,9 @@ pub use openai_compat_providers::{
     stepfun, together_ai, upstage, venice, vultr_ai, xai, zai, zhipu,
 };
 
+pub mod metadata;
+pub use metadata::{env_var_for, key_url_for, provider_metadata, MetaLookup, ProviderMetadata};
+
 pub mod free;
 pub use free::{
     catalog_entry, CircuitBreakerConfig, FreeEntry, FreeProvider, FreeUpstream, LatencyConfig,

@@ -167,6 +167,9 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+r", "historySearch", KeyContext::Global),
         ("ctrl+b", "createBranch", KeyContext::Global),
         ("alt+h", "openHelp", KeyContext::Global),
+        ("alt+c", "compact", KeyContext::Global),
+        ("ctrl+/", "showKeybindings", KeyContext::Global),
+        ("ctrl+shift+s", "showSources", KeyContext::Global),
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
         ("enter", "submit", KeyContext::Chat),
@@ -229,12 +232,20 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Paste placeholders — expand `[Pasted text #N ...]` back into the
         // full pasted body (clicking the placeholder does the same).
         ("alt+e", "expandPaste", KeyContext::Chat),
+        // Standalone clipboard image paste — reads the system clipboard
+        // and attaches any image found, without requiring Ctrl+V (which
+        // Windows Terminal via SSH intercepts).
+        ("alt+i", "pasteImage", KeyContext::Chat),
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
         // App shortcuts
         ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
+        // ========== FREE MODE UPSTREAM CYCLE ==========
+        ("alt+u", "cycleFreeUpstream", KeyContext::Chat),
+        // ========== EFFORT ==========
+        ("alt+shift+e", "openEffort", KeyContext::Chat),
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
         ("enter", "yes", KeyContext::Confirmation),
@@ -247,17 +258,23 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("q", "close", KeyContext::Help),
         ("up", "scrollUp", KeyContext::Help),
         ("down", "scrollDown", KeyContext::Help),
+        ("k", "scrollUp", KeyContext::Help),
+        ("j", "scrollDown", KeyContext::Help),
         ("pageup", "pageUp", KeyContext::Help),
         ("pagedown", "pageDown", KeyContext::Help),
         // ========== HISTORY SEARCH ==========
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
+        ("k", "prevResult", KeyContext::HistorySearch),
+        ("j", "nextResult", KeyContext::HistorySearch),
         ("enter", "select", KeyContext::HistorySearch),
         ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
         ("up", "prevMessage", KeyContext::Transcript),
         ("down", "nextMessage", KeyContext::Transcript),
+        ("k", "prevMessage", KeyContext::Transcript),
+        ("j", "nextMessage", KeyContext::Transcript),
         ("pageup", "pageUp", KeyContext::Transcript),
         ("pagedown", "pageDown", KeyContext::Transcript),
         ("home", "goStart", KeyContext::Transcript),
@@ -283,12 +300,16 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
         ("down", "nextTask", KeyContext::Task),
+        ("k", "prevTask", KeyContext::Task),
+        ("j", "nextTask", KeyContext::Task),
         ("enter", "selectTask", KeyContext::Task),
         ("escape", "closeTask", KeyContext::Task),
         ("x", "toggleDone", KeyContext::Task),
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
+        ("k", "prevDiff", KeyContext::DiffDialog),
+        ("j", "nextDiff", KeyContext::DiffDialog),
         ("a", "acceptDiff", KeyContext::DiffDialog),
         ("enter", "acceptDiff", KeyContext::DiffDialog),
         ("r", "rejectDiff", KeyContext::DiffDialog),

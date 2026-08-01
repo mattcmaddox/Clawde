@@ -77,6 +77,16 @@ pub struct SettingsScreen {
     pub routing_strategy: String,
     /// Comma-separated list of disabled free upstream IDs.
     pub disabled_upstreams: String,
+    /// First-byte watchdog timeout in seconds (0 = disabled).
+    pub first_byte_timeout_secs: String,
+    /// Whether the parallel probe is enabled (default true).
+    pub staggered_probe: bool,
+    /// 5xx cooldown in seconds (0 = disabled).
+    pub upstream_5xx_cooldown_secs: String,
+    /// Health poller interval in seconds (0 = startup only).
+    pub health_poll_interval_secs: String,
+    /// Whole-chain retries after all upstreams fail.
+    pub fallback_retries: String,
     /// Preferred web search backend.
     pub preferred_search_backend: String,
     /// Health warning message for the search backend (shown in description area).
@@ -119,6 +129,11 @@ impl SettingsScreen {
             file_injection_max_size: "100".to_string(),
             routing_strategy: "sequential".to_string(),
             disabled_upstreams: String::new(),
+            first_byte_timeout_secs: "0".to_string(),
+            staggered_probe: true,
+            upstream_5xx_cooldown_secs: "45".to_string(),
+            health_poll_interval_secs: "300".to_string(),
+            fallback_retries: "1".to_string(),
             preferred_search_backend: "auto".to_string(),
             health_warning: String::new(),
             confirming_discard: false,
@@ -201,11 +216,67 @@ impl SettingsScreen {
             })
             .unwrap_or_default();
 
-        // Read preferred search backend from settings
-        self.preferred_search_backend = self
+        // Read first-byte timeout from provider config (default 0 = disabled).
+        self.first_byte_timeout_secs = self
             .settings_snapshot
-            .preferred_search_backend
-            .clone();
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("first_byte_timeout_secs"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "0".to_string());
+
+        // Read staggered probe flag from provider config (default true).
+        self.staggered_probe = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("staggered_probe"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Read 5xx cooldown from provider config (default 45s).
+        self.upstream_5xx_cooldown_secs = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("upstream_5xx_cooldown_secs"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "45".to_string());
+
+        // Read health poll interval from provider config (default 300s).
+        self.health_poll_interval_secs = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("health_poll_interval_secs"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "300".to_string());
+
+        // Read fallback retries from provider config (default 0).
+        self.fallback_retries = self
+            .settings_snapshot
+            .config
+            .provider_configs
+            .get("free")
+            .and_then(|pc| pc.options.get("routing"))
+            .and_then(|v| v.get("fallback_retries"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "0".to_string());
+
+        // Read preferred search backend from settings
+        self.preferred_search_backend = self.settings_snapshot.preferred_search_backend.clone();
 
         // Sync the env var so web_search.rs respects the stored preference immediately.
         let val = self.preferred_search_backend.trim();
@@ -218,10 +289,7 @@ impl SettingsScreen {
             match check_backend_configured(val) {
                 Ok(()) => self.health_warning.clear(),
                 Err(msg) => {
-                    self.health_warning = format!(
-                        "Warning: {} not configured — {}",
-                        val, msg
-                    );
+                    self.health_warning = format!("Warning: {} not configured — {}", val, msg);
                 }
             }
         }
@@ -323,17 +391,67 @@ impl SettingsScreen {
                         self.file_injection_max_size = value.clone();
                     }
                 }
+                "first_byte_timeout_secs" => {
+                    if let Ok(n) = value.parse::<u64>() {
+                        self.first_byte_timeout_secs = value.clone();
+                        let mut routing = get_or_create_routing_json(config);
+                        routing["first_byte_timeout_secs"] = serde_json::Value::from(n);
+                        config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                    }
+                }
+                "upstream_5xx_cooldown_secs" => {
+                    if let Ok(n) = value.parse::<u64>() {
+                        self.upstream_5xx_cooldown_secs = value.clone();
+                        let mut routing = get_or_create_routing_json(config);
+                        routing["upstream_5xx_cooldown_secs"] = serde_json::Value::from(n);
+                        config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                    }
+                }
+                "health_poll_interval_secs" => {
+                    if let Ok(n) = value.parse::<u64>() {
+                        self.health_poll_interval_secs = value.clone();
+                        let mut routing = get_or_create_routing_json(config);
+                        routing["health_poll_interval_secs"] = serde_json::Value::from(n);
+                        config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                    }
+                }
+                "fallback_retries" => {
+                    if let Ok(n) = value.parse::<u32>() {
+                        self.fallback_retries = value.clone();
+                        let mut routing = get_or_create_routing_json(config);
+                        routing["fallback_retries"] = serde_json::Value::from(n);
+                        config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                    }
+                }
                 "disabled_upstreams" => {
                     self.disabled_upstreams = value.clone();
                     let parsed: Vec<String> = value
-                        .split(|c: char| c == ',' || c == ' ')
+                        .split(|c: char| [',', ' '].contains(&c))
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    let routing = serde_json::json!({
-                        "disabled_upstreams": parsed,
-                        "strategy": self.routing_strategy
-                    });
+                    let mut routing = get_or_create_routing_json(config);
+                    routing["disabled_upstreams"] = serde_json::Value::from(parsed);
                     config
                         .provider_configs
                         .entry("free".to_string())
@@ -359,6 +477,19 @@ impl Default for SettingsScreen {
 // ---------------------------------------------------------------------------
 // Settings entries definition
 // ---------------------------------------------------------------------------
+
+/// Read the existing routing JSON from the free provider config, or return
+/// an empty object if none exists. Callers modify the returned object and
+/// write it back — this prevents editing one routing field from overwriting
+/// all the others.
+fn get_or_create_routing_json(config: &Config) -> serde_json::Value {
+    config
+        .provider_configs
+        .get("free")
+        .and_then(|pc| pc.options.get("routing"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+}
 
 fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     let mut entries = vec![
@@ -495,6 +626,41 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
                 options: vec!["sequential", "random_failover", "latency_based"],
             },
             value: screen.routing_strategy.clone(),
+        },
+        SettingsEntry {
+            key: "first_byte_timeout_secs",
+            label: "First-byte timeout (s)",
+            description: "Seconds to wait for first byte before racing the next free upstream (0 = disabled, recommend 5).",
+            kind: SettingKind::Number,
+            value: screen.first_byte_timeout_secs.clone(),
+        },
+        SettingsEntry {
+            key: "staggered_probe",
+            label: "Parallel probe",
+            description: "When the first-byte timeout expires, launch a parallel probe at the next upstream instead of advancing sequentially.",
+            kind: SettingKind::Bool,
+            value: if screen.staggered_probe { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "upstream_5xx_cooldown_secs",
+            label: "5xx cooldown (s)",
+            description: "Seconds to cool down an upstream after a 5xx/498 server error (0 = disabled, default 45).",
+            kind: SettingKind::Number,
+            value: screen.upstream_5xx_cooldown_secs.clone(),
+        },
+        SettingsEntry {
+            key: "health_poll_interval_secs",
+            label: "Health poll interval (s)",
+            description: "How often to probe upstream key health (0 = startup only, default 300).",
+            kind: SettingKind::Number,
+            value: screen.health_poll_interval_secs.clone(),
+        },
+        SettingsEntry {
+            key: "fallback_retries",
+            label: "Fallback retries",
+            description: "Whole-chain retries after every upstream fails (0 = no retry, surface summary immediately).",
+            kind: SettingKind::Number,
+            value: screen.fallback_retries.clone(),
         },
         SettingsEntry {
             key: "disabled_upstreams",
@@ -969,6 +1135,21 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                             if new_value { None } else { Some(false) };
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "staggered_probe" => {
+                        screen.staggered_probe = new_value;
+                        let mut routing =
+                            get_or_create_routing_json(&screen.settings_snapshot.config);
+                        routing["staggered_probe"] = serde_json::Value::Bool(new_value);
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     "show_cwd" => {
                         screen.show_cwd = new_value;
                         screen.settings_snapshot.show_cwd = new_value;
@@ -1028,11 +1209,9 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     }
                     "routing_strategy" => {
                         screen.routing_strategy = new_value.to_string();
-                        // Persist the routing strategy in settings.json under
-                        // providers.free.options.routing.strategy.
-                        let routing = serde_json::json!({
-                            "strategy": new_value
-                        });
+                        let mut routing =
+                            get_or_create_routing_json(&screen.settings_snapshot.config);
+                        routing["strategy"] = serde_json::Value::String(new_value.to_string());
                         screen
                             .settings_snapshot
                             .config
@@ -1045,8 +1224,7 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     }
                     "preferredSearchBackend" => {
                         screen.preferred_search_backend = new_value.to_string();
-                        screen.settings_snapshot.preferred_search_backend =
-                            new_value.to_string();
+                        screen.settings_snapshot.preferred_search_backend = new_value.to_string();
                         // Also set the env var so it takes effect immediately.
                         if new_value == "auto" {
                             std::env::remove_var("PREFERRED_SEARCH_BACKEND");
@@ -1060,10 +1238,8 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                                     screen.health_warning = String::new();
                                 }
                                 Err(msg) => {
-                                    screen.health_warning = format!(
-                                        "Warning: {} not configured — {}",
-                                        new_value, msg
-                                    );
+                                    screen.health_warning =
+                                        format!("Warning: {} not configured — {}", new_value, msg);
                                 }
                             }
                         } else {
@@ -1110,8 +1286,8 @@ mod tests {
             entries.len()
         );
         assert!(
-            entries.len() <= 21,
-            "Should have at most 21 editable settings, got {}",
+            entries.len() <= 26,
+            "Should have at most 26 editable settings, got {}",
             entries.len()
         );
     }

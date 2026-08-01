@@ -44,6 +44,7 @@ impl StatusNotice {
         self
     }
 
+    #[allow(dead_code)]
     pub fn expires_in_ms(mut self, ms: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -78,6 +79,7 @@ pub mod notice_ids {
 }
 
 /// Build the standard compact warning notice.
+#[allow(dead_code)]
 pub fn compact_warning_notice(fill_pct: f64) -> StatusNotice {
     if fill_pct >= 0.95 {
         StatusNotice::new(
@@ -101,6 +103,7 @@ pub fn compact_warning_notice(fill_pct: f64) -> StatusNotice {
 }
 
 /// Sort notices by priority (highest first), then by ID for stability.
+#[allow(dead_code)]
 pub fn sort_notices(notices: &mut [StatusNotice]) {
     notices.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
 }

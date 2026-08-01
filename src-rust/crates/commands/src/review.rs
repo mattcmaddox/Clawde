@@ -66,12 +66,33 @@ impl SlashCommand for ReviewCommand {
             }
         };
 
-        if diff.is_empty() {
-            return CommandResult::Message(
-                "No diff found. Stage some changes or provide a base ref (e.g. /review main)."
-                    .to_string(),
-            );
-        }
+        // If the combined diff is empty, fall back to per-file diffs of each
+        // modified file (exercises list_modified_files and get_file_diff).
+        let diff = if diff.is_empty() {
+            let modified = clawde_core::git_utils::list_modified_files(&repo_root);
+            if modified.is_empty() {
+                return CommandResult::Message(
+                    "No diff found. Stage some changes or provide a base ref (e.g. /review main)."
+                        .to_string(),
+                );
+            }
+            let mut parts = Vec::new();
+            for path in &modified {
+                let fd = clawde_core::git_utils::get_file_diff(&repo_root, path, None);
+                if !fd.is_empty() {
+                    parts.push(fd);
+                }
+            }
+            if parts.is_empty() {
+                return CommandResult::Message(
+                    "No diff found. Stage some changes or provide a base ref (e.g. /review main)."
+                        .to_string(),
+                );
+            }
+            parts.join("\n")
+        } else {
+            diff
+        };
 
         // ------------------------------------------------------------------
         // 2. Summarise changed files for the TUI header

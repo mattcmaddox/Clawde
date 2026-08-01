@@ -152,6 +152,7 @@ fn summarize_messages(messages: Vec<Message>, _max_tokens: u64) -> (Vec<Message>
 
 /// Persist collapse state to ~/.claurst/context_collapse_state.json
 #[cfg(feature = "cached_microcompact")]
+#[allow(dead_code)]
 pub fn save_collapse_state(_session_id: &str, state: &CollapseState) -> anyhow::Result<()> {
     let path = crate::config::Settings::config_dir().join("context_collapse_state.json");
 
@@ -163,6 +164,7 @@ pub fn save_collapse_state(_session_id: &str, state: &CollapseState) -> anyhow::
 
 /// Load collapse state from ~/.claurst/context_collapse_state.json
 #[cfg(feature = "cached_microcompact")]
+#[allow(dead_code)]
 pub fn load_collapse_state(_session_id: &str) -> Option<CollapseState> {
     let path = crate::config::Settings::config_dir().join("context_collapse_state.json");
 

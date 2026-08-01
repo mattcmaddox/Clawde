@@ -190,6 +190,7 @@ impl SessionMemoryExtractor {
     }
 
     /// Check whether extraction should run given the current session state.
+    #[allow(dead_code)]
     pub fn should_extract_with_state(messages: &[Message], state: &SessionMemoryState) -> bool {
         if !Self::should_extract(messages) {
             return false;

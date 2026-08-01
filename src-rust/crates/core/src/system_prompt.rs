@@ -56,6 +56,7 @@ impl SystemPromptSection {
 
     /// Create a volatile section that re-evaluates every turn.
     /// Passing `None` for content means the section is absent this turn.
+    #[allow(dead_code)]
     pub fn uncached(tag: &'static str, content: Option<impl Into<String>>) -> Self {
         Self {
             tag,
@@ -180,9 +181,7 @@ impl SystemPromptPrefix {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
                 "You are Clawde, a CLI coding agent for software engineering tasks."
             }
-            Self::SdkPreset => {
-                "You are Clawde, a CLI coding agent running within the Agent SDK."
-            }
+            Self::SdkPreset => "You are Clawde, a CLI coding agent running within the Agent SDK.",
             Self::Sdk => "You are a coding agent built on the Agent SDK.",
         }
     }

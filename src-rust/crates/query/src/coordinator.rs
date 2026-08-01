@@ -155,6 +155,7 @@ impl Default for ScratchpadGate {
 // to callers that already operate on `&Box<dyn Tool>`; switching to `&dyn Tool`
 // would ripple through those call sites for no functional gain.
 #[allow(clippy::borrowed_box)]
+#[allow(dead_code)]
 pub fn filter_tools_for_mode(
     tools: &[Box<dyn clawde_tools::Tool>],
     mode: AgentMode,

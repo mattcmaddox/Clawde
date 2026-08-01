@@ -135,7 +135,7 @@ impl NotificationKind {
 /// Render the topmost notification as a floating toast at the top-right of `area`.
 ///
 /// Layout (3 rows):
-///   row 0: ▐ [icon] [message truncated]          [Esc] ▌
+///   row 0: ▐ \[icon] \[message truncated]          \[Esc] ▌
 ///   row 1: ▐ [progress bar for timed notifs]            ▌
 ///   row 2: (bottom border row, blank)
 pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, area: Rect) {

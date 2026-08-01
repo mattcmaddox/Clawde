@@ -1492,6 +1492,9 @@ pub enum TypeaheadSource {
     ArgCompletion,
 }
 
+/// Type alias for a reference to the arg-completions callback.
+pub type ArgCompletionsRef = dyn Fn(&str, &str) -> Vec<TypeaheadSuggestion> + Send + Sync;
+
 /// A single typeahead suggestion.
 #[derive(Debug, Clone)]
 pub struct TypeaheadSuggestion {
@@ -1512,16 +1515,25 @@ pub struct TypeaheadSuggestion {
 /// - `/` slash commands (e.g. `/help`, `/clear`)
 /// - `/command <partial>` argument completions (e.g. `/effort med`)
 /// - `@` file references (e.g. `@src/`, `@~/Documents/`)
+///
+/// `slash_aliases` maps alias names to `(canonical name, description)` triples
+/// (e.g. `("history", "session", "…")`). When the user types an alias
+/// prefix, the suggestion shows the canonical command name — as if the
+/// canonical name had been typed — so `/history` autocompletes to `/session`.
+/// The list is derived from the commands crate (`all_command_aliases`), so any
+/// command that declares an alias gets hidden-alias autocomplete
+/// automatically, including commands outside the curated prompt list.
 pub fn compute_typeahead(
     input: &str,
     slash_commands: &[(&str, &str)],
+    slash_aliases: &[(String, String, String)],
     file_autocomplete_limit: usize,
     file_autocomplete_show_hidden: bool,
-    arg_completions_fn: Option<&(dyn Fn(&str, &str) -> Vec<TypeaheadSuggestion> + Send + Sync)>,
+    arg_completions_fn: Option<&ArgCompletionsRef>,
 ) -> Vec<TypeaheadSuggestion> {
     // Handle slash commands: /help, /clear, etc.
     if input.starts_with('/') {
-        return compute_slash_suggestions(input, slash_commands, arg_completions_fn);
+        return compute_slash_suggestions(input, slash_commands, slash_aliases, arg_completions_fn);
     }
 
     // Handle file references: @, @/, @~/, @src/, etc.
@@ -1534,25 +1546,45 @@ pub fn compute_typeahead(
 
 /// Compute typeahead suggestions for slash commands only (e.g., `/help`).
 ///
-/// When the input contains a space after a known command name (e.g.
+/// When the input contains a space after a known command name or alias (e.g.
 /// `/effort med`), delegates to `arg_completions_fn` for argument-level
 /// suggestions.  Otherwise, matches the input prefix against registered
-/// command names.
+/// command names and aliases.
+///
+/// Aliases never appear in the suggestion list on their own: typing an alias
+/// prefix (e.g. `/hist` for `history` → `session`) yields a suggestion for
+/// the *canonical* command name, so the bottom pane reads exactly as if the
+/// canonical command had been typed. Alias suggestions carry the description
+/// from the commands crate, so they work even when the canonical command is
+/// not in the curated `slash_commands` list.
 pub(crate) fn compute_slash_suggestions(
     input: &str,
     slash_commands: &[(&str, &str)],
-    arg_completions_fn: Option<&(dyn Fn(&str, &str) -> Vec<TypeaheadSuggestion> + Send + Sync)>,
+    slash_aliases: &[(String, String, String)],
+    arg_completions_fn: Option<&ArgCompletionsRef>,
 ) -> Vec<TypeaheadSuggestion> {
     let mut suggestions = Vec::new();
 
     if let Some(cmd_prefix) = input.strip_prefix('/') {
         // Check for "command + space + partial arg": if the prefix contains a
-        // space and the part before the first space is a known command, route
-        // to argument completions.
+        // space and the part before the first space is a known command or
+        // alias, route to argument completions. Aliases are resolved to their
+        // canonical name first so the suggestions read as if the canonical
+        // command had been typed (e.g. `/history list` → `/session list`).
         if let Some((cmd_name, partial_arg)) = cmd_prefix.split_once(' ') {
-            if slash_commands.iter().any(|(n, _)| *n == cmd_name) {
+            let canonical = slash_aliases
+                .iter()
+                .find(|(a, _, _)| a == cmd_name)
+                .map(|(_, c, _)| c.as_str())
+                .unwrap_or(cmd_name);
+            // Route when the canonical is either a curated command or a
+            // command reachable through the alias table (i.e. any registered
+            // command that has an alias).
+            let is_known = slash_commands.iter().any(|(n, _)| *n == canonical)
+                || slash_aliases.iter().any(|(_, c, _)| c == canonical);
+            if is_known {
                 if let Some(ref completions_fn) = arg_completions_fn {
-                    return completions_fn(cmd_name, partial_arg);
+                    return completions_fn(canonical, partial_arg);
                 }
             }
         }
@@ -1567,6 +1599,31 @@ pub(crate) fn compute_slash_suggestions(
                     faded: false,
                     arg_value: None,
                 });
+            }
+        }
+        // Alias match: suggest the canonical command name (deduplicated against
+        // the canonical-name loop above when both match the same prefix). The
+        // description comes from the alias table, so aliases for commands not
+        // in the curated list still autocomplete. When the canonical command
+        // IS in the curated list, prefer its curated description so a command
+        // reached via alias reads identically to one reached by name.
+        for (alias, canonical, desc) in slash_aliases {
+            if alias.to_lowercase().starts_with(&prefix_lower) {
+                let text = format!("/{}", canonical);
+                if !suggestions.iter().any(|s| s.text == text) {
+                    let description = slash_commands
+                        .iter()
+                        .find(|(n, _)| *n == canonical.as_str())
+                        .map(|(_, d)| (*d).to_string())
+                        .unwrap_or_else(|| desc.clone());
+                    suggestions.push(TypeaheadSuggestion {
+                        text,
+                        description,
+                        source: TypeaheadSource::SlashCommand,
+                        faded: false,
+                        arg_value: None,
+                    });
+                }
             }
         }
     }
@@ -2231,6 +2288,7 @@ impl PromptInputState {
     }
 
     /// Ctrl+K: Cut from cursor to end of line and save to kill ring.
+    #[allow(dead_code)]
     pub fn kill_line(&mut self) {
         if self.mode == InputMode::Readonly {
             return;
@@ -3338,9 +3396,10 @@ impl PromptInputState {
     pub fn update_suggestions(
         &mut self,
         slash_commands: &[(&str, &str)],
+        slash_aliases: &[(String, String, String)],
         file_autocomplete_limit: usize,
         file_autocomplete_show_hidden: bool,
-        arg_completions_fn: Option<&(dyn Fn(&str, &str) -> Vec<TypeaheadSuggestion> + Send + Sync)>,
+        arg_completions_fn: Option<&ArgCompletionsRef>,
     ) {
         // Only look at text up to the cursor — text after the cursor belongs to a
         // different editing position and would confuse rfind('@') / rfind('/').
@@ -3348,6 +3407,7 @@ impl PromptInputState {
         self.suggestions = compute_typeahead(
             text_before_cursor,
             slash_commands,
+            slash_aliases,
             file_autocomplete_limit,
             file_autocomplete_show_hidden,
             arg_completions_fn,
@@ -4689,7 +4749,7 @@ mod tests {
             ("history", "Show history"),
             ("compact", "Compact"),
         ];
-        let suggestions = compute_slash_suggestions("/h", &cmds, None);
+        let suggestions = compute_slash_suggestions("/h", &cmds, &[], None);
         assert_eq!(suggestions.len(), 2);
         assert_eq!(suggestions[0].text, "/help");
         assert_eq!(suggestions[1].text, "/history");
@@ -4698,7 +4758,7 @@ mod tests {
     #[test]
     fn typeahead_full_match() {
         let cmds = [("compact", "Compact conversation")];
-        let suggestions = compute_slash_suggestions("/compact", &cmds, None);
+        let suggestions = compute_slash_suggestions("/compact", &cmds, &[], None);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/compact");
         assert_eq!(suggestions[0].description, "Compact conversation");
@@ -4707,9 +4767,130 @@ mod tests {
     #[test]
     fn typeahead_case_insensitive() {
         let cmds = [("Help", "Show help")];
-        let suggestions = compute_slash_suggestions("/H", &cmds, None);
+        let suggestions = compute_slash_suggestions("/H", &cmds, &[], None);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/Help");
+    }
+
+    fn alias_triples(pairs: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        pairs
+            .iter()
+            .map(|(a, c, d)| (a.to_string(), c.to_string(), d.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn typeahead_alias_suggests_canonical_name() {
+        // `/history` is an alias for `/session`; typing the alias prefix shows
+        // the canonical command name, as if `/session` had been typed.
+        let cmds = [("session", "Browse and manage sessions")];
+        let aliases = alias_triples(&[("history", "session", "Browse and manage sessions")]);
+        let suggestions = compute_slash_suggestions("/hist", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/session");
+        assert_eq!(suggestions[0].description, "Browse and manage sessions");
+        // Full alias input also resolves to the canonical name.
+        let suggestions = compute_slash_suggestions("/history", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/session");
+        // The canonical name itself still matches directly.
+        let suggestions = compute_slash_suggestions("/ses", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/session");
+    }
+
+    #[test]
+    fn typeahead_alias_suggests_command_not_in_curated_list() {
+        // Aliases for commands outside the curated prompt list still
+        // autocomplete — the description comes from the alias table.
+        let cmds = [("session", "Browse and manage sessions")];
+        let aliases = alias_triples(&[
+            ("history", "session", "Browse and manage sessions"),
+            ("ctx", "ctx-viz", "Open the context window & usage overlay"),
+        ]);
+        let suggestions = compute_slash_suggestions("/ct", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/ctx-viz");
+        assert_eq!(
+            suggestions[0].description,
+            "Open the context window & usage overlay"
+        );
+    }
+
+    #[test]
+    fn typeahead_alias_prefers_curated_description() {
+        // When the canonical command is in the curated list, the curated
+        // description wins over the commands-crate description so the same
+        // command reads identically whether reached by name or by alias.
+        let cmds = [("session", "Browse and manage sessions")];
+        let aliases =
+            alias_triples(&[("history", "session", "Show or manage conversation sessions")]);
+        let suggestions = compute_slash_suggestions("/hist", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/session");
+        assert_eq!(suggestions[0].description, "Browse and manage sessions");
+    }
+
+    #[test]
+    fn typeahead_alias_not_duplicated() {
+        // A prefix matching both an alias and an unrelated command yields one
+        // suggestion per command; the alias resolves to its canonical name.
+        let cmds = [("session", "Browse sessions"), ("help", "Show help")];
+        let aliases = alias_triples(&[("history", "session", "Browse sessions")]);
+        let suggestions = compute_slash_suggestions("/h", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions.iter().any(|s| s.text == "/session"));
+        assert!(suggestions.iter().any(|s| s.text == "/help"));
+    }
+
+    #[test]
+    fn typeahead_alias_arg_completions_route() {
+        // `/history <arg>` routes to arg completions with the canonical name,
+        // so suggestions read as if `/session` had been typed.
+        let cmds = [("session", "Browse sessions")];
+        let aliases = alias_triples(&[("history", "session", "Browse sessions")]);
+        let completions = |cmd: &str, _partial: &str| -> Vec<TypeaheadSuggestion> {
+            assert_eq!(cmd, "session");
+            vec![TypeaheadSuggestion {
+                text: "/session list".into(),
+                description: "List all saved sessions".into(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("list".into()),
+            }]
+        };
+        let suggestions =
+            compute_slash_suggestions("/history l", &cmds, &aliases, Some(&completions));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/session list");
+    }
+
+    #[test]
+    fn typeahead_shared_alias_orders_by_table() {
+        // Two commands declaring the same alias string: the suggestion loop
+        // emits every matching canonical (dedup is by suggestion text, not by
+        // alias), in alias-table order — so the first-declared canonical wins
+        // the top slot, matching `find_command`'s first-match-in-order
+        // dispatch. Arg-completion routing and intercept resolution use
+        // `.find()`, which also picks the first triple.
+        let cmds = [("session", "Browse sessions"), ("notes", "Manage notes")];
+        let aliases = alias_triples(&[
+            ("history", "session", "Browse sessions"),
+            ("history", "notes", "Manage notes"), // collides — loses the top slot
+        ]);
+        let suggestions = compute_slash_suggestions("/hist", &cmds, &aliases, None);
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].text, "/session");
+        assert_eq!(suggestions[0].description, "Browse sessions");
+        assert_eq!(suggestions[1].text, "/notes");
+
+        // Arg-completion routing resolves the shared alias to the first
+        // canonical (`.find()` first-match), as dispatch would.
+        let completions = |cmd: &str, _partial: &str| -> Vec<TypeaheadSuggestion> {
+            assert_eq!(cmd, "session");
+            vec![]
+        };
+        compute_slash_suggestions("/history l", &cmds, &aliases, Some(&completions));
     }
 
     // ---- suggestion navigation -----------------------------------------
@@ -4724,7 +4905,7 @@ mod tests {
         ];
         s.text = "/h".to_string();
         s.cursor = s.text.len();
-        s.update_suggestions(&cmds, 15, false, None);
+        s.update_suggestions(&cmds, &[], 15, false, None);
         assert_eq!(s.suggestions.len(), 2);
         assert_eq!(s.suggestion_index, Some(0));
         s.suggestion_next();
@@ -4739,7 +4920,7 @@ mod tests {
         let cmds = [("help", "Show help")];
         s.text = "/he".to_string();
         s.cursor = s.text.len();
-        s.update_suggestions(&cmds, 15, false, None);
+        s.update_suggestions(&cmds, &[], 15, false, None);
         s.suggestion_next();
         s.accept_suggestion();
         assert_eq!(s.text, "/help");
@@ -5717,7 +5898,7 @@ mod tests {
     #[test]
     fn file_autocomplete_slash_commands_still_work() {
         let cmds = vec![("help", "Show help"), ("clear", "Clear messages")];
-        let suggestions = compute_slash_suggestions("/he", &cmds, None);
+        let suggestions = compute_slash_suggestions("/he", &cmds, &[], None);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/help");
     }

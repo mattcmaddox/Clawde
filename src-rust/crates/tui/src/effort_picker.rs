@@ -40,7 +40,7 @@ use std::cell::Cell;
 use crate::model_picker::EffortLevel;
 
 // ---------------------------------------------------------------------------
-// Palette (selector-only) — claurst red family
+// Palette (selector-only) — clawde pink family
 // ---------------------------------------------------------------------------
 
 /// Brighter red for the selected `ultracode` label / marker.
@@ -138,7 +138,7 @@ impl EffortPickerState {
     /// repaints to keep moving. True for the `ultracode` spectrum background and
     /// any rainbow label. The CLI event loop uses this to keep ticking while the
     /// picker is open on an animated level. `xhigh` only animates when it is the
-    /// top native tier (see [`is_rainbow_level`]).
+    /// top native tier (see `is_rainbow_level`).
     pub fn wants_animation(&self) -> bool {
         if !self.visible {
             return false;
@@ -620,7 +620,7 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 // Ultracode red wave (background)
 // ---------------------------------------------------------------------------
 
-/// Paint claurst's red audio wave into `inner` as a BACKGROUND-color gradient
+/// Paint a red audio wave into `inner` as a BACKGROUND-color gradient
 /// (space glyphs). It reads like a glowing oscilloscope waveform: a bright,
 /// undulating crest LINE that flows slowly sideways over a dim deep-red field,
 /// with a dark wash above. Because the field stays dim and only the thin crest
@@ -673,12 +673,12 @@ fn spectrum_amp(gx: u16, frame: u64) -> f32 {
 }
 
 /// A clawde-red whose brightness scales with `lit` in `[0, 1]`: a deep-red wash
-/// at the base brightening to a vivid claurst red at the crest. Used as a
+/// at the base brightening to a vivid pink-red at the crest. Used as a
 /// BACKGROUND color for the wave (so it can be richly red while text stays
 /// readable on top). Always red-dominant (`r > g` and `r > b`) — never purple.
 fn red_shade(lit: f32) -> Color {
     let lit = lit.clamp(0.0, 1.0);
-    // Deep-red wash (34, 8, 16) -> vivid claurst red (255, 42, 104).
+    // Deep-red wash (34, 8, 16) -> vivid pink-red (255, 42, 104).
     let r = 34.0 + 221.0 * lit;
     let g = 8.0 + 34.0 * lit;
     let b = 16.0 + 88.0 * lit;

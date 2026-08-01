@@ -536,9 +536,9 @@ Please provide the UPDATED summary now, following this structure and preserving 
 /// Build the compaction prompt, optionally with custom instructions appended.
 ///
 /// When `previous_summary` is a non-empty prior summary, the iterative
-/// [`UPDATE_COMPACT_PROMPT`] variant is selected so the model folds the previous
+/// `UPDATE_COMPACT_PROMPT` variant is selected so the model folds the previous
 /// summary forward rather than re-summarising from scratch. Otherwise the
-/// from-scratch [`BASE_COMPACT_PROMPT`] is used.
+/// from-scratch `BASE_COMPACT_PROMPT` is used.
 pub fn get_compact_prompt(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
@@ -916,7 +916,7 @@ pub fn resolve_context_window(
 /// actually saw. The chars/4 heuristic can be off by a wide margin, and with
 /// prompt caching the bare `input_tokens` field massively *undercounts* — the
 /// bulk of the context is billed as cache reads. We fall back to the chars/4
-/// estimate ([`estimate_tokens_for_messages`]) only before the first response,
+/// estimate (`estimate_tokens_for_messages`) only before the first response,
 /// or when the provider reported no usage (`None` / `0`).
 ///
 /// Mirrors pi's `estimateContextTokens`, which likewise prefers the last
@@ -1677,6 +1677,7 @@ const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 ///
 /// When the same file is read more than once in the conversation, replaces
 /// all but the last read with `[Content shown N time(s); showing last occurrence only]`.
+#[allow(dead_code)]
 pub fn collapse_read_tool_results(
     messages: Vec<clawde_core::types::Message>,
 ) -> Vec<clawde_core::types::Message> {
@@ -1739,6 +1740,7 @@ pub fn collapse_read_tool_results(
 ///
 /// If the same search was run more than once (same query), keep only the
 /// most recent result; replace earlier results with a truncation notice.
+#[allow(dead_code)]
 pub fn collapse_search_results(
     messages: Vec<clawde_core::types::Message>,
 ) -> Vec<clawde_core::types::Message> {
@@ -2392,7 +2394,7 @@ mod tests {
         fn id(&self) -> &clawde_core::ProviderId {
             static ID: std::sync::LazyLock<clawde_core::ProviderId> =
                 std::sync::LazyLock::new(|| clawde_core::ProviderId::new("mock"));
-            &*ID
+            &ID
         }
 
         fn name(&self) -> &str {
@@ -2523,8 +2525,10 @@ mod tests {
             Message::assistant(big.clone()),
             Message::user(big),
         ];
-        let mut state = AutoCompactState::default();
-        state.turns_since_last_compact = 10; // bypass turn-gap debounce
+        let mut state = AutoCompactState {
+            turns_since_last_compact: 10, // bypass turn-gap debounce
+            ..Default::default()
+        };
 
         // 95% — above threshold. First compaction has no debounce history.
         let result = auto_compact_if_needed(

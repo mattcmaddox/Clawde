@@ -86,6 +86,9 @@ impl Tool for GlobTool {
         let full_pattern = base_dir.join(&params.pattern);
         let pattern_str = full_pattern.to_string_lossy().to_string();
 
+        // Resolve git repo root so we can filter out ignored paths.
+        let repo_root = clawde_core::git_utils::get_repo_root(&base_dir);
+
         // On Windows, normalize backslashes to forward slashes for the glob crate
         let pattern_str = pattern_str.replace('\\', "/");
 
@@ -93,6 +96,12 @@ impl Tool for GlobTool {
             Ok(paths) => {
                 let mut out = Vec::new();
                 for path in paths.filter_map(|p| p.ok()) {
+                    // Skip git-ignored paths (same pattern as grep_tool).
+                    if let Some(ref root) = repo_root {
+                        if clawde_core::git_utils::is_ignored(root, &path) {
+                            continue;
+                        }
+                    }
                     if !ctx.path_is_within_workspace(&path) {
                         if let Err(e) = ctx.check_permission_for_path(
                             self.name(),

@@ -41,6 +41,7 @@ pub mod transform;
 pub mod protocol;
 
 // Provider registry (Phase 1C).
+pub mod health_poller;
 pub mod registry;
 
 // Concrete provider adapters (Phase 1D).
@@ -97,8 +98,8 @@ pub use providers::OpenAiProvider;
 pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
 pub use model_registry::{
     effective_model_for_config, CostBreakdown, CostTier, CostTierCondition, ExperimentalMode,
-    InterleavedReasoning, Modality, ModelEntry, ModelRegistry, ModelStatus, ProviderEntry,
-    ProviderOverride,
+    InterleavedReasoning, Modality, ModelCapability, ModelEntry, ModelRegistry, ModelStatus,
+    ProviderEntry, ProviderOverride,
 };
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
@@ -390,14 +391,14 @@ pub mod streaming {
         Ping,
         /// Rate-limit usage metadata extracted from response headers.
         /// Sent once per request before any SSE frames.
-    RateLimitHeaders {
-        /// Which provider returned these headers (e.g. "anthropic", "groq").
-        provider_id: String,
-        /// Fraction of the tokens budget used (0.0–1.0).
-        tokens_pct_used: f32,
-        /// Fraction of the requests budget used (0.0–1.0).
-        requests_pct_used: f32,
-    },
+        RateLimitHeaders {
+            /// Which provider returned these headers (e.g. "anthropic", "groq").
+            provider_id: String,
+            /// Fraction of the tokens budget used (0.0–1.0).
+            tokens_pct_used: f32,
+            /// Fraction of the requests budget used (0.0–1.0).
+            requests_pct_used: f32,
+        },
     }
 
     /// The delta payload inside a `content_block_delta` event.
@@ -623,7 +624,7 @@ pub mod client {
         /// Claurst's own attribution so the official identity is the only one the
         /// server sees. No-op for API-key auth.
         fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
-            if !self.config.use_bearer_auth {
+            if !self.is_oauth() {
                 return;
             }
 
@@ -919,7 +920,9 @@ pub mod client {
 
             // Spawn a task that reads the SSE byte stream and emits events.
             tokio::spawn(async move {
-                if let Err(e) = Self::process_sse_stream(resp, handler, tx.clone(), "anthropic").await {
+                if let Err(e) =
+                    Self::process_sse_stream(resp, handler, tx.clone(), "anthropic").await
+                {
                     let _ = tx
                         .send(streaming::AnthropicStreamEvent::Error {
                             error_type: "stream_error".into(),
@@ -948,7 +951,7 @@ pub mod client {
                 .get(&url)
                 .header("anthropic-version", &self.config.api_version)
                 .header("content-type", "application/json");
-            if self.config.use_bearer_auth {
+            if self.is_oauth() {
                 req = req
                     .header(
                         "anthropic-beta",
@@ -987,7 +990,7 @@ pub mod client {
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
-            let use_oauth = self.config.use_bearer_auth;
+            let use_oauth = self.is_oauth();
             let session_id = self.session_id.clone();
 
             // Active OAuth account, fetched once and cached for the process
@@ -1644,6 +1647,16 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+        // so a `pub fn` that nothing calls silently rots. The shared
+        // implementation in `clawde_core::dead_code_guard` scans the workspace
+        // and fails if any `pub fn` / `pub async fn` declared in this crate has
+        // no reference anywhere except its own declaration.
+        clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
 
     #[test]
     fn test_sse_parser_basic() {

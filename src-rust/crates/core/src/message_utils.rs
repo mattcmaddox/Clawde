@@ -30,6 +30,7 @@ pub struct ContextUsage {
 }
 
 /// Calculate context window usage.
+#[allow(dead_code)]
 pub fn calculate_context_window_usage(messages: &[Message], model: &str) -> ContextUsage {
     let used = estimate_messages_tokens(messages);
     let total = context_window_for_model(model);
@@ -99,6 +100,7 @@ pub fn is_tool_use_message(msg: &Message) -> bool {
 }
 
 /// Returns `true` if the message is a tool-result turn.
+#[allow(dead_code)]
 pub fn is_tool_result_message(msg: &Message) -> bool {
     msg.role == Role::User
         && match &msg.content {
@@ -126,6 +128,7 @@ pub fn merge_consecutive_text_blocks(blocks: Vec<ContentBlock>) -> Vec<ContentBl
 }
 
 /// Truncate the text content of a message to `max_chars`.
+#[allow(dead_code)]
 pub fn truncate_message_content(msg: &mut Message, max_chars: usize) {
     match &mut msg.content {
         MessageContent::Text(s) => {
@@ -148,6 +151,7 @@ pub fn truncate_message_content(msg: &mut Message, max_chars: usize) {
 }
 
 /// Format a tool result value for display / history.
+#[allow(dead_code)]
 pub fn format_tool_result(result: &Value) -> String {
     match result {
         Value::String(s) => s.clone(),

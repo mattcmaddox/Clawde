@@ -97,6 +97,8 @@ impl Tool for LspTool {
             let mut manager = lsp_manager_arc.lock().await;
             manager.seed_from_config(&ctx.config.lsp_servers);
             manager.seed_with_defaults();
+            // Start all configured LSP servers on first use.
+            manager.start_servers(&ctx.working_dir).await;
         }
 
         // Check that at least one server is registered for this file before

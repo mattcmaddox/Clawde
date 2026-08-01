@@ -59,6 +59,7 @@ impl InvalidConfigDialogState {
     }
 
     /// Show the dialog with a AGENTS.md parse error.
+    #[allow(dead_code)]
     pub fn show_claude_md_error(error: &str) -> Self {
         Self {
             visible: true,

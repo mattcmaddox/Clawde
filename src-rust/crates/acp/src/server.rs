@@ -67,7 +67,8 @@ impl AgentServer {
             }
             "authenticate" => {
                 let _req: acp::AuthenticateRequest = parse_params(params)?;
-                // Claurst uses local credentials; clients don't need to authenticate.
+                // ACP v1 AuthenticateRequest has no token/credential field, so
+                // shared-secret validation must be handled at the transport level.
                 serde_json::to_value(acp::AuthenticateResponse::default())
                     .map_err(|_| acp::Error::internal_error())
             }

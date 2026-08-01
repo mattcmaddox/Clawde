@@ -213,6 +213,7 @@ impl PluginListState {
 /// When `state.show_detail` is true and a plugin is selected, a detail
 /// panel is rendered below the list.
 /// Returns the height consumed.
+#[allow(dead_code)]
 pub fn render_plugin_list(
     frame: &mut Frame,
     state: &mut PluginListState,

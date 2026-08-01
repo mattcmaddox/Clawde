@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 pub struct AdvisorCommand;
 pub struct FastCommand;
+pub struct ImageCommand;
 pub struct ColorSetCommand;
 
 // ---- /advisor ------------------------------------------------------------
@@ -73,6 +74,121 @@ impl SlashCommand for AdvisorCommand {
                     ))
                 }
             }
+        }
+    }
+}
+
+// ---- /image --------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ImageCommand {
+    fn name(&self) -> &str {
+        "image"
+    }
+    fn description(&self) -> &str {
+        "Switch to a vision-capable (or other capability) model"
+    }
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        // If the user is typing --capability <value>, return capability names.
+        if let Some(cap_val) = partial
+            .strip_prefix("--capability ")
+            .or_else(|| partial.strip_prefix("-c "))
+            .or_else(|| partial.strip_prefix("--capability="))
+        {
+            crate::capability_arg_completions(cap_val)
+        } else {
+            vec![]
+        }
+    }
+    fn help(&self) -> &str {
+        "Usage: /image [--capability <cap>]\n\n\
+         Switches to the best capability-matched model for the current provider.\n\
+         Defaults to vision when no --capability flag is given.\n\
+         After switching, paste an image with Ctrl+V to include it in your prompt.\n\n\
+         Examples:\n\
+           /image                          — switch to a vision model\n\
+           /image --capability audio       — switch to an audio-capable model\n\
+           /image -c tools                 — switch to a tool-calling model"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let trimmed = args.trim();
+
+        // --help: show available capability flags.
+        if trimmed == "--help" || trimmed == "-h" {
+            return CommandResult::Message(format!(
+                "/image [--capability <cap>]\n\n\
+                     Switches to the best model with the given capability.\n\
+                     Defaults to vision when no flag is given.\n\
+                     After switching, paste an image with Ctrl+V to include it in your prompt.\n\n\
+                     {}\n\n\
+                     Examples:\n\
+                       /image\n\
+                       /image --capability audio\n\
+                       /image -c tools",
+                crate::capability_help_text()
+            ));
+        }
+
+        let provider_id = ctx.config.selected_provider_id();
+        let registry = clawde_api::ModelRegistry::new();
+
+        // Determine which capability to filter by (default: Vision)
+        // using the shared helper to keep the match logic in one place.
+        let target_cap = if let Some(cap_val) = trimmed
+            .strip_prefix("--capability ")
+            .or_else(|| trimmed.strip_prefix("-c "))
+            .or_else(|| trimmed.strip_prefix("--capability="))
+            .map(|s| s.trim())
+        {
+            match crate::parse_capability_str(&cap_val.to_lowercase()) {
+                Some(cap) => cap,
+                None => {
+                    return CommandResult::Message(format!(
+                        "Unknown capability '{}'. Valid: image, audio, pdf, video, tools, reasoning, json",
+                        cap_val
+                    ));
+                }
+            }
+        } else {
+            clawde_api::ModelCapability::Vision
+        };
+
+        let cap_label = crate::capability_label(target_cap);
+
+        // Use the generic capability-based lookup.
+        let model = provider_lookup_ids(provider_id)
+            .into_iter()
+            .flat_map(|lookup_id| {
+                registry
+                    .list_by_capability(target_cap)
+                    .into_iter()
+                    .filter(move |m| &*m.info.provider_id == lookup_id)
+            })
+            .next()
+            .map(|m| m.info.id.to_string())
+            .or_else(|| {
+                // Fallback: search across ALL providers for any model with this capability.
+                registry
+                    .list_by_capability(target_cap)
+                    .first()
+                    .map(|m| m.info.id.to_string())
+            });
+
+        if let Some(model_id) = model {
+            let model_name = stripped_model_for_provider(provider_id, &model_id).to_string();
+            let mut new_config = ctx.config.clone();
+            new_config.model = Some(canonical_model_for_provider(provider_id, &model_id));
+            CommandResult::ConfigChangeMessage(
+                new_config,
+                format!("Switched to {} — capable of {}.\n", model_name, cap_label),
+            )
+        } else {
+            CommandResult::Message(format!(
+                "No {}-capable model found for the current provider.\n\
+                     Try switching to a different provider with /connect.",
+                cap_label
+            ))
         }
     }
 }

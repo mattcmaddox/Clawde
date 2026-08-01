@@ -225,12 +225,14 @@ pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellStat
 }
 
 /// Remove the shell state for a session (e.g. when the session ends).
+#[allow(dead_code)]
 pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATE_REGISTRY.remove(session_id);
 }
 
 /// Return the `ShadowSnapshot` for `working_dir`, creating it on first call.
 /// Returns `None` when git is unavailable or the directory is not in a git repo.
+#[allow(dead_code)]
 pub fn session_shadow(
     working_dir: &std::path::Path,
 ) -> Option<Arc<clawde_core::snapshot::ShadowSnapshot>> {
@@ -238,6 +240,7 @@ pub fn session_shadow(
 }
 
 /// Drop the cached shadow snapshot for `working_dir` (e.g. when a session ends).
+#[allow(dead_code)]
 pub fn clear_session_shadow(working_dir: &std::path::Path) {
     clawde_core::snapshot::remove(working_dir);
 }
@@ -431,6 +434,7 @@ impl ToolContext {
 
     /// Like `check_permission` but also passes structured `details` text
     /// (e.g. a risk explanation) that the TUI permission dialog can display.
+    #[allow(dead_code)]
     pub fn check_permission_with_details(
         &self,
         tool_name: &str,
@@ -633,6 +637,16 @@ pub fn find_tool(name: &str) -> Option<Box<dyn Tool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+        // so a `pub fn` that nothing calls silently rots. The shared
+        // implementation in `clawde_core::dead_code_guard` scans the workspace
+        // and fails if any `pub fn` / `pub async fn` declared in this crate has
+        // no reference anywhere except its own declaration.
+        clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
 
     struct AskPermissionHandler {
         reason: String,

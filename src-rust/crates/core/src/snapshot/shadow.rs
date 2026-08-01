@@ -37,7 +37,7 @@ impl ShadowSnapshot {
         Self::for_session_in(working_dir, &data_root)
     }
 
-    /// Like [`for_session`] but roots the shadow gitdir under an explicit
+    /// Like `for_session` but roots the shadow gitdir under an explicit
     /// `data_root` instead of the user's data directory. Lets tests (and
     /// sandboxed builds with no writable HOME) stage a hermetic snapshot
     /// store in a tempdir rather than writing under `~/.claurst`.

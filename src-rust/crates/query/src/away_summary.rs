@@ -60,7 +60,7 @@ commit recaps."
 /// - the cancellation token is triggered before the response arrives, or
 /// - any API / network error occurs.
 ///
-/// Only the last [`RECENT_MESSAGE_WINDOW`] messages are sent to the model to
+/// Only the last `RECENT_MESSAGE_WINDOW` messages are sent to the model to
 /// keep the prompt small.
 pub async fn generate_away_summary(
     messages: &[Message],

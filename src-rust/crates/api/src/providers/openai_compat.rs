@@ -31,7 +31,7 @@ use super::request_options::merge_openai_compatible_options;
 
 /// Provider-specific behavioural quirks that alter how the generic adapter
 /// builds and interprets requests/responses.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProviderQuirks {
     /// Truncate tool call IDs to at most this many characters before sending.
     /// For example, Mistral requires tool IDs of at most 9 characters.
@@ -75,6 +75,13 @@ pub struct ProviderQuirks {
     /// the default we request (e.g. DeepSeek Chat caps at 8 192).
     pub max_tokens_cap: Option<u32>,
 
+    /// Hard cap on total tokens (prompt + max_tokens) for this provider.
+    /// When set, the provider truncates the system prompt to ensure the
+    /// total estimated token count stays under this limit.
+    /// Use this for providers with tight TPM rate limits (e.g. Groq free
+    /// tier limits to 12 000 TPM).
+    pub max_total_tokens: Option<u32>,
+
     /// Set to `true` for providers that never require an API key (e.g.
     /// Ollama, LM Studio, llama.cpp).  When `true`, `health_check()` will
     /// always attempt a live network probe regardless of whether the base URL
@@ -88,6 +95,31 @@ pub struct ProviderQuirks {
     /// root (e.g. `"http://localhost:11434"`) so the native API can be called
     /// independently of the `/v1` base URL used for chat completions.
     pub ollama_native_host: Option<String>,
+
+    /// Estimated bytes-per-token ratio for prompt truncation.
+    /// Default is `4.0` (typical for English prose). Code-heavy content
+    /// like system prompts / tool definitions tokenizes at ~1.5 bytes/token.
+    pub bytes_per_token: f64,
+}
+
+impl Default for ProviderQuirks {
+    fn default() -> Self {
+        Self {
+            tool_id_max_len: None,
+            tool_id_alphanumeric_only: false,
+            overflow_patterns: Vec::new(),
+            include_usage_in_stream: false,
+            default_temperature: None,
+            fix_tool_user_sequence: false,
+            reasoning_field: None,
+            requires_reasoning_roundtrip: false,
+            max_tokens_cap: None,
+            max_total_tokens: None,
+            no_api_key_required: false,
+            ollama_native_host: None,
+            bytes_per_token: 4.0, // prose-safe default; code-heavy providers override lower
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,12 +127,12 @@ pub struct ProviderQuirks {
 // ---------------------------------------------------------------------------
 
 pub struct OpenAiCompatProvider {
-    id: ProviderId,
-    name: String,
+    pub(crate) id: ProviderId,
+    pub(crate) name: String,
     base_url: String,
     api_key: Option<String>,
     extra_headers: Vec<(String, String)>,
-    quirks: ProviderQuirks,
+    pub(crate) quirks: ProviderQuirks,
     http_client: reqwest::Client,
 }
 
@@ -262,6 +294,75 @@ impl OpenAiCompatProvider {
         // `content: null` on assistant messages — replace with an empty string.
         if self.quirks.requires_reasoning_roundtrip || self.quirks.no_api_key_required {
             Self::ensure_content_not_null(&mut messages);
+        }
+
+        // Max-total-tokens truncation: when `max_total_tokens` is set, estimate
+        // the total token count (prompt + max_tokens) using a simple byte heuristic
+        // and truncate the system message to fit within the budget.
+        // Rough estimate: 1 token ≈ 4 bytes for typical text.
+        if let Some(total_limit) = self.quirks.max_total_tokens {
+            let max_tokens = self.quirks.max_tokens_cap.unwrap_or(request.max_tokens);
+            let budget_prompt_tokens = total_limit.saturating_sub(max_tokens) as usize;
+            if budget_prompt_tokens < 100 {
+                // Budget too small for any meaningful prompt.
+                return messages;
+            }
+            // Convert the token budget to a byte budget using the provider's
+            // configured bytes-per-token ratio. Code-heavy content (Clawde
+            // system prompt, AGENTS.md, git context) tokenizes at ~1.4-1.5
+            // bytes/token, much denser than the 4.0 default for English prose.
+            let ratio = self.quirks.bytes_per_token;
+            let budget_bytes = (budget_prompt_tokens as f64 * ratio) as usize;
+
+            // Estimate current total byte size of all serialised messages.
+            // Using serde_json's Display (compact JSON) for accuracy.
+            let current_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
+
+            if current_bytes > budget_bytes {
+                tracing::debug!(
+                    current_bytes,
+                    budget_bytes,
+                    total_limit,
+                    max_tokens,
+                    ratio,
+                    "max_total_tokens: system prompt exceeds budget, truncating"
+                );
+                // Pre-compute the byte size of non-system messages so we don't
+                // need to borrow `messages` again while holding a mutable ref.
+                let non_system_bytes: usize =
+                    messages.iter().skip(1).map(|m| m.to_string().len()).sum();
+
+                // Truncate the first (system) message content to fit the budget.
+                if let Some(system_msg) = messages.first_mut() {
+                    if system_msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+                        if let Some(content_val) = system_msg.get_mut("content") {
+                            if let Some(content) = content_val.as_str() {
+                                let content_bytes = content.len();
+                                let sys_budget = budget_bytes.saturating_sub(non_system_bytes);
+                                // Reserve ~50 bytes for the truncation suffix.
+                                let max_content_bytes = sys_budget.saturating_sub(50);
+                                if content_bytes > max_content_bytes && max_content_bytes >= 14 {
+                                    // Need to truncate. Keep at least 14 bytes.
+                                    let keep_bytes =
+                                        std::cmp::max(max_content_bytes, 14).min(content_bytes);
+                                    let truncate_to = content
+                                        .char_indices()
+                                        .take_while(|(b, _)| *b < keep_bytes)
+                                        .last()
+                                        .map(|(i, c)| i + c.len_utf8())
+                                        .unwrap_or(0)
+                                        .min(content_bytes);
+                                    let truncated = &content[..truncate_to];
+                                    *content_val = json!(format!(
+                                        "{}... [truncated to fit provider token limit]",
+                                        truncated
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         messages
@@ -1057,12 +1158,114 @@ impl LlmProvider for OpenAiCompatProvider {
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
     }
+
+    fn max_tokens_cap_for(&self, _model: &str) -> Option<u32> {
+        self.quirks.max_tokens_cap
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_types::SystemPrompt;
     use serde_json::json;
+
+    #[test]
+    fn max_total_tokens_truncates_large_system_prompt() {
+        // Provider with max_total_tokens=1000, max_tokens_cap=100, bytes_per_token=1.5
+        // Prompt budget = (1000 - 100) * 1.5 = 1350 bytes
+        let provider = OpenAiCompatProvider::new("test", "Test", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                max_total_tokens: Some(1_000),
+                max_tokens_cap: Some(100),
+                bytes_per_token: 1.5,
+                ..Default::default()
+            });
+
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            system_prompt: Some(SystemPrompt::Text("x".repeat(2000))),
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+
+        // Must have at least one message (the system prompt).
+        assert!(!messages.is_empty(), "expected at least the system message");
+
+        // The system message content should contain the truncation suffix.
+        let content = messages[0]["content"].as_str().unwrap_or("");
+        assert!(
+            content.contains("[truncated to fit provider token limit]"),
+            "expected truncation suffix, got: {}",
+            &content[content.len().saturating_sub(100)..]
+        );
+
+        // Total serialised byte size should be within budget (with some slack
+        // for the JSON envelope overhead, but the system prompt content itself
+        // is the dominant component).
+        let total_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
+        let budget_bytes = ((1000 - 100) as f64 * 1.5) as usize;
+        // Allow 100 bytes of slack for JSON keys/brackets not counted in content.
+        assert!(
+            total_bytes <= budget_bytes + 100,
+            "total bytes {} exceeds budget {} + 100 slack",
+            total_bytes,
+            budget_bytes
+        );
+    }
+
+    #[test]
+    fn max_total_tokens_skips_truncation_for_small_prompt() {
+        // Same provider, but a small system prompt that fits within budget.
+        let provider = OpenAiCompatProvider::new("test", "Test", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                max_total_tokens: Some(1_000),
+                max_tokens_cap: Some(100),
+                bytes_per_token: 1.5,
+                ..Default::default()
+            });
+
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![],
+            system_prompt: Some(SystemPrompt::Text("Hello, world!".to_string())),
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+
+        // Should have one system message with the original content unchanged.
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_str().unwrap_or("");
+        assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn bytes_per_token_default_four() {
+        // Verify the default bytes_per_token is 4.0 (English prose conservative).
+        let quirks = ProviderQuirks::default();
+        assert!(
+            (quirks.bytes_per_token - 4.0).abs() < f64::EPSILON,
+            "expected default bytes_per_token=4.0, got {}",
+            quirks.bytes_per_token
+        );
+    }
 
     #[test]
     fn mistral_tool_ids_match_opencode_style() {

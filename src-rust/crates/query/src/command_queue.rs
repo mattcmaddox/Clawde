@@ -48,7 +48,7 @@ pub enum QueuedCommand {
     SetModel(String),
     /// Inject a plain user message into the conversation
     InjectUserMessage(String),
-    /// Inject a system-level message (sent as a user message with [System] prefix)
+    /// Inject a system-level message (sent as a user message with \[System] prefix)
     InjectSystemMessage(String),
     /// Trigger a named skill
     TriggerSkill(String),

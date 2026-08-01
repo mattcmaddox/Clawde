@@ -132,6 +132,7 @@ pub fn get_commit_history(repo_root: &Path, n: usize) -> Vec<CommitInfo> {
 // ---------------------------------------------------------------------------
 
 /// Create and switch to a new branch.
+#[allow(dead_code)]
 pub fn create_branch(repo_root: &Path, name: &str) -> bool {
     Command::new("git")
         .current_dir(repo_root)
@@ -142,6 +143,7 @@ pub fn create_branch(repo_root: &Path, name: &str) -> bool {
 }
 
 /// Switch to an existing branch.
+#[allow(dead_code)]
 pub fn switch_branch(repo_root: &Path, name: &str) -> bool {
     Command::new("git")
         .current_dir(repo_root)
@@ -172,6 +174,7 @@ pub fn stash(repo_root: &Path, message: Option<&str>) -> bool {
 }
 
 /// Pop the top stash entry.
+#[allow(dead_code)]
 pub fn stash_pop(repo_root: &Path) -> bool {
     Command::new("git")
         .current_dir(repo_root)

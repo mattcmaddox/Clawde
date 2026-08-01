@@ -126,6 +126,7 @@ impl SessionBranchingState {
     }
 
     /// Get a mutable reference to the currently selected branch, if any.
+    #[allow(dead_code)]
     pub fn selected_branch_mut(&mut self) -> Option<&mut BranchInfo> {
         self.branches.get_mut(self.selected_idx)
     }

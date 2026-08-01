@@ -30,14 +30,22 @@ mod runtime;
 mod server;
 mod sessions;
 
+use std::fs;
 use std::sync::Arc;
 
+use clawde_core::config::AcpServerConfig;
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 pub use connection::Connection;
 pub use runtime::AgentRuntime;
 pub use server::AgentServer;
+
+// ---------------------------------------------------------------------------
+// TCP / embedded mode
+// ---------------------------------------------------------------------------
 
 /// Run the ACP server on the current process' stdin / stdout. Returns when
 /// stdin reaches EOF or when the runtime fails to initialize.
@@ -88,4 +96,204 @@ fn install_stderr_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+// ---------------------------------------------------------------------------
+// TCP mode (standalone or embedded)
+// ---------------------------------------------------------------------------
+
+/// Run the ACP server in TCP mode, accepting connections on `addr`.
+///
+/// When `config` contains `tls_cert_path` and `tls_key_path`, the server wraps
+/// each connection with TLS (rustls). Without TLS config the server uses raw
+/// TCP — suitable for trusted LANs or when combined with an SSH tunnel.
+///
+/// Each TCP connection gets its own `AgentServer` instance sharing the same
+/// `AgentRuntime`. The function runs until the listener errors.
+pub async fn run_acp_server_tcp(
+    addr: impl ToSocketAddrs + std::fmt::Debug,
+    config: Option<&AcpServerConfig>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    install_stderr_tracing();
+    let working_dir = std::env::current_dir()?;
+
+    // Warn if TLS is half-configured (only one of cert/key paths set).
+    if let Some(cfg) = config {
+        if cfg.tls_cert_path.is_some() != cfg.tls_key_path.is_some() {
+            warn!(
+                "ACP: TLS is half-configured — only one of tlsCertPath/tlsKeyPath is set; falling back to plain TCP"
+            );
+        }
+    }
+
+    // Build optional TLS acceptor from config cert/key paths.
+    let tls_acceptor = config
+        .and_then(|cfg| {
+            let cert_path = cfg.tls_cert_path.as_ref()?;
+            let key_path = cfg.tls_key_path.as_ref()?;
+            Some(load_tls_acceptor(cert_path, key_path))
+        })
+        .transpose()?;
+
+    if tls_acceptor.is_some() {
+        info!(?addr, cwd = %working_dir.display(), "ACP: starting TCP server (TLS enabled)");
+    } else {
+        info!(?addr, cwd = %working_dir.display(), "ACP: starting TCP server (plain TCP)");
+    }
+
+    let runtime = Arc::new(AgentRuntime::build(working_dir).await?);
+
+    let listener = TcpListener::bind(&addr).await?;
+    info!(?addr, "ACP: TCP server listening (cancel on shutdown)");
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => result?,
+            _ = cancel.cancelled() => {
+                info!("ACP: TCP server shutting down (cancellation requested)");
+                return Ok(());
+            }
+        };
+        info!(?peer, "ACP: new TCP connection");
+        let runtime = runtime.clone();
+
+        let (reader, writer) = if let Some(ref acceptor) = tls_acceptor {
+            // Perform TLS handshake before splitting.
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(?peer, error = %e, "ACP: TLS handshake failed");
+                    continue;
+                }
+            };
+            let (r, w) = tokio::io::split(tls_stream);
+            // Box the split halves so the rest of the handler is type-agnostic.
+            (
+                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+            )
+        } else {
+            let (r, w) = tokio::io::split(stream);
+            (
+                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+            )
+        };
+
+        tokio::spawn(async move {
+            let connection = Connection::new(writer);
+            let server = AgentServer::new(connection.clone(), runtime);
+
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let reader_fut = connection::run_reader(connection.clone(), reader, tx);
+
+            let dispatch_fut = async {
+                let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                while let Some(msg) = rx.recv().await {
+                    tasks.push(server.dispatch(msg));
+                }
+                for handle in tasks {
+                    let _ = handle.await;
+                }
+            };
+
+            let (reader_res, _) = tokio::join!(reader_fut, dispatch_fut);
+            if let Err(e) = reader_res {
+                warn!(?peer, error = %e, "ACP: TCP reader error");
+            }
+            info!(?peer, "ACP: TCP connection closed");
+        });
+    }
+}
+
+/// Start an embedded ACP TCP server in a background tokio task if enabled in config.
+/// The server runs on the configured address (default `127.0.0.1:9876`) and accepts
+/// ACP JSON-RPC connections from LAN clients. Tokio cancels the task on shutdown.
+/// TLS is enabled automatically when `tls_cert_path` and `tls_key_path` are set.
+///
+/// Returns a `CancellationToken` that can be used to request graceful shutdown:
+/// calling `cancel()` on it stops accepting new connections and lets the accept
+/// loop return. The caller must still await/drop the spawned task for cleanup.
+pub fn start_embedded_acp_server(config: &AcpServerConfig) -> CancellationToken {
+    let cancel = CancellationToken::new();
+    if !config.enabled {
+        return cancel;
+    }
+    let addr = config.listen.clone();
+    let config = config.clone();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_acp_server_tcp(addr, Some(&config), cancel_clone).await {
+            error!(error = %e, "ACP: embedded server failed");
+        }
+    });
+    cancel
+}
+
+/// Load TLS certificate and key PEM files and build a `TlsAcceptor`.
+fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
+    use rustls::pki_types::PrivateKeyDer;
+
+    let cert_bytes = fs::read(cert_path)
+        .map_err(|e| anyhow::anyhow!("failed to read TLS cert '{}': {}", cert_path, e))?;
+    let key_bytes = fs::read(key_path)
+        .map_err(|e| anyhow::anyhow!("failed to read TLS key '{}': {}", key_path, e))?;
+
+    // Parse PEM-encoded certificate chain.
+    let mut cert_reader = std::io::BufReader::new(cert_bytes.as_slice());
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader)
+            .filter_map(|r| r.ok())
+            .collect();
+
+    if certs.is_empty() {
+        anyhow::bail!(
+            "TLS cert file is empty or contains no certificates: {}",
+            cert_path
+        );
+    }
+
+    // Parse private key: try PKCS8 first, then EC, then RSA.
+    // Each format is tried with its own BufReader; we eagerly collect the
+    // iterator into a Vec so the borrow on the reader is released before
+    // the reader variable goes out of scope.
+    let key: PrivateKeyDer<'static> = {
+        let mut rdr = std::io::BufReader::new(key_bytes.as_slice());
+        let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut rdr)
+            .filter_map(|r| r.ok())
+            .collect();
+        if let Some(k) = keys.into_iter().next() {
+            PrivateKeyDer::Pkcs8(k)
+        } else {
+            let mut rdr = std::io::BufReader::new(key_bytes.as_slice());
+            let keys: Vec<_> = rustls_pemfile::ec_private_keys(&mut rdr)
+                .filter_map(|r| r.ok())
+                .collect();
+            if let Some(k) = keys.into_iter().next() {
+                PrivateKeyDer::Sec1(k)
+            } else {
+                let mut rdr = std::io::BufReader::new(key_bytes.as_slice());
+                let keys: Vec<_> = rustls_pemfile::rsa_private_keys(&mut rdr)
+                    .filter_map(|r| r.ok())
+                    .collect();
+                keys.into_iter()
+                    .next()
+                    .map(PrivateKeyDer::Pkcs1)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                        "TLS key file contains no supported private key (PKCS8, EC, or RSA): {}",
+                        key_path
+                    )
+                    })?
+            }
+        }
+    };
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| anyhow::anyhow!("invalid TLS key/cert pair: {}", e))?;
+
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
 }

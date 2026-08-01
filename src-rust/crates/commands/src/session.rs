@@ -239,7 +239,7 @@ impl SlashCommand for SessionCommand {
         "session"
     }
     fn aliases(&self) -> Vec<&str> {
-        vec!["remote"]
+        vec!["remote", "history"]
     }
     fn description(&self) -> &str {
         "Show or manage conversation sessions"

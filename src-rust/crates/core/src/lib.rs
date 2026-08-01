@@ -94,7 +94,7 @@ pub use key_ring::{KeyRing, KeyStatus};
 // Re-export commonly used types at the crate root
 pub use config::{
     builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
-    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    AcpServerConfig, AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat,
     PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
 };
@@ -110,6 +110,11 @@ pub use types::{
 };
 
 // Skill discovery: filesystem and git URL skill loading.
+/// Test-support helper for the workspace dead-code guard. Every crate's test
+/// suite calls [`dead_code_guard::assert_no_dead_pub_functions`] so a `pub fn`
+/// that nothing calls can't silently rot (rustc's `dead_code` lint never fires
+/// for `pub` items).
+pub mod dead_code_guard;
 pub mod skill_discovery;
 pub use cost::CostTracker;
 pub use feature_flags::FeatureFlagManager;
@@ -194,6 +199,7 @@ pub mod error {
 
         /// Return `true` for errors that mean the conversation cannot continue
         /// without intervention (e.g. compaction or context-window reset).
+        #[allow(dead_code)]
         pub fn is_context_limit(&self) -> bool {
             matches!(
                 self,
@@ -454,6 +460,7 @@ pub mod types {
         }
 
         /// Return references to all `ToolResult` blocks in this message.
+        #[allow(dead_code)]
         pub fn get_tool_result_blocks(&self) -> Vec<&ContentBlock> {
             match &self.content {
                 MessageContent::Blocks(blocks) => blocks
@@ -489,6 +496,7 @@ pub mod types {
         }
 
         /// Create a user message representing a `!`-prefixed local shell command with output.
+        #[allow(dead_code)]
         pub fn user_local_command_output(
             command: impl Into<String>,
             output: impl Into<String>,
@@ -506,6 +514,7 @@ pub mod types {
         }
 
         /// Create a user message representing a skill/slash-command invocation.
+        #[allow(dead_code)]
         pub fn user_command(name: impl Into<String>, args: impl Into<String>) -> Self {
             Self {
                 role: Role::User,
@@ -520,6 +529,7 @@ pub mod types {
         }
 
         /// Create a user message representing a memory key/value entry.
+        #[allow(dead_code)]
         pub fn user_memory_input(key: impl Into<String>, value: impl Into<String>) -> Self {
             Self {
                 role: Role::User,
@@ -534,6 +544,7 @@ pub mod types {
         }
 
         /// Create a system message representing an API error (red-bordered block).
+        #[allow(dead_code)]
         pub fn system_api_error(message: impl Into<String>, retry_secs: Option<u32>) -> Self {
             Self {
                 role: Role::User,
@@ -548,6 +559,7 @@ pub mod types {
         }
 
         /// Create a system message representing a collapsed read/search summary.
+        #[allow(dead_code)]
         pub fn collapsed_read_search(
             tool_name: impl Into<String>,
             paths: Vec<String>,
@@ -567,6 +579,7 @@ pub mod types {
         }
 
         /// Create a system message representing a sub-task assignment.
+        #[allow(dead_code)]
         pub fn task_assignment(
             id: impl Into<String>,
             subject: impl Into<String>,
@@ -1277,7 +1290,7 @@ pub mod config {
         #[serde(default, rename = "skipDangerousModePermissionPrompt")]
         pub skip_dangerous_mode_permission_prompt: bool,
         /// Bash command prefixes (first word) the user chose to always allow
-        /// from the permission dialog's "Allow commands matching <prefix>*"
+        /// from the permission dialog's "Allow commands matching \<prefix>*"
         /// option. Loaded into the prefix allowlist at startup.
         #[serde(default, rename = "allowedBashPrefixes")]
         pub allowed_bash_prefixes: Vec<String>,
@@ -1361,6 +1374,62 @@ pub mod config {
             rename = "fileInjectionMaxSize"
         )]
         pub file_injection_max_size: usize,
+        /// Preferred web search backend. "auto" (default), "searxng", "firecrawl", or "duckduckgo".
+        #[serde(
+            default = "default_preferred_search_backend",
+            rename = "preferredSearchBackend"
+        )]
+        pub preferred_search_backend: String,
+
+        /// ACP TCP server configuration (standalone or embedded).
+        #[serde(default, rename = "acpServer")]
+        pub acp_server: AcpServerConfig,
+    }
+
+    fn default_preferred_search_backend() -> String {
+        "auto".to_string()
+    }
+
+    /// Configuration for the ACP TCP server (standalone or embedded).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct AcpServerConfig {
+        /// Whether the TCP server should listen.
+        #[serde(default)]
+        pub enabled: bool,
+        /// Address to bind, e.g. "0.0.0.0:9876".
+        #[serde(default = "default_acp_listen")]
+        pub listen: String,
+        /// Path to a PEM-encoded TLS certificate file (enables TLS when set).
+        #[serde(
+            default,
+            rename = "tlsCertPath",
+            alias = "tls_cert_path",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub tls_cert_path: Option<String>,
+        /// Path to a PEM-encoded TLS private key file (required with tlsCertPath).
+        #[serde(
+            default,
+            rename = "tlsKeyPath",
+            alias = "tls_key_path",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub tls_key_path: Option<String>,
+    }
+
+    fn default_acp_listen() -> String {
+        "127.0.0.1:9876".to_string()
+    }
+
+    impl Default for AcpServerConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                listen: default_acp_listen(),
+                tls_cert_path: None,
+                tls_key_path: None,
+            }
+        }
     }
 
     /// A user-defined slash command template.
@@ -1505,6 +1574,7 @@ pub mod config {
         }
 
         /// Resolve the effective compact threshold (0.0 - 1.0).
+        #[allow(dead_code)]
         pub fn effective_compact_threshold(&self) -> f32 {
             if self.compact_threshold > 0.0 {
                 self.compact_threshold
@@ -1591,6 +1661,7 @@ pub mod config {
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
         ///
         /// Silently attempts token refresh when the access token is expired.
+        #[allow(dead_code)]
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
             if self.selected_provider_id() != "anthropic" {
                 return self.resolve_api_key().map(|key| (key, false));
@@ -2184,6 +2255,16 @@ pub mod config {
                     over.file_injection_max_size
                 } else {
                     base.file_injection_max_size
+                },
+                preferred_search_backend: if over.preferred_search_backend != "auto" {
+                    over.preferred_search_backend.clone()
+                } else {
+                    base.preferred_search_backend.clone()
+                },
+                acp_server: if over.acp_server.enabled {
+                    over.acp_server.clone()
+                } else {
+                    base.acp_server.clone()
                 },
             }
         }
@@ -3095,6 +3176,7 @@ pub mod permissions {
         }
 
         /// Remove a persistent rule by index and save settings.
+        #[allow(dead_code)]
         pub fn remove_rule(
             &mut self,
             idx: usize,
@@ -3126,6 +3208,7 @@ pub mod permissions {
         /// Register a pending permission and return a receiver.  The caller
         /// awaits the receiver and gets a `PermissionDecision` when the user
         /// (or a bridge peer) resolves the request.
+        #[allow(dead_code)]
         pub fn register_pending(
             &mut self,
             id: String,
@@ -3141,6 +3224,7 @@ pub mod permissions {
 
         /// Resolve a pending permission by `tool_use_id`, delivering
         /// `decision` to the waiting receiver.  No-op if the ID is unknown.
+        #[allow(dead_code)]
         pub fn resolve_pending(&mut self, id: &str, decision: PermissionDecision) {
             if let Some(pos) = self.pending.iter().position(|p| p.tool_use_id == id) {
                 let pending = self.pending.remove(pos);
@@ -3166,7 +3250,7 @@ pub mod permissions {
         /// Additional workspace roots considered in-bounds for file access.
         pub allowed_roots: Vec<std::path::PathBuf>,
         /// Context-aware description showing user WHY the tool needs permission.
-        /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: https://example.com"
+        /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: <https://example.com>"
         pub context_description: Option<String>,
     }
 
@@ -3659,6 +3743,7 @@ pub mod history {
             self.messages.len()
         }
 
+        #[allow(dead_code)]
         pub fn last_user_message(&self) -> Option<&Message> {
             self.messages
                 .iter()
@@ -3673,6 +3758,7 @@ pub mod history {
 
     /// Create a checkpoint at the current end of the session's message list.
     /// The checkpoint captures all messages currently in the session.
+    #[allow(dead_code)]
     pub fn create_checkpoint(session: &mut ConversationSession, label: Option<&str>) {
         let idx = session.messages.len();
         let checkpoint = SessionCheckpoint {
@@ -3693,6 +3779,7 @@ pub mod history {
     ///
     /// # Panics
     /// Panics if `idx` is out of bounds (i.e. >= `session.checkpoints.len()`).
+    #[allow(dead_code)]
     pub fn restore_checkpoint(session: &mut ConversationSession, idx: usize) -> Vec<Message> {
         let snapshot = session.checkpoints[idx].snapshot.clone();
         let replaced = std::mem::replace(&mut session.messages, snapshot);
@@ -3765,6 +3852,7 @@ pub mod history {
     }
 
     /// Rename (set the title of) a session.
+    #[allow(dead_code)]
     pub async fn rename_session(id: &str, new_title: &str) -> anyhow::Result<()> {
         let mut session = load_session(id).await?;
         session.title = Some(new_title.to_string());
@@ -3935,6 +4023,7 @@ pub mod cost {
         };
 
         /// Default pricing is Opus (most capable, highest cost).
+        #[allow(dead_code)]
         pub fn default_pricing() -> Self {
             Self::OPUS
         }
@@ -4629,6 +4718,7 @@ pub mod tasks {
         }
 
         /// Return `true` if the task is still running.
+        #[allow(dead_code)]
         pub fn is_running(&self) -> bool {
             matches!(self.status, TaskStatus::Running)
         }
@@ -4738,6 +4828,16 @@ pub mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
+        // so a `pub fn` that nothing calls silently rots. The shared
+        // implementation in `crate::dead_code_guard` scans the workspace and
+        // fails if any `pub fn` / `pub async fn` declared in this crate has
+        // no reference anywhere except its own declaration.
+        crate::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
 
     #[test]
     fn test_message_user() {

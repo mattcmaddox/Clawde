@@ -33,6 +33,10 @@ pub struct CommandContext {
     pub mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     /// Optional callback for starting an MCP OAuth flow in the background.
     pub mcp_auth_runner: Option<Arc<dyn Fn(clawde_mcp::oauth::McpAuthSession) + Send + Sync>>,
+    /// Live provider registry, when available. Lets commands such as
+    /// `/keys health` surface runtime state (e.g. free-mode upstream
+    /// empty-completion cooldowns, spec §6.3) that is not persisted to disk.
+    pub provider_registry: Option<std::sync::Arc<clawde_api::ProviderRegistry>>,
 }
 
 /// Result of running a slash command.
@@ -580,7 +584,7 @@ impl SlashCommand for HelpCommand {
         "Show available commands and usage information"
     }
 
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if !args.is_empty() {
             // Show help for a specific command
             if let Some(cmd) = find_command(args) {
@@ -662,6 +666,34 @@ impl SlashCommand for HelpCommand {
                 for entry in entries {
                     output.push_str(&format!("{}\n", entry));
                 }
+            }
+        }
+
+        // Append user-defined command templates from settings and discovered
+        // skill commands so custom commands are discoverable, not just
+        // executable. Both are built through the shared collection builders;
+        // names colliding with a built-in command are skipped so the listing
+        // never shows the same name twice (dispatch resolves built-ins first).
+        // `commands` (bound above for the `visible` filter) is still in scope;
+        // reusing it avoids a second `all_commands()` allocation and the
+        // borrow-lifetime error of borrowing from a temporary Vec.
+        let builtin_names: std::collections::HashSet<&str> =
+            commands.iter().map(|c| c.name()).collect();
+        let user_cmds: Vec<Box<dyn SlashCommand>> = commands_from_settings(&ctx.config)
+            .into_iter()
+            .filter(|c| !builtin_names.contains(c.name()))
+            .collect();
+        if !user_cmds.is_empty() {
+            output.push_str("\nUser-defined\n");
+            for cmd in &user_cmds {
+                output.push_str(&format!("  /{:<20} {}\n", cmd.name(), cmd.description()));
+            }
+        }
+        let skill_cmds = commands_from_discovered_skills(&ctx.working_dir, &ctx.config.skills);
+        if !skill_cmds.is_empty() {
+            output.push_str("\nSkills\n");
+            for cmd in &skill_cmds {
+                output.push_str(&format!("  /{:<20} {}\n", cmd.name(), cmd.description()));
             }
         }
 
@@ -873,6 +905,55 @@ impl SlashCommand for CompactCommand {
     }
 }
 /// Build a plain-text transcript of all messages for the compaction prompt.
+/// Parse a capability name string (or alias) into the corresponding
+/// `ModelCapability` value.  Returns `None` for unknown strings.
+///
+/// Delegates to [`clawde_api::ModelCapability::from_name`].
+pub fn parse_capability_str(s: &str) -> Option<clawde_api::ModelCapability> {
+    clawde_api::ModelCapability::from_name(s)
+}
+
+/// Return a human-friendly display label for a capability.
+///
+/// Delegates to [`clawde_api::ModelCapability::label`].
+pub fn capability_label(cap: clawde_api::ModelCapability) -> &'static str {
+    cap.label()
+}
+
+/// Return a formatted help-text block listing all available capability values
+/// with their descriptions. Shared by /image --help and /model --help.
+///
+/// Delegates to [`clawde_api::ModelCapability::help_text`].
+pub fn capability_help_text() -> String {
+    clawde_api::ModelCapability::help_text()
+}
+
+/// Return arg completions for capability values, filtered by the typed prefix.
+fn capability_arg_completions(partial: &str) -> Vec<ArgCompletion> {
+    let p = partial.to_lowercase();
+    clawde_api::ModelCapability::all_entries()
+        .iter()
+        .flat_map(|(value, desc)| {
+            // Always show the primary value ("json")
+            let mut entries = vec![ArgCompletion {
+                value: value.to_string(),
+                description: desc.to_string(),
+                available: true,
+            }];
+            // Also suggest "structured_output" alias for json.
+            if *value == "json" {
+                entries.push(ArgCompletion {
+                    value: "structured_output".into(),
+                    description: desc.to_string(),
+                    available: true,
+                });
+            }
+            entries
+        })
+        .filter(|ac| ac.value.to_lowercase().starts_with(&p))
+        .collect()
+}
+
 fn build_conversation_transcript(messages: &[Message]) -> String {
     let mut transcript = String::new();
     for msg in messages {
@@ -1069,10 +1150,15 @@ impl SlashCommand for ModelCommand {
         "Show or change the current model"
     }
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
-        // Cache model IDs from the bundled models.dev snapshot.
-        // The OnceLock builds the vec once per process lifetime (deduped),
-        // then each keystroke only clones the entries matching the typed
-        // prefix — not the full list.
+        // If the user is typing --capability <value>, return capability names.
+        if let Some(cap_val) = partial
+            .strip_prefix("--capability ")
+            .or_else(|| partial.strip_prefix("-c "))
+            .or_else(|| partial.strip_prefix("--capability="))
+        {
+            return capability_arg_completions(cap_val);
+        }
+        // Return model IDs for plain /model <partial>.
         use std::collections::HashSet;
         use std::sync::OnceLock;
         static MODELS: OnceLock<Vec<ArgCompletion>> = OnceLock::new();
@@ -1118,29 +1204,48 @@ impl SlashCommand for ModelCommand {
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
-        if args.is_empty() {
-            CommandResult::Message(format!("Current model: {}", ctx.config.effective_model()))
-        } else {
-            // Accept both "provider/model" and bare model names.
-            // The config stores the full string (including provider prefix when present)
-            // so that downstream dispatch can route to the correct provider.
-            let model_str = args.to_string();
-            let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
-                if provider == "anthropic" {
-                    format!("Switched to {}", model)
-                } else {
-                    format!("Switched to {}/{}", provider, model)
-                }
-            } else {
-                format!("Switched to {}", model_str)
-            };
-            let mut new_config = ctx.config.clone();
-            new_config.model = Some(model_str.clone());
-            if let Some((provider, _)) = model_str.split_once('/') {
-                new_config.provider = Some(provider.to_string());
-            }
-            CommandResult::ConfigChangeMessage(new_config, confirmation)
+
+        // --help: show available capability flags.
+        if args == "--help" || args == "-h" {
+            return CommandResult::Message(format!(
+                "/model [<model-id>|--capability <cap>]\n\n\
+                     Without arguments, shows the current model.\n\
+                     With a model ID, switches to that model.\n\
+                     With --capability, opens the model picker filtered by capability.\n\n\
+                     {}\n\n\
+                     Examples:\n\
+                       /model\n\
+                       /model claude-sonnet-4-6\n\
+                       /model --capability image\n\
+                       /model --capability vision|audio,tools",
+                crate::capability_help_text()
+            ));
         }
+
+        if args.is_empty() {
+            return CommandResult::Message(format!(
+                "Current model: {}",
+                ctx.config.effective_model()
+            ));
+        }
+
+        // Accept both "provider/model" and bare model names.
+        let model_str = args.to_string();
+        let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
+            if provider == "anthropic" {
+                format!("Switched to {}", model)
+            } else {
+                format!("Switched to {}/{}", provider, model)
+            }
+        } else {
+            format!("Switched to {}", model_str)
+        };
+        let mut new_config = ctx.config.clone();
+        new_config.model = Some(model_str.clone());
+        if let Some((provider, _)) = model_str.split_once('/') {
+            new_config.provider = Some(provider.to_string());
+        }
+        CommandResult::ConfigChangeMessage(new_config, confirmation)
     }
 }
 
@@ -1593,6 +1698,45 @@ impl SlashCommand for AutoCompactCommand {
     }
 }
 
+// ---- /sources ------------------------------------------------------------
+
+pub struct SourcesCommand;
+
+#[async_trait]
+impl SlashCommand for SourcesCommand {
+    fn name(&self) -> &str {
+        "sources"
+    }
+    fn description(&self) -> &str {
+        "Show which web search backend was used for the last search"
+    }
+    fn help(&self) -> &str {
+        "Usage: /sources\n\n\
+         Shows which search backend was used for the most recent web search.\n\
+         The search backend is also shown in the footer as 'search:<backend>'.\n\n\
+         Possible backends: searxng, firecrawl, duckduckgo"
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let backend = clawde_tools::web_search::get_last_search_backend();
+        if backend.is_empty() {
+            CommandResult::Message(
+                "No web search has been performed yet in this session.\n\
+                 Backends: SearXNG, Firecrawl, DuckDuckGo (in order of priority)"
+                    .to_string(),
+            )
+        } else {
+            CommandResult::Message(format!(
+                "Last search backend used: {}\n\
+                 \n\
+                 The search backend is also shown in the footer as 'search:{backend}'.\n\
+                 Configure your search preference via FIRECRAWL_API_KEY or SEARXNG_URL env vars.",
+                backend
+            ))
+        }
+    }
+}
+
 // ---- Named-command slash adapters ----------------------------------------
 
 #[async_trait]
@@ -1777,6 +1921,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SecurityReviewCommand),
         Box::new(TerminalSetupCommand),
         Box::new(ExtraUsageCommand),
+        Box::new(ImageCommand),
         Box::new(FastCommand),
         Box::new(ThinkBackCommand),
         Box::new(ThinkBackPlayCommand),
@@ -1810,6 +1955,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(GoalCommand),
         // Multi-key management
         Box::new(KeysCommand),
+        // Rate-limit query
+        Box::new(LimitsCommand),
         // Routing strategy for free mode
         Box::new(RoutingCommand),
         Box::new(RoutingAlias {
@@ -1824,9 +1971,19 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             name: "lr",
             target: "latency_based",
         }),
+        // Search source tracking
+        Box::new(SourcesCommand),
         // Session navigation ported from opencode: /new (lazy home) + /move.
         Box::new(NewCommand),
         Box::new(MoveCommand),
+        // Free upstream model browser — provides arg_completions for --capability.
+        Box::new(NamedCommandAdapter {
+            slash_name: "models",
+            target_name: "models",
+            slash_aliases: &[],
+            slash_description: "Browse free upstream models",
+            slash_help: "Usage: /models [--capability <cap>]",
+        }),
     ]
 }
 
@@ -1836,6 +1993,39 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     all_commands()
         .into_iter()
         .find(|c| c.name() == name || c.aliases().contains(&name))
+}
+
+/// Return every `(alias, canonical name, description)` triple across all
+/// registered commands.
+///
+/// This is the single source of truth for hidden aliases: any command that
+/// declares an alias in its [`SlashCommand::aliases`] implementation is
+/// automatically included. The TUI uses this to make alias prefixes
+/// autocomplete to the canonical command name (e.g. `/history` → `/session`)
+/// without maintaining a separate hardcoded alias table. The description is
+/// carried along so the typeahead can render a suggestion for any alias even
+/// when the canonical command is not part of the TUI's curated prompt list.
+///
+/// Each `aliases()` entry maps to the command that declared it. Aliases must
+/// not collide with another command's canonical name — `find_command` prefers
+/// a name match at dispatch, so an alias claiming a canonical name would be
+/// ambiguous. `test_all_command_aliases_no_canonical_collisions` enforces
+/// this invariant.
+pub fn all_command_aliases() -> Vec<(String, String, String)> {
+    all_commands()
+        .into_iter()
+        .flat_map(|cmd| {
+            let canonical = cmd.name().to_string();
+            let description = cmd.description().to_string();
+            // Collect inside the closure: `cmd.aliases()` borrows `cmd`, which
+            // is local to the closure, so the mapped iterator cannot be
+            // returned directly — materializing the triples ends the borrow.
+            cmd.aliases()
+                .into_iter()
+                .map(move |alias| (alias.to_string(), canonical.clone(), description.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Get argument completions for a registered slash command.
@@ -1855,9 +2045,21 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
 /// (typically O(1–20) entries) and keeping the filter here means every
 /// command benefits from it without needing to implement it themselves.
 pub fn get_arg_completions(cmd_name: &str, partial: &str) -> Vec<ArgCompletion> {
+    // Early return for capability completions — handles /model, /image, /models.
+    // Must happen before the normal dispatch so the downstream partial_lower
+    // filter (which compares against the full partial like "--capability vi")
+    // doesn't incorrectly drop results like "vision".
+    if let Some(cap_val) = partial
+        .strip_prefix("--capability ")
+        .or_else(|| partial.strip_prefix("-c "))
+        .or_else(|| partial.strip_prefix("--capability="))
+    {
+        return capability_arg_completions(cap_val);
+    }
+
     use std::sync::OnceLock;
     static CMDS: OnceLock<Vec<Box<dyn SlashCommand>>> = OnceLock::new();
-    let cmds = CMDS.get_or_init(|| all_commands());
+    let cmds = CMDS.get_or_init(all_commands);
 
     let cmd = match cmds
         .iter()
@@ -1871,21 +2073,6 @@ pub fn get_arg_completions(cmd_name: &str, partial: &str) -> Vec<ArgCompletion> 
     completions
         .into_iter()
         .filter(|ac| ac.value.to_lowercase().starts_with(&partial_lower))
-        .collect()
-}
-
-/// Build `HelpEntry` values for all non-hidden commands, suitable for
-/// populating `HelpOverlay::commands` at startup.
-pub fn build_help_entries() -> Vec<clawde_tui::overlays::HelpEntry> {
-    all_commands()
-        .iter()
-        .filter(|c| !c.hidden())
-        .map(|c| clawde_tui::overlays::HelpEntry {
-            name: c.name().to_string(),
-            aliases: c.aliases().join(", "),
-            description: c.description().to_string(),
-            category: command_category(c.name()).to_string(),
-        })
         .collect()
 }
 
@@ -1925,9 +2112,9 @@ impl SlashCommand for TemplateCommand {
 }
 
 /// Build slash commands from user-defined command templates stored in
-/// `settings.commands`.
-pub fn commands_from_settings(settings: &clawde_core::Settings) -> Vec<Box<dyn SlashCommand>> {
-    settings
+/// `config.commands` (copied from settings.json on load).
+pub fn commands_from_settings(config: &Config) -> Vec<Box<dyn SlashCommand>> {
+    config
         .commands
         .iter()
         .map(|(name, template)| {
@@ -2069,6 +2256,17 @@ pub mod stats;
 mod tests {
     use super::*;
     use clawde_core::cost::CostTracker;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialises every test that mutates the process-global `CLAWDE_HOME`
+    /// env var. Multiple tests setting `CLAWDE_HOME` to their own temp dir in
+    /// parallel races the environment: one test's `save()` can target a path
+    /// whose parent directory belongs to (and was already cleaned up by)
+    /// another test, producing flaky "No such file or directory" failures.
+    /// Test harnesses (`TestAccounts` in accounts.rs, `TestHome` in keys.rs,
+    /// and the theme-completion test below) acquire this lock for their whole
+    /// lifetime so only one such test runs at a time.
+    pub(crate) static CLAWDE_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn make_ctx() -> CommandContext {
         CommandContext {
@@ -2081,6 +2279,7 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             mcp_auth_runner: None,
+            provider_registry: None,
         }
     }
 
@@ -2132,6 +2331,96 @@ mod tests {
         assert!(find_command("bashes").is_some());
         assert!(find_command("remote").is_some());
         assert!(find_command("remote-setup").is_some());
+    }
+
+    #[test]
+    fn test_all_command_aliases_includes_session_history() {
+        let aliases = all_command_aliases();
+        assert!(
+            aliases
+                .iter()
+                .any(|(a, c, _)| a == "history" && c == "session"),
+            "expected (history → session) in {:?}",
+            aliases
+        );
+    }
+
+    #[test]
+    fn test_all_command_aliases_cover_all_aliases() {
+        // Every alias declared by a command must appear in the alias table,
+        // mapped to the command that declared it, with a non-empty description.
+        let aliases = all_command_aliases();
+        for cmd in all_commands() {
+            let canonical = cmd.name().to_string();
+            for alias in cmd.aliases() {
+                assert!(
+                    aliases
+                        .iter()
+                        .any(|(a, c, d)| { a == alias && *c == canonical && !d.is_empty() }),
+                    "alias {} → {} missing (or missing description) from all_command_aliases",
+                    alias,
+                    canonical
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_command_aliases_no_canonical_collisions() {
+        // An alias must never claim a name that is another command's canonical
+        // name — dispatch prefers the canonical name, so the typeahead must too.
+        let commands = all_commands();
+        let canonical_names: std::collections::HashSet<String> =
+            commands.iter().map(|c| c.name().to_string()).collect();
+        for (alias, _, _) in all_command_aliases() {
+            assert!(
+                !canonical_names.contains(&alias),
+                "alias {alias} collides with a canonical command name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_alias_first_match_semantics() {
+        // If two commands ever declare the same alias string, dispatch
+        // (`find_command`) and the typeahead (`all_command_aliases` first
+        // match) must agree on the winner: both iterate `all_commands()` in
+        // order and pick the first command that claims the alias. Lock in the
+        // invariant that for every alias, `find_command` resolves to the same
+        // canonical as the first (alias → canonical) triple in the table.
+        let aliases = all_command_aliases();
+        for (alias, canonical, _) in &aliases {
+            let resolved = find_command(alias)
+                .map(|c| c.name().to_string())
+                .expect("alias must resolve to a command");
+            assert_eq!(
+                &resolved, canonical,
+                "alias `{alias}`: dispatch resolves to `{resolved}` but typeahead first-match says `{canonical}`"
+            );
+        }
+
+        // Document the shared-alias scenario explicitly: the first command in
+        // `all_commands()` order wins. (No two commands currently share an
+        // alias, so this just asserts the ordering invariant holds for the
+        // real table — if a collision is ever introduced, the loop above keeps
+        // dispatch and typeahead in agreement.)
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for cmd in all_commands() {
+            let canonical = cmd.name().to_string();
+            for alias in cmd.aliases() {
+                if let Some(prev) = seen.insert(alias.to_string(), canonical.clone()) {
+                    // A collision exists: dispatch must pick the first-declared
+                    // canonical (the earlier command in all_commands() order).
+                    let resolved = find_command(alias)
+                        .map(|c| c.name().to_string())
+                        .unwrap_or_default();
+                    assert_eq!(
+                        resolved, prev,
+                        "first-match wins for shared alias `{alias}`"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2429,6 +2718,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_help_resolves_alias_to_canonical() {
+        // `/help history` must resolve the hidden alias to its canonical
+        // command (/session) and show the command plus its aliases.
+        let mut ctx = make_ctx();
+        let cmd = find_command("help").unwrap();
+        let result = cmd.execute("history", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("/session"),
+                    "expected canonical /session in help output, got: {msg}"
+                );
+                assert!(
+                    msg.contains("history"),
+                    "expected alias /history listed in help output, got: {msg}"
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_help_unknown_alias_errors() {
+        // `/help not-an-alias` must fall through to the unknown-command error
+        // rather than silently returning empty help.
+        let mut ctx = make_ctx();
+        let cmd = find_command("help").unwrap();
+        let result = cmd.execute("not-an-alias", &mut ctx).await;
+        assert!(matches!(result, CommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_no_unreferenced_pub_functions_in_workspace() {
+        // Dead-code guard: rustc's `dead_code` lint never fires for `pub`
+        // items, so a `pub fn` that nothing calls (like the former
+        // `build_help_entries`) silently rots. The shared implementation in
+        // `clawde_core::dead_code_guard` scans the workspace and fails if any
+        // `pub fn` / `pub async fn` declared in this crate has no reference
+        // anywhere except its own declaration.
+        clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
+
+    #[tokio::test]
     async fn test_web_setup_proxy_executes_named_command() {
         let mut ctx = make_ctx();
         let cmd = find_command("web-setup").unwrap();
@@ -2592,6 +2924,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn test_build_conversation_transcript_empty() {
         let result = build_conversation_transcript(&[]);
         assert_eq!(result, "");
@@ -3015,14 +3348,25 @@ fn auto_compact_completions_on_off() {
 }
 
 #[test]
-fn theme_completions_all_four() {
+fn theme_completions_all_builtins_and_subcommands() {
+    // The theme command reads custom themes from the config dir, which the
+    // CLAWDE_HOME env var redirects. TestHome acquires the shared
+    // CLAWDE_HOME_LOCK and points the env var at a fresh temp dir, so no
+    // user themes leak into the count and no env race occurs.
+    let _home = crate::keys::tests::TestHome::new();
+
     let completions = crate::get_arg_completions("theme", "");
-    assert_eq!(completions.len(), 4);
+    // 9 built-ins + list/create/delete subcommands, with no custom themes
+    // in the isolated temp home.
+    assert_eq!(completions.len(), 12);
     let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
     assert!(values.contains(&"default"));
     assert!(values.contains(&"dark"));
     assert!(values.contains(&"light"));
     assert!(values.contains(&"catppuccin"));
+    assert!(values.contains(&"list"));
+    assert!(values.contains(&"create"));
+    assert!(values.contains(&"delete"));
 }
 
 #[test]
@@ -3031,6 +3375,89 @@ fn diff_completions_flags() {
     let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
     assert!(values.contains(&"--stat"));
     assert!(values.contains(&"--staged"));
+}
+
+#[test]
+fn get_arg_completions_model_with_capability_flag_returns_vision() {
+    let completions = crate::get_arg_completions("model", "--capability vision");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(
+        values.contains(&"vision"),
+        "should return 'vision' completion, got: {:?}",
+        values
+    );
+}
+
+#[test]
+fn get_arg_completions_model_with_capability_short_flag_returns_reasoning() {
+    let completions = crate::get_arg_completions("model", "-c reasoning");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(values.contains(&"reasoning"), "should return 'reasoning'");
+}
+
+#[test]
+fn get_arg_completions_model_with_capability_partial_prefix_filters() {
+    let completions = crate::get_arg_completions("model", "--capability vis");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert_eq!(values, vec!["vision"], "only 'vision' starts with 'vis'");
+}
+
+#[test]
+fn get_arg_completions_model_no_capability_returns_model_ids() {
+    // Without --capability prefix, returns model IDs (not capability names).
+    let completions = crate::get_arg_completions("model", "claude");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(
+        !values.contains(&"vision"),
+        "should NOT return capability names"
+    );
+    assert!(
+        values.iter().any(|v| v.contains("claude")),
+        "should contain model IDs matching 'claude', got: {:?}",
+        values
+    );
+}
+
+#[test]
+fn get_arg_completions_image_with_capability_flag_returns_tools() {
+    let completions = crate::get_arg_completions("image", "--capability tools");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(
+        values.contains(&"tools"),
+        "should return 'tools' completion, got: {:?}",
+        values
+    );
+}
+
+#[test]
+fn get_arg_completions_models_with_capability_flag_returns_audio() {
+    let completions = crate::get_arg_completions("models", "--capability audio");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(
+        values.contains(&"audio"),
+        "should return 'audio' completion, got: {:?}",
+        values
+    );
+}
+
+#[test]
+fn get_arg_completions_models_no_flag_returns_empty() {
+    // Without --capability, /models has no arg completions.
+    let completions = crate::get_arg_completions("models", "");
+    assert!(
+        completions.is_empty(),
+        "models without flag should be empty"
+    );
+}
+
+#[test]
+fn get_arg_completions_capability_equals_syntax_works() {
+    let completions = crate::get_arg_completions("model", "--capability=vision");
+    let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+    assert!(
+        values.contains(&"vision"),
+        "should return 'vision' completion"
+    );
 }
 
 #[test]

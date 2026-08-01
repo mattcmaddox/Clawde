@@ -41,6 +41,7 @@ static OVERFLOW_PATTERNS: &[&str] = &[
     "context length is only.*tokens",
     "input length.*exceeds.*context length",
     "context_length_exceeded",
+    "request too large",
     "request entity too large",
     "too many tokens",
     "context.*length.*exceeded",
@@ -145,9 +146,12 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             retry_after: None,
         },
         413 => ProviderError::ContextOverflow {
+            // Include the actual response body so callers can see the real
+            // Groq / provider message (e.g., TPM rate-limit info).
+            // The `message` variable is already extracted from JSON / body above.
             provider: provider.clone(),
-            message: "Request too large (413)".to_string(),
-            max_tokens: None,
+            message,
+            max_tokens: extract_token_limit(body),
         },
         500..=599 => ProviderError::ServerError {
             provider: provider.clone(),

@@ -1231,17 +1231,14 @@ impl NamedCommand for ModelsCommand {
             );
         }
 
-        let mut out = format!(
-            "FreeProvider upstreams ({}):\n\n",
-            defaults.len()
-        );
+        let mut out = format!("FreeProvider upstreams ({}):\n\n", defaults.len());
         for (name, model) in &defaults {
             out.push_str(&format!("  {:<18}  {}\n", name, model));
         }
-        out.push_str(&format!(
+        out.push_str(
             "\nUse /model <upstream>/<model> to pin a specific upstream.\n\
-             Use /context to see key health and model details."
-        ));
+             Use /context to see key health and model details.",
+        );
         CommandResult::Message(out)
     }
 }
@@ -1299,6 +1296,7 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             mcp_auth_runner: None,
+            provider_registry: None,
         }
     }
 

@@ -362,6 +362,7 @@ impl ElicitationDialogState {
     }
 
     /// For multi-enum fields: move the sub-cursor up.
+    #[allow(dead_code)]
     pub fn multi_enum_prev(&mut self) {
         let Some(field) = self.fields.get_mut(self.active_field) else {
             return;

@@ -106,7 +106,7 @@ pub struct SyncedData {
 pub struct SettingsSyncManager {
     /// OAuth bearer token for authentication.
     pub oauth_token: String,
-    /// Base API URL (default: https://api.anthropic.com).
+    /// Base API URL (default: <https://api.anthropic.com>).
     pub base_url: String,
     http: reqwest::Client,
 }
@@ -328,6 +328,7 @@ impl SettingsSyncManager {
     ///   1. Read local settings and AGENTS.md files
     ///   2. Fetch current remote state for diffing
     ///   3. Upload only changed entries
+    #[allow(dead_code)]
     pub fn upload_in_background(token: String, base_url: String) {
         tokio::spawn(async move {
             let mgr = SettingsSyncManager::new(token, base_url);

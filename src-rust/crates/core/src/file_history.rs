@@ -183,6 +183,7 @@ impl FileHistory {
         snapshots
     }
 
+    #[allow(dead_code)]
     pub fn from_entries(entries: Vec<FileHistoryEntry>) -> Self {
         let mut by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
         for (idx, entry) in entries.iter().enumerate() {

@@ -46,6 +46,7 @@ impl GoalStatus {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_continuable(&self) -> bool {
         matches!(self, GoalStatus::Active)
     }

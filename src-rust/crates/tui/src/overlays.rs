@@ -12,6 +12,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+use crate::theme_colors::current_palette;
+
 pub const CLAURST_ACCENT: Color = Color::Rgb(233, 30, 99);
 pub const CLAURST_PANEL_BG: Color = Color::Rgb(20, 20, 28);
 pub const CLAURST_PANEL_BORDER: Color = Color::Rgb(72, 72, 80);
@@ -46,11 +48,12 @@ pub fn render_dark_overlay(frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_dark_overlay_buf(buf: &mut Buffer, area: Rect) {
+    let p = current_palette();
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_bg(CLAURST_OVERLAY_BG);
-                cell.set_fg(CLAURST_MUTED);
+                cell.set_fg(p.disabled);
             }
         }
     }
@@ -62,12 +65,13 @@ pub fn render_dialog_bg(frame: &mut Frame, area: Rect) {
 }
 
 pub fn render_dialog_bg_buf(buf: &mut Buffer, area: Rect) {
+    let p = current_palette();
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_char(' ');
-                cell.set_bg(CLAURST_PANEL_BG);
-                cell.set_fg(CLAURST_TEXT);
+                cell.set_bg(p.panel_bg);
+                cell.set_fg(p.text_light);
             }
         }
     }
@@ -155,6 +159,7 @@ pub fn begin_modal_buf(
     layout
 }
 
+#[allow(dead_code)]
 pub fn modal_title_line(title: &str, right_hint: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -174,6 +179,7 @@ pub fn render_modal_title_frame(frame: &mut Frame, area: Rect, title: &str, righ
     if area.height == 0 {
         return;
     }
+    let p = current_palette();
     let title_width = UnicodeWidthStr::width(title);
     let hint_width = UnicodeWidthStr::width(right_hint);
     let padding = area
@@ -183,11 +189,11 @@ pub fn render_modal_title_frame(frame: &mut Frame, area: Rect, title: &str, righ
         Span::styled(
             format!(" {}", title),
             Style::default()
-                .fg(CLAURST_TEXT)
+                .fg(p.text_light)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ".repeat(padding), Style::default().fg(CLAURST_TEXT)),
-        Span::styled(right_hint.to_string(), Style::default().fg(CLAURST_MUTED)),
+        Span::styled(" ".repeat(padding), Style::default().fg(p.text_light)),
+        Span::styled(right_hint.to_string(), Style::default().fg(p.disabled)),
     ]);
     frame.render_widget(
         Paragraph::new(line),
@@ -204,6 +210,7 @@ pub fn render_modal_title_buf(buf: &mut Buffer, area: Rect, title: &str, right_h
     if area.height == 0 {
         return;
     }
+    let p = current_palette();
     let title_width = UnicodeWidthStr::width(title);
     let hint_width = UnicodeWidthStr::width(right_hint);
     let padding = area
@@ -213,11 +220,11 @@ pub fn render_modal_title_buf(buf: &mut Buffer, area: Rect, title: &str, right_h
         Span::styled(
             format!(" {}", title),
             Style::default()
-                .fg(CLAURST_TEXT)
+                .fg(p.text_light)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ".repeat(padding), Style::default().fg(CLAURST_TEXT)),
-        Span::styled(right_hint.to_string(), Style::default().fg(CLAURST_MUTED)),
+        Span::styled(" ".repeat(padding), Style::default().fg(p.text_light)),
+        Span::styled(right_hint.to_string(), Style::default().fg(p.disabled)),
     ]);
     Paragraph::new(line).render(
         Rect {
@@ -267,6 +274,46 @@ pub fn modal_search_line(
             format!(" {}", query),
             Style::default().fg(query_color),
         )])
+    }
+}
+
+/// Draw a thin vertical scrollbar along the right edge of `area`.
+/// `offset` is the first visible item index, `total` the item count, and
+/// `viewport` how many items fit on screen at once.
+pub fn render_scrollbar(
+    frame: &mut Frame,
+    p: &crate::theme_colors::ColorPalette,
+    area: Rect,
+    offset: usize,
+    total: usize,
+    viewport: usize,
+) {
+    if area.height == 0 || total == 0 {
+        return;
+    }
+    let visible = total.min(viewport);
+    let track_h = area.height as usize;
+    let thumb_h = (track_h * visible / total).max(1);
+    let max_scroll = total.saturating_sub(visible);
+    let frac = if max_scroll == 0 {
+        0.0
+    } else {
+        offset as f32 / max_scroll as f32
+    };
+    let thumb_y = ((track_h - thumb_h) as f32 * frac) as usize;
+    let x = area.x + area.width.saturating_sub(1);
+    for row in 0..track_h {
+        let y = area.y + row as u16;
+        let in_thumb = row >= thumb_y && row < thumb_y + thumb_h;
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            if in_thumb {
+                cell.set_symbol("█");
+                cell.set_fg(p.accent);
+            } else {
+                cell.set_symbol("│");
+                cell.set_fg(p.disabled);
+            }
+        }
     }
 }
 
@@ -333,6 +380,21 @@ impl HelpOverlay {
             self.scroll_offset += 1;
         }
     }
+    pub fn page_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(10);
+    }
+
+    pub fn page_down(&mut self, max: u16) {
+        self.scroll_offset = (self.scroll_offset + 10).min(max.saturating_sub(1));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self, max: u16) {
+        self.scroll_offset = max.saturating_sub(1);
+    }
 
     pub fn push_filter_char(&mut self, c: char) {
         self.filter.push(c);
@@ -355,13 +417,15 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         return;
     }
 
+    let p = current_palette();
+
     let layout = begin_modal_frame(frame, area, 100, 36, 3, 1);
     render_modal_title_frame(frame, layout.header_area, "Shortcuts & commands", "esc");
     let search_line = modal_search_line(
         &overlay.filter,
         "Search shortcuts or commands",
-        CLAURST_MUTED,
-        CLAURST_TEXT,
+        p.disabled,
+        p.text_light,
     );
     if let Some(search_area) = modal_header_line_area(layout.header_area, 2) {
         frame.render_widget(Paragraph::new(search_line), search_area);
@@ -386,18 +450,14 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
 
     left_lines.push(Line::from(Span::styled(
         " Keyboard Shortcuts",
-        Style::default()
-            .fg(CLAURST_ACCENT)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     left_lines.push(Line::from(""));
 
     // Navigation category
     left_lines.push(Line::from(Span::styled(
         " Navigation",
-        Style::default()
-            .fg(CLAURST_ACCENT)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &[
         ("PageUp / PgDn", "Scroll messages"),
@@ -411,9 +471,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     // Input category
     left_lines.push(Line::from(Span::styled(
         " Input",
-        Style::default()
-            .fg(CLAURST_ACCENT)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &[
         ("Enter", "Submit message"),
@@ -429,9 +487,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     // App category
     left_lines.push(Line::from(Span::styled(
         " App",
-        Style::default()
-            .fg(CLAURST_ACCENT)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &[
         ("F1 / ?", "Toggle help"),
@@ -440,6 +496,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         ("Ctrl+C", "Cancel / quit"),
         ("Ctrl+D", "Quit (empty input)"),
         ("Ctrl+L", "Clear screen"),
+        ("Ctrl+Shift+S", "Show search source"),
         ("t", "Expand/collapse thinking"),
     ] {
         left_lines.push(kb_line(key, desc));
@@ -448,13 +505,13 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     frame.render_widget(
         Paragraph::new(left_lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(CLAURST_PANEL_BG)),
+            .style(Style::default().bg(p.panel_bg)),
         col_chunks[0],
     );
 
     // ─── Center divider ────────────────────────────────────────────────────
     let divider_lines: Vec<Line<'static>> = (0..content_area.height)
-        .map(|_| Line::from(Span::styled("\u{2502}", Style::default().fg(CLAURST_MUTED))))
+        .map(|_| Line::from(Span::styled("\u{2502}", Style::default().fg(p.disabled))))
         .collect();
     frame.render_widget(Paragraph::new(divider_lines), col_chunks[1]);
 
@@ -475,9 +532,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
 
     right_lines.push(Line::from(Span::styled(
         " Slash Commands",
-        Style::default()
-            .fg(CLAURST_ACCENT)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     right_lines.push(Line::from(""));
 
@@ -490,9 +545,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             }
             right_lines.push(Line::from(Span::styled(
                 format!(" {}", entry.category),
-                Style::default()
-                    .fg(CLAURST_ACCENT)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
             )));
         }
         let aliases_text = if entry.aliases.is_empty() {
@@ -505,22 +558,19 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             Span::styled(
                 format!("/{:<14}", entry.name),
                 Style::default()
-                    .fg(CLAURST_TEXT)
+                    .fg(p.text_light)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(aliases_text, Style::default().fg(CLAURST_MUTED)),
+            Span::styled(aliases_text, Style::default().fg(p.disabled)),
             Span::raw("  "),
-            Span::styled(
-                entry.description.clone(),
-                Style::default().fg(CLAURST_MUTED),
-            ),
+            Span::styled(entry.description.clone(), Style::default().fg(p.disabled)),
         ]));
     }
 
     if filtered.is_empty() {
         right_lines.push(Line::from(Span::styled(
             " No matching commands",
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(p.disabled),
         )));
     }
 
@@ -533,7 +583,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         Paragraph::new(right_lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .style(Style::default().bg(CLAURST_PANEL_BG)),
+            .style(Style::default().bg(p.panel_bg)),
         col_chunks[2],
     );
 
@@ -543,7 +593,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             APP_VERSION
         ),
         Style::default()
-            .fg(CLAURST_MUTED)
+            .fg(p.disabled)
             .add_modifier(Modifier::ITALIC),
     )]);
     frame.render_widget(Paragraph::new(version_line), layout.footer_area);
@@ -778,6 +828,7 @@ pub struct HistorySearchOverlay {
 /// Convenience accessor: the plain list of `snapshot_idx` values from
 /// `matches`, in order.  Kept for callers that only need indices.
 impl HistorySearchOverlay {
+    #[allow(dead_code)]
     pub fn match_indices(&self) -> Vec<usize> {
         self.matches.iter().map(|m| m.snapshot_idx).collect()
     }
@@ -964,6 +1015,7 @@ impl HistorySearchOverlay {
     }
 
     /// Like `current_entry` but returns from the internal snapshot.
+    #[allow(dead_code)]
     pub fn current_entry_owned(&self) -> Option<&str> {
         let snap_idx = self.matches.get(self.selected_idx)?.snapshot_idx;
         self.snapshot.get(snap_idx).map(|e| e.text.as_str())
@@ -1595,15 +1647,16 @@ fn render_rewind_confirm(frame: &mut Frame, message_idx: usize, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn kb_line<'a>(key: &str, desc: &str) -> Line<'a> {
+    let p = current_palette();
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
             format!("{:<20}", key),
             Style::default()
-                .fg(CLAURST_TEXT)
+                .fg(p.text_light)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(desc.to_string(), Style::default().fg(CLAURST_MUTED)),
+        Span::styled(desc.to_string(), Style::default().fg(p.disabled)),
     ])
 }
 
@@ -2000,6 +2053,387 @@ pub fn render_global_search(
             height: 1,
         },
         buf,
+    );
+}
+// ============================================================================
+// KeybindingsOverlay (Ctrl+/)
+// ============================================================================
+
+/// State for the Ctrl+/ keybinding cheat-sheet overlay.
+#[derive(Debug, Default)]
+pub struct KeybindingsOverlayState {
+    pub visible: bool,
+    pub scroll_offset: u16,
+    /// Live search filter.
+    pub filter: String,
+    /// Frame counter when the overlay was last opened, for slide-in animation.
+    /// 0 = not animating.
+    pub open_frame: u64,
+}
+
+impl KeybindingsOverlayState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn toggle(&mut self) {
+        self.visible = !self.visible;
+        if self.visible {
+            self.scroll_offset = 0;
+            self.filter.clear();
+            self.open_frame = 0; // caller will set the actual frame_count
+        } else {
+            self.scroll_offset = 0;
+            self.filter.clear();
+            self.open_frame = 0;
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.scroll_offset = 0;
+        self.filter.clear();
+        self.open_frame = 0;
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self, max: u16) {
+        if self.scroll_offset + 1 < max {
+            self.scroll_offset += 1;
+        }
+    }
+    pub fn page_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(10);
+    }
+
+    pub fn page_down(&mut self, max: u16) {
+        self.scroll_offset = (self.scroll_offset + 10).min(max.saturating_sub(1));
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self, max: u16) {
+        self.scroll_offset = max.saturating_sub(1);
+    }
+
+    pub fn push_filter_char(&mut self, c: char) {
+        self.filter.push(c);
+        self.scroll_offset = 0;
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        self.filter.pop();
+        self.scroll_offset = 0;
+    }
+}
+
+/// Build a human-readable label for a key context enum.
+fn context_label(ctx: &clawde_core::keybindings::KeyContext) -> &'static str {
+    use clawde_core::keybindings::KeyContext;
+    match ctx {
+        KeyContext::Global => "Global",
+        KeyContext::Chat => "Chat & Input",
+        KeyContext::Confirmation => "Confirmations",
+        KeyContext::Help => "Help Overlay",
+        KeyContext::Transcript => "Transcript",
+        KeyContext::MessageSelector => "Message Selector",
+        KeyContext::ThemePicker => "Theme Picker",
+        KeyContext::Task => "Tasks",
+        KeyContext::DiffDialog => "Diff Viewer",
+        KeyContext::Select => "Select Dialogs",
+        KeyContext::Plugin => "Plugin",
+        KeyContext::HistorySearch => "History Search",
+        KeyContext::Settings => "Settings",
+        KeyContext::Autocomplete => "Autocomplete",
+        KeyContext::ModelPicker => "Model Picker",
+        KeyContext::Tabs => "Tabs",
+        KeyContext::Attachments => "Attachments",
+        KeyContext::Footer => "Footer",
+    }
+}
+
+/// Format a `ParsedKeystroke` into a readable string like "Ctrl+Shift+A".
+fn fmt_keystroke(ks: &clawde_core::keybindings::ParsedKeystroke) -> String {
+    let mut parts = Vec::new();
+    if ks.ctrl {
+        parts.push("Ctrl");
+    }
+    if ks.alt {
+        parts.push("Alt");
+    }
+    if ks.shift {
+        parts.push("Shift");
+    }
+    if ks.meta {
+        parts.push("Cmd");
+    }
+    let key = &ks.key;
+    let display_key = match key.as_str() {
+        "escape" => "Esc",
+        "enter" => "Enter",
+        "backspace" => "Bksp",
+        "space" => "Space",
+        "up" => "\u{2191}",
+        "down" => "\u{2193}",
+        "left" => "\u{2190}",
+        "right" => "\u{2192}",
+        "pageup" => "PgUp",
+        "pagedown" => "PgDn",
+        "home" => "Home",
+        "end" => "End",
+        "tab" => "Tab",
+        "delete" => "Del",
+        other => other,
+    };
+    parts.push(display_key);
+    parts.join("+")
+}
+
+/// Render the keybinding cheat-sheet overlay.
+pub fn render_keybindings_overlay(
+    frame: &mut Frame,
+    state: &KeybindingsOverlayState,
+    area: Rect,
+    frame_count: u64,
+    accent_color: Color,
+) {
+    if !state.visible {
+        return;
+    }
+
+    // Slide-in animation: content reveals from top to bottom over ~8 frames.
+    let anim_progress = if state.open_frame > 0 && frame_count >= state.open_frame {
+        ((frame_count - state.open_frame) as f64 / 8.0).min(1.0)
+    } else {
+        1.0
+    };
+
+    let layout = begin_modal_frame(frame, area, 90, 32, 3, 1);
+    render_modal_title_frame(
+        frame,
+        layout.header_area,
+        "Keyboard Shortcuts",
+        "Esc: close",
+    );
+
+    let search_line = modal_search_line(
+        &state.filter,
+        "Filter keybindings...",
+        CLAURST_MUTED,
+        CLAURST_TEXT,
+    );
+    if let Some(search_area) = modal_header_line_area(layout.header_area, 2) {
+        frame.render_widget(Paragraph::new(search_line), search_area);
+    }
+
+    let content_area = layout.body_area;
+    if content_area.height == 0 {
+        return;
+    }
+
+    use clawde_core::keybindings::default_bindings;
+    use std::collections::HashMap;
+
+    let bindings = default_bindings();
+
+    let mut by_context: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut context_order: Vec<String> = Vec::new();
+
+    for binding in &bindings {
+        let ctx_label = context_label(&binding.context);
+        let action = match &binding.action {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+        // Skip generic navigation actions that are context-dependent
+        if matches!(
+            action.as_str(),
+            "yes"
+                | "no"
+                | "prev"
+                | "next"
+                | "prevOption"
+                | "nextOption"
+                | "select"
+                | "cancel"
+                | "close"
+                | "prevTask"
+                | "nextTask"
+                | "selectTask"
+                | "closeTask"
+                | "toggleDone"
+                | "prevDiff"
+                | "nextDiff"
+                | "acceptDiff"
+                | "rejectDiff"
+                | "prevMessage"
+                | "nextMessage"
+                | "selectMessage"
+                | "pageUp"
+                | "pageDown"
+                | "goStart"
+                | "goEnd"
+                | "togglePreview"
+                | "search"
+                | "prevResult"
+                | "nextResult"
+                | "toggle"
+                | "addAttachment"
+                | "removeAttachment"
+        ) {
+            continue;
+        }
+        let chord_str: String = binding
+            .chord
+            .iter()
+            .map(fmt_keystroke)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let action_label = match action.as_str() {
+            "redraw" => "Clear screen",
+            "historySearch" => "Search history",
+            "createBranch" => "Branch session",
+            "openHelp" => "Open help",
+            "compact" => "Compact context",
+            "showKeybindings" => "Show keybindings",
+            "submit" => "Submit message",
+            "newline" => "New line",
+            "goLineStart" => "Line start",
+            "goLineEnd" => "Line end",
+            "moveWordBackward" => "Word backward",
+            "moveWordForward" => "Word forward",
+            "killWord" => "Kill word",
+            "deleteWord" => "Delete word",
+            "deleteCharBefore" => "Delete char before",
+            "killToStart" => "Kill to start",
+            "clearLine" => "Clear input",
+            "historyPrev" => "History prev",
+            "historyNext" => "History next",
+            "previousMessage" => "Previous msg",
+            "nextMessage" => "Next msg",
+            "jumpToNextError" => "Next error",
+            "jumpToPreviousError" => "Previous error",
+            "findInMessage" => "Find in message",
+            "globalSearch" => "Global search",
+            "findNext" => "Find next",
+            "findPrev" => "Find prev",
+            "goToLine" => "Go to line",
+            "indent" => "Indent",
+            "reverseIndent" => "Unindent",
+            "expandPaste" => "Expand paste",
+            "scrollUp" => "Scroll up",
+            "scrollDown" => "Scroll down",
+            "openModelPicker" => "Model picker",
+            "openCommandPalette" => "Command palette",
+            _ => &action,
+        };
+
+        let entry = (action_label.to_string(), chord_str);
+
+        if !by_context.contains_key(ctx_label) {
+            context_order.push(ctx_label.to_string());
+        }
+        by_context
+            .entry(ctx_label.to_string())
+            .or_default()
+            .push(entry);
+    }
+
+    let filter_lc = state.filter.to_lowercase();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for ctx_name in &context_order {
+        let entries = by_context.get(ctx_name).expect("just inserted");
+
+        let filtered_entries: Vec<_> = if filter_lc.is_empty() {
+            entries.iter().collect()
+        } else {
+            entries
+                .iter()
+                .filter(|(label, chord)| {
+                    label.to_lowercase().contains(&filter_lc)
+                        || chord.to_lowercase().contains(&filter_lc)
+                })
+                .collect()
+        };
+
+        if filtered_entries.is_empty() {
+            continue;
+        }
+
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {}", ctx_name),
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        for (label, chord) in &filtered_entries {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<25}", chord),
+                    Style::default()
+                        .fg(CLAURST_TEXT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(label.to_string(), Style::default().fg(CLAURST_MUTED)),
+            ]));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  No matching keybindings.",
+            Style::default().fg(CLAURST_MUTED),
+        )));
+    }
+
+    let total = lines.len() as u16;
+    // Content-reveal animation: clamp visible rows during slide-in.
+    let content_area = if anim_progress < 1.0 {
+        let reveal_rows = (content_area.height as f64 * anim_progress).ceil() as u16;
+        Rect {
+            height: reveal_rows.max(1),
+            ..content_area
+        }
+    } else {
+        content_area
+    };
+    let visible = content_area.height;
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = state.scroll_offset.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .style(Style::default().bg(CLAURST_PANEL_BG)),
+        content_area,
+    );
+
+    let footer_text = format!(
+        "  type to filter  \u{b7}  \u{2191}\u{2193} scroll  \u{b7}  {} bindings across {} contexts",
+        bindings.len(),
+        context_order.len()
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default()
+                .fg(CLAURST_MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ))),
+        layout.footer_area,
     );
 }
 

@@ -62,6 +62,7 @@ impl TokenBudget {
     }
 
     /// True if we should trigger context collapse (≥ 97% used).
+    #[allow(dead_code)]
     pub fn should_collapse(&self) -> bool {
         self.fill_fraction >= 0.97
     }

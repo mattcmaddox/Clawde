@@ -241,7 +241,7 @@ async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Result<
 
 /// Extract chatgpt-account-id from the JWT access token.
 /// The account_id is in the middle segment (payload) under
-/// https://api.openai.com/auth.account_id
+/// <https://api.openai.com/auth.account_id>
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     let payload_b64 = parts.get(1)?;

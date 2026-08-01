@@ -160,4 +160,46 @@ pub trait LlmProvider: Send + Sync {
     fn routing_strategy_name(&self) -> Option<&'static str> {
         None
     }
+
+    /// Report per-upstream empty-completion cooldown state (spec §6.3).
+    /// Each entry is `(upstream_id, consecutive_empties, retry_secs)` where
+    /// `retry_secs` is the seconds remaining in the empty-completion
+    /// cooldown, or `None` when the upstream is not currently cooled for
+    /// empty completions. Only upstreams that have recorded at least one
+    /// empty completion are listed.
+    ///
+    /// The default implementation returns an empty vector — most providers
+    /// do not multiplex multiple upstreams. Composite providers (e.g.
+    /// `FreeProvider`) override this so the TUI status display and
+    /// `/keys health` can show which upstreams are cooled down for empty
+    /// completions.
+    fn upstream_empty_cooldowns(&self) -> Vec<(String, u32, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Inject an external key exhaustion signal into the provider's key ring
+    /// (e.g. from the health poller — spec §6.4).  Returns `true` if the
+    /// key was marked exhausted; `false` when this provider has no key ring
+    /// or the index is out of bounds.
+    ///
+    /// The default implementation returns `false` — only providers that
+    /// support automatic key rotation (e.g. `KeyRotatingProvider`) override
+    /// this.
+    /// Inject an external key exhaustion signal (e.g. from the health
+    /// poller — spec §6.4).  Returns `true` if the key was marked
+    /// exhausted; `false` when this provider has no key ring or the
+    /// upstream/index isn't found.
+    ///
+    /// The default implementation returns `false` — only providers that
+    /// support automatic key rotation (e.g. `KeyRotatingProvider`) or
+    /// multiplex upstreams (e.g. `FreeProvider`) override this.
+    fn mark_key_exhausted(
+        &self,
+        _upstream_id: Option<&str>,
+        _key_idx: usize,
+        _cooldown_secs: u64,
+        _reason: Option<String>,
+    ) -> bool {
+        false
+    }
 }

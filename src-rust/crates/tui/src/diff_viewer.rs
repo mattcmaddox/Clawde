@@ -302,6 +302,7 @@ pub fn build_turn_diff(
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn build_latest_turn_diff(
     file_history: &FileHistory,
     project_root: &std::path::Path,

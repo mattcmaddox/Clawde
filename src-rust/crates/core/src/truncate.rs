@@ -32,6 +32,7 @@ pub fn truncate_lines(lines: &[String], max_lines: usize) -> (Vec<String>, bool)
 
 /// Truncate tool output to a safe display length.
 /// Returns `(truncated_text, was_truncated)`.
+#[allow(dead_code)]
 pub fn truncate_tool_output(text: &str, max_chars: usize) -> (String, bool) {
     if text.len() <= max_chars {
         return (text.to_string(), false);

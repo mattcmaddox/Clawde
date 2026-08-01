@@ -176,7 +176,7 @@ pub fn render_context_viz(
 
         for (upstream_name, model_id) in &free_model_defaults {
             let truncated = if model_id.len() > 32 {
-                format!("{}…{}", &model_id[..15], &model_id[model_id.len()-15..])
+                format!("{}…{}", &model_id[..15], &model_id[model_id.len() - 15..])
             } else {
                 model_id.clone()
             };
@@ -293,7 +293,7 @@ pub fn render_context_viz(
             Style::default().fg(CLAURST_MUTED),
         )]));
 
-        for (_i, key) in fc_keys.iter().enumerate() {
+        for key in fc_keys.iter() {
             let preview = if key.len() > 16 {
                 format!("{}..{}", &key[..8], &key[key.len() - 4..])
             } else {
@@ -395,14 +395,12 @@ fn truncate_name(name: &str, max: usize) -> String {
         name.to_string()
     } else {
         let mut result = String::with_capacity(max + 1);
-        let mut count = 0;
-        for ch in name.chars() {
+        for (count, ch) in name.chars().enumerate() {
             if count >= max.saturating_sub(1) {
                 result.push('\u{2026}');
                 break;
             }
             result.push(ch);
-            count += 1;
         }
         result
     }
@@ -491,7 +489,20 @@ mod tests {
         let before = terminal.backend().buffer().clone();
         terminal
             .draw(|frame| {
-                render_context_viz(frame, &state, frame.area(), 0, 0, vec![], 0.0, 0, 0, 0, 0, vec![]);
+                render_context_viz(
+                    frame,
+                    &state,
+                    frame.area(),
+                    0,
+                    0,
+                    vec![],
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    vec![],
+                );
             })
             .unwrap();
         assert_eq!(terminal.backend().buffer().content(), before.content());

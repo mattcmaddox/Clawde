@@ -247,7 +247,7 @@ fn extract_reset_timestamp_from_str(lower: &str) -> Option<u64> {
             let candidate = after.trim_start();
             // Snip at common delimiters.
             let end = candidate
-                .find(|c: char| c == '.' || c == ',' || c == ')' || c == '\n')
+                .find(|c| ['.', ',', ')', '\n'].contains(&c))
                 .unwrap_or(candidate.len().min(40));
             let date_str = &candidate[..end].trim();
 

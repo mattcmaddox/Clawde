@@ -430,14 +430,14 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 ///   │  This will execute a shell command.             │
 ///   │  This may modify system-wide security policy.   │
 ///   │                                                │
-///   │  [1] Yes, allow once                           │
-///   │  [2] Yes, allow this session                   │
-///   │▶ [3] Yes, always allow (persistent)            │
-///   │  [4] No, deny                                  │
+///   │  \[1] Yes, allow once                           │
+///   │  \[2] Yes, allow this session                   │
+///   │▶ \[3] Yes, always allow (persistent)            │
+///   │  \[4] No, deny                                  │
 ///   └────────────────────────────────────────────────┘
 ///
 /// For `Bash` with a `suggested_prefix`, a 5th option is shown:
-///   │  [5] Allow commands matching git*              │
+///   │  \[5] Allow commands matching git*              │
 ///
 /// For `FileRead`, 4 options (once / session / persistent / deny).
 /// For `FileWrite`, 4 options (once / session / project / deny).
@@ -793,11 +793,13 @@ impl ToolPermissionDialog {
     }
 
     /// Move focus to next button.
+    #[allow(dead_code)]
     pub fn next_button(&mut self) {
         self.focused_button = (self.focused_button + 1) % 3;
     }
 
     /// Move focus to previous button.
+    #[allow(dead_code)]
     pub fn prev_button(&mut self) {
         self.focused_button = (self.focused_button + 2) % 3;
     }
@@ -812,6 +814,7 @@ impl ToolPermissionDialog {
 }
 
 /// Render a tool-specific permission dialog as a centered overlay.
+#[allow(dead_code)]
 pub fn render_tool_permission_dialog(dialog: &ToolPermissionDialog, frame: &mut Frame) {
     let area = centered_dialog_area(frame.area(), 70, 20);
     frame.render_widget(Clear, area);
@@ -1116,9 +1119,9 @@ impl Default for McpApprovalDialogState {
 /// │    • tool_two                                     │
 /// │    • tool_three                                   │
 /// │                                                   │
-/// │  ▶ [1] Allow this session                         │
-/// │    [2] Always allow                               │
-/// │    [3] Deny                                       │
+/// │  ▶ \[1] Allow this session                         │
+/// │    \[2] Always allow                               │
+/// │    \[3] Deny                                       │
 /// └───────────────────────────────────────────────────┘
 pub fn render_mcp_approval_dialog(state: &McpApprovalDialogState, area: Rect, buf: &mut Buffer) {
     if !state.visible {
@@ -1264,6 +1267,7 @@ pub fn render_mcp_approval_dialog(state: &McpApprovalDialogState, area: Rect, bu
 
 /// Render the MCP approval dialog using a `Frame` (convenience wrapper for
 /// the main render loop).
+#[allow(dead_code)]
 pub fn render_mcp_approval_dialog_frame(state: &McpApprovalDialogState, frame: &mut Frame) {
     if !state.visible {
         return;

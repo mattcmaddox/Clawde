@@ -284,6 +284,7 @@ static RUNTIME_STYLES: Lazy<Mutex<Vec<OutputStyleDef>>> = Lazy::new(|| Mutex::ne
 /// Styles registered here are included in `all_styles_with_runtime` and
 /// `find_style_runtime`.  Duplicate names are silently ignored so that
 /// hot-reloading a plugin does not double-register styles.
+#[allow(dead_code)]
 pub fn register_runtime_style(style: OutputStyleDef) {
     if let Ok(mut list) = RUNTIME_STYLES.lock() {
         if !list.iter().any(|s| s.name == style.name) {

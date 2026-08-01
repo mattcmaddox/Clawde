@@ -440,6 +440,19 @@ fn png_dimensions(path: &PathBuf) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+/// Check whether a file path points to a supported image format.
+/// Used to detect `@path/to/image.png` references in the prompt so images
+/// can be auto-attached without clipboard tools (critical for SSH users).
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+    )
+}
+
 /// Read a file and base64-encode it for the Anthropic API.
 pub fn encode_image_base64(path: &PathBuf) -> Option<String> {
     let data = std::fs::read(path).ok()?;

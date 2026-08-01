@@ -86,7 +86,8 @@ pub struct AgentInfo {
     pub model_name: Option<String>,
     /// Cost in USD accumulated by this agent.
     pub cost_usd: f64,
-}    /// A defined agent (from .clawde/agents/*.md or plugin).
+}
+/// A defined agent (from .clawde/agents/*.md or plugin).
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
     /// Backing markdown file path.

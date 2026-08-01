@@ -200,17 +200,29 @@ impl Tool for GrepTool {
         let mut results: Vec<String> = Vec::new();
         let mut match_count = 0usize;
 
+        // Resolve the git repo root so we can skip ignored directories.
+        // Only consulted when inside a git worktree — avoids wasted process
+        // spawns in non-git workspaces.
+        let repo_root = clawde_core::git_utils::get_repo_root(&search_path);
+
         for entry in WalkDir::new(&search_path)
             .follow_links(true)
             .into_iter()
             .filter_entry(|e| {
-                // Skip hidden directories
                 let name = e.file_name().to_string_lossy();
-                !name.starts_with('.')
-                    && name != "node_modules"
-                    && name != "target"
-                    && name != "__pycache__"
-                    && name != ".git"
+                if name.starts_with('.') || name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" {
+                    return false;
+                }
+                // Skip git-ignored directories so we don't descend into
+                // e.g. dist/, build/, etc.
+                if let Some(ref root) = repo_root {
+                    if e.file_type().is_dir()
+                        && clawde_core::git_utils::is_ignored(root, e.path())
+                    {
+                        return false;
+                    }
+                }
+                true
             })
         {
             let entry = match entry {

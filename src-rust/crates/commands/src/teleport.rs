@@ -42,7 +42,8 @@ mod teleport_bundle {
     }
 
     impl TeleportPermissions {
-        #[allow(dead_code)]
+        /// Build a permissions snapshot from a serialized rule list, deriving
+        /// the plain allowed/denied tool-name lists from the rule actions.
         pub fn from_rules(rules: &[SerializedPermissionRule]) -> Self {
             let mut allowed = Vec::new();
             let mut denied = Vec::new();
@@ -310,9 +311,19 @@ impl SlashCommand for TeleportCommand {
                 }
 
                 // ---- restore tool permissions ----------------------------
+                // Rebuild allowed/denied from the authoritative serialized
+                // rules so the in-memory lists and the bundle never drift;
+                // older bundles without rules fall back to the stored plain
+                // lists.
                 let mut new_config = ctx.config.clone();
-                new_config.allowed_tools = bundle.permissions.allowed.clone();
-                new_config.disallowed_tools = bundle.permissions.denied.clone();
+                if bundle.permissions.rules.is_empty() {
+                    new_config.allowed_tools = bundle.permissions.allowed.clone();
+                    new_config.disallowed_tools = bundle.permissions.denied.clone();
+                } else {
+                    let perms = TeleportPermissions::from_rules(&bundle.permissions.rules);
+                    new_config.allowed_tools = perms.allowed;
+                    new_config.disallowed_tools = perms.denied;
+                }
                 if let Some(ref model) = bundle.model {
                     new_config.model = Some(model.clone());
                 }

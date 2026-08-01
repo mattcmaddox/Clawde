@@ -129,6 +129,7 @@ pub fn format_context_window(context_window: u32) -> String {
 /// Format a model display line with optional context window and cost info.
 ///
 /// Example: `"gpt-4o  128K ctx  $5.00/M"`
+#[allow(dead_code)]
 pub fn format_model_line(
     model_str: &str,
     context_window: Option<u32>,
@@ -160,6 +161,7 @@ impl ModelPickerState {
     /// Models with a `"provider/model"` slash format are grouped by their
     /// provider prefix.  Bare model names are heuristically assigned to a
     /// provider based on the model name pattern.
+    #[allow(dead_code)]
     pub fn build_provider_sections(models: &[String]) -> Vec<ProviderSection> {
         use std::collections::HashMap;
         let mut by_provider: HashMap<String, Vec<String>> = HashMap::new();
@@ -224,6 +226,11 @@ pub struct ModelEntry {
     pub description: String,
     /// Whether this is the currently active model.
     pub is_current: bool,
+    /// Whether this model supports reasoning/effort levels.
+    /// Populated from the registry's capability info.
+    pub reasoning: bool,
+    /// Capability tags displayed as badges: "vision", "tools", "reasoning".
+    pub capabilities: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +244,8 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
         display_name: name.to_string(),
         description: desc.to_string(),
         is_current: false,
+        reasoning: false,
+        capabilities: Vec::new(),
     }
 }
 
@@ -310,6 +319,8 @@ pub fn models_for_provider_from_registry(
                 display_name: e.info.name.clone(),
                 description: cost_str,
                 is_current: false,
+                reasoning: e.reasoning,
+                capabilities: build_capability_tags(e),
             }
         })
         .collect()
@@ -446,6 +457,8 @@ fn codex_provider_models(registry: &clawde_api::ModelRegistry) -> Vec<ModelEntry
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                reasoning: e.reasoning,
+                capabilities: build_capability_tags(e),
             }
         })
         .collect()
@@ -468,6 +481,8 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                reasoning: false,
+                capabilities: Vec::new(),
             }
         })
         .collect()
@@ -476,24 +491,84 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
 /// Always shows `free/auto` first; one pin entry per catalog upstream so the
 /// user can target a specific provider when they need to.
-fn free_provider_models() -> Vec<ModelEntry> {
+pub fn free_provider_models() -> Vec<ModelEntry> {
+    let reg = picker_registry();
+
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
         display_name: "Auto (round-robin across configured providers)".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
+        reasoning: false,
+        capabilities: Vec::new(),
     }];
 
     for upstream in clawde_api::FREE_CATALOG {
+        // Look up the upstream's default model in the registry to
+        // get its real capability metadata (vision, tools, reasoning, etc.).
+        // This is what makes `/model --capability image` work with `free`
+        // provider — upstreams like Google (gemini-2.5-flash) and
+        // GitHub Models (gpt-4o-mini) have real registry entries.
+        let (capabilities, reasoning) = match reg.get(upstream.id, upstream.default_model) {
+            Some(entry) => (build_capability_tags(entry), entry.reasoning),
+            // Fallback: at minimum include tool_calling from the catalog.
+            None if upstream.tool_calling => (vec!["tools".to_string()], false),
+            None => (Vec::new(), false),
+        };
+
         entries.push(ModelEntry {
             id: format!("{}/{}", upstream.id, upstream.default_model),
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
             description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
+            reasoning,
+            capabilities,
         });
     }
 
     entries
+}
+
+/// Map a ModelCapability enum variant to its tag string, used for filtering
+/// picker entries by capability (e.g. `/model --capability image`).
+pub fn capability_tag_str(cap: clawde_api::ModelCapability) -> &'static str {
+    match cap {
+        clawde_api::ModelCapability::Vision => "vision",
+        clawde_api::ModelCapability::Audio => "audio",
+        clawde_api::ModelCapability::Pdf => "pdf",
+        clawde_api::ModelCapability::Video => "video",
+        clawde_api::ModelCapability::ToolCalling => "tools",
+        clawde_api::ModelCapability::Reasoning => "reasoning",
+        clawde_api::ModelCapability::StructuredOutput => "json",
+    }
+}
+
+/// Build capability tag strings from a registry ModelEntry.
+/// Maps capability flags into short tags: "vision", "tools", "reasoning", etc.
+pub fn build_capability_tags(entry: &clawde_api::ModelEntry) -> Vec<String> {
+    let mut tags = Vec::new();
+    if entry.vision() {
+        tags.push("vision".to_string());
+    }
+    if entry.tool_calling {
+        tags.push("tools".to_string());
+    }
+    if entry.reasoning {
+        tags.push("reasoning".to_string());
+    }
+    if entry.structured_output {
+        tags.push("json".to_string());
+    }
+    if entry.audio_input() {
+        tags.push("audio".to_string());
+    }
+    if entry.pdf_input() {
+        tags.push("pdf".to_string());
+    }
+    if entry.video_input() {
+        tags.push("video".to_string());
+    }
+    tags
 }
 
 /// State for the /model picker overlay.
@@ -953,6 +1028,21 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 spans.push(Span::styled("   ", Style::default().bg(bg)));
             }
 
+            // Capability badges (compact icons)
+            for cap in &model.capabilities {
+                let (icon, color) = match cap.as_str() {
+                    "vision" => (" \u{1f5bc}", Color::Rgb(100, 200, 255)), // 🖼
+                    "tools" => (" \u{1f6e0}", Color::Rgb(180, 220, 120)),  // 🛠
+                    "reasoning" => (" \u{1f9e0}", Color::Rgb(200, 180, 255)), // 🧠
+                    "json" => (" {}", Color::Rgb(255, 200, 100)),          // {}
+                    "audio" => (" \u{1f50a}", Color::Rgb(255, 180, 200)),  // 🔊
+                    "pdf" => (" \u{1f4c4}", Color::Rgb(200, 200, 200)),    // 📄
+                    "video" => (" \u{1f3ac}", Color::Rgb(255, 220, 150)),  // 🎬
+                    _ => continue,
+                };
+                spans.push(Span::styled(icon, Style::default().fg(color).bg(bg)));
+            }
+
             spans.push(Span::styled(
                 model.display_name.clone(),
                 Style::default().fg(fg).bg(bg),
@@ -1053,18 +1143,28 @@ mod tests {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                reasoning: true,
+                capabilities: vec![
+                    "vision".to_string(),
+                    "tools".to_string(),
+                    "reasoning".to_string(),
+                ],
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                reasoning: false,
+                capabilities: vec!["vision".to_string(), "tools".to_string()],
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                reasoning: false,
+                capabilities: vec!["tools".to_string()],
             },
         ]
     }
@@ -1571,6 +1671,8 @@ mod tests {
                 display_name: "LIVE OVERWRITE".to_string(),
                 description: "live desc".to_string(),
                 is_current: false,
+                reasoning: true,
+                capabilities: Vec::new(),
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1578,6 +1680,8 @@ mod tests {
                 display_name: "GPT-5.5 (live)".to_string(),
                 description: "live only".to_string(),
                 is_current: false,
+                reasoning: false,
+                capabilities: Vec::new(),
             },
         ];
         p.merge_models(live);
@@ -1637,6 +1741,8 @@ mod tests {
             display_name: "Llama 3.3".to_string(),
             description: "local".to_string(),
             is_current: false,
+            reasoning: false,
+            capabilities: Vec::new(),
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),
@@ -1661,6 +1767,43 @@ mod tests {
             assert!(
                 !provider_uses_catalog_projection(pid),
                 "{pid} must keep its live/curated discovery"
+            );
+        }
+    }
+
+    // 22. free_provider_models populates capabilities from the registry.
+    //     Upstreams whose default_model exists in the bundled models.dev
+    //     snapshot should get full capability metadata; all others get at
+    //     minimum the "tools" fallback since every FREE_CATALOG entry has
+    //     tool_calling: true.
+    #[test]
+    fn free_provider_models_has_capabilities() {
+        let models = free_provider_models();
+        // First entry is "free/auto" which has no capabilities.
+        assert!(models[0].id == "free/auto");
+        assert!(models[0].capabilities.is_empty());
+
+        // Every upstream entry should at least have "tools" capability.
+        let upstream_entries: Vec<&ModelEntry> = models[1..].iter().collect();
+        assert!(!upstream_entries.is_empty(), "must have upstream entries");
+
+        for entry in &upstream_entries {
+            assert!(
+                entry.capabilities.contains(&"tools".to_string()),
+                "upstream '{}' must have 'tools' capability (tool_calling: true)",
+                entry.id
+            );
+        }
+
+        // Every upstream (including Google/gemini-2.5-flash) has at minimum
+        // the "tools" fallback since all FREE_CATALOG entries have tool_calling: true.
+        let google = upstream_entries
+            .iter()
+            .find(|m| m.id.starts_with("google/"));
+        if let Some(google_entry) = google {
+            assert!(
+                google_entry.capabilities.contains(&"tools".to_string()),
+                "Google upstream must have at least 'tools' capability"
             );
         }
     }

@@ -178,12 +178,14 @@ impl TasksOverlay {
     }
 
     /// Get the status of the currently selected task, if any.
+    #[allow(dead_code)]
     pub fn selected_status(&self) -> Option<TaskStatus> {
         self.tasks.get(self.selected_idx).map(|t| t.status.clone())
     }
 
     /// Cycle the selected task's status to the next state.
     /// Returns the new status if successful.
+    #[allow(dead_code)]
     pub fn cycle_selected_status(&mut self) -> Option<TaskStatus> {
         if let Some(task) = self.tasks.get_mut(self.selected_idx) {
             task.status = next_status(&task.status);
@@ -263,7 +265,10 @@ fn progress_bar(fraction: f32, width: usize) -> Vec<Span<'static>> {
     vec![
         Span::styled("[", Style::default().fg(Color::DarkGray)),
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(bar_fg)),
-        Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             format!("] {:.0}%", frac * 100.0),
             Style::default().fg(bar_fg),
@@ -308,10 +313,13 @@ pub fn render_tasks_overlay(frame: &mut Frame, overlay: &TasksOverlay, area: Rec
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Progress summary bar        let (_pending, _in_progress, completed) = overlay.stats();
-        let total = overlay.tasks.len();
-        if total > 0 {
-            let done_frac = completed as f32 / total as f32;
-        lines.push(Line::from(progress_bar(done_frac, (inner.width as usize).saturating_sub(10).min(30))));
+    let total = overlay.tasks.len();
+    if total > 0 {
+        let done_frac = completed as f32 / total as f32;
+        lines.push(Line::from(progress_bar(
+            done_frac,
+            (inner.width as usize).saturating_sub(10).min(30),
+        )));
         lines.push(Line::from(""));
     }
 

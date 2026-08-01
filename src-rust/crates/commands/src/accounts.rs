@@ -433,7 +433,11 @@ mod tests {
     /// Panic-safe guard: sets `CLAWDE_HOME` to a temp dir with an optional
     /// test registry, and restores the original env var on drop (even during
     /// unwinding from a panic).
+    ///
+    /// Holds the shared [`crate::tests::CLAWDE_HOME_LOCK`] for its lifetime so
+    /// tests that mutate the process-global env var never race each other.
     struct TestAccounts {
+        _lock: std::sync::MutexGuard<'static, ()>,
         _tmp: tempfile::TempDir,
         prev_clawde_home: Option<std::ffi::OsString>,
     }
@@ -443,6 +447,10 @@ mod tests {
         /// marking "work" as the active Anthropic account and "gpt" as the
         /// active Codex account.
         fn seeded() -> Self {
+            let lock = crate::tests::CLAWDE_HOME_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var_os("CLAWDE_HOME");
             let tmp = tempfile::tempdir().unwrap();
             std::env::set_var("CLAWDE_HOME", tmp.path());
@@ -452,8 +460,10 @@ mod tests {
                 providers: {
                     let mut pm = std::collections::BTreeMap::new();
 
-                    let mut anthropic = clawde_core::accounts::ProviderAccounts::default();
-                    anthropic.active = Some("work".to_string());
+                    let mut anthropic = clawde_core::accounts::ProviderAccounts {
+                        active: Some("work".to_string()),
+                        ..Default::default()
+                    };
                     anthropic.profiles.insert(
                         "work".to_string(),
                         clawde_core::accounts::AccountProfile {
@@ -475,8 +485,10 @@ mod tests {
                         anthropic,
                     );
 
-                    let mut codex = clawde_core::accounts::ProviderAccounts::default();
-                    codex.active = Some("gpt".to_string());
+                    let mut codex = clawde_core::accounts::ProviderAccounts {
+                        active: Some("gpt".to_string()),
+                        ..Default::default()
+                    };
                     codex.profiles.insert(
                         "gpt".to_string(),
                         clawde_core::accounts::AccountProfile {
@@ -492,6 +504,7 @@ mod tests {
             registry.save().unwrap();
 
             TestAccounts {
+                _lock: lock,
                 _tmp: tmp,
                 prev_clawde_home: prev,
             }
@@ -500,10 +513,15 @@ mod tests {
         /// Point CLAWDE_HOME at a temp dir with NO accounts.json (empty
         /// registry).
         fn empty() -> Self {
+            let lock = crate::tests::CLAWDE_HOME_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var_os("CLAWDE_HOME");
             let tmp = tempfile::tempdir().unwrap();
             std::env::set_var("CLAWDE_HOME", tmp.path());
             TestAccounts {
+                _lock: lock,
                 _tmp: tmp,
                 prev_clawde_home: prev,
             }

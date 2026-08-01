@@ -325,28 +325,45 @@ async fn record_and_transcribe(
             return Ok(());
         }
 
-        // Resolve API key: explicit config first, then OPENAI_API_KEY, then ANTHROPIC_API_KEY.
-        let api_key_opt = config
+        // Resolve API key: explicit config first, then GROQ_API_KEY (free,
+        // fast), then OPENAI_API_KEY, then ANTHROPIC_API_KEY.
+        // When a Groq key is used, the endpoint and model are automatically
+        // switched to Groq's Whisper endpoint and whisper-large-v3.
+        let key_opt: Option<(String, bool)> = config
             .api_key
             .as_deref()
             .filter(|k| !k.is_empty())
-            .map(|k| k.to_string())
+            .map(|k| (k.to_string(), false))
+            .or_else(|| {
+                std::env::var("GROQ_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+                    .map(|k| (k, true))
+            })
             .or_else(|| {
                 std::env::var("OPENAI_API_KEY")
                     .ok()
                     .filter(|k| !k.is_empty())
+                    .map(|k| (k, false))
             })
             .or_else(|| {
                 std::env::var("ANTHROPIC_API_KEY")
                     .ok()
                     .filter(|k| !k.is_empty())
+                    .map(|k| (k, false))
             });
 
-        let api_key = match api_key_opt {
-            Some(k) => k,
+        let (api_key, model, endpoint_url) = match key_opt {
+            Some((key, true)) => (
+                key,
+                "whisper-large-v3".to_string(),
+                Some("https://api.groq.com/openai/v1/audio/transcriptions".to_string()),
+            ),
+            Some((key, false)) => (key, config.model.clone(), config.endpoint_url.clone()),
             None => {
                 let msg = "No API key found for voice transcription. \
-                           Set OPENAI_API_KEY, or point WHISPER_ENDPOINT_URL to a \
+                           Set GROQ_API_KEY (recommended — free), OPENAI_API_KEY, \
+                           or point WHISPER_ENDPOINT_URL to a \
                            local Whisper server (e.g. whisper.cpp or faster-whisper)."
                     .to_string();
                 let _ = event_tx.send(VoiceEvent::Error(msg.clone())).await;
@@ -359,8 +376,8 @@ async fn record_and_transcribe(
             sample_rate,
             &api_key,
             config.language.as_deref(),
-            &config.model,
-            config.endpoint_url.as_deref(),
+            &model,
+            endpoint_url.as_deref(),
         )
         .await
         {

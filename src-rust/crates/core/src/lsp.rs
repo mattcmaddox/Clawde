@@ -482,6 +482,7 @@ impl LspClient {
     }
 
     /// Notify the server that a document has been changed.
+    #[allow(dead_code)]
     pub async fn change_document(
         &mut self,
         uri: &str,
@@ -499,6 +500,7 @@ impl LspClient {
     }
 
     /// Notify the server that a document has been saved.
+    #[allow(dead_code)]
     pub async fn save_document(&mut self, uri: &str) -> anyhow::Result<()> {
         self.send_notification_inner(
             "textDocument/didSave",
@@ -508,6 +510,7 @@ impl LspClient {
     }
 
     /// Notify the server that a document has been closed.
+    #[allow(dead_code)]
     pub async fn close_document(&mut self, uri: &str) -> anyhow::Result<()> {
         self.send_notification_inner(
             "textDocument/didClose",
@@ -1252,6 +1255,7 @@ impl LspManager {
     }
 
     /// Shut down all running servers.
+    #[allow(dead_code)]
     pub async fn shutdown_all(&mut self) {
         let names: Vec<String> = self.clients.keys().cloned().collect();
         for name in names {
