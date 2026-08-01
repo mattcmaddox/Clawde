@@ -428,19 +428,11 @@ fn tab_span(label: &str, active: bool) -> Span<'static> {
 // Overview tab
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::vec_init_then_push)]
 fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
     let total_tokens = data.total_input_tokens + data.total_output_tokens;
     let mut lines = Vec::new();
 
-    lines.push(Line::from(vec![
-        Span::styled("Total tokens: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format_tokens(total_tokens),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
     lines.push(Line::from(vec![
         Span::styled("  Input:    ", Style::default().fg(Color::DarkGray)),
         Span::raw(format_tokens(data.total_input_tokens)),
@@ -451,9 +443,11 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
     ]));
     lines.push(Line::default());
     lines.push(Line::from(vec![
-        Span::styled("Total cost: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("${:.2}", data.total_cost_cents / 100.0),
+            clawde_core::format_utils::format_usage_summary(
+                total_tokens,
+                data.total_cost_cents,
+            ),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),

@@ -4718,6 +4718,11 @@ async fn run_interactive(
     session.updated_at = chrono::Utc::now();
     let _ = clawde_core::history::save_session(&session).await;
 
+    // Best-effort shutdown of all LSP servers on exit.
+    let lsp_mgr = clawde_core::lsp::global_lsp_manager();
+    let mut guard = lsp_mgr.lock().await;
+    guard.shutdown_all().await;
+
     restore_terminal(&mut terminal)?;
     Ok(())
 }

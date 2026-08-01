@@ -1255,7 +1255,6 @@ impl LspManager {
     }
 
     /// Shut down all running servers.
-    #[allow(dead_code)]
     pub async fn shutdown_all(&mut self) {
         let names: Vec<String> = self.clients.keys().cloned().collect();
         for name in names {

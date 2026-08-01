@@ -44,7 +44,6 @@ pub fn format_tokens(count: u64) -> String {
 
 /// Format a token/cost summary line for the status bar.
 /// Example: "3.2K tokens · $0.04"
-#[allow(dead_code)]
 pub fn format_usage_summary(tokens: u64, cost_cents: f64) -> String {
     format!(
         "{} tokens · {}",
@@ -55,7 +54,6 @@ pub fn format_usage_summary(tokens: u64, cost_cents: f64) -> String {
 
 /// Format a relative time string (for session listings).
 /// "just now", "2 minutes ago", "3 hours ago", "yesterday", "Mar 15"
-#[allow(dead_code)]
 pub fn format_relative_time(ts_ms: u64) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
