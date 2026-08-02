@@ -213,6 +213,9 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
             "cloudflare" => Some(Arc::new(
                 crate::providers::openai_compat_providers::cloudflare_with_key(&key),
             ) as Arc<dyn LlmProvider>),
+            "github-copilot" => {
+                Some(Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
+            }
             id => crate::providers::openai_compat_providers::provider_for_id(id)
                 .map(|p| Arc::new(p.with_api_key(key)) as Arc<dyn LlmProvider>),
         };
@@ -398,7 +401,13 @@ pub fn provider_from_config(
         }
         "cohere" => api_key.map(|key| Arc::new(CohereProvider::new(key)) as Arc<dyn LlmProvider>),
         "github-copilot" => {
-            api_key.map(|key| Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
+            // Try env/api_key first, fall back to stored OAuth token from /connect.
+            api_key
+                .map(|key| Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
+                .or_else(|| {
+                    CopilotProvider::from_auth_store()
+                        .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
+                })
         }
         "codex" | "openai-codex" => {
             CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)

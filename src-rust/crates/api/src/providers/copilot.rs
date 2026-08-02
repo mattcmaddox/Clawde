@@ -67,6 +67,22 @@ impl CopilotProvider {
         std::env::var("GITHUB_TOKEN").ok().map(Self::new)
     }
 
+    /// Try to load the stored OAuth token from ~/.clawde/auth.json.
+    /// The `/connect` → GitHub Copilot flow stores a `ghu_` OAuth token
+    /// under `credentials.github-copilot.access`.
+    pub fn from_auth_store() -> Option<Self> {
+        let auth = clawde_core::AuthStore::load();
+        let cred = auth.credentials.get("github-copilot")?;
+        let token = match cred {
+            clawde_core::StoredCredential::OAuthToken { access, .. } => access.clone(),
+            clawde_core::StoredCredential::ApiKey { key } => key.clone(),
+        };
+        if token.len() < 8 {
+            return None;
+        }
+        Some(Self::new(token))
+    }
+
     fn base_url() -> &'static str {
         "https://api.githubcopilot.com"
     }
@@ -462,42 +478,13 @@ impl CopilotProvider {
 
     /// Hardcoded fallback model list used when the /models endpoint is
     /// unreachable or returns empty data.
+    /// Hardcoded fallback model list used when the /models endpoint is
+    /// unreachable or returns empty data.  Only includes models actually
+    /// available on Copilot Free (confirmed via live probe 2026-08-02).
     fn hardcoded_models(provider_id: &ProviderId) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
-                id: ModelId::new("claude-sonnet-4.6"),
-                provider_id: provider_id.clone(),
-                name: "Claude Sonnet 4.6 (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 32_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("claude-sonnet-4.5"),
-                provider_id: provider_id.clone(),
-                name: "Claude Sonnet 4.5 (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 32_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("claude-haiku-4.5"),
-                provider_id: provider_id.clone(),
-                name: "Claude Haiku 4.5 (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 32_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("gpt-4.1"),
-                provider_id: provider_id.clone(),
-                name: "GPT-4.1 (Copilot)".into(),
-                context_window: 64_000,
-                max_output_tokens: 16_384,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("gpt-4o"),
+                id: ModelId::new("gpt-4o-2024-11-20"),
                 provider_id: provider_id.clone(),
                 name: "GPT-4o (Copilot)".into(),
                 context_window: 128_000,
@@ -505,7 +492,15 @@ impl CopilotProvider {
                 ..Default::default()
             },
             ModelInfo {
-                id: ModelId::new("gpt-4o-mini"),
+                id: ModelId::new("gpt-4o-2024-08-06"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4o Aug 2024 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+                ..Default::default()
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4o-mini-2024-07-18"),
                 provider_id: provider_id.clone(),
                 name: "GPT-4o Mini (Copilot)".into(),
                 context_window: 128_000,
@@ -513,43 +508,19 @@ impl CopilotProvider {
                 ..Default::default()
             },
             ModelInfo {
-                id: ModelId::new("gpt-5.4"),
+                id: ModelId::new("gpt-4-0613"),
                 provider_id: provider_id.clone(),
-                name: "GPT-5.4 (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 128_000,
+                name: "GPT-4 (Copilot)".into(),
+                context_window: 32_000,
+                max_output_tokens: 8_192,
                 ..Default::default()
             },
             ModelInfo {
-                id: ModelId::new("gpt-5-mini"),
+                id: ModelId::new("gpt-3.5-turbo"),
                 provider_id: provider_id.clone(),
-                name: "GPT-5 Mini (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 128_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("o3-mini"),
-                provider_id: provider_id.clone(),
-                name: "o3-mini (Copilot)".into(),
-                context_window: 200_000,
-                max_output_tokens: 100_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("o4-mini"),
-                provider_id: provider_id.clone(),
-                name: "o4-mini (Copilot)".into(),
-                context_window: 200_000,
-                max_output_tokens: 100_000,
-                ..Default::default()
-            },
-            ModelInfo {
-                id: ModelId::new("gemini-3-flash-preview"),
-                provider_id: provider_id.clone(),
-                name: "Gemini 3 Flash (Copilot)".into(),
-                context_window: 128_000,
-                max_output_tokens: 64_000,
+                name: "GPT-3.5 Turbo (Copilot)".into(),
+                context_window: 16_000,
+                max_output_tokens: 4_096,
                 ..Default::default()
             },
         ]
@@ -1242,7 +1213,15 @@ impl LlmProvider for CopilotProvider {
 
                 if let Some(arr) = items {
                     for item in arr {
-                        if item.get("model_picker_enabled").and_then(|v| v.as_bool()) == Some(false)
+                        // Skip models whose policy state is explicitly "disabled"
+                        // (e.g. Claude, Gemini, GPT-5.x on free tier).
+                        // model_picker_enabled is false for ALL free-tier models,
+                        // so we filter by policy.state instead.
+                        if item
+                            .get("policy")
+                            .and_then(|p| p.get("state"))
+                            .and_then(|v| v.as_str())
+                            == Some("disabled")
                         {
                             continue;
                         }

@@ -1615,7 +1615,7 @@ pub mod config {
                 // unconfigured Qwen provider never resolves to a claude-* model.
                 Some("qwen") | Some("alibaba") => "qwen3-max",
                 Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
-                Some("github-copilot") => "gpt-4o",
+                Some("github-copilot") => "gpt-4o-2024-11-20",
                 Some("ollama") => "llama3.2",
                 Some("lmstudio") => "default",
                 Some("llamacpp") => "default",

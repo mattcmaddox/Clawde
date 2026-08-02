@@ -73,7 +73,18 @@ pub struct FreeUpstream {
 /// tiers first. The chain starts with the best models (Llama 3.3 70B-class)
 /// and falls through to lighter fallbacks.
 pub const FREE_CATALOG: &[FreeUpstream] = &[
-    // Tier 1: Best-quality models
+    // Tier 0: GPT-4o-class models (the crown jewel)
+    FreeUpstream {
+        id: "github-copilot",
+        title: "GitHub Copilot",
+        key_url: "github.com/settings/tokens",
+        default_model: "gpt-4o-2024-11-20",
+        note: "GPT-4o (16K ctx) — free OAuth via /connect",
+        tool_calling: true,
+        max_tokens_cap: Some(16_384),
+        fallback_models: &["gpt-4o-2024-08-06"],
+    },
+    // Tier 1: Best-quality open-weight models
     FreeUpstream {
         id: "huggingface",
         title: "Hugging Face",
@@ -1675,6 +1686,7 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
+        "github-copilot" => "https://api.githubcopilot.com/models",
         _ => return Err(format!("No validation endpoint for '{}'", upstream_id)),
     };
 
