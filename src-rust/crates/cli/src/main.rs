@@ -4367,16 +4367,16 @@ async fn run_interactive(
             match provider_id.as_str() {
                 "github-copilot" => {
                     let tx2 = device_auth_tx.clone();
-                    // Use the OpenCode Copilot OAuth app (Ov23li8tweQw6odWQebz)
+                    // Use the GitHub Copilot CLI OAuth app (Iv1.b507a08c87ecfe98)
                     // which is registered and authorised for the Copilot API.
                     // Tokens from an unregistered app get "model not supported"
                     // on every model.
-                    const COPILOT_CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
+                    const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
                     tokio::spawn(async move {
                         // Step 1: Request device code
                         match clawde_core::device_code::request_device_code(
                             COPILOT_CLIENT_ID,
-                            "read:user",
+                            "copilot",
                             "https://github.com/login/device/code",
                         )
                         .await
