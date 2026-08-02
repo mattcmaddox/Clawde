@@ -73,7 +73,7 @@ looks like:
     },
     "agentInfo": {
       "name": "clawde",
-      "title": "Claurst",
+      "title": "Clawde",
       "version": "0.1.8"
     }
   }

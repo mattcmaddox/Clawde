@@ -104,9 +104,24 @@ impl SlashCommand for CtxVizCommand {
             0.0
         };
 
+        // Last-seen GitHub API quota (populated by update checks / /update).
+        let gh_line = clawde_core::github::last_rate_limit()
+            .map(|rl| {
+                format!(
+                    " — GitHub API: {}/{} requests ({})",
+                    rl.remaining,
+                    rl.limit,
+                    clawde_core::github::format_reset(
+                        rl.reset_unix,
+                        clawde_core::github::unix_now()
+                    )
+                )
+            })
+            .unwrap_or_default();
+
         CommandResult::Message(format!(
             "Context: ~{total:.0}K / {window:.0}K tokens ({pct:.1}%) — \
-             {msgs} msgs ({user}U/{asst}A, {tc} tools) — ${cost:.4}",
+             {msgs} msgs ({user}U/{asst}A, {tc} tools) — ${cost:.4}{gh_line}",
             total = total_tokens as f64 / 1000.0,
             window = context_window as f64 / 1000.0,
             pct = pct,

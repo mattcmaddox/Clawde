@@ -42,7 +42,7 @@ impl SlashCommand for VoiceCommand {
     fn help(&self) -> &str {
         "Usage: /voice [on|off|status]\n\n\
          Enables or disables voice input (push-to-talk).\n\
-         Setting is persisted to ~/.claurst/ui-settings.json.\n\n\
+         Setting is persisted to ~/.clawde/ui-settings.json.\n\n\
          Transcription is performed via a Whisper-compatible API.\n\
          Set one of these env vars for the API key:\n\
            OPENAI_API_KEY   — OpenAI Whisper (default endpoint)\n\
@@ -139,7 +139,7 @@ impl SlashCommand for UpgradeCommand {
     }
     fn help(&self) -> &str {
         "Usage: /update\n\n\
-         Checks GitHub releases for the latest version of Claurst.\n\
+         Checks GitHub releases for the latest version of Clawde.\n\
          If a newer version is available, shows where to download it."
     }
 
@@ -147,29 +147,20 @@ impl SlashCommand for UpgradeCommand {
         let current = clawde_core::constants::APP_VERSION;
 
         // Check GitHub releases API for latest version
-        let client = reqwest::Client::builder()
-            .user_agent(format!("claurst/{}", current))
-            .timeout(std::time::Duration::from_secs(8))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => {
-                return CommandResult::Message(format!(
-                    "Current version: {current}\n\
-                     Could not check for updates (HTTP client error: {e})\n\
-                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
-                ))
-            }
-        };
+        let client = clawde_core::github::api_client();
 
         let resp = client
-            .get("https://api.github.com/repos/kuberwastaken/claurst/releases/latest")
+            .get(format!(
+                "{}/repos/{}/releases/latest",
+                clawde_core::github::GITHUB_API_BASE,
+                clawde_core::github::GITHUB_REPO
+            ))
             .send()
             .await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
+                let rate_note = github_rate_note(&r);
                 let json: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
 
                 let tag = json
@@ -178,45 +169,123 @@ impl SlashCommand for UpgradeCommand {
                     .unwrap_or("unknown")
                     .trim_start_matches('v');
 
+                let fallback_url = format!(
+                    "https://github.com/{}/releases",
+                    clawde_core::github::GITHUB_REPO
+                );
                 let url = json
                     .get("html_url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("https://github.com/kuberwastaken/claurst/releases");
+                    .unwrap_or(&fallback_url);
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
-                        "Claurst v{current} - you are up to date.\n\
-                         Release page: {url}"
+                        "Clawde v{current} - you are up to date.\n\
+                         Release page: {url}{rate_note}"
                     ))
                 } else {
                     CommandResult::Message(format!(
                         "Update available!\n\
                          Current version:  v{current}\n\
                          Latest version:   v{tag}\n\
-                         Release page:     {url}\n\n\
+                         Release page:     {url}{rate_note}\n\n\
                          Upgrade in place (recommended):\n\
-                           claurst upgrade\n\n\
+                           clawde upgrade\n\n\
                          Or reinstall with your original method:\n\
-                           npm install -g claurst\n\
-                           curl -fsSL https://github.com/kuberwastaken/claurst/releases/latest/download/install.sh | bash   (macOS/Linux)\n\
-                           irm https://github.com/kuberwastaken/claurst/releases/latest/download/install.ps1 | iex          (Windows)"
+                           npm install -g clawde\n\
+                           curl -fsSL https://github.com/{}/releases/latest/download/install.sh | bash   (macOS/Linux)\n\
+                           irm https://github.com/{}/releases/latest/download/install.ps1 | iex          (Windows)",
+                        clawde_core::github::GITHUB_REPO,
+                        clawde_core::github::GITHUB_REPO
                     ))
                 }
             }
             Ok(r) => {
+                // On a 403 the quota is usually exhausted — GitHub sends
+                // `Retry-After` (delta-seconds) plus the reset timestamp, so
+                // tell the user when to try again instead of just failing.
+                // Parse the CURRENT response headers (not the possibly stale
+                // last_rate_limit) and store the fresh status for /ctx-viz.
+                // This arm deliberately uses ONLY the retry hint (not
+                // github_rate_note's generic warning) to avoid stating the
+                // reset time twice in the same message.
                 let status = r.status();
+                let rate_note = if status == reqwest::StatusCode::FORBIDDEN {
+                    match clawde_core::github::parse_rate_limit(r.headers()) {
+                        Some(limit) => {
+                            clawde_core::github::store_rate_limit(limit);
+                            format_retry_hint(retry_after_secs(r.headers(), &limit))
+                        }
+                        None => github_rate_note(&r),
+                    }
+                } else {
+                    github_rate_note(&r)
+                };
                 CommandResult::Message(format!(
                     "Current version: v{current}\n\
-                     Could not check for updates (HTTP {status}).\n\
-                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
+                     Could not check for updates (HTTP {status}).{rate_note}\n\
+                     Visit https://github.com/{}/releases for updates.",
+                    clawde_core::github::GITHUB_REPO
                 ))
             }
             Err(e) => CommandResult::Message(format!(
                 "Current version: v{current}\n\
                  Could not check for updates: {e}\n\
-                 Visit https://github.com/kuberwastaken/claurst/releases for updates."
+                 Visit https://github.com/{}/releases for updates.",
+                clawde_core::github::GITHUB_REPO
             )),
         }
+    }
+}
+
+/// Append a GitHub API rate-limit note to a `/update` / `/release-notes`
+/// message when the remaining quota is low. Empty when the quota is healthy.
+/// Also records the last-seen status for the `/ctx-viz` overlay.
+fn github_rate_note(resp: &reqwest::Response) -> String {
+    let limit = clawde_core::github::parse_rate_limit(resp.headers());
+    if let Some(limit) = limit {
+        clawde_core::github::store_rate_limit(limit);
+    }
+    rate_limit_note_text(limit)
+}
+
+/// Format the low-quota warning appended to `/update` / `/release-notes`
+/// messages. Empty when the quota is healthy. Pure — unit-tested directly.
+fn rate_limit_note_text(limit: Option<clawde_core::github::RateLimit>) -> String {
+    limit
+        .as_ref()
+        .and_then(clawde_core::github::rate_limit_warning)
+        .map(|w| format!("\n\n{w}"))
+        .unwrap_or_default()
+}
+
+/// Seconds until the rate-limit window resets. Prefers the `Retry-After`
+/// header (delta-seconds or RFC 7231 HTTP-date, via the api crate's parser)
+/// and falls back to `X-RateLimit-Reset`.
+fn retry_after_secs(
+    headers: &reqwest::header::HeaderMap,
+    limit: &clawde_core::github::RateLimit,
+) -> u64 {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(clawde_api::extract_retry_after_header)
+        .unwrap_or_else(|| {
+            limit
+                .reset_unix
+                .saturating_sub(clawde_core::github::unix_now())
+        })
+}
+
+/// Format the retry hint appended to a 403 rate-limit message. Pure —
+/// unit-tested directly.
+fn format_retry_hint(secs: u64) -> String {
+    if secs >= 60 {
+        format!(" Retry after ~{} min.", secs / 60)
+    } else if secs > 0 {
+        format!(" Retry after ~{} sec.", secs)
+    } else {
+        " Retry shortly.".to_string()
     }
 }
 
@@ -248,28 +317,17 @@ impl SlashCommand for ReleaseNotesCommand {
             format!("v{}", version)
         };
 
-        let client = reqwest::Client::builder()
-            .user_agent(format!("claurst/{}", current))
-            .timeout(std::time::Duration::from_secs(8))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(_) => {
-                return CommandResult::Message(format!(
-                    "Claurst {tag} release notes:\n\
-                     Visit https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
-                ))
-            }
-        };
-
+        let client = clawde_core::github::api_client();
         let url = format!(
-            "https://api.github.com/repos/kuberwastaken/claurst/releases/tags/{}",
+            "{}/repos/{}/releases/tags/{}",
+            clawde_core::github::GITHUB_API_BASE,
+            clawde_core::github::GITHUB_REPO,
             tag
         );
 
         match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => {
+                let rate_note = github_rate_note(&r);
                 let json: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
 
                 let body = json
@@ -285,26 +343,32 @@ impl SlashCommand for ReleaseNotesCommand {
                 let html_url = json.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
 
                 CommandResult::Message(format!(
-                    "Release Notes: Claurst {tag}\n\
+                    "Release Notes: Clawde {tag}\n\
                      Published: {published}\n\
-                     URL: {html_url}\n\
+                     URL: {html_url}{rate_note}\n\
                      ─────────────────────────────────\n\
                      {body}"
                 ))
             }
             Ok(r) if r.status().as_u16() == 404 => CommandResult::Message(format!(
                 "No release found for {tag}.\n\
-                 View all releases: https://github.com/kuberwastaken/claurst/releases"
+                 View all releases: https://github.com/{}/releases",
+                clawde_core::github::GITHUB_REPO
             )),
-            Ok(r) => CommandResult::Message(format!(
-                "Could not fetch release notes (HTTP {}).\n\
-                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{}",
-                r.status(),
-                tag
-            )),
+            Ok(r) => {
+                let rate_note = github_rate_note(&r);
+                CommandResult::Message(format!(
+                    "Could not fetch release notes (HTTP {}).{rate_note}\n\
+                     View at: https://github.com/{}/releases/tag/{}",
+                    r.status(),
+                    clawde_core::github::GITHUB_REPO,
+                    tag
+                ))
+            }
             Err(e) => CommandResult::Message(format!(
                 "Could not fetch release notes: {e}\n\
-                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
+                 View at: https://github.com/{}/releases/tag/{tag}",
+                clawde_core::github::GITHUB_REPO
             )),
         }
     }
@@ -323,7 +387,7 @@ impl SlashCommand for RateLimitOptionsCommand {
     fn help(&self) -> &str {
         "Usage: /rate-limit-options\n\n\
          Displays available rate limit tiers and the current tier for your account.\n\
-         Rate limits depend on your Claurst plan (Free, Pro, Max, API)."
+         Rate limits depend on your Clawde plan (Free, Pro, Max, API)."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -370,5 +434,84 @@ impl SlashCommand for RateLimitOptionsCommand {
              Manage billing: https://claude.ai/settings/billing",
             tier_info = tier_info,
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn limit(remaining: u64, reset_unix: u64) -> clawde_core::github::RateLimit {
+        clawde_core::github::RateLimit {
+            limit: 60,
+            remaining,
+            reset_unix,
+        }
+    }
+
+    #[test]
+    fn rate_limit_note_text_empty_when_healthy() {
+        assert_eq!(rate_limit_note_text(None), "");
+        let now = clawde_core::github::unix_now();
+        assert_eq!(rate_limit_note_text(Some(limit(50, now + 1800))), "");
+    }
+
+    #[test]
+    fn rate_limit_note_text_warns_when_low() {
+        let now = clawde_core::github::unix_now();
+        let note = rate_limit_note_text(Some(limit(2, now + 1800)));
+        assert!(note.contains("rate limit low"), "got: {note}");
+        assert!(note.contains("2 requests remaining"), "got: {note}");
+    }
+
+    #[test]
+    fn rate_limit_note_text_warns_when_exhausted() {
+        let now = clawde_core::github::unix_now();
+        let note = rate_limit_note_text(Some(limit(0, now + 3600)));
+        assert!(note.contains("exhausted"), "got: {note}");
+    }
+
+    #[test]
+    fn format_retry_hint_minutes_seconds_shortly() {
+        assert_eq!(format_retry_hint(120), " Retry after ~2 min.");
+        assert_eq!(format_retry_hint(45), " Retry after ~45 sec.");
+        assert_eq!(format_retry_hint(0), " Retry shortly.");
+    }
+
+    #[test]
+    fn retry_after_prefers_header_then_reset() {
+        let now = clawde_core::github::unix_now();
+        let l = limit(0, now + 1800);
+
+        // Delta-seconds Retry-After header wins.
+        let mut headers = HeaderMap::new();
+        headers.insert("Retry-After", HeaderValue::from_static("120"));
+        assert_eq!(retry_after_secs(&headers, &l), 120);
+
+        // Without the header, derive from X-RateLimit-Reset.
+        assert_eq!(retry_after_secs(&HeaderMap::new(), &l), 1800);
+    }
+
+    #[test]
+    fn retry_after_parses_http_date() {
+        // RFC 7231 HTTP-date is handled by the api crate's parser. A date 30
+        // days out keeps the test valid regardless of the wall clock.
+        let l = limit(0, 0); // reset fallback would be ~0
+        let future = chrono::Utc::now() + chrono::Duration::days(30);
+        let date_str = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Retry-After",
+            HeaderValue::from_str(&date_str).expect("ascii date header"),
+        );
+        let secs = retry_after_secs(&headers, &l);
+        // A 30-day-out date yields a large delta (well past the reset
+        // fallback), proving the HTTP-date branch was taken.
+        assert!(secs > 60 * 60 * 24 * 29, "got {secs}s");
     }
 }

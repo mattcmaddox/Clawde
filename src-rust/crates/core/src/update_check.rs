@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/kuberwastaken/claurst/releases/latest";
+use crate::github::{GITHUB_API_BASE, GITHUB_REPO};
+
 const CHECK_INTERVAL_HOURS: u64 = 24;
 
 /// Information about an available update.
@@ -46,8 +46,7 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
                                         current_version: current,
                                         latest_version: cached.clone(),
                                         release_url: format!(
-                                            "https://github.com/kuberwastaken/claurst/releases/tag/v{}",
-                                            cached
+                                            "https://github.com/{GITHUB_REPO}/releases/tag/v{cached}"
                                         ),
                                         has_update: true,
                                     });
@@ -62,15 +61,23 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
     }
 
     // --- Network fetch -------------------------------------------------------
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent(format!("Claurst/{}", current))
-        .build()
-        .ok()?;
+    let client = crate::github::api_client();
 
-    let resp = client.get(GITHUB_RELEASES_URL).send().await.ok()?;
+    let resp = client
+        .get(format!(
+            "{GITHUB_API_BASE}/repos/{GITHUB_REPO}/releases/latest"
+        ))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
+    }
+
+    // Record the last-seen rate-limit status for the /ctx-viz overlay (read
+    // the headers before the response is consumed by `.json()`).
+    if let Some(limit) = crate::github::parse_rate_limit(resp.headers()) {
+        crate::github::store_rate_limit(limit);
     }
 
     let json: serde_json::Value = resp.json().await.ok()?;
@@ -79,7 +86,7 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
     let html_url = json
         .get("html_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("https://github.com/kuberwastaken/claurst/releases")
+        .unwrap_or(&format!("https://github.com/{GITHUB_REPO}/releases"))
         .to_string();
 
     // Cache the fetched version so we don't hit GitHub again for 24 h.
@@ -108,7 +115,7 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
 // ---------------------------------------------------------------------------
 
 fn update_cache_path() -> Option<std::path::PathBuf> {
-    dirs::cache_dir().map(|d| d.join("claurst").join("update_check.txt"))
+    dirs::cache_dir().map(|d| d.join("clawde").join("update_check.txt"))
 }
 
 /// Compare two semver strings.  Returns `true` when `latest` > `current`.

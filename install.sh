@@ -166,7 +166,13 @@ resolve_version() {
         specific_version="$requested_version"
     else
         # Fetch latest version from GitHub API.  Use sed instead of jq for portability.
-        specific_version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        # Headers mirror the docs-required set: descriptive User-Agent, JSON media
+        # type, and the pinned REST API version.
+        specific_version=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -A "clawde-installer" \
+            "https://api.github.com/repos/${REPO}/releases/latest" \
             | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' \
             | head -n 1)
         if [[ -z "$specific_version" ]]; then

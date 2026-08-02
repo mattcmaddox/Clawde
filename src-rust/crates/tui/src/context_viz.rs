@@ -269,7 +269,39 @@ pub fn render_context_viz(
         }
     }
 
-    lines.push(Line::from(""));
+    // -- GitHub API ------------------------------------------------------------
+    if let Some(gh) = clawde_core::github::last_rate_limit() {
+        lines.push(Line::from(vec![Span::styled(
+            " GitHub API",
+            Style::default()
+                .fg(CLAURST_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        let gh_color = if gh.remaining == 0 {
+            Color::Red
+        } else if gh.remaining <= 5 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        let reset_text =
+            clawde_core::github::format_reset(gh.reset_unix, clawde_core::github::unix_now());
+
+        lines.push(Line::from(vec![
+            Span::styled("  Requests: ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{} / {}", gh.remaining, gh.limit),
+                Style::default().fg(gh_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  ({reset_text})"),
+                Style::default().fg(CLAURST_MUTED),
+            ),
+        ]));
+
+        lines.push(Line::from(""));
+    }
 
     // -- Firecrawl keys ---------------------------------------------------------
     let fc_keys = collect_firecrawl_keys();

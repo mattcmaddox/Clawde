@@ -84,6 +84,10 @@ pub use ide::{detect_ide, IdeKind};
 pub mod update_check;
 pub use update_check::{check_for_updates, UpdateInfo};
 
+// Shared GitHub REST API config: repo path + pre-configured client.
+pub mod github;
+pub use github::{api_client, GITHUB_API_BASE, GITHUB_REPO};
+
 // Self-contained HTML export of a session, used by the `/share` slash command.
 pub mod share_export;
 

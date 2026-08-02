@@ -3086,6 +3086,31 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(label, style));
         }
 
+        // GitHub API quota — warning marker when the update-check quota is low
+        // (≤ 5 requests left), mirroring the key-ring / health-sweep badges.
+        if let Some(limit) = clawde_core::github::last_rate_limit() {
+            if limit.remaining <= 5 {
+                let gh_color = if limit.remaining == 0 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!(
+                        " \u{26a0} gh {}/{} ({}) ",
+                        limit.remaining,
+                        limit.limit,
+                        clawde_core::github::format_reset(
+                            limit.reset_unix,
+                            clawde_core::github::unix_now()
+                        )
+                    ),
+                    Style::default().fg(gh_color).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
         // Bash prefix indicator — shown when prompt starts with '!'
         if app.prompt_input.text.starts_with('!') {
             if !spans.is_empty() {

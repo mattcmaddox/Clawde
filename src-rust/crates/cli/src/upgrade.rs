@@ -2,17 +2,17 @@
 //
 // Downloads the latest release from GitHub, extracts it, and atomically
 // replaces the running binary.  Mirrors the logic in install.sh / install.ps1
-// so that an `upgrade` from inside Claurst feels identical to a fresh install.
+// so that an `upgrade` from inside Clawde feels identical to a fresh install.
 //
 // Extraction shells out to `tar` (Linux/macOS) or PowerShell `Expand-Archive`
 // (Windows) — both are present on every modern system and saves us pulling
 // `flate2`/`tar`/`zip` into the cli crate just for one command.
 
 use anyhow::{anyhow, bail, Context, Result};
+use clawde_core::github::GITHUB_REPO;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const REPO: &str = "Kuberwastaken/clawde";
 const APP: &str = "clawde";
 
 pub async fn run_upgrade(args: &[String]) -> Result<()> {
@@ -68,7 +68,7 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
     let (archive_name, is_zip) = archive_name_for_target(&target);
     let url = format!(
         "https://github.com/{}/releases/download/v{}/{}",
-        REPO, target_version, archive_name
+        GITHUB_REPO, target_version, archive_name
     );
 
     let tmp_dir = tempdir_for_upgrade()?;
@@ -180,11 +180,12 @@ fn archive_name_for_target(target: &str) -> (String, bool) {
 // ---------------------------------------------------------------------------
 
 async fn fetch_latest_version() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(format!("clawde-upgrade/{}", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let url = format!(
+        "{}/repos/{}/releases/latest",
+        clawde_core::github::GITHUB_API_BASE,
+        GITHUB_REPO
+    );
+    let client = clawde_core::github::api_client();
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         bail!("GitHub API returned {} for {}", resp.status(), url);

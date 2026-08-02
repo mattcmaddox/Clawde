@@ -88,7 +88,11 @@ function Resolve-Version {
         return ($script:Version -replace '^v', '')
     }
     try {
-        $resp = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'clawde-installer' }
+        $resp = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{
+            'User-Agent'          = 'clawde-installer'
+            'Accept'              = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+        }
         $tag = $resp.tag_name
         if ([string]::IsNullOrEmpty($tag)) { throw "no tag_name in response" }
         return ($tag -replace '^v', '')
