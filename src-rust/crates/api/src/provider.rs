@@ -177,6 +177,26 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Report per-upstream key-ring health for composite providers.
+    /// Each entry is `(upstream_id, active_keys, total_keys, retry_secs)`
+    /// where `retry_secs` is the seconds until the earliest exhausted key
+    /// recovers, or `None` when all keys are active. The default
+    /// implementation returns an empty vector — only composite providers
+    /// that multiplex upstreams (e.g. `FreeProvider`) override this.
+    fn upstream_key_health(&self) -> Vec<(String, usize, usize, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Report per-upstream cooldown state for composite providers.
+    /// Each entry is `(upstream_id, kind, retry_secs)` where `kind` is
+    /// `"empty"` (empty-completion cooldown) or `"5xx"` (server-error /
+    /// circuit-breaker cooldown) and `retry_secs` is the seconds remaining
+    /// in the cooldown. The default implementation returns an empty vector
+    /// — only composite providers that multiplex upstreams override this.
+    fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
+        Vec::new()
+    }
+
     /// Inject an external key exhaustion signal into the provider's key ring
     /// (e.g. from the health poller — spec §6.4).  Returns `true` if the
     /// key was marked exhausted; `false` when this provider has no key ring

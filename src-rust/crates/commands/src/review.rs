@@ -201,7 +201,10 @@ impl SlashCommand for ReviewCommand {
         // ------------------------------------------------------------------
         // 4. Optionally post to GitHub PR
         // ------------------------------------------------------------------
-        let github_token = std::env::var("GITHUB_TOKEN").ok();
+        // Prefer the env var, then the stored `github` credential — same
+        // resolution the shared api_client uses, so /review works with a
+        // stored PAT instead of requiring GITHUB_TOKEN to be exported.
+        let github_token = clawde_core::github::github_token();
         let mut github_post_result: Option<String> = None;
 
         if let Some(ref token) = github_token {

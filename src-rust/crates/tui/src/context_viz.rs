@@ -5,6 +5,8 @@
 // app.context_window_size, app.messages, and app.key_ring_data_fn —
 // all updated per-turn.
 
+use std::collections::HashMap;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -14,8 +16,8 @@ use ratatui::Frame;
 use clawde_tools::web_search::{collect_firecrawl_keys, firecrawl_key_health};
 
 use crate::overlays::{
-    begin_modal_frame, modal_header_line_area, render_modal_title_frame, CLAURST_ACCENT,
-    CLAURST_MUTED, CLAURST_PANEL_BG,
+    begin_modal_frame, modal_header_line_area, render_modal_title_frame, render_scrollbar,
+    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +48,12 @@ pub struct KeyRingRow {
 #[derive(Debug, Default, Clone)]
 pub struct ContextVizState {
     pub visible: bool,
+    /// Vertical scroll offset (in wrapped rows) for the modal body. Clamped
+    /// against the rendered content height at draw time (render_app holds an
+    /// immutable `&App`, matching the help-overlay pattern), so this value may
+    /// temporarily exceed the max while content is short — it is never drawn
+    /// out of bounds.
+    pub scroll_offset: usize,
 }
 
 impl ContextVizState {
@@ -55,14 +63,43 @@ impl ContextVizState {
 
     pub fn open(&mut self) {
         self.visible = true;
+        self.scroll_offset = 0;
     }
 
     pub fn close(&mut self) {
         self.visible = false;
+        self.scroll_offset = 0;
     }
 
     pub fn toggle(&mut self) {
         self.visible = !self.visible;
+        if !self.visible {
+            self.scroll_offset = 0;
+        }
+    }
+
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+
+    pub fn page_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(8);
+    }
+
+    pub fn page_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(8);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self, max: usize) {
+        self.scroll_offset = max.saturating_sub(1);
     }
 }
 
@@ -82,7 +119,13 @@ pub fn render_context_viz(
     msg_user: usize,
     msg_assistant: usize,
     tool_calls: usize,
-    free_model_defaults: Vec<(String, String)>,
+    free_model_defaults: Vec<(String, String, String)>,
+    // Per-upstream key-ring health `(upstream_id, active, total, retry_secs)`
+    // for the free provider — drives the status dot in the Free models table.
+    free_upstream_health: Vec<(String, usize, usize, Option<u64>)>,
+    // Per-upstream cooldown annotations `(upstream_id, kind, retry_secs)`
+    // where `kind` is `"empty"` or `"5xx"`.
+    free_upstream_cooldowns: Vec<(String, String, Option<u64>)>,
 ) {
     if !state.visible {
         return;
@@ -174,22 +217,101 @@ pub fn render_context_viz(
                 .add_modifier(Modifier::BOLD),
         )]));
 
-        for (upstream_name, model_id) in &free_model_defaults {
+        // Index upstream key-health by id so the status dot can be drawn.
+        let health_map: HashMap<&str, (usize, usize, Option<u64>)> = free_upstream_health
+            .iter()
+            .map(|(id, active, total, retry)| (id.as_str(), (*active, *total, *retry)))
+            .collect();
+        // Index upstream cooldown annotations by id: (kind, retry_secs).
+        let mut cooldown_map: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
+        for (id, kind, retry) in &free_upstream_cooldowns {
+            if let Some(secs) = retry {
+                cooldown_map
+                    .entry(id.as_str())
+                    .or_default()
+                    .push((kind.as_str(), *secs));
+            }
+        }
+
+        for (position, (upstream_id, upstream_name, model_id)) in
+            free_model_defaults.iter().enumerate()
+        {
             let truncated = if model_id.len() > 32 {
                 format!("{}…{}", &model_id[..15], &model_id[model_id.len() - 15..])
             } else {
                 model_id.clone()
             };
-            lines.push(Line::from(vec![
+            let (dot, dot_color) = upstream_dot(upstream_id, &health_map, &cooldown_map);
+            let mut spans = vec![
+                Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
                 Span::styled(
-                    format!("  {:<16}", truncate_name(upstream_name, 16)),
+                    format!("{:<16}", truncate_name(upstream_name, 16)),
                     Style::default().fg(Color::White),
                 ),
                 Span::styled(
                     format!("  {}", truncated),
                     Style::default().fg(Color::Green),
                 ),
-            ]));
+            ];
+            // Persistent cooldown annotations — the /ctx-viz equivalent of
+            // the transient status-row badges, so users can see *why* an
+            // upstream is being skipped.
+            if let Some(annotations) = cooldown_map.get(upstream_id.as_str()) {
+                for (kind, secs) in annotations {
+                    spans.push(Span::styled(
+                        format!(" ({}-cooldown {}s)", kind, secs),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+            lines.push(Line::from(spans));
+
+            // Detail line: fallback-chain priority and key-ring state, so
+            // users can see which upstream is tried first and how healthy its
+            // keys are without opening /keys health.
+            let keys_detail = match health_map.get(upstream_id.as_str()) {
+                Some((active, total, retry)) => {
+                    let retry_part = if *active == 0 && *total > 0 {
+                        match retry {
+                            Some(r) => format!(", retry {}s", r),
+                            None => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    format!("keys {}/{}", active, total) + &retry_part
+                }
+                None => "keys \u{2014}".to_string(),
+            };
+            // Fallback models (secondary models tried on the same upstream
+            // before the chain moves on) — surfaced so users can see which
+            // providers auto-recover from a slow primary.
+            let fallback_note = clawde_api::FREE_CATALOG
+                .iter()
+                .find(|u| u.id == upstream_id)
+                .map(|u| u.fallback_models)
+                .unwrap_or(&[]);
+            let mut detail = format!("     priority #{} \u{00b7} {}", position + 1, keys_detail);
+            if !fallback_note.is_empty() {
+                // Truncate each fallback ID like the primary model above so
+                // the note can't overflow the modal on narrow terminals.
+                let fb_list: Vec<String> = fallback_note
+                    .iter()
+                    .map(|m| {
+                        if m.len() > 32 {
+                            format!("{}…{}", &m[..15], &m[m.len() - 15..])
+                        } else {
+                            (*m).to_string()
+                        }
+                    })
+                    .collect();
+                detail.push_str(" \u{00b7} fb: ");
+                detail.push_str(&fb_list.join(", "));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                detail,
+                Style::default().fg(CLAURST_MUTED),
+            )]));
         }
 
         lines.push(Line::from(""));
@@ -398,19 +520,100 @@ pub fn render_context_viz(
         ),
     ]));
 
+    // Total wrapped rows (long lines wrap inside the modal), so the scroll
+    // offset can be clamped and a scrollbar shown when the body overflows —
+    // e.g. long free-model chains with per-upstream detail lines would
+    // otherwise push the key-health / cost sections out of view.
+    // (`Paragraph::line_count` is an unstable ratatui API, so wrap each line
+    // by its unicode width, matching the `Wrap { trim: false }` behaviour.)
+    let inner_width = (inner.width as usize).max(1);
+    let total_rows: usize = lines
+        .iter()
+        .map(|line| {
+            let w = line.width();
+            if w == 0 {
+                1
+            } else {
+                w.div_ceil(inner_width)
+            }
+        })
+        .sum();
+    let max_scroll = total_rows.saturating_sub(inner.height as usize);
+    let scroll = state.scroll_offset.min(max_scroll);
+
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0))
         .style(Style::default().bg(CLAURST_PANEL_BG))
         .render(inner, frame.buffer_mut());
+
+    // Thin vertical scrollbar along the body's right edge when content
+    // overflows (reuses the shared overlay scrollbar helper).
+    if max_scroll > 0 {
+        render_scrollbar(
+            frame,
+            &crate::theme_colors::current_palette(),
+            inner,
+            scroll,
+            total_rows,
+            inner.height as usize,
+        );
+    }
+
+    let footer_hint = if max_scroll > 0 {
+        format!(
+            " \u{2191}\u{2193}/j/k/pgup/pgdn scroll \u{00b7} {}/{} \u{00b7} enter/esc close",
+            scroll + 1,
+            total_rows
+        )
+    } else {
+        " enter/esc close".to_string()
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            " enter/esc close",
+            footer_hint,
             Style::default()
                 .fg(CLAURST_MUTED)
                 .add_modifier(Modifier::ITALIC),
         )])),
         layout.footer_area,
     );
+}
+
+/// Health dot for one free-mode upstream:
+///   ● green  — healthy (no cooldown, keys active / no key ring)
+///   ◐ yellow — some keys exhausted
+///   ○ red    — all keys down, or a 5xx / empty cooldown is active
+fn upstream_dot(
+    id: &str,
+    health: &HashMap<&str, (usize, usize, Option<u64>)>,
+    cooldowns: &HashMap<&str, Vec<(&str, u64)>>,
+) -> (char, Color) {
+    if cooldowns.contains_key(id) {
+        return ('\u{25cb}', Color::Red); // ○
+    }
+    match health.get(id) {
+        Some((active, total, _)) if *total > 0 && *active == 0 => ('\u{25cb}', Color::Red),
+        Some((active, total, _)) if *total > 0 && *active < *total => ('\u{25d0}', Color::Yellow), // ◐
+        _ => ('\u{25cf}', Color::Green), // ●
+    }
+}
+
+/// Build `/ctx-viz` key-health rows from a provider registry. Shared by the
+/// CLI's callback wiring and the TUI render path (which prefers the live app
+/// registry so rows stay fresh after key / routing changes).
+pub fn key_ring_rows_from_registry(reg: &clawde_api::ProviderRegistry) -> Vec<KeyRingRow> {
+    reg.key_ring_summaries()
+        .into_iter()
+        .map(|(name, active, total, retry)| KeyRingRow {
+            provider_name: name,
+            active,
+            total,
+            retry_secs: retry,
+            tokens_pct: None,
+            requests_pct: None,
+        })
+        .collect()
 }
 
 fn pct_color(pct: Option<f32>) -> Color {
@@ -499,7 +702,9 @@ mod tests {
                     4,
                     5,
                     3,
-                    vec![("Groq".into(), "llama-3.3-70b".into())],
+                    vec![("groq".into(), "Groq".into(), "llama-3.3-70b".into())],
+                    vec![("groq".into(), 2, 3, Some(30))],
+                    vec![("groq".into(), "empty".into(), Some(42))],
                 );
             })
             .unwrap();
@@ -512,6 +717,138 @@ mod tests {
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(content.contains("Context") || content.contains("Key"));
+    }
+
+    #[test]
+    fn context_viz_shows_fallback_models_for_upstreams_that_have_them() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut state = ContextVizState::new();
+        state.open();
+        terminal
+            .draw(|frame| {
+                render_context_viz(
+                    frame,
+                    &state,
+                    frame.area(),
+                    50_000,
+                    200_000,
+                    Vec::new(),
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    // nvidia has a catalog fallback; groq does not.
+                    vec![
+                        (
+                            "nvidia".into(),
+                            "NVIDIA NIM".into(),
+                            "meta/llama-3.3-70b-instruct".into(),
+                        ),
+                        ("groq".into(), "Groq".into(), "openai/gpt-oss-120b".into()),
+                    ],
+                    vec![("nvidia".into(), 2, 2, None), ("groq".into(), 2, 2, None)],
+                    Vec::new(),
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // The fallback note appears on nvidia's detail line exactly once
+        // (flat buffer — no newlines between rows).
+        assert!(
+            content.contains("fb: meta/llama-3.1-8b-instruct"),
+            "expected fallback note, got: {:?}",
+            &content[content.find("Free").unwrap_or(0)..]
+        );
+        // groq has no fallbacks — its detail line must not carry a fb note.
+        assert_eq!(
+            content.matches("fb:").count(),
+            1,
+            "expected exactly one fb note (nvidia only), got: {:?}",
+            &content[content.find("Free").unwrap_or(0)..]
+        );
+    }
+
+    #[test]
+    fn context_viz_scroll_state_resets_on_open_close() {
+        let mut state = ContextVizState::new();
+        state.open();
+        state.scroll_down();
+        state.scroll_down();
+        assert_eq!(state.scroll_offset, 2);
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 1);
+        state.close();
+        assert!(!state.visible);
+        assert_eq!(state.scroll_offset, 0);
+        // Reopening starts at the top again.
+        state.open();
+        state.scroll_to_bottom(usize::MAX);
+        assert_eq!(state.scroll_offset, usize::MAX - 1);
+        state.scroll_to_top();
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn context_viz_overflow_renders_scrollable() {
+        // A long free-model chain (10 upstreams with per-upstream detail
+        // lines) overflows the modal body on a 30-row terminal. Rendering with
+        // a scroll offset must not panic and the footer must advertise
+        // scrolling so the user knows lower sections are reachable.
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut state = ContextVizState::new();
+        state.open();
+        state.scroll_down();
+        state.scroll_down();
+        let upstreams: Vec<(String, String, String)> = (0..10)
+            .map(|i| {
+                (
+                    format!("upstream-{}", i),
+                    format!("Upstream {}", i),
+                    format!("model-{}", i),
+                )
+            })
+            .collect();
+        terminal
+            .draw(|frame| {
+                render_context_viz(
+                    frame,
+                    &state,
+                    frame.area(),
+                    50_000,
+                    200_000,
+                    vec![],
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    upstreams.clone(),
+                    vec![],
+                    vec![],
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // Overflowing content shows the scroll hint in the footer.
+        assert!(
+            content.contains("scroll"),
+            "footer should advertise scrolling when the body overflows"
+        );
     }
 
     #[test]
@@ -533,6 +870,8 @@ mod tests {
                     0,
                     0,
                     0,
+                    vec![],
+                    vec![],
                     vec![],
                 );
             })

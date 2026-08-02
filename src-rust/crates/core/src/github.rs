@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Canonical GitHub repository ("owner/repo"). The single source of truth —
 /// call sites that used the pre-rename `kuberwastaken/claurst` path are
 /// migrated here so update checks hit the renamed repo.
-pub const GITHUB_REPO: &str = "Kuberwastaken/clawde";
+pub const GITHUB_REPO: &str = "mattcmaddox/Clawde";
 
 /// Base URL for the GitHub REST API.
 pub const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -40,18 +40,61 @@ fn default_headers() -> reqwest::header::HeaderMap {
     headers
 }
 
+/// Resolve a GitHub API token, preferring the `GITHUB_TOKEN` env var and
+/// falling back to the stored `github` credential in the auth store.
+///
+/// Returns `None` when neither source has a usable token. Used by
+/// [`api_client`] so every GitHub REST caller (update check, `/update`,
+/// `/release-notes`, `/review`, upgrade) gets the authenticated 5,000 req/hr
+/// quota instead of the anonymous 60 req/hr when a token is configured.
+pub fn github_token() -> Option<String> {
+    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
+        if !t.trim().is_empty() {
+            return Some(t.trim().to_string());
+        }
+    }
+    let store = crate::AuthStore::load();
+    match store.get("github") {
+        Some(crate::StoredCredential::ApiKey { key }) if !key.trim().is_empty() => {
+            Some(key.trim().to_string())
+        }
+        _ => store
+            .keys_for("github")
+            .and_then(|k| k.first())
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty()),
+    }
+}
+
+/// Build the default header set, adding `Authorization: Bearer <token>` when
+/// a token is available (env `GITHUB_TOKEN`, or the stored `github`
+/// credential). Kept as a pure function so the auth wiring is unit-testable
+/// without a network round trip.
+fn client_headers_with_auth(token: Option<&str>) -> reqwest::header::HeaderMap {
+    let mut headers = default_headers();
+    if let Some(token) = token {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
 /// Build a reqwest client pre-configured for the GitHub REST API.
 ///
 /// Sets the required `User-Agent`, `Accept: application/vnd.github+json`,
 /// and `X-GitHub-Api-Version: 2022-11-28` headers plus a 10s timeout.
-/// Callers add `Authorization` themselves when the endpoint requires it.
+/// When a GitHub token is available (env `GITHUB_TOKEN`, or the stored
+/// `github` credential), it is attached as a default `Authorization` header
+/// so every request benefits from the authenticated quota. Callers that need
+/// a different credential override the header per-request.
 ///
 /// The builder config is static, so `expect` is safe here.
 pub fn api_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("clawde/{}", crate::constants::APP_VERSION))
-        .default_headers(default_headers())
+        .default_headers(client_headers_with_auth(github_token().as_deref()))
         .build()
         .expect("static github client config")
 }
@@ -231,6 +274,115 @@ pub fn rate_limit_warning(limit: &RateLimit) -> Option<String> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    /// Redirect `CLAWDE_HOME` to a temp dir for the lifetime of the guard so
+    /// `AuthStore::load()` (used by `github_token`) can never touch the real
+    /// `~/.clawde/auth.json`. Restores the previous env var on drop. Mirrors
+    /// the `TestHome` guard in auth_store.rs.
+    struct TestHome {
+        _tmp: tempfile::TempDir,
+        prev_clawde_home: Option<std::ffi::OsString>,
+        prev_github_token: Option<std::ffi::OsString>,
+        #[cfg(unix)]
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            #[cfg(unix)]
+            let _lock = crate::paths::ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev_clawde_home = std::env::var_os("CLAWDE_HOME");
+            let prev_github_token = std::env::var_os("GITHUB_TOKEN");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::env::remove_var("GITHUB_TOKEN");
+            TestHome {
+                _tmp: tmp,
+                prev_clawde_home,
+                prev_github_token,
+                #[cfg(unix)]
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.prev_clawde_home {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+            match &self.prev_github_token {
+                Some(v) => std::env::set_var("GITHUB_TOKEN", v),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+        }
+    }
+
+    #[test]
+    fn github_token_uses_env_var_first() {
+        let _home = TestHome::new();
+        // Seed a stored credential — the env var must still win.
+        let mut store = crate::AuthStore::default();
+        store.set(
+            "github",
+            crate::StoredCredential::ApiKey {
+                key: "stored-key".into(),
+            },
+        );
+        std::env::set_var("GITHUB_TOKEN", "env-key");
+        assert_eq!(github_token().as_deref(), Some("env-key"));
+    }
+
+    #[test]
+    fn github_token_falls_back_to_stored_credential() {
+        let _home = TestHome::new();
+        let mut store = crate::AuthStore::default();
+        store.set(
+            "github",
+            crate::StoredCredential::ApiKey {
+                key: "stored-key".into(),
+            },
+        );
+        assert_eq!(github_token().as_deref(), Some("stored-key"));
+    }
+
+    #[test]
+    fn github_token_falls_back_to_multi_key_first_entry() {
+        let _home = TestHome::new();
+        let mut store = crate::AuthStore::default();
+        store.set_keys("github", vec!["k1".into(), "k2".into()]);
+        assert_eq!(github_token().as_deref(), Some("k1"));
+    }
+
+    #[test]
+    fn github_token_none_when_unconfigured() {
+        let _home = TestHome::new();
+        assert_eq!(github_token(), None);
+    }
+
+    #[test]
+    fn client_headers_attach_bearer_when_token_resolves() {
+        let headers = client_headers_with_auth(Some("ghp_testtoken"));
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer ghp_testtoken"
+        );
+        // The required GitHub headers must survive alongside the auth header.
+        assert_eq!(headers.get(reqwest::header::ACCEPT).unwrap(), GITHUB_MEDIA_TYPE);
+        assert_eq!(
+            headers.get("X-GitHub-Api-Version").unwrap(),
+            GITHUB_API_VERSION
+        );
+    }
+
+    #[test]
+    fn client_headers_no_bearer_without_token() {
+        let headers = client_headers_with_auth(None);
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
 
     fn rate_limit_headers(limit: &str, remaining: &str, reset: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

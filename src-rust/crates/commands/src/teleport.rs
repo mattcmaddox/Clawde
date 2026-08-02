@@ -76,7 +76,7 @@ impl SlashCommand for TeleportCommand {
          \n\
          /teleport export [--output <file>]\n\
          \x20 Serialize the current session to a .teleport JSON bundle.\n\
-         \x20 Defaults to ~/.claurst/teleport_<session_id>.json\n\
+         \x20 Defaults to ~/.clawde/teleport_<session_id>.json\n\
          \n\
          /teleport import <file>\n\
          \x20 Load a .teleport bundle and restore messages, working dir, and\n\
@@ -119,7 +119,7 @@ impl SlashCommand for TeleportCommand {
                     if let Some(p) = explicit {
                         p
                     } else {
-                        // Default: <claurst home>/teleport_<session_id>.json
+                        // Default: <clawde home>/teleport_<session_id>.json
                         let base = clawde_core::config::Settings::config_dir();
                         let _ = std::fs::create_dir_all(&base);
                         base.join(format!("teleport_{}.json", ctx.session_id))

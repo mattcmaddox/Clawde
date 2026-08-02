@@ -549,6 +549,27 @@ async fn main() -> anyhow::Result<()> {
                 .parse()
                 .expect("valid directive"),
         )
+        // The health poller runs in the background (startup + every 5 min) and
+        // would otherwise write its warn!/info! lines straight into the TUI's
+        // alternate screen, clobbering the rendered frame. Its findings are
+        // surfaced through the key-ring injection instead (spec §6.4).
+        .add_directive(
+            "clawde_api::health_poller=off"
+                .parse()
+                .expect("valid directive"),
+        )
+        // Background HTTP (models cache refresh, update check, health probes,
+        // MCP/bridge polling) logs connection warnings at `warn` by default —
+        // a flaky network would clobber the TUI. Outcomes are delivered via
+        // channels and state, not logs.
+        .add_directive("reqwest=off".parse().expect("valid directive"))
+        .add_directive("hyper=off".parse().expect("valid directive"))
+        .add_directive("h2=off".parse().expect("valid directive"))
+        // MCP lifecycle events (disconnects, reconnect failures, SSE stream
+        // errors) and remote-bridge poll errors fire mid-TUI at `warn`/`error`;
+        // both are surfaced through their own TUI state/overlays instead.
+        .add_directive("clawde_mcp=off".parse().expect("valid directive"))
+        .add_directive("clawde_bridge=off".parse().expect("valid directive"))
         .add_directive("clawde_query=off".parse().expect("valid directive"));
     tracing_subscriber::fmt()
         .with_env_filter(log_filter)
@@ -991,6 +1012,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(clawde_api::health_poller::run_health_poller(
             0,
             free_provider,
+            None, // headless — no TUI to report to
         ));
         run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
     } else {
@@ -1441,7 +1463,9 @@ async fn refresh_models_cache_once() {
     // Write canonical path + legacy path so older installs keep working.
     let _ = std::fs::write(&cache_path, &text);
     let _ = std::fs::write(&legacy_cache_path, &text);
-    tracing::info!(path = %cache_path.display(), "Models cache refreshed from {}", url);
+    // debug: the background models refresh runs mid-TUI; info! would print
+    // into the alternate screen in verbose mode.
+    tracing::debug!(path = %cache_path.display(), "Models cache refreshed from {}", url);
 }
 
 async fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
@@ -2065,21 +2089,7 @@ async fn run_interactive(
         app.key_ring_data_fn = Some(std::sync::Arc::new(
             move || -> Vec<clawde_tui::context_viz::KeyRingRow> {
                 reg.as_ref()
-                    .map(|r| {
-                        r.key_ring_summaries()
-                            .into_iter()
-                            .map(|(name, active, total, retry)| {
-                                clawde_tui::context_viz::KeyRingRow {
-                                    provider_name: name,
-                                    active,
-                                    total,
-                                    retry_secs: retry,
-                                    tokens_pct: None,
-                                    requests_pct: None,
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|r| clawde_tui::context_viz::key_ring_rows_from_registry(r.as_ref()))
                     .unwrap_or_default()
             },
         ));
@@ -2088,6 +2098,12 @@ async fn run_interactive(
         // store_free_model_defaults; read them back now for the TUI.
         app.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
     }
+
+    // Ollama mode is a config-level setting, not registry-dependent.
+    app.ollama_mode = config.resolve_ollama_mode();
+    // Sync the global network-block flag so PermissionManager can deny
+    // Network-level tools immediately on startup.
+    clawde_core::set_ollama_network_blocked(app.ollama_mode == clawde_core::OllamaMode::Isolated);
 
     app.arg_completions = Some(std::sync::Arc::new(
         |cmd_name: &str, partial: &str| -> Vec<clawde_tui::prompt_input::TypeaheadSuggestion> {
@@ -2151,6 +2167,11 @@ async fn run_interactive(
     // Background: zero-token health poller — probes every configured free
     // upstream key at startup and every 5 min so dead keys are surfaced
     // before the first user request hits them (spec §6.4).
+    // Background health sweeps push their per-key outcome here so the TUI can
+    // surface dead keys (footer marker + status message) the moment a probe
+    // finds them (spec §6.4).
+    let (health_tx, mut health_rx) = mpsc::unbounded_channel();
+    let mut last_health_gen = 0u64;
     if let Some(ref provider_registry) = provider_registry {
         let free_provider = provider_registry
             .get(&clawde_core::ProviderId::new("free"))
@@ -2165,6 +2186,7 @@ async fn run_interactive(
         tokio::spawn(clawde_api::health_poller::run_health_poller(
             poll_interval,
             free_provider,
+            Some(health_tx),
         ));
     }
 
@@ -2314,7 +2336,9 @@ async fn run_interactive(
             if let Err(e) =
                 clawde_bridge::run_bridge_loop(cfg, tui_tx, outbound_rx, cancel_clone).await
             {
-                warn!("Bridge loop exited with error: {}", e);
+                // Downgraded: bridge exit is already surfaced to the TUI via
+                // bridge events; a warn! here would clobber the alternate screen.
+                debug!("Bridge loop exited with error: {}", e);
             }
         });
 
@@ -2705,6 +2729,14 @@ async fn run_interactive(
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
                             let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // Key / auth mutations (/keys, /logout, /refresh clears
+                            // saved auth) change the free-mode chain — refresh the
+                            // TUI's cached free-model defaults and registry copy so
+                            // /ctx-viz and the prompt status line reflect the live
+                            // chain immediately.
+                            if matches!(cmd_name.as_str(), "keys" | "logout" | "refresh") {
+                                app.refresh_free_provider();
+                            }
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
 
@@ -4161,6 +4193,7 @@ async fn run_interactive(
 
         // Drain free dialog key validation results (non-blocking).
         app.poll_free_dialog_validation();
+        app.poll_free_dialog_reprobe();
         app.poll_image_results();
 
         // Drain ask-user question events (non-blocking).
@@ -4297,6 +4330,34 @@ async fn run_interactive(
         if app.update_available.is_none() {
             if let Ok(Some(version)) = update_rx.try_recv() {
                 app.update_available = Some(version);
+            }
+        }
+
+        // Background health sweeps: refresh the footer marker and surface a
+        // status message the first time a sweep finds dead keys.
+        while let Ok(sweep) = health_rx.try_recv() {
+            let was_healthy = app
+                .last_health_sweep
+                .as_ref()
+                .is_none_or(|s| s.unhealthy == 0);
+            app.last_health_sweep = Some(sweep.clone());
+            if was_healthy && sweep.unhealthy > 0 {
+                app.status_message = Some(format!(
+                    "Health check: {} of {} key(s) unhealthy — run /health for details.",
+                    sweep.unhealthy, sweep.checked
+                ));
+            }
+        }
+        // A manual `/health` probe also updates the footer marker (its full
+        // report is shown in the transcript as the command's output). Gated on
+        // the generation counter so the outcome is only cloned when it changed.
+        let gen = clawde_api::health_poller::last_sweep_generation();
+        if gen != last_health_gen {
+            last_health_gen = gen;
+            if let Some(sweep) = clawde_api::health_poller::take_last_sweep() {
+                if app.last_health_sweep.as_ref() != Some(&sweep) {
+                    app.last_health_sweep = Some(sweep);
+                }
             }
         }
 

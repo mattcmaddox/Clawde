@@ -51,6 +51,7 @@ pub fn resolve_provider_api_base(
 
 /// Registry of all available LLM providers.
 /// Holds `Arc<dyn LlmProvider>` for each registered provider.
+#[derive(Clone)]
 pub struct ProviderRegistry {
     providers: HashMap<ProviderId, Arc<dyn LlmProvider>>,
     default_provider_id: ProviderId,
@@ -58,6 +59,14 @@ pub struct ProviderRegistry {
 
 fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
+
+    // Cloudflare's OpenAI-compat endpoint embeds the account ID in the URL
+    // path, so the stored key is the composite `ACCOUNT_ID:API_TOKEN` and
+    // must be parsed by its dedicated factory rather than injected as a
+    // plain Bearer token.
+    if provider_id == "cloudflare" {
+        return Some(Arc::new(p::cloudflare_with_key(&key)));
+    }
 
     if let Some(provider) = p::provider_for_id(provider_id) {
         return Some(Arc::new(provider.with_api_key(key)));
@@ -159,6 +168,11 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                         "cohere" => {
                             Arc::new(CohereProvider::new(key_owned)) as Arc<dyn LlmProvider>
                         }
+                        "cloudflare" => Arc::new(
+                            crate::providers::openai_compat_providers::cloudflare_with_key(
+                                &key_owned,
+                            ),
+                        ) as Arc<dyn LlmProvider>,
                         id => {
                             let p = crate::providers::openai_compat_providers::provider_for_id(id)
                                 .unwrap_or_else(|| {
@@ -196,6 +210,9 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         let provider: Option<Arc<dyn LlmProvider>> = match upstream.id {
             "google" => Some(Arc::new(GoogleProvider::new(key))),
             "cohere" => Some(Arc::new(CohereProvider::new(key))),
+            "cloudflare" => Some(Arc::new(
+                crate::providers::openai_compat_providers::cloudflare_with_key(&key),
+            ) as Arc<dyn LlmProvider>),
             id => crate::providers::openai_compat_providers::provider_for_id(id)
                 .map(|p| Arc::new(p.with_api_key(key)) as Arc<dyn LlmProvider>),
         };
@@ -221,6 +238,28 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         {
             entry.effective_model = Some(free_model);
         }
+    }
+
+    // When Ollama is in Auto mode, append it to the free-model fallback
+    // chain as a local last-resort provider. No API key needed — it uses
+    // the already-built Ollama provider from the registry. In Isolated
+    // mode Ollama stays out of the free chain entirely.
+    if config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto {
+        let ollama_provider = crate::providers::ollama();
+        chain.push(FreeEntry {
+            upstream: crate::providers::FreeUpstream {
+                id: "ollama",
+                title: "Ollama",
+                key_url: "ollama.com",
+                default_model: "llama3.2",
+                note: "local fallback — no key needed",
+                tool_calling: true,
+                max_tokens_cap: Some(4_096),
+                fallback_models: &[],
+            },
+            provider: Arc::new(ollama_provider),
+            effective_model: Some("llama3.2".to_string()),
+        });
     }
 
     if chain.is_empty() {
@@ -440,12 +479,32 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
 /// Type alias for the empty-cooldown summaries returned by [`ProviderRegistry::empty_cooldown_summaries`].
 pub type EmptyCooldownSummaries = Vec<(String, Vec<(String, u32, Option<u64>)>)>;
 
+/// Type alias for per-upstream key-health summaries returned by
+/// [`ProviderRegistry::upstream_key_health_summaries`].
+pub type UpstreamKeyHealthSummaries = Vec<(String, Vec<(String, usize, usize, Option<u64>)>)>;
+
+/// Type alias for per-upstream cooldown summaries returned by
+/// [`ProviderRegistry::upstream_cooldown_summaries`].
+pub type UpstreamCooldownSummaries = Vec<(String, Vec<(String, String, Option<u64>)>)>;
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
             default_provider_id: ProviderId::new(ProviderId::ANTHROPIC),
+        }
+    }
+
+    /// Rebuild the "free" composite provider from the current config and
+    /// register (or remove) it in-place.  This is safe to call at runtime
+    /// so that `/ollama` and similar toggles take effect immediately.
+    pub fn rebuild_free(&mut self, config: &clawde_core::config::Config) {
+        let free_id = ProviderId::new("free");
+        if let Some(new_free) = build_free_provider(config) {
+            self.providers.insert(free_id, new_free);
+        } else {
+            self.providers.remove(&free_id);
         }
     }
 
@@ -517,6 +576,39 @@ impl ProviderRegistry {
         let mut summaries = Vec::new();
         for (id, provider) in &self.providers {
             let entries = provider.upstream_empty_cooldowns();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream key-ring health from all registered composite
+    /// providers. Each entry is `(provider_name, Vec<(upstream_id,
+    /// active_keys, total_keys, retry_secs)>)` and only includes providers
+    /// that report at least one upstream with a key ring. Sorted by provider
+    /// name.
+    pub fn upstream_key_health_summaries(&self) -> UpstreamKeyHealthSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_key_health();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream cooldown state (empty-completion + 5xx /
+    /// circuit-breaker) from all registered composite providers. Each entry
+    /// is `(provider_name, Vec<(upstream_id, kind, retry_secs)>)` where
+    /// `kind` is `"empty"` or `"5xx"`. Sorted by provider name.
+    pub fn upstream_cooldown_summaries(&self) -> UpstreamCooldownSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_cooldowns();
             if !entries.is_empty() {
                 summaries.push((id.to_string(), entries));
             }
@@ -717,7 +809,7 @@ impl ProviderRegistry {
     /// Build a registry that checks **both** environment variables and the
     /// persistent [`AuthStore`] (`~/.claurst/auth.json`) for credentials.
     ///
-    /// This ensures that API keys stored via `/connect` or `claurst auth` are
+    /// This ensures that API keys stored via `/connect` or `clawde auth` are
     /// picked up at startup, not just env vars.  Falls back to
     /// `from_environment` for providers that only support env-var config, and
     /// adds any extra providers that have keys in the auth store.
@@ -961,11 +1053,13 @@ impl ProviderRegistry {
         {
             self.register(Arc::new(p::cline()));
         }
-        if std::env::var("GITHUB_TOKEN")
+        // Cloudflare Workers AI — token env var set (account ID either in
+        // CLOUDFLARE_ACCOUNT_ID or as the composite ACCOUNT_ID:API_TOKEN).
+        if std::env::var("CLOUDFLARE_API_TOKEN")
             .map(|v| !v.is_empty())
             .unwrap_or(false)
         {
-            self.register(Arc::new(p::github_models()));
+            self.register(Arc::new(p::cloudflare()));
         }
         self
     }

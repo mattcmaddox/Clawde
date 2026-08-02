@@ -69,6 +69,7 @@ pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
             | "venice"
             | "huggingface"
             | "nvidia"
+            | "cloudflare"
             | "siliconflow"
             | "sambanova"
             | "moonshot"

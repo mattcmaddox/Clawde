@@ -51,7 +51,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
         "cline" => Some(cline()),
-        "github-models" => Some(github_models()),
+        "cloudflare" => Some(cloudflare()),
         _ => None,
     }
 }
@@ -597,20 +597,71 @@ pub fn routing() -> OpenAiCompatProvider {
     })
 }
 
-/// GitHub Models — free tier models via GitHub's inference API.
-/// Uses the same `GITHUB_TOKEN` as the Copilot provider.
-/// Rate-limited free tier (10-15 RPM, 50-150 RPD) — good fallback.
-/// Requires a GitHub PAT with `models:read` permission.
-pub fn github_models() -> OpenAiCompatProvider {
-    let key = std::env::var("GITHUB_TOKEN").unwrap_or_default();
+/// Cloudflare Workers AI — free tier (10,000 neurons/day, no credit card).
+///
+/// The OpenAI-compatible endpoint embeds the Cloudflare account ID in the
+/// URL path (`/accounts/{ACCOUNT_ID}/ai/v1`), so a usable credential is the
+/// composite `ACCOUNT_ID:API_TOKEN` string. The account ID can alternatively
+/// be supplied via the `CLOUDFLARE_ACCOUNT_ID` env var, in which case
+/// `CLOUDFLARE_API_TOKEN` holds only the API token.
+///
+/// `cloudflare_with_key()` is the canonical constructor for the free-mode
+/// chain, where keys are stored as single strings in the auth store.
+pub fn cloudflare() -> OpenAiCompatProvider {
+    // Env-var path: two dedicated Cloudflare tooling vars.
+    let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap_or_default();
+    let token = std::env::var("CLOUDFLARE_API_TOKEN").unwrap_or_default();
+    if !account.trim().is_empty() && !token.trim().is_empty() {
+        return cloudflare_with_parts(&account, &token);
+    }
+    // Composite single-key path (auth store / free chain):
+    // `CLOUDFLARE_API_TOKEN` carries `ACCOUNT_ID:API_TOKEN`.
+    match cloudflare_parts(&token) {
+        Some((a, t)) => cloudflare_with_parts(a, t),
+        None => cloudflare_with_parts(&account, &token),
+    }
+}
+
+/// Build a Cloudflare provider from a composite `ACCOUNT_ID:API_TOKEN` key
+/// (the format the free-mode dialog and `/keys` store). Falls back to the
+/// `CLOUDFLARE_ACCOUNT_ID` env var when the key has no `:` separator.
+pub fn cloudflare_with_key(key: &str) -> OpenAiCompatProvider {
+    match cloudflare_parts(key) {
+        Some((a, t)) => cloudflare_with_parts(a, t),
+        None => {
+            let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap_or_default();
+            cloudflare_with_parts(&account, key)
+        }
+    }
+}
+
+/// Split a Cloudflare credential into `(account_id, api_token)`.
+/// `pub(crate)` so the free-mode chain (`free.rs`) can reuse the same
+/// parsing for key validation probes.
+pub(crate) fn cloudflare_parts(key: &str) -> Option<(&str, &str)> {
+    let (account, token) = key.trim().split_once(':')?;
+    if account.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((account, token))
+}
+
+/// Construct the Cloudflare OpenAI-compat provider from explicit parts.
+fn cloudflare_with_parts(account_id: &str, api_token: &str) -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(
-        ProviderId::GITHUB_MODELS,
-        "GitHub Models",
-        "https://models.github.ai/inference",
+        ProviderId::CLOUDFLARE,
+        "Cloudflare Workers AI",
+        format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1",
+            account_id.trim()
+        ),
     )
-    .with_api_key(key)
-    .with_header("Accept", "application/vnd.github+json")
-    .with_header("X-GitHub-Api-Version", "2026-03-10")
+    .with_api_key(api_token.to_string())
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        max_tokens_cap: Some(8_192),
+        ..Default::default()
+    })
 }
 
 /// Cline (cline.bot) — OpenAI-compatible proxy with frequently rotating

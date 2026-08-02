@@ -61,6 +61,11 @@ pub struct FreeUpstream {
     /// Hard cap on `max_tokens` for this upstream's default model.
     /// When set, requests are silently clamped to this value.
     pub max_tokens_cap: Option<u32>,
+    /// Secondary model IDs tried right after the primary on the SAME
+    /// upstream, before the chain moves to the next provider. Lets a slow or
+    /// capacity-starved primary (e.g. NVIDIA's 70B routinely exceeding the
+    /// 30s upstream timeout) fall back to a smaller model on the same key.
+    pub fallback_models: &'static [&'static str],
 }
 
 /// Ordered priority of providers we stack into Free mode. Order matters —
@@ -77,6 +82,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "free Inference API — Llama 3.3 70B",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "nvidia",
@@ -86,6 +92,11 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Llama 3.3 70B — 2 keys",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        // The free tier's 70B worker is routinely capacity-starved (503
+        // "ResourceExhausted" or 25-75s responses vs the 30s upstream
+        // timeout). Fall back to the always-warm 8B on the same key before
+        // giving up on NVIDIA entirely.
+        fallback_models: &["meta/llama-3.1-8b-instruct"],
     },
     FreeUpstream {
         id: "cerebras",
@@ -95,6 +106,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GPT-OSS 120B (65K ctx) · Gemma 4 31B",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     // Tier 2: Very good models (some currently rate-limited)
     FreeUpstream {
@@ -105,15 +117,30 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Gemini 2.5 Flash",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     FreeUpstream {
-        id: "github-models",
-        title: "GitHub Models",
-        key_url: "github.com/settings/tokens",
-        default_model: "gpt-4o-mini",
-        note: "GPT-4o-mini — 2 keys",
+        id: "cloudflare",
+        title: "Cloudflare Workers AI",
+        key_url: "dash.cloudflare.com",
+        default_model: CLOUDFLARE_PROBE_MODEL,
+        note: "10K neurons/day — key format ACCOUNT_ID:API_TOKEN",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
+    },
+    FreeUpstream {
+        id: "groq",
+        title: "Groq",
+        key_url: "console.groq.com/keys",
+        default_model: "openai/gpt-oss-120b",
+        note: "GPT-OSS 120B · Llama 3.3 70B — 1K req/day",
+        tool_calling: true,
+        // The groq() factory's own quirks clamp max_tokens to 512 and total
+        // to 8.5K (free-tier TPM budget); leave the catalog cap unset so the
+        // provider's authoritative tuning is the only clamp applied.
+        max_tokens_cap: None,
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "sambanova",
@@ -123,6 +150,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Llama 3.3 70B · DeepSeek V3",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     // Tier 3: Decent fallbacks
     FreeUpstream {
@@ -133,6 +161,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "live free-model API — auto-discovers best model at startup",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "mistral",
@@ -142,6 +171,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "Devstral Small (free) · Large · Codestral",
         tool_calling: true,
         max_tokens_cap: None,
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "cohere",
@@ -151,6 +181,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "North Mini Code (free) · Command R+",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "opencode-zen",
@@ -160,6 +191,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "MiniMax M2.5 — 2 keys",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     FreeUpstream {
         id: "zai",
@@ -169,6 +201,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GLM-4.7 · GLM-5 · GLM-5.1 — Zhipu AI international",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
+        fallback_models: &[],
     },
     // Tier 4: Paywalled — kept as last resort
     FreeUpstream {
@@ -179,6 +212,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "19 free-tier models — requires $10 prepaid credits",
         tool_calling: true,
         max_tokens_cap: None,
+        fallback_models: &[],
     },
 ];
 
@@ -190,25 +224,29 @@ pub fn catalog_entry(id: &str) -> Option<&'static FreeUpstream> {
 /// Static storage for the most recently built FreeProvider's model defaults.
 /// Populated by `build_free_provider` in registry.rs; read by the TUI for
 /// the /ctx-viz "Free models" table. Thread-safe via OnceLock.
-static RECENT_FREE_MODEL_DEFAULTS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
-fn recent_free_model_defaults() -> &'static Mutex<Vec<(String, String)>> {
+///
+/// Each entry is `(upstream_id, upstream_title, effective_model)` — the
+/// id lets the TUI join per-upstream key-health / cooldown data onto the
+/// display rows.
+static RECENT_FREE_MODEL_DEFAULTS: OnceLock<Mutex<Vec<(String, String, String)>>> = OnceLock::new();
+fn recent_free_model_defaults() -> &'static Mutex<Vec<(String, String, String)>> {
     RECENT_FREE_MODEL_DEFAULTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Set the free model defaults from a newly-built FreeProvider's chain.
 /// Called by `build_free_provider` in registry.rs after constructing the
 /// chain. The TUI reads these via [`take_free_model_defaults`].
-pub fn store_free_model_defaults(defaults: Vec<(String, String)>) {
+pub fn store_free_model_defaults(defaults: Vec<(String, String, String)>) {
     if let Ok(mut guard) = recent_free_model_defaults().lock() {
         *guard = defaults;
     }
 }
 
-/// Retrieve the stored free model defaults.
-/// Returns a clone so that multiple callers (startup wiring, /models
+/// Retrieve the stored free model defaults as `(upstream_id, title, model)`
+/// triples. Returns a clone so that multiple callers (startup wiring, /models
 /// command) all see the same data. Returns an empty vec if none have
 /// been stored yet.
-pub fn take_free_model_defaults() -> Vec<(String, String)> {
+pub fn take_free_model_defaults() -> Vec<(String, String, String)> {
     RECENT_FREE_MODEL_DEFAULTS
         .get()
         .and_then(|m| m.lock().ok())
@@ -271,15 +309,56 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         "nvidia" => FreeModelDiscovery::OpenAiModelList {
             base_url: "https://integrate.api.nvidia.com/v1",
         },
+        "groq" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api.groq.com/openai/v1",
+        },
         "google" => FreeModelDiscovery::GeminiModels,
+        // cloudflare: /ai/v1/models does not support GET (405) — the
+        // hardcoded default_model is authoritative.
+        "cloudflare" => FreeModelDiscovery::None,
         _ => FreeModelDiscovery::None,
     }
+}
+
+/// Per-upstream cache for live free-model discovery results. Populated on
+/// the first build and reused by runtime rebuilds so `refresh_free_provider`
+/// (triggered by /keys, /logout, /refresh, the free-mode dialog, and the
+/// /ollama toggle) never blocks the UI thread on repeated network fetches.
+/// Free-model lists are slow-moving within a session, mirroring the
+/// `AUTO_DETECTED_DEFAULTS` models.dev cache.
+static LIVE_DISCOVERY_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+fn live_discovery_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    LIVE_DISCOVERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Run live discovery for the first entry whose ID matches `upstream_id`.
 /// Returns the discovered model ID, or `None` if discovery is not configured
 /// or the fetch fails.
+///
+/// Results (including failures) are cached per upstream id after the first
+/// fetch, so runtime rebuilds of the free chain don't re-run blocking
+/// network calls on the UI thread.
 pub fn run_live_discovery(
+    upstream_id: &str,
+    auth_store: &clawde_core::AuthStore,
+) -> Option<String> {
+    // Fast path: previously discovered (or previously failed) result.
+    if let Some(cached) = live_discovery_cache()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(upstream_id).cloned())
+    {
+        return cached;
+    }
+    let result = run_live_discovery_uncached(upstream_id, auth_store);
+    if let Ok(mut guard) = live_discovery_cache().lock() {
+        guard.insert(upstream_id.to_string(), result.clone());
+    }
+    result
+}
+
+/// The uncached discovery fetch — see [`run_live_discovery`].
+fn run_live_discovery_uncached(
     upstream_id: &str,
     auth_store: &clawde_core::AuthStore,
 ) -> Option<String> {
@@ -841,6 +920,16 @@ fn is_upstream_server_error(err: &ProviderError) -> bool {
     }
 }
 
+/// Clamp `req.max_tokens` to the entry's configured cap, when one exists.
+/// Single source of truth for the per-upstream token cap — used by every
+/// dispatch site (non-streaming fallback, streaming fallback,
+/// `RetryingFreeStream` re-dispatch, and the first-byte watchdog probe).
+fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
+    if let Some(cap) = entry.upstream.max_tokens_cap {
+        req.max_tokens = req.max_tokens.min(cap);
+    }
+}
+
 /// Routing configuration for a [`FreeProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
@@ -1018,6 +1107,17 @@ impl CooldownState {
 
     fn empty_cooldown_remaining_secs(&self, idx: usize) -> Option<u64> {
         let until = self.empty_cooldown_until.get(idx).copied().flatten()?;
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        Some(until.duration_since(now).as_secs())
+    }
+
+    /// Seconds remaining in the 5xx / circuit-breaker cooldown at `idx`,
+    /// or `None` when not cooled (or the cooldown has already expired).
+    fn cooldown_remaining_secs(&self, idx: usize) -> Option<u64> {
+        let until = self.cooldown_until.get(idx).copied().flatten()?;
         let now = Instant::now();
         if now >= until {
             return None;
@@ -1247,10 +1347,36 @@ pub fn resolve_free_upstream_keys(
 }
 
 /// Query rate-limit information for a given upstream by making a lightweight
-/// HEAD request to the provider's models endpoint and parsing response headers.
+/// GET request to the provider's models endpoint and parsing response headers.
+///
+/// Uses GET (not HEAD): several upstreams (nvidia, huggingface, cline) reject
+/// HEAD with 405. For upstreams whose models endpoint doesn't check auth
+/// (nvidia, huggingface, openrouter, sambanova, cline), the key is confirmed
+/// with the same minimal `chat/completions` probe as [`validate_upstream_key`]
+/// so a dead key is reported as invalid instead of returning empty headers —
+/// and the rate-limit headers are read from the **chat response**, since those
+/// upstreams expose no rate-limit headers on the models endpoint.
 pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, String> {
     if key.trim().len() < 8 {
         return Err("Key too short (min 8 characters)".to_string());
+    }
+
+    // Cloudflare's /ai/v1/models endpoint does not support GET (405), and the
+    // account-scoped URL is derived from the composite ACCOUNT_ID:API_TOKEN
+    // key — probe the chat endpoint directly and read its headers.
+    if upstream_id == "cloudflare" {
+        let response = probe_cloudflare_chat(key)?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(format!("Invalid API token (HTTP {})", status));
+        }
+        if status == 404 {
+            return Err("Invalid Cloudflare account ID (HTTP 404)".to_string());
+        }
+        // Note: a 429 here is returned as healthy-with-headers, not an error —
+        // rate limits are a load signal, not a key-health signal (and the
+        // probe already proved the key is valid by reaching this point).
+        return Ok(parse_rate_limit_headers(response.headers()));
     }
 
     let base_url = match upstream_id {
@@ -1260,7 +1386,6 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
-        "github-models" => "https://models.inference.ai.azure.com/openai/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
         "mistral" => "https://api.mistral.ai/v1/models",
         "cohere" => "https://api.cohere.com/v1/models",
@@ -1280,47 +1405,229 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         client.get(base_url).query(&[("key", key)])
     } else {
         client
-            .head(base_url)
+            .get(base_url)
             .header("Authorization", format!("Bearer {}", key))
     };
 
     match request.send() {
         Ok(response) => {
             let status = response.status();
-            let headers = response.headers().clone();
-
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                return Err(format!("Invalid API key (HTTP {})", status));
+            if !status.is_success() {
+                // Reuse the probe classifier so google's 400 ("API key not
+                // valid") is reported as invalid, 429 as rate-limited, etc.
+                return match classify_probe_status(upstream_id, status.as_u16()) {
+                    Ok(()) => Err(format!("HTTP {} — unexpected response", status)),
+                    Err(e) => Err(e),
+                };
             }
 
-            let parse_u32 = |name: &str| -> Option<u32> {
-                headers
-                    .get(name)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok())
+            // Auth-lax upstreams: a models 2xx doesn't prove the key, and the
+            // models response carries no rate-limit headers — the
+            // chat/completions endpoint is where both auth and limits live.
+            // Confirm the key via the chat probe and parse rate-limit headers
+            // from THAT response.
+            let headers = if models_endpoint_validates_auth(upstream_id) {
+                response.headers().clone()
+            } else {
+                validate_key_via_chat(upstream_id, key, &client)?
+                    .headers()
+                    .clone()
             };
 
-            let parse_retry = || -> Option<u64> {
-                headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok())
-            };
+            Ok(parse_rate_limit_headers(&headers))
+        }
+        Err(e) => Err(format!("Connection failed: {}", e)),
+    }
+}
 
-            let info = RateLimitInfo {
-                rpm_limit: parse_u32("x-ratelimit-limit-requests"),
-                rpm_remaining: parse_u32("x-ratelimit-remaining-requests"),
-                rpd_limit: parse_u32("x-ratelimit-limit-requests-day"),
-                rpd_remaining: parse_u32("x-ratelimit-remaining-requests-day"),
-                tpm_limit: parse_u32("x-ratelimit-limit-tokens"),
-                tpm_remaining: parse_u32("x-ratelimit-remaining-tokens"),
-                retry_after: parse_retry(),
-                headers_found: headers
-                    .keys()
-                    .any(|k| k.as_str().to_lowercase().contains("ratelimit")),
-            };
+/// Parse rate-limit information from an HTTP response's headers.
+///
+/// Shared by the models-endpoint and chat-completions probe responses so
+/// `/limits` and the health poller surface the same header names.
+fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLimitInfo {
+    let parse_u32 = |name: &str| -> Option<u32> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+    };
 
-            Ok(info)
+    let parse_retry = || -> Option<u64> {
+        headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+    };
+
+    RateLimitInfo {
+        rpm_limit: parse_u32("x-ratelimit-limit-requests"),
+        rpm_remaining: parse_u32("x-ratelimit-remaining-requests"),
+        rpd_limit: parse_u32("x-ratelimit-limit-requests-day"),
+        rpd_remaining: parse_u32("x-ratelimit-remaining-requests-day"),
+        tpm_limit: parse_u32("x-ratelimit-limit-tokens"),
+        tpm_remaining: parse_u32("x-ratelimit-remaining-tokens"),
+        retry_after: parse_retry(),
+        headers_found: headers
+            .keys()
+            .any(|k| k.as_str().to_lowercase().contains("ratelimit")),
+    }
+}
+
+/// Upstreams whose `/v1/models` endpoint does **not** check the API key — it
+/// returns 200 even for a garbage key (verified by live probing). For these, a
+/// 2xx models response only proves reachability, so the key must be confirmed
+/// with a minimal `chat/completions` probe, where auth is enforced.
+///
+/// opencode-zen is deliberately absent: its chat endpoint also ignores the
+/// key, so the models 2xx is the best signal it offers.
+///
+/// cloudflare is auth-lax in a different sense: its models endpoint does not
+/// support GET at all (405), so every probe goes through the chat endpoint
+/// (see [`probe_cloudflare_chat`]).
+fn models_endpoint_validates_auth(upstream_id: &str) -> bool {
+    !matches!(
+        upstream_id,
+        "nvidia" | "huggingface" | "openrouter" | "sambanova" | "cline" | "cloudflare"
+    )
+}
+
+/// Classify a models-endpoint HTTP status into a probe verdict.
+///
+/// Returns `Ok(())` for success, or a human-readable error otherwise.
+/// Google reports bad keys as HTTP 400 ("API key not valid") rather than
+/// 401/403, so that is mapped to the invalid-key error too.
+fn classify_probe_status(upstream_id: &str, status: u16) -> Result<(), String> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if status == 401 || status == 403 || (upstream_id == "google" && status == 400) {
+        return Err(format!("Invalid API key (HTTP {})", status));
+    }
+    if status == 429 {
+        return Err("Rate limited — try again later".to_string());
+    }
+    Err(format!("HTTP {} — unexpected response", status))
+}
+
+/// Confirm a key with a minimal 1-token `chat/completions` request.
+///
+/// Used only for upstreams whose models endpoint doesn't check auth. Providers
+/// validate the key *before* model validation, so 401/403 unambiguously means
+/// an invalid key; any other response (200, or a model-not-found 4xx, 429)
+/// means the key was accepted.
+///
+/// Returns the chat response on success so callers (e.g. [`query_rate_limits`])
+/// can read rate-limit headers from the endpoint that actually enforces them.
+/// Default model used for Cloudflare chat probes (must match the catalog's
+/// `default_model` so validation exercises the same endpoint the chain uses).
+const CLOUDFLARE_PROBE_MODEL: &str = "@cf/qwen/qwen3-30b-a3b-fp8";
+
+/// Send a 1-token `chat/completions` probe to Cloudflare's account-scoped
+/// OpenAI-compatible endpoint.
+///
+/// The key is the composite `ACCOUNT_ID:API_TOKEN`; the account ID is used to
+/// build the URL path and only the token is sent as the Bearer credential.
+/// Returns the raw response so both [`validate_upstream_key`] and
+/// [`query_rate_limits`] can classify it and read headers.
+fn probe_cloudflare_chat(key: &str) -> Result<reqwest::blocking::Response, String> {
+    let (account_id, api_token) = split_cloudflare_key(key)?;
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1/chat/completions",
+        account_id
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    let body = serde_json::json!({
+        "model": CLOUDFLARE_PROBE_MODEL,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&body)
+        .send()
+    {
+        Ok(response) => Ok(response),
+        Err(e) => Err(format!("Connection failed: {}", e)),
+    }
+}
+
+/// Split a Cloudflare credential into `(account_id, api_token)`.
+/// Reuses the same parsing as the provider factory in
+/// `openai_compat_providers.rs` so both paths agree on the composite format.
+fn split_cloudflare_key(key: &str) -> Result<(&str, &str), String> {
+    crate::providers::openai_compat_providers::cloudflare_parts(key).ok_or_else(|| {
+        "Cloudflare key must be ACCOUNT_ID:API_TOKEN (account ID, colon, API token)".to_string()
+    })
+}
+
+/// Pick `(base_url, probe_model)` for the 1-token chat probe used to
+/// confirm auth-lax upstream keys.
+///
+/// Prefers the upstream's first catalog fallback model when one exists —
+/// fallbacks are the always-warm small models (e.g. nvidia's 8B). The free
+/// tier's 70B workers are frequently capacity-starved ("ResourceExhausted"
+/// 503s or 30s+ responses well past the 5s probe timeout), which marks
+/// VALID keys unhealthy. Probing the fallback answers in <1s and proves the
+/// key just as well. Upstreams without a fallback probe their default model.
+fn chat_probe_for(upstream_id: &str) -> Option<(&'static str, &'static str)> {
+    let (base_url, default_model) = match upstream_id {
+        "nvidia" => (
+            "https://integrate.api.nvidia.com/v1",
+            "meta/llama-3.3-70b-instruct",
+        ),
+        "huggingface" => (
+            "https://router.huggingface.co/v1",
+            "meta-llama/Llama-3.3-70B-Instruct",
+        ),
+        "openrouter" => ("https://openrouter.ai/api/v1", "openrouter/free"),
+        "sambanova" => ("https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct"),
+        "cline" => ("https://api.cline.bot/v1", "stepfun/step-3.7-flash"),
+        // Only the 5 auth-lax upstreams reach this probe — every caller gates
+        // on `!models_endpoint_validates_auth`. opencode-zen is handled by its
+        // models 2xx, so this arm is defensive only.
+        _ => return None,
+    };
+    let model = catalog_entry(upstream_id)
+        .and_then(|u| u.fallback_models.first())
+        .copied()
+        .unwrap_or(default_model);
+    Some((base_url, model))
+}
+
+fn validate_key_via_chat(
+    upstream_id: &str,
+    key: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<reqwest::blocking::Response, String> {
+    let (base_url, model) = match chat_probe_for(upstream_id) {
+        Some(v) => v,
+        None => return Err(format!("No chat probe for '{}'", upstream_id)),
+    };
+
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    });
+
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", key))
+        .json(&body)
+        .send()
+    {
+        Ok(response) => {
+            let status = response.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                Err(format!("Invalid API key (HTTP {})", status))
+            } else {
+                Ok(response)
+            }
         }
         Err(e) => Err(format!("Connection failed: {}", e)),
     }
@@ -1328,9 +1635,31 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
 
 /// Validate an API key for a given upstream by making a lightweight request
 /// to the provider's models endpoint. Returns `Ok(())` if the key is valid.
+///
+/// For upstreams whose models endpoint doesn't check auth (nvidia,
+/// huggingface, openrouter, sambanova, cline — it returns 200 even for a
+/// garbage key), a 2xx response is confirmed with a minimal 1-token
+/// `chat/completions` probe so dead keys are actually caught.
 pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String> {
     if key.trim().len() < 8 {
         return Err("Key too short (min 8 characters)".to_string());
+    }
+
+    // Cloudflare's models endpoint does not support GET, so auth is proven
+    // with the chat probe directly (account-scoped URL from the composite key).
+    if upstream_id == "cloudflare" {
+        let response = probe_cloudflare_chat(key)?;
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(format!("Invalid API token (HTTP {})", status));
+        }
+        if status == 404 {
+            return Err("Invalid Cloudflare account ID (HTTP 404)".to_string());
+        }
+        if status == 429 {
+            return Err("Rate limited — try again later".to_string());
+        }
+        return Ok(());
     }
 
     let base_url = match upstream_id {
@@ -1340,7 +1669,6 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
         "groq" => "https://api.groq.com/openai/v1/models",
         "openrouter" => "https://openrouter.ai/api/v1/models",
-        "github-models" => "https://models.inference.ai.azure.com/openai/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
         "mistral" => "https://api.mistral.ai/v1/models",
         "cohere" => "https://api.cohere.com/v1/models",
@@ -1371,14 +1699,13 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
-                Ok(())
-            } else if status.as_u16() == 401 || status.as_u16() == 403 {
-                Err(format!("Invalid API key (HTTP {})", status))
-            } else if status.as_u16() == 429 {
-                Err("Rate limited — try again later".to_string())
-            } else {
-                Err(format!("HTTP {} — unexpected response", status))
+                if models_endpoint_validates_auth(upstream_id) {
+                    return Ok(());
+                }
+                // Auth-lax models endpoint: confirm the key via chat/completions.
+                return validate_key_via_chat(upstream_id, key, &client).map(|_| ());
             }
+            classify_probe_status(upstream_id, status.as_u16())
         }
         Err(e) => Err(format!("Connection failed: {}", e)),
     }
@@ -1668,6 +1995,20 @@ impl FreeProvider {
         }
     }
 
+    /// One chain entry's contribution to the dispatch plan: the effective
+    /// (primary) model first, then any per-upstream fallback models. This
+    /// lets a slow or failing primary (e.g. NVIDIA's capacity-starved 70B
+    /// exceeding the upstream timeout) fall back to a smaller model on the
+    /// SAME provider before the chain moves to the next upstream.
+    fn plan_rows_for_entry(&self, idx: usize) -> Vec<(usize, String)> {
+        let mut rows = Vec::with_capacity(1 + self.chain[idx].upstream.fallback_models.len());
+        rows.push((idx, self.model_for_entry(idx).to_string()));
+        for fb in self.chain[idx].upstream.fallback_models {
+            rows.push((idx, fb.to_string()));
+        }
+        rows
+    }
+
     /// Original sequential plan: upstreams in catalog (or pinned) order.
     fn attempt_plan_sequential(&self, route: &Route) -> Vec<(usize, String)> {
         match route {
@@ -1675,19 +2016,28 @@ impl FreeProvider {
                 .chain
                 .iter()
                 .enumerate()
-                .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                .flat_map(|(idx, _entry)| self.plan_rows_for_entry(idx))
                 .collect(),
             Route::Pinned {
                 start_idx,
                 pinned_model,
             } => {
                 let mut plan = Vec::with_capacity(self.chain_len());
+                // Pinned model first, then the pinned upstream's fallbacks,
+                // then the rest of the chain (with their own fallbacks).
                 plan.push((*start_idx, pinned_model.clone()));
+                plan.extend(
+                    self.chain[*start_idx]
+                        .upstream
+                        .fallback_models
+                        .iter()
+                        .map(|m| (*start_idx, m.to_string())),
+                );
                 for (idx, _entry) in self.chain.iter().enumerate() {
                     if idx == *start_idx {
                         continue;
                     }
-                    plan.push((idx, self.model_for_entry(idx).to_string()));
+                    plan.extend(self.plan_rows_for_entry(idx));
                 }
                 plan
             }
@@ -1701,31 +2051,42 @@ impl FreeProvider {
         let mut rng = rand::thread_rng();
         match route {
             Route::Auto => {
-                let mut plan: Vec<(usize, String)> = self
+                // Shuffle per-upstream GROUPS so each upstream's fallback
+                // models stay adjacent to their primary.
+                let mut groups: Vec<Vec<(usize, String)>> = self
                     .chain
                     .iter()
                     .enumerate()
-                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .map(|(idx, _entry)| self.plan_rows_for_entry(idx))
                     .collect();
-                plan.shuffle(&mut rng);
-                plan
+                groups.shuffle(&mut rng);
+                groups.into_iter().flatten().collect()
             }
             Route::Pinned {
                 start_idx,
                 pinned_model,
             } => {
-                let mut rest: Vec<(usize, String)> = self
+                let mut rest: Vec<Vec<(usize, String)>> = self
                     .chain
                     .iter()
                     .enumerate()
                     .filter(|(idx, _)| *idx != *start_idx)
-                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .map(|(idx, _entry)| self.plan_rows_for_entry(idx))
                     .collect();
                 rest.shuffle(&mut rng);
 
                 let mut plan = Vec::with_capacity(self.chain_len());
                 plan.push((*start_idx, pinned_model.clone()));
-                plan.extend(rest);
+                plan.extend(
+                    self.chain[*start_idx]
+                        .upstream
+                        .fallback_models
+                        .iter()
+                        .map(|m| (*start_idx, m.to_string())),
+                );
+                for group in rest {
+                    plan.extend(group);
+                }
                 plan
             }
         }
@@ -1738,11 +2099,13 @@ impl FreeProvider {
         let latencies = self.latencies.lock().unwrap();
         match route {
             Route::Auto => {
+                // sort_by is stable, so each upstream's fallback rows (same
+                // idx, equal latency) stay adjacent to their primary.
                 let mut plan: Vec<(usize, String)> = self
                     .chain
                     .iter()
                     .enumerate()
-                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .flat_map(|(idx, _entry)| self.plan_rows_for_entry(idx))
                     .collect();
                 plan.sort_by(|a, b| {
                     latencies
@@ -1761,7 +2124,7 @@ impl FreeProvider {
                     .iter()
                     .enumerate()
                     .filter(|(idx, _)| *idx != *start_idx)
-                    .map(|(idx, _entry)| (idx, self.model_for_entry(idx).to_string()))
+                    .flat_map(|(idx, _entry)| self.plan_rows_for_entry(idx))
                     .collect();
                 rest.sort_by(|a, b| {
                     latencies
@@ -1772,6 +2135,13 @@ impl FreeProvider {
 
                 let mut plan = Vec::with_capacity(self.chain_len());
                 plan.push((*start_idx, pinned_model.clone()));
+                plan.extend(
+                    self.chain[*start_idx]
+                        .upstream
+                        .fallback_models
+                        .iter()
+                        .map(|m| (*start_idx, m.to_string())),
+                );
                 plan.extend(rest);
                 plan
             }
@@ -1793,13 +2163,14 @@ impl FreeProvider {
         &self.routing
     }
 
-    /// Check if an upstream is in cooldown (circuit breaker).
+    /// Check if an upstream is in any cooldown (circuit breaker, 5xx, or
+    /// empty-completion).  Always consults the cooldown state regardless of
+    /// whether the circuit breaker is enabled, so that 5xx and empty-completion
+    /// cooldowns are effective even without a configured circuit breaker.
     fn is_in_cooldown(&self, idx: usize) -> bool {
-        if !self.circuit_breaker_enabled() {
-            return false;
-        }
-        let cd = self.cooldown.lock().unwrap();
-        cd.is_in_cooldown(idx)
+        let mut cd = self.cooldown.lock().unwrap();
+        cd.prune_expired();
+        cd.is_in_cooldown(idx) || cd.is_in_empty_cooldown(idx)
     }
 
     /// Record a successful request at `idx` with the given `elapsed` duration.
@@ -1837,20 +2208,30 @@ impl FreeProvider {
     /// Return the effective model for each upstream in the chain.
     ///
     /// Returns a vector of `(upstream_title, effective_model_id)` pairs,
-    /// one per entry in the fallback chain. Used by the TUI to display
-    /// which free models were auto-detected at startup or via live
-    /// discovery (Cline, OpenRouter, etc.).
-    pub fn free_model_defaults(&self) -> Vec<(String, String)> {
+    /// one per entry in the fallback chain. Each entry is
+    /// `(upstream_id, upstream_title, effective_model)` — the id lets the
+    /// TUI join per-upstream key-health / cooldown data onto the display.
+    /// Used by the TUI to show which free models were auto-detected at
+    /// startup or via live discovery (Cline, OpenRouter, etc.).
+    pub fn free_model_defaults(&self) -> Vec<(String, String, String)> {
         self.chain
             .iter()
             .enumerate()
             .map(|(idx, entry)| {
                 (
+                    entry.upstream.id.to_string(),
                     entry.upstream.title.to_string(),
                     self.model_for_entry(idx).to_string(),
                 )
             })
             .collect()
+    }
+
+    /// Clamp the request's `max_tokens` to the upstream's cap when one is
+    /// configured.  Called before dispatching to avoid sending downstream
+    /// requests that the upstream will reject or silently truncate.
+    fn clamp_max_tokens(&self, req: &mut ProviderRequest, idx: usize) {
+        clamp_max_tokens_for(req, &self.chain[idx]);
     }
 
     /// Apply an immediate cooldown to the upstream at `idx` if the error is
@@ -1871,24 +2252,6 @@ impl FreeProvider {
             idx,
             secs,
         );
-    }
-
-    /// Return per-upstream empty-cooldown summaries for the /keys health
-    /// command and TUI status display (spec §6.3).
-    pub fn upstream_empty_cooldowns(&self) -> Vec<(String, u32, Option<u64>)> {
-        let cd = self.cooldown.lock().unwrap();
-        self.chain
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| {
-                (
-                    entry.upstream.id.to_string(),
-                    cd.consecutive_empties(idx),
-                    cd.empty_cooldown_remaining_secs(idx),
-                )
-            })
-            .filter(|(_, count, remaining)| *count > 0 || remaining.is_some())
-            .collect()
     }
 }
 
@@ -2034,7 +2397,8 @@ impl RetryingFreeStream {
     /// exhausted.
     fn start_next_plan_entry(&mut self) -> bool {
         while let Some((idx, model)) = self.remaining_plan.pop_front() {
-            let cd = self.cooldown.lock().unwrap();
+            let mut cd = self.cooldown.lock().unwrap();
+            cd.prune_expired();
             let in_cooldown = cd.is_in_cooldown(idx) || cd.is_in_empty_cooldown(idx);
             if in_cooldown {
                 let uid = self.chain[idx].upstream.id;
@@ -2047,6 +2411,7 @@ impl RetryingFreeStream {
             let entry = &self.chain[idx];
             let mut req = self.request.clone();
             req.model = model.clone();
+            clamp_max_tokens_for(&mut req, entry);
             let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
             let provider = entry.provider.clone();
 
@@ -2152,7 +2517,8 @@ impl Stream for RetryingFreeStream {
                     if start.elapsed().as_secs() >= self.routing.first_byte_timeout_secs {
                         // Find the next plan entry not in cooldown.
                         while let Some((idx, model)) = self.remaining_plan.pop_front() {
-                            let cd = self.cooldown.lock().unwrap();
+                            let mut cd = self.cooldown.lock().unwrap();
+                            cd.prune_expired();
                             let in_cooldown =
                                 cd.is_in_cooldown(idx) || cd.is_in_empty_cooldown(idx);
                             if in_cooldown {
@@ -2167,6 +2533,7 @@ impl Stream for RetryingFreeStream {
                             let entry = &self.chain[idx];
                             let mut req = self.request.clone();
                             req.model = model.clone();
+                            clamp_max_tokens_for(&mut req, entry);
                             let timeout =
                                 std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
                             let provider = entry.provider.clone();
@@ -2362,6 +2729,7 @@ impl LlmProvider for FreeProvider {
             let entry = &self.chain[idx];
             let mut req = request.clone();
             req.model = upstream_model;
+            self.clamp_max_tokens(&mut req, idx);
 
             let start = Instant::now();
             let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
@@ -2449,6 +2817,7 @@ impl LlmProvider for FreeProvider {
             let entry = &self.chain[idx];
             let mut req = request.clone();
             req.model = upstream_model.clone();
+            self.clamp_max_tokens(&mut req, idx);
 
             let _start = Instant::now();
             let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
@@ -2599,6 +2968,92 @@ impl LlmProvider for FreeProvider {
         }
     }
 
+    fn mark_key_exhausted(
+        &self,
+        upstream_id: Option<&str>,
+        key_idx: usize,
+        cooldown_secs: u64,
+        reason: Option<String>,
+    ) -> bool {
+        // Forward to the matching chain entry's key ring. The health poller
+        // (spec §6.4) injects definitively-dead keys through this path so the
+        // TUI's key-health indicators and rotation order learn about them
+        // without waiting for the next real request.
+        let Some(upstream_id) = upstream_id else {
+            return false;
+        };
+        for entry in &self.chain {
+            if entry.upstream.id == upstream_id {
+                return entry.provider.mark_key_exhausted(
+                    Some(upstream_id),
+                    key_idx,
+                    cooldown_secs,
+                    reason,
+                );
+            }
+        }
+        false
+    }
+
+    /// Return per-upstream empty-cooldown summaries for the /keys health
+    /// command and TUI status display (spec §6.3).
+    ///
+    /// Implemented as a trait override (not just an inherent method) so the
+    /// registry's [`ProviderRegistry::empty_cooldown_summaries`] — which
+    /// queries through `Arc<dyn LlmProvider>` — actually sees the data.
+    fn upstream_empty_cooldowns(&self) -> Vec<(String, u32, Option<u64>)> {
+        let cd = self.cooldown.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                (
+                    entry.upstream.id.to_string(),
+                    cd.consecutive_empties(idx),
+                    cd.empty_cooldown_remaining_secs(idx),
+                )
+            })
+            .filter(|(_, count, remaining)| *count > 0 || remaining.is_some())
+            .collect()
+    }
+
+    fn upstream_key_health(&self) -> Vec<(String, usize, usize, Option<u64>)> {
+        // Per-upstream view of key-ring health: only upstreams wrapped in a
+        // KeyRotatingProvider (2+ keys) report a ring, matching the
+        // aggregated key_ring_status() above.
+        self.chain
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .provider
+                    .key_ring_status()
+                    .map(|(active, total, retry)| {
+                        (entry.upstream.id.to_string(), active, total, retry)
+                    })
+            })
+            .collect()
+    }
+
+    fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
+        // Both cooldown kinds: "5xx" (server-error / circuit-breaker) and
+        // "empty" (empty-completion). Locked once, never across an await.
+        let cd = self.cooldown.lock().unwrap();
+        let mut out = Vec::new();
+        for (idx, entry) in self.chain.iter().enumerate() {
+            if let Some(secs) = cd.cooldown_remaining_secs(idx) {
+                out.push((entry.upstream.id.to_string(), "5xx".to_string(), Some(secs)));
+            }
+            if let Some(secs) = cd.empty_cooldown_remaining_secs(idx) {
+                out.push((
+                    entry.upstream.id.to_string(),
+                    "empty".to_string(),
+                    Some(secs),
+                ));
+            }
+        }
+        out
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         // tool_calling is true when any chain entry's upstream supports it.
         let tool_calling = self.chain.iter().any(|entry| entry.upstream.tool_calling);
@@ -2648,9 +3103,147 @@ mod tests {
 
     use crate::provider_types::StopReason;
 
+    /// Test harness: records `(upstream_id, key_idx, cooldown_secs)` calls to
+    /// `mark_key_exhausted` so tests can assert exhaustion forwarding.
+    /// Named to keep clippy::type_complexity off the StubProvider fields.
+    type ExhaustionRecorder = Arc<Mutex<Vec<(Option<String>, usize, u64)>>>;
+
+    // ---- Rate-limit header parsing -------------------------------------------
+
+    #[test]
+    fn parse_rate_limit_headers_reads_standard_names() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-limit-requests", HeaderValue::from_static("30"));
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("12"),
+        );
+        headers.insert(
+            "x-ratelimit-limit-requests-day",
+            HeaderValue::from_static("1000"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests-day",
+            HeaderValue::from_static("999"),
+        );
+        headers.insert(
+            "x-ratelimit-limit-tokens",
+            HeaderValue::from_static("200000"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("123456"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+
+        let info = parse_rate_limit_headers(&headers);
+        assert_eq!(info.rpm_limit, Some(30));
+        assert_eq!(info.rpm_remaining, Some(12));
+        assert_eq!(info.rpd_limit, Some(1000));
+        assert_eq!(info.rpd_remaining, Some(999));
+        assert_eq!(info.tpm_limit, Some(200000));
+        assert_eq!(info.tpm_remaining, Some(123456));
+        assert_eq!(info.retry_after, Some(7));
+        assert!(info.headers_found);
+    }
+
+    #[test]
+    fn parse_rate_limit_headers_without_headers_reports_none() {
+        use reqwest::header::HeaderMap;
+
+        let info = parse_rate_limit_headers(&HeaderMap::new());
+        assert_eq!(info.rpm_limit, None);
+        assert_eq!(info.retry_after, None);
+        assert!(!info.headers_found);
+    }
+
+    // ---- Key-probe classification -------------------------------------------
+
+    #[test]
+    fn auth_lax_upstreams_need_chat_confirmation() {
+        // These upstreams' /v1/models endpoint returns 200 even for a garbage
+        // key (verified by live probing), so a 2xx alone must not conclude
+        // "healthy" — the chat probe is required. cloudflare is auth-lax in a
+        // different sense: its models endpoint doesn't support GET at all.
+        for id in [
+            "nvidia",
+            "huggingface",
+            "openrouter",
+            "sambanova",
+            "cline",
+            "cloudflare",
+        ] {
+            assert!(
+                !models_endpoint_validates_auth(id),
+                "{} should be auth-lax",
+                id
+            );
+        }
+        // Everything else validates the key on the models endpoint.
+        for id in ["groq", "cerebras", "google", "mistral", "cohere", "zai"] {
+            assert!(
+                models_endpoint_validates_auth(id),
+                "{} should validate auth",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn chat_probe_prefers_fallback_model_for_capacity_starved_upstreams() {
+        // nvidia has a catalog fallback (8B) — the probe must use it instead
+        // of the capacity-starved 70B default, so valid keys aren't marked
+        // unhealthy by a 30s+ 503.
+        let (base, model) = chat_probe_for("nvidia").expect("nvidia probe");
+        assert_eq!(model, "meta/llama-3.1-8b-instruct");
+        assert!(base.contains("nvidia.com"));
+        // Upstreams without fallbacks probe their default model.
+        let (_, hf_model) = chat_probe_for("huggingface").expect("hf probe");
+        assert_eq!(hf_model, "meta-llama/Llama-3.3-70B-Instruct");
+        let (_, sb_model) = chat_probe_for("sambanova").expect("sambanova probe");
+        assert_eq!(sb_model, "Meta-Llama-3.3-70B-Instruct");
+        // Unsupported upstreams have no chat probe.
+        assert!(chat_probe_for("groq").is_none());
+    }
+
+    #[test]
+    fn probe_status_classification() {
+        // Success on an auth-checking upstream is a clean pass.
+        assert_eq!(classify_probe_status("groq", 200), Ok(()));
+        assert_eq!(classify_probe_status("google", 200), Ok(()));
+        // 401/403 are invalid keys everywhere.
+        assert!(classify_probe_status("groq", 401).is_err());
+        assert!(classify_probe_status("nvidia", 403).is_err());
+        // Google reports bad keys as 400 ("API key not valid") — mapped to
+        // the invalid-key error, not "unexpected response".
+        let err = classify_probe_status("google", 400).unwrap_err();
+        assert!(err.contains("Invalid API key"), "got: {}", err);
+        // A 400 on a non-Google upstream stays "unexpected response".
+        let err = classify_probe_status("groq", 400).unwrap_err();
+        assert!(err.contains("unexpected response"), "got: {}", err);
+        // 429 is rate-limited.
+        let err = classify_probe_status("groq", 429).unwrap_err();
+        assert!(err.contains("Rate limited"), "got: {}", err);
+        // 5xx is unexpected.
+        let err = classify_probe_status("nvidia", 500).unwrap_err();
+        assert!(err.contains("unexpected response"), "got: {}", err);
+    }
+
     struct StubProvider {
         id: ProviderId,
         ok: bool,
+        /// When set, records the `max_tokens` value seen by `create_message`
+        /// so tests can assert dispatch-time clamping.
+        seen_max_tokens: Option<Arc<Mutex<Option<u32>>>>,
+        /// When set, reports a key-ring status via `key_ring_status()` so
+        /// tests can exercise `upstream_key_health()`.
+        ring_status: Option<(usize, usize, Option<u64>)>,
+        /// When set, records `mark_key_exhausted` calls as
+        /// `(upstream_id, key_idx, cooldown_secs)` so tests can assert
+        /// exhaustion forwarding from the composite provider.
+        exhaustion: Option<ExhaustionRecorder>,
     }
 
     #[async_trait]
@@ -2667,6 +3260,11 @@ mod tests {
             &self,
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
+            if let Some(rec) = &self.seen_max_tokens {
+                if let Ok(mut g) = rec.lock() {
+                    *g = Some(request.max_tokens);
+                }
+            }
             if self.ok {
                 Ok(ProviderResponse {
                     id: "msg".to_string(),
@@ -2706,6 +3304,25 @@ mod tests {
             Ok(ProviderStatus::Healthy)
         }
 
+        fn key_ring_status(&self) -> Option<(usize, usize, Option<u64>)> {
+            self.ring_status
+        }
+
+        fn mark_key_exhausted(
+            &self,
+            upstream_id: Option<&str>,
+            key_idx: usize,
+            cooldown_secs: u64,
+            _reason: Option<String>,
+        ) -> bool {
+            if let Some(rec) = &self.exhaustion {
+                if let Ok(mut g) = rec.lock() {
+                    g.push((upstream_id.map(|s| s.to_string()), key_idx, cooldown_secs));
+                }
+            }
+            true
+        }
+
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 streaming: true,
@@ -2729,6 +3346,58 @@ mod tests {
             provider: Arc::new(StubProvider {
                 id: ProviderId::new(id),
                 ok,
+                seen_max_tokens: None,
+                ring_status: None,
+                exhaustion: None,
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn entry_with_recorder(
+        id: &'static str,
+        ok: bool,
+        recorder: Arc<Mutex<Option<u32>>>,
+    ) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok,
+                seen_max_tokens: Some(recorder),
+                ring_status: None,
+                exhaustion: None,
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn entry_with_exhaustion_recorder(id: &'static str, recorder: ExhaustionRecorder) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok: true,
+                seen_max_tokens: None,
+                ring_status: None,
+                exhaustion: Some(recorder),
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn entry_with_ring(id: &'static str, ring: (usize, usize, Option<u64>)) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok: true,
+                seen_max_tokens: None,
+                ring_status: Some(ring),
+                exhaustion: None,
             }),
             effective_model: None,
         }
@@ -2773,6 +3442,46 @@ mod tests {
             }
             other => panic!("expected pinned, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn nvidia_plan_includes_8b_fallback_after_70b() {
+        let provider = FreeProvider::new(vec![
+            entry("nvidia", true),
+            entry("cerebras", true),
+            entry("groq", true),
+        ]);
+        // Sequential Auto plan: nvidia's 70B primary, then its 8B fallback on
+        // the SAME index, then the other upstreams.
+        let plan = provider.attempt_plan(&Route::Auto);
+        assert_eq!(plan[0], (0, "meta/llama-3.3-70b-instruct".to_string()));
+        assert_eq!(plan[1], (0, "meta/llama-3.1-8b-instruct".to_string()));
+        assert_eq!(plan[2], (1, "gpt-oss-120b".to_string()));
+        assert_eq!(plan[3], (2, "openai/gpt-oss-120b".to_string()));
+        // Upstreams without fallbacks still contribute exactly one row.
+        assert_eq!(plan.len(), 4);
+    }
+
+    #[test]
+    fn pinned_route_tries_pinned_model_then_upstream_fallbacks() {
+        let provider = FreeProvider::new(vec![
+            entry("huggingface", true),
+            entry("nvidia", true),
+            entry("cerebras", true),
+        ]);
+        // Pinning nvidia: the pinned model, then nvidia's 8B fallback, then
+        // the rest of the chain in catalog order.
+        let plan = provider.attempt_plan(&Route::Pinned {
+            start_idx: 1,
+            pinned_model: "meta/llama-3.3-70b-instruct".to_string(),
+        });
+        assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
+        assert_eq!(plan[1], (1, "meta/llama-3.1-8b-instruct".to_string()));
+        assert_eq!(
+            plan[2],
+            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
+        );
+        assert_eq!(plan[3], (2, "gpt-oss-120b".to_string()));
     }
 
     #[test]
@@ -3008,6 +3717,207 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // max_tokens_cap clamping tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_message_clamps_max_tokens_to_upstream_cap() {
+        // huggingface catalog entry has max_tokens_cap = 8_192.
+        let recorder = Arc::new(Mutex::new(None));
+        let provider = FreeProvider::new(vec![entry_with_recorder(
+            "huggingface",
+            true,
+            recorder.clone(),
+        )]);
+        let mut req = dummy_request("free/auto");
+        req.max_tokens = 16_384;
+        provider.create_message(req).await.expect("should succeed");
+        let seen = *recorder.lock().unwrap();
+        assert_eq!(
+            seen,
+            Some(8_192),
+            "max_tokens must be clamped to upstream cap"
+        );
+    }
+
+    #[test]
+    fn clamp_max_tokens_for_noop_when_no_cap() {
+        // mistral catalog entry has max_tokens_cap = None.
+        let entry = entry("mistral", true);
+        let mut req = dummy_request("mistral/x");
+        req.max_tokens = 16_384;
+        clamp_max_tokens_for(&mut req, &entry);
+        assert_eq!(req.max_tokens, 16_384, "no cap means no clamping");
+    }
+
+    #[test]
+    fn clamp_max_tokens_for_never_raises_max_tokens() {
+        let entry = entry("huggingface", true); // cap = 8_192
+        let mut req = dummy_request("huggingface/x");
+        req.max_tokens = 4_096;
+        clamp_max_tokens_for(&mut req, &entry);
+        assert_eq!(
+            req.max_tokens, 4_096,
+            "smaller request must pass through unchanged"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // 5xx cooldown visibility tests (no circuit breaker configured)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn five_xx_cooldown_is_visible_without_circuit_breaker() {
+        // Circuit breaker is disabled by default; the 5xx cooldown must
+        // still be visible to is_in_cooldown (regression for the old gate
+        // that made 5xx cooldowns dead on the non-streaming path).
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let err = ProviderError::ServerError {
+            provider: ProviderId::new("huggingface"),
+            status: Some(503),
+            message: "boom".into(),
+            is_retryable: true,
+        };
+        provider.maybe_cooldown_upstream_for_5xx(0, &err);
+        assert!(
+            provider.is_in_cooldown(0),
+            "5xx cooldown should be visible even with circuit breaker disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn five_xx_cooldown_skips_upstream_in_fallback() {
+        // Use a *working* first upstream so the skip is observable: with the
+        // old buggy is_in_cooldown gate the loop would try huggingface,
+        // succeed, and return its model; with the fix it skips the cooled
+        // upstream and lands on cerebras.
+        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        let err = ProviderError::ServerError {
+            provider: ProviderId::new("huggingface"),
+            status: Some(503),
+            message: "boom".into(),
+            is_retryable: true,
+        };
+        provider.maybe_cooldown_upstream_for_5xx(0, &err);
+        assert!(provider.is_in_cooldown(0));
+
+        let resp = provider
+            .create_message(dummy_request("free/auto"))
+            .await
+            .expect("should succeed via cerebras");
+        assert_eq!(
+            resp.model, "gpt-oss-120b",
+            "cooled-down upstream must be skipped even though it would succeed"
+        );
+    }
+
+    #[test]
+    fn upstream_cooldowns_reports_5xx_and_empty_kinds() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        // 5xx cooldown on the first upstream (default 45s).
+        let err = ProviderError::ServerError {
+            provider: ProviderId::new("huggingface"),
+            status: Some(503),
+            message: "boom".into(),
+            is_retryable: true,
+        };
+        provider.maybe_cooldown_upstream_for_5xx(0, &err);
+        // Empty-completion cooldown on the second upstream (default max 3,
+        // cooldown 60s). Drive the cooldown state directly — the empty-completion
+        // recording path lives on RetryingFreeStream. `record_empty` returns
+        // `just_cooled`, i.e. true only when the threshold is crossed.
+        {
+            let mut cd = provider.cooldown.lock().unwrap();
+            assert!(
+                !cd.record_empty(1, 3, 60),
+                "first empty must not trip the cooldown"
+            );
+            assert!(
+                !cd.record_empty(1, 3, 60),
+                "second empty must not trip the cooldown"
+            );
+            assert!(
+                cd.record_empty(1, 3, 60),
+                "third consecutive empty must trip the cooldown"
+            );
+        }
+
+        let cooldowns = provider.upstream_cooldowns();
+        let kinds: Vec<&str> = cooldowns.iter().map(|(_, k, _)| k.as_str()).collect();
+        assert!(
+            kinds.contains(&"5xx"),
+            "5xx cooldown must be reported, got {:?}",
+            cooldowns
+        );
+        assert!(
+            kinds.contains(&"empty"),
+            "empty cooldown must be reported, got {:?}",
+            cooldowns
+        );
+        for (_, _, retry) in &cooldowns {
+            assert!(retry.is_some(), "active cooldowns must carry retry_secs");
+        }
+
+        // The trait override must surface the empty cooldown through `dyn` —
+        // guards the regression where upstream_empty_cooldowns was only an
+        // inherent method and the registry (Arc<dyn LlmProvider>) always got
+        // the empty trait default.
+        let dyn_provider: Arc<dyn LlmProvider> = Arc::new(provider);
+        let empty = dyn_provider.upstream_empty_cooldowns();
+        assert!(
+            empty.iter().any(|(id, _, _)| id == "cerebras"),
+            "trait upstream_empty_cooldowns must report cerebras, got {:?}",
+            empty
+        );
+    }
+
+    #[test]
+    fn upstream_key_health_reports_ring_backed_upstreams() {
+        let provider = FreeProvider::new(vec![
+            entry("huggingface", true),
+            entry_with_ring("cerebras", (1, 2, Some(45))),
+        ]);
+        let health = provider.upstream_key_health();
+        assert_eq!(
+            health.len(),
+            1,
+            "only ring-backed upstreams report health, got {:?}",
+            health
+        );
+        assert_eq!(health[0].0, "cerebras");
+        assert_eq!((health[0].1, health[0].2), (1, 2));
+        assert_eq!(health[0].3, Some(45));
+    }
+
+    #[test]
+    fn mark_key_exhausted_forwards_to_matching_upstream() {
+        let recorder: ExhaustionRecorder = Arc::new(Mutex::new(Vec::new()));
+        let provider = FreeProvider::new(vec![
+            entry("huggingface", true),
+            entry_with_exhaustion_recorder("cerebras", recorder.clone()),
+        ]);
+
+        // Matches the chain entry's upstream id → forwarded with the real
+        // key index and cooldown (as injected by the health poller, §6.4).
+        assert!(provider.mark_key_exhausted(
+            Some("cerebras"),
+            2,
+            300,
+            Some("Invalid API key (HTTP 401)".to_string())
+        ));
+        let recorded = recorder.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one forwarding expected");
+        assert_eq!(recorded[0], (Some("cerebras".to_string()), 2, 300));
+        drop(recorded);
+        recorder.lock().unwrap().clear();
+
+        // Unknown upstream / missing id → not forwarded, returns false.
+        assert!(!provider.mark_key_exhausted(Some("nope"), 0, 1, None));
+        assert!(!provider.mark_key_exhausted(None, 0, 1, None));
+        assert!(recorder.lock().unwrap().is_empty(), "no extra forwards");
+    }
+
+    // -------------------------------------------------------------------
     // Circuit breaker tests
     // -------------------------------------------------------------------
 
@@ -3166,6 +4076,49 @@ mod tests {
     }
 
     #[test]
+    fn latency_plan_keeps_fallback_adjacent_after_primary() {
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::LatencyBased,
+            latency: Some(LatencyConfig { max_samples: 10 }),
+            ..Default::default()
+        };
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("nvidia", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            cfg,
+            false,
+        );
+
+        // Record distinct latencies: nvidia fastest (100ms), google 300ms,
+        // cerebras 500ms, huggingface 800ms. Even though the latency sort
+        // reorders upstreams, nvidia's 8B fallback row must stay adjacent
+        // AFTER its 70B primary (stable sort keeps same-idx rows together
+        // in insertion order).
+        provider.record_success(0, Duration::from_millis(800));
+        provider.record_success(1, Duration::from_millis(100));
+        provider.record_success(2, Duration::from_millis(500));
+        provider.record_success(3, Duration::from_millis(300));
+
+        let plan = provider.attempt_plan(&Route::Auto);
+
+        // nvidia (idx 1, fastest) first: 70B then its 8B fallback adjacent.
+        assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
+        assert_eq!(plan[1], (1, "meta/llama-3.1-8b-instruct".to_string()));
+        // google (300ms), cerebras (500ms), huggingface (800ms).
+        assert_eq!(plan[2], (3, "gemini-2.5-flash".to_string()));
+        assert_eq!(plan[3], (2, "gpt-oss-120b".to_string()));
+        assert_eq!(
+            plan[4],
+            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
+        );
+        assert_eq!(plan.len(), 5);
+    }
+
+    #[test]
     fn latency_tracking_pinned_starts_with_pinned_then_sorted() {
         let cfg = RoutingConfig {
             strategy: RoutingStrategy::LatencyBased,
@@ -3277,6 +4230,53 @@ mod tests {
 // Live discovery mock tests (fetch_openai_compat_model_list)
 // -------------------------------------------------------------------
 
+/// Spawn a robust mock HTTP server on `listener` that answers every
+/// connection with `response`. Uses a thread per connection and drains the
+/// request before replying — a naive single-threaded accept→write loop makes
+/// hyper intermittently fail with "received unexpected message from
+/// connection" (a response racing keep-alive connection reuse), which flaked
+/// these tests. Returns a ready flag the caller spins on so the fetch never
+/// races a not-yet-starting accept loop.
+#[cfg(test)]
+fn spawn_mock_server(
+    listener: std::net::TcpListener,
+    response: String,
+) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let server_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = server_ready.clone();
+    std::thread::spawn(move || {
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        for mut s in listener.incoming().take(16).flatten() {
+            let response = response.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(response.as_bytes());
+            });
+        }
+    });
+    server_ready
+}
+
+/// Spin until the mock server's accept loop is running.
+#[cfg(test)]
+fn wait_for_mock_server(ready: &std::sync::atomic::AtomicBool) {
+    while !ready.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Minimal 200 OK JSON response builder for the mock servers.
+#[cfg(test)]
+fn mock_json_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
 #[test]
 fn fetch_openai_compat_model_list_parses_openai_response() {
     // Mock JSON response from a standard OpenAI-compatible /v1/models endpoint.
@@ -3288,25 +4288,10 @@ fn fetch_openai_compat_model_list_parses_openai_response() {
             ]
         }"#;
 
-    // Start a minimal HTTP server to serve the mock response.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let expected_body = json.to_string();
-
-    std::thread::spawn(move || {
-        for mut s in listener.incoming().take(1).flatten() {
-            use std::io::Write;
-            let response = format!(
-                "HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: {}\n\n{}",
-                expected_body.len(),
-                expected_body
-            );
-            let _ = s.write_all(response.as_bytes());
-        }
-    });
-
-    // Give the mock server thread a moment to start accepting.
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ready = spawn_mock_server(listener, mock_json_response(json));
+    wait_for_mock_server(&ready);
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("test-key", &base_url, "groq");
@@ -3325,22 +4310,8 @@ fn fetch_openai_compat_model_list_returns_first_on_no_autodetect() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let expected_body = json.to_string();
-
-    std::thread::spawn(move || {
-        for mut s in listener.incoming().take(1).flatten() {
-            use std::io::Write;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                expected_body.len(),
-                expected_body
-            );
-            let _ = s.write_all(response.as_bytes());
-        }
-    });
-
-    // Give the mock server thread a moment to start accepting.
-    std::thread::sleep(std::time::Duration::from_millis(10));
+    let ready = spawn_mock_server(listener, mock_json_response(json));
+    wait_for_mock_server(&ready);
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("test-key", &base_url, "unknown-provider");
@@ -3351,14 +4322,11 @@ fn fetch_openai_compat_model_list_returns_first_on_no_autodetect() {
 fn fetch_openai_compat_model_list_handles_http_error() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-
-    std::thread::spawn(move || {
-        for mut s in listener.incoming().take(1).flatten() {
-            use std::io::Write;
-            let response = "HTTP/1.1 401 Unauthorized\nContent-Length: 0\n\n";
-            let _ = s.write_all(response.as_bytes());
-        }
-    });
+    let ready = spawn_mock_server(
+        listener,
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_string(),
+    );
+    wait_for_mock_server(&ready);
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("bad-key", &base_url, "groq");
@@ -3371,19 +4339,8 @@ fn fetch_openai_compat_model_list_handles_empty_response() {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let expected_body = json.to_string();
-
-    std::thread::spawn(move || {
-        for mut s in listener.incoming().take(1).flatten() {
-            use std::io::Write;
-            let response = format!(
-                "HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: {}\n\n{}",
-                expected_body.len(),
-                expected_body
-            );
-            let _ = s.write_all(response.as_bytes());
-        }
-    });
+    let ready = spawn_mock_server(listener, mock_json_response(json));
+    wait_for_mock_server(&ready);
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("test-key", &base_url, "groq");

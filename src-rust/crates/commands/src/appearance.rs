@@ -81,7 +81,7 @@ impl SlashCommand for ColorCommand {
          Named colors: red, green, blue, yellow, cyan, magenta, white, orange, purple\n\
          Hex codes:    #RGB or #RRGGBB\n\
          Reset:        /color default\n\n\
-         The color is persisted to ~/.claurst/ui-settings.json and\n\
+         The color is persisted to ~/.clawde/ui-settings.json and\n\
          applied on the next REPL startup."
     }
 
@@ -373,7 +373,7 @@ impl SlashCommand for KeybindingsCommand {
         "keybindings"
     }
     fn description(&self) -> &str {
-        "Create or open ~/.claurst/keybindings.json"
+        "Create or open ~/.clawde/keybindings.json"
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -443,7 +443,7 @@ impl SlashCommand for PrivacySettingsCommand {
         "privacy-settings"
     }
     fn description(&self) -> &str {
-        "Open Claurst privacy settings"
+        "Open Clawde privacy settings"
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {

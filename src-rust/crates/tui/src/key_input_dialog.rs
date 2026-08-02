@@ -24,6 +24,11 @@ pub struct KeyInputDialogState {
     pub provider_name: String,
     pub input: String,
     pub cursor_pos: usize,
+    /// Two-step composite-key flow (cloudflare): when `Some`, the API token
+    /// was captured on the first Enter and the dialog now awaits the account
+    /// ID in `input`. The next Enter joins them into the stored
+    /// `ACCOUNT_ID:API_TOKEN`.
+    pub pending_token: Option<String>,
     /// The area used by this dialog in the last render (for click-outside detection).
     pub last_rect: Cell<Rect>,
 }
@@ -42,6 +47,7 @@ impl KeyInputDialogState {
             provider_name: String::new(),
             input: String::new(),
             cursor_pos: 0,
+            pending_token: None,
             last_rect: Cell::new(Rect::default()),
         }
     }
@@ -53,6 +59,7 @@ impl KeyInputDialogState {
         self.provider_name = provider_name;
         self.input.clear();
         self.cursor_pos = 0;
+        self.pending_token = None;
     }
 
     /// Close and clear the dialog.
@@ -60,6 +67,49 @@ impl KeyInputDialogState {
         self.visible = false;
         self.input.clear();
         self.cursor_pos = 0;
+        self.pending_token = None;
+    }
+
+    /// Capture the typed token and switch to the account-ID prompt.
+    /// Returns `false` when there is nothing to capture.
+    pub fn capture_token(&mut self) -> bool {
+        let token = self.input.trim().to_string();
+        if token.is_empty() {
+            return false;
+        }
+        self.pending_token = Some(token);
+        self.input.clear();
+        self.cursor_pos = 0;
+        true
+    }
+
+    /// Join the typed account ID with the captured token and store it back
+    /// into `input` as the composite `ACCOUNT_ID:API_TOKEN`. Returns `false`
+    /// when there is no captured token (or the ID is empty).
+    pub fn compose_with_id(&mut self) -> bool {
+        let Some(token) = self.pending_token.take() else {
+            return false;
+        };
+        let id = self.input.trim().to_string();
+        if id.is_empty() {
+            self.pending_token = Some(token);
+            return false;
+        }
+        self.input = format!("{}:{}", id, token);
+        self.cursor_pos = self.input.len();
+        true
+    }
+
+    /// Cancel the two-step flow, restoring the captured token to `input` so
+    /// it can be re-entered. Returns `true` if a capture was undone.
+    pub fn cancel_token(&mut self) -> bool {
+        if let Some(token) = self.pending_token.take() {
+            self.input = token;
+            self.cursor_pos = self.input.len();
+            true
+        } else {
+            false
+        }
     }
 
     /// Insert a character at the cursor position.
@@ -144,15 +194,25 @@ pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, a
     // Blank line
     lines.push(Line::from(""));
 
-    // "API Key:" label
+    // "API Key:" or "Cloudflare Account ID:" label, depending on the step.
+    let awaiting_id = state.pending_token.is_some();
     lines.push(Line::from(vec![Span::styled(
-        " API Key:",
+        if awaiting_id {
+            " Cloudflare Account ID:"
+        } else {
+            " API Key:"
+        },
         Style::default().fg(Color::Rgb(180, 180, 180)),
     )]));
 
-    // Masked key display (show last 4 chars, mask the rest)
+    // Masked key display (show last 4 chars, mask the rest). During the
+    // two-step flow the placeholder asks for the account ID explicitly.
     let masked = if state.input.is_empty() {
-        "paste your API key here...".to_string()
+        if awaiting_id {
+            "Paste your Cloudflare ID now...".to_string()
+        } else {
+            "paste your API key here...".to_string()
+        }
     } else {
         let len = state.input.len();
         if len <= 4 {

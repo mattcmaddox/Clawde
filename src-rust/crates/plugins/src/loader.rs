@@ -1,7 +1,7 @@
 /// Plugin discovery and loading — ported from `pluginLoader.ts` / `pluginDirectories.ts`.
 ///
 /// Scan order (matches TS precedence):
-/// 1. `~/.claurst/plugins/<name>/`  — user-global plugins
+/// 1. `~/.clawde/plugins/<name>/`  — user-global plugins
 /// 2. `<project>/.claurst/plugins/<name>/`  — project-local plugins
 /// 3. Extra paths from `settings.plugin_paths` (if the field exists)
 ///
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 // Public helpers
 // ---------------------------------------------------------------------------
 
-/// Return the default user-level plugins directory: `<claurst home>/plugins`.
+/// Return the default user-level plugins directory: `<clawde home>/plugins`.
 pub fn default_user_plugins_dir() -> Option<PathBuf> {
     Some(clawde_core::config::Settings::config_dir().join("plugins"))
 }

@@ -94,6 +94,7 @@ authentication, and utility infrastructure.
 | `claudemd.rs` | Clawde's markdown dialect parsing/rendering |
 | `git_utils.rs` | Git operations (status, diff, worktree) |
 | `update_check.rs` | GitHub release update checking |
+| `github.rs` | Shared GitHub REST client (`api_client()` sets `User-Agent`, `Accept`, `X-GitHub-Api-Version`; `github_token()` resolves `GITHUB_TOKEN` env → stored `github` credential, attached as default `Authorization` so callers get the 5,000 req/hr quota) + `parse_rate_limit`/`store_rate_limit`/`last_rate_limit` with disk persistence (stale windows pruned on load), `unix_now()`/`format_reset()`/`rate_limit_warning()` helpers |
 | `share_export/` | HTML/CSS/JS templates for sharing sessions as GitHub Gists |
 | `voice.rs` | Voice/microphone capture (requires `libasound2-dev`) |
 | `memdir.rs` | Long-term memory directory management |

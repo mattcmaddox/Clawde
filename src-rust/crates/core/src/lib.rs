@@ -97,10 +97,11 @@ pub use key_ring::{KeyRing, KeyStatus};
 
 // Re-export commonly used types at the crate root
 pub use config::{
-    builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
-    AcpServerConfig, AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
-    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat,
-    PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
+    builtin_managed_agent_presets, default_agents, is_ollama_network_blocked,
+    set_ollama_network_blocked, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
+    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaMode,
+    OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
 };
 pub use error::{ClaudeError, Result};
 pub use import_config::{
@@ -748,7 +749,11 @@ pub mod config {
             "stepfun" => &["STEPFUN_API_KEY"],
             "fireworks" => &["FIREWORKS_API_KEY"],
             "cloudflare" | "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
-                &["CLOUDFLARE_API_TOKEN"]
+                // The canonical cloudflare id additionally reads
+                // CLOUDFLARE_ACCOUNT_ID (the OpenAI-compat URL embeds the
+                // account ID; the token env var may carry the composite
+                // ACCOUNT_ID:API_TOKEN when no separate account var is set).
+                &["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
             }
             "vercel" => &["AI_GATEWAY_API_KEY"],
             "helicone" => &["HELICONE_API_KEY"],
@@ -935,6 +940,43 @@ pub mod config {
                 max_concurrent_executors: 4,
             },
         ]
+    }
+
+    // ---- OllamaMode -------------------------------------------------------
+
+    /// Controls whether Ollama participates in the free-models fallback chain
+    /// (Auto) or runs standalone with manual selection only (Isolated).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum OllamaMode {
+        /// Ollama is assumed always online and participates in free-models
+        /// fallback routing alongside cloud providers.
+        #[default]
+        Auto,
+        /// Ollama runs in isolation — only reachable via explicit
+        /// `--provider ollama`, never automatically selected in free-mode.
+        /// When isolated, network-capable tools (WebSearch, WebFetch) are
+        /// also blocked to prevent data leakage.
+        Isolated,
+    }
+
+    /// Global flag controlling whether network-level tool operations are
+    /// blocked.  Set by the `/ollama` toggle; read by
+    /// [`PermissionManager::evaluate`] to auto-deny [`PermissionLevel::Network`]
+    /// operations.
+    static OLLAMA_NETWORK_BLOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Set the global network block flag.  When `true`, all
+    /// [`PermissionLevel::Network`] tool operations are denied.
+    pub fn set_ollama_network_blocked(blocked: bool) {
+        OLLAMA_NETWORK_BLOCKED.store(blocked, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Return `true` when network-level tool operations are blocked
+    /// (ollama is in isolated / offline mode).
+    pub fn is_ollama_network_blocked() -> bool {
+        OLLAMA_NETWORK_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ---- ProviderConfig --------------------------------------------------
@@ -1512,6 +1554,20 @@ pub mod config {
     }
 
     impl Config {
+        /// Resolve the Ollama connectivity mode from settings.
+        ///
+        /// Reads `providers.ollama.options.mode` — `"auto"` (the default)
+        /// or `"isolated"`. In "auto" mode Ollama participates in the
+        /// free-models fallback chain; in "isolated" mode it only responds
+        /// to explicit `--provider ollama` selection.
+        pub fn resolve_ollama_mode(&self) -> OllamaMode {
+            self.provider_configs
+                .get("ollama")
+                .and_then(|cfg| cfg.options.get("mode"))
+                .and_then(|v| serde_json::from_value::<OllamaMode>(v.clone()).ok())
+                .unwrap_or_default()
+        }
+
         /// Whether app-level mouse capture should be enabled. Defaults to `true`
         /// (capture on) when unset, preserving historical behaviour; users opt out
         /// via `"mouseCapture": false` to restore native terminal text selection
@@ -3020,6 +3076,14 @@ pub mod permissions {
                 return PermissionDecision::Allow;
             }
 
+            // Step 1b — network-blocked mode (ollama isolated): deny all
+            // Network-level operations regardless of other rules.
+            if crate::config::is_ollama_network_blocked()
+                && PermissionLevel::for_tool(tool_name) == PermissionLevel::Network
+            {
+                return PermissionDecision::Deny;
+            }
+
             // Steps 2–3 — evaluate explicit rules (deny has priority over
             // allow; persistent rules evaluated before session rules within
             // each polarity, matching TS rule-source ordering)
@@ -3964,6 +4028,7 @@ pub mod cost {
         "groq",
         "cerebras",
         "google",
+        "cloudflare",
         "mistral",
         "sambanova",
         "nvidia",
@@ -4200,7 +4265,9 @@ pub mod hooks {
         let ctx_json = match serde_json::to_string(ctx) {
             Ok(j) => j,
             Err(e) => {
-                warn!("Failed to serialize hook context: {}", e);
+                // debug: hook failures are surfaced as HookError transcript
+                // attachments; warn! here would clobber the TUI mid-turn.
+                debug!("Failed to serialize hook context: {}", e);
                 return HookOutcome::Allowed;
             }
         };
@@ -4232,6 +4299,10 @@ pub mod hooks {
             let mut child = match result {
                 Ok(c) => c,
                 Err(e) => {
+                    // Kept at warn! deliberately: a hook that cannot spawn (e.g.
+                    // missing/typo'd executable) is a user config error that
+                    // otherwise surfaces nowhere — there is no HookError
+                    // attachment on this path.
                     warn!(command = %entry.command, error = %e, "Failed to spawn hook");
                     continue;
                 }
@@ -4246,7 +4317,9 @@ pub mod hooks {
             let output = match child.wait_with_output().await {
                 Ok(o) => o,
                 Err(e) => {
-                    warn!(command = %entry.command, error = %e, "Hook wait failed");
+                    // debug: surfaced via HookError attachments; warn! would
+                    // clobber the TUI alternate screen mid-turn.
+                    debug!(command = %entry.command, error = %e, "Hook wait failed");
                     continue;
                 }
             };

@@ -42,7 +42,7 @@ impl SlashCommand for RemoteControlCommand {
     }
     fn help(&self) -> &str {
         "Usage: /remote-control [start|stop|status]\n\n\
-         The Bridge feature lets you connect your local Claurst CLI to the\n\
+         The Bridge feature lets you connect your local Clawde CLI to the\n\
          claude.ai web UI or mobile app.\n\n\
          Subcommands:\n\
          /remote-control          Show current bridge status and connection URL\n\
@@ -89,7 +89,7 @@ impl SlashCommand for RemoteControlCommand {
                          ──────────────\n\
                          Session URL:  {url}\n\
                          Share this URL or QR code with others to let them connect\n\
-                         to this Claurst session from the claude.ai web UI.\n",
+                         to this Clawde session from the claude.ai web UI.\n",
                         url = url
                     )
                 } else {
@@ -104,7 +104,7 @@ impl SlashCommand for RemoteControlCommand {
                     "Remote Control (Bridge)\n\
                      ═══════════════════════\n\
                      What it does: lets you connect the claude.ai web UI or mobile app\n\
-                     to this running Claurst CLI session on your local machine.\n\
+                     to this running Clawde CLI session on your local machine.\n\
                      All prompts and responses are relayed bidirectionally.\n\
                      \n\
                      Local Machine\n\
@@ -123,7 +123,7 @@ impl SlashCommand for RemoteControlCommand {
                      1. Obtain a session token from claude.ai (Settings → Remote Control)\n\
                      2. Set it:  export CLAURST_BRIDGE_TOKEN=<your-token>\n\
                      3. Enable:  /remote-control start\n\
-                     4. Restart Claurst — the bridge will connect automatically\n\
+                     4. Restart Clawde — the bridge will connect automatically\n\
                      5. Open {bridge_url}/claude-code in your browser\n\
                      \n\
                      Note: Full bridge polling requires server-side session infrastructure.\n\
@@ -161,7 +161,7 @@ impl SlashCommand for RemoteControlCommand {
                 };
                 CommandResult::Message(format!(
                     "Remote control bridge enabled at startup.\n\
-                     Restart Claurst to activate the bridge connection.\n\n\
+                     Restart Clawde to activate the bridge connection.\n\n\
                      {token_note}",
                     token_note = token_note
                 ))
@@ -196,7 +196,7 @@ impl SlashCommand for RemoteEnvCommand {
     }
     fn help(&self) -> &str {
         "Usage: /remote-env [set <KEY> <VALUE> | unset <KEY> | list]\n\n\
-         Manages env vars stored in config that are forwarded to remote Claurst sessions.\n\
+         Manages env vars stored in config that are forwarded to remote Clawde sessions.\n\
          These are persisted to settings under the 'env' key."
     }
 

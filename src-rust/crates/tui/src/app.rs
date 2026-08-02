@@ -69,6 +69,10 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("fork", "Fork session into a new branch"),
     ("goal", "Set or view the current session goal"),
     ("heapdump", "Show process memory and diagnostic information"),
+    (
+        "health",
+        "Probe free-mode key health — /health [<upstream>]",
+    ),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
     (
@@ -139,17 +143,22 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
+    (
+        "ollama",
+        "Toggle Ollama connectivity mode (auto / isolated)",
+    ),
 ];
 
 fn help_command_category(name: &str) -> &'static str {
     match name {
-        "connect" | "model" | "models" | "providers" | "refresh" | "fast" | "effort" | "voice" => {
-            "Model & Provider"
-        }
+        "connect" | "model" | "models" | "providers" | "refresh" | "fast" | "effort" | "voice"
+        | "ollama" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => {
             "Review & History"
         }
-        "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
+        "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" | "health" => {
+            "Diagnostics"
+        }
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
@@ -232,6 +241,37 @@ fn detect_env_var_key(upstream_id: &str) -> Option<String> {
     std::env::var(env_var).ok().filter(|v| !v.is_empty())
 }
 
+/// Collect a provider's stored keys (single credential first, then rotation
+/// keys), deduplicated. Used to seed the Connect Free dialog — every key
+/// becomes one health dot.
+fn stored_keys_for(auth: &clawde_core::AuthStore, provider_id: &str, out: &mut Vec<String>) {
+    if let Some(key) = auth.api_key_for(provider_id) {
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    if let Some(keys) = auth.keys_for(provider_id) {
+        for key in keys {
+            if !out.contains(key) {
+                out.push(key.clone());
+            }
+        }
+    }
+}
+
+/// All stored keys for a free-catalog upstream. OpenCode Zen shares the
+/// OpenCode Go key slots.
+fn free_upstream_stored_keys(auth: &clawde_core::AuthStore, upstream_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if upstream_id == "opencode-zen" {
+        stored_keys_for(auth, "opencode-zen", &mut out);
+        stored_keys_for(auth, "opencode-go", &mut out);
+    } else {
+        stored_keys_for(auth, upstream_id, &mut out);
+    }
+    out
+}
+
 /// Map a free catalog upstream id to its primary environment variable name.
 fn env_var_name_for_upstream(upstream_id: &str) -> Option<&'static str> {
     match upstream_id {
@@ -239,7 +279,8 @@ fn env_var_name_for_upstream(upstream_id: &str) -> Option<&'static str> {
         "nvidia" => Some("NVIDIA_API_KEY"),
         "cerebras" => Some("CEREBRAS_API_KEY"),
         "google" => Some("GOOGLE_API_KEY"),
-        "github-models" => Some("GITHUB_TOKEN"),
+        "cloudflare" => Some("CLOUDFLARE_API_TOKEN"),
+        "groq" => Some("GROQ_API_KEY"),
         "sambanova" => Some("SAMBANOVA_API_KEY"),
         "cline" => None, // Cline uses OAuth / has no standard env var
         "mistral" => Some("MISTRAL_API_KEY"),
@@ -292,6 +333,13 @@ fn provider_picker_items() -> Vec<SelectItem> {
             id: "groq".into(),
             title: "Groq".into(),
             description: "Fast hosted inference — free tier".into(),
+            category: "Free".into(),
+            badge: Some("FREE".into()),
+        },
+        SelectItem {
+            id: "cloudflare".into(),
+            title: "Cloudflare Workers AI".into(),
+            description: "Free tier — 10K neurons/day, Qwen3 · Llama · GLM".into(),
             category: "Free".into(),
             badge: Some("FREE".into()),
         },
@@ -676,13 +724,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             description: "Fast inference".into(),
             category: "Other".into(),
             badge: None,
-        },
-        SelectItem {
-            id: "github-models".into(),
-            title: "GitHub Models".into(),
-            description: "Free + paid via GitHub token".into(),
-            category: "Other".into(),
-            badge: Some("FREE".into()),
         },
         SelectItem {
             id: "novita".into(),
@@ -1559,7 +1600,7 @@ pub struct App {
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
     pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
-    /// "Free" composite-provider setup dialog (warning + 2 API keys).
+    /// "Free" composite-provider setup dialog (multi-key health dots).
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
@@ -1636,10 +1677,17 @@ pub struct App {
     /// Set once at startup from the CLI layer; polled each render frame.
     pub key_ring_data_fn:
         Option<std::sync::Arc<dyn Fn() -> Vec<crate::context_viz::KeyRingRow> + Send + Sync>>,
-    /// Auto-detected free model defaults, computed once at startup.
-    /// Each entry is `(upstream_title, effective_model_id)` for a
-    /// configured upstream in the free-mode fallback chain.
-    pub free_model_defaults: Vec<(String, String)>,
+    /// Auto-detected free model defaults, refreshed on startup and after any
+    /// key / routing mutation. Each entry is
+    /// `(upstream_id, upstream_title, effective_model_id)` for a configured
+    /// upstream in the free-mode fallback chain.
+    pub free_model_defaults: Vec<(String, String, String)>,
+    /// Ollama connectivity mode — Auto (participates in free-model
+    /// fallback) or Isolated (manual selection only).
+    pub ollama_mode: clawde_core::OllamaMode,
+    /// Outcome of the most recent background health sweep. Used by the footer
+    /// to show a marker when dead keys were found (also updated by /health).
+    pub last_health_sweep: Option<clawde_api::health_poller::ProbeOutcome>,
     /// Cycling index for the free-mode upstream display in the prompt
     /// status line. 0 = auto (abstract label), 1..N = corresponding
     /// upstream from `free_model_defaults`.  Cycled via Alt+U.
@@ -1695,7 +1743,14 @@ pub struct App {
     /// Receiver for non-blocking key validation results (from free mode dialog).
     /// Drained each frame so validation status updates as soon as the HTTP
     /// request completes.
-    pub validation_rx: Option<std::sync::mpsc::Receiver<(usize, Result<(), String>)>>,
+    pub validation_rx: Option<std::sync::mpsc::Receiver<crate::free_mode_dialog::ValidationPing>>,
+    /// Receiver for health-poller re-probe results (Ctrl+R in the free mode
+    /// dialog — runs the same probe as `/health <upstream>`). Drained each
+    /// frame so the re-probed provider's dots update in place. Each message
+    /// is `(field_idx, outcome)` — the field captured when the probe was
+    /// started, so results land correctly even if the cursor moves mid-probe.
+    pub free_reprobe_rx:
+        Option<std::sync::mpsc::Receiver<(usize, clawde_api::health_poller::ProbeOutcome)>>,
     /// Receiver for non-blocking clipboard image reads (spawned on a background
     /// thread so the TUI never freezes during xclip/wl-paste subprocess calls).
     pub image_rx: Option<std::sync::mpsc::Receiver<Option<crate::image_paste::PastedImage>>>,
@@ -1924,7 +1979,7 @@ impl App {
             // Try to load cached models.dev data from disk.
             let cache_path = dirs::cache_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("claurst")
+                .join("clawde")
                 .join("models.json");
             reg.load_cache(&cache_path);
             reg.apply_model_overrides(&config.model_overrides);
@@ -2099,6 +2154,8 @@ impl App {
             status_line_override: None,
             key_ring_data_fn: None,
             free_model_defaults: Vec::new(),
+            ollama_mode: clawde_core::OllamaMode::default(),
+            last_health_sweep: None,
             free_upstream_index: 0,
             arg_completions: None,
             slash_aliases: Vec::new(),
@@ -2108,7 +2165,7 @@ impl App {
             auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
-                // (stored in ~/.claurst/ui-settings.json).  We also accept
+                // (stored in ~/.clawde/ui-settings.json).  We also accept
                 // CLAURST_VOICE_ENABLED=1 as an override for easier testing.
                 let voice_on = std::env::var("CLAURST_VOICE_ENABLED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2138,6 +2195,7 @@ impl App {
             model_fetch_rx: None,
             user_question_rx: None,
             validation_rx: None,
+            free_reprobe_rx: None,
             image_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             context_window_size: 0,
@@ -2378,8 +2436,9 @@ impl App {
     pub fn poll_free_dialog_validation(&mut self) {
         if let Some(ref rx) = self.validation_rx {
             match rx.try_recv() {
-                Ok((idx, result)) => {
-                    self.free_mode_dialog.set_validation_result(idx, result);
+                Ok((field_idx, key_idx, result)) => {
+                    self.free_mode_dialog
+                        .set_validation_result(field_idx, key_idx, result);
                     // Don't clear validation_rx — auto-ping may send
                     // multiple results (one per upstream). Only clear
                     // on Disconnected (all threads done).
@@ -2390,6 +2449,46 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Poll the free dialog re-probe channel (called from main loop).
+    /// Applies a completed health-poller outcome to the active provider's
+    /// health dots — same probe as `/health <upstream>`.
+    pub fn poll_free_dialog_reprobe(&mut self) {
+        if let Some(ref rx) = self.free_reprobe_rx {
+            match rx.try_recv() {
+                Ok((field_idx, outcome)) => {
+                    self.free_mode_dialog
+                        .apply_probe_outcome(field_idx, &outcome);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.free_reprobe_rx = None;
+                }
+            }
+        }
+    }
+
+    /// Commit the free-mode dialog: append any typed new key, persist every
+    /// configured key to the auth store, close the dialog, rebuild the free
+    /// chain, and activate Free mode. Shared by both Ctrl+Enter code paths.
+    /// No-ops (with a hint) when no key is configured — the footer promises
+    /// "paste at least 1 key" before connecting.
+    fn connect_free_mode(&mut self) {
+        if !self.free_mode_dialog.can_submit() {
+            self.status_message = Some("Add at least 1 key to enable Free mode.".to_string());
+            return;
+        }
+        self.free_mode_dialog.append_pending();
+        self.free_mode_dialog.apply_values();
+        // Sync the in-memory auth_store so re-opening the dialog seeds from
+        // the freshly-written store (apply_values writes to a fresh load).
+        self.auth_store = clawde_core::AuthStore::load();
+        self.free_mode_dialog.close();
+        // Rebuild the free chain from the freshly-saved keys so the status
+        // bar and /ctx-viz reflect them now.
+        self.refresh_free_provider();
+        self.activate_provider("free".to_string(), "Free Mode".to_string(), "Connected to");
     }
 
     /// Drain the non-blocking clipboard image receiver. Called every frame
@@ -2437,7 +2536,7 @@ impl App {
 
         let cache_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("claurst")
+            .join("clawde")
             .join("models.json");
         if cache_path.exists() {
             self.model_registry.load_cache(&cache_path);
@@ -2497,6 +2596,41 @@ impl App {
         self.has_credentials = true;
         self.status_message = Some(format!("{} {}.", status_prefix, provider_name));
         self.open_model_picker_for_provider(&provider_id, Some(picker_title));
+    }
+
+    /// Rebuild the "free" composite provider from the current settings and
+    /// auth store, then refresh the TUI's cached free-model defaults so the
+    /// prompt status line and /ctx-viz reflect the live chain.
+    ///
+    /// Keys added/removed via `/connect`, `/keys`, the free-mode dialog, or
+    /// `/logout` change the chain; routing / ollama-mode changes come from
+    /// settings. `build_free_provider` reads the auth store fresh on every
+    /// call, so a rebuild picks up runtime mutations immediately — matching
+    /// what the query loop sees via `runtime_provider_for`.
+    pub fn refresh_free_provider(&mut self) {
+        // Reload settings so routing / ollama-mode changes made at runtime
+        // are picked up by the rebuild.
+        let config = Settings::load_sync()
+            .map(|s| s.effective_config())
+            .unwrap_or_else(|_| self.config.clone());
+        if let Some(ref mut reg_arc) = self.provider_registry {
+            let registry = std::sync::Arc::make_mut(reg_arc);
+            registry.rebuild_free(&config);
+        }
+        self.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
+    }
+
+    /// Whether a provider id can affect the free-mode fallback chain — i.e.
+    /// it is a catalog upstream, the composite "free" provider itself, an
+    /// OpenCode Zen/Go alias, or Ollama (when in Auto mode). Used to skip
+    /// pointless free-chain rebuilds when connecting unrelated providers.
+    fn provider_affects_free_chain(&self, provider_id: &str) -> bool {
+        matches!(
+            provider_id,
+            "free" | "opencode-zen" | "opencode-go" | "ollama"
+        ) || clawde_api::providers::free::FREE_CATALOG
+            .iter()
+            .any(|u| u.id == provider_id)
     }
 
     fn persist_custom_provider_base_url(&self, base_url: &str) {
@@ -2839,7 +2973,7 @@ impl App {
                     // Load the model registry cache (same as open_model_picker_for_provider).
                     let cache_path = dirs::cache_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join("claurst")
+                        .join("clawde")
                         .join("models.json");
                     if cache_path.exists() {
                         self.model_registry.load_cache(&cache_path);
@@ -3166,6 +3300,44 @@ impl App {
                     self.status_message =
                         Some("Voice mode enabled. Press Alt+V to start recording.".to_string());
                 }
+                true
+            }
+            "ollama" => {
+                use clawde_core::OllamaMode;
+                let next = match self.ollama_mode {
+                    OllamaMode::Auto => OllamaMode::Isolated,
+                    OllamaMode::Isolated => OllamaMode::Auto,
+                };
+                // Persist to settings so the choice survives restarts.
+                if let Ok(mut settings) = Settings::load_sync() {
+                    let mode_val = match next {
+                        OllamaMode::Auto => "auto",
+                        OllamaMode::Isolated => "isolated",
+                    };
+                    settings
+                        .providers
+                        .entry("ollama".to_string())
+                        .or_default()
+                        .options
+                        .insert(
+                            "mode".to_string(),
+                            serde_json::Value::String(mode_val.to_string()),
+                        );
+                    let _ = settings.save_sync();
+                    // Rebuild the free provider chain so the mode change takes
+                    // effect immediately without a restart, and refresh the
+                    // TUI's free-model upstream list so the status bar and
+                    // /ctx-viz reflect the rebuilt chain.
+                    self.refresh_free_provider();
+                }
+                self.ollama_mode = next;
+                // Sync the network-block flag so tools are denied immediately.
+                clawde_core::set_ollama_network_blocked(next == OllamaMode::Isolated);
+                let label = match next {
+                    OllamaMode::Auto => "auto (network allowed)",
+                    OllamaMode::Isolated => "isolated (network blocked)",
+                };
+                self.status_message = Some(format!("Ollama mode: {}.", label));
                 true
             }
             "doctor" => {
@@ -4318,11 +4490,34 @@ impl App {
         if self.key_input_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
-                    self.key_input_dialog.close();
+                    // Esc during the Cloudflare two-step flow cancels the
+                    // captured token (restoring it to the input line); a
+                    // second Esc closes the dialog.
+                    if !self.key_input_dialog.cancel_token() {
+                        self.key_input_dialog.close();
+                    }
                 }
                 KeyCode::Enter => {
                     let provider_id = self.key_input_dialog.provider_id.clone();
                     let provider_name = self.key_input_dialog.provider_name.clone();
+                    // Cloudflare keys are the composite ACCOUNT_ID:API_TOKEN.
+                    // The first Enter captures the API token and switches the
+                    // dialog to the account-ID prompt; the second Enter joins
+                    // them and saves the composite key.
+                    if provider_id == "cloudflare" {
+                        if self.key_input_dialog.pending_token.is_none() {
+                            if self.key_input_dialog.capture_token() {
+                                // Stay open — the dialog now asks for the ID.
+                                return false;
+                            }
+                            self.key_input_dialog.close();
+                            return false;
+                        }
+                        if !self.key_input_dialog.compose_with_id() {
+                            // Empty account ID — keep asking.
+                            return false;
+                        }
+                    }
                     let api_key = self.key_input_dialog.take_key();
                     if !api_key.is_empty() {
                         // Branch on the on-disk state (a long-lived snapshot may
@@ -4401,6 +4596,12 @@ impl App {
                                 );
                             }
                         }
+                        // Connecting a free-catalog upstream (e.g. via /connect
+                        // or a second key for rotation) changes the free chain —
+                        // rebuild it so the status bar and /ctx-viz stay live.
+                        if self.provider_affects_free_chain(&provider_id) {
+                            self.refresh_free_provider();
+                        }
                         self.activate_provider(provider_id, provider_name, "Connected to");
                     }
                 }
@@ -4440,12 +4641,35 @@ impl App {
             return false;
         }
 
-        // "Free" composite-provider setup dialog (collects any subset of the
-        // free-tier upstream keys; min 1 to enable, more = better).
+        // "Free" composite-provider setup dialog — multi-key health dots,
+        // reveal-on-Enter, append-on-Enter, delete-confirm, Ctrl+Enter connect.
         if self.free_mode_dialog.visible {
+            // Delete-confirmation popup captures all keys while open.
+            if self.free_mode_dialog.delete_confirm.is_some() {
+                match key.code {
+                    KeyCode::Enter => {
+                        self.free_mode_dialog.confirm_delete();
+                    }
+                    KeyCode::Esc => {
+                        self.free_mode_dialog.cancel_delete();
+                    }
+                    KeyCode::Char(c) => match c.to_ascii_lowercase() {
+                        'y' => self.free_mode_dialog.confirm_delete(),
+                        'n' => self.free_mode_dialog.cancel_delete(),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
-                    self.free_mode_dialog.close();
+                    // Esc cascade: hide a revealed key → drop typed text → close.
+                    if !self.free_mode_dialog.unreveal_active()
+                        && !self.free_mode_dialog.clear_pending()
+                    {
+                        self.free_mode_dialog.close();
+                    }
                 }
                 KeyCode::Tab => {
                     // Tab toggles between show-all and show-configured-only view
@@ -4454,37 +4678,45 @@ impl App {
                 KeyCode::Down => {
                     self.free_mode_dialog.move_next();
                 }
-                KeyCode::BackTab | KeyCode::Up => {
+                KeyCode::Up | KeyCode::BackTab => {
                     self.free_mode_dialog.move_prev();
                 }
-                KeyCode::Enter => {
-                    if self.free_mode_dialog.can_submit() {
-                        let values = self.free_mode_dialog.take_values();
-                        self.auth_store.reload();
-                        for (provider_id, key) in values {
-                            self.auth_store
-                                .set(provider_id, clawde_core::StoredCredential::ApiKey { key });
-                        }
-                        self.free_mode_dialog.close();
-                        self.activate_provider(
-                            "free".to_string(),
-                            "Free Mode".to_string(),
-                            "Connected to",
-                        );
-                    } else {
-                        self.free_mode_dialog.move_next();
-                    }
+                KeyCode::Right => {
+                    self.free_mode_dialog.move_node_next();
                 }
-                KeyCode::Backspace => {
-                    self.free_mode_dialog.backspace();
+                KeyCode::Left => {
+                    self.free_mode_dialog.move_node_prev();
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl+Enter — commit everything and connect Free mode.
+                    self.connect_free_mode();
+                }
+                KeyCode::Char('\n') | KeyCode::Char('\r')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    // Some terminals report Ctrl+Enter as a control character.
+                    self.connect_free_mode();
+                }
+                KeyCode::Enter => {
+                    self.free_mode_dialog.enter_active();
+                }
+                KeyCode::Backspace | KeyCode::Delete => {
+                    // Delete on a revealed key asks for confirmation; otherwise
+                    // it edits the typed new-key text.
+                    if !self.free_mode_dialog.try_open_delete_confirm() {
+                        self.free_mode_dialog.backspace();
+                    }
                 }
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' => {
                     // Ctrl+S: Apply/save keys without closing the dialog
+                    self.free_mode_dialog.append_pending();
                     let saved = self.free_mode_dialog.apply_values();
                     if saved > 0 {
                         // Sync the in-memory auth_store so keys show up on re-open.
                         self.auth_store = clawde_core::AuthStore::load();
                         self.status_message = Some(format!("\u{2713} Saved {} key(s)", saved));
+                        // Rebuild the free chain so the saved keys take effect.
+                        self.refresh_free_provider();
                     }
                 }
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'v' => {
@@ -4493,11 +4725,44 @@ impl App {
                         self.validation_rx = Some(rx);
                     }
                 }
+                KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'r' => {
+                    // Re-probe the active provider's health via the
+                    // health-poller path (same probe as /health <upstream>).
+                    if let Some(rx) = self.free_mode_dialog.start_reprobe() {
+                        self.free_reprobe_rx = Some(rx);
+                    }
+                }
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'd' => {
                     // Toggle enabled/disabled for the active upstream
                     self.free_mode_dialog.toggle_enabled();
                 }
                 KeyCode::Char(c) => {
+                    // Vim-style navigation (h/j/k/l) is active only while the
+                    // new-key buffer is empty — once a key is being typed those
+                    // letters belong to the key, not the cursor. Arrow keys
+                    // always navigate.
+                    let lower = c.to_ascii_lowercase();
+                    if self.free_mode_dialog.pending_is_empty() {
+                        match lower {
+                            'j' => {
+                                self.free_mode_dialog.move_next();
+                                return false;
+                            }
+                            'k' => {
+                                self.free_mode_dialog.move_prev();
+                                return false;
+                            }
+                            'h' => {
+                                self.free_mode_dialog.move_node_prev();
+                                return false;
+                            }
+                            'l' => {
+                                self.free_mode_dialog.move_node_next();
+                                return false;
+                            }
+                            _ => {}
+                        }
+                    }
                     let c = self.shift_normalize(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
                 }
@@ -4593,27 +4858,27 @@ impl App {
                             // free-tier upstreams (min 1; more = better availability).
                             "free" => {
                                 // Collect existing keys from auth_store *and* env vars
-                                // so users see all configured keys.
-                                let existing: Vec<(&'static str, String)> =
+                                // so users see all configured keys — one dot per key.
+                                let existing: Vec<(&'static str, Vec<String>)> =
                                     clawde_api::FREE_CATALOG
                                         .iter()
                                         .filter_map(|upstream| {
-                                            let key = match upstream.id {
-                                                "opencode-zen" => self
-                                                    .auth_store
-                                                    .api_key_for(
-                                                        clawde_core::ProviderId::OPENCODE_ZEN,
-                                                    )
-                                                    .or_else(|| {
-                                                        self.auth_store.api_key_for(
-                                                            clawde_core::ProviderId::OPENCODE_GO,
-                                                        )
-                                                    }),
-                                                other => self.auth_store.api_key_for(other),
+                                            let mut keys = free_upstream_stored_keys(
+                                                &self.auth_store,
+                                                upstream.id,
+                                            );
+                                            // Fall back to env var when nothing is stored.
+                                            if keys.is_empty() {
+                                                if let Some(k) = detect_env_var_key(upstream.id) {
+                                                    keys.push(k);
+                                                }
                                             }
-                                            // Fall back to env var when auth_store has no key.
-                                            .or_else(|| detect_env_var_key(upstream.id));
-                                            key.filter(|k| !k.is_empty()).map(|k| (upstream.id, k))
+                                            keys.retain(|k| !k.trim().is_empty());
+                                            if keys.is_empty() {
+                                                None
+                                            } else {
+                                                Some((upstream.id, keys))
+                                            }
                                         })
                                         .collect();
 
@@ -4626,22 +4891,11 @@ impl App {
                                         .iter()
                                         .filter_map(|upstream| {
                                             // Only mark as env-var when auth_store has NO key.
-                                            let already_in_store = match upstream.id {
-                                                "opencode-zen" => self
-                                                    .auth_store
-                                                    .api_key_for(
-                                                        clawde_core::ProviderId::OPENCODE_ZEN,
-                                                    )
-                                                    .or_else(|| {
-                                                        self.auth_store.api_key_for(
-                                                            clawde_core::ProviderId::OPENCODE_GO,
-                                                        )
-                                                    })
-                                                    .is_some(),
-                                                other => {
-                                                    self.auth_store.api_key_for(other).is_some()
-                                                }
-                                            };
+                                            let already_in_store = !free_upstream_stored_keys(
+                                                &self.auth_store,
+                                                upstream.id,
+                                            )
+                                            .is_empty();
                                             if already_in_store {
                                                 return None;
                                             }
@@ -5073,6 +5327,14 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.context_viz.close();
                 }
+                // Scroll the modal body when the content overflows (long
+                // free-model chains push lower sections out of view).
+                KeyCode::Up | KeyCode::Char('k') => self.context_viz.scroll_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.context_viz.scroll_down(),
+                KeyCode::PageUp => self.context_viz.page_up(),
+                KeyCode::PageDown => self.context_viz.page_down(),
+                KeyCode::Home => self.context_viz.scroll_to_top(),
+                KeyCode::End => self.context_viz.scroll_to_bottom(usize::MAX),
                 _ => {}
             }
             return false;
@@ -6627,6 +6889,12 @@ impl App {
             "openCommandPalette" => {
                 if !self.is_streaming {
                     self.command_palette.open();
+                }
+                false
+            }
+            "toggleOllama" => {
+                if !self.is_streaming {
+                    self.intercept_slash_command("ollama");
                 }
                 false
             }

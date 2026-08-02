@@ -53,7 +53,7 @@ impl MemoryFileSelectorState {
     /// Open the selector for the given project root.
     ///
     /// Populates the file list with:
-    /// - User:    `~/.claurst/AGENTS.md`
+    /// - User:    `~/.clawde/AGENTS.md`
     /// - Project: `{project_root}/AGENTS.md`
     /// - Local:   `{project_root}/.claurst/AGENTS.md`
     ///
@@ -63,7 +63,7 @@ impl MemoryFileSelectorState {
         self.selected = 0;
         self.files.clear();
 
-        // User-level: ~/.claurst/AGENTS.md
+        // User-level: ~/.clawde/AGENTS.md
         let user_path = clawde_core::config::Settings::config_dir().join("AGENTS.md");
         let user_display = {
             let home = dirs::home_dir().unwrap_or_default();

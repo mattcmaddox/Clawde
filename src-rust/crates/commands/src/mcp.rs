@@ -64,7 +64,7 @@ impl SlashCommand for McpCommand {
     fn help(&self) -> &str {
         "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
-         MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
+         MCP servers extend Clawde with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
@@ -75,7 +75,7 @@ impl SlashCommand for McpCommand {
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
            /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template\n\n\
-         To add/remove MCP servers, edit ~/.claurst/settings.json\n\
+         To add/remove MCP servers, edit ~/.clawde/settings.json\n\
          under the 'mcpServers' key.\n\
          Docs: https://docs.anthropic.com/claude-code/mcp"
     }
@@ -141,7 +141,7 @@ impl SlashCommand for McpCommand {
         if ctx.config.mcp_servers.is_empty() {
             return CommandResult::Message(
                 "No MCP servers configured.\n\n\
-                 To add a MCP server, edit ~/.claurst/settings.json:\n\
+                 To add a MCP server, edit ~/.clawde/settings.json:\n\
                  {\n\
                    \"mcpServers\": [\n\
                      {\n\
@@ -185,7 +185,7 @@ impl SlashCommand for McpCommand {
             if ctx.mcp_manager.is_none() {
                 output.push_str(
                     "\nNote: MCP manager is not active in this session.\n\
-                     Restart Claurst to connect to MCP servers.\n\
+                     Restart Clawde to connect to MCP servers.\n\
                      Use /mcp connect <server> to retry a single server.",
                 );
             }
@@ -286,8 +286,8 @@ impl McpCommand {
                 "MCP Server '{}' (stdio){}\n\
                  {}\n\n\
                  stdio servers authenticate via environment variables (API keys etc.).\n\
-                 Add required variables to the 'env' block in ~/.claurst/settings.json,\n\
-                 then restart Claurst or run /mcp connect {} to reconnect.",
+                 Add required variables to the 'env' block in ~/.clawde/settings.json,\n\
+                 then restart Clawde or run /mcp connect {} to reconnect.",
                 server_name, token_note, env_note, server_name
             ));
         }
@@ -367,9 +367,9 @@ impl McpCommand {
              Server URL: {}\n\n\
              To authenticate:\n\
              1. Open the server URL in your browser and complete OAuth\n\
-             2. The token is saved to ~/.claurst/mcp-tokens/{}.json\n\
-             3. Restart Claurst — the token will be used automatically\n\n\
-             Token storage: ~/.claurst/mcp-tokens/{}.json",
+             2. The token is saved to ~/.clawde/mcp-tokens/{}.json\n\
+             3. Restart Clawde — the token will be used automatically\n\n\
+             Token storage: ~/.clawde/mcp-tokens/{}.json",
             server_name, token_note, server_url, server_name, server_name
         ))
     }
@@ -381,7 +381,7 @@ impl McpCommand {
             None => {
                 return CommandResult::Message(
                     "MCP manager is not active. No tool information available.\n\
-                 Restart Claurst to connect to MCP servers."
+                 Restart Clawde to connect to MCP servers."
                         .to_string(),
                 )
             }
@@ -463,8 +463,8 @@ impl McpCommand {
                 // No live manager — give useful instructions.
                 CommandResult::Message(format!(
                     "The MCP manager is not running in this session.\n\
-                     To connect '{}', restart Claurst — servers connect automatically\n\
-                     on startup using the configuration in ~/.claurst/settings.json.\n\
+                     To connect '{}', restart Clawde — servers connect automatically\n\
+                     on startup using the configuration in ~/.clawde/settings.json.\n\
                      \n\
                      If the server requires authentication, run /mcp auth {} first.",
                     server_name, server_name
@@ -495,8 +495,8 @@ impl McpCommand {
                              The runtime MCP manager reconnects servers automatically.\n\
                              If the server stays disconnected:\n\
                              1. Check authentication: /mcp auth {}\n\
-                             2. Verify the command/URL in ~/.claurst/settings.json\n\
-                             3. Restart Claurst to force a full reconnect",
+                             2. Verify the command/URL in ~/.clawde/settings.json\n\
+                             3. Restart Clawde to force a full reconnect",
                             server_name,
                             manager.server_status(server_name).display(),
                             server_name
@@ -607,7 +607,7 @@ impl McpCommand {
             }
         } else {
             lines.push("MCP manager is not active in this session.".to_string());
-            lines.push("Restart Claurst to start the MCP runtime.".to_string());
+            lines.push("Restart Clawde to start the MCP runtime.".to_string());
         }
 
         // Hint about log files.

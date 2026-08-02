@@ -171,7 +171,7 @@ $ARGUMENTS
 ## Settings Reference
 
 Settings files are in:
-- User:    ~/.claurst/settings.json
+- User:    ~/.clawde/settings.json
 - Project: .claurst/settings.json
 - Local:   .claurst/settings.local.json
 
@@ -288,7 +288,7 @@ Modify Claurst configuration by updating settings.json files.
 
 | File | Scope | Use For |
 |------|-------|---------|
-| `~/.claurst/settings.json` | Global | Personal preferences for all projects |
+| `~/.clawde/settings.json` | Global | Personal preferences for all projects |
 | `.claurst/settings.json` | Project | Team-wide hooks, permissions, plugins |
 | `.claurst/settings.local.json` | Project (local) | Personal overrides for this project |
 

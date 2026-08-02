@@ -742,7 +742,7 @@ impl SlashCommand for CommitCommand {
         "commit"
     }
     fn description(&self) -> &str {
-        "Ask Claurst to commit staged changes"
+        "Ask Clawde to commit staged changes"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {

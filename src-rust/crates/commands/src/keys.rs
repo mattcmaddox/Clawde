@@ -35,6 +35,54 @@ fn partition_placeholder_keys(keys: Vec<String>) -> (Vec<String>, Vec<String>) {
     (valid, dropped)
 }
 
+/// Validate a Cloudflare composite key (`ACCOUNT_ID:API_TOKEN`).
+///
+/// Cloudflare's OpenAI-compatible endpoint embeds the account ID in the URL
+/// path, so a bare API token cannot be routed anywhere on its own. The stored
+/// credential must carry both halves joined by a colon — the same shape the
+/// free-mode dialog collects in two steps. Mirrors `cloudflare_parts` in the
+/// api crate so every entry point agrees on the composite format.
+fn validate_cloudflare_key(key: &str) -> Result<String, String> {
+    let trimmed = key.trim().to_string();
+    let Some((account, token)) = trimmed.split_once(':') else {
+        return Err(
+            "Cloudflare keys must be ACCOUNT_ID:API_TOKEN — a bare API token has\n\
+             no account ID to route requests to.\n\
+             Example: abc123def456:your-api-token"
+                .to_string(),
+        );
+    };
+    if account.is_empty() || token.is_empty() {
+        return Err(
+            "Cloudflare key has an empty half — expected ACCOUNT_ID:API_TOKEN.\n\
+             Example: abc123def456:your-api-token"
+                .to_string(),
+        );
+    }
+    // Wrong-order guard: Cloudflare account IDs are 32-char lowercase hex;
+    // API tokens are longer mixed-case alphanumeric/`_`/`-` strings. If the
+    // halves look swapped, reject instead of storing a credential that can
+    // never authenticate (the account ID would be sent as the Bearer token).
+    if looks_like_account_id(token) && !looks_like_account_id(account) {
+        return Err(
+            "That looks like TOKEN:ACCOUNT_ID — the halves are swapped.\n\
+             Cloudflare expects ACCOUNT_ID:API_TOKEN (account ID first).\n\
+             Example: abc123def456:your-api-token"
+                .to_string(),
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Cloudflare account IDs are 32-character lowercase hex strings
+/// (e.g. `1a2b3c4d5e6f7890abcdef1234567890`). Used only to catch clearly
+/// swapped composite pastes — permissive by design, never a hard requirement.
+fn looks_like_account_id(s: &str) -> bool {
+    s.len() == 32
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
 pub struct KeysCommand;
 
 #[async_trait]
@@ -60,6 +108,9 @@ impl SlashCommand for KeysCommand {
            /keys add <p> <key>          — append a key to a provider\n\
            /keys remove <p> <index>     — remove key at 1-based index (see /keys list)\n\
            /keys health [<provider>]    — show runtime key status + cooldowns\n\
+         \n\
+         Cloudflare keys are composite ACCOUNT_ID:API_TOKEN credentials (both\n\
+         halves joined by a colon) and are shape-validated before saving.\n\
          \n\
          Examples:\n\
            /keys set groq gsk_key1 gsk_key2 gsk_key3\n\
@@ -182,6 +233,18 @@ impl SlashCommand for KeysCommand {
                             .to_string(),
                     );
                 }
+                // Cloudflare composite keys: every entry must be the
+                // ACCOUNT_ID:API_TOKEN shape or it cannot be routed at all.
+                if provider == "cloudflare" {
+                    for k in &valid {
+                        if let Err(err) = validate_cloudflare_key(k) {
+                            return CommandResult::Error(format!(
+                                "Invalid Cloudflare key '{}':\n{}",
+                                k, err
+                            ));
+                        }
+                    }
+                }
                 store.set_keys(provider, valid.clone());
                 let dropped_note = if dropped.is_empty() {
                     String::new()
@@ -223,15 +286,30 @@ impl SlashCommand for KeysCommand {
                             .to_string(),
                     );
                 }
+                // Cloudflare stores a composite ACCOUNT_ID:API_TOKEN — a bare
+                // token passes the length guard but cannot be routed, so check
+                // the composite shape explicitly.
+                if provider == "cloudflare" {
+                    if let Err(err) = validate_cloudflare_key(&valid[0]) {
+                        return CommandResult::Error(err);
+                    }
+                }
                 store.add_key(provider, valid[0].clone());
                 let total = store.keys_for(provider).map(|k| k.len()).unwrap_or(0);
-                CommandResult::Message(format!(
+                let mut msg = format!(
                     "Key added to '{}' — now has {} key{}.\n\
                      Key rotation is active when 2+ keys are configured.",
                     provider,
                     total,
                     if total == 1 { "" } else { "s" },
-                ))
+                );
+                if provider == "cloudflare" {
+                    msg.push_str(
+                        "\nStored as ACCOUNT_ID:API_TOKEN — account ID first, token second,\n\
+                         joined by a colon.",
+                    );
+                }
+                CommandResult::Message(msg)
             }
             "remove" => {
                 let provider = parts.next().unwrap_or_default().trim();
@@ -668,8 +746,11 @@ impl SlashCommand for LimitsCommand {
     fn help(&self) -> &str {
         "Usage: /limits [provider]\n\
          \n\
-         Makes a lightweight HEAD/GET request to each configured provider's\n\
+         Makes a lightweight GET request to each configured provider's\n\
          models endpoint and parses X-RateLimit-* response headers.\n\
+         Upstreams whose models endpoint doesn't check auth (nvidia,\n\
+         huggingface, openrouter, sambanova, cline) get a 1-token\n\
+         chat/completions confirmation first.\n\
          \n\
          Most free-tier providers (including Gemini) don't expose rate-limit\n\
          headers — the command reports when they're unavailable.\n\
@@ -1105,5 +1186,147 @@ pub(crate) mod tests {
             result
         );
         assert_eq!(AuthStore::load().keys_for("groq").map(|k| k.len()), Some(2));
+    }
+
+    #[test]
+    fn cloudflare_add_rejects_bare_token_with_format_hint() {
+        let _home = TestHome::new();
+        let cmd = KeysCommand;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // A bare token passes the 8-char length guard but has no account ID —
+        // the composite validation must reject it with a format hint.
+        let result = rt.block_on(cmd.execute("add cloudflare tok_12345678", &mut test_ctx()));
+        match result {
+            CommandResult::Error(err) => {
+                assert!(
+                    err.contains("ACCOUNT_ID:API_TOKEN"),
+                    "error must explain the composite format, got: {}",
+                    err
+                );
+            }
+            other => panic!("expected CommandResult::Error, got: {:?}", other),
+        }
+        assert!(
+            AuthStore::load().keys_for("cloudflare").is_none(),
+            "rejected key must not be persisted"
+        );
+    }
+
+    #[test]
+    fn cloudflare_add_accepts_composite_key() {
+        let _home = TestHome::new();
+        let cmd = KeysCommand;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result =
+            rt.block_on(cmd.execute("add cloudflare abc123def456:tok_12345678", &mut test_ctx()));
+        assert!(
+            matches!(result, CommandResult::Message(_)),
+            "composite key must be accepted, got: {:?}",
+            result
+        );
+        let store = AuthStore::load();
+        let keys = store.keys_for("cloudflare").unwrap();
+        assert_eq!(keys, vec!["abc123def456:tok_12345678"]);
+    }
+
+    #[test]
+    fn cloudflare_add_rejects_empty_half() {
+        let _home = TestHome::new();
+        let cmd = KeysCommand;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Account ID present, empty token half — the composite check must catch
+        // it even though the whole string clears the 8-char guard.
+        let result = rt.block_on(cmd.execute("add cloudflare abc123def456:", &mut test_ctx()));
+        assert!(
+            matches!(result, CommandResult::Error(_)),
+            "empty token half must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn cloudflare_set_rejects_invalid_key_atomically() {
+        let _home = TestHome::new();
+        let cmd = KeysCommand;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // One bad composite in a multi-key set must fail the whole set.
+        let result = rt.block_on(cmd.execute(
+            "set cloudflare abc123def456:tok_12345678 bare_token_12345",
+            &mut test_ctx(),
+        ));
+        assert!(
+            matches!(result, CommandResult::Error(_)),
+            "a bare token in a set must fail the whole set, got: {:?}",
+            result
+        );
+        assert!(
+            AuthStore::load().keys_for("cloudflare").is_none(),
+            "failed set must not persist any keys"
+        );
+
+        // All-composite set still works.
+        let result = rt.block_on(cmd.execute(
+            "set cloudflare abc123def456:tok_12345678 fedcba098765:tok_98765432",
+            &mut test_ctx(),
+        ));
+        assert!(
+            matches!(result, CommandResult::Message(_)),
+            "all-composite set must be accepted, got: {:?}",
+            result
+        );
+        assert_eq!(
+            AuthStore::load().keys_for("cloudflare").map(|k| k.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cloudflare_add_rejects_swapped_halves_with_hint() {
+        let _home = TestHome::new();
+        let cmd = KeysCommand;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // TOKEN:ACCOUNT_ID — the right side is a 32-char lowercase hex account
+        // ID, so the validator must catch the swap and refuse to store it.
+        let token = "AbC123dEf456GhIj789KLMnopQrstUvWxYz_ab";
+        let account = "1a2b3c4d5e6f7890abcdef1234567890";
+        let result = rt.block_on(cmd.execute(
+            &format!("add cloudflare {}:{}", token, account),
+            &mut test_ctx(),
+        ));
+        match result {
+            CommandResult::Error(err) => {
+                assert!(
+                    err.contains("swapped"),
+                    "error must mention the swap, got: {}",
+                    err
+                );
+                assert!(
+                    err.contains("ACCOUNT_ID:API_TOKEN"),
+                    "error must show the correct format, got: {}",
+                    err
+                );
+            }
+            other => panic!("expected CommandResult::Error, got: {:?}", other),
+        }
+        assert!(
+            AuthStore::load().keys_for("cloudflare").is_none(),
+            "swapped key must not be persisted"
+        );
+    }
+
+    #[test]
+    fn cloudflare_accepts_32_hex_account_first() {
+        // The real-world shape: 32-char lowercase hex account ID, then token.
+        let account = "1a2b3c4d5e6f7890abcdef1234567890";
+        assert!(validate_cloudflare_key(&format!("{}:tok_12345678", account)).is_ok());
+        // A plain token without a colon still fails the composite check.
+        assert!(validate_cloudflare_key("tok_12345678").is_err());
+        // A short non-hex "account" half must not trip the swap detector.
+        assert!(validate_cloudflare_key("abc123def456:tok_12345678").is_ok());
     }
 }

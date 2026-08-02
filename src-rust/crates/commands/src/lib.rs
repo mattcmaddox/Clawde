@@ -1,4 +1,4 @@
-// claurst-commands: Slash command system for Claurst.
+// clawde-commands: Slash command system for Clawde.
 //
 // This crate implements the /command framework that allows users to type
 // commands like /help, /compact, /clear, /model, /config, /cost, etc.
@@ -256,6 +256,8 @@ mod plugin;
 pub use plugin::*;
 mod doctor;
 pub use doctor::*;
+mod health;
+pub use health::*;
 mod accounts;
 pub use accounts::*;
 mod review;
@@ -1131,7 +1133,7 @@ impl SlashCommand for ExitCommand {
         vec!["quit", "q"]
     }
     fn description(&self) -> &str {
-        "Exit Claurst"
+        "Exit Clawde"
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -1572,7 +1574,7 @@ impl SlashCommand for HooksCommand {
             // so the user knows what to do.
             return CommandResult::Message(
                 "No hooks configured.\n\
-                 Add hooks to ~/.claurst/settings.json under the 'hooks' key.\n\
+                 Add hooks to ~/.clawde/settings.json under the 'hooks' key.\n\
                  Example:\n\
                  \x20 \"hooks\": {\n\
                  \x20   \"PreToolUse\": [{ \"matcher\": \"*\", \"hooks\": [{ \"type\": \"command\", \"command\": \"echo $STDIN\" }] }]\n\
@@ -1614,7 +1616,7 @@ impl SlashCommand for ThinkingCommand {
         } else {
             CommandResult::Message(format!(
                 "Extended thinking is available with {}.\n\
-                 You can request thinking by asking Claurst to 'think step by step' or \
+                 You can request thinking by asking Clawde to 'think step by step' or \
                  'think carefully before answering'.",
                 model
             ))
@@ -1786,6 +1788,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(MemoryCommand),
         Box::new(UsageCommand),
         Box::new(DoctorCommand),
+        Box::new(HealthCommand),
         Box::new(LoginCommand),
         Box::new(LogoutCommand),
         Box::new(AccountsCommand),
@@ -1826,7 +1829,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "add-dir",
             target_name: "add-dir",
             slash_aliases: &[],
-            slash_description: "Add a directory to Claurst's allowed workspace paths",
+            slash_description: "Add a directory to Clawde's allowed workspace paths",
             slash_help: "Usage: /add-dir <path>",
         }),
         Box::new(NamedCommandAdapter {
@@ -1854,7 +1857,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "passes",
             target_name: "passes",
             slash_aliases: &[],
-            slash_description: "Share a free week of Claurst with friends",
+            slash_description: "Share a free week of Clawde with friends",
             slash_help: "Usage: /passes",
         }),
         Box::new(NamedCommandAdapter {
@@ -1875,28 +1878,28 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "desktop",
             target_name: "desktop",
             slash_aliases: &[],
-            slash_description: "Open the Claurst desktop app",
+            slash_description: "Open the Clawde desktop app",
             slash_help: "Usage: /desktop",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "mobile",
             target_name: "mobile",
             slash_aliases: &[],
-            slash_description: "Set up Claurst on mobile",
+            slash_description: "Set up Clawde on mobile",
             slash_help: "Usage: /mobile",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "install-github-app",
             target_name: "install-github-app",
             slash_aliases: &[],
-            slash_description: "Set up Claurst GitHub Actions for a repository",
+            slash_description: "Set up Clawde GitHub Actions for a repository",
             slash_help: "Usage: /install-github-app",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "web-setup",
             target_name: "remote-setup",
             slash_aliases: &["remote-setup"],
-            slash_description: "Configure a remote Claurst environment",
+            slash_description: "Configure a remote Clawde environment",
             slash_help: "Usage: /web-setup",
         }),
         Box::new(NamedCommandAdapter {
@@ -1923,6 +1926,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ExtraUsageCommand),
         Box::new(ImageCommand),
         Box::new(FastCommand),
+        Box::new(OllamaModeCommand),
         Box::new(ThinkBackCommand),
         Box::new(ThinkBackPlayCommand),
         Box::new(ColorSetCommand),
@@ -2242,7 +2246,7 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
 pub mod named_commands;
 
 // ---------------------------------------------------------------------------
-// Stats analytics (persisted transcript aggregation) — backs `claurst stats`.
+// Stats analytics (persisted transcript aggregation) — backs `clawde stats`.
 // The current-session `/stats` slash command lives above; this module reads
 // JSONL transcripts on disk.
 // ---------------------------------------------------------------------------

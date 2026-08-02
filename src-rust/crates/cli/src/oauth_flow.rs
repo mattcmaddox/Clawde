@@ -1,9 +1,9 @@
-// OAuth 2.0 PKCE login flow for the Claurst CLI.
+// OAuth 2.0 PKCE login flow for the Clawde CLI.
 //
 // Uses the Claude Code client ID and impersonates Claude Code at request time
 // (see `clawde_core::oauth_config` for the impersonation constants and
 // `clawde_api::AnthropicClient::apply_oauth_stealth` for how they're applied).
-// Claude Pro/Max tokens used through Claurst draw from the account's "extra
+// Claude Pro/Max tokens used through Clawde draw from the account's "extra
 // usage" pool, not subscription quota — users should be aware of this before
 // switching from API-key auth.
 //

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Where a plugin came from (mirrors the TS `source` field on `LoadedPlugin`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PluginSource {
-    /// `~/.claurst/plugins/`
+    /// `~/.clawde/plugins/`
     User,
     /// `<project>/.claurst/plugins/`
     Project,
@@ -109,7 +109,7 @@ impl CommandRunAction {
 
 /// A plugin-defined slash command, ready for registration in the command system.
 ///
-/// `cc-plugins` does NOT implement `claurst_commands::SlashCommand` directly (that
+/// `cc-plugins` does NOT implement `clawde_commands::SlashCommand` directly (that
 /// would create a circular dependency).  Instead `cc-commands` wraps
 /// `PluginCommandDef` in a thin adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]

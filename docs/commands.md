@@ -18,7 +18,7 @@ This document is the complete reference for every slash command available in Cla
 10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
 11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
 12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/rocky`, `/normal`, `/mobile`, `/color`, `/stickers`
-13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/version`, `/update`
+13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/version`, `/update`
 14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
 15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
 16. [Command Availability](#command-availability)
@@ -717,6 +717,7 @@ Show the current session status. Includes active model, permission mode, thinkin
 ---
 
 ### /insights
+**Aliases:** `ctx-viz`
 
 Generate an analytical report of the current session. Prints a structured breakdown of conversation statistics including turn count, token usage (input/output/total), average tokens per exchange, estimated cost, total tool calls, and the most frequently invoked tool.
 
@@ -1175,6 +1176,32 @@ Run the Clawde diagnostics suite. Checks configuration integrity, provider conne
 
 ---
 
+### /health
+
+Probe every stored free-mode API key and report per-key health. Each key is
+checked with a live request to the provider's `/v1/models` endpoint (5s
+timeout). Upstreams whose models endpoint does not validate the key —
+**nvidia**, **huggingface**, **openrouter**, **sambanova**, **cline** — get a
+1-token `chat/completions` confirmation probe instead, so dead keys on those
+providers are actually caught (their models endpoint returns 200 even for a
+garbage key). Keys that fail authentication are marked exhausted in the
+running key rings (visible in the footer and `/ctx-viz`).
+
+Pass an upstream id to probe just that provider — useful when chasing one bad
+key without waiting for the whole catalog.
+
+```
+/health
+/health nvidia
+/health groq
+```
+
+The same probe runs automatically at startup and every
+`health_poll_interval_secs` (default 300s) in the background; the footer shows
+a `⚠ N dead` marker when the last sweep found unhealthy keys.
+
+---
+
 ### /version
 **Aliases:** `v`
 
@@ -1192,10 +1219,31 @@ Display the current Clawde version string and build metadata.
 
 Check for available updates. Queries the GitHub releases API and displays the latest version. If a newer version exists, prints the download URL or upgrade instructions. Does not auto-update.
 
+All GitHub API calls send the required `User-Agent`, `Accept`, and
+`X-GitHub-Api-Version` headers.
+
 ```
 /update
 /upgrade
 ```
+
+#### GitHub API rate-limit surfacing
+
+When the anonymous API quota runs low (≤ 5 requests remaining), `/update` and
+`/release-notes` append a warning with the reset countdown. A `403` response
+appends a precise retry hint (`Retry after ~X min`) parsed from the current
+response's `Retry-After` header or `X-RateLimit-Reset` timestamp — a
+primary-limit 403 carries the reset in the body headers, so the timing shown is
+the real one, not a stale store value.
+
+The last-seen quota is persisted to disk (pruned once its reset window
+passes) and surfaced in three places:
+
+- the TUI footer as a `⚠ gh N/M (resets in ~X min)` badge when ≤ 5 requests
+  remain (red at 0, yellow otherwise)
+- `/ctx-viz` as a **GitHub API** section with `Requests: N / M`
+  (green > 5, yellow ≤ 5, red at 0)
+- `/doctor` as a `GitHub API: N/M requests` line
 
 ---
 

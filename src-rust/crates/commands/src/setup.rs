@@ -22,7 +22,7 @@ impl SlashCommand for StatuslineCommand {
     fn help(&self) -> &str {
         "Usage: /statusline [show|hide] [cost|tokens|model|time|all]\n\n\
          Controls which items appear in the TUI status bar at the bottom.\n\
-         Settings are persisted to ~/.claurst/ui-settings.json.\n\n\
+         Settings are persisted to ~/.clawde/ui-settings.json.\n\n\
          Examples:\n\
            /statusline               — show current configuration\n\
            /statusline show cost     — show cost in status line\n\
@@ -126,7 +126,7 @@ impl SlashCommand for SecurityReviewCommand {
     }
     fn help(&self) -> &str {
         "Usage: /security-review [path]\n\n\
-         Asks Claurst to perform a security review of the codebase.\n\
+         Asks Clawde to perform a security review of the codebase.\n\
          Analyzes for common vulnerabilities: injection attacks, auth issues,\n\
          secrets exposure, unsafe deserialization, path traversal, etc."
     }
@@ -171,12 +171,12 @@ impl SlashCommand for TerminalSetupCommand {
         "terminal-setup"
     }
     fn description(&self) -> &str {
-        "Help configure your terminal for optimal Claurst use"
+        "Help configure your terminal for optimal Clawde use"
     }
     fn help(&self) -> &str {
         "Usage: /terminal-setup\n\n\
          Diagnoses your terminal environment and gives recommendations for\n\
-         optimal Claurst display (font, color support, Unicode, etc.)."
+         optimal Clawde display (font, color support, Unicode, etc.)."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -249,7 +249,7 @@ impl SlashCommand for TerminalSetupCommand {
             "Terminal Setup Diagnostic\n\
              ─────────────────────────\n\
              {checks}\n\n\
-             Recommendations for optimal Claurst experience:\n\
+             Recommendations for optimal Clawde experience:\n\
              ─────────────────────────────────────────────────\n\
              1. Font: Use a Nerd Font for box-drawing characters and icons\n\
                 {nerd_hint}\n\

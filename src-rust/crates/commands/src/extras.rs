@@ -9,6 +9,7 @@ pub struct AdvisorCommand;
 pub struct FastCommand;
 pub struct ImageCommand;
 pub struct ColorSetCommand;
+pub struct OllamaModeCommand;
 
 // ---- /advisor ------------------------------------------------------------
 
@@ -210,7 +211,7 @@ impl SlashCommand for FastCommand {
         "Usage: /fast [on|off]\n\n\
          Fast mode switches to the active provider's smaller, faster model\n\
          for quick responses. Toggle without argument to switch.\n\
-         The setting is persisted to ~/.claurst/ui-settings.json."
+         The setting is persisted to ~/.clawde/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -320,5 +321,40 @@ impl SlashCommand for ColorSetCommand {
             )),
             Err(e) => CommandResult::Error(format!("Failed to save color: {}", e)),
         }
+    }
+}
+
+// ---- /ollama (tab completion only — intercepted by the TUI) --------------
+
+#[async_trait]
+impl SlashCommand for OllamaModeCommand {
+    fn name(&self) -> &str {
+        "ollama"
+    }
+    fn description(&self) -> &str {
+        "Toggle Ollama connectivity mode (auto / isolated)"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion {
+                value: "auto".into(),
+                description: "Ollama participates in free-model fallback, network tools allowed"
+                    .into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "isolated".into(),
+                description: "Ollama isolated — network tools blocked for privacy".into(),
+                available: true,
+            },
+        ]
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        CommandResult::Message(
+            "Ollama mode is toggled in the TUI. Use /ollama without arguments \
+             or press Alt+O to switch between auto and isolated mode."
+                .to_string(),
+        )
     }
 }

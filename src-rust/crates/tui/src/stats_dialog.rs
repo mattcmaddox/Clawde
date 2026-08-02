@@ -1,7 +1,7 @@
 //! Stats dialog — mirrors src/components/Stats.tsx
 //!
 //! Four-tab overlay: Overview | Daily Tokens | Cost Heatmap | Models
-//! Data source: ~/.claurst/stats.jsonl (append-only per-turn usage log)
+//! Data source: ~/.clawde/stats.jsonl (append-only per-turn usage log)
 
 use ratatui::{
     buffer::Buffer,
@@ -22,7 +22,7 @@ use crate::overlays::{
 // Data types
 // ---------------------------------------------------------------------------
 
-/// A single entry in ~/.claurst/stats.jsonl
+/// A single entry in ~/.clawde/stats.jsonl
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatsEntry {
     pub timestamp_ms: u64,
@@ -74,7 +74,7 @@ pub struct ModelBreakdown {
 // Data loading
 // ---------------------------------------------------------------------------
 
-/// Load and aggregate stats from ~/.claurst/stats.jsonl
+/// Load and aggregate stats from ~/.clawde/stats.jsonl
 pub fn load_stats() -> AggregatedStats {
     let path = clawde_core::config::Settings::config_dir().join("stats.jsonl");
 
@@ -442,17 +442,12 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
         Span::raw(format_tokens(data.total_output_tokens)),
     ]));
     lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled(
-            clawde_core::format_utils::format_usage_summary(
-                total_tokens,
-                data.total_cost_cents,
-            ),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        clawde_core::format_utils::format_usage_summary(total_tokens, data.total_cost_cents),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )]));
 
     // Streak display
     lines.push(Line::default());

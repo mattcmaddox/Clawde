@@ -42,7 +42,7 @@ impl McpToken {
 
 /// Directory holding the MCP OAuth token store.
 ///
-/// Defaults to `<claurst home>/mcp-tokens`, but can be redirected with the
+/// Defaults to `<clawde home>/mcp-tokens`, but can be redirected with the
 /// `CLAURST_MCP_TOKENS_DIR` environment variable. The override lets tests run
 /// hermetically (and lets packagers/sandboxes relocate the store) without
 /// writing to the real HOME, which is unwritable in sandboxed builds.

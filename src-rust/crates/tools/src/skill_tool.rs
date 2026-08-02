@@ -41,7 +41,7 @@ impl Tool for SkillTool {
 
     fn description(&self) -> &str {
         "Execute a skill (custom prompt template) by name. \
-         Skills are .md files in .claurst/commands/ or ~/.claurst/commands/. \
+         Skills are .md files in .claurst/commands/ or ~/.clawde/commands/. \
          Use skill=\"list\" to discover available skills. \
          The expanded skill prompt is returned for you to act on."
     }

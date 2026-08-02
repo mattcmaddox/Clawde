@@ -306,7 +306,6 @@ impl AuthStore {
             "deepinfra" => "DEEPINFRA_API_KEY",
             "venice" => "VENICE_API_KEY",
             "github-copilot" => "GITHUB_TOKEN",
-            "github-models" => "GITHUB_TOKEN",
             "azure" => "AZURE_API_KEY",
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
@@ -337,6 +336,11 @@ impl AuthStore {
             "routing" => "ROUTING_API_KEY",
             "neuralwatt" => "NEURALWATT_API_KEY",
             "cline" => "CLINE_API_KEY",
+            // cloudflare adapter reads CLOUDFLARE_API_TOKEN (plus
+            // CLOUDFLARE_ACCOUNT_ID for the URL path; the token env var
+            // carries the composite ACCOUNT_ID:API_TOKEN when no separate
+            // account var is set).
+            "cloudflare" => "CLOUDFLARE_API_TOKEN",
             "custom-openai" => "CUSTOM_OPENAI_API_KEY",
             "ollama" | "lm-studio" | "llama-cpp" => "", // No API key required
             _ => return None,

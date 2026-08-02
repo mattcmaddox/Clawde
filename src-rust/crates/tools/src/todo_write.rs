@@ -26,7 +26,7 @@ pub fn todos_path(session_id: &str) -> anyhow::Result<PathBuf> {
     Ok(todos_dir().join(format!("{}.json", session_id)))
 }
 
-/// Directory holding persisted todo lists (`<claurst home>/todos`).
+/// Directory holding persisted todo lists (`<clawde home>/todos`).
 fn todos_dir() -> PathBuf {
     clawde_core::config::Settings::config_dir().join("todos")
 }
@@ -386,11 +386,11 @@ mod tests {
         );
         // Route the assertion through the same canonical resolver instead of
         // hardcoding `.claurst`: the todos file must live under the resolved
-        // claurst home (which may be ~/.clawde, $CLAWDE_HOME, or the XDG dir).
+        // Clawde home (which may be ~/.clawde, $CLAWDE_HOME, or the XDG dir).
         let home = clawde_core::config::Settings::config_dir();
         assert!(
             path.starts_with(home.join("todos")),
-            "todos_path should be under the claurst home"
+            "todos_path should be under the Clawde home"
         );
         assert!(
             path_str.ends_with(".json"),

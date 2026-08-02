@@ -231,6 +231,11 @@ pub struct SystemPromptOptions {
     /// all per-tool guidance is emitted — preserving the previous behaviour
     /// for callers that don't yet thread the tool list through.
     pub enabled_tools: Option<Vec<String>>,
+    /// When `true`, network-capable tools (WebSearch, WebFetch) are blocked
+    /// by the permission system (ollama isolated / offline mode).  A hint is
+    /// injected into the dynamic section so the model knows not to attempt
+    /// these tools.
+    pub network_blocked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +331,18 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 14. Appended system prompt (--append-system-prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
+    }
+
+    // 15. Network-blocked hint (ollama isolated / offline mode).
+    // Injected so the model knows WebSearch/WebFetch will be denied and
+    // doesn't waste turns attempting them.
+    if opts.network_blocked {
+        parts.push(
+            "\n<offline_mode>\nNetwork tools (WebSearch, WebFetch) are \
+             currently blocked. Do not attempt to use them — they will be \
+             denied. Use local tools (Read, Grep, Glob, Bash) instead.\n</offline_mode>"
+                .to_string(),
+        );
     }
 
     parts.join("\n")

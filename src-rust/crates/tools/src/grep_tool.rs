@@ -210,14 +210,18 @@ impl Tool for GrepTool {
             .into_iter()
             .filter_entry(|e| {
                 let name = e.file_name().to_string_lossy();
-                if name.starts_with('.') || name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" {
+                if name.starts_with('.')
+                    || name == "node_modules"
+                    || name == "target"
+                    || name == "__pycache__"
+                    || name == ".git"
+                {
                     return false;
                 }
                 // Skip git-ignored directories so we don't descend into
                 // e.g. dist/, build/, etc.
                 if let Some(ref root) = repo_root {
-                    if e.file_type().is_dir()
-                        && clawde_core::git_utils::is_ignored(root, e.path())
+                    if e.file_type().is_dir() && clawde_core::git_utils::is_ignored(root, e.path())
                     {
                         return false;
                     }

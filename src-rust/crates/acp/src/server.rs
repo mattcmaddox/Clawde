@@ -137,7 +137,7 @@ impl AgentServer {
         *self.client_capabilities.write() = req.client_capabilities.clone();
 
         let agent_info = acp::Implementation::new("clawde", env!("CARGO_PKG_VERSION"))
-            .title(Some("Claurst".to_string()));
+            .title(Some("Clawde".to_string()));
 
         let mut response = acp::InitializeResponse::new(acp::ProtocolVersion::V1)
             .agent_capabilities(

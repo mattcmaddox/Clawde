@@ -92,6 +92,11 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "app.cline.bot/settings",
     },
     ProviderMetadata {
+        id: "cloudflare",
+        env_var: "CLOUDFLARE_API_TOKEN",
+        key_url: "dash.cloudflare.com",
+    },
+    ProviderMetadata {
         id: "cloudflare-ai-gateway",
         env_var: "CLOUDFLARE_API_TOKEN",
         key_url: "the provider's website",
@@ -128,11 +133,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         id: "github-copilot",
-        env_var: "GITHUB_TOKEN",
-        key_url: "github.com/settings/tokens",
-    },
-    ProviderMetadata {
-        id: "github-models",
         env_var: "GITHUB_TOKEN",
         key_url: "github.com/settings/tokens",
     },

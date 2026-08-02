@@ -1,6 +1,6 @@
-// ConfigTool: get or set Claurst configuration settings at runtime.
+// ConfigTool: get or set Clawde configuration settings at runtime.
 //
-// Reads from and persists to ~/.claurst/settings.json.
+// Reads from and persists to ~/.clawde/settings.json.
 // Supported settings: model, max_tokens, verbose, permission_mode.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
@@ -37,9 +37,9 @@ impl Tool for ConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Get or set Claurst configuration settings. Omit 'value' to read the current value. \
+        "Get or set Clawde configuration settings. Omit 'value' to read the current value. \
          Supported settings: model, max_tokens, verbose, permission_mode, auto_compact. \
-         Changes persist to ~/.claurst/settings.json."
+         Changes persist to ~/.clawde/settings.json."
     }
 
     fn permission_level(&self) -> PermissionLevel {

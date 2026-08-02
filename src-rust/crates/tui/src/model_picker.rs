@@ -1203,7 +1203,7 @@ mod tests {
             r#"{{"anthropic":{{"id":"anthropic","name":"Anthropic","models":{{"{novel_id}":{{"id":"{novel_id}","name":"Claude Opus 9.9","release_date":"2099-12-31","limit":{{"context":200000,"output":64000}}}}}}}}}}"#
         );
         let path = std::env::temp_dir().join(format!(
-            "claurst_picker_{}_{}.json",
+            "clawde_picker_{}_{}.json",
             std::process::id(),
             novel_id
         ));

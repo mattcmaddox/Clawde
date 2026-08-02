@@ -193,17 +193,19 @@ If the user's instructions conflict with the rules above, ask for confirmation t
 
 ```
 Level 1: FreeProvider (across providers)
-  ├── upstream[0]:  Groq
-  ├── upstream[1]:  Cerebras
-  ├── upstream[2]:  Google Gemini
-  ├── upstream[3]:  Mistral
-  ├── upstream[4]:  SambaNova
-  ├── upstream[5]:  NVIDIA
-  ├── upstream[6]:  Cohere
-  ├── upstream[7]:  OpenRouter
-  ├── upstream[8]:  OpenCode Zen
-  ├── upstream[9]:  Z.AI
-  └── upstream[10]: Zhipu
+  ├── upstream[0]:  Hugging Face
+  ├── upstream[1]:  NVIDIA NIM
+  ├── upstream[2]:  Cerebras
+  ├── upstream[3]:  Google Gemini
+  ├── upstream[4]:  Cloudflare Workers AI
+  ├── upstream[5]:  Groq
+  ├── upstream[6]:  SambaNova
+  ├── upstream[7]:  Cline
+  ├── upstream[8]:  Mistral
+  ├── upstream[9]:  Cohere
+  ├── upstream[10]: OpenCode Zen
+  ├── upstream[11]: Z.AI
+  └── upstream[12]: OpenRouter
 
 Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
   └── key[0], key[1], key[2], ...  (round-robins on exhaustion)
@@ -267,8 +269,15 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 
 ### Chain Assembly (`build_free_provider`)
 
-- `FREE_CATALOG` constant at free.rs:54-158 defines 11 upstreams by priority
+- `FREE_CATALOG` constant at free.rs:70-192 defines 13 upstreams by priority
 - Each `FreeUpstream` has: id, title, key_url, default_model, note
+- Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
+  so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation
+  uses the chat probe (the `/ai/v1/models` endpoint returns 405 for GET)
+- Groq: free tier is fast but token-capped (100-200K TPD on strong models,
+  12K TPM) — a quick-task lane, not a daily driver
 - OpenCode Zen/Go key sharing: checks both auth store slots
 - Silent skip for unconfigured upstreams (no error)
-- Catalog order = fallback priority (Groq first as fastest/most generous)
+- Catalog order = fallback priority (Hugging Face first; see the
+  FREE_CATALOG constant at free.rs:70-192 for the authoritative 13-upstream
+  order — GitHub Models (retired 2026-07-30) is no longer included)

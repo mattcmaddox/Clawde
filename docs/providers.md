@@ -58,6 +58,15 @@ Use the `/keys` slash command to manage keys:
 /keys list groq
 ```
 
+**Cloudflare composite keys:** Cloudflare's OpenAI-compatible endpoint embeds the
+account ID in the URL path, so a stored key must carry both halves joined by a
+colon — `ACCOUNT_ID:API_TOKEN`. `/keys` shape-validates this before saving; a
+bare token or a key with an empty half is rejected with a format hint.
+
+```
+/keys add cloudflare abc123def456:your-api-token
+```
+
 ### Key rotation behavior
 
 - **Rate limited (429):** The exhausted key cools down for 60 seconds (or the

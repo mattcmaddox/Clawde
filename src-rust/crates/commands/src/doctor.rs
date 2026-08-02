@@ -26,7 +26,7 @@ impl SlashCommand for DoctorCommand {
          - Disk space\n\
          - Config file integrity\n\
          - Tool permission summary\n\
-         - Claurst version"
+         - Clawde version"
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -34,7 +34,7 @@ impl SlashCommand for DoctorCommand {
 
         // ── Header ─────────────────────────────────────────────────────────
         lines.push(format!(
-            "Claurst v{}  |  {}",
+            "Clawde v{}  |  {}",
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
         ));
@@ -211,7 +211,7 @@ impl SlashCommand for DoctorCommand {
             lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
 
-        // Settings validation — try loading ~/.claurst/settings.json
+        // Settings validation — try loading ~/.clawde/settings.json
         let settings_path = config_dir.join("settings.json");
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path)

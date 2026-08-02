@@ -6,7 +6,7 @@ use crate::agents_view::render_agents_menu;
 use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::ask_user_dialog::render_ask_user_dialog;
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
-use crate::context_viz::render_context_viz;
+use crate::context_viz::{key_ring_rows_from_registry, render_context_viz};
 use crate::custom_provider_dialog::render_custom_provider_dialog;
 use crate::desktop_upsell_startup::render_desktop_upsell_startup;
 use crate::device_auth_dialog::render_device_auth_dialog;
@@ -595,8 +595,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             // error strings (e.g. "Error: overloaded_error (529): …") wrap
             // instead of overflowing the input area.  Cap at 3 lines.
             let usable_width = size.width.max(1) as usize;
-            let char_count = text.chars().count();
-            char_count.div_ceil(usable_width).clamp(1, 3) as u16
+            let rows = text.split('\n').fold(0usize, |acc, line| {
+                acc + line.chars().count().div_ceil(usable_width)
+            });
+            rows.clamp(1, 3) as u16
         } else {
             1
         }
@@ -906,30 +908,53 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // Context visualization overlay
     if app.context_viz.visible {
+        // Prefer the live app registry (refreshed after key / routing changes)
+        // so the key-health table reflects the current chain; fall back to the
+        // startup callback when no registry is wired (e.g. tests).
+        let mut key_rows = app
+            .provider_registry
+            .as_ref()
+            .map(|reg| key_ring_rows_from_registry(reg.as_ref()))
+            .or_else(|| app.key_ring_data_fn.as_ref().map(|f| f()))
+            .unwrap_or_default();
+        // Merge per-provider HTTP rate limit data into the table rows.
+        for row in &mut key_rows {
+            if let Some(&(tokens, requests)) = app
+                .provider_http_rates
+                .get(&row.provider_name.to_lowercase())
+            {
+                row.tokens_pct = Some(tokens);
+                row.requests_pct = Some(requests);
+            }
+        }
+        // Per-upstream key-health and cooldown state for the free provider
+        // (drives the status dots and cooldown annotations in the table).
+        let free_health = app
+            .provider_registry
+            .as_ref()
+            .map(|r| r.upstream_key_health_summaries())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(pid, _)| pid == "free")
+            .map(|(_, entries)| entries)
+            .unwrap_or_default();
+        let free_cooldowns = app
+            .provider_registry
+            .as_ref()
+            .map(|r| r.upstream_cooldown_summaries())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(pid, _)| pid == "free")
+            .map(|(_, entries)| entries)
+            .unwrap_or_default();
+
         render_context_viz(
             frame,
             &app.context_viz,
             size,
             app.context_used_tokens,
             app.context_window_size,
-            {
-                let mut rows = app
-                    .key_ring_data_fn
-                    .as_ref()
-                    .map(|f| f())
-                    .unwrap_or_default();
-                // Merge per-provider HTTP rate limit data into the table rows.
-                for row in &mut rows {
-                    if let Some(&(tokens, requests)) = app
-                        .provider_http_rates
-                        .get(&row.provider_name.to_lowercase())
-                    {
-                        row.tokens_pct = Some(tokens);
-                        row.requests_pct = Some(requests);
-                    }
-                }
-                rows
-            },
+            key_rows,
             app.cost_usd,
             app.messages.len(),
             app.messages
@@ -945,6 +970,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                 .flat_map(|m| m.get_tool_use_blocks())
                 .count(),
             app.free_model_defaults.clone(),
+            free_health,
+            free_cooldowns,
         );
     }
 
@@ -1982,7 +2009,6 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
     // Free mode health badge — shows key count when free mode has keys
     let free_filled = app.free_mode_dialog.filled_count();
-    let free_total = app.free_mode_dialog.fields.len();
     if free_filled > 0 {
         right_lines.push(Line::from(vec![
             Span::styled(
@@ -1992,7 +2018,11 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{} / {} keys", free_filled, free_total),
+                format!(
+                    "{} key{}",
+                    free_filled,
+                    if free_filled == 1 { "" } else { "s" }
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -2492,7 +2522,9 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                     Some(idx - 1)
                 };
                 if let Some(ui) = safe_idx {
-                    if let Some((upstream, upstream_model)) = app.free_model_defaults.get(ui) {
+                    if let Some((_upstream_id, upstream, upstream_model)) =
+                        app.free_model_defaults.get(ui)
+                    {
                         provider = upstream.clone();
                         model_short = upstream_model.clone();
                     }
@@ -2796,10 +2828,20 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                     };
                     let retry_label =
                         retry_secs.map(|s| format!("retry in {}", format_duration_ms(s * 1000)));
-                    let label = match retry_label {
+                    let mut label = match retry_label {
                         Some(r) => format!("{}:{}/{} ({})", provider, active, total, r),
                         None => format!("{}:{}/{}", provider, active, total),
                     };
+                    // Fallback-models count for the free provider: how many
+                    // configured upstreams carry a secondary model (e.g.
+                    // nvidia 70B -> 8B). Surfaced so users know the chain
+                    // can self-recover on a slow primary.
+                    if provider == "free" {
+                        let fb = free_fallback_upstream_count(&app.free_model_defaults);
+                        if fb > 0 {
+                            label.push_str(&format!(" \u{00b7} {} fb", fb));
+                        }
+                    }
                     spans.push(Span::styled(label, Style::default().fg(color)));
                     spans.push(Span::raw(" "));
                 }
@@ -2882,9 +2924,33 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(spans_to_text(spans)).wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
+}
+
+/// Convert a run of styled spans into a `Text`, splitting any embedded `\n`
+/// into separate lines. Ratatui's `Line` renders an embedded newline as
+/// inline content, so multi-line strings (e.g. `/keys` error hints) would
+/// glue into words like "hasno" when the status row wraps — splitting first
+/// keeps multi-line messages readable. Single-line messages are unchanged.
+fn spans_to_text(spans: Vec<Span<'static>>) -> ratatui::text::Text<'static> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        for (i, part) in span.content.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Line::from(std::mem::take(&mut current)));
+            }
+            if !part.is_empty() {
+                current.push(Span::styled(part.to_string(), span.style));
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    ratatui::text::Text::from(lines)
 }
 
 /// Build spans for a text string with a right-to-left glimmer sweep, matching
@@ -2937,6 +3003,20 @@ fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
         spans.push(Span::styled(run, if run_bright { bright } else { base }));
     }
     spans
+}
+
+/// Count how many configured free upstreams carry at least one secondary
+/// (fallback) model in the catalog. Used for the footer's `N fb` badge next
+/// to the free key-ring health label.
+fn free_fallback_upstream_count(defaults: &[(String, String, String)]) -> usize {
+    defaults
+        .iter()
+        .filter(|(upstream_id, _, _)| {
+            clawde_api::FREE_CATALOG
+                .iter()
+                .any(|u| u.id == upstream_id && !u.fallback_models.is_empty())
+        })
+        .count()
 }
 // Keybinding hints footer
 // -----------------------------------------------------------------------
@@ -3086,6 +3166,35 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(label, style));
         }
 
+        // Ollama connectivity mode indicator — dim and unobtrusive.
+        // Shows whether Ollama is in Auto (participates in free-model
+        // fallback) or Isolated (offline: no network tools).
+        {
+            let (label, color) = match app.ollama_mode {
+                clawde_core::OllamaMode::Auto => (" ollama:auto ", Color::Rgb(80, 140, 80)),
+                clawde_core::OllamaMode::Isolated => {
+                    (" \u{1f512} ollama:offline ", Color::Rgb(60, 140, 200))
+                }
+            };
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::DIM),
+            ));
+        }
+
+        // Health sweep indicator — red warning marker when the last background
+        // probe found dead keys. Hidden when everything is healthy.
+        if let Some(sweep) = app.last_health_sweep.as_ref() {
+            if sweep.unhealthy > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!(" \u{26a0} {} dead ", sweep.unhealthy),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
         // GitHub API quota — warning marker when the update-check quota is low
         // (≤ 5 requests left), mirroring the key-ring / health-sweep badges.
         if let Some(limit) = clawde_core::github::last_rate_limit() {
@@ -3107,6 +3216,58 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                         )
                     ),
                     Style::default().fg(gh_color).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
+        // Free-mode aggregate indicator — compact and unobtrusive, shown only
+        // when the whole free chain is down: every key in the free key rings
+        // is exhausted, or every configured upstream is in a 5xx/empty
+        // cooldown. Mirrors the ollama indicator's placement.
+        {
+            let free_aggregate: Option<(usize, usize, Option<u64>)> =
+                app.provider_registry.as_ref().and_then(|reg| {
+                    let provider = reg.get(&clawde_core::ProviderId::new("free"))?;
+                    let chain_len = app.free_model_defaults.len();
+                    if chain_len == 0 {
+                        return None;
+                    }
+                    // Key-ring exhaustion (multi-key upstreams): all keys down.
+                    if let Some((active, total, retry)) = provider.key_ring_status() {
+                        if total > 0 && active == 0 {
+                            return Some((active, total, retry));
+                        }
+                    }
+                    // All-upstreams-cooled case: every chain entry is in a
+                    // 5xx / empty cooldown.
+                    let (cooled_count, cooled_retry) = reg
+                        .upstream_cooldown_summaries()
+                        .into_iter()
+                        .find(|(pid, _)| pid == "free")
+                        .map(|(_, entries)| {
+                            let retry = entries.iter().filter_map(|(_, _, r)| *r).min();
+                            (entries.len(), retry)
+                        })
+                        .unwrap_or((0, None));
+                    if cooled_count > 0 && cooled_count >= chain_len {
+                        Some((cooled_count, chain_len, cooled_retry))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((active, total, retry)) = free_aggregate {
+                let retry_label = retry
+                    .map(|s| format!("retry in {}", format_duration_ms(s * 1000)))
+                    .unwrap_or_default();
+                let label = if retry_label.is_empty() {
+                    format!(" free:{}/{} ", active, total)
+                } else {
+                    format!(" free:{}/{} ({}) ", active, total, retry_label)
+                };
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    label,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
                 ));
             }
         }
@@ -4804,5 +4965,32 @@ mod status_row_badge_tests {
             "'Fast' badge should survive a model change. Output: {:?}",
             out
         );
+    }
+
+    #[test]
+    fn spans_to_text_splits_multiline_status_messages() {
+        let text = spans_to_text(vec![Span::styled(
+            "line one\nline two\nline three".to_string(),
+            Style::default().fg(Color::Red),
+        )]);
+        let rendered: Vec<String> = text.lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(rendered, vec!["line one", "line two", "line three"]);
+        // Style is preserved on every split fragment.
+        for line in &text.lines {
+            for span in &line.spans {
+                assert_eq!(span.style.fg, Some(Color::Red));
+            }
+        }
+    }
+
+    #[test]
+    fn spans_to_text_handles_single_line_and_trailing_newline() {
+        let single = spans_to_text(vec![Span::raw("hello")]);
+        assert_eq!(single.lines.len(), 1);
+        // A trailing newline must not create a spurious empty final line.
+        let trailing = spans_to_text(vec![Span::raw("a\nb\n")]);
+        assert_eq!(trailing.lines.len(), 2);
+        // Empty content produces no lines at all.
+        assert!(spans_to_text(Vec::new()).lines.is_empty());
     }
 }

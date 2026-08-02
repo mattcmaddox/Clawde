@@ -29,6 +29,9 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         // Forward the session's enabled tool set so per-tool guideline blocks
         // are only emitted for tools that are actually loaded (issue #233).
         enabled_tools: config.enabled_tools.clone(),
+        // Let the system prompt know when network tools are blocked so the
+        // model doesn't waste turns attempting WebSearch/WebFetch.
+        network_blocked: clawde_core::is_ollama_network_blocked(),
         ..Default::default()
     };
 

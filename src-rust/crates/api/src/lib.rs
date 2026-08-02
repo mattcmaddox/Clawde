@@ -766,7 +766,7 @@ pub mod client {
                         model
                     )
                 } else {
-                    "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                    "Set ANTHROPIC_API_KEY, run `clawde auth login`, \
                      or use --provider to select a different provider (e.g. --provider openai)."
                         .to_string()
                 };
@@ -885,7 +885,7 @@ pub mod client {
                 } else if model.starts_with("llama") {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {
-                    "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                    "Set ANTHROPIC_API_KEY, run `clawde auth login`, \
                      or use --provider to select a different provider (e.g. --provider openai)."
                         .to_string()
                 };
