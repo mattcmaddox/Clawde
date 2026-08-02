@@ -4845,6 +4845,21 @@ impl App {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
 
+                        // If the user already has credentials for this provider,
+                        // skip the re-auth dialog and activate directly.
+                        let already_connected = self
+                            .auth_store
+                            .api_key_for(&selected.id)
+                            .is_some_and(|k| k.len() >= 8);
+                        if already_connected {
+                            self.activate_provider(
+                                selected.id.clone(),
+                                selected.title.clone(),
+                                "Already connected — switched to",
+                            );
+                            return false;
+                        }
+
                         match selected.id.as_str() {
                             // Local providers — activate immediately, no key needed
                             "ollama" | "lmstudio" | "llamacpp" => {

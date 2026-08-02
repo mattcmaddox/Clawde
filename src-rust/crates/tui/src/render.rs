@@ -1909,7 +1909,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(accent))
         .title(Line::from(vec![
             Span::styled(
-                " Clawde ",
+                " \u{1F43E}Clawde ",
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
