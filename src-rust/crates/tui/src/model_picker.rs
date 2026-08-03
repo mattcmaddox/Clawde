@@ -535,7 +535,10 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         let host_count = upstreams.len();
         entries.push(ModelEntry {
             id: format!("free/family/{}", family),
-            display_name: format!("{} — pick provider", first.default_model),
+            // The model name alone — the description line already carries the
+            // hosting-provider list and the "round-robin" hint, so a "pick
+            // provider" suffix would just eat width and repeat the same info.
+            display_name: first.default_model.to_string(),
             description: format!(
                 "{} {} · $0.00 per M",
                 hosts,
@@ -1092,10 +1095,42 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 spans.push(Span::styled(icon, Style::default().fg(color).bg(bg)));
             }
 
-            spans.push(Span::styled(
-                model.display_name.clone(),
-                Style::default().fg(fg).bg(bg),
-            ));
+            // Row coloring — model-first family rows get a blue name
+            // (signals "auto round-robin across providers"), while pin rows
+            // split into a bright provider and a muted model id so the row
+            // reads "model | provider" at a glance.
+            if is_selected {
+                spans.push(Span::styled(
+                    model.display_name.clone(),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            } else if model.id.starts_with("free/family/") {
+                // Model-first rows are keyed by id (authoritative) so a family
+                // always renders blue even if its model name ever contained an
+                // em dash.
+                spans.push(Span::styled(
+                    model.display_name.clone(),
+                    Style::default().fg(Color::Rgb(140, 190, 255)).bg(bg),
+                ));
+            } else if let Some((provider_part, model_part)) =
+                model.display_name.split_once('\u{2014}')
+            {
+                // Pin rows split "Provider — model" into a bright provider and
+                // a muted model id so the row reads "model | provider".
+                spans.push(Span::styled(
+                    format!("{}\u{2014}", provider_part),
+                    Style::default().fg(Color::White).bg(bg),
+                ));
+                spans.push(Span::styled(
+                    model_part.to_string(),
+                    Style::default().fg(Color::Rgb(170, 170, 180)).bg(bg),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    model.display_name.clone(),
+                    Style::default().fg(fg).bg(bg),
+                ));
+            }
 
             // Effort indicator — show the effort clamped onto this model's
             // variants ladder so it never displays a tier the model can't do.
@@ -1842,6 +1877,18 @@ mod tests {
                 "upstream '{}' must have 'tools' capability (tool_calling: true)",
                 entry.id
             );
+        }
+
+        // Family entries must not carry a "pick provider" suffix — the model
+        // name alone is the display name (the description carries the hosts).
+        for entry in &upstream_entries {
+            if entry.id.starts_with("free/family/") {
+                assert!(
+                    !entry.display_name.contains("pick provider"),
+                    "family '{}' display name should not say 'pick provider'",
+                    entry.id
+                );
+            }
         }
 
         // Every upstream (including Google/gemini-2.5-flash) has at minimum
