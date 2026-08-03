@@ -1909,7 +1909,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(accent))
         .title(Line::from(vec![
             Span::styled(
-                " \u{1F43E}Clawde ",
+                " \u{1F43E} Clawde ",
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -2091,7 +2091,7 @@ fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let top = Line::from(vec![
         Span::styled("\u{256d}\u{2500}", Style::default().fg(accent)),
         Span::styled(
-            " \u{1F43E}Clawde ",
+            " \u{1F43E} Clawde ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(

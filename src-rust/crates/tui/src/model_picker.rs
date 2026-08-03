@@ -498,7 +498,7 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
 
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
-        display_name: "Auto (round-robin across configured providers)".to_string(),
+        display_name: "Auto".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
         reasoning: false,
@@ -1052,6 +1052,9 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         .map(|m| m.id == "free/auto")
         .unwrap_or(false);
 
+    // Section labels for sticky-header look-up (one per row in `lines`).
+    let mut line_sections: Vec<Option<&'static str>> = Vec::new();
+
     if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             " No results found",
@@ -1064,13 +1067,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
-        let mut prev_section: Option<&'static str> = None;
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
 
-            // Subtle section header for the free picker: model-first family
-            // entries, then provider-pin entries. `free/auto` needs no header.
             let section = if !is_free_picker_list || model.id == "free/auto" {
                 None
             } else if model.id.starts_with("free/family/") {
@@ -1078,17 +1078,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             } else {
                 Some("Provider pins")
             };
-            if let Some(name) = section {
-                if prev_section != Some(name) {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!(" {} ", name.to_uppercase()),
-                        Style::default()
-                            .fg(Color::Rgb(120, 120, 135))
-                            .add_modifier(Modifier::BOLD),
-                    )]));
-                }
-                prev_section = section;
-            }
+            line_sections.push(section);
 
             if is_selected {
                 selected_line_idx = lines.len() as u16;
@@ -1203,20 +1193,69 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         }
     }
 
-    // ── Scroll ──
+    // ── Sticky section header (free picker only) ──
+    // When the user scrolls past the Auto row the current section header
+    // pins itself at the top of the body so families / pins stay labeled.
+    let has_header = is_free_picker_list && body_area.height > 1;
+    let list_rows = if has_header {
+        body_area.height.saturating_sub(1)
+    } else {
+        body_area.height
+    };
+
     let total_lines = lines.len() as u16;
-    let visible = body_area.height;
-    let scroll_y = if total_lines <= visible {
+    let scroll_y = if total_lines <= list_rows {
         0u16
-    } else if selected_line_idx + 3 >= visible {
-        (selected_line_idx + 3).saturating_sub(visible)
+    } else if selected_line_idx + 3 >= list_rows {
+        (selected_line_idx + 3).saturating_sub(list_rows)
     } else {
         0
     };
 
-    let para = Paragraph::new(lines).bg(dialog_bg).scroll((scroll_y, 0));
+    if has_header && total_lines > 0 {
+        let top = scroll_y.min(total_lines.saturating_sub(1));
+        if let Some(name) = line_sections
+            .get(top as usize)
+            .copied()
+            .flatten()
+        {
+            let count = line_sections
+                .iter()
+                .filter(|s| **s == Some(name))
+                .count();
+            let header = Line::from(vec![Span::styled(
+                format!("  {}  · {} ", name.to_uppercase(), count),
+                Style::default()
+                    .fg(Color::Rgb(120, 120, 135))
+                    .add_modifier(Modifier::BOLD),
+            )]);
+            let header_area = Rect {
+                x: body_area.x,
+                y: body_area.y,
+                width: body_area.width,
+                height: 1,
+            };
+            Paragraph::new(vec![header])
+                .bg(dialog_bg)
+                .render(header_area, buf);
+        }
+    }
 
-    para.render(body_area, buf);
+    let list_area = if has_header {
+        Rect {
+            x: body_area.x,
+            y: body_area.y + 1,
+            width: body_area.width,
+            height: list_rows,
+        }
+    } else {
+        body_area
+    };
+
+    Paragraph::new(lines)
+        .bg(dialog_bg)
+        .scroll((scroll_y, 0))
+        .render(list_area, buf);
 
     let mut footer_spans = vec![
         Span::styled(" enter", Style::default().fg(dim)),
@@ -1579,16 +1618,19 @@ mod tests {
         }
     }
 
-    // 15b. The free picker renders subtle "MODEL FAMILIES" and
-    //      "PROVIDER PINS" section headers between the model-first family
-    //      entries and the provider-pin entries; the pin entries show the
-    //      provider name split from the (muted) model id.
+    // 15b. The free picker renders a sticky "MODEL FAMILIES · N" header
+    //      at the top of the body when the user scrolls past the Auto row.
+    //      `p.open` places the cursor on a pin row far enough down that
+    //      scrolling is forced and the family-section header sticks.
     #[test]
-    fn render_free_picker_shows_section_headers() {
+    fn render_free_picker_shows_sticky_section_headers() {
         let mut p = ModelPickerState::new();
         p.set_models(free_provider_models());
-        p.open("free/auto");
-        let area = Rect::new(0, 0, 120, 40);
+        // The Cerebras pin row sits at index ~15; with an area this short
+        // the body overflows and scroll_y is forced > 0, pinning the sticky
+        // header at the top.
+        p.open("cerebras/gpt-oss-120b");
+        let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
         render_model_picker(&p, area, &mut buf);
 
@@ -1600,16 +1642,12 @@ mod tests {
         let joined = rendered.join("\n");
 
         assert!(
-            joined.contains("MODEL FAMILIES"),
-            "free picker must render the MODEL FAMILIES header"
+            joined.contains("MODEL FAMILIES") && joined.contains(" · "),
+            "free picker must render the MODEL FAMILIES · N sticky header"
         );
+        // Pin row provider + model id split both present.
         assert!(
-            joined.contains("PROVIDER PINS"),
-            "free picker must render the PROVIDER PINS header"
-        );
-        // Pin row provider + model id both present (split display name).
-        assert!(
-            joined.contains("Hugging Face") && joined.contains("Llama-3.3-70B-Instruct"),
+            joined.contains("Cerebras") && joined.contains("gpt-oss-120b"),
             "pin row should show both provider and model id"
         );
     }
