@@ -55,6 +55,11 @@ pub struct FreeUpstream {
     pub title: &'static str,
     pub key_url: &'static str,
     pub default_model: &'static str,
+    /// Grouping key for "model-first" routing: upstreams hosting the same
+    /// model family share a slug (e.g. "llama-3.3-70b" covers Hugging Face,
+    /// NVIDIA and SambaNova). Selecting `free/family/<slug>` in the picker
+    /// round-robins across every hosting upstream in catalog order.
+    pub model_family: &'static str,
     pub note: &'static str,
     /// Whether the default model supports function/tool calling.
     pub tool_calling: bool,
@@ -79,6 +84,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "GitHub Copilot",
         key_url: "github.com/settings/tokens",
         default_model: "gpt-4o-2024-11-20",
+        model_family: "gpt-4o",
         note: "GPT-4o (16K ctx) — free OAuth via /connect",
         tool_calling: true,
         max_tokens_cap: Some(16_384),
@@ -90,6 +96,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Hugging Face",
         key_url: "huggingface.co/settings/tokens",
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
+        model_family: "llama-3.3-70b",
         note: "free Inference API — Llama 3.3 70B",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -100,6 +107,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "NVIDIA NIM",
         key_url: "build.nvidia.com",
         default_model: "meta/llama-3.3-70b-instruct",
+        model_family: "llama-3.3-70b",
         note: "Llama 3.3 70B — 2 keys",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -114,6 +122,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Cerebras",
         key_url: "cloud.cerebras.ai",
         default_model: "gpt-oss-120b",
+        model_family: "gpt-oss-120b",
         note: "GPT-OSS 120B (65K ctx) · Gemma 4 31B",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -125,6 +134,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Google Gemini",
         key_url: "aistudio.google.com/app/apikey",
         default_model: "gemini-2.5-flash",
+        model_family: "gemini-2.5-flash",
         note: "Gemini 2.5 Flash",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -135,6 +145,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Cloudflare Workers AI",
         key_url: "dash.cloudflare.com",
         default_model: CLOUDFLARE_PROBE_MODEL,
+        model_family: "qwen3-30b",
         note: "10K neurons/day — key format ACCOUNT_ID:API_TOKEN",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -145,6 +156,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Groq",
         key_url: "console.groq.com/keys",
         default_model: "openai/gpt-oss-120b",
+        model_family: "gpt-oss-120b",
         note: "GPT-OSS 120B · Llama 3.3 70B — 1K req/day",
         tool_calling: true,
         // The groq() factory's own quirks clamp max_tokens to 512 and total
@@ -158,6 +170,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "SambaNova",
         key_url: "cloud.sambanova.ai",
         default_model: "Meta-Llama-3.3-70B-Instruct",
+        model_family: "llama-3.3-70b",
         note: "Llama 3.3 70B · DeepSeek V3",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -169,6 +182,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Cline",
         key_url: "app.cline.bot/settings",
         default_model: "stepfun/step-3.7-flash",
+        model_family: "step-3.7-flash",
         note: "live free-model API — auto-discovers best model at startup",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -179,6 +193,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Mistral",
         key_url: "console.mistral.ai/api-keys",
         default_model: "labs-devstral-small-2512",
+        model_family: "devstral-small",
         note: "Devstral Small (free) · Large · Codestral",
         tool_calling: true,
         max_tokens_cap: None,
@@ -189,6 +204,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Cohere",
         key_url: "dashboard.cohere.com/api-keys",
         default_model: "north-mini-code-1-0",
+        model_family: "north-mini-code",
         note: "North Mini Code (free) · Command R+",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -199,6 +215,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "OpenCode Zen",
         key_url: "opencode.ai/auth",
         default_model: "minimax-m2.5-free",
+        model_family: "minimax-m2.5",
         note: "MiniMax M2.5 — 2 keys",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -209,6 +226,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "Z.AI",
         key_url: "z.ai/manage-apikey/apikey-list",
         default_model: "glm-4.7",
+        model_family: "glm-4.7",
         note: "GLM-4.7 · GLM-5 · GLM-5.1 — Zhipu AI international",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
@@ -220,6 +238,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         title: "OpenRouter",
         key_url: "openrouter.ai/keys",
         default_model: "openrouter/free",
+        model_family: "openrouter-free",
         note: "19 free-tier models — requires $10 prepaid credits",
         tool_calling: true,
         max_tokens_cap: None,
@@ -1745,6 +1764,13 @@ enum Route {
         start_idx: usize,
         pinned_model: String,
     },
+    /// Model-first routing: try every chain entry whose upstream hosts the
+    /// given `model_family` (in catalog order, each with its own default
+    /// model), then fall through to the remaining entries. This is the
+    /// `free/family/<slug>` selection from the model-first picker view —
+    /// e.g. `free/family/llama-3.3-70b` round-robins across Hugging Face,
+    /// NVIDIA and SambaNova before trying other model families.
+    Family { model_family: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -1959,6 +1985,26 @@ impl FreeProvider {
             trimmed.to_string()
         };
 
+        // Model-first family route: `free/family/<slug>` or `family/<slug>`.
+        // Resolve the slug against the catalog so an unknown family falls
+        // back to Auto rather than silently routing nowhere. We store the
+        // catalog's own `&'static str` family slug, never a borrow of the
+        // local `normalized` buffer.
+        if let Some(rest) = normalized
+            .strip_prefix("free/family/")
+            .or_else(|| normalized.strip_prefix("family/"))
+        {
+            if let Some(entry) = FREE_CATALOG
+                .iter()
+                .find(|entry| entry.model_family == rest)
+            {
+                return Route::Family {
+                    model_family: entry.model_family,
+                };
+            }
+            return Route::Auto;
+        }
+
         // Find a chain entry whose id is a prefix.
         for (idx, entry) in self.chain.iter().enumerate() {
             let prefix = format!("{}/", entry.upstream.id);
@@ -2053,6 +2099,22 @@ impl FreeProvider {
                 }
                 plan
             }
+            Route::Family { model_family } => {
+                // Model-first: all upstreams hosting the family in catalog
+                // order (with their per-upstream fallbacks), then the rest.
+                let mut plan = Vec::with_capacity(self.chain_len());
+                for (idx, _entry) in self.chain.iter().enumerate() {
+                    if self.chain[idx].upstream.model_family == *model_family {
+                        plan.extend(self.plan_rows_for_entry(idx));
+                    }
+                }
+                for (idx, _entry) in self.chain.iter().enumerate() {
+                    if self.chain[idx].upstream.model_family != *model_family {
+                        plan.extend(self.plan_rows_for_entry(idx));
+                    }
+                }
+                plan
+            }
         }
     }
 
@@ -2100,6 +2162,38 @@ impl FreeProvider {
                     plan.extend(group);
                 }
                 plan
+            }
+            Route::Family { model_family } => {
+                // Family upstreams first (each with their fallbacks), then the
+                // rest — both groups shuffled independently so the family
+                // still leads the plan.
+                let family_idx: Vec<usize> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| self.chain[*idx].upstream.model_family == *model_family)
+                    .map(|(idx, _)| idx)
+                    .collect();
+                let mut family_groups: Vec<Vec<(usize, String)>> = family_idx
+                    .iter()
+                    .map(|idx| self.plan_rows_for_entry(*idx))
+                    .collect();
+                family_groups.shuffle(&mut rng);
+
+                let mut rest_groups: Vec<Vec<(usize, String)>> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| self.chain[*idx].upstream.model_family != *model_family)
+                    .map(|(idx, _entry)| self.plan_rows_for_entry(idx))
+                    .collect();
+                rest_groups.shuffle(&mut rng);
+
+                family_groups
+                    .into_iter()
+                    .chain(rest_groups)
+                    .flatten()
+                    .collect()
             }
         }
     }
@@ -2156,6 +2250,40 @@ impl FreeProvider {
                 );
                 plan.extend(rest);
                 plan
+            }
+            Route::Family { model_family } => {
+                // Family upstreams first (each with their fallbacks), then the
+                // rest — both sorted by latency, family always leading.
+                let mut family: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| self.chain[*idx].upstream.model_family == *model_family)
+                    .flat_map(|(idx, _entry)| self.plan_rows_for_entry(idx))
+                    .collect();
+                family.sort_by(|a, b| {
+                    latencies
+                        .avg_latency(a.0)
+                        .partial_cmp(&latencies.avg_latency(b.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let mut rest: Vec<(usize, String)> = self
+                    .chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| self.chain[*idx].upstream.model_family != *model_family)
+                    .flat_map(|(idx, _entry)| self.plan_rows_for_entry(idx))
+                    .collect();
+                rest.sort_by(|a, b| {
+                    latencies
+                        .avg_latency(a.0)
+                        .partial_cmp(&latencies.avg_latency(b.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                family.extend(rest);
+                family
             }
         }
     }
@@ -3089,6 +3217,13 @@ impl LlmProvider for FreeProvider {
         let (idx, _) = match route {
             Route::Auto => self.chain.first().map(|e| (0, e))?,
             Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
+            Route::Family { model_family } => {
+                let idx = self
+                    .chain
+                    .iter()
+                    .position(|e| e.upstream.model_family == model_family)?;
+                (idx, self.chain.get(idx)?)
+            }
         };
         Some(self.chain[idx].upstream.tool_calling)
     }
@@ -3098,6 +3233,13 @@ impl LlmProvider for FreeProvider {
         let (idx, _) = match route {
             Route::Auto => self.chain.first().map(|e| (0, e))?,
             Route::Pinned { start_idx, .. } => (start_idx, self.chain.get(start_idx)?),
+            Route::Family { model_family } => {
+                let idx = self
+                    .chain
+                    .iter()
+                    .position(|e| e.upstream.model_family == model_family)?;
+                (idx, self.chain.get(idx)?)
+            }
         };
         self.chain[idx].upstream.max_tokens_cap
     }
@@ -3523,6 +3665,69 @@ mod tests {
             }
             other => panic!("expected pinned, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn family_route_resolves_from_slug() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        match provider.resolve_route("free/family/llama-3.3-70b") {
+            Route::Family { model_family } => assert_eq!(model_family, "llama-3.3-70b"),
+            other => panic!("expected family, got {:?}", other),
+        }
+        // Bare `family/<slug>` is accepted too.
+        match provider.resolve_route("family/llama-3.3-70b") {
+            Route::Family { model_family } => assert_eq!(model_family, "llama-3.3-70b"),
+            other => panic!("expected family, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_family_falls_back_to_auto() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        assert!(matches!(
+            provider.resolve_route("free/family/does-not-exist"),
+            Route::Auto
+        ));
+        assert!(matches!(
+            provider.resolve_route("family/does-not-exist"),
+            Route::Auto
+        ));
+    }
+
+    #[test]
+    fn family_plan_leads_with_hosts_then_rest() {
+        let provider = FreeProvider::new(vec![
+            entry("huggingface", true),
+            entry("cerebras", true),
+            entry("nvidia", true),
+            entry("groq", true),
+        ]);
+        let plan = provider.attempt_plan(&Route::Family {
+            model_family: "llama-3.3-70b",
+        });
+        // Family hosts first in catalog order — huggingface (idx 0), then
+        // nvidia (idx 2) with its 8B fallback on the same index.
+        assert_eq!(
+            plan[0],
+            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
+        );
+        assert_eq!(plan[1], (2, "meta/llama-3.3-70b-instruct".to_string()));
+        assert_eq!(plan[2], (2, "meta/llama-3.1-8b-instruct".to_string()));
+        // Non-family upstreams follow in catalog order.
+        assert_eq!(plan[3], (1, "gpt-oss-120b".to_string()));
+        assert_eq!(plan[4], (3, "openai/gpt-oss-120b".to_string()));
+    }
+
+    #[test]
+    fn family_route_reports_host_capabilities() {
+        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        // The catalog's huggingface entry hosts llama-3.3-70b with tool
+        // calling and a max-tokens cap — the family route must surface those
+        // from the first matching host.
+        let tc = provider.tool_calling_for("free/family/llama-3.3-70b");
+        assert_eq!(tc, Some(true));
+        let cap = provider.max_tokens_cap_for("free/family/llama-3.3-70b");
+        assert!(cap.is_some());
     }
 
     #[test]

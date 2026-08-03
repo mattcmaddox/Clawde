@@ -259,6 +259,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                 tool_calling: true,
                 max_tokens_cap: Some(4_096),
                 fallback_models: &[],
+                model_family: "llama3.2",
             },
             provider: Arc::new(ollama_provider),
             effective_model: Some("llama3.2".to_string()),

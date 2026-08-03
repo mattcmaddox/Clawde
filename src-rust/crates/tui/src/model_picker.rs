@@ -489,8 +489,10 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 }
 
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
-/// Always shows `free/auto` first; one pin entry per catalog upstream so the
-/// user can target a specific provider when they need to.
+/// Always shows `free/auto` first, then one entry per **model family**
+/// (model-first selection — `free/family/<slug>` round-robins across every
+/// provider hosting that family), and finally one pin entry per catalog
+/// upstream for users who want to target a specific provider.
 pub fn free_provider_models() -> Vec<ModelEntry> {
     let reg = picker_registry();
 
@@ -503,6 +505,53 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         capabilities: Vec::new(),
     }];
 
+    // --- Model-first section: group catalog entries by model family ---
+    // Preserve catalog order; the first upstream in each family supplies the
+    // display name, capabilities, and reasoning metadata.
+    let mut families: Vec<(&'static str, Vec<&'static clawde_api::FreeUpstream>)> = Vec::new();
+    for upstream in clawde_api::FREE_CATALOG {
+        match families
+            .iter_mut()
+            .find(|(family, _)| *family == upstream.model_family)
+        {
+            Some((_, list)) => list.push(upstream),
+            None => families.push((upstream.model_family, vec![upstream])),
+        }
+    }
+
+    for (family, upstreams) in &families {
+        let first = upstreams[0];
+        let (capabilities, reasoning) = match reg.get(first.id, first.default_model) {
+            Some(entry) => (build_capability_tags(entry), entry.reasoning),
+            None if first.tool_calling => (vec!["tools".to_string()], false),
+            None => (Vec::new(), false),
+        };
+        // "3 providers" style description listing every hosting upstream.
+        let hosts = upstreams
+            .iter()
+            .map(|u| u.title)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let host_count = upstreams.len();
+        entries.push(ModelEntry {
+            id: format!("free/family/{}", family),
+            display_name: format!("{} — pick provider", first.default_model),
+            description: format!(
+                "{} {} · $0.00 per M",
+                hosts,
+                if host_count > 1 {
+                    "· round-robin".to_string()
+                } else {
+                    String::new()
+                }
+            ),
+            is_current: false,
+            reasoning,
+            capabilities,
+        });
+    }
+
+    // --- Provider-first section: one pin entry per catalog upstream ---
     for upstream in clawde_api::FREE_CATALOG {
         // Look up the upstream's default model in the registry to
         // get its real capability metadata (vision, tools, reasoning, etc.).
