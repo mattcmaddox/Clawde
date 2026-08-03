@@ -647,19 +647,6 @@ pub fn build_capability_tags(entry: &clawde_api::ModelEntry) -> Vec<String> {
     tags
 }
 
-/// Accent colour for a task sort mode, used in the picker header row.
-fn task_color(task: FreeTask) -> Color {
-    match task {
-        FreeTask::All => Color::Rgb(200, 200, 210),
-        FreeTask::Coding => Color::Rgb(100, 170, 255), // blue — code
-        FreeTask::Reasoning => Color::Rgb(200, 160, 255), // lavender — think
-        FreeTask::Creative => Color::Rgb(255, 160, 200), // pink — creative
-        FreeTask::Fast => Color::Rgb(100, 255, 130),   // green — speed
-        FreeTask::Multimodal => Color::Rgb(100, 220, 255), // cyan — many formats
-        FreeTask::Context => Color::Rgb(255, 180, 100), // orange — big window
-    }
-}
-
 /// Map a specialty tag string to its display colour.
 ///
 /// Used in the render loop to colour the first segment of the description
@@ -739,6 +726,30 @@ impl FreeTask {
             FreeTask::Fast => "fast",
             FreeTask::Multimodal => "multimodal",
             FreeTask::Context => "long context",
+        }
+    }
+
+    /// Parse a persisted label back into a task; unknown / empty strings
+    /// fall back to [`FreeTask::All`]. Used when restoring the last-used sort
+    /// from settings at startup.
+    pub fn from_label(label: &str) -> FreeTask {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|t| t.label() == label)
+            .unwrap_or(FreeTask::All)
+    }
+
+    /// Accent colour for this task (matches the picker header badge).
+    pub fn color(self) -> Color {
+        match self {
+            FreeTask::All => Color::Rgb(200, 200, 210),
+            FreeTask::Coding => Color::Rgb(100, 170, 255), // blue — code
+            FreeTask::Reasoning => Color::Rgb(200, 160, 255), // lavender — think
+            FreeTask::Creative => Color::Rgb(255, 160, 200), // pink — creative
+            FreeTask::Fast => Color::Rgb(100, 255, 130),   // green — speed
+            FreeTask::Multimodal => Color::Rgb(100, 220, 255), // cyan — many formats
+            FreeTask::Context => Color::Rgb(255, 180, 100), // orange — big window
         }
     }
 
@@ -1027,6 +1038,32 @@ impl ModelPickerState {
             .and_then(|id| filtered.iter().position(|m| m.id == id))
             .unwrap_or(0);
         self.selected_idx = idx.min(filtered.len().saturating_sub(1));
+    }
+
+    /// `true` when this picker is showing the free-mode list (starts with
+    /// `free/auto`). Task cycling and number-key jumps only apply there.
+    pub fn is_free_list(&self) -> bool {
+        self.models.first().map(|m| m.id == "free/auto").unwrap_or(false)
+    }
+
+    /// Jump straight to the 1-based task slot `n` (1 = All, 2 = Coding, …).
+    /// Out-of-range values clamp to `All`. Keeps the highlighted model anchored.
+    pub fn task_jump(&mut self, n: usize) {
+        let anchor = self
+            .filtered_models()
+            .get(self.selected_idx)
+            .map(|m| m.id.clone());
+        self.task_sort = Self::task_for_slot(n);
+        self.anchor_selection(anchor.as_deref());
+    }
+
+    /// Map a 1-based number-key slot to a task (1 = All, 2 = Coding, …).
+    fn task_for_slot(n: usize) -> FreeTask {
+        if n >= 1 && n <= FreeTask::ALL.len() {
+            FreeTask::ALL[n - 1]
+        } else {
+            FreeTask::All
+        }
     }
 
     /// Confirm the current selection.
@@ -1321,12 +1358,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             Span::styled(
                 state.task_sort.label(),
                 Style::default()
-                    .fg(task_color(state.task_sort))
+                    .fg(state.task_sort.color())
                     .add_modifier(Modifier::BOLD)
                     .bg(dialog_bg),
             ),
             Span::styled(
-                "   Tab \u{2194} sort",
+                "   \u{21b9}/1-7 sort",
                 Style::default().fg(dim).bg(dialog_bg),
             ),        ]));
     }
@@ -2507,5 +2544,57 @@ mod tests {
             .map(|m| m.id.as_str())
             .collect();
         assert_eq!(filtered, original, "provider pickers must not be reordered");
+    }
+
+    // 1-based number slots map to tasks in cycle order (1 = All, 2 = Coding…).
+    #[test]
+    fn task_jump_maps_slots_in_order() {
+        for (slot, expected) in FreeTask::ALL.iter().enumerate() {
+            assert_eq!(
+                ModelPickerState::task_for_slot(slot + 1),
+                *expected,
+                "slot {} should map to {:?}",
+                slot + 1,
+                expected
+            );
+        }
+        // Out-of-range clamps to All.
+        assert_eq!(ModelPickerState::task_for_slot(0), FreeTask::All);
+        assert_eq!(ModelPickerState::task_for_slot(99), FreeTask::All);
+    }
+
+    // from_label round-trips persisted labels and tolerates junk.
+    #[test]
+    fn task_from_label_roundtrip() {
+        for task in FreeTask::ALL {
+            assert_eq!(
+                FreeTask::from_label(task.label()),
+                task,
+                "label '{}' must round-trip",
+                task.label()
+            );
+        }
+        assert_eq!(FreeTask::from_label(""), FreeTask::All);
+        assert_eq!(FreeTask::from_label("nonsense"), FreeTask::All);
+        assert_eq!(FreeTask::from_label("CODING"), FreeTask::All); // case-sensitive
+    }
+
+    // task_jump anchors the highlighted model just like task_next/task_prev.
+    #[test]
+    fn task_jump_anchors_selection() {
+        let mut p = ModelPickerState::new();
+        p.set_models(free_provider_models());
+        p.selected_idx = p
+            .models
+            .iter()
+            .position(|m| m.id.starts_with("free/family/"))
+            .unwrap_or(0);
+        let anchor_id = p.filtered_models()[p.selected_idx].id.clone();
+        p.task_jump(4); // Creative
+        assert_eq!(p.task_sort, FreeTask::Creative);
+        assert_eq!(
+            p.filtered_models()[p.selected_idx].id, anchor_id,
+            "task_jump must keep the selected model highlighted"
+        );
     }
 }

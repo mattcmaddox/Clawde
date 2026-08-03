@@ -2603,7 +2603,20 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                     format!("{} {}", app.effort_level.symbol(), app.effort_level.label()),
                     Style::default().fg(effort_color),
                 ));
-            } // Routing strategy badge (only for free provider).
+            }
+            // Active free-model task sort (when not the default "all") — e.g.
+            // "coding" — so the user sees /models is pre-sorted by task. Only
+            // for the free composite provider: the sort is inert elsewhere.
+            if app.config.selected_provider_id() == "free"
+                && app.model_picker.task_sort != crate::model_picker::FreeTask::All
+            {
+                let task = app.model_picker.task_sort;
+                badge_spans.push(Span::styled(
+                    task.label(),
+                    Style::default().fg(task.color()).add_modifier(Modifier::BOLD),
+                ));
+            }
+            // Routing strategy badge (only for free provider).
             if app.config.selected_provider_id() == "free" {
                 if let Some(ref registry) = app.provider_registry {
                     let active_pid = app.config.selected_provider_id();

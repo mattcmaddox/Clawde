@@ -1100,6 +1100,10 @@ pub mod config {
         pub theme: Theme,
         #[serde(default)]
         pub output_style: Option<String>,
+        /// Last-used free-model task sort ("all", "coding", …) restored into
+        /// the /models picker at startup. Absence means the default (All).
+        #[serde(default, rename = "freeTaskSort", alias = "free_task_sort")]
+        pub free_task_sort: Option<String>,
         pub auto_compact: bool,
         pub compact_threshold: f32,
         pub verbose: bool,
@@ -2129,6 +2133,7 @@ pub mod config {
                 permission_mode: over.config.permission_mode,
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
+                free_task_sort: over.config.free_task_sort.or(base.config.free_task_sort),
                 auto_compact: over.config.auto_compact || base.config.auto_compact,
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold

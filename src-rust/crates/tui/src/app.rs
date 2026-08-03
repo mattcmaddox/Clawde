@@ -1972,6 +1972,13 @@ impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        // Restore the last-used free-model task sort from settings (e.g.
+        // "coding") so the /models picker opens pre-sorted on next launch.
+        let saved_task = Settings::load_sync()
+            .ok()
+            .and_then(|s| s.config.free_task_sort.clone())
+            .map(|label| crate::model_picker::FreeTask::from_label(&label))
+            .unwrap_or_default();
         // Build the model registry up front so user metadata overrides
         // (issue #309) are layered on before the struct owns `config`.
         let model_registry = {
@@ -2079,7 +2086,11 @@ impl App {
             memory_update_notification:
                 crate::memory_update_notification::MemoryUpdateNotificationState::new(),
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
-            model_picker: ModelPickerState::new(),
+            model_picker: {
+                let mut picker = ModelPickerState::new();
+                picker.task_sort = saved_task;
+                picker
+            },
             session_browser: SessionBrowserState::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),
             tasks_overlay: TasksOverlay::new(),
@@ -2650,6 +2661,24 @@ impl App {
         settings.config.provider = self.config.provider.clone();
         settings.config.model = self.config.model.clone();
         let _ = settings.save_sync();
+    }
+
+    /// Persist the last-used free-model task sort to settings so it survives
+    /// restarts. `All` (the default) clears the stored value so a later
+    /// restart starts unsorted rather than resurrecting a stale sort.
+    fn persist_free_task_sort(&self) {
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        let task = self.model_picker.task_sort;
+        let stored = settings.config.free_task_sort.clone();
+        let next = if task == crate::model_picker::FreeTask::All {
+            None
+        } else {
+            Some(task.label().to_string())
+        };
+        if stored != next {
+            settings.config.free_task_sort = next;
+            let _ = settings.save_sync();
+        }
     }
 
     fn infer_provider_from_model(model: &str) -> Option<String> {
@@ -5122,8 +5151,27 @@ impl App {
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
-                KeyCode::Tab => self.model_picker.task_next(),
-                KeyCode::BackTab => self.model_picker.task_prev(),
+                KeyCode::Tab => {
+                    self.model_picker.task_next();
+                    self.persist_free_task_sort();
+                }
+                KeyCode::BackTab => {
+                    self.model_picker.task_prev();
+                    self.persist_free_task_sort();
+                }
+                // 1-7 jump straight to a task slot in the free picker. Only
+                // when the filter is empty so digit search still works once
+                // the user starts typing.
+                KeyCode::Char(c)
+                    if self.model_picker.is_free_list()
+                        && self.model_picker.filter.is_empty()
+                        && c.is_ascii_digit()
+                        && c.to_digit(10)
+                            .is_some_and(|d| (1..=7).contains(&d)) =>
+                {
+                    self.model_picker.task_jump(c.to_digit(10).unwrap() as usize);
+                    self.persist_free_task_sort();
+                }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.model_picker.select_prev()
                 }
@@ -8791,6 +8839,42 @@ mod tests {
         App::new(config, cost_tracker)
     }
 
+    /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
+    /// settings writes (e.g. task-sort persistence) never touch the real
+    /// `~/.clawde/settings.json`. Mirrors the TestHome helper in commands/keys.rs.
+    struct TestHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        prev_clawde_home: Option<std::ffi::OsString>,
+    }
+
+    impl TestHome {
+        fn acquire() -> TestHome {
+            use std::sync::Mutex;
+            static HOME_LOCK: Mutex<()> = Mutex::new(());
+            let _lock = HOME_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            TestHome {
+                _lock,
+                _tmp: tmp,
+                prev_clawde_home: prev,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.prev_clawde_home {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
     fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
@@ -9431,6 +9515,7 @@ mod tests {
 
     #[test]
     fn test_tab_cycles_free_picker_task_sort() {
+        let _home = TestHome::acquire();
         let mut app = make_app();
         assert!(app.intercept_slash_command("models"));
         assert!(app.model_picker.visible);
@@ -9447,6 +9532,81 @@ mod tests {
             app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
         }
         assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+    }
+
+    #[test]
+    fn test_number_keys_jump_to_task_in_free_picker() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        // 2 = Coding, 5 = Fast.
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        app.handle_key_event(press_key(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Fast);
+        // Out-of-range digits fall through to the filter.
+        app.handle_key_event(press_key(KeyCode::Char('9'), KeyModifiers::NONE));
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Fast,
+            "digit 9 is not a task slot and must not change the sort"
+        );
+        assert_eq!(
+            app.model_picker.filter, "9",
+            "digit 9 should have typed into the filter"
+        );
+    }
+
+    #[test]
+    fn test_number_keys_ignored_outside_free_picker() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Non-free picker (e.g. anthropic via /model) must not task-jump.
+        app.config.provider = Some("anthropic".to_string());
+        assert!(app.intercept_slash_command("model"));
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(app.model_picker.filter, "2");
+    }
+
+    #[test]
+    fn test_task_sort_persists_to_settings() {
+        let _home = TestHome::acquire();
+
+        // Set the sort via the picker; the key handler persists it.
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        // Drop the app so settings are flushed to disk, then rebuild.
+        drop(app);
+        let app = make_app();
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning,
+            "a fresh App must restore the persisted task sort from settings"
+        );
+    }
+
+    #[test]
+    fn test_cycling_back_to_all_clears_persisted_task() {
+        let _home = TestHome::acquire();
+
+        // Set Reasoning, then cycle back to All — the stored value must be
+        // cleared so the next launch starts unsorted (not stale Reasoning).
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        drop(app);
+
+        let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();
+        assert!(
+            settings.config.free_task_sort.is_none(),
+            "returning to All must clear the persisted task sort"
+        );
     }
 
     #[test]
