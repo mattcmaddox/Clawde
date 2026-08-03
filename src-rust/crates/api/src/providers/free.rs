@@ -3108,6 +3108,18 @@ impl LlmProvider for FreeProvider {
         }
     }
 
+    fn mark_key_healthy(&self, upstream_id: Option<&str>, key_idx: usize) -> bool {
+        let Some(upstream_id) = upstream_id else {
+            return false;
+        };
+        for entry in &self.chain {
+            if entry.upstream.id == upstream_id {
+                return entry.provider.mark_key_healthy(Some(upstream_id), key_idx);
+            }
+        }
+        false
+    }
+
     fn mark_key_exhausted(
         &self,
         upstream_id: Option<&str>,

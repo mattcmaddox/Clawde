@@ -180,6 +180,19 @@ impl KeyRing {
     // Status queries
     // -----------------------------------------------------------------------
 
+    /// Clear an exhausted key's cooldown (e.g. the health poller has
+    /// confirmed the key is working again). Returns `true` if the index was
+    /// valid.
+    pub fn mark_healthy(&mut self, index: usize) -> bool {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.cooldown_until = None;
+            entry.last_error = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns `true` when every key in the ring is in cooldown (none usable).
     pub fn all_exhausted(&self) -> bool {
         self.entries.iter().all(|e| e.cooldown_until.is_some())

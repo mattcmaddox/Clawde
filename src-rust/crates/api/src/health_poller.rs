@@ -258,6 +258,12 @@ async fn poll_and_log(
                         key_idx,
                         "health_poller: key OK"
                     );
+                    // Clear any lingering cooldown injected by a previous
+                    // definitive failure — the key is demonstrably healthy
+                    // right now so the key ring must reflect that.
+                    if let Some(provider) = free_provider {
+                        provider.mark_key_healthy(Some(&upstream_id_for_log), key_idx);
+                    }
                     outcome.results.push(HealthProbeResult {
                         upstream: upstream_id_for_log.clone(),
                         key_idx,

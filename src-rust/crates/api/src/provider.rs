@@ -205,6 +205,15 @@ pub trait LlmProvider: Send + Sync {
     /// The default implementation returns `false` — only providers that
     /// support automatic key rotation (e.g. `KeyRotatingProvider`) override
     /// this.
+    /// Clear an externally-injected key exhaustion (e.g. the health poller
+    /// has confirmed the key is healthy again after a previous definitive
+    /// failure — spec §6.4).  Returns `true` if the key's cooldown was
+    /// cleared; `false` when this provider has no key ring or the
+    /// upstream/index isn't found.
+    fn mark_key_healthy(&self, _upstream_id: Option<&str>, _key_idx: usize) -> bool {
+        false
+    }
+
     /// Inject an external key exhaustion signal (e.g. from the health
     /// poller — spec §6.4).  Returns `true` if the key was marked
     /// exhausted; `false` when this provider has no key ring or the

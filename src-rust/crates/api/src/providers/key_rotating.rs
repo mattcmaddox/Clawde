@@ -405,6 +405,13 @@ impl LlmProvider for KeyRotatingProvider {
         }
     }
 
+    fn mark_key_healthy(&self, _upstream_id: Option<&str>, key_idx: usize) -> bool {
+        match self.ring.lock() {
+            Ok(mut ring) => ring.mark_healthy(key_idx),
+            Err(_) => false,
+        }
+    }
+
     fn mark_key_exhausted(
         &self,
         _upstream_id: Option<&str>,
