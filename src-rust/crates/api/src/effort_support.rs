@@ -38,6 +38,15 @@ pub fn variant_ladder(
     model: &str,
     registry: Option<&ModelRegistry>,
 ) -> Vec<EffortLevel> {
+    // Family-route ids (`free/family/<slug>` from the /models picker, and the
+    // bare `family/<slug>` the /effort path derives from a family selection)
+    // name a model *family*, not a single provider: they round-robin across
+    // every upstream hosting the family. Resolve the slug against FREE_CATALOG
+    // and inherit the first hosting upstream's ladder (catalog priority order)
+    // so family entries surface the same effort selector as their hosts.
+    if let Some(ladder) = family_variant_ladder(provider, model, registry) {
+        return ladder;
+    }
     let facts = ModelFacts::resolve(provider, model, registry);
     crate::variants::variant_efforts(
         &facts.npm,
@@ -46,6 +55,37 @@ pub fn variant_ladder(
         &facts.provider_id,
         facts.reasoning,
     )
+}
+
+/// Resolve `free/family/<slug>` / `family/<slug>` model ids against the free
+/// catalog. Returns the first hosting upstream's ladder when the family has a
+/// reasoning host, an empty ladder for a family whose hosts are all
+/// non-reasoning, and `None` when `model` is not a family id (the normal
+/// provider/model path).
+fn family_variant_ladder(
+    provider: &str,
+    model: &str,
+    registry: Option<&ModelRegistry>,
+) -> Option<Vec<EffortLevel>> {
+    let slug = if provider == "free" || provider.is_empty() {
+        model.strip_prefix("free/family/").or_else(|| model.strip_prefix("family/"))
+    } else {
+        return None;
+    }?;
+
+    // First host with an actual ladder wins — its ladder is what the family's
+    // first-choice routing will exercise. Unknown family → empty, mirroring
+    // the `Route::Family` → `Route::Auto` fallback.
+    for host in crate::FREE_CATALOG
+        .iter()
+        .filter(|u| u.model_family == slug)
+    {
+        let ladder = variant_ladder(host.id, host.default_model, registry);
+        if !ladder.is_empty() {
+            return Some(ladder);
+        }
+    }
+    Some(Vec::new())
 }
 
 /// The effort levels selectable for `provider`/`model`, ascending, with
@@ -82,6 +122,11 @@ pub fn supported_efforts(
 /// Prefers the registry `reasoning` flag when the model is known; otherwise uses
 /// a model-name heuristic.
 pub fn model_is_reasoning(provider: &str, model: &str, registry: Option<&ModelRegistry>) -> bool {
+    // Family ids inherit their first hosting host's reasoning flag, mirroring
+    // `variant_ladder` so the two never disagree for the same id.
+    if let Some(ladder) = family_variant_ladder(provider, model, registry) {
+        return !ladder.is_empty();
+    }
     ModelFacts::resolve(provider, model, registry).reasoning
 }
 
@@ -365,5 +410,69 @@ mod tests {
                 EffortLevel::Ultracode,
             ]
         );
+    }
+
+    // The /models model-first picker emits `free/family/<slug>` ids (and the
+    // /effort path a bare `family/<slug>`). These name a model *family*, not a
+    // single provider, so the ladder must be inherited from the family's
+    // hosting upstreams rather than resolving against a literal `free` provider.
+    #[test]
+    fn family_slug_inherits_host_ladder() {
+        use EffortLevel::*;
+        let reg = ModelRegistry::new();
+
+        // gpt-oss-120b family is hosted by cerebras (low/med/high). The family
+        // slug must surface the same ladder, both in the full picker form and
+        // the /effort bare form.
+        assert_eq!(
+            variant_ladder("free", "free/family/gpt-oss-120b", Some(&reg)),
+            vec![Low, Medium, High]
+        );
+        assert_eq!(
+            variant_ladder("free", "family/gpt-oss-120b", Some(&reg)),
+            vec![Low, Medium, High]
+        );
+
+        // gemini-2.5-flash family → google's high/max ladder.
+        assert_eq!(
+            variant_ladder("free", "free/family/gemini-2.5-flash", Some(&reg)),
+            vec![High, Max]
+        );
+
+        // Non-reasoning family (gpt-4o) stays empty — no effort selector.
+        assert!(variant_ladder("free", "free/family/gpt-4o", Some(&reg)).is_empty());
+
+        // model_is_reasoning must agree with the ladder for the same family id.
+        assert!(model_is_reasoning("free", "free/family/gpt-oss-120b", Some(&reg)));
+        assert!(!model_is_reasoning("free", "free/family/gpt-4o", Some(&reg)));
+
+        // Unknown family slug falls back to the old behavior (empty ladder via
+        // the literal free provider), mirroring Route::Family → Auto.
+        assert!(variant_ladder("free", "free/family/no-such-model", Some(&reg)).is_empty());
+    }
+
+    // A family whose FIRST host is non-reasoning must still inherit a ladder
+    // when a later host in the catalog supports reasoning tiers.
+    #[test]
+    fn family_slug_skips_non_reasoning_hosts() {
+        let reg = ModelRegistry::new();
+        // llama-3.3-70b family: hosted by huggingface (registry non-reasoning
+        // for the instruct variant) and others. The ladder must come from the
+        // first host that actually exposes one; an all-non-reasoning family
+        // yields empty.
+        let ladder = variant_ladder("free", "free/family/llama-3.3-70b", Some(&reg));
+        assert!(
+            ladder.is_empty(),
+            "llama-3.3-70b instruct variants expose no reasoning tiers: {ladder:?}"
+        );
+    }
+
+    // Non-family `free` ids must not be intercepted: `free/auto` keeps its
+    // normal (empty, auto-routed) ladder.
+    #[test]
+    fn free_auto_is_not_family_intercepted() {
+        let reg = ModelRegistry::new();
+        assert!(variant_ladder("free", "auto", Some(&reg)).is_empty());
+        assert!(variant_ladder("free", "free/auto", Some(&reg)).is_empty());
     }
 }
