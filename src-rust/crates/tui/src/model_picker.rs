@@ -647,6 +647,19 @@ pub fn build_capability_tags(entry: &clawde_api::ModelEntry) -> Vec<String> {
     tags
 }
 
+/// Accent colour for a task sort mode, used in the picker header row.
+fn task_color(task: FreeTask) -> Color {
+    match task {
+        FreeTask::All => Color::Rgb(200, 200, 210),
+        FreeTask::Coding => Color::Rgb(100, 170, 255), // blue — code
+        FreeTask::Reasoning => Color::Rgb(200, 160, 255), // lavender — think
+        FreeTask::Creative => Color::Rgb(255, 160, 200), // pink — creative
+        FreeTask::Fast => Color::Rgb(100, 255, 130),   // green — speed
+        FreeTask::Multimodal => Color::Rgb(100, 220, 255), // cyan — many formats
+        FreeTask::Context => Color::Rgb(255, 180, 100), // orange — big window
+    }
+}
+
 /// Map a specialty tag string to its display colour.
 ///
 /// Used in the render loop to colour the first segment of the description
@@ -681,6 +694,148 @@ fn specialty_color(specialty: &str) -> Color {
     }
 }
 
+/// Task-based sort modes for the free-model picker.
+///
+/// Selecting a task reorders the "Model families" rows so the models best
+/// suited to that task float to the top. `All` preserves catalog order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreeTask {
+    /// Catalog order (no reordering).
+    #[default]
+    All,
+    /// Code-writing / code-review heavy work.
+    Coding,
+    /// Math, logic, planning, agentic reasoning.
+    Reasoning,
+    /// Writing, brainstorming, playful / divergent generation.
+    Creative,
+    /// Quick, low-latency chit-chat and light edits.
+    Fast,
+    /// Image / audio / video / document understanding.
+    Multimodal,
+    /// Long documents, big codebases, huge contexts.
+    Context,
+}
+
+impl FreeTask {
+    /// All task modes in cycle order (Tab/Shift+Tab walks this array).
+    pub const ALL: [FreeTask; 7] = [
+        FreeTask::All,
+        FreeTask::Coding,
+        FreeTask::Reasoning,
+        FreeTask::Creative,
+        FreeTask::Fast,
+        FreeTask::Multimodal,
+        FreeTask::Context,
+    ];
+
+    /// Short label shown in the picker header / footer.
+    pub fn label(self) -> &'static str {
+        match self {
+            FreeTask::All => "all",
+            FreeTask::Coding => "coding",
+            FreeTask::Reasoning => "reasoning",
+            FreeTask::Creative => "creative",
+            FreeTask::Fast => "fast",
+            FreeTask::Multimodal => "multimodal",
+            FreeTask::Context => "long context",
+        }
+    }
+
+    /// Next task in cycle order.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Previous task in cycle order.
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Sort rank for one model entry — lower = floats closer to the top.
+    /// Based on the entry's specialty tag (the curated 1-3 word descriptor)
+    /// plus its capability badges. Falls back to the entry's own specialty
+    /// when the model has no curated tag.
+    fn rank(self, m: &ModelEntry) -> u8 {
+        let spec = m.specialty.unwrap_or("").to_lowercase();
+        let has = |needle: &str| spec.contains(needle);
+        let caps = &m.capabilities;
+        let multimodal_cap = caps
+            .iter()
+            .any(|c| matches!(c.as_str(), "vision" | "audio" | "video" | "pdf"));
+        match self {
+            FreeTask::All => 0,
+            FreeTask::Coding => {
+                if has("coding") {
+                    0
+                } else if has("best overall") {
+                    1
+                } else if has("fast") || has("general") {
+                    2
+                } else {
+                    3
+                }
+            }
+            FreeTask::Reasoning => {
+                let reasoning_cap = caps.iter().any(|c| c == "reasoning");
+                if has("reasoning") || reasoning_cap {
+                    0
+                } else if has("best overall") {
+                    1
+                } else if has("general") || has("large context") {
+                    2
+                } else {
+                    3
+                }
+            }
+            FreeTask::Creative => {
+                if has("creative") {
+                    0
+                } else if has("variety") || has("multimodal") {
+                    1
+                } else if has("best overall") {
+                    2
+                } else {
+                    3
+                }
+            }
+            FreeTask::Fast => {
+                if has("fast") {
+                    0
+                } else if has("coding") {
+                    1
+                } else if has("best overall") {
+                    2
+                } else {
+                    3
+                }
+            }
+            FreeTask::Multimodal => {
+                if has("multimodal") || multimodal_cap {
+                    0
+                } else if has("variety") {
+                    1
+                } else {
+                    2
+                }
+            }
+            FreeTask::Context => {
+                if has("large context") {
+                    0
+                } else if has("best overall") {
+                    1
+                } else if has("general") {
+                    2
+                } else {
+                    3
+                }
+            }
+        }
+    }
+}
+
 /// State for the /model picker overlay.
 pub struct ModelPickerState {
     pub visible: bool,
@@ -689,6 +844,8 @@ pub struct ModelPickerState {
     pub title: String,
     /// Live filter typed by the user.
     pub filter: String,
+    /// Active task sort for the free-model picker (reorders family rows).
+    pub task_sort: FreeTask,
     /// Current effort level for models that support extended thinking.
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active.
@@ -722,6 +879,7 @@ impl ModelPickerState {
             models: Vec::new(),
             title: "Select model".to_string(),
             filter: String::new(),
+            task_sort: FreeTask::All,
             effort_level: EffortLevel::Medium,
             fast_mode: false,
             fast_mode_model: None,
@@ -839,6 +997,38 @@ impl ModelPickerState {
         }
     }
 
+    /// Cycle the task sort forward (Tab), keeping the currently highlighted
+    /// model selected across the reorder.
+    pub fn task_next(&mut self) {
+        let anchor = self
+            .filtered_models()
+            .get(self.selected_idx)
+            .map(|m| m.id.clone());
+        self.task_sort = self.task_sort.next();
+        self.anchor_selection(anchor.as_deref());
+    }
+
+    /// Cycle the task sort backward (Shift+Tab), keeping the currently
+    /// highlighted model selected across the reorder.
+    pub fn task_prev(&mut self) {
+        let anchor = self
+            .filtered_models()
+            .get(self.selected_idx)
+            .map(|m| m.id.clone());
+        self.task_sort = self.task_sort.prev();
+        self.anchor_selection(anchor.as_deref());
+    }
+
+    /// Re-locate the previously selected model id after a reorder; falls back
+    /// to the first row when the anchor is gone (e.g. filtered out).
+    fn anchor_selection(&mut self, anchor: Option<&str>) {
+        let filtered = self.filtered_models();
+        let idx = anchor
+            .and_then(|id| filtered.iter().position(|m| m.id == id))
+            .unwrap_or(0);
+        self.selected_idx = idx.min(filtered.len().saturating_sub(1));
+    }
+
     /// Confirm the current selection.
     ///
     /// Returns `(model_id, effort)` where `effort` is `None` for models that
@@ -884,22 +1074,58 @@ impl ModelPickerState {
     }
 
     /// Return models that match the current filter (case-insensitive).
+    ///
+    /// For the free picker, the rows are additionally reordered by the active
+    /// [`FreeTask`]: `free/auto` stays pinned first, the "Model families"
+    /// rows float their best-fit models to the top, and the "Provider pins"
+    /// section keeps catalog order (provider targeting is orthogonal to task).
     pub fn filtered_models(&self) -> Vec<&ModelEntry> {
-        if self.filter.is_empty() {
-            return self.models.iter().collect();
+        let mut list: Vec<&ModelEntry> = if self.filter.is_empty() {
+            self.models.iter().collect()
+        } else {
+            let needle = self.filter.to_lowercase();
+            self.models
+                .iter()
+                .filter(|m| {
+                    m.id.to_lowercase().contains(needle.as_str())
+                        || m.display_name.to_lowercase().contains(needle.as_str())
+                        || m.description.to_lowercase().contains(needle.as_str())
+                        || m.specialty
+                            .map(|s| s.to_lowercase().contains(needle.as_str()))
+                            .unwrap_or(false)
+                })
+                .collect()
+        };
+
+        // Free-picker task sort: keep `free/auto` pinned first, stable-sort
+        // the model-family rows by how well they fit the selected task, and
+        // leave the provider-pin section in catalog order.
+        if self.task_sort != FreeTask::All {
+            let is_free = list.first().map(|m| m.id == "free/auto").unwrap_or(false);
+            if is_free && list.len() > 1 {
+                let head = &list[..1];
+                let mut families: Vec<&ModelEntry> = list
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .filter(|m| m.id.starts_with("free/family/"))
+                    .collect();
+                let pins: Vec<&ModelEntry> = list
+                    .iter()
+                    .skip(1)
+                    .copied()
+                    .filter(|m| !m.id.starts_with("free/family/"))
+                    .collect();
+                families.sort_by_key(|m| self.task_sort.rank(m));
+                let mut out = Vec::with_capacity(list.len());
+                out.extend_from_slice(head);
+                out.extend(families);
+                out.extend(pins);
+                list = out;
+            }
         }
-        let needle = self.filter.to_lowercase();
-        self.models
-            .iter()
-            .filter(|m| {
-                m.id.to_lowercase().contains(needle.as_str())
-                    || m.display_name.to_lowercase().contains(needle.as_str())
-                    || m.description.to_lowercase().contains(needle.as_str())
-                    || m.specialty
-                        .map(|s| s.to_lowercase().contains(needle.as_str()))
-                        .unwrap_or(false)
-            })
-            .collect()
+
+        list
     }
 
     /// Replace the model list with dynamically loaded entries.
@@ -1002,7 +1228,19 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     let width = 65u16.min(area.width.saturating_sub(6));
     let max_height = (area.height as f32 * 0.75) as u16;
     let filtered = state.filtered_models();
-    let content_h = (filtered.len() as u16 + 6).min(max_height).max(8);
+
+    // The free-mode list is the only picker that starts with `free/auto`;
+    // gate the task row, the section headers, and the taller header on it so
+    // provider pickers (anthropic, openai, …) are unaffected.
+    let is_free_picker_list = state
+        .models
+        .first()
+        .map(|m| m.id == "free/auto")
+        .unwrap_or(false);
+
+    let content_h = (filtered.len() as u16 + if is_free_picker_list { 8 } else { 6 })
+        .min(max_height)
+        .max(8);
     let dialog_area = centered_rect(width, content_h, area);
 
     // ── Fill dialog bg (no border) ──
@@ -1024,7 +1262,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     };
 
     let footer_height = 1u16.min(inner.height);
-    let header_height = 3u16.min(inner.height.saturating_sub(footer_height));
+    let header_height = (if is_free_picker_list { 4 } else { 3 })
+        .min(inner.height.saturating_sub(footer_height));
     let header_area = Rect {
         x: inner.x,
         y: inner.y,
@@ -1071,6 +1310,27 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         Color::White,
     ));
 
+    // Task row (free picker only): shows the active task sort and a hint that
+    // Tab cycles it. Clicking is not supported; Tab/Shift+Tab reorder rows.
+    if is_free_picker_list {
+        header_lines.push(Line::from(vec![
+            Span::styled(
+                "  Task: ",
+                Style::default().fg(dim).bg(dialog_bg),
+            ),
+            Span::styled(
+                state.task_sort.label(),
+                Style::default()
+                    .fg(task_color(state.task_sort))
+                    .add_modifier(Modifier::BOLD)
+                    .bg(dialog_bg),
+            ),
+            Span::styled(
+                "   Tab \u{2194} sort",
+                Style::default().fg(dim).bg(dialog_bg),
+            ),        ]));
+    }
+
     let header_para = Paragraph::new(header_lines).bg(dialog_bg);
     header_para.render(header_area, buf);
 
@@ -1106,11 +1366,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // The free-mode list is the only picker that starts with `free/auto`;
     // gate the "Model families" / "Provider pins" section headers on it so
     // provider pickers (anthropic, openai, …) are unaffected.
-    let is_free_picker_list = state
-        .models
-        .first()
-        .map(|m| m.id == "free/auto")
-        .unwrap_or(false);
+    // (`is_free_picker_list` is computed above, next to `filtered`.)
 
     // Section labels for sticky-header look-up (one per row in `lines`).
     let mut line_sections: Vec<Option<&'static str>> = Vec::new();
@@ -2110,5 +2366,146 @@ mod tests {
                 "Google upstream must have at least 'tools' capability"
             );
         }
+    }
+
+    // ── Task-based family sorting ──
+
+    // next()/prev() walk the FULL cycle without repeating or skipping.
+    #[test]
+    fn free_task_cycles_through_all_modes() {
+        let mut seen = Vec::new();
+        let mut t = FreeTask::All;
+        for _ in 0..FreeTask::ALL.len() {
+            seen.push(t);
+            t = t.next();
+        }
+        assert_eq!(
+            seen.len(),
+            FreeTask::ALL.len(),
+            "cycling must visit every mode exactly once"
+        );
+        seen.dedup();
+        assert_eq!(seen.len(), FreeTask::ALL.len(), "no duplicate modes");
+        assert_eq!(t, FreeTask::All, "full cycle wraps back to All");
+        assert_eq!(
+            FreeTask::All.prev(),
+            *FreeTask::ALL.last().unwrap(),
+            "prev from All wraps to the last mode"
+        );
+        assert_eq!(FreeTask::All.next(), FreeTask::Coding);
+        assert_eq!(FreeTask::Coding.prev(), FreeTask::All);
+    }
+
+    // Coding task floats coding-specialised families to the top while
+    // keeping free/auto pinned first and provider pins in catalog order.
+    #[test]
+    fn task_sort_floats_coding_families() {
+        let mut p = ModelPickerState::new();
+        p.set_models(free_provider_models());
+        p.task_sort = FreeTask::Coding;
+        let filtered = p.filtered_models();
+
+        // free/auto stays pinned at the top.
+        assert_eq!(filtered[0].id, "free/auto");
+
+        // The first family row must be a coding-specialised model.
+        let first_family = filtered
+            .iter()
+            .skip(1)
+            .find(|m| m.id.starts_with("free/family/"))
+            .expect("at least one family row");
+        let spec = first_family.specialty.unwrap_or("").to_lowercase();
+        assert!(
+            spec.contains("coding"),
+            "first family under Coding sort should be a coding model, got '{}'",
+            spec
+        );
+
+        // Every coding-specialised family precedes every non-coding family.
+        let mut seen_non_coding = false;
+        let mut coding_seen_after = false;
+        for m in filtered.iter().skip(1) {
+            if !m.id.starts_with("free/family/") {
+                continue;
+            }
+            let s = m.specialty.unwrap_or("").to_lowercase();
+            if s.contains("coding") {
+                if seen_non_coding {
+                    coding_seen_after = true;
+                }
+            } else {
+                seen_non_coding = true;
+            }
+        }
+        assert!(
+            !coding_seen_after,
+            "a coding family must never appear after a non-coding family"
+        );
+    }
+
+    // Provider pins keep catalog order regardless of the task sort.
+    #[test]
+    fn task_sort_preserves_pin_order() {
+        let mut p = ModelPickerState::new();
+        p.set_models(free_provider_models());
+        let original_ids: Vec<String> =
+            p.models.iter().map(|m| m.id.clone()).collect();
+        p.task_sort = FreeTask::Reasoning;
+        let filtered = p.filtered_models();
+        // free_provider_models() only ever emits `free/auto` + `free/family/*`
+        // + `<upstream>/<model>` pins, so both exclusion predicates below pick
+        // out exactly the pin rows (and nothing else).
+        let original_pins: Vec<&str> = original_ids
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|id| !id.starts_with("free/") && *id != "free/auto")
+            .collect();
+        let filtered_pins: Vec<&str> = filtered
+            .iter()
+            .map(|m| m.id.as_str())
+            .filter(|id| !id.starts_with("free/family/") && *id != "free/auto")
+            .collect();
+        assert_eq!(
+            filtered_pins, original_pins,
+            "provider pins must keep catalog order under task sort"
+        );
+    }
+
+    // Task cycling keeps the currently highlighted model selected (anchored).
+    #[test]
+    fn task_cycle_anchors_selection() {
+        let mut p = ModelPickerState::new();
+        p.set_models(free_provider_models());
+        // Select the first pin row (provider pin, stable across reorders).
+        p.selected_idx = p
+            .models
+            .iter()
+            .position(|m| m.id.starts_with("free/family/"))
+            .unwrap_or(0);
+        let anchor_id = p.filtered_models()[p.selected_idx].id.clone();
+        p.task_next();
+        assert_eq!(
+            p.filtered_models()[p.selected_idx].id, anchor_id,
+            "task cycle must keep the selected model highlighted"
+        );
+        p.task_next();
+        assert_eq!(
+            p.filtered_models()[p.selected_idx].id, anchor_id,
+            "repeated task cycles must keep anchoring"
+        );
+    }
+
+    // Non-free pickers (anthropic, openai, …) are untouched by task sort.
+    #[test]
+    fn task_sort_ignores_provider_pickers() {
+        let mut p = make_picker(); // sample_models() — claude/openai ids
+        p.task_sort = FreeTask::Coding;
+        let original: Vec<String> = p.models.iter().map(|m| m.id.clone()).collect();
+        let filtered: Vec<&str> = p
+            .filtered_models()
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(filtered, original, "provider pickers must not be reordered");
     }
 }

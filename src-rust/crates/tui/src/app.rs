@@ -5122,6 +5122,8 @@ impl App {
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
+                KeyCode::Tab => self.model_picker.task_next(),
+                KeyCode::BackTab => self.model_picker.task_prev(),
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.model_picker.select_prev()
                 }
@@ -9425,6 +9427,26 @@ mod tests {
         assert!(!app.model_picker.visible);
         assert!(app.intercept_slash_command("model"));
         assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_tab_cycles_free_picker_task_sort() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        assert!(app.model_picker.visible);
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        // Tab cycles forward, Shift+Tab backward.
+        app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        app.handle_key_event(press_key(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        // Full cycle from Coding wraps back to Coding.
+        for _ in 0..crate::model_picker::FreeTask::ALL.len() {
+            app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
     }
 
     #[test]
