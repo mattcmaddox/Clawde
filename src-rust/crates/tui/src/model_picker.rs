@@ -1275,7 +1275,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         .map(|m| m.id == "free/auto")
         .unwrap_or(false);
 
-    let content_h = (filtered.len() as u16 + if is_free_picker_list { 8 } else { 6 })
+    let content_h = (filtered.len() as u16 + if is_free_picker_list { 9 } else { 6 })
         .min(max_height)
         .max(8);
     let dialog_area = centered_rect(width, content_h, area);
@@ -1299,7 +1299,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     };
 
     let footer_height = 1u16.min(inner.height);
-    let header_height = (if is_free_picker_list { 4 } else { 3 })
+    let header_height = (if is_free_picker_list { 5 } else { 3 })
         .min(inner.height.saturating_sub(footer_height));
     let header_area = Rect {
         x: inner.x,
@@ -1347,8 +1347,9 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         Color::White,
     ));
 
-    // Task row (free picker only): shows the active task sort and a hint that
-    // Tab cycles it. Clicking is not supported; Tab/Shift+Tab reorder rows.
+    // Task row + legend (free picker only): shows the active task sort, the
+    // Tab hint, and the 1-7 number-key slot mapping. Tab/Shift+Tab or the
+    // number keys reorder rows.
     if is_free_picker_list {
         header_lines.push(Line::from(vec![
             Span::styled(
@@ -1363,9 +1364,39 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                     .bg(dialog_bg),
             ),
             Span::styled(
-                "   \u{21b9}/1-7 sort",
+                "   \u{21b9} sort  ",
                 Style::default().fg(dim).bg(dialog_bg),
-            ),        ]));
+            ),
+        ]));
+
+        // 1=all 2=code 3=reason 4=creative 5=fast 6=multi 7=ctx
+        let mut legend_spans: Vec<Span<'static>> = Vec::new();
+        for (slot, task) in FreeTask::ALL.iter().enumerate() {
+            if slot > 0 {
+                legend_spans.push(Span::styled(
+                    "  ",
+                    Style::default().fg(dim).bg(dialog_bg),
+                ));
+            }
+            // Compact slot label — must fit the 65-wide dialog.
+            let short = match task {
+                FreeTask::All => "all",
+                FreeTask::Coding => "code",
+                FreeTask::Reasoning => "reason",
+                FreeTask::Creative => "creative",
+                FreeTask::Fast => "fast",
+                FreeTask::Multimodal => "multi",
+                FreeTask::Context => "ctx",
+            };
+            legend_spans.push(Span::styled(
+                format!("{}={}", slot + 1, short),
+                Style::default()
+                    .fg(task.color())
+                    .add_modifier(Modifier::BOLD)
+                    .bg(dialog_bg),
+            ));
+        }
+        header_lines.push(Line::from(legend_spans));
     }
 
     let header_para = Paragraph::new(header_lines).bg(dialog_bg);

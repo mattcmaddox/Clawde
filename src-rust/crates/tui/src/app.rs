@@ -2749,6 +2749,21 @@ impl App {
         self.model_name = model;
         self.refresh_context_window_size();
         self.context_used_tokens = 0;
+        self.reset_free_task_sort_if_not_free(&provider_id);
+    }
+
+    /// Clear the free-model task sort (and its persisted value) when switching
+    /// to a provider where the sort is inert, so the /models picker and the
+    /// status badge don't keep advertising a stale task.
+    fn reset_free_task_sort_if_not_free(&mut self, provider_id: &str) {
+        if provider_id == "free" {
+            return;
+        }
+        if self.model_picker.task_sort == crate::model_picker::FreeTask::All {
+            return;
+        }
+        self.model_picker.task_sort = crate::model_picker::FreeTask::All;
+        self.persist_free_task_sort();
     }
 
     /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
@@ -2862,7 +2877,8 @@ impl App {
         self.model_name = model.clone();
         self.config.model = Some(model.clone());
         if let Some(provider) = Self::infer_provider_from_model(&model) {
-            self.config.provider = Some(provider);
+            self.config.provider = Some(provider.clone());
+            self.reset_free_task_sort_if_not_free(&provider);
         }
         self.refresh_context_window_size();
         // Reset used tokens when switching models (context is fresh).
@@ -9585,6 +9601,44 @@ mod tests {
             app.model_picker.task_sort,
             crate::model_picker::FreeTask::Reasoning,
             "a fresh App must restore the persisted task sort from settings"
+        );
+    }
+
+    #[test]
+    fn test_switching_away_from_free_resets_task_sort() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Set a non-All task in the free picker.
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        // Switching to a non-free provider clears it (and the persisted value).
+        app.set_provider_default("anthropic".to_string());
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All,
+            "leaving the free provider must reset the task sort"
+        );
+        let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();
+        assert!(
+            settings.config.free_task_sort.is_none(),
+            "resetting on provider switch must clear the persisted sort"
+        );
+    }
+
+    #[test]
+    fn test_switching_to_free_keeps_task_sort() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        // Staying on free must not reset the sort.
+        app.set_provider_default("free".to_string());
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning,
+            "switching within free must keep the task sort"
         );
     }
 

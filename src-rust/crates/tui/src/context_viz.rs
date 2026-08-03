@@ -126,6 +126,9 @@ pub fn render_context_viz(
     // Per-upstream cooldown annotations `(upstream_id, kind, retry_secs)`
     // where `kind` is `"empty"` or `"5xx"`.
     free_upstream_cooldowns: Vec<(String, String, Option<u64>)>,
+    // Active free-model task sort — rendered as a status line so the user can
+    // see /models is pre-sorted by task (hidden when the default `All`).
+    free_task_sort: crate::model_picker::FreeTask,
 ) {
     if !state.visible {
         return;
@@ -389,6 +392,30 @@ pub fn render_context_viz(
                 Span::styled(format!("{:>7}", retry_text), row_style),
             ]));
         }
+    }
+
+    // -- Free model sort -------------------------------------------------------
+    if free_task_sort != crate::model_picker::FreeTask::All {
+        lines.push(Line::from(vec![Span::styled(
+            " Free model sort",
+            Style::default()
+                .fg(CLAURST_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("  Task: ", Style::default().fg(Color::White)),
+            Span::styled(
+                free_task_sort.label(),
+                Style::default()
+                    .fg(free_task_sort.color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (rows pre-sorted; 1-7 jumps in /models)",
+                Style::default().fg(CLAURST_MUTED),
+            ),
+        ]));
+        lines.push(Line::from(""));
     }
 
     // -- GitHub API ------------------------------------------------------------
@@ -705,6 +732,7 @@ mod tests {
                     vec![("groq".into(), "Groq".into(), "llama-3.3-70b".into())],
                     vec![("groq".into(), 2, 3, Some(30))],
                     vec![("groq".into(), "empty".into(), Some(42))],
+                    crate::model_picker::FreeTask::All,
                 );
             })
             .unwrap();
@@ -749,6 +777,7 @@ mod tests {
                     ],
                     vec![("nvidia".into(), 2, 2, None), ("groq".into(), 2, 2, None)],
                     Vec::new(),
+                    crate::model_picker::FreeTask::All,
                 );
             })
             .unwrap();
@@ -833,6 +862,7 @@ mod tests {
                     upstreams.clone(),
                     vec![],
                     vec![],
+                    crate::model_picker::FreeTask::All,
                 );
             })
             .unwrap();
@@ -848,6 +878,83 @@ mod tests {
         assert!(
             content.contains("scroll"),
             "footer should advertise scrolling when the body overflows"
+        );
+    }
+
+    #[test]
+    fn context_viz_shows_free_task_sort_when_not_all() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut state = ContextVizState::new();
+        state.open();
+        terminal
+            .draw(|frame| {
+                render_context_viz(
+                    frame,
+                    &state,
+                    frame.area(),
+                    50_000,
+                    200_000,
+                    Vec::new(),
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                    vec![],
+                    crate::model_picker::FreeTask::Coding,
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            content.contains("Free model sort"),
+            "ctx-viz must show the Free model sort section when a task is active"
+        );
+        assert!(content.contains("coding"));
+        // The default All must NOT show the section.
+        let mut state_all = ContextVizState::new();
+        state_all.open();
+        terminal
+            .draw(|frame| {
+                render_context_viz(
+                    frame,
+                    &state_all,
+                    frame.area(),
+                    50_000,
+                    200_000,
+                    Vec::new(),
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                    vec![],
+                    crate::model_picker::FreeTask::All,
+                );
+            })
+            .unwrap();
+        let content_all: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(
+            !content_all.contains("Free model sort"),
+            "ctx-viz must hide the sort section when the task is All"
         );
     }
 
@@ -873,6 +980,7 @@ mod tests {
                     vec![],
                     vec![],
                     vec![],
+                    crate::model_picker::FreeTask::All,
                 );
             })
             .unwrap();

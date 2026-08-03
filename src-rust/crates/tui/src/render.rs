@@ -972,6 +972,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             app.free_model_defaults.clone(),
             free_health,
             free_cooldowns,
+            app.model_picker.task_sort,
         );
     }
 
