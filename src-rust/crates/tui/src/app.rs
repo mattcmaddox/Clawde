@@ -9,7 +9,7 @@ use crate::diff_viewer::{build_turn_diff, DiffViewerState};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::import_config_dialog::ImportConfigDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
-use crate::model_picker::{EffortLevel, ModelPickerState};
+use crate::model_picker::{EffortLevel, FreeTask, ModelPickerState};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
     GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, KeybindingsOverlayState,
@@ -100,6 +100,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
     ("models", "Browse free upstream models"),
+    ("task", "Cycle the free-model task sort (all/coding/reasoning/…)"),
     (
         "move",
         "Re-home this session to another worktree of the same project",
@@ -2766,6 +2767,27 @@ impl App {
         self.persist_free_task_sort();
     }
 
+    /// Cycle the free-model task sort by `delta` slots (used by /task and the
+    /// cycleFreeTask keybinding). Persists the change and shows a status line
+    /// so the sort can be driven from the prompt without opening /models.
+    fn cycle_free_task(&mut self, delta: isize) {
+        let tasks = FreeTask::ALL;
+        let cur = tasks
+            .iter()
+            .position(|t| *t == self.model_picker.task_sort)
+            .unwrap_or(0) as isize;
+        let next = ((cur + delta).rem_euclid(tasks.len() as isize)) as usize;
+        self.set_free_task(tasks[next]);
+    }
+
+    /// Set the free-model task sort to an absolute task, persisting it and
+    /// reporting it in the status line.
+    fn set_free_task(&mut self, task: FreeTask) {
+        self.model_picker.task_sort = task;
+        self.persist_free_task_sort();
+        self.status_message = Some(format!("Task sort: {}.", task.label()));
+    }
+
     /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
     /// and the loading spinner while streaming.
     /// Call once per frame before rendering.
@@ -2990,6 +3012,31 @@ impl App {
             }
         }
 
+        // /task [<name>]: cycle the free-model task sort, or jump straight to
+        // a named task (all/coding/reasoning/creative/fast/multimodal/context).
+        if cmd == "task" {
+            let arg = args.trim();
+            if arg.is_empty() {
+                self.cycle_free_task(1);
+            } else if let Some(task) = FreeTask::ALL.iter().copied().find(|t| {
+                // Accept the full label AND the short legend form (e.g.
+                // "reasoning" or the "reason" shown as 3=reason in the picker).
+                t.label() == arg || matches!((t, arg), (FreeTask::Coding, "code") | (FreeTask::Reasoning, "reason") | (FreeTask::Multimodal, "multi") | (FreeTask::Context, "ctx"))
+            }) {
+                self.set_free_task(task);
+            } else {
+                self.status_message = Some(format!(
+                    "Unknown task '{arg}' — one of: {}",
+                    FreeTask::ALL
+                        .iter()
+                        .map(|t| t.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            return true;
+        }
+
         // Parse capability filter from --capability flag (used by /model and /models).
         let cap_parse_result = parse_capability_args(args);
 
@@ -3186,6 +3233,12 @@ impl App {
                 self.model_picker.loading_models = false;
                 self.model_picker.models_loaded = true;
                 self.model_picker_fetch_pending = false;
+                true
+            }
+            "task" => {
+                // Bare /task cycles forward; arg forms are handled in
+                // intercept_slash_command_with_args before this dispatch.
+                self.cycle_free_task(1);
                 true
             }
             "session" | "resume" => {
@@ -6961,6 +7014,10 @@ impl App {
                 }
                 false
             }
+            "cycleFreeTask" => {
+                self.cycle_free_task(1);
+                false
+            }
             "openEffort" => {
                 if !self.is_streaming {
                     self.intercept_slash_command("effort");
@@ -9602,6 +9659,58 @@ mod tests {
             crate::model_picker::FreeTask::Reasoning,
             "a fresh App must restore the persisted task sort from settings"
         );
+    }
+
+    #[test]
+    fn test_task_slash_command_cycles_sort() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("task"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert!(app.intercept_slash_command("task"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        // Named arg jumps straight to a task.
+        assert!(app.intercept_slash_command_with_args("task", "creative"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Creative);
+        assert!(app.intercept_slash_command_with_args("task", "all"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+    }
+
+    #[test]
+    fn test_task_slash_command_rejects_unknown_task() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("task", "bogus"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("Unknown task")),
+            "unknown task must show a helpful error"
+        );
+    }
+
+    #[test]
+    fn test_task_slash_command_accepts_short_legend_labels() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("task", "code"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert!(app.intercept_slash_command_with_args("task", "reason"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert!(app.intercept_slash_command_with_args("task", "ctx"));
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Context);
+    }
+
+    #[test]
+    fn test_cycle_free_task_keybinding_advances_sort() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Keybinding actions return false (not consumed) like cycleFreeUpstream.
+        app.handle_keybinding_action("cycleFreeTask");
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        app.handle_keybinding_action("cycleFreeTask");
+        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
     }
 
     #[test]

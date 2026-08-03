@@ -259,6 +259,33 @@ List all configured AI providers and their connection status. Shows provider nam
 
 ---
 
+### /task
+
+Cycle the free-model task sort, or jump straight to a named task. The task
+sort reorders the `/models` picker so the best-fit models float to the top
+for each common task (see the 1-7 legend in the picker header). Bare `/task`
+cycles forward; pass a task name to jump directly.
+
+```
+/task
+/task coding
+/task reasoning
+/task creative
+/task all
+```
+
+Available tasks: `all`, `coding`, `reasoning`, `creative`, `fast`,
+`multimodal`, `context` — plus the short legend forms shown in the picker
+header (`code`, `reason`, `multi`, `ctx`). The same cycle is bound to
+**Alt+T**, and the active sort shows as a badge in the status line when the
+free provider is active. The sort persists across restarts and resets when
+you switch to a non-free provider.
+
+> Note: `/task` (singular) controls the free-model task **sort**, distinct
+> from `/tasks` (plural), which manages background tasks.
+
+---
+
 ### /connect
 
 Connect to a remote AI provider or configure a custom provider endpoint. Supports OpenAI-compatible APIs, Anthropic direct, and others.

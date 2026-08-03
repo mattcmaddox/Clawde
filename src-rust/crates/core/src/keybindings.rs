@@ -244,6 +244,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
         // ========== FREE MODE UPSTREAM CYCLE ==========
         ("alt+u", "cycleFreeUpstream", KeyContext::Chat),
+        ("alt+t", "cycleFreeTask", KeyContext::Chat),
         // ========== OLLAMA MODE TOGGLE ==========
         ("alt+o", "toggleOllama", KeyContext::Chat),
         // ========== EFFORT ==========
