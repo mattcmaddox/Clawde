@@ -1011,6 +1011,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
+    // Topmost: hover tooltip for the free-model task-sort badge.
+    render_task_badge_tooltip(frame, app);
 }
 
 /// Snapshot the rendered text of every row inside the selectable area into
@@ -2470,7 +2472,138 @@ fn render_todo_block(
 // Input pane
 // -----------------------------------------------------------------------
 
+/// Compute the on-screen rect of the span at `idx` inside a right-aligned
+/// `Line` rendered into `area`. Used to hit-test the free-model task-sort
+/// badge for the hover tooltip.
+fn right_aligned_span_rect(spans: &[Span<'static>], idx: usize, area: Rect) -> Option<Rect> {
+    let span = spans.get(idx)?;
+    let line_w: u16 = spans.iter().map(|s| s.width() as u16).sum();
+    // A right-aligned Paragraph clips the LEFT side of an over-long line, so
+    // the computed badge position would not match what is visible. Bail out
+    // instead of advertising a rect the user can't actually hover.
+    if line_w > area.width {
+        return None;
+    }
+    let offset: u16 = spans[..idx].iter().map(|s| s.width() as u16).sum();
+    let start_x = area.x + area.width.saturating_sub(line_w);
+    Some(Rect {
+        x: start_x + offset,
+        y: area.y,
+        width: span.width() as u16,
+        height: 1,
+    })
+}
+
+/// Content lines for the task-sort hover tooltip: a usage hint, the valid
+/// `/task <name>` values colour-coded per task (active bolded), and the
+/// alt+t / number-key affordances.
+fn task_tooltip_lines(active: crate::model_picker::FreeTask) -> Vec<Line<'static>> {
+    let p = crate::theme_colors::current_palette();
+    let tasks = crate::model_picker::FreeTask::ALL;
+
+    let mut content: Vec<Line<'static>> = Vec::new();
+    content.push(Line::from(vec![
+        Span::styled(
+            "/task <name>",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  sets the sort", Style::default().fg(p.hint)),
+    ]));
+
+    for row in [&tasks[..3], &tasks[3..6], &tasks[6..]] {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, t) in row.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            }
+            let mut style = Style::default().fg(t.color());
+            if *t == active {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(t.label(), style));
+        }
+        content.push(Line::from(spans));
+    }
+
+    content.push(Line::from(vec![
+        Span::styled(
+            "alt+t",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cycles · ", Style::default().fg(p.hint)),
+        Span::styled(
+            "1-7",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" jumps in /models", Style::default().fg(p.hint)),
+    ]));
+    content
+}
+
+/// Popup tooltip for the free-model task-sort badge in the status line.
+///
+/// When the mouse hovers over the badge (recorded each frame as
+/// `task_badge_rect`, cursor position tracked in `handle_mouse_event`),
+/// show the valid `/task <name>` values plus the alt+t / number-key
+/// affordances. Mirrors the context-menu popup styling.
+fn render_task_badge_tooltip(frame: &mut Frame, app: &App) {
+    let badge_rect = app.task_badge_rect.get();
+    if badge_rect.width == 0 || badge_rect.height == 0 {
+        return;
+    }
+    let Some((mx, my)) = app.last_mouse_pos.get() else {
+        return;
+    };
+    if my != badge_rect.y
+        || mx < badge_rect.x
+        || mx >= badge_rect.x.saturating_add(badge_rect.width)
+    {
+        return;
+    }
+    if is_modal_open(app) {
+        return;
+    }
+
+    let p = crate::theme_colors::current_palette();
+    let content = task_tooltip_lines(app.model_picker.task_sort);
+    let content_w = content.iter().map(|l| l.width()).max().unwrap_or(20) as u16;
+    let tip_w = content_w.saturating_add(4);
+    let tip_h = content.len() as u16 + 2;
+
+    let screen = frame.area();
+    let tip_x = badge_rect.x.min(screen.width.saturating_sub(tip_w));
+    let tip_y = badge_rect.y.saturating_sub(tip_h + 1); // 1-row gap above the badge
+    let tip_area = Rect {
+        x: tip_x,
+        y: tip_y,
+        width: tip_w,
+        height: tip_h,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 30)))
+        .border_style(Style::default().fg(p.accent));
+    block.render(tip_area, frame.buffer_mut());
+
+    let inner = Rect {
+        x: tip_area.x + 1,
+        y: tip_area.y + 1,
+        width: tip_area.width.saturating_sub(2),
+        height: tip_area.height.saturating_sub(2),
+    };
+    frame.render_widget(
+        Paragraph::new(content).style(Style::default().bg(Color::Rgb(24, 24, 30))),
+        inner,
+    );
+}
+
 fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    // Any stale task-badge rect from a previous frame must not keep the
+    // hover tooltip alive once the badge is gone (streaming, tiny terminal,
+    // non-free provider, …).
+    app.task_badge_rect.set(Rect::default());
     // Split: 1-row model/mode status line + remaining rows for the prompt input.
     let (status_area, input_area) = if area.height > 2 {
         let splits = Layout::default()
@@ -2585,6 +2718,9 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         // Context-sensitive hints in the right slot. These are suppressed
         // once the prompt has text so they don't compete with typing, and
         // during streaming when the input is readonly.
+        // Index of the free-model task-sort badge within the final right-hint
+        // span list, set when the badge is drawn this frame.
+        let mut task_badge_span_idx: Option<usize> = None;
         let right_hint = if app.prompt_input.has_expandable_paste_ref() {
             // A [Pasted text #N ...] placeholder is in the buffer — tell the
             // user how to view the full pasted body before submitting.
@@ -2608,14 +2744,18 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             // Active free-model task sort (when not the default "all") — e.g.
             // "coding" — so the user sees /models is pre-sorted by task. Only
             // for the free composite provider: the sort is inert elsewhere.
+            let mut task_badge_idx: Option<usize> = None;
             if app.config.selected_provider_id() == "free"
                 && app.model_picker.task_sort != crate::model_picker::FreeTask::All
             {
                 let task = app.model_picker.task_sort;
                 badge_spans.push(Span::styled(
                     task.label(),
-                    Style::default().fg(task.color()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(task.color())
+                        .add_modifier(Modifier::BOLD),
                 ));
+                task_badge_idx = Some(badge_spans.len() - 1);
             }
             // Routing strategy badge (only for free provider).
             if app.config.selected_provider_id() == "free" {
@@ -2648,12 +2788,18 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                 "? shortcuts · Ctrl+/ keys"
             };
 
-            // Join badges with · separator, then append shortcut.
+            // Join badges with · separator, then append shortcut. Remember
+            // where the task badge lands in the span list so the hover
+            // tooltip can compute its on-screen rect via
+            // `right_aligned_span_rect`.
             let mut spans: Vec<Span> = Vec::new();
             let mut first = true;
-            for s in &badge_spans {
+            for (i, s) in badge_spans.iter().enumerate() {
                 if !first {
                     spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+                }
+                if Some(i) == task_badge_idx {
+                    task_badge_span_idx = Some(spans.len());
                 }
                 spans.push(s.clone());
                 first = false;
@@ -2680,6 +2826,20 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             width: chunks[1].width.saturating_sub(1),
             height: chunks[1].height,
         };
+
+        // Record the task badge's on-screen rect (right-aligned line inside
+        // right_padded) so the hover tooltip can hit-test it next frame.
+        // Computed before `right_hint` is moved into the render call below.
+        if let Some(idx) = task_badge_span_idx {
+            if let Some(rect) = right_aligned_span_rect(&right_hint.spans, idx, right_padded) {
+                app.task_badge_rect.set(rect);
+            } else {
+                app.task_badge_rect.set(Rect::default());
+            }
+        } else {
+            app.task_badge_rect.set(Rect::default());
+        }
+
         frame.render_widget(Paragraph::new(vec![left_line]), left_padded);
         frame.render_widget(
             Paragraph::new(vec![right_hint]).alignment(Alignment::Right),
@@ -5006,5 +5166,177 @@ mod status_row_badge_tests {
         assert_eq!(trailing.lines.len(), 2);
         // Empty content produces no lines at all.
         assert!(spans_to_text(Vec::new()).lines.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_badge_tooltip_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn right_aligned_span_rect_math() {
+        // Right-aligned line inside a 40-wide area starting at x=10.
+        // Spans: "AB" (2) + " · " (3) + "coding" (6) + " · " (3) + "shortcut" (8)
+        let spans = vec![
+            Span::raw("AB"),
+            Span::styled(" · ", Style::default()),
+            Span::raw("coding"),
+            Span::styled(" · ", Style::default()),
+            Span::raw("shortcut"),
+        ];
+        let area = Rect {
+            x: 10,
+            y: 3,
+            width: 40,
+            height: 1,
+        };
+        // Line width = 2+3+6+3+8 = 22 → starts at 10+40-22 = 28.
+        let badge = right_aligned_span_rect(&spans, 2, area).unwrap();
+        assert_eq!(badge.x, 28 + 2 + 3); // offset of "coding" within the line
+        assert_eq!(badge.y, 3);
+        assert_eq!(badge.width, 6);
+        assert_eq!(badge.height, 1);
+        // Badge out of range → None.
+        assert!(right_aligned_span_rect(&spans, 99, area).is_none());
+        // Over-long line (wider than the area) clips on the left in the real
+        // renderer — no rect to hover, so bail out with None.
+        let long: Vec<Span> = vec![Span::raw("x".repeat(60))];
+        assert!(right_aligned_span_rect(&long, 0, area).is_none());
+    }
+
+    #[test]
+    fn tooltip_draws_isolated_from_real_settings() {
+        // Guard: App::new restores free_task_sort from settings; point
+        // CLAWDE_HOME at a temp dir so a malformed real settings file can
+        // never flake this render test (mirrors app.rs TestHome).
+        use std::sync::Mutex;
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAWDE_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+
+        let app = crate::app::App::new(
+            clawde_core::config::Config::default(),
+            clawde_core::cost::CostTracker::new(),
+        );
+        // The tooltip must draw for any task sort without touching disk.
+        app.task_badge_rect.set(Rect {
+            x: 60,
+            y: 5,
+            width: 6,
+            height: 1,
+        });
+        app.last_mouse_pos.set(Some((62, 5)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_task_badge_tooltip(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| c.symbol())
+            .collect();
+        assert!(drawn.contains("coding"));
+
+        match prev {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[test]
+    fn tooltip_lists_all_valid_task_names() {
+        let lines = task_tooltip_lines(crate::model_picker::FreeTask::Coding);
+        let text = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        for name in [
+            "all",
+            "coding",
+            "reasoning",
+            "creative",
+            "fast",
+            "multimodal",
+            "long context",
+        ] {
+            assert!(text.contains(name), "tooltip missing '{name}': {text}");
+        }
+        // Affordance hints present.
+        assert!(text.contains("/task <name>"));
+        assert!(text.contains("alt+t"));
+        assert!(text.contains("1-7"));
+    }
+
+    #[test]
+    fn tooltip_draws_only_when_mouse_over_badge() {
+        let app = crate::app::App::new(
+            clawde_core::config::Config::default(),
+            clawde_core::cost::CostTracker::new(),
+        );
+        // Pretend the task badge was drawn at (60, 5) last frame and the
+        // cursor is hovering exactly over it.
+        app.task_badge_rect.set(Rect {
+            x: 60,
+            y: 5,
+            width: 6,
+            height: 1,
+        });
+        app.last_mouse_pos.set(Some((62, 5)));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render_task_badge_tooltip(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            drawn.contains("coding"),
+            "tooltip should draw when hovering the badge"
+        );
+
+        // Move the cursor away — the tooltip must disappear.
+        app.last_mouse_pos.set(Some((10, 20)));
+        terminal
+            .draw(|f| render_task_badge_tooltip(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !drawn.contains("coding"),
+            "tooltip must not draw when the mouse is elsewhere"
+        );
+
+        // And with no recorded mouse position at all.
+        app.last_mouse_pos.set(None);
+        terminal
+            .draw(|f| render_task_badge_tooltip(f, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!drawn.contains("coding"));
     }
 }

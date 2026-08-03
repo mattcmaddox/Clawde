@@ -371,7 +371,10 @@ mod tests {
             "Bearer ghp_testtoken"
         );
         // The required GitHub headers must survive alongside the auth header.
-        assert_eq!(headers.get(reqwest::header::ACCEPT).unwrap(), GITHUB_MEDIA_TYPE);
+        assert_eq!(
+            headers.get(reqwest::header::ACCEPT).unwrap(),
+            GITHUB_MEDIA_TYPE
+        );
         assert_eq!(
             headers.get("X-GitHub-Api-Version").unwrap(),
             GITHUB_API_VERSION

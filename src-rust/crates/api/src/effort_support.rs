@@ -68,7 +68,9 @@ fn family_variant_ladder(
     registry: Option<&ModelRegistry>,
 ) -> Option<Vec<EffortLevel>> {
     let slug = if provider == "free" || provider.is_empty() {
-        model.strip_prefix("free/family/").or_else(|| model.strip_prefix("family/"))
+        model
+            .strip_prefix("free/family/")
+            .or_else(|| model.strip_prefix("family/"))
     } else {
         return None;
     }?;
@@ -443,8 +445,16 @@ mod tests {
         assert!(variant_ladder("free", "free/family/gpt-4o", Some(&reg)).is_empty());
 
         // model_is_reasoning must agree with the ladder for the same family id.
-        assert!(model_is_reasoning("free", "free/family/gpt-oss-120b", Some(&reg)));
-        assert!(!model_is_reasoning("free", "free/family/gpt-4o", Some(&reg)));
+        assert!(model_is_reasoning(
+            "free",
+            "free/family/gpt-oss-120b",
+            Some(&reg)
+        ));
+        assert!(!model_is_reasoning(
+            "free",
+            "free/family/gpt-4o",
+            Some(&reg)
+        ));
 
         // Unknown family slug falls back to the old behavior (empty ladder via
         // the literal free provider), mirroring Route::Family → Auto.

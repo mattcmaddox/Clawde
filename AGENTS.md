@@ -82,6 +82,43 @@ tmux kill-session -t clawde-test
 
 On Windows hosts, prefer `cargo run -- --print "..."` against the headless path. The Windows console has known quirks with the kitty keyboard protocol — see `crates/tui` for the push/pop workaround.
 
+## Prevention & Regression Guards
+
+### TUI repaint cadence (do not regress)
+
+The TUI main loop must never repaint at full rate while idle. The decision
+lives in `App::needs_fast_repaint()` (`crates/tui/src/app.rs`) and the poll
+timeout in `crates/cli/src/main.rs` (16 ms while streaming / effort-picker
+animation / any modal is open, 250 ms otherwise). Any new per-frame animation
+must extend `needs_fast_repaint()`; never hardcode a 16 ms poll for all states.
+An idle session regressing to a constant 60fps repaint burns ~30% of a core
+forever. Check with:
+
+```bash
+python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde
+```
+
+### `cargo check` skips test targets
+
+`cargo check --workspace` (and plain `cargo build`) do NOT compile `#[cfg(test)]`
+code. A test-only compile error slips through every local check but fails CI's
+`cargo test --workspace`. Run the pre-commit hook or:
+
+```bash
+cargo check -p clawde-tui --tests
+```
+
+### Pre-commit hook
+
+`.githooks/pre-commit` runs rustfmt + the TUI test-target check before commits
+(see the script header). Enable once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Opt out of a single commit: `SKIP_CLAWDE_HOOK=1 git commit ...`
+
 ## Issues & PR Comments
 
 When posting issue/PR comments:

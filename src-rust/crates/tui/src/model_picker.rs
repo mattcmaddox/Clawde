@@ -593,7 +593,10 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         entries.push(ModelEntry {
             id: format!("{}/{}", upstream.id, upstream.default_model),
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
-            description: format!("{} · {} · {}", upstream.specialty, upstream.note, upstream.usage),
+            description: format!(
+                "{} · {} · {}",
+                upstream.specialty, upstream.note, upstream.usage
+            ),
             is_current: false,
             reasoning,
             capabilities,
@@ -1043,7 +1046,10 @@ impl ModelPickerState {
     /// `true` when this picker is showing the free-mode list (starts with
     /// `free/auto`). Task cycling and number-key jumps only apply there.
     pub fn is_free_list(&self) -> bool {
-        self.models.first().map(|m| m.id == "free/auto").unwrap_or(false)
+        self.models
+            .first()
+            .map(|m| m.id == "free/auto")
+            .unwrap_or(false)
     }
 
     /// Jump straight to the 1-based task slot `n` (1 = All, 2 = Coding, …).
@@ -1299,8 +1305,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     };
 
     let footer_height = 1u16.min(inner.height);
-    let header_height = (if is_free_picker_list { 5 } else { 3 })
-        .min(inner.height.saturating_sub(footer_height));
+    let header_height =
+        (if is_free_picker_list { 5 } else { 3 }).min(inner.height.saturating_sub(footer_height));
     let header_area = Rect {
         x: inner.x,
         y: inner.y,
@@ -1352,10 +1358,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // number keys reorder rows.
     if is_free_picker_list {
         header_lines.push(Line::from(vec![
-            Span::styled(
-                "  Task: ",
-                Style::default().fg(dim).bg(dialog_bg),
-            ),
+            Span::styled("  Task: ", Style::default().fg(dim).bg(dialog_bg)),
             Span::styled(
                 state.task_sort.label(),
                 Style::default()
@@ -1363,20 +1366,14 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                     .add_modifier(Modifier::BOLD)
                     .bg(dialog_bg),
             ),
-            Span::styled(
-                "   \u{21b9} sort  ",
-                Style::default().fg(dim).bg(dialog_bg),
-            ),
+            Span::styled("   \u{21b9} sort  ", Style::default().fg(dim).bg(dialog_bg)),
         ]));
 
         // 1=all 2=code 3=reason 4=creative 5=fast 6=multi 7=ctx
         let mut legend_spans: Vec<Span<'static>> = Vec::new();
         for (slot, task) in FreeTask::ALL.iter().enumerate() {
             if slot > 0 {
-                legend_spans.push(Span::styled(
-                    "  ",
-                    Style::default().fg(dim).bg(dialog_bg),
-                ));
+                legend_spans.push(Span::styled("  ", Style::default().fg(dim).bg(dialog_bg)));
             }
             // Compact slot label — must fit the 65-wide dialog.
             let short = match task {
@@ -1621,15 +1618,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if has_header && total_lines > 0 {
         let top = scroll_y.min(total_lines.saturating_sub(1));
-        if let Some(name) = line_sections
-            .get(top as usize)
-            .copied()
-            .flatten()
-        {
-            let count = line_sections
-                .iter()
-                .filter(|s| **s == Some(name))
-                .count();
+        if let Some(name) = line_sections.get(top as usize).copied().flatten() {
+            let count = line_sections.iter().filter(|s| **s == Some(name)).count();
             let header = Line::from(vec![Span::styled(
                 format!("  {}  · {} ", name.to_uppercase(), count),
                 Style::default()
@@ -2516,8 +2506,7 @@ mod tests {
     fn task_sort_preserves_pin_order() {
         let mut p = ModelPickerState::new();
         p.set_models(free_provider_models());
-        let original_ids: Vec<String> =
-            p.models.iter().map(|m| m.id.clone()).collect();
+        let original_ids: Vec<String> = p.models.iter().map(|m| m.id.clone()).collect();
         p.task_sort = FreeTask::Reasoning;
         let filtered = p.filtered_models();
         // free_provider_models() only ever emits `free/auto` + `free/family/*`
@@ -2553,12 +2542,14 @@ mod tests {
         let anchor_id = p.filtered_models()[p.selected_idx].id.clone();
         p.task_next();
         assert_eq!(
-            p.filtered_models()[p.selected_idx].id, anchor_id,
+            p.filtered_models()[p.selected_idx].id,
+            anchor_id,
             "task cycle must keep the selected model highlighted"
         );
         p.task_next();
         assert_eq!(
-            p.filtered_models()[p.selected_idx].id, anchor_id,
+            p.filtered_models()[p.selected_idx].id,
+            anchor_id,
             "repeated task cycles must keep anchoring"
         );
     }
@@ -2569,11 +2560,7 @@ mod tests {
         let mut p = make_picker(); // sample_models() — claude/openai ids
         p.task_sort = FreeTask::Coding;
         let original: Vec<String> = p.models.iter().map(|m| m.id.clone()).collect();
-        let filtered: Vec<&str> = p
-            .filtered_models()
-            .iter()
-            .map(|m| m.id.as_str())
-            .collect();
+        let filtered: Vec<&str> = p.filtered_models().iter().map(|m| m.id.as_str()).collect();
         assert_eq!(filtered, original, "provider pickers must not be reordered");
     }
 
@@ -2624,7 +2611,8 @@ mod tests {
         p.task_jump(4); // Creative
         assert_eq!(p.task_sort, FreeTask::Creative);
         assert_eq!(
-            p.filtered_models()[p.selected_idx].id, anchor_id,
+            p.filtered_models()[p.selected_idx].id,
+            anchor_id,
             "task_jump must keep the selected model highlighted"
         );
     }

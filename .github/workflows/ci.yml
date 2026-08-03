@@ -76,16 +76,15 @@ jobs:
         working-directory: src-rust
         run: cargo test --workspace --locked test_no_unreferenced_pub_functions_in_workspace -- --test-threads=1
 
-      # Advisory for now: the codebase has pre-existing clippy warnings and
-      # rustfmt drift. Flip continue-on-error off once they are cleaned up.
-      - name: Clippy (advisory)
+      # Both gates are REQUIRED now: the workspace is clippy-clean with
+      # -D warnings and rustfmt-clean, so regressions must fail CI loudly
+      # instead of silently accumulating drift.
+      - name: Clippy (required)
         if: runner.os == 'Linux'
         working-directory: src-rust
-        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: rustfmt (advisory)
+      - name: rustfmt (required)
         if: runner.os == 'Linux'
         working-directory: src-rust
-        continue-on-error: true
         run: cargo fmt --all --check

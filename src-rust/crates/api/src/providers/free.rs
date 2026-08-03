@@ -2030,10 +2030,7 @@ impl FreeProvider {
             .strip_prefix("free/family/")
             .or_else(|| normalized.strip_prefix("family/"))
         {
-            if let Some(entry) = FREE_CATALOG
-                .iter()
-                .find(|entry| entry.model_family == rest)
-            {
+            if let Some(entry) = FREE_CATALOG.iter().find(|entry| entry.model_family == rest) {
                 return Route::Family {
                     model_family: entry.model_family,
                 };

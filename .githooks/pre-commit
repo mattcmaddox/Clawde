@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Clawde pre-commit hook (enable once per clone: git config core.hooksPath .githooks).
+#
+# Fast, read-only checks that run before a commit is created:
+#   1. rustfmt drift (`cargo fmt --all --check`) — instant.
+#   2. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
+#      test-code compile breaks that plain `cargo check --workspace` skips
+#      (test targets are not compiled by the default check/build).
+#
+# Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
+# Skip only the slower cargo check (keep the instant fmt check):
+#   CLAWDE_HOOK_SKIP_TESTS=1 git commit ...
+set -u
+
+if [ "${SKIP_CLAWDE_HOOK:-0}" = "1" ]; then
+    exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 0
+cd "$ROOT" || exit 0
+
+# Only relevant when Rust sources are staged.
+if ! git diff --cached --name-only | grep -q '^src-rust/.*\.rs$'; then
+    exit 0
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    exit 0
+fi
+
+cd "$ROOT/src-rust"
+
+if ! cargo fmt --all --check >/dev/null 2>&1; then
+    echo "pre-commit: cargo fmt --all --check failed — run 'cargo fmt --all' and stage the result."
+    exit 1
+fi
+
+if [ "${CLAWDE_HOOK_SKIP_TESTS:-0}" = "1" ]; then
+    exit 0
+fi
+if ! cargo check -p clawde-tui --tests >/dev/null 2>&1; then
+    echo "pre-commit: clawde-tui test targets do not compile."
+    echo "  Note: plain 'cargo check --workspace' skips test targets; CI's"
+    echo "  'cargo test --workspace' compiles them and would fail."
+    exit 1
+fi
+
+exit 0

@@ -100,7 +100,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
     ("models", "Browse free upstream models"),
-    ("task", "Cycle the free-model task sort (all/coding/reasoning/…)"),
+    ("task", "Set free-model sort: /task <name> (all/coding/reasoning/creative/fast/multimodal/long-context)"),
     (
         "move",
         "Re-home this session to another worktree of the same project",
@@ -153,7 +153,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 fn help_command_category(name: &str) -> &'static str {
     match name {
         "connect" | "model" | "models" | "providers" | "refresh" | "fast" | "effort" | "voice"
-        | "ollama" => "Model & Provider",
+        | "ollama" | "task" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => {
             "Review & History"
         }
@@ -1793,6 +1793,12 @@ pub struct App {
     pub last_input_area: Cell<ratatui::layout::Rect>,
     /// The footer's right column area (where tips are shown) from the last render.
     pub footer_right_column_area: Cell<ratatui::layout::Rect>,
+    /// Last mouse position (screen coords) seen by the mouse handler — used for
+    /// hover tooltips (e.g. the free-model task-sort badge).
+    pub last_mouse_pos: Cell<Option<(u16, u16)>>,
+    /// Screen rect of the free-model task-sort badge drawn last frame — the
+    /// hover target for the task tooltip. Default when no badge is shown.
+    pub task_badge_rect: Cell<ratatui::layout::Rect>,
     /// Which area of the TUI currently has keyboard focus.
     pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
@@ -2224,6 +2230,8 @@ impl App {
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
             footer_right_column_area: Cell::new(ratatui::layout::Rect::default()),
+            last_mouse_pos: Cell::new(None),
+            task_badge_rect: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
@@ -3021,7 +3029,14 @@ impl App {
             } else if let Some(task) = FreeTask::ALL.iter().copied().find(|t| {
                 // Accept the full label AND the short legend form (e.g.
                 // "reasoning" or the "reason" shown as 3=reason in the picker).
-                t.label() == arg || matches!((t, arg), (FreeTask::Coding, "code") | (FreeTask::Reasoning, "reason") | (FreeTask::Multimodal, "multi") | (FreeTask::Context, "ctx"))
+                t.label() == arg
+                    || matches!(
+                        (t, arg),
+                        (FreeTask::Coding, "code")
+                            | (FreeTask::Reasoning, "reason")
+                            | (FreeTask::Multimodal, "multi")
+                            | (FreeTask::Context, "ctx")
+                    )
             }) {
                 self.set_free_task(task);
             } else {
@@ -3567,6 +3582,17 @@ impl App {
             || self.mcp_approval.visible
             || self.file_injection_dialog.visible
             || self.context_menu_state.is_some()
+    }
+
+    /// Whether the main event loop needs a fast (~60fps) repaint cadence.
+    ///
+    /// True only while something on screen is actually animating: streaming
+    /// (spinner, thinking shimmer, live text), the effort picker's animated
+    /// ultracode spectrum, or a modal dialog (attention spinner). When false
+    /// the loop stretches its poll interval so an idle session does not burn
+    /// a core repainting a static screen at full rate.
+    pub fn needs_fast_repaint(&self) -> bool {
+        self.is_streaming || self.effort_picker.wants_animation() || self.any_modal_open()
     }
 
     fn dismiss_error_notifications(&mut self) {
@@ -5235,10 +5261,10 @@ impl App {
                     if self.model_picker.is_free_list()
                         && self.model_picker.filter.is_empty()
                         && c.is_ascii_digit()
-                        && c.to_digit(10)
-                            .is_some_and(|d| (1..=7).contains(&d)) =>
+                        && c.to_digit(10).is_some_and(|d| (1..=7).contains(&d)) =>
                 {
-                    self.model_picker.task_jump(c.to_digit(10).unwrap() as usize);
+                    self.model_picker
+                        .task_jump(c.to_digit(10).unwrap() as usize);
                     self.persist_free_task_sort();
                 }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -7855,8 +7881,16 @@ impl App {
         // Keyboard scrolling (PageUp/PageDown, etc.) is handled elsewhere and is
         // unaffected by this gate.
         if !self.config.mouse_capture_enabled() {
+            // Hover tooltips must not fire when the terminal owns the mouse
+            // (native selection).
+            self.last_mouse_pos.set(None);
             return;
         }
+
+        // Record the cursor position for hover tooltips (cheap — runs before
+        // the move fast-reject below so moves still update the cursor).
+        self.last_mouse_pos
+            .set(Some((mouse_event.column, mouse_event.row)));
 
         // The paste viewer modal swallows mouse input: the wheel scrolls its
         // body, everything else is inert (Esc/q close it).
@@ -8912,6 +8946,25 @@ mod tests {
         App::new(config, cost_tracker)
     }
 
+    #[test]
+    fn idle_app_does_not_need_fast_repaint() {
+        assert!(!make_app().needs_fast_repaint());
+    }
+
+    #[test]
+    fn streaming_app_needs_fast_repaint() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        assert!(app.needs_fast_repaint());
+    }
+
+    #[test]
+    fn open_modal_needs_fast_repaint() {
+        let mut app = make_app();
+        app.model_picker.visible = true;
+        assert!(app.needs_fast_repaint());
+    }
+
     /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
     /// settings writes (e.g. task-sort persistence) never touch the real
     /// `~/.clawde/settings.json`. Mirrors the TestHome helper in commands/keys.rs.
@@ -9005,6 +9058,39 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn mouse_move_records_hover_position() {
+        let mut app = make_app();
+        assert_eq!(app.last_mouse_pos.get(), None);
+        let ev = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 42,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(ev);
+        // Even though moves are fast-rejected (no scroll / selection work),
+        // the position must be recorded for hover tooltips.
+        assert_eq!(app.last_mouse_pos.get(), Some((42, 7)));
+    }
+
+    #[test]
+    fn mouse_position_cleared_when_capture_disabled() {
+        let mut app = make_app();
+        app.last_mouse_pos.set(Some((10, 10)));
+        app.config.mouse_capture = Some(false);
+        let ev = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse_event(ev);
+        // Capture off → the terminal owns the mouse; the app must not act on
+        // stray events and must not keep a stale hover position.
+        assert_eq!(app.last_mouse_pos.get(), None);
     }
 
     #[test]
@@ -9592,19 +9678,34 @@ mod tests {
         let mut app = make_app();
         assert!(app.intercept_slash_command("models"));
         assert!(app.model_picker.visible);
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All
+        );
         // Tab cycles forward, Shift+Tab backward.
         app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         app.handle_key_event(press_key(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         // Full cycle from Coding wraps back to Coding.
         for _ in 0..crate::model_picker::FreeTask::ALL.len() {
             app.handle_key_event(press_key(KeyCode::Tab, KeyModifiers::NONE));
         }
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
     }
 
     #[test]
@@ -9614,9 +9715,15 @@ mod tests {
         assert!(app.intercept_slash_command("models"));
         // 2 = Coding, 5 = Fast.
         app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         app.handle_key_event(press_key(KeyCode::Char('5'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Fast);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Fast
+        );
         // Out-of-range digits fall through to the filter.
         app.handle_key_event(press_key(KeyCode::Char('9'), KeyModifiers::NONE));
         assert_eq!(
@@ -9638,7 +9745,10 @@ mod tests {
         app.config.provider = Some("anthropic".to_string());
         assert!(app.intercept_slash_command("model"));
         app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All
+        );
         assert_eq!(app.model_picker.filter, "2");
     }
 
@@ -9650,7 +9760,10 @@ mod tests {
         let mut app = make_app();
         assert!(app.intercept_slash_command("models"));
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         // Drop the app so settings are flushed to disk, then rebuild.
         drop(app);
         let app = make_app();
@@ -9666,14 +9779,26 @@ mod tests {
         let _home = TestHome::acquire();
         let mut app = make_app();
         assert!(app.intercept_slash_command("task"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         assert!(app.intercept_slash_command("task"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         // Named arg jumps straight to a task.
         assert!(app.intercept_slash_command_with_args("task", "creative"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Creative);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Creative
+        );
         assert!(app.intercept_slash_command_with_args("task", "all"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All
+        );
     }
 
     #[test]
@@ -9681,7 +9806,10 @@ mod tests {
         let _home = TestHome::acquire();
         let mut app = make_app();
         assert!(app.intercept_slash_command_with_args("task", "bogus"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All
+        );
         assert!(
             app.status_message
                 .as_deref()
@@ -9695,11 +9823,20 @@ mod tests {
         let _home = TestHome::acquire();
         let mut app = make_app();
         assert!(app.intercept_slash_command_with_args("task", "code"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         assert!(app.intercept_slash_command_with_args("task", "reason"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         assert!(app.intercept_slash_command_with_args("task", "ctx"));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Context);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Context
+        );
     }
 
     #[test]
@@ -9708,9 +9845,15 @@ mod tests {
         let mut app = make_app();
         // Keybinding actions return false (not consumed) like cycleFreeUpstream.
         app.handle_keybinding_action("cycleFreeTask");
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Coding);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Coding
+        );
         app.handle_keybinding_action("cycleFreeTask");
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
     }
 
     #[test]
@@ -9720,7 +9863,10 @@ mod tests {
         // Set a non-All task in the free picker.
         assert!(app.intercept_slash_command("models"));
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         // Switching to a non-free provider clears it (and the persisted value).
         app.set_provider_default("anthropic".to_string());
         assert_eq!(
@@ -9741,7 +9887,10 @@ mod tests {
         let mut app = make_app();
         assert!(app.intercept_slash_command("models"));
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         // Staying on free must not reset the sort.
         app.set_provider_default("free".to_string());
         assert_eq!(
@@ -9760,9 +9909,15 @@ mod tests {
         let mut app = make_app();
         assert!(app.intercept_slash_command("models"));
         app.handle_key_event(press_key(KeyCode::Char('3'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::Reasoning);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::Reasoning
+        );
         app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
-        assert_eq!(app.model_picker.task_sort, crate::model_picker::FreeTask::All);
+        assert_eq!(
+            app.model_picker.task_sort,
+            crate::model_picker::FreeTask::All
+        );
         drop(app);
 
         let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();

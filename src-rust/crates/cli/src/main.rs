@@ -2484,6 +2484,20 @@ async fn run_interactive(
     }
 
     'main: loop {
+        // Check for SIGTERM (kill from outside the process) on every iteration,
+        // NOT only when a key event arrives — otherwise an idle session ignores
+        // `kill` until the user presses a key and can never be stopped cleanly.
+        if sigterm.load(Ordering::Relaxed) {
+            tracing::info!("SIGTERM — exiting TUI loop");
+            if app.is_streaming {
+                if let Some(ref ct) = cancel {
+                    ct.cancel();
+                }
+            }
+            app.should_exit = true;
+            break 'main;
+        }
+
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
         app.notifications.tick();
@@ -2547,16 +2561,25 @@ async fn run_interactive(
             None
         };
 
-        // Repaint cadence. The loop already polls at ~60fps for the streaming
-        // spinner; the effort picker's animated ultracode spectrum can be open
-        // while idle, so cap the poll interval to at least ~30fps whenever it is
-        // showing (frame_count advances every draw, moving the spectrum). This is
-        // a no-op unless the base cadence is ever relaxed, and it does NOT tick
-        // faster when the picker is closed.
-        let poll_timeout = if app.effort_picker.wants_animation() {
-            Duration::from_millis(16).min(Duration::from_millis(33))
-        } else {
+        // Repaint cadence. The loop repaints on every iteration, which only
+        // needs a fast (~60fps) cadence while something on screen is actually
+        // animating: streaming (spinner, thinking shimmer, live text), the
+        // effort picker's ultracode spectrum, or a modal dialog (attention
+        // spinner). When none of those apply the UI is static — the
+        // welcome-screen mascot cycles on a 1.5–3 s timer and toast progress
+        // bars move at human timescales — so stretch the poll interval to
+        // 250 ms instead of 16 ms. This drops an idle session from a constant
+        // ~60fps repaint (≈30% of a core) to ~4fps (a few percent) without
+        // changing any behavior; input latency is unaffected because poll()
+        // still wakes on the next event.
+        // The predicate lives on App and is unit-tested (see
+        // app.rs::tests::*needs_fast_repaint) so the cadence invariant cannot
+        // drift silently.
+        let fast_repaint = app.needs_fast_repaint();
+        let poll_timeout = if fast_repaint {
             Duration::from_millis(16)
+        } else {
+            Duration::from_millis(250)
         };
         let evt_opt: Option<Event> = if let Some(e) = synthetic_event {
             Some(e)
@@ -2583,17 +2606,8 @@ async fn run_interactive(
                         continue;
                     }
 
-                    // Check for SIGTERM (kill from outside the process)
-                    if sigterm.load(Ordering::Relaxed) {
-                        tracing::info!("SIGTERM — exiting TUI loop");
-                        if app.is_streaming {
-                            if let Some(ref ct) = cancel {
-                                ct.cancel();
-                            }
-                        }
-                        app.should_exit = true;
-                        break 'main;
-                    }
+                    // SIGTERM is handled at the top of the loop so an idle
+                    // session (no key events) still honours `kill`.
 
                     // ── Paste-burst detection ─────────────────────────────
                     // Terminals without bracketed paste (notably Windows
