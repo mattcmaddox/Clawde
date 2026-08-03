@@ -535,10 +535,11 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         let host_count = upstreams.len();
         entries.push(ModelEntry {
             id: format!("free/family/{}", family),
-            // The model name alone — the description line already carries the
-            // hosting-provider list and the "round-robin" hint, so a "pick
-            // provider" suffix would just eat width and repeat the same info.
-            display_name: first.default_model.to_string(),
+            // The short family slug (e.g. "gpt-4o", "llama-3.3-70b") as the
+            // display name — it matches the id suffix and is far more compact
+            // than the first upstream's full model id (e.g.
+            // "gpt-4o-2024-11-20"). The description line carries the host list.
+            display_name: family.to_string(),
             description: format!(
                 "{} {} · $0.00 per M",
                 hosts,
@@ -1042,6 +1043,15 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         lines.push(Line::from(""));
     }
 
+    // The free-mode list is the only picker that starts with `free/auto`;
+    // gate the "Model families" / "Provider pins" section headers on it so
+    // provider pickers (anthropic, openai, …) are unaffected.
+    let is_free_picker_list = state
+        .models
+        .first()
+        .map(|m| m.id == "free/auto")
+        .unwrap_or(false);
+
     if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             " No results found",
@@ -1054,9 +1064,31 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
+        let mut prev_section: Option<&'static str> = None;
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
+
+            // Subtle section header for the free picker: model-first family
+            // entries, then provider-pin entries. `free/auto` needs no header.
+            let section = if !is_free_picker_list || model.id == "free/auto" {
+                None
+            } else if model.id.starts_with("free/family/") {
+                Some("Model families")
+            } else {
+                Some("Provider pins")
+            };
+            if let Some(name) = section {
+                if prev_section != Some(name) {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!(" {} ", name.to_uppercase()),
+                        Style::default()
+                            .fg(Color::Rgb(120, 120, 135))
+                            .add_modifier(Modifier::BOLD),
+                    )]));
+                }
+                prev_section = section;
+            }
 
             if is_selected {
                 selected_line_idx = lines.len() as u16;
@@ -1547,6 +1579,41 @@ mod tests {
         }
     }
 
+    // 15b. The free picker renders subtle "MODEL FAMILIES" and
+    //      "PROVIDER PINS" section headers between the model-first family
+    //      entries and the provider-pin entries; the pin entries show the
+    //      provider name split from the (muted) model id.
+    #[test]
+    fn render_free_picker_shows_section_headers() {
+        let mut p = ModelPickerState::new();
+        p.set_models(free_provider_models());
+        p.open("free/auto");
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_model_picker(&p, area, &mut buf);
+
+        let rendered: Vec<String> = buf
+            .content()
+            .chunks(area.width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(
+            joined.contains("MODEL FAMILIES"),
+            "free picker must render the MODEL FAMILIES header"
+        );
+        assert!(
+            joined.contains("PROVIDER PINS"),
+            "free picker must render the PROVIDER PINS header"
+        );
+        // Pin row provider + model id both present (split display name).
+        assert!(
+            joined.contains("Hugging Face") && joined.contains("Llama-3.3-70B-Instruct"),
+            "pin row should show both provider and model id"
+        );
+    }
+
     // 16. models_for_provider_from_registry returns the bundled snapshot's
     //     entries for each well-known provider.  Specific model IDs aren't
     //     asserted here because the snapshot is regenerated periodically;
@@ -1879,13 +1946,21 @@ mod tests {
             );
         }
 
-        // Family entries must not carry a "pick provider" suffix — the model
-        // name alone is the display name (the description carries the hosts).
+        // Family entries must not carry a "pick provider" suffix, and their
+        // display name should be the short family slug (matching the id
+        // suffix) rather than a full dated model id — the description carries
+        // the hosts.
         for entry in &upstream_entries {
             if entry.id.starts_with("free/family/") {
+                let slug = entry.id.strip_prefix("free/family/").unwrap();
                 assert!(
                     !entry.display_name.contains("pick provider"),
                     "family '{}' display name should not say 'pick provider'",
+                    entry.id
+                );
+                assert_eq!(
+                    entry.display_name, slug,
+                    "family '{}' display name should be the short slug",
                     entry.id
                 );
             }
