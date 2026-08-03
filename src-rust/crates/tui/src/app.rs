@@ -9989,6 +9989,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: vec![],
+            specialty: None,
+            usage: String::new(),
         };
         assert!(matches_capability_groups(&m, &[]));
     }
@@ -10002,6 +10004,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: vec!["vision".to_string(), "tools".to_string()],
+            specialty: None,
+            usage: String::new(),
         };
         let groups = vec![vec![clawde_api::ModelCapability::Vision]];
         assert!(matches_capability_groups(&m, &groups));
@@ -10019,6 +10023,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: vec!["vision".to_string()],
+            specialty: None,
+            usage: String::new(),
         };
         // vision OR audio — model has vision, so should match.
         let groups = vec![vec![
@@ -10044,6 +10050,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: vec!["vision".to_string(), "tools".to_string()],
+            specialty: None,
+            usage: String::new(),
         };
         // (vision) AND (tools) — both present, so match.
         let groups = vec![
@@ -10069,6 +10077,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: vec!["vision".to_string(), "tools".to_string()],
+            specialty: None,
+            usage: String::new(),
         };
         // (vision OR audio) AND (tools OR reasoning)
         let groups = vec![

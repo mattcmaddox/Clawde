@@ -4287,6 +4287,8 @@ async fn run_interactive(
                                                         is_current: false,
                                                         reasoning: false,
                                                         capabilities: Vec::new(),
+                                                        specialty: None,
+                                                        usage: String::new(),
                                                     }
                                                 })
                                             })
@@ -4306,6 +4308,8 @@ async fn run_interactive(
                                                     is_current: false,
                                                     reasoning: false,
                                                     capabilities: Vec::new(),
+                                                    specialty: None,
+                                                    usage: String::new(),
                                                 }
                                             })
                                             .collect()

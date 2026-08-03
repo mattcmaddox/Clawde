@@ -261,6 +261,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                 fallback_models: &[],
                 model_family: "llama3.2",
                 specialty: "local",
+                usage: "local · 4K",
             },
             provider: Arc::new(ollama_provider),
             effective_model: Some("llama3.2".to_string()),

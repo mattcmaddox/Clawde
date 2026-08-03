@@ -231,6 +231,13 @@ pub struct ModelEntry {
     pub reasoning: bool,
     /// Capability tags displayed as badges: "vision", "tools", "reasoning".
     pub capabilities: Vec<String>,
+    /// Short specialty tag for this model ("best overall", "coding", …).
+    /// Rendered as a coloured badge in the picker; `None` for non-free
+    /// provider lists.
+    pub specialty: Option<&'static str>,
+    /// Standardised free-tier usage hint ("1K req/day", "10K/day", …).
+    /// Replaces the repetitive "$0.00 per M" in the free-model picker.
+    pub usage: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +253,8 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
         is_current: false,
         reasoning: false,
         capabilities: Vec::new(),
+        specialty: None,
+        usage: String::new(),
     }
 }
 
@@ -321,6 +330,8 @@ pub fn models_for_provider_from_registry(
                 is_current: false,
                 reasoning: e.reasoning,
                 capabilities: build_capability_tags(e),
+                specialty: None,
+                usage: String::new(),
             }
         })
         .collect()
@@ -459,6 +470,8 @@ fn codex_provider_models(registry: &clawde_api::ModelRegistry) -> Vec<ModelEntry
                 is_current: false,
                 reasoning: e.reasoning,
                 capabilities: build_capability_tags(e),
+                specialty: None,
+                usage: String::new(),
             }
         })
         .collect()
@@ -483,6 +496,8 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                 is_current: false,
                 reasoning: false,
                 capabilities: Vec::new(),
+                specialty: None,
+                usage: String::new(),
             }
         })
         .collect()
@@ -499,10 +514,12 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
         display_name: "Auto".to_string(),
-        description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
+        description: "stacks every free-tier key you've added · free".to_string(),
         is_current: false,
         reasoning: false,
         capabilities: Vec::new(),
+        specialty: None,
+        usage: String::new(),
     }];
 
     // --- Model-first section: group catalog entries by model family ---
@@ -541,18 +558,21 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
             // "gpt-4o-2024-11-20"). The description line carries the host list.
             display_name: family.to_string(),
             description: format!(
-                "{} · {} {}· $0.00 per M",
+                "{} · {} {}· {}",
                 first.specialty,
                 hosts,
                 if host_count > 1 {
                     "· round-robin ".to_string()
                 } else {
                     String::new()
-                }
+                },
+                first.usage,
             ),
             is_current: false,
             reasoning,
             capabilities,
+            specialty: Some(first.specialty),
+            usage: first.usage.to_string(),
         });
     }
 
@@ -573,10 +593,12 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         entries.push(ModelEntry {
             id: format!("{}/{}", upstream.id, upstream.default_model),
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
-            description: format!("{} · {} · $0.00 per M", upstream.specialty, upstream.note),
+            description: format!("{} · {} · {}", upstream.specialty, upstream.note, upstream.usage),
             is_current: false,
             reasoning,
             capabilities,
+            specialty: Some(upstream.specialty),
+            usage: upstream.usage.to_string(),
         });
     }
 
@@ -623,6 +645,40 @@ pub fn build_capability_tags(entry: &clawde_api::ModelEntry) -> Vec<String> {
         tags.push("video".to_string());
     }
     tags
+}
+
+/// Map a specialty tag string to its display colour.
+///
+/// Used in the render loop to colour the first segment of the description
+/// line — the tag that tells the user what this model is best at.
+fn specialty_color(specialty: &str) -> Color {
+    let lower = specialty.to_lowercase();
+    // Exact matches first, then substring matches.
+    if lower.contains("best") || lower.contains("overall") {
+        Color::Rgb(255, 215, 0) // gold — premium
+    } else if lower.contains("fast") {
+        Color::Rgb(100, 255, 130) // green — speed
+    } else if lower.contains("coding") {
+        Color::Rgb(100, 170, 255) // blue — code
+    } else if lower.contains("reasoning") {
+        Color::Rgb(200, 160, 255) // lavender — think
+    } else if lower.contains("multimodal") {
+        Color::Rgb(100, 220, 255) // cyan — many formats
+    } else if lower.contains("creative") {
+        Color::Rgb(255, 160, 200) // pink — creative
+    } else if lower.contains("large context") {
+        Color::Rgb(255, 180, 100) // orange — big window
+    } else if lower.contains("strong") || lower.contains("generalist") {
+        Color::Rgb(180, 220, 255) // light blue — all-rounder
+    } else if lower.contains("local") {
+        Color::Rgb(255, 240, 100) // yellow — local
+    } else if lower.contains("general") {
+        Color::Rgb(200, 200, 200) // silver — general purpose
+    } else if lower.contains("variety") {
+        Color::Rgb(210, 210, 220) // light gray — mix
+    } else {
+        Color::Rgb(200, 200, 200) // silver — default
+    }
 }
 
 /// State for the /model picker overlay.
@@ -839,6 +895,9 @@ impl ModelPickerState {
                 m.id.to_lowercase().contains(needle.as_str())
                     || m.display_name.to_lowercase().contains(needle.as_str())
                     || m.description.to_lowercase().contains(needle.as_str())
+                    || m.specialty
+                        .map(|s| s.to_lowercase().contains(needle.as_str()))
+                        .unwrap_or(false)
             })
             .collect()
     }
@@ -1165,17 +1224,40 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 ));
             }
 
-            // Description
+            // Description — specialty tag is coloured, rest is dim.
             if !model.description.is_empty() {
                 let desc_fg = if is_selected {
                     Color::Rgb(200, 200, 200)
                 } else {
                     dim
                 };
-                spans.push(Span::styled(
-                    format!("  {}", model.description),
-                    Style::default().fg(desc_fg).bg(bg),
-                ));
+                spans.push(Span::styled("  ", Style::default().bg(bg)));
+                if let Some(specialty) = model.specialty {
+                    if let Some((badge, rest)) = model.description.split_once('·') {
+                        let badge_color = specialty_color(specialty);
+                        spans.push(Span::styled(
+                            badge.trim().to_string(),
+                            Style::default()
+                                .fg(badge_color)
+                                .add_modifier(Modifier::BOLD)
+                                .bg(bg),
+                        ));
+                        spans.push(Span::styled(
+                            format!(" ·{}", rest),
+                            Style::default().fg(desc_fg).bg(bg),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            model.description.clone(),
+                            Style::default().fg(desc_fg).bg(bg),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled(
+                        model.description.clone(),
+                        Style::default().fg(desc_fg).bg(bg),
+                    ));
+                }
             }
 
             // Pad for full-width highlight
@@ -1305,6 +1387,8 @@ mod tests {
                     "tools".to_string(),
                     "reasoning".to_string(),
                 ],
+                specialty: None,
+                usage: String::new(),
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
@@ -1313,6 +1397,8 @@ mod tests {
                 is_current: false,
                 reasoning: false,
                 capabilities: vec!["vision".to_string(), "tools".to_string()],
+                specialty: None,
+                usage: String::new(),
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
@@ -1321,6 +1407,8 @@ mod tests {
                 is_current: false,
                 reasoning: false,
                 capabilities: vec!["tools".to_string()],
+                specialty: None,
+                usage: String::new(),
             },
         ]
     }
@@ -1863,6 +1951,8 @@ mod tests {
                 is_current: false,
                 reasoning: true,
                 capabilities: Vec::new(),
+                specialty: None,
+                usage: String::new(),
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1872,6 +1962,8 @@ mod tests {
                 is_current: false,
                 reasoning: false,
                 capabilities: Vec::new(),
+                specialty: None,
+                usage: String::new(),
             },
         ];
         p.merge_models(live);
@@ -1933,6 +2025,8 @@ mod tests {
             is_current: false,
             reasoning: false,
             capabilities: Vec::new(),
+            specialty: None,
+            usage: String::new(),
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),

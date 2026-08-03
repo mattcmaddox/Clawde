@@ -75,6 +75,10 @@ pub struct FreeUpstream {
     /// this model family is best at ("best overall", "coding specialist",
     /// "fast", "multimodal", …). Displayed as a badge in the picker row.
     pub specialty: &'static str,
+    /// Standardised free-tier usage hint ("1K req/day", "10K neurons/day",
+    /// "OAuth", "2 keys", …). Replaces the repetitive "$0.00 per M" so the
+    /// user knows at a glance how much quota each upstream actually has.
+    pub usage: &'static str,
 }
 
 /// Ordered priority of providers we stack into Free mode. Order matters —
@@ -94,6 +98,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(16_384),
         fallback_models: &["gpt-4o-2024-08-06"],
         specialty: "best overall",
+        usage: "OAuth · 16K",
     },
     // Tier 1: Best-quality open-weight models
     FreeUpstream {
@@ -107,6 +112,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "strong generalist",
+        usage: "free API · 8K",
     },
     FreeUpstream {
         id: "nvidia",
@@ -118,6 +124,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         tool_calling: true,
         max_tokens_cap: Some(8_192),
         specialty: "strong generalist",
+        usage: "2 keys · 8K",
         // The free tier's 70B worker is routinely capacity-starved (503
         // "ResourceExhausted" or 25-75s responses vs the 30s upstream
         // timeout). Fall back to the always-warm 8B on the same key before
@@ -135,6 +142,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "large context",
+        usage: "65K ctx",
     },
     // Tier 2: Very good models (some currently rate-limited)
     FreeUpstream {
@@ -148,6 +156,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "multimodal",
+        usage: "free tier · 8K",
     },
     FreeUpstream {
         id: "cloudflare",
@@ -160,6 +169,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "coding",
+        usage: "10K/day · 8K",
     },
     FreeUpstream {
         id: "groq",
@@ -170,6 +180,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         note: "GPT-OSS 120B · Llama 3.3 70B — 1K req/day",
         tool_calling: true,
         specialty: "large context",
+        usage: "1K req/day",
         // The groq() factory's own quirks clamp max_tokens to 512 and total
         // to 8.5K (free-tier TPM budget); leave the catalog cap unset so the
         // provider's authoritative tuning is the only clamp applied.
@@ -187,6 +198,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "strong generalist",
+        usage: "free tier · 8K",
     },
     // Tier 3: Decent fallbacks
     FreeUpstream {
@@ -200,6 +212,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "fast",
+        usage: "auto-pick · 8K",
     },
     FreeUpstream {
         id: "mistral",
@@ -212,6 +225,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: None,
         fallback_models: &[],
         specialty: "creative",
+        usage: "free · ?K",
     },
     FreeUpstream {
         id: "cohere",
@@ -224,6 +238,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "coding specialist",
+        usage: "free · 8K",
     },
     FreeUpstream {
         id: "opencode-zen",
@@ -236,6 +251,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "general purpose",
+        usage: "2 keys · 8K",
     },
     FreeUpstream {
         id: "zai",
@@ -248,6 +264,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
         specialty: "reasoning",
+        usage: "free · 8K",
     },
     // Tier 4: Paywalled — kept as last resort
     FreeUpstream {
@@ -261,6 +278,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         max_tokens_cap: None,
         fallback_models: &[],
         specialty: "variety pack",
+        usage: "$10 credits · varies",
     },
 ];
 
