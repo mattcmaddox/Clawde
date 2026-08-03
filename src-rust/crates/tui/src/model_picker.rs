@@ -1115,13 +1115,13 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             // Capability badges (compact icons)
             for cap in &model.capabilities {
                 let (icon, color) = match cap.as_str() {
-                    "vision" => (" \u{1f5bc}", Color::Rgb(100, 200, 255)), // 🖼
-                    "tools" => (" \u{1f6e0}", Color::Rgb(180, 220, 120)),  // 🛠
-                    "reasoning" => (" \u{1f9e0}", Color::Rgb(200, 180, 255)), // 🧠
-                    "json" => (" {}", Color::Rgb(255, 200, 100)),          // {}
-                    "audio" => (" \u{1f50a}", Color::Rgb(255, 180, 200)),  // 🔊
-                    "pdf" => (" \u{1f4c4}", Color::Rgb(200, 200, 200)),    // 📄
-                    "video" => (" \u{1f3ac}", Color::Rgb(255, 220, 150)),  // 🎬
+                    "vision" => (" \u{1f5bc} ", Color::Rgb(100, 200, 255)), // 🖼
+                    "tools" => (" \u{1f6e0} ", Color::Rgb(180, 220, 120)),  // 🛠
+                    "reasoning" => (" \u{1f9e0} ", Color::Rgb(200, 180, 255)), // 🧠
+                    "json" => (" {} ", Color::Rgb(255, 200, 100)),          // {}
+                    "audio" => (" \u{1f50a} ", Color::Rgb(255, 180, 200)),  // 🔊
+                    "pdf" => (" \u{1f4c4} ", Color::Rgb(200, 200, 200)),    // 📄
+                    "video" => (" \u{1f3ac} ", Color::Rgb(255, 220, 150)),  // 🎬
                     _ => continue,
                 };
                 spans.push(Span::styled(icon, Style::default().fg(color).bg(bg)));
