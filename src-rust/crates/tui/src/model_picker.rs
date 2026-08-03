@@ -541,10 +541,11 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
             // "gpt-4o-2024-11-20"). The description line carries the host list.
             display_name: family.to_string(),
             description: format!(
-                "{} {} · $0.00 per M",
+                "{} · {} {}· $0.00 per M",
+                first.specialty,
                 hosts,
                 if host_count > 1 {
-                    "· round-robin".to_string()
+                    "· round-robin ".to_string()
                 } else {
                     String::new()
                 }
@@ -572,7 +573,7 @@ pub fn free_provider_models() -> Vec<ModelEntry> {
         entries.push(ModelEntry {
             id: format!("{}/{}", upstream.id, upstream.default_model),
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
-            description: format!("{} · $0.00 per M", upstream.note),
+            description: format!("{} · {} · $0.00 per M", upstream.specialty, upstream.note),
             is_current: false,
             reasoning,
             capabilities,
