@@ -11,7 +11,7 @@
 // 1. Generate PKCE code_verifier / code_challenge / state
 // 2. Start a temporary localhost HTTP server on a random port
 // 3. Build auth URL; print for the user and attempt to open in browser
-// 4. Wait (with 60-second timeout) for:
+// 4. Wait (with 120-second timeout) for:
 //    a. Automatic redirect to localhost/callback, OR
 //    b. User manually pastes the authorization code at the terminal
 // 5. Exchange the authorization code for tokens via POST to TOKEN_URL
@@ -297,6 +297,20 @@ fn try_open_browser(url: &str) {
     }
 }
 
+/// Read one line from the callback socket with a 5s cap. The browser sends
+/// the entire request immediately after connecting, so a read that takes
+/// longer means the client stalled or vanished — bail instead of blocking
+/// forever.
+async fn read_line_capped<R>(reader: &mut BufReader<R>, buf: &mut String) -> anyhow::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(buf))
+        .await
+        .context("Timed out reading HTTP request from callback client")?
+        .context("Failed to read HTTP request from callback client")
+}
+
 /// Tiny async HTTP server that captures /callback?code=AUTH_CODE&state=STATE.
 async fn run_callback_server(
     listener: TcpListener,
@@ -313,16 +327,20 @@ async fn run_callback_server(
         .context("Timeout waiting for browser redirect")?
         .context("Accept failed")?;
 
-    // Read the HTTP request line-by-line until the blank line
+    // Read the HTTP request line-by-line until the blank line. The browser
+    // sends the whole request the moment it connects (sub-second on loopback),
+    // so each read is capped at 5s — anything slower is a stalled or hostile
+    // client, not a slow user. The accept() above is the only step that
+    // legitimately waits on the human (consent page), hence its 120s cap.
     let (reader, mut writer) = socket.split();
     let mut reader = BufReader::new(reader);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
+    read_line_capped(&mut reader, &mut request_line).await?;
 
     // Drain remaining headers
     loop {
         let mut header = String::new();
-        reader.read_line(&mut header).await?;
+        read_line_capped(&mut reader, &mut header).await?;
         if header.trim().is_empty() {
             break;
         }
@@ -558,5 +576,71 @@ async fn wait_for_auth_code_impl(
         _ = tokio::time::sleep(Duration::from_secs(120)) => {
             bail!("Authentication timed out after 120 seconds")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client that connects but never sends bytes must not block the callback
+    /// server forever — `read_line_capped` bails after ~5s.
+    #[tokio::test]
+    async fn callback_read_cap_times_out_on_silent_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect and hold the socket open without sending anything — the exact
+        // stall the cap guards against.
+        tokio::spawn(async move {
+            let _sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = socket.split();
+        let mut reader = BufReader::new(reader);
+        let mut buf = String::new();
+
+        let started = std::time::Instant::now();
+        let err = read_line_capped(&mut reader, &mut buf).await.unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5) - Duration::from_millis(200),
+            "expected the 5s cap to fire, elapsed={:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains("Timed out"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The happy path (browser sends the request immediately) must still
+    /// complete fast — the 5s cap is a guard, not a delay.
+    #[tokio::test]
+    async fn callback_server_parses_redirect_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                b"GET /callback?code=ABC123&state=STATE1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            // Read the 302 so the server's response write doesn't hit a closed socket.
+            let mut resp = [0u8; 512];
+            let _ = s.read(&mut resp).await;
+        });
+
+        let started = std::time::Instant::now();
+        let code = run_callback_server(listener, "STATE1").await.unwrap();
+        assert_eq!(code, "ABC123");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "happy path must complete well under the read cap"
+        );
     }
 }
