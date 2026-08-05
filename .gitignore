@@ -14,6 +14,11 @@ refs/
 .gitignore
 .gitattributes
 
+# Test fixtures: synthetic multi-upstream auth store for api tests.
+# Never put real API keys here — the fixture exists so tests can assert
+# resolver/rotation behavior against a realistic store shape.
+src-rust/crates/api/tests/fixtures/
+
 # VSCode / unsolicited devcontainers mounts
 .vscode/
 .claurst/

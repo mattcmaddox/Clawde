@@ -2766,7 +2766,7 @@ fn fetch_gemini_models_parses_gemini_response() {
 ///   * OpenCode Zen reads the `opencode-go` slots as a fallback.
 #[test]
 fn resolve_free_upstream_keys_is_ring_aligned() {
-    let mut store = clawde_core::AuthStore::default();
+    let (mut store, _home) = crate::test_support::test_auth_store();
     store.keys.insert(
         "groq".to_string(),
         vec![
@@ -2794,7 +2794,7 @@ fn resolve_free_upstream_keys_ignores_credentials() {
     // A provider with a single credential but no multi-key slots must not
     // be treated as a multi-key ring (index 0 in the ring would otherwise
     // not correspond to anything the poller probes).
-    let mut store = clawde_core::AuthStore::default();
+    let (mut store, _home) = crate::test_support::test_auth_store();
     store.credentials.insert(
         "openrouter".to_string(),
         clawde_core::StoredCredential::ApiKey {
@@ -2816,7 +2816,7 @@ fn resolve_free_upstream_keys_ignores_credentials() {
 
 #[test]
 fn resolve_free_upstream_keys_opencode_zen_shares_go_slots() {
-    let mut store = clawde_core::AuthStore::default();
+    let (mut store, _home) = crate::test_support::test_auth_store();
     store.keys.insert(
         "opencode-go".to_string(),
         vec!["zen-shared-key-00000000000000".into()],
@@ -2832,7 +2832,7 @@ fn resolve_free_upstream_keys_opencode_zen_shares_go_slots() {
 
 #[test]
 fn all_stored_free_upstream_keys_dedups_and_merges() {
-    let mut store = clawde_core::AuthStore::default();
+    let (mut store, _home) = crate::test_support::test_auth_store();
     store.credentials.insert(
         "groq".to_string(),
         clawde_core::StoredCredential::ApiKey {
@@ -2860,6 +2860,12 @@ fn all_stored_free_upstream_keys_dedups_and_merges() {
 
 #[test]
 fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
+    // One TestHome guard for the whole test body; each scenario builds a
+    // fresh in-memory store. Creating a second TestHome while the first
+    // guard is still alive would re-lock the non-reentrant CLAWDE_HOME_LOCK
+    // on the same thread and self-deadlock, so the guard is created once.
+    let _home = crate::test_support::TestHome::new();
+
     // A valid multi-key slot wins over a stored credential — the ring
     // resolver would use it, so the single-key path must agree (and the
     // health poller probes those exact slots).
@@ -2909,6 +2915,10 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
 
 #[test]
 fn first_free_upstream_key_trims_and_drops_placeholders() {
+    // One TestHome guard for the whole test body — see the sibling test
+    // above for why a second guard would self-deadlock on the same thread.
+    let _home = crate::test_support::TestHome::new();
+
     // A slot-0 placeholder does NOT shadow a valid slot-1 key — the
     // ring-consistent resolver trims all slots and skips short ones, so
     // the single-key path sees the same key the ring would have used.
@@ -2942,7 +2952,7 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
 
 #[test]
 fn first_free_upstream_key_opencode_zen_shares_go_slots() {
-    let mut store = clawde_core::AuthStore::default();
+    let (mut store, _home) = crate::test_support::test_auth_store();
     store.keys.insert(
         "opencode-go".to_string(),
         vec!["zen-shared-key-00000000000000".into()],
@@ -2950,5 +2960,79 @@ fn first_free_upstream_key_opencode_zen_shares_go_slots() {
     assert_eq!(
         first_free_upstream_key(&store, "opencode-zen").as_deref(),
         Some("zen-shared-key-00000000000000")
+    );
+}
+
+/// Load the synthetic multi-upstream fixture (`tests/fixtures/auth.json`)
+/// through the real `AuthStore::load()` path by pointing CLAWDE_HOME at a
+/// temp dir containing a copy of it.
+///
+/// This exercises the full disk→resolver path against a realistic store
+/// shape: 5 upstreams with 2+ keys (ring paths), 6 single-key slots, cloudflare
+/// composite keys, and credentials separate from the keys map. The fixture is
+/// git-ignored and holds only fake keys.
+#[test]
+fn resolvers_agree_on_synthetic_fixture_store() {
+    let _home = crate::test_support::TestHome::new();
+
+    // Copy the fixture into the redirected CLAWDE_HOME so `AuthStore::load()`
+    // reads it from `{home}/auth.json`.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/auth.json");
+    let dest = std::env::var("CLAWDE_HOME").expect("TestHome sets CLAWDE_HOME");
+    let dest_dir = std::path::Path::new(&dest);
+    std::fs::create_dir_all(dest_dir).unwrap();
+    std::fs::copy(&fixture, dest_dir.join("auth.json")).unwrap();
+
+    let store = clawde_core::AuthStore::load();
+
+    // Multi-key upstreams form rings of exactly the stored key count
+    // (all fixture keys are >=8 chars, so nothing is filtered out).
+    for (upstream, expected) in [
+        ("groq", 2),
+        ("nvidia", 2),
+        ("opencode-zen", 3),
+        ("cline", 2),
+        ("cloudflare", 2),
+    ] {
+        let ring = resolve_free_upstream_keys(&store, upstream)
+            .unwrap_or_else(|| panic!("{upstream}: expected a ring"));
+        assert_eq!(ring.len(), expected, "{upstream} ring size");
+        // Ring keys equal the display union minus credentials — the poller
+        // probes exactly these.
+        let display = all_stored_free_upstream_keys(&store, upstream);
+        assert_eq!(ring, display, "{upstream}: ring keys == display keys");
+    }
+
+    // Single-key upstreams resolve through the single-key chain path.
+    for upstream in [
+        "cerebras",
+        "zai",
+        "sambanova",
+        "mistral",
+        "google",
+        "cohere",
+        "huggingface",
+    ] {
+        assert!(
+            first_free_upstream_key(&store, upstream).is_some(),
+            "{upstream}: single-key chain path must resolve"
+        );
+    }
+
+    // Cloudflare composite keys survive round-trip with the account id intact.
+    let cf = resolve_free_upstream_keys(&store, "cloudflare").unwrap();
+    assert!(
+        cf.iter().all(|k| k.contains(':')),
+        "cloudflare keys must keep ACCOUNT_ID:TOKEN composite form"
+    );
+
+    // Credentials are excluded from rings but visible in the display union.
+    let zen_ring = resolve_free_upstream_keys(&store, "opencode-zen").unwrap();
+    let zen_display = all_stored_free_upstream_keys(&store, "opencode-zen");
+    assert_eq!(zen_ring.len(), 3);
+    assert_eq!(
+        zen_display.len(),
+        3,
+        "no credentials stored for opencode-zen"
     );
 }

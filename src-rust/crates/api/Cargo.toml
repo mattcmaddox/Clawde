@@ -33,3 +33,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

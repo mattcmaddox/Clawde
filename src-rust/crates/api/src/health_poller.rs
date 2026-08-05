@@ -425,7 +425,6 @@ mod tests {
     use super::resolve_keys;
     use super::{build_probe_list, classify_health_error, last_sweep_generation, probe_sync_for};
     use crate::providers::free::resolve_free_upstream_keys;
-    use clawde_core::AuthStore;
 
     #[test]
     fn auth_failures_are_definitive() {
@@ -518,7 +517,7 @@ mod tests {
         //   - groq: 3 slots, one <8 placeholder that must be dropped -> ring of 2
         //   - opencode-zen: no own slots, falls back to opencode-go slots
         //   - cline: 1 valid key + 1 placeholder -> single-key chain entry
-        let mut store = AuthStore::default();
+        let (mut store, _home) = crate::test_support::test_auth_store();
         store.keys.insert(
             "groq".to_string(),
             vec![

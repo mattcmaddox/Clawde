@@ -62,6 +62,11 @@ pub mod error_handling;
 // Cooldown/retry-time extraction from API error responses.
 pub mod time_extract;
 
+// Test-only helpers (CLAWDE_HOME redirect etc.). Compiled only under `cargo
+// test`; production builds never see this module.
+#[cfg(test)]
+pub(crate) mod test_support;
+
 // Message transform layer — concrete transformers (Phase 4).
 pub mod transformers;
 
