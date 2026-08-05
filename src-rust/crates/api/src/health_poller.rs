@@ -267,11 +267,11 @@ async fn poll_and_log(
 
         // Probe EVERY key in the pool — not just key 0 — carrying its real
         // index so exhaustion lands on the right ring slot.
+        //
+        // No length guard needed here: resolve_free_upstream_keys already
+        // trims and drops <8-char placeholders, so every key in this list is
+        // exactly what a KeyRotatingProvider ring holds (indices align).
         for (key_idx, key) in keys.iter().enumerate() {
-            if key.len() < 8 {
-                continue;
-            }
-
             outcome.checked += 1;
             let upstream_id_owned = upstream_id.clone();
             let upstream_id_for_log = upstream_id_owned.clone();
@@ -422,7 +422,10 @@ fn build_probe_list(auth_store: &clawde_core::AuthStore) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_health_error, last_sweep_generation, probe_sync_for};
+    use super::resolve_keys;
+    use super::{build_probe_list, classify_health_error, last_sweep_generation, probe_sync_for};
+    use crate::providers::free::resolve_free_upstream_keys;
+    use clawde_core::AuthStore;
 
     #[test]
     fn auth_failures_are_definitive() {
@@ -497,6 +500,94 @@ mod tests {
             last_sweep_generation(),
             gen_before,
             "targeted probes must not clobber the last-sweep slot"
+        );
+    }
+
+    /// End-to-end alignment contract: the health poller's probe list (per
+    /// upstream, in enumerate order) must EXACTLY equal the keys that
+    /// `build_free_provider` feeds into each `KeyRotatingProvider` ring.
+    ///
+    /// Both sides go through `resolve_free_upstream_keys`, but this test locks
+    /// it against regression: if the poller ever switched to a different
+    /// resolver (e.g. one that includes credentials or skips the trim/>=8
+    /// guard), the `key_idx` forwarded into `mark_key_healthy`/
+    /// `mark_key_exhausted` would desync from the ring slots.
+    #[test]
+    fn poller_probe_list_aligns_with_registry_ring_keys() {
+        // Craft a store exercising every resolver rule:
+        //   - groq: 3 slots, one <8 placeholder that must be dropped -> ring of 2
+        //   - opencode-zen: no own slots, falls back to opencode-go slots
+        //   - cline: 1 valid key + 1 placeholder -> single-key chain entry
+        let mut store = AuthStore::default();
+        store.keys.insert(
+            "groq".to_string(),
+            vec![
+                "gsk-valid-key-0000000001".to_string(),
+                "   gsk-valid-key-0000000002   ".to_string(), // trimmed, kept
+                "short".to_string(),                          // <8, dropped
+            ],
+        );
+        store.keys.insert(
+            "opencode-go".to_string(),
+            vec!["zen-shared-key-00000000000000".to_string()],
+        );
+        store.keys.insert(
+            "cline".to_string(),
+            vec![
+                "sk-valid-cline-key-0000000001".to_string(),
+                "short".to_string(),
+            ],
+        );
+
+        // The poller walks FREE_CATALOG and includes every upstream with at
+        // least one usable key.
+        let targets = build_probe_list(&store);
+        assert!(
+            targets.contains(&"groq".to_string()),
+            "groq must be probed (2 usable keys)"
+        );
+        assert!(
+            targets.contains(&"opencode-zen".to_string()),
+            "opencode-zen must be probed via opencode-go slot fallback"
+        );
+        assert!(
+            targets.contains(&"cline".to_string()),
+            "cline must be probed (1 usable key)"
+        );
+
+        // Per-upstream probe list == registry ring keys, in order.
+        let groq_probe = resolve_keys(&store, "groq").expect("groq keys");
+        let groq_ring = resolve_free_upstream_keys(&store, "groq").expect("groq ring");
+        assert_eq!(
+            groq_probe, groq_ring,
+            "poller probe list must equal ring keys for groq"
+        );
+        assert_eq!(
+            groq_probe,
+            vec![
+                "gsk-valid-key-0000000001".to_string(),
+                "gsk-valid-key-0000000002".to_string(),
+            ],
+            "placeholder dropped, whitespace trimmed, order preserved"
+        );
+        // key_idx 0 and 1 in the probe map to ring slots 0 and 1.
+        assert_eq!(groq_probe.len(), 2, "ring holds exactly the probed keys");
+
+        let zen_probe = resolve_keys(&store, "opencode-zen").expect("zen keys");
+        let zen_ring = resolve_free_upstream_keys(&store, "opencode-zen").expect("zen ring");
+        assert_eq!(
+            zen_probe, zen_ring,
+            "opencode-zen probe must equal ring built from opencode-go slots"
+        );
+        assert_eq!(zen_probe, vec!["zen-shared-key-00000000000000".to_string()]);
+
+        // A single usable key still yields exactly one probe entry (single-key
+        // chain path uses first_free_upstream_key, but the poller probes the
+        // same ring-aligned list).
+        let cline_probe = resolve_keys(&store, "cline").expect("cline keys");
+        assert_eq!(
+            cline_probe,
+            vec!["sk-valid-cline-key-0000000001".to_string()]
         );
     }
 }

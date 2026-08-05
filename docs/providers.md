@@ -83,6 +83,24 @@ bare token or a key with an empty half is rejected with a format hint.
 Keys are stored in `~/.clawde/auth.json` under the `"keys"` map, separate from
 single-key credentials. The `/keys` command manages this automatically.
 
+Keys are read through a single source of truth in the free-provider module
+(`crates/api/src/providers/free/mod.rs`), which guarantees the health poller,
+the rotation rings, and the Connect Free dialog all agree on which keys exist
+and in what order:
+
+- **`resolve_free_upstream_keys`** — the ring-aligned list used to build
+  `KeyRotatingProvider` rings *and* to probe health. It reads the multi-key
+  store only (credentials are excluded so `key_idx` stays in sync with ring
+  slots), trims whitespace, and drops <8-char placeholder keys.
+- **`first_free_upstream_key`** — the single-key chain path: first valid ring
+  slot, else the stored credential (incl. OAuth tokens), else the provider's
+  env var.
+- **`all_stored_free_upstream_keys`** — display only: credentials + rotation
+  keys merged and deduplicated for the Connect Free dialog's health dots.
+
+OpenCode Zen reads the `opencode-go` key slots as a fallback in all three
+resolvers.
+
 ### Managing routing with `/routing`
 
 Use the `/routing` slash command to view or change how the free-mode router

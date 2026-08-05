@@ -257,24 +257,51 @@ Level 2: KeyRotatingProvider (within each upstream, 2+ keys)
 | **AuthStore** | `crates/core/src/auth_store.rs` | JSON store at `~/.clawde/auth.json` — `credentials` (single-key) + `keys` (multi-key) maps |
 | **KeysCommand** | `crates/commands/src/keys.rs` | `/keys` command: set, add, remove, list, health |
 | **ProviderRegistry** | `crates/api/src/registry.rs` | Wires `KeyRotatingProvider` when 2+ keys detected |
-| **FreeProvider** | `crates/api/src/providers/free.rs` | Composite aggregator chaining upstreams with ordered fallback |
+| **FreeProvider** | `crates/api/src/providers/free/` (mod.rs + catalog.rs + discovery.rs + modelsdev.rs + impls.rs) | Composite aggregator chaining upstreams with ordered fallback |
 | **time_extract** | `crates/api/src/time_extract.rs` | Cooldown extraction from Retry-After headers, error bodies, ISO 8601 timestamps |
+
+### Key Resolution (single source of truth)
+
+The free module exposes three resolvers over the auth store — one per consumer,
+so the registry, health poller, and TUI dialog can never disagree:
+
+1. **`resolve_free_upstream_keys()`** (`free/mod.rs`) — **ring-aligned**: keys
+   from the multi-key store only (no credentials), whitespace-trimmed, >=8-char
+   placeholder guard, OpenCode Zen reading the `opencode-go` slots as fallback.
+   Used by BOTH `build_free_provider`'s multi-key path AND the health poller's
+   `resolve_keys` wrapper, so the `key_idx` the poller forwards into
+   `mark_key_healthy` / `mark_key_exhausted` lines up exactly with the
+   `KeyRotatingProvider` ring slots.
+2. **`first_free_upstream_key()`** (`free/mod.rs`) — the single-key chain path:
+   first valid ring slot, else stored credential (incl. OAuth), else env var,
+   with the same trim + >=8 guard and Zen/Go alias. A placeholder in slot 0
+   does not shadow a valid slot-1 key.
+3. **`all_stored_free_upstream_keys()`** (`free/mod.rs`) — **display-oriented**:
+   merges credentials + rotation keys, deduped, for the Connect Free dialog's
+   per-key health dots. NOT ring-aligned — never used for probing.
+
+Model discovery fetches use `first_upstream_key()` (`free/discovery.rs`), which
+is keys-first (ring order) with a credential fallback — any valid key works for
+fetching a model list.
 
 ### Key Algorithms
 
-1. **`build_free_provider()`** (registry.rs:100-195) — Iterates `FREE_CATALOG` in priority order. For each upstream: if 2+ keys → `KeyRotatingProvider`, else if 1 key → single provider, else skip.
+1. **`build_free_provider()`** (registry.rs) — Iterates `FREE_CATALOG` in
+   priority order. For each upstream: if `resolve_free_upstream_keys` returns
+   2+ keys → `KeyRotatingProvider`, else if 1 usable key (via
+   `first_free_upstream_key`) → single provider, else skip.
 
-2. **`resolve_route()`** (free.rs:188-226) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID.
+2. **`resolve_route()`** (free/impls.rs) — Maps model ID to Route. `"free"`/`"auto"`/`"free/auto"`/`""` → Auto (try all in order). `"groq/model"` → Pinned (try pinned first, then rest). Legacy `"zen/"` → normalized to `"opencode-zen/"`. OpenRouter special: `"openrouter/free"` restores full model ID.
 
-3. **`attempt_plan()`** (free.rs:229-252) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
+3. **`attempt_plan()`** (free/impls.rs) — Builds ordered `[(idx, model)]` list. Auto = all upstreams with their `default_model`. Pinned = pinned first, then all others in catalog order with defaults.
 
-4. **`should_fallback()`** (free.rs:254-258) — Falls through on everything EXCEPT `InvalidRequest` and `ContentFiltered` (user errors that fail identically on every upstream).
+4. **`should_fallback()`** (free/impls.rs) — Falls through on everything EXCEPT `InvalidRequest` and `ContentFiltered` (user errors that fail identically on every upstream).
 
-5. **Fallback loop** (free.rs:282-361) — Iterates plan, clones request per attempt replacing model, dispatches. Returns first success, falls through on transient errors.
+5. **Fallback loop** (free/impls.rs) — Iterates plan, clones request per attempt replacing model, dispatches. Returns first success, falls through on transient errors.
 
-6. **`key_ring_status()`** (free.rs:410-436) — Aggregates across upstreams: active=sum, total=sum, retry=min. Returns `None` if no upstream has a KeyRotatingProvider.
+6. **`key_ring_status()`** (free/impls.rs) — Aggregates across upstreams: active=sum, total=sum, retry=min. Returns `None` if no upstream has a KeyRotatingProvider.
 
-7. **`key_ring_summaries()`** (registry.rs:429-440) — Collects all registered providers' status, filters to `total > 0`, sorts alphabetically.
+7. **`key_ring_summaries()`** (registry.rs) — Collects all registered providers' status, filters to `total > 0`, sorts alphabetically.
 
 ### Error-Triggered Rotation
 
@@ -306,7 +333,7 @@ Synthetic only — never calls upstream `discover_models()`. Produces one `free/
 
 ### Chain Assembly (`build_free_provider`)
 
-- `FREE_CATALOG` constant at free.rs:70-192 defines 13 upstreams by priority
+- `FREE_CATALOG` constant at free/catalog.rs defines 13 upstreams by priority
 - Each `FreeUpstream` has: id, title, key_url, default_model, note
 - Cloudflare: OpenAI-compat endpoint embeds the account ID in the URL path,
   so its stored key is the composite `ACCOUNT_ID:API_TOKEN`; key validation

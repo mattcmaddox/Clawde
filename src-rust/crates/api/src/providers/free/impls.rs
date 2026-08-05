@@ -2767,8 +2767,8 @@ fn fetch_gemini_models_parses_gemini_response() {
 #[test]
 fn resolve_free_upstream_keys_is_ring_aligned() {
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys(
-        "groq",
+    store.keys.insert(
+        "groq".to_string(),
         vec![
             "   gsk-a-very-long-real-key-0001".into(), // trimmed, kept
             "short".into(),                            // <8 chars, filtered
@@ -2817,7 +2817,10 @@ fn resolve_free_upstream_keys_ignores_credentials() {
 #[test]
 fn resolve_free_upstream_keys_opencode_zen_shares_go_slots() {
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys("opencode-go", vec!["zen-shared-key-00000000000000".into()]);
+    store.keys.insert(
+        "opencode-go".to_string(),
+        vec!["zen-shared-key-00000000000000".into()],
+    );
 
     // Zen has no slots of its own — the ring must be built from the Go
     // slots so poller key_idx stays aligned with the actual ring.
@@ -2836,8 +2839,8 @@ fn all_stored_free_upstream_keys_dedups_and_merges() {
             key: "gsk-credential-00000000".into(),
         },
     );
-    store.set_keys(
-        "groq",
+    store.keys.insert(
+        "groq".to_string(),
         vec![
             "gsk-credential-00000000".into(),
             "gsk-rotating-000000000".into(),
@@ -2867,7 +2870,10 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
             key: "or-credential-key-0123456789".into(),
         },
     );
-    store.set_keys("openrouter", vec!["or-rotating-key-0123456789".into()]);
+    store.keys.insert(
+        "openrouter".to_string(),
+        vec!["or-rotating-key-0123456789".into()],
+    );
     assert_eq!(
         first_free_upstream_key(&store, "openrouter").as_deref(),
         Some("or-rotating-key-0123456789"),
@@ -2882,7 +2888,9 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
             key: "or-credential-key-0123456789".into(),
         },
     );
-    store.set_keys("openrouter", vec!["short".into()]);
+    store
+        .keys
+        .insert("openrouter".to_string(), vec!["short".into()]);
     assert_eq!(
         first_free_upstream_key(&store, "openrouter").as_deref(),
         Some("or-credential-key-0123456789"),
@@ -2905,8 +2913,8 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
     // ring-consistent resolver trims all slots and skips short ones, so
     // the single-key path sees the same key the ring would have used.
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys(
-        "groq",
+    store.keys.insert(
+        "groq".to_string(),
         vec!["   short   ".into(), "gsk-very-long-real-key-0001".into()],
     );
     assert_eq!(
@@ -2917,7 +2925,10 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
 
     // A padded but genuinely long key is trimmed and kept.
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys("groq", vec!["   gsk-very-long-real-key-0001   ".into()]);
+    store.keys.insert(
+        "groq".to_string(),
+        vec!["   gsk-very-long-real-key-0001   ".into()],
+    );
     assert_eq!(
         first_free_upstream_key(&store, "groq").as_deref(),
         Some("gsk-very-long-real-key-0001")
@@ -2925,14 +2936,17 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
 
     // Short keys alone -> None.
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys("groq", vec!["short".into()]);
+    store.keys.insert("groq".to_string(), vec!["short".into()]);
     assert_eq!(first_free_upstream_key(&store, "groq"), None);
 }
 
 #[test]
 fn first_free_upstream_key_opencode_zen_shares_go_slots() {
     let mut store = clawde_core::AuthStore::default();
-    store.set_keys("opencode-go", vec!["zen-shared-key-00000000000000".into()]);
+    store.keys.insert(
+        "opencode-go".to_string(),
+        vec!["zen-shared-key-00000000000000".into()],
+    );
     assert_eq!(
         first_free_upstream_key(&store, "opencode-zen").as_deref(),
         Some("zen-shared-key-00000000000000")
