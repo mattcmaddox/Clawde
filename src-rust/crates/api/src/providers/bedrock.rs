@@ -23,7 +23,6 @@ use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::error_handling::parse_error_response;
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
@@ -405,10 +404,6 @@ impl BedrockProvider {
     // -----------------------------------------------------------------------
     // HTTP helpers
     // -----------------------------------------------------------------------
-
-    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
-        parse_error_response(status, body, &self.id)
-    }
 
     // -----------------------------------------------------------------------
     // Send helpers

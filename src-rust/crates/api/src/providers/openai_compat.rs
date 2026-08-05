@@ -13,7 +13,6 @@ use clawde_core::types::ContentBlock;
 use futures::Stream;
 use serde_json::{json, Value};
 
-use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
@@ -486,10 +485,6 @@ impl OpenAiCompatProvider {
             builder = builder.header(name.as_str(), value.as_str());
         }
         builder
-    }
-
-    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
-        parse_error_response(status, body, &self.id)
     }
 
     // -----------------------------------------------------------------------

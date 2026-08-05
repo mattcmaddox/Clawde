@@ -17,7 +17,6 @@ use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::error_handling::parse_error_response;
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
@@ -74,10 +73,6 @@ impl AzureProvider {
             "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
             self.resource_name, deployment, self.api_version
         )
-    }
-
-    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
-        parse_error_response(status, body, &self.id)
     }
 
     async fn send_non_streaming(

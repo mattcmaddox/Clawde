@@ -246,55 +246,31 @@ fn detect_env_var_key(upstream_id: &str) -> Option<String> {
     let env_var = env_var_name_for_upstream(upstream_id)?;
     std::env::var(env_var).ok().filter(|v| !v.is_empty())
 }
-
-/// Collect a provider's stored keys (single credential first, then rotation
-/// keys), deduplicated. Used to seed the Connect Free dialog — every key
-/// becomes one health dot.
-fn stored_keys_for(auth: &clawde_core::AuthStore, provider_id: &str, out: &mut Vec<String>) {
-    if let Some(key) = auth.api_key_for(provider_id) {
-        if !out.contains(&key) {
-            out.push(key);
-        }
-    }
-    if let Some(keys) = auth.keys_for(provider_id) {
-        for key in keys {
-            if !out.contains(key) {
-                out.push(key.clone());
-            }
-        }
-    }
-}
-
-/// All stored keys for a free-catalog upstream. OpenCode Zen shares the
-/// OpenCode Go key slots.
+/// All stored keys for a free-catalog upstream: single-key / OAuth
+/// credentials plus rotation keys, deduplicated, with OpenCode Zen sharing
+/// the OpenCode Go slots. Display-oriented — seeds the Connect Free dialog's
+/// per-key health dots (the health poller keeps its own ring-aligned probe
+/// list via `resolve_free_upstream_keys`).
 fn free_upstream_stored_keys(auth: &clawde_core::AuthStore, upstream_id: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if upstream_id == "opencode-zen" {
-        stored_keys_for(auth, "opencode-zen", &mut out);
-        stored_keys_for(auth, "opencode-go", &mut out);
-    } else {
-        stored_keys_for(auth, upstream_id, &mut out);
-    }
-    out
+    clawde_api::providers::free::all_stored_free_upstream_keys(auth, upstream_id)
 }
 
 /// Map a free catalog upstream id to its primary environment variable name.
+///
+/// Delegates to the shared [`ProviderMetadata`] table in the API crate so
+/// there is a single source of truth for env-var names. Upstreams that are
+/// OAuth-only (no standard env var) return `None`.
 fn env_var_name_for_upstream(upstream_id: &str) -> Option<&'static str> {
-    match upstream_id {
-        "huggingface" => Some("HF_TOKEN"),
-        "nvidia" => Some("NVIDIA_API_KEY"),
-        "cerebras" => Some("CEREBRAS_API_KEY"),
-        "google" => Some("GOOGLE_API_KEY"),
-        "cloudflare" => Some("CLOUDFLARE_API_TOKEN"),
-        "groq" => Some("GROQ_API_KEY"),
-        "sambanova" => Some("SAMBANOVA_API_KEY"),
-        "cline" => None, // Cline uses OAuth / has no standard env var
-        "mistral" => Some("MISTRAL_API_KEY"),
-        "cohere" => Some("COHERE_API_KEY"),
-        "opencode-zen" => None, // OpenCode Zen uses OAuth
-        "zai" => Some("ZAI_API_KEY"),
-        "openrouter" => Some("OPENROUTER_API_KEY"),
-        _ => None,
+    // OAuth-only upstreams deliberately have no standard env var.
+    if matches!(upstream_id, "cline" | "opencode-zen") {
+        return None;
+    }
+    // The metadata table falls back to "API_KEY" for unknown providers;
+    // only map upstreams actually present in the free catalog.
+    if clawde_api::providers::free::catalog_entry(upstream_id).is_some() {
+        Some(clawde_api::providers::env_var_for(upstream_id))
+    } else {
+        None
     }
 }
 

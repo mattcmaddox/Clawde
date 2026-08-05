@@ -30,7 +30,6 @@ use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
@@ -470,10 +469,6 @@ impl CopilotProvider {
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0),
         }
-    }
-
-    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
-        parse_error_response(status, body, &self.id)
     }
 
     /// Hardcoded fallback model list used when the /models endpoint is

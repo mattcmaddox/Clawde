@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use std::pin::Pin;
 use tracing::debug;
 
-use crate::error_handling::parse_error_response;
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::SystemPrompt;
@@ -339,10 +338,6 @@ impl OpenAiProvider {
 
     fn auth_header(&self) -> (&'static str, String) {
         ("Authorization", format!("Bearer {}", self.api_key))
-    }
-
-    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
-        parse_error_response(status, body, &self.id)
     }
 
     // -----------------------------------------------------------------------

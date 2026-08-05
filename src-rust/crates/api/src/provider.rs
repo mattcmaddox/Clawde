@@ -10,6 +10,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
+use crate::error_handling::parse_error_response;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
@@ -93,6 +94,22 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
+
+    /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
+    /// a local Ollama/LM Studio server, or a Copilot entitlement query).
+    ///
+    /// Catalog-backed providers (Anthropic, OpenAI, Google, …) do **not**
+    /// override this: their model list is a read-only projection of the
+    /// models.dev catalog held in [`crate::ModelRegistry`], so the picker never
+    /// turns a provider return value into the displayed list.  The default impl
+    /// therefore returns an empty vector — only providers whose models cannot be
+    /// Map an HTTP error status and response body to a [`ProviderError`].
+    ///
+    /// The default delegates to [`parse_error_response`]; providers with
+    /// custom error formats (e.g. Cohere) override this.
+    fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
+        parse_error_response(status, body, self.id())
+    }
 
     /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
     /// a local Ollama/LM Studio server, or a Copilot entitlement query).
