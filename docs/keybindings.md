@@ -49,8 +49,9 @@ These bindings are active when focus is in the chat input field.
 | `Enter` | submit | Submit the current message to the model |
 | `Shift+Enter` | newline | Insert a literal newline without submitting |
 | `Ctrl+J` | newline | Newline (fallback for terminals without CSI-u protocol) |
-| `Up` / `Ctrl+O` | historyPrev | Navigate to the previous message in input history |
+| `Up` | historyPrev | Navigate to the previous message in input history |
 | `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
+| `Ctrl+O` | toggleThinkingExpand | Expand or collapse all thinking blocks |
 | `Tab` | indent | Insert indentation (or cycle completions if open) |
 | `Shift+Tab` | reverseIndent | Remove one level of indentation |
 | `Page Up` | scrollUp | Scroll the conversation view up one page |

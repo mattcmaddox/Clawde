@@ -1574,10 +1574,11 @@ mod tests {
             "Bash".to_string(),
             "Run a shell command".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
+        assert_eq!(pr.options.len(), 5);
         assert_eq!(pr.options[0].key, 'y');
         assert_eq!(pr.options[1].key, 'Y');
         assert_eq!(pr.options[2].key, 'p');
-        assert_eq!(pr.options[3].key, 'n');
+        assert_eq!(pr.options[3].key, 'a');
+        assert_eq!(pr.options[4].key, 'n');
     }
 }

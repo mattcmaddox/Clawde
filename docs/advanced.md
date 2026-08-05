@@ -383,14 +383,14 @@ echo "explain this code" | clawde -p
 
 ```bash
 clawde --print --output-format json "..."
-clawde --print --output-format stream-json --verbose "..."
+clawde --print --output-format stream-json "..."
 ```
 
 | Format | Description |
 |---|---|
 | (default) | Plain text output — only the final assistant message. |
-| `json` | Full message array as JSON (requires `--verbose`). |
-| `stream-json` | Newline-delimited JSON stream of messages as they arrive (requires `--verbose`). |
+| `json` | Full message array as JSON. |
+| `stream-json` | Newline-delimited JSON stream of messages as they arrive. |
 
 `stream-json` is the format used by the Agent SDK transport. It emits every message event as it arrives, making it suitable for real-time processing pipelines.
 

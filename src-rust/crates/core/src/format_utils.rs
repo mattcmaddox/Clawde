@@ -52,6 +52,20 @@ pub fn format_usage_summary(tokens: u64, cost_cents: f64) -> String {
     )
 }
 
+/// Format an absolute wall-clock timestamp compactly for listings.
+/// Same year → `"Aug 3 14:22"`; other year → `"Aug 3 2025"`.
+/// Clock skew (mtime in the future) degrades to the raw local time.
+pub fn format_short_absolute_time(mtime: std::time::SystemTime) -> String {
+    use chrono::{DateTime, Datelike, Local};
+    let dt: DateTime<Local> = mtime.into();
+    let now = chrono::Local::now();
+    if dt.year() == now.year() {
+        dt.format("%b %d %H:%M").to_string()
+    } else {
+        dt.format("%b %d %Y").to_string()
+    }
+}
+
 /// Format a relative time string (for session listings).
 /// "just now", "2 minutes ago", "3 hours ago", "yesterday", "Mar 15"
 pub fn format_relative_time(ts_ms: u64) -> String {
@@ -102,5 +116,22 @@ mod tests {
         assert_eq!(format_tokens(500), "500");
         assert_eq!(format_tokens(1500), "1.5K");
         assert_eq!(format_tokens(50_000), "50K");
+    }
+
+    #[test]
+    fn format_short_absolute_time_same_year() {
+        // A fixed instant in the middle of August 2026.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_784_000_000);
+        let s = format_short_absolute_time(mtime);
+        // Format is "Mon DD HH:MM" — assert shape rather than exact month name
+        // so the test is timezone-independent.
+        assert!(s.len() >= 11, "got {:?}", s);
+        assert!(
+            s.contains(' '),
+            "expected a space-separated date, got {:?}",
+            s
+        );
+        let parts: Vec<&str> = s.split(' ').collect();
+        assert!(parts.len() >= 2, "got {:?}", s);
     }
 }

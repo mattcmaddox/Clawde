@@ -285,6 +285,11 @@ pub fn models_for_provider_from_registry(
     if is_codex_provider(provider_id) {
         return codex_provider_models(registry);
     }
+    // Cline is a proxy not in the models.dev catalog — serve the curated list
+    // so the picker isn't empty when the user does `/connect cline`.
+    if provider_id == "cline" {
+        return cline_provider_models();
+    }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
 
@@ -364,6 +369,18 @@ pub fn default_model_for_provider(
             clawde_core::codex_oauth::DEFAULT_CODEX_MODEL
         );
     }
+    // Cline requires models in provider/model format (e.g. deepseek/deepseek-v4-flash).
+    // The catalog default is authoritative since Cline isn't in models.dev.
+    if provider_id == "cline" {
+        return format!(
+            "cline/{}",
+            clawde_api::FREE_CATALOG
+                .iter()
+                .find(|u| u.id == "cline")
+                .map(|u| u.default_model)
+                .unwrap_or("deepseek/deepseek-v4-flash")
+        );
+    }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
         if provider_id == "anthropic" {
             best
@@ -406,7 +423,7 @@ pub fn default_model_for_provider(
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
+        "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax" | "cline"
     )
 }
 
@@ -501,6 +518,91 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
             }
         })
         .collect()
+}
+
+/// Cline model list — live discovery from Cline's recommended-models API.
+///
+/// Cline (cline.bot) is a proxy requiring models in `provider/model` format
+/// (e.g. `deepseek/deepseek-v4-flash`). Since Cline is not in the models.dev
+/// catalog, this function fetches the current free model list from Cline's
+/// API (cached once per process lifetime) and enriches each entry with
+/// capability tags and context-window info from the bundled registry.
+///
+/// Falls back to the catalog default (`deepseek/deepseek-v4-flash`) when the
+/// API is unreachable or no Cline key is configured.
+fn cline_provider_models() -> Vec<ModelEntry> {
+    let reg = picker_registry();
+
+    // Live discovery: fetch all current free models from Cline's API.
+    // Cached in a OnceLock so the network call only happens once per
+    // process lifetime.
+    static LIVE_MODELS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    let discovered = LIVE_MODELS.get_or_init(|| {
+        let auth_store = clawde_core::AuthStore::load();
+        auth_store
+            .api_key_for("cline")
+            .filter(|k| k.len() >= 8)
+            .and_then(|key| clawde_api::providers::fetch_cline_free_models(&key))
+    });
+
+    match discovered {
+        Some(model_ids) if !model_ids.is_empty() => {
+            // Build an entry per model from the live list, enriched with
+            // registry metadata.
+            model_ids
+                .iter()
+                .map(|id| cline_model_entry(reg, id))
+                .collect()
+        }
+        _ => {
+            // Fallback: the single catalog default.
+            vec![cline_model_entry(reg, "deepseek/deepseek-v4-flash")]
+        }
+    }
+}
+
+/// Build a single [`ModelEntry`] for a Cline model by looking up its id in
+/// the registry for capability tags, context window, and reasoning support.
+/// Falls back to a `"tools"` capability tag when the registry has no entry,
+/// and derives a human-readable display name from the model id slug.
+fn cline_model_entry(reg: &clawde_api::ModelRegistry, model_id: &str) -> ModelEntry {
+    let (provider, bare_model) = model_id.split_once('/').unwrap_or(("unknown", model_id));
+
+    let (display_name, description, reasoning, capabilities) = match reg.get(provider, bare_model) {
+        Some(entry) => {
+            let name = entry.info.name.clone();
+            let ctx = format_context_window(entry.info.context_window);
+            let desc = format!("{} · free", ctx);
+            let caps = build_capability_tags(entry);
+            (name, desc, entry.reasoning, caps)
+        }
+        None => {
+            // Registry miss — derive a display name from the model id.
+            let name = bare_model
+                .split('-')
+                .map(|w| {
+                    let mut chars = w.chars();
+                    match chars.next() {
+                        Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            (name, "free".to_string(), false, vec!["tools".to_string()])
+        }
+    };
+
+    ModelEntry {
+        id: model_id.to_string(),
+        display_name,
+        description,
+        is_current: false,
+        reasoning,
+        capabilities,
+        specialty: None,
+        usage: "free".to_string(),
+    }
 }
 
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
@@ -2353,7 +2455,7 @@ mod tests {
     //     project from the catalog (no live fetch that could clobber it).
     #[test]
     fn hardcoded_list_providers_use_catalog_projection() {
-        for pid in ["azure", "amazon-bedrock", "cohere", "minimax"] {
+        for pid in ["azure", "amazon-bedrock", "cohere", "minimax", "cline"] {
             assert!(
                 provider_uses_catalog_projection(pid),
                 "{pid} must project from the catalog after its hardcoded list was removed"
@@ -2614,6 +2716,100 @@ mod tests {
             p.filtered_models()[p.selected_idx].id,
             anchor_id,
             "task_jump must keep the selected model highlighted"
+        );
+    }
+
+    // ---- cline_provider_models -----------------------------------------
+
+    #[test]
+    fn cline_provider_models_returns_non_empty_list() {
+        let models = models_for_provider_from_registry("cline", &clawde_api::ModelRegistry::new());
+        assert!(
+            !models.is_empty(),
+            "cline picker must have at least one model"
+        );
+    }
+
+    #[test]
+    fn cline_provider_models_first_is_primary() {
+        let models = models_for_provider_from_registry("cline", &clawde_api::ModelRegistry::new());
+        let first = &models[0];
+        // The primary model must be in provider/model format with a slash.
+        assert!(
+            first.id.contains('/'),
+            "primary Cline model must be in provider/model format, got '{}'",
+            first.id
+        );
+    }
+
+    #[test]
+    fn cline_provider_models_all_have_provider_prefix() {
+        let models = models_for_provider_from_registry("cline", &clawde_api::ModelRegistry::new());
+        for m in &models {
+            assert!(
+                m.id.contains('/'),
+                "Cline model '{}' must be in provider/model format",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn cline_provider_models_has_registry_enriched_entries() {
+        let models = models_for_provider_from_registry("cline", &clawde_api::ModelRegistry::new());
+        // Without a Cline API key the live discovery fails, so we get the
+        // fallback: deepseek/deepseek-v4-flash with at least the "tools" tag.
+        for m in &models {
+            assert!(
+                !m.capabilities.is_empty(),
+                "Cline model '{}' must have capabilities (registry or fallback)",
+                m.id
+            );
+            // Verify the display name isn't empty or bare — cline_model_entry
+            // derives a name from the model slug when the registry misses.
+            assert!(
+                !m.display_name.is_empty(),
+                "Cline model '{}' must have a display name",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn cline_provider_models_no_duplicate_entries() {
+        let models = models_for_provider_from_registry("cline", &clawde_api::ModelRegistry::new());
+        // No model id should appear more than once.
+        let mut seen = std::collections::HashSet::new();
+        for m in &models {
+            assert!(
+                seen.insert(&m.id),
+                "Cline model '{}' appears more than once",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn cline_default_model_is_prefixed() {
+        let registry = clawde_api::ModelRegistry::new();
+        let default = default_model_for_provider("cline", &registry);
+        assert!(
+            default.starts_with("cline/"),
+            "Cline default model must be prefixed: '{}'",
+            default
+        );
+        assert!(
+            default.contains('/'),
+            "Cline default must have a slash (provider/model): '{}'",
+            default
+        );
+    }
+
+    #[test]
+    fn cline_is_catalog_projection() {
+        assert!(
+            provider_uses_catalog_projection("cline"),
+            "cline must be in catalog projection to avoid pointless background fetch"
         );
     }
 }

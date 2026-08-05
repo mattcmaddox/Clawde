@@ -29,8 +29,9 @@ pub use metadata::{env_var_for, key_url_for, provider_metadata, MetaLookup, Prov
 
 pub mod free;
 pub use free::{
-    catalog_entry, CircuitBreakerConfig, FreeEntry, FreeProvider, FreeUpstream, LatencyConfig,
-    RoutingConfig, RoutingStrategy, FREE_CATALOG,
+    catalog_entry, fetch_cline_free_model, fetch_cline_free_models, CircuitBreakerConfig,
+    FreeEntry, FreeProvider, FreeUpstream, LatencyConfig, RoutingConfig, RoutingStrategy,
+    FREE_CATALOG,
 };
 
 pub mod cohere;

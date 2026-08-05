@@ -179,16 +179,20 @@ fn extract_error_message(json: &serde_json::Value) -> String {
     //   Anthropic:        /error/error/message
     //   Cohere / simple:  /message
     //   Some providers:   /detail
-    let paths = [
+    let nested_paths = [
         "/error/message",
         "/error/error/message",
         "/message",
         "/detail",
     ];
-    for path in paths {
+    for path in nested_paths {
         if let Some(msg) = json.pointer(path).and_then(|v| v.as_str()) {
             return msg.to_string();
         }
+    }
+    // Flat /error string (Cline, some gateways): {"error": "message"}
+    if let Some(msg) = json.pointer("/error").and_then(|v| v.as_str()) {
+        return msg.to_string();
     }
     json.to_string()
 }
@@ -317,6 +321,53 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(429, "rate limited", &pid);
         assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    // ---- Flat {"error": "string"} format (Cline, some gateways) -----
+
+    #[test]
+    fn test_parse_error_flat_json_error_string() {
+        // Cline returns flat {"error": "string"} — not nested {"error": {"message": "..."}}.
+        let pid = ProviderId::new("cline");
+        let err = parse_error_response(
+            401,
+            r#"{"error":"Unauthorized: Please make sure you're using the latest version of Cline and re-authenticate your Cline account."}"#,
+            &pid,
+        );
+        assert!(
+            matches!(&err, ProviderError::AuthFailed { message, .. } if message == "Unauthorized: Please make sure you're using the latest version of Cline and re-authenticate your Cline account."),
+            "expected clean message, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_error_flat_json_with_rate_limit() {
+        let pid = ProviderId::new("cline");
+        let err = parse_error_response(
+            429,
+            r#"{"error":"Rate limited. Retry after 298 seconds."}"#,
+            &pid,
+        );
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_extract_error_message_preserves_nested_paths() {
+        // Nested {"error": {"message": "..."}} still works.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"error":{"message":"Invalid API key"}}"#).unwrap();
+        let msg = extract_error_message(&json);
+        assert_eq!(msg, "Invalid API key");
+    }
+
+    #[test]
+    fn test_extract_error_message_prefers_nested_over_flat() {
+        // When /error/message exists, it takes priority over /error as string.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"error":{"message":"nested message"}}"#).unwrap();
+        let msg = extract_error_message(&json);
+        assert_eq!(msg, "nested message");
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub(crate) fn build_provider_options(
     model_id: &str,
     effort_level: Option<clawde_core::effort::EffortLevel>,
     thinking_budget: Option<u32>,
+    provider_settings_options: Option<&std::collections::HashMap<String, Value>>,
 ) -> Value {
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
@@ -284,6 +285,16 @@ pub(crate) fn build_provider_options(
                 "clear_thinking": false,
             }),
         );
+    }
+
+    // Merge provider-specific options from settings.json (e.g. Ollama's
+    // num_ctx). Settings options override auto-generated ones so the user
+    // can pin a context window from their dev machine without remoting
+    // into the inference host.
+    if let Some(settings_opts) = provider_settings_options {
+        for (key, value) in settings_opts {
+            options.insert(key.clone(), value.clone());
+        }
     }
 
     if options.is_empty() {

@@ -591,6 +591,151 @@ pub fn render_transcript_user_message(
     wrapped
 }
 
+/// Stable hash of a thinking block's full text, used to track per-block
+/// expansion. Shared by the transcript renderers and the Ctrl+O
+/// expand/collapse-all toggle so both address blocks by the same key.
+pub fn thinking_block_hash(thinking: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    thinking.hash(&mut h);
+    h.finish()
+}
+
+/// Stable hash identifying a group of parallel tool calls. Derived from the
+/// members' tool-use ids (unique per turn) so it is stable across renders and
+/// distinct from thinking-block hashes.
+pub fn grouped_tool_use_hash(ids: &[&str], names: &[&str]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for (id, name) in ids.iter().zip(names) {
+        id.hash(&mut h);
+        name.hash(&mut h);
+        h.write_u8(0);
+    }
+    h.finish()
+}
+
+/// Find maximal runs of >=2 consecutive `ToolUse` blocks in a message
+/// (parallel tool calls emitted in one assistant turn).
+///
+/// Returns `(group_hash, start_block_index, run_len)` per run.
+pub fn grouped_tool_use_runs(msg: &Message) -> Vec<(u64, usize, usize)> {
+    let blocks = msg.content_blocks();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        if matches!(blocks[i], ContentBlock::ToolUse { .. }) {
+            let mut j = i + 1;
+            while j < blocks.len() && matches!(blocks[j], ContentBlock::ToolUse { .. }) {
+                j += 1;
+            }
+            if j - i >= 2 {
+                let ids: Vec<&str> = blocks[i..j]
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let names: Vec<&str> = blocks[i..j]
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                runs.push((grouped_tool_use_hash(&ids, &names), i, j - i));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    runs
+}
+
+/// Stable hash for an LSP diagnostics block's full text. Namespaced with a
+/// distinct prefix so it can't collide with thinking-block or grouped-tool
+/// hashes stored in the same `expanded_thinking` set.
+pub fn diagnostics_block_hash(text: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    "lsp-diag".hash(&mut h);
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Detect LSP diagnostics output as produced by `LspManager::format_diagnostics`
+/// (`[ERROR] file:line:col - message` lines). Returns `(issue_count, file_count)`
+/// when every non-empty line matches that shape, else `None`.
+///
+/// Content-based (not tool-name-gated) so the Ctrl+O toggle, which has no
+/// access to `tool_names`, stays in lockstep with the renderer. The format is
+/// distinctive enough that ordinary tool output can't false-positive: a Bash
+/// result containing `[ERROR] file:1:2 - msg` mixed with other lines fails the
+/// all-lines check and renders normally.
+pub fn parse_lsp_diagnostics(text: &str) -> Option<(usize, usize)> {
+    let mut issues = 0usize;
+    let mut files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rest = line.strip_prefix('[')?;
+        let (severity, rest) = rest.split_once(']')?;
+        if !matches!(severity, "ERROR" | "WARNING" | "INFO" | "HINT") {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let (loc, _msg) = rest.split_once(" - ")?;
+        let mut parts = loc.rsplitn(3, ':');
+        let col = parts.next()?;
+        let line_no = parts.next()?;
+        let file = parts.next()?;
+        if !col.chars().all(|c| c.is_ascii_digit()) || !line_no.chars().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+        files.insert(file);
+        issues += 1;
+    }
+    if issues == 0 {
+        None
+    } else {
+        Some((issues, files.len()))
+    }
+}
+
+/// Every collapsible-block hash in a message: thinking blocks, LSP diagnostics
+/// summaries, and grouped parallel tool-use runs. Shared by the transcript
+/// renderer and the Ctrl+O expand/collapse-all toggle so both address blocks
+/// by the same key.
+pub fn expandable_block_hashes(msg: &Message) -> Vec<u64> {
+    let mut hashes = Vec::new();
+    for block in msg.content_blocks() {
+        match block {
+            ContentBlock::Thinking { thinking, .. } => hashes.push(thinking_block_hash(&thinking)),
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                if !is_error.unwrap_or(false) {
+                    let text = tool_result_text(&content);
+                    if parse_lsp_diagnostics(&text).is_some() {
+                        hashes.push(diagnostics_block_hash(&text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    hashes.extend(grouped_tool_use_runs(msg).into_iter().map(|(h, _, _)| h));
+    hashes
+}
+
 pub fn render_transcript_reasoning_block(
     text: &str,
     expanded: bool,
@@ -599,7 +744,7 @@ pub fn render_transcript_reasoning_block(
     let mut lines = Vec::new();
     let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
     let chevron = if expanded { "▼" } else { "▶" };
-    lines.push(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             format!("  {} Thinking: ", chevron),
             Style::default()
@@ -612,7 +757,18 @@ pub fn render_transcript_reasoning_block(
                 .fg(TRANSCRIPT_SUBTLE)
                 .add_modifier(Modifier::ITALIC),
         ),
-    ]));
+    ];
+    // Mirrors the spec's collapsed "(ctrl+o to expand)" affordance: the same
+    // key (or clicking the header) expands the block.
+    if !expanded {
+        header_spans.push(Span::styled(
+            " (ctrl+o to expand)",
+            Style::default()
+                .fg(TRANSCRIPT_SUBTLE)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.push(Line::from(header_spans));
 
     if expanded {
         let rendered = render_markdown(text, width.saturating_sub(6));
@@ -654,7 +810,10 @@ pub fn render_transcript_assistant_message_tagged(
             buffer.clear();
         };
 
-    for block in msg.content_blocks() {
+    // Parallel tool calls (>=2 consecutive ToolUse blocks) collapse into one
+    // expandable row; the precomputed runs tell us which blocks belong to one.
+    let runs = grouped_tool_use_runs(msg);
+    for (idx, block) in msg.content_blocks().into_iter().enumerate() {
         match block {
             ContentBlock::Text { text } => {
                 if !pending_text.is_empty() {
@@ -664,13 +823,7 @@ pub fn render_transcript_assistant_message_tagged(
             }
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut pending_text, &mut out, ctx.width);
-                let thinking_hash = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    thinking.hash(&mut h);
-                    h.finish()
-                };
+                let thinking_hash = thinking_block_hash(&thinking);
                 let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
                 let block_lines = render_transcript_reasoning_block(&thinking, expanded, ctx.width);
                 for (i, line) in block_lines.into_iter().enumerate() {
@@ -692,13 +845,58 @@ pub fn render_transcript_assistant_message_tagged(
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 flush_text(&mut pending_text, &mut out, ctx.width);
-                for line in indent_lines(
-                    render_tool_use_inner(&name, &input),
-                    "   ",
-                    Style::default(),
-                    TRANSCRIPT_TEXT,
-                ) {
-                    out.push((line, None));
+                // Member of a parallel run: only the run start renders the
+                // grouped header (click / Ctrl+O to expand); later members are
+                // covered by it.
+                if let Some(&(group_hash, start, len)) = runs.iter().find(|&&(_, s, _)| s == idx) {
+                    if idx == start {
+                        let group_blocks = msg.content_blocks();
+                        let names: Vec<&str> = group_blocks[start..start + len]
+                            .iter()
+                            .filter_map(|b| match b {
+                                ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        let expanded =
+                            ctx.show_thinking || ctx.expanded_thinking.contains(&group_hash);
+                        if expanded {
+                            // Show every tool's own header (with argument summary).
+                            for b in &group_blocks[start..start + len] {
+                                if let ContentBlock::ToolUse { name, input, .. } = b {
+                                    for line in indent_lines(
+                                        render_tool_use_inner(name, input),
+                                        "   ",
+                                        Style::default(),
+                                        TRANSCRIPT_TEXT,
+                                    ) {
+                                        out.push((line, None));
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut lines = render_grouped_tool_use(&names, false);
+                            let mut header = lines.remove(0);
+                            // Mirrors the thinking-block affordance: same key
+                            // (or clicking the header) expands the group.
+                            header.spans.push(Span::styled(
+                                " (ctrl+o to expand)".to_string(),
+                                Style::default()
+                                    .fg(TRANSCRIPT_SUBTLE)
+                                    .add_modifier(Modifier::ITALIC),
+                            ));
+                            out.push((header, Some(group_hash)));
+                        }
+                    }
+                } else {
+                    for line in indent_lines(
+                        render_tool_use_inner(&name, &input),
+                        "   ",
+                        Style::default(),
+                        TRANSCRIPT_TEXT,
+                    ) {
+                        out.push((line, None));
+                    }
                 }
             }
             ContentBlock::ToolResult {
@@ -709,6 +907,45 @@ pub fn render_transcript_assistant_message_tagged(
                 flush_text(&mut pending_text, &mut out, ctx.width);
                 let text = tool_result_text(&content);
                 let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
+                // LSP diagnostics collapse to a one-line summary (spec's
+                // DiagnosticsDisplay): "Found N diagnostic issue(s) in M file(s)"
+                // + (ctrl+o to expand). Expanded shows the per-file detail.
+                let parsed_diag = if !is_error.unwrap_or(false) {
+                    parse_lsp_diagnostics(&text)
+                        .map(|(issues, files)| (diagnostics_block_hash(&text), issues, files))
+                } else {
+                    None
+                };
+                // If collapsed, swap the whole block for a one-line summary.
+                // If expanded, keep the full detail but remember the hash so the
+                // first rendered line stays click-to-collapse (same affordance
+                // as thinking-block headers).
+                let diagnostics_hash = match parsed_diag {
+                    Some((hash, issues, files)) if !ctx.expanded_thinking.contains(&hash) => {
+                        let summary = Line::from(vec![
+                            Span::styled(
+                                format!(
+                                    "  ▶ Found {} diagnostic issue{} in {} file{}",
+                                    issues,
+                                    if issues == 1 { "" } else { "s" },
+                                    files,
+                                    if files == 1 { "" } else { "s" },
+                                ),
+                                Style::default().fg(TRANSCRIPT_SUBTLE),
+                            ),
+                            Span::styled(
+                                " (ctrl+o to expand)".to_string(),
+                                Style::default()
+                                    .fg(TRANSCRIPT_SUBTLE)
+                                    .add_modifier(Modifier::ITALIC),
+                            ),
+                        ]);
+                        out.push((summary, Some(hash)));
+                        continue;
+                    }
+                    Some((hash, _, _)) => Some(hash),
+                    None => None,
+                };
                 let rendered = if is_error.unwrap_or(false) {
                     render_tool_result_error(&text)
                 } else {
@@ -722,8 +959,14 @@ pub fn render_transcript_assistant_message_tagged(
                         _ => render_tool_result_success(&text, false),
                     }
                 };
-                for line in indent_lines(rendered, "   ", Style::default(), TRANSCRIPT_TEXT) {
-                    out.push((line, None));
+                for (i, line) in indent_lines(rendered, "   ", Style::default(), TRANSCRIPT_TEXT)
+                    .into_iter()
+                    .enumerate()
+                {
+                    // Tag only the first line of an expanded diagnostics block
+                    // (or any single-line result) so it stays clickable.
+                    let tag = if i == 0 { diagnostics_hash } else { None };
+                    out.push((line, tag));
                 }
             }
             ContentBlock::Image { source } => {
@@ -875,13 +1118,7 @@ pub fn render_transcript_assistant_message(
             }
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut pending_text, &mut lines);
-                let thinking_hash = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    thinking.hash(&mut h);
-                    h.finish()
-                };
+                let thinking_hash = thinking_block_hash(&thinking);
                 let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
                 lines.extend(render_transcript_reasoning_block(
                     &thinking, expanded, ctx.width,
@@ -1528,7 +1765,7 @@ pub fn render_system_message(text: &str) -> Vec<Line<'static>> {
 pub fn render_thinking_block(text: &str, expanded: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
-    lines.push(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             "Thinking: ",
             Style::default()
@@ -1541,7 +1778,18 @@ pub fn render_thinking_block(text: &str, expanded: bool) -> Vec<Line<'static>> {
                 .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
         ),
-    ]));
+    ];
+    // Mirrors the spec's collapsed "(ctrl+o to expand)" affordance: the same
+    // key (or clicking the header) expands the block.
+    if !expanded {
+        header_spans.push(Span::styled(
+            " (ctrl+o to expand)",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.push(Line::from(header_spans));
     if expanded {
         for line in text.lines() {
             lines.push(Line::from(vec![
@@ -1739,13 +1987,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             ContentBlock::Thinking { thinking, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 // Compute a stable hash of the thinking content for per-block expansion tracking
-                let thinking_hash = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    thinking.hash(&mut h);
-                    h.finish()
-                };
+                let thinking_hash = thinking_block_hash(&thinking);
                 let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
                 lines.extend(prefix_message_lines(
                     render_thinking_block(&thinking, expanded),
@@ -2880,6 +3122,123 @@ mod tests {
     }
 
     #[test]
+    fn test_grouped_tool_use_runs_detects_parallel_runs() {
+        // Three consecutive ToolUse blocks form one run; a Text block between
+        // tool calls breaks the run so the trailing Grep stays ungrouped.
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+                thought_signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "tu-2".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({ "file_path": "a.rs" }),
+                thought_signature: None,
+            },
+            ContentBlock::Text {
+                text: "moving on".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu-3".to_string(),
+                name: "Grep".to_string(),
+                input: serde_json::json!({ "pattern": "foo" }),
+                thought_signature: None,
+            },
+        ]);
+        let runs = grouped_tool_use_runs(&msg);
+        assert_eq!(runs.len(), 1, "only the 2-block run is grouped");
+        let (hash, start, len) = runs[0];
+        assert_eq!((start, len), (0, 2));
+
+        // The hash is stable across calls and appears in the expandable set.
+        assert!(expandable_block_hashes(&msg).contains(&hash));
+    }
+
+    #[test]
+    fn test_transcript_collapses_parallel_tool_uses() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "cargo test" }),
+                thought_signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "tu-2".to_string(),
+                name: "Grep".to_string(),
+                input: serde_json::json!({ "pattern": "fn main" }),
+                thought_signature: None,
+            },
+        ]);
+        let tagged = render_transcript_assistant_message_tagged(&msg, &RenderContext::default());
+        let text: Vec<String> = tagged.iter().map(|(l, _)| line_text(l)).collect();
+        let combined = text.join("\n");
+        assert!(
+            combined.contains("2 tool calls"),
+            "collapsed group header expected, got: {combined}"
+        );
+        assert!(combined.contains("ctrl+o to expand"));
+        assert!(
+            !combined.contains("cargo test"),
+            "collapsed group must hide per-tool summaries"
+        );
+
+        // Exactly one line is tagged with the group hash (the header).
+        let (header, tag) = tagged[0].clone();
+        assert!(
+            tag.is_some(),
+            "group header must be clickable, got: {}",
+            line_text(&header)
+        );
+        assert!(
+            tagged.iter().skip(1).all(|(_, t)| t.is_none()),
+            "only the group header carries the expand hash"
+        );
+    }
+
+    #[test]
+    fn test_transcript_group_expands_to_individual_headers() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "cargo test" }),
+                thought_signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "tu-2".to_string(),
+                name: "Grep".to_string(),
+                input: serde_json::json!({ "pattern": "fn main" }),
+                thought_signature: None,
+            },
+        ]);
+        let (hash, _, _) = grouped_tool_use_runs(&msg)[0];
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(hash);
+        let ctx = RenderContext {
+            expanded_thinking: &expanded,
+            ..RenderContext::default()
+        };
+        let tagged = render_transcript_assistant_message_tagged(&msg, &ctx);
+        let combined: String = tagged
+            .iter()
+            .map(|(l, _)| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("cargo test"),
+            "expanded group must show per-tool summaries, got: {combined}"
+        );
+        assert!(
+            !combined.contains("ctrl+o to expand"),
+            "expanded group hides the hint"
+        );
+    }
+
+    #[test]
     fn test_render_rate_limit_with_hint_false() {
         let result = render_rate_limit_with_hint(60, false);
         assert_eq!(result.len(), 2, "without hint should have 2 lines");
@@ -2960,5 +3319,84 @@ mod tests {
         // Mixed multibyte content around both cut points must also be safe.
         let mixed = "😀é✅ん".repeat(3_000);
         let _ = truncate_user_prompt_text(&mixed); // no panic == pass
+    }
+
+    // ---- LSP diagnostics summary -------------------------------------------
+
+    #[test]
+    fn test_parse_lsp_diagnostics_counts_issues_and_files() {
+        let out = parse_lsp_diagnostics(
+            "[ERROR] /src/main.rs:12:5 - missing semicolon (rustc) [E0308]\n\
+             [WARNING] /src/main.rs:40:1 - unused variable (rustc) [W0001]\n\
+             [ERROR] /src/lib.rs:3:9 - type mismatch (rustc) [E0277]",
+        );
+        assert_eq!(out, Some((3, 2)));
+    }
+
+    #[test]
+    fn test_parse_lsp_diagnostics_rejects_non_diagnostics() {
+        // Ordinary tool output must NOT be treated as diagnostics — mixed
+        // content fails the all-lines check and returns None.
+        assert_eq!(
+            parse_lsp_diagnostics("  Build failed.\n  make: *** [all] Error 2"),
+            None
+        );
+        assert_eq!(
+            parse_lsp_diagnostics("[ERROR] no location format here"),
+            None
+        );
+        assert_eq!(parse_lsp_diagnostics("No diagnostics for 'x'."), None);
+        assert_eq!(parse_lsp_diagnostics(""), None);
+    }
+
+    #[test]
+    fn test_transcript_collapses_lsp_diagnostics() {
+        let msg = Message::assistant_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tu-1".to_string(),
+            content: ToolResultContent::Text(
+                "[ERROR] /src/main.rs:12:5 - missing semicolon\n\
+                 [WARNING] /src/lib.rs:3:9 - unused import"
+                    .to_string(),
+            ),
+            is_error: Some(false),
+        }]);
+        let mut ctx = RenderContext::default();
+        let expanded = std::collections::HashSet::new();
+        ctx.expanded_thinking = &expanded;
+        let tagged = render_transcript_assistant_message_tagged(&msg, &ctx);
+        let text: Vec<String> = tagged.iter().map(|(l, _)| line_text(l)).collect();
+        let combined = text.join("\n");
+        assert!(
+            combined.contains("Found 2 diagnostic issues in 2 files"),
+            "collapsed summary expected, got: {combined}"
+        );
+        assert!(combined.contains("ctrl+o to expand"));
+        assert!(
+            !combined.contains("missing semicolon"),
+            "collapsed summary must hide per-diagnostic detail"
+        );
+
+        // The summary line is tagged with the hash → clickable + Ctrl+O toggle.
+        let hash = diagnostics_block_hash(
+            "[ERROR] /src/main.rs:12:5 - missing semicolon\n\
+             [WARNING] /src/lib.rs:3:9 - unused import",
+        );
+        assert_eq!(tagged[0].1, Some(hash));
+        assert!(expandable_block_hashes(&msg).contains(&hash));
+
+        // Expanded shows the full detail instead of the summary.
+        {
+            let mut ctx = RenderContext::default();
+            let expanded2 = std::collections::HashSet::from([hash]);
+            ctx.expanded_thinking = &expanded2;
+            let tagged = render_transcript_assistant_message_tagged(&msg, &ctx);
+            let text: Vec<String> = tagged.iter().map(|(l, _)| line_text(l)).collect();
+            let combined = text.join("\n");
+            assert!(
+                combined.contains("missing semicolon"),
+                "expanded must show full diagnostics, got: {combined}"
+            );
+            assert!(!combined.contains("Found 2 diagnostic issues"));
+        }
     }
 }

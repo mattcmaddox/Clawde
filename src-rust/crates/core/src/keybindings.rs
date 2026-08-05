@@ -209,7 +209,9 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+l", "clearLine", KeyContext::Chat),
         // History navigation
         ("up", "historyPrev", KeyContext::Chat),
-        ("ctrl+o", "historyPrev", KeyContext::Chat),
+        // Ctrl+O expands/collapses all thinking blocks (mirrors the spec's
+        // "ctrl+o to expand" convention); history navigation stays on Up.
+        ("ctrl+o", "toggleThinkingExpand", KeyContext::Chat),
         ("down", "historyNext", KeyContext::Chat),
         ("ctrl+i", "historyNext", KeyContext::Chat),
         // Message navigation
@@ -241,6 +243,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "scrollDown", KeyContext::Chat),
         // App shortcuts
         ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
+        ("ctrl+,", "openSettings", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
         // ========== FREE MODE UPSTREAM CYCLE ==========
         ("alt+u", "cycleFreeUpstream", KeyContext::Chat),

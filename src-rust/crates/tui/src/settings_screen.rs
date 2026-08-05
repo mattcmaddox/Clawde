@@ -8,7 +8,8 @@ use crate::overlays::{
     centered_rect, modal_search_line, render_dark_overlay, render_dialog_bg, CLAURST_ACCENT,
     CLAURST_MUTED, CLAURST_PANEL_BG,
 };
-use clawde_core::config::{Config, Settings};
+use clawde_core::config::{Config, PermissionMode, Settings};
+use clawde_core::constants::DEFAULT_MAX_TOKENS;
 use clawde_core::output_styles::{builtin_styles, find_style};
 use clawde_tools::web_search::check_backend_configured;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -17,6 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use std::collections::HashMap;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,15 +27,80 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub enum SettingKind {
     Bool,
-    Enum { options: Vec<&'static str> },
+    Enum {
+        options: Vec<&'static str>,
+    },
     Number,
+    /// Free-form text (e.g. a comma-separated list) edited inline.
+    Text,
 }
+
+/// Whether a setting applies to the running session immediately, or only
+/// after the next launch (e.g. verbose logging, mouse capture, headless-only
+/// output format). Shown as a per-row state tag so users know what to expect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingEffect {
+    Immediate,
+    NextSession,
+}
+
+impl SettingEffect {
+    fn label(self) -> &'static str {
+        match self {
+            SettingEffect::Immediate => "now",
+            SettingEffect::NextSession => "next",
+        }
+    }
+}
+
+/// Where the effective value of a setting comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingOrigin {
+    /// Not set anywhere — the built-in default is in effect.
+    Default,
+    /// Set in the user's global `~/.clawde/settings.json`.
+    Global,
+    /// Overridden by the repository's `.clawde/settings.json`.
+    Project,
+}
+
+impl SettingOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            SettingOrigin::Default => "default",
+            SettingOrigin::Global => "global",
+            SettingOrigin::Project => "project",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            SettingOrigin::Default => Color::DarkGray,
+            SettingOrigin::Global => Color::Rgb(150, 150, 170),
+            SettingOrigin::Project => Color::Cyan,
+        }
+    }
+}
+
+/// Section headers shown in the settings list. The curated "Common" section
+/// is pinned first so the settings users actually change live at the top;
+/// the rest are grouped by concern.
+const SECTION_COMMON: &str = "Common";
+const SECTION_INTERFACE: &str = "Interface";
+const SECTION_WORKSPACE: &str = "Workspace & files";
+const SECTION_FREE_ROUTING: &str = "Free-mode routing";
+const SECTION_OLLAMA: &str = "Ollama (local)";
 
 #[derive(Debug, Clone)]
 pub struct SettingsEntry {
     pub key: &'static str,
     pub label: &'static str,
     pub description: &'static str,
+    pub section: &'static str,
+    /// The built-in default for this setting (as displayed). Used to compute
+    /// the per-row origin tag (default vs customized).
+    pub default: String,
+    pub effect: SettingEffect,
     pub kind: SettingKind,
     pub value: String,
 }
@@ -47,8 +114,16 @@ pub struct SettingsScreen {
     pub edit_field: Option<String>,
     /// Current buffer content while editing a field.
     pub edit_value: String,
-    /// Snapshot of settings at open time.
+    /// Snapshot of the GLOBAL settings — what edits are applied to and what
+    /// `save_sync()` writes back to `~/.clawde/settings.json`.
     pub settings_snapshot: Settings,
+    /// Effective settings (global merged with any project overrides). Values
+    /// are displayed from this view so the screen is honest about what is
+    /// actually in effect, even when a `.clawde/settings.json` overrides it.
+    pub effective_snapshot: Settings,
+    /// Project-level settings loaded from the nearest `.clawde/settings.json`
+    /// (if any). Drives the per-entry origin tag ("project").
+    pub project_snapshot: Option<Settings>,
     /// Pending changes (field_name → new_value string).
     pub pending_changes: HashMap<String, String>,
 
@@ -93,6 +168,14 @@ pub struct SettingsScreen {
     pub health_warning: String,
     /// When true, the user is asked to confirm before discarding pending changes.
     pub confirming_discard: bool,
+    /// Ollama: context window size (human label from OLLAMA_CTX_PRESETS).
+    pub ollama_num_ctx: String,
+    /// Ollama: model keep-alive duration (human label).
+    pub ollama_keep_alive: String,
+    /// Ollama: max output tokens (human label from OLLAMA_PREDICT_PRESETS).
+    pub ollama_num_predict: String,
+    /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
+    pub permission_mode: String,
 }
 
 impl SettingsScreen {
@@ -106,6 +189,8 @@ impl SettingsScreen {
             edit_field: None,
             edit_value: String::new(),
             settings_snapshot: settings_snapshot.clone(),
+            effective_snapshot: settings_snapshot.clone(),
+            project_snapshot: None,
             pending_changes: HashMap::new(),
             auto_compact: false,
             notifications: true,
@@ -137,6 +222,10 @@ impl SettingsScreen {
             preferred_search_backend: "auto".to_string(),
             health_warning: String::new(),
             confirming_discard: false,
+            ollama_num_ctx: "12K".to_string(),
+            ollama_keep_alive: "forever".to_string(),
+            ollama_num_predict: "2K".to_string(),
+            permission_mode: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
         screen.apply_settings_from_snapshot();
@@ -146,50 +235,45 @@ impl SettingsScreen {
     /// Apply all settings from the snapshot to the screen fields.
     /// This is called on initialization and when opening the settings screen.
     fn apply_settings_from_snapshot(&mut self) {
-        self.auto_compact = self.settings_snapshot.auto_compact;
-        self.notifications = self.settings_snapshot.notifications;
-        self.show_turn_duration = self.settings_snapshot.show_turn_duration;
-        self.output_style = self
-            .settings_snapshot
+        let s = &self.effective_snapshot;
+        self.auto_compact = s.auto_compact;
+        self.notifications = s.notifications;
+        self.show_turn_duration = s.show_turn_duration;
+        self.output_style = s
             .config
             .output_style
             .clone()
             .unwrap_or_else(|| "default".to_string());
-        self.reduce_motion = self.settings_snapshot.reduce_motion;
-        self.terminal_progress_bar = self.settings_snapshot.terminal_progress_bar;
-        self.verbose = self.settings_snapshot.config.verbose;
-        self.cursor_blink_enabled = self.settings_snapshot.config.cursor_blink_enabled;
-        self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
-        self.mouse_capture = self.settings_snapshot.config.mouse_capture_enabled();
-        self.show_cwd = self.settings_snapshot.show_cwd;
-        self.show_git_branch = self.settings_snapshot.show_git_branch;
-        self.compact_threshold = self.settings_snapshot.config.compact_threshold.to_string();
-        self.auto_commits = self.settings_snapshot.config.auto_commits.unwrap_or(false);
-        self.output_format = match &self.settings_snapshot.config.output_format {
+        self.reduce_motion = s.reduce_motion;
+        self.terminal_progress_bar = s.terminal_progress_bar;
+        self.verbose = s.config.verbose;
+        self.cursor_blink_enabled = s.config.cursor_blink_enabled;
+        self.auto_copy_enabled = s.auto_copy_on_highlight;
+        self.mouse_capture = s.config.mouse_capture_enabled();
+        self.show_cwd = s.show_cwd;
+        self.show_git_branch = s.show_git_branch;
+        // The threshold is stored as a percentage number in the screen's terms;
+        // an unset (0.0) value means the default is in effect.
+        self.compact_threshold = if s.config.compact_threshold > 0.0 {
+            s.config.compact_threshold.to_string()
+        } else {
+            "95".to_string()
+        };
+        self.auto_commits = s.config.auto_commits.unwrap_or(false);
+        self.output_format = match &s.config.output_format {
             clawde_core::config::OutputFormat::Text => "text".to_string(),
             clawde_core::config::OutputFormat::Json => "json".to_string(),
             clawde_core::config::OutputFormat::StreamJson => "stream_json".to_string(),
         };
-        self.disable_claude_mds = self.settings_snapshot.config.disable_claude_mds;
-        self.file_injection_enabled = self.settings_snapshot.config.file_injection_enabled;
-        self.file_autocomplete_limit = self
-            .settings_snapshot
-            .config
-            .file_autocomplete_limit
-            .to_string();
-        self.file_autocomplete_show_hidden_files = self
-            .settings_snapshot
-            .config
-            .file_autocomplete_show_hidden_files;
-        self.file_injection_max_size = self
-            .settings_snapshot
-            .config
-            .file_injection_max_size
-            .to_string();
+        self.disable_claude_mds = s.config.disable_claude_mds;
+        self.file_injection_enabled = s.config.file_injection_enabled;
+        self.file_autocomplete_limit = s.config.file_autocomplete_limit.to_string();
+        self.file_autocomplete_show_hidden_files = s.config.file_autocomplete_show_hidden_files;
+        self.file_injection_max_size = s.config.file_injection_max_size.to_string();
+        self.permission_mode = permission_mode_str(&s.config.permission_mode);
 
         // Read routing strategy from provider config
-        self.routing_strategy = self
-            .settings_snapshot
+        self.routing_strategy = s
             .config
             .provider_configs
             .get("free")
@@ -200,8 +284,7 @@ impl SettingsScreen {
             .to_string();
 
         // Read disabled upstreams from provider config
-        self.disabled_upstreams = self
-            .settings_snapshot
+        self.disabled_upstreams = s
             .config
             .provider_configs
             .get("free")
@@ -217,8 +300,7 @@ impl SettingsScreen {
             .unwrap_or_default();
 
         // Read first-byte timeout from provider config (default 0 = disabled).
-        self.first_byte_timeout_secs = self
-            .settings_snapshot
+        self.first_byte_timeout_secs = s
             .config
             .provider_configs
             .get("free")
@@ -229,8 +311,7 @@ impl SettingsScreen {
             .unwrap_or_else(|| "0".to_string());
 
         // Read staggered probe flag from provider config (default true).
-        self.staggered_probe = self
-            .settings_snapshot
+        self.staggered_probe = s
             .config
             .provider_configs
             .get("free")
@@ -240,8 +321,7 @@ impl SettingsScreen {
             .unwrap_or(true);
 
         // Read 5xx cooldown from provider config (default 45s).
-        self.upstream_5xx_cooldown_secs = self
-            .settings_snapshot
+        self.upstream_5xx_cooldown_secs = s
             .config
             .provider_configs
             .get("free")
@@ -252,8 +332,7 @@ impl SettingsScreen {
             .unwrap_or_else(|| "45".to_string());
 
         // Read health poll interval from provider config (default 300s).
-        self.health_poll_interval_secs = self
-            .settings_snapshot
+        self.health_poll_interval_secs = s
             .config
             .provider_configs
             .get("free")
@@ -264,8 +343,7 @@ impl SettingsScreen {
             .unwrap_or_else(|| "300".to_string());
 
         // Read fallback retries from provider config (default 0).
-        self.fallback_retries = self
-            .settings_snapshot
+        self.fallback_retries = s
             .config
             .provider_configs
             .get("free")
@@ -276,7 +354,26 @@ impl SettingsScreen {
             .unwrap_or_else(|| "0".to_string());
 
         // Read preferred search backend from settings
-        self.preferred_search_backend = self.settings_snapshot.preferred_search_backend.clone();
+        self.preferred_search_backend = s.preferred_search_backend.clone();
+
+        // Read Ollama options from provider config.
+        let ollama_opts = s
+            .config
+            .provider_configs
+            .get("ollama")
+            .map(|pc| &pc.options);
+        self.ollama_num_ctx = ollama_opts
+            .and_then(|o| o.get("num_ctx").and_then(|v| v.as_u64()))
+            .map(num_ctx_to_preset)
+            .unwrap_or_else(|| "12K".to_string());
+        self.ollama_keep_alive = ollama_opts
+            .and_then(|o| o.get("keep_alive").and_then(keep_alive_value_to_i64))
+            .map(keep_alive_to_preset)
+            .unwrap_or_else(|| "forever".to_string());
+        self.ollama_num_predict = ollama_opts
+            .and_then(|o| o.get("num_predict").and_then(|v| v.as_u64()))
+            .map(num_predict_to_preset)
+            .unwrap_or_else(|| "2K".to_string());
 
         // Sync the env var so web_search.rs respects the stored preference immediately.
         let val = self.preferred_search_backend.trim();
@@ -295,8 +392,14 @@ impl SettingsScreen {
         }
     }
 
-    pub fn open(&mut self) {
+    /// Open the screen, loading the effective (global + project) view for the
+    /// given working directory so displayed values and origin tags reflect
+    /// what the running session actually uses. Edits always write to the
+    /// global settings file.
+    pub fn open(&mut self, cwd: &Path) {
         self.settings_snapshot = Settings::load_sync().unwrap_or_default();
+        self.effective_snapshot = Settings::load_effective_sync(cwd);
+        self.project_snapshot = Settings::load_project_settings_sync(cwd);
         self.pending_changes.clear();
         self.edit_field = None;
         self.edit_value.clear();
@@ -305,7 +408,7 @@ impl SettingsScreen {
         self.scroll_offset = 0;
         self.visible = true;
 
-        // Wire real settings from snapshot
+        // Wire real settings from the effective snapshot
         self.apply_settings_from_snapshot();
     }
 
@@ -478,6 +581,109 @@ impl Default for SettingsScreen {
 // Settings entries definition
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Ollama preset helpers — map human labels to/from raw API values
+// ---------------------------------------------------------------------------
+
+const OLLAMA_CTX_PRESETS: &[(&str, u64)] = &[
+    ("4K", 4_096),
+    ("8K", 8_192),
+    ("12K", 12_288),
+    ("16K", 16_384),
+    ("24K", 24_576),
+    ("32K", 32_768),
+];
+
+const OLLAMA_PREDICT_PRESETS: &[(&str, u64)] = &[
+    ("512", 512),
+    ("1K", 1_024),
+    ("2K", 2_048),
+    ("4K", 4_096),
+    ("8K", 8_192),
+];
+
+const OLLAMA_KEEP_ALIVE_PRESETS: &[(&str, i64)] = &[
+    ("5 min", 300),
+    ("10 min", 600),
+    ("30 min", 1_800),
+    ("1 hour", 3_600),
+    ("forever", -1),
+];
+
+fn keep_alive_value_to_i64(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn num_ctx_to_preset(n: u64) -> String {
+    for (label, val) in OLLAMA_CTX_PRESETS {
+        if *val == n {
+            return label.to_string();
+        }
+    }
+    format!("{}K", n / 1024)
+}
+
+fn preset_to_num_ctx(preset: &str) -> u64 {
+    for (label, val) in OLLAMA_CTX_PRESETS {
+        if *label == preset {
+            return *val;
+        }
+    }
+    12_288
+}
+
+fn num_predict_to_preset(n: u64) -> String {
+    for (label, val) in OLLAMA_PREDICT_PRESETS {
+        if *val == n {
+            return label.to_string();
+        }
+    }
+    format!("{}", n)
+}
+
+fn preset_to_num_predict(preset: &str) -> u64 {
+    for (label, val) in OLLAMA_PREDICT_PRESETS {
+        if *label == preset {
+            return *val;
+        }
+    }
+    2_048
+}
+
+fn keep_alive_to_preset(n: i64) -> String {
+    if n <= 0 {
+        return "forever".to_string();
+    }
+    for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
+        if *val == n {
+            return label.to_string();
+        }
+    }
+    format!("{}s", n)
+}
+
+fn preset_to_keep_alive(preset: &str) -> String {
+    for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
+        if *label == preset {
+            return val.to_string();
+        }
+    }
+    "-1".to_string()
+}
+
+fn ollama_ctx_labels() -> Vec<&'static str> {
+    OLLAMA_CTX_PRESETS.iter().map(|(l, _)| *l).collect()
+}
+
+fn ollama_predict_labels() -> Vec<&'static str> {
+    OLLAMA_PREDICT_PRESETS.iter().map(|(l, _)| *l).collect()
+}
+
+fn ollama_keep_alive_labels() -> Vec<&'static str> {
+    OLLAMA_KEEP_ALIVE_PRESETS.iter().map(|(l, _)| *l).collect()
+}
+
 /// Read the existing routing JSON from the free provider config, or return
 /// an empty object if none exists. Callers modify the returned object and
 /// write it back — this prevents editing one routing field from overwriting
@@ -491,231 +697,603 @@ fn get_or_create_routing_json(config: &Config) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
 }
 
+// Extract a single setting's raw value (as stored) from a settings
+// snapshot. Returns the empty string when the setting is unset — the caller
+// distinguishes "unset" (default) from "customized" via [`default_value_for`].
+// This is what powers the per-row origin tag: compare the global and project
+// snapshots against the built-in default.
+fn value_from_settings(settings: &Settings, key: &str) -> String {
+    let c = &settings.config;
+    match key {
+        "max_tokens" => c.max_tokens.map(|n| n.to_string()).unwrap_or_default(),
+        "auto_compact" => settings.auto_compact.to_string(),
+        "notifications" => settings.notifications.to_string(),
+        "show_turn_duration" => settings.show_turn_duration.to_string(),
+        "output_style" => c.output_style.clone().unwrap_or_default(),
+        "reduce_motion" => settings.reduce_motion.to_string(),
+        "terminal_progress_bar" => settings.terminal_progress_bar.to_string(),
+        "verbose" => c.verbose.to_string(),
+        "cursor_blink_enabled" => c.cursor_blink_enabled.to_string(),
+        "auto_copy_enabled" => settings.auto_copy_on_highlight.to_string(),
+        "mouse_capture" => c.mouse_capture_enabled().to_string(),
+        "show_cwd" => settings.show_cwd.to_string(),
+        "show_git_branch" => settings.show_git_branch.to_string(),
+        // The threshold is stored as a percentage number; 0.0 means unset.
+        "compact_threshold" => {
+            if c.compact_threshold > 0.0 {
+                c.compact_threshold.to_string()
+            } else {
+                String::new()
+            }
+        }
+        "auto_commits" => c.auto_commits.unwrap_or(false).to_string(),
+        "output_format" => match c.output_format {
+            clawde_core::config::OutputFormat::Text => "text",
+            clawde_core::config::OutputFormat::Json => "json",
+            clawde_core::config::OutputFormat::StreamJson => "streamjson",
+        }
+        .to_string(),
+        "disable_claude_mds" => c.disable_claude_mds.to_string(),
+        "permission_mode" => permission_mode_str(&c.permission_mode),
+        "routing_strategy" => routing_str_value(c, "strategy"),
+        "first_byte_timeout_secs" => routing_u64_str(c, "first_byte_timeout_secs"),
+        "staggered_probe" => routing_bool_str(c, "staggered_probe"),
+        "upstream_5xx_cooldown_secs" => routing_u64_str(c, "upstream_5xx_cooldown_secs"),
+        "health_poll_interval_secs" => routing_u64_str(c, "health_poll_interval_secs"),
+        "fallback_retries" => routing_u64_str(c, "fallback_retries"),
+        "disabled_upstreams" => routing_disabled_str(c),
+        "preferredSearchBackend" => settings.preferred_search_backend.clone(),
+        "fileInjectionEnabled" => c.file_injection_enabled.to_string(),
+        "fileAutocompleteLimit" => c.file_autocomplete_limit.to_string(),
+        "fileAutocompleteShowHiddenFiles" => c.file_autocomplete_show_hidden_files.to_string(),
+        "fileInjectionMaxSize" => c.file_injection_max_size.to_string(),
+        "ollama_num_ctx" => ollama_num_ctx_str(c),
+        "ollama_keep_alive" => ollama_keep_alive_str(c),
+        "ollama_num_predict" => ollama_num_predict_str(c),
+        _ => String::new(),
+    }
+}
+
+/// The raw "unset" representation of a setting — used to decide whether a
+/// snapshot differs from the built-in default (origin tag). Empty string for
+/// settings that are absent by default; explicit literals for those whose
+/// defaults are baked into serde or getters.
+fn default_value_for(key: &str) -> String {
+    match key {
+        // Absent in the file == default.
+        "output_style"
+        | "compact_threshold"
+        | "max_tokens"
+        | "disabled_upstreams"
+        | "routing_strategy"
+        | "first_byte_timeout_secs"
+        | "staggered_probe"
+        | "upstream_5xx_cooldown_secs"
+        | "health_poll_interval_secs"
+        | "fallback_retries"
+        | "ollama_num_ctx"
+        | "ollama_keep_alive"
+        | "ollama_num_predict" => String::new(),
+        "auto_compact"
+        | "notifications"
+        | "terminal_progress_bar"
+        | "show_cwd"
+        | "show_git_branch"
+        | "fileInjectionEnabled"
+        | "mouse_capture" => "true".to_string(),
+        "permission_mode" => "default".to_string(),
+        "output_format" => "text".to_string(),
+        "preferredSearchBackend" => "auto".to_string(),
+        "fileAutocompleteLimit" => "15".to_string(),
+        "fileInjectionMaxSize" => "100".to_string(),
+        _ => "false".to_string(),
+    }
+}
+
+/// Where a setting's effective value comes from: built-in default, the global
+/// `~/.clawde/settings.json`, or a project `.clawde/settings.json` override.
+/// Computed fresh on every call so toggling a value flips the tag immediately.
+fn entry_origin(screen: &SettingsScreen, key: &str) -> SettingOrigin {
+    let default_v = default_value_for(key);
+    let glob = value_from_settings(&screen.settings_snapshot, key);
+    let proj = screen
+        .project_snapshot
+        .as_ref()
+        .map(|p| value_from_settings(p, key))
+        .unwrap_or_default();
+    if !proj.is_empty() && proj != glob {
+        return SettingOrigin::Project;
+    }
+    if glob != default_v {
+        return SettingOrigin::Global;
+    }
+    SettingOrigin::Default
+}
+
+fn routing_json(config: &Config) -> Option<&serde_json::Value> {
+    config
+        .provider_configs
+        .get("free")
+        .and_then(|pc| pc.options.get("routing"))
+}
+
+fn routing_str_value(config: &Config, key: &str) -> String {
+    routing_json(config)
+        .and_then(|r| r.get(key))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn routing_u64_str(config: &Config, key: &str) -> String {
+    routing_json(config)
+        .and_then(|r| r.get(key))
+        .and_then(|v| v.as_u64())
+        .map(|n| n.to_string())
+        .unwrap_or_default()
+}
+
+fn routing_bool_str(config: &Config, key: &str) -> String {
+    routing_json(config)
+        .and_then(|r| r.get(key))
+        .and_then(|v| v.as_bool())
+        .map(|b| b.to_string())
+        .unwrap_or_default()
+}
+
+fn routing_disabled_str(config: &Config) -> String {
+    routing_json(config)
+        .and_then(|r| r.get("disabled_upstreams"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+fn ollama_opts(config: &Config) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
+    config.provider_configs.get("ollama").map(|pc| &pc.options)
+}
+
+fn ollama_num_ctx_str(config: &Config) -> String {
+    ollama_opts(config)
+        .and_then(|o| o.get("num_ctx").and_then(|v| v.as_u64()))
+        .map(num_ctx_to_preset)
+        .unwrap_or_default()
+}
+
+fn ollama_keep_alive_str(config: &Config) -> String {
+    ollama_opts(config)
+        .and_then(|o| o.get("keep_alive").and_then(keep_alive_value_to_i64))
+        .map(keep_alive_to_preset)
+        .unwrap_or_default()
+}
+
+fn ollama_num_predict_str(config: &Config) -> String {
+    ollama_opts(config)
+        .and_then(|o| o.get("num_predict").and_then(|v| v.as_u64()))
+        .map(num_predict_to_preset)
+        .unwrap_or_default()
+}
+
+fn permission_mode_str(mode: &PermissionMode) -> String {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::BypassPermissions => "bypassPermissions",
+        PermissionMode::Plan => "plan",
+    }
+    .to_string()
+}
+
+fn parse_permission_mode(s: &str) -> PermissionMode {
+    match s {
+        "acceptEdits" => PermissionMode::AcceptEdits,
+        "bypassPermissions" => PermissionMode::BypassPermissions,
+        "plan" => PermissionMode::Plan,
+        _ => PermissionMode::Default,
+    }
+}
+
+fn make_entry(
+    key: &'static str,
+    label: &'static str,
+    description: &'static str,
+    section: &'static str,
+    default: String,
+    effect: SettingEffect,
+    kind: SettingKind,
+    value: String,
+) -> SettingsEntry {
+    SettingsEntry {
+        key,
+        label,
+        description,
+        section,
+        default,
+        effect,
+        kind,
+        value,
+    }
+}
+
+fn bool_v(b: bool) -> String {
+    if b { "true" } else { "false" }.to_string()
+}
+
+/// Every editable setting, ordered into sections. The curated "Common"
+/// section is pinned first — these are the settings users actually change
+/// most often (permission mode, output style, free routing, auto-compact,
+/// token cap, auto-commits, notifications). The rest are grouped by concern
+/// so a flat alphabetical list never hides a setting again.
 fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     let mut entries = vec![
-        SettingsEntry {
-            key: "max_tokens",
-            label: "Max Tokens",
-            description: "Maximum tokens per response.",
-            kind: SettingKind::Number,
-            value: screen.settings_snapshot.config.max_tokens
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| clawde_core::constants::DEFAULT_MAX_TOKENS.to_string()),
-        },
-        SettingsEntry {
-            key: "auto_compact",
-            label: "Auto-compact",
-            description: "Automatically compact turns at threshold.",
-            kind: SettingKind::Bool,
-            value: if screen.auto_compact { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "notifications",
-            label: "Desktop notifications",
-            description: "Notify when a turn completes.",
-            kind: SettingKind::Bool,
-            value: if screen.notifications { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "show_turn_duration",
-            label: "Show turn duration",
-            description: "Display elapsed time per turn in status bar.",
-            kind: SettingKind::Bool,
-            value: if screen.show_turn_duration { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "output_style",
-            label: "Output Style",
-            description: "Controls the verbosity and format of responses.",
-            kind: SettingKind::Enum {
+        // ---- Common -----------------------------------------------------
+        make_entry(
+            "permission_mode",
+            "Permission mode",
+            "How tool calls are approved: default (prompt for writes/commands), acceptEdits (auto-approve), bypassPermissions (no prompts), plan (read-only).",
+            SECTION_COMMON,
+            "default".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Enum {
+                options: vec!["default", "acceptEdits", "bypassPermissions", "plan"],
+            },
+            screen.permission_mode.clone(),
+        ),
+        make_entry(
+            "output_style",
+            "Output style",
+            "Controls the verbosity and format of responses.",
+            SECTION_COMMON,
+            "default".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Enum {
                 options: vec!["default", "concise", "explanatory", "learning"],
             },
-            value: screen.output_style.clone(),
-        },
-        SettingsEntry {
-            key: "reduce_motion",
-            label: "Reduce motion",
-            description: "Disable UI animations.",
-            kind: SettingKind::Bool,
-            value: if screen.reduce_motion { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "terminal_progress_bar",
-            label: "Terminal progress bar",
-            description: "Show progress during tool use.",
-            kind: SettingKind::Bool,
-            value: if screen.terminal_progress_bar { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "verbose",
-            label: "Verbose logging",
-            description: "Log additional debug information. Takes effect on next session.",
-            kind: SettingKind::Bool,
-            value: if screen.verbose { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "cursor_blink_enabled",
-            label: "Cursor blinking",
-            description: "Enable cursor blinking in the chat prompt.",
-            kind: SettingKind::Bool,
-            value: if screen.cursor_blink_enabled { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "auto_copy_enabled",
-            label: "Auto-copy on highlight",
-            description: "Automatically copy highlighted text to clipboard.",
-            kind: SettingKind::Bool,
-            value: if screen.auto_copy_enabled { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "mouse_capture",
-            label: "Mouse capture",
-            description: "Capture the mouse for scroll/right-click/drag-select. Turn off for native terminal text selection. Takes effect on next session.",
-            kind: SettingKind::Bool,
-            value: if screen.mouse_capture { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "show_cwd",
-            label: "Show current directory",
-            description: "Display the current working directory in the footer.",
-            kind: SettingKind::Bool,
-            value: if screen.show_cwd { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "show_git_branch",
-            label: "Show git branch",
-            description: "Display the current git branch in the footer.",
-            kind: SettingKind::Bool,
-            value: if screen.show_git_branch { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "compact_threshold",
-            label: "Auto-compact threshold",
-            description: "Context usage % at which to trigger auto-compact (0-100).",
-            kind: SettingKind::Number,
-            value: screen.compact_threshold.clone(),
-        },
-        SettingsEntry {
-            key: "auto_commits",
-            label: "Auto-commits",
-            description: "Automatically snapshot changes to git via shadow-git.",
-            kind: SettingKind::Bool,
-            value: if screen.auto_commits { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "output_format",
-            label: "Output format",
-            description: "How responses are formatted: text, JSON, or streaming JSON.",
-            kind: SettingKind::Enum {
-                options: vec!["text", "json", "streamjson"],
-            },
-            value: screen.output_format.clone(),
-        },
-        SettingsEntry {
-            key: "disable_claude_mds",
-            label: "Disable CLAUDE.md",
-            description: "Ignore CLAUDE.md files in projects (use defaults instead).",
-            kind: SettingKind::Bool,
-            value: if screen.disable_claude_mds { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "routing_strategy",
-            label: "Free routing",
-            description: "How free-mode selects upstream providers (sequential/random/latency).",
-            kind: SettingKind::Enum {
+            screen.output_style.clone(),
+        ),
+        make_entry(
+            "routing_strategy",
+            "Free routing",
+            "How free-mode selects upstream providers (sequential/random/latency).",
+            SECTION_COMMON,
+            "sequential".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Enum {
                 options: vec!["sequential", "random_failover", "latency_based"],
             },
-            value: screen.routing_strategy.clone(),
-        },
-        SettingsEntry {
-            key: "first_byte_timeout_secs",
-            label: "First-byte timeout (s)",
-            description: "Seconds to wait for first byte before racing the next free upstream (0 = disabled, recommend 5).",
-            kind: SettingKind::Number,
-            value: screen.first_byte_timeout_secs.clone(),
-        },
-        SettingsEntry {
-            key: "staggered_probe",
-            label: "Parallel probe",
-            description: "When the first-byte timeout expires, launch a parallel probe at the next upstream instead of advancing sequentially.",
-            kind: SettingKind::Bool,
-            value: if screen.staggered_probe { "true" } else { "false" }.to_string(),
-        },
-        SettingsEntry {
-            key: "upstream_5xx_cooldown_secs",
-            label: "5xx cooldown (s)",
-            description: "Seconds to cool down an upstream after a 5xx/498 server error (0 = disabled, default 45).",
-            kind: SettingKind::Number,
-            value: screen.upstream_5xx_cooldown_secs.clone(),
-        },
-        SettingsEntry {
-            key: "health_poll_interval_secs",
-            label: "Health poll interval (s)",
-            description: "How often to probe upstream key health (0 = startup only, default 300).",
-            kind: SettingKind::Number,
-            value: screen.health_poll_interval_secs.clone(),
-        },
-        SettingsEntry {
-            key: "fallback_retries",
-            label: "Fallback retries",
-            description: "Whole-chain retries after every upstream fails (0 = no retry, surface summary immediately).",
-            kind: SettingKind::Number,
-            value: screen.fallback_retries.clone(),
-        },
-        SettingsEntry {
-            key: "disabled_upstreams",
-            label: "Disabled upstreams",
-            description: "Free upstreams to skip (comma-separated IDs, e.g. nvidia, cohere).",
-            kind: SettingKind::Number,
-            value: screen.disabled_upstreams.clone(),
-        },
-        SettingsEntry {
-            key: "preferredSearchBackend",
-            label: "Search backend",
-            description: "Preferred web search backend (auto, searxng, firecrawl, duckduckgo).",
-            kind: SettingKind::Enum {
+            screen.routing_strategy.clone(),
+        ),
+        make_entry(
+            "auto_compact",
+            "Auto-compact",
+            "Automatically compact turns at threshold.",
+            SECTION_COMMON,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.auto_compact),
+        ),
+        make_entry(
+            "compact_threshold",
+            "Auto-compact threshold",
+            "Context usage % at which to trigger auto-compact (0-100).",
+            SECTION_COMMON,
+            "95".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Number,
+            screen.compact_threshold.clone(),
+        ),
+        make_entry(
+            "max_tokens",
+            "Max tokens",
+            "Maximum tokens per response.",
+            SECTION_COMMON,
+            DEFAULT_MAX_TOKENS.to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Number,
+            screen
+                .settings_snapshot
+                .config
+                .max_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| DEFAULT_MAX_TOKENS.to_string()),
+        ),
+        make_entry(
+            "auto_commits",
+            "Auto-commits",
+            "Automatically snapshot changes to git via shadow-git.",
+            SECTION_COMMON,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.auto_commits),
+        ),
+        make_entry(
+            "notifications",
+            "Desktop notifications",
+            "Notify when a turn completes.",
+            SECTION_COMMON,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.notifications),
+        ),
+        // ---- Interface ---------------------------------------------------
+        make_entry(
+            "output_format",
+            "Output format",
+            "How responses are formatted: text, JSON, or streaming JSON (headless).",
+            SECTION_INTERFACE,
+            "text".to_string(),
+            SettingEffect::NextSession,
+            SettingKind::Enum {
+                options: vec!["text", "json", "streamjson"],
+            },
+            screen.output_format.clone(),
+        ),
+        make_entry(
+            "preferredSearchBackend",
+            "Search backend",
+            "Preferred web search backend (auto, searxng, firecrawl, duckduckgo).",
+            SECTION_INTERFACE,
+            "auto".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Enum {
                 options: vec!["auto", "searxng", "firecrawl", "duckduckgo"],
             },
-            value: screen.preferred_search_backend.clone(),
-        },
-        SettingsEntry {
-            key: "fileInjectionEnabled",
-            label: "File injection (@)",
-            description: "Auto-inject @file references into message context.",
-            kind: SettingKind::Bool,
-            value: if screen.file_injection_enabled { "true" } else { "false" }.to_string(),
-        },
+            screen.preferred_search_backend.clone(),
+        ),
+        make_entry(
+            "verbose",
+            "Verbose logging",
+            "Log additional debug information. Takes effect on next session.",
+            SECTION_INTERFACE,
+            "false".to_string(),
+            SettingEffect::NextSession,
+            SettingKind::Bool,
+            bool_v(screen.verbose),
+        ),
+        make_entry(
+            "reduce_motion",
+            "Reduce motion",
+            "Disable UI animations.",
+            SECTION_INTERFACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.reduce_motion),
+        ),
+        make_entry(
+            "terminal_progress_bar",
+            "Terminal progress bar",
+            "Show progress during tool use.",
+            SECTION_INTERFACE,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.terminal_progress_bar),
+        ),
+        make_entry(
+            "show_turn_duration",
+            "Show turn duration",
+            "Display elapsed time per turn in status bar.",
+            SECTION_INTERFACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.show_turn_duration),
+        ),
+        make_entry(
+            "cursor_blink_enabled",
+            "Cursor blinking",
+            "Enable cursor blinking in the chat prompt.",
+            SECTION_INTERFACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.cursor_blink_enabled),
+        ),
+        make_entry(
+            "auto_copy_enabled",
+            "Auto-copy on highlight",
+            "Automatically copy highlighted text to clipboard.",
+            SECTION_INTERFACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.auto_copy_enabled),
+        ),
+        make_entry(
+            "mouse_capture",
+            "Mouse capture",
+            "Capture the mouse for scroll/right-click/drag-select. Turn off for native terminal text selection. Takes effect on next session.",
+            SECTION_INTERFACE,
+            "true".to_string(),
+            SettingEffect::NextSession,
+            SettingKind::Bool,
+            bool_v(screen.mouse_capture),
+        ),
+        // ---- Workspace & files ------------------------------------------
+        make_entry(
+            "show_cwd",
+            "Show current directory",
+            "Display the current working directory in the footer.",
+            SECTION_WORKSPACE,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.show_cwd),
+        ),
+        make_entry(
+            "show_git_branch",
+            "Show git branch",
+            "Display the current git branch in the footer.",
+            SECTION_WORKSPACE,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.show_git_branch),
+        ),
+        make_entry(
+            "disable_claude_mds",
+            "Disable CLAUDE.md",
+            "Ignore CLAUDE.md files in projects (use defaults instead).",
+            SECTION_WORKSPACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.disable_claude_mds),
+        ),
+        make_entry(
+            "fileInjectionEnabled",
+            "File injection (@)",
+            "Auto-inject @file references into message context.",
+            SECTION_WORKSPACE,
+            "true".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.file_injection_enabled),
+        ),
     ];
 
     // Only show these if file injection is enabled
     if screen.file_injection_enabled {
-        entries.push(SettingsEntry {
-            key: "fileAutocompleteLimit",
-            label: "File autocomplete limit",
-            description: "Max suggestions shown in @ autocomplete (type more to narrow results).",
-            kind: SettingKind::Number,
-            value: screen.file_autocomplete_limit.clone(),
-        });
-        entries.push(SettingsEntry {
-            key: "fileAutocompleteShowHiddenFiles",
-            label: "Show hidden files",
-            description: "Include hidden files (.) in @ autocomplete.",
-            kind: SettingKind::Bool,
-            value: if screen.file_autocomplete_show_hidden_files {
-                "true"
-            } else {
-                "false"
-            }
-            .to_string(),
-        });
-        entries.push(SettingsEntry {
-            key: "fileInjectionMaxSize",
-            label: "File injection max size",
-            description: "Max file size to auto-inject (KB, 0=no limit).",
-            kind: SettingKind::Number,
-            value: screen.file_injection_max_size.clone(),
-        });
+        entries.push(make_entry(
+            "fileAutocompleteLimit",
+            "File autocomplete limit",
+            "Max suggestions shown in @ autocomplete (type more to narrow results).",
+            SECTION_WORKSPACE,
+            "15".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Number,
+            screen.file_autocomplete_limit.clone(),
+        ));
+        entries.push(make_entry(
+            "fileAutocompleteShowHiddenFiles",
+            "Show hidden files",
+            "Include hidden files (.) in @ autocomplete.",
+            SECTION_WORKSPACE,
+            "false".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Bool,
+            bool_v(screen.file_autocomplete_show_hidden_files),
+        ));
+        entries.push(make_entry(
+            "fileInjectionMaxSize",
+            "File injection max size",
+            "Max file size to auto-inject (KB, 0=no limit).",
+            SECTION_WORKSPACE,
+            "100".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Number,
+            screen.file_injection_max_size.clone(),
+        ));
     }
+
+    // ---- Free-mode routing ----------------------------------------------
+    entries.push(make_entry(
+        "first_byte_timeout_secs",
+        "First-byte timeout (s)",
+        "Seconds to wait for first byte before racing the next free upstream (0 = disabled, recommend 5).",
+        SECTION_FREE_ROUTING,
+        "0".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Number,
+        screen.first_byte_timeout_secs.clone(),
+    ));
+    entries.push(make_entry(
+        "staggered_probe",
+        "Parallel probe",
+        "When the first-byte timeout expires, launch a parallel probe at the next upstream instead of advancing sequentially.",
+        SECTION_FREE_ROUTING,
+        "true".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Bool,
+        bool_v(screen.staggered_probe),
+    ));
+    entries.push(make_entry(
+        "upstream_5xx_cooldown_secs",
+        "5xx cooldown (s)",
+        "Seconds to cool down an upstream after a 5xx/498 server error (0 = disabled, default 45).",
+        SECTION_FREE_ROUTING,
+        "45".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Number,
+        screen.upstream_5xx_cooldown_secs.clone(),
+    ));
+    entries.push(make_entry(
+        "health_poll_interval_secs",
+        "Health poll interval (s)",
+        "How often to probe upstream key health (0 = startup only, default 300).",
+        SECTION_FREE_ROUTING,
+        "300".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Number,
+        screen.health_poll_interval_secs.clone(),
+    ));
+    entries.push(make_entry(
+        "fallback_retries",
+        "Fallback retries",
+        "Whole-chain retries after every upstream fails (0 = no retry, surface summary immediately).",
+        SECTION_FREE_ROUTING,
+        "0".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Number,
+        screen.fallback_retries.clone(),
+    ));
+    entries.push(make_entry(
+        "disabled_upstreams",
+        "Disabled upstreams",
+        "Free upstreams to skip (comma-separated IDs, e.g. nvidia, cohere).",
+        SECTION_FREE_ROUTING,
+        String::new(),
+        SettingEffect::Immediate,
+        SettingKind::Text,
+        screen.disabled_upstreams.clone(),
+    ));
+
+    // ---- Ollama (local) -------------------------------------------------
+    entries.push(make_entry(
+        "ollama_num_ctx",
+        "Ollama: Context window",
+        "Context window size for Ollama models. Lower = less VRAM, faster. Higher = more conversation history. 12K is a good default for 3B coding models.",
+        SECTION_OLLAMA,
+        "12K".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Enum {
+            options: ollama_ctx_labels(),
+        },
+        screen.ollama_num_ctx.clone(),
+    ));
+    entries.push(make_entry(
+        "ollama_keep_alive",
+        "Ollama: Keep alive",
+        "How long Ollama keeps the model loaded in VRAM after the last request. 'forever' avoids reload delays but uses VRAM continuously.",
+        SECTION_OLLAMA,
+        "forever".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Enum {
+            options: ollama_keep_alive_labels(),
+        },
+        screen.ollama_keep_alive.clone(),
+    ));
+    entries.push(make_entry(
+        "ollama_num_predict",
+        "Ollama: Max output",
+        "Maximum tokens the model can generate per response. Lower values are faster and prevent the model from rambling.",
+        SECTION_OLLAMA,
+        "2K".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Enum {
+            options: ollama_predict_labels(),
+        },
+        screen.ollama_num_predict.clone(),
+    ));
 
     entries
 }
@@ -723,6 +1301,29 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// Whether an entry should appear given the current search box text.
+/// A leading `!` narrows results to only settings whose origin is NOT
+/// Default — i.e. the user has customised them. The rest of the text
+/// (if any) is matched against the entry label.
+fn entry_matches_filter(
+    entry: &SettingsEntry,
+    search_query: &str,
+    screen: &SettingsScreen,
+) -> bool {
+    let (customized_only, term) = if let Some(t) = search_query.strip_prefix('!') {
+        (true, t)
+    } else {
+        (false, search_query)
+    };
+    if customized_only && matches!(entry_origin(screen, entry.key), SettingOrigin::Default) {
+        return false;
+    }
+    if !term.is_empty() && !entry.label.to_lowercase().contains(&term.to_lowercase()) {
+        return false;
+    }
+    true
+}
 
 pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: Rect) {
     if !screen.visible {
@@ -762,7 +1363,7 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Percentage(50),
-            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(inner);
 
@@ -772,7 +1373,29 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     let description_area = layout[4];
     let footer_area = layout[5];
 
-    // Header
+    // Header — the current model sits in the middle so the single most-changed
+    // setting is visible at the top of the screen without adding a row.
+    // When numeric edits are buffered but not yet committed, a small "unsaved"
+    // marker appears so the user knows there are pending changes.
+    let model_disp = truncate_mid(screen.effective_snapshot.config.effective_model(), 28);
+    let dirty = !screen.pending_changes.is_empty();
+    let dirty_span = if dirty {
+        Span::styled(
+            "  ● unsaved",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        )
+    } else {
+        Span::raw("")
+    };
+    // The literal prefix is "  ·  model " (11 chars) — must match the span
+    // below or "Esc close" overflows the dialog on narrow widths.
+    let head_len = " Settings — Clawde".chars().count()
+        + model_disp.chars().count()
+        + 11
+        + if dirty { 11 } else { 0 };
+    let esc_w = inner.width.saturating_sub(head_len as u16) as usize;
     let title = Line::from(vec![
         Span::styled(
             " Settings",
@@ -782,11 +1405,14 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         ),
         Span::styled(" — Clawde", Style::default().fg(CLAURST_MUTED)),
         Span::styled(
-            format!(
-                "{:>width$}",
-                "Esc close",
-                width = inner.width.saturating_sub(19) as usize
-            ),
+            format!("  ·  model {}", model_disp),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        dirty_span,
+        Span::styled(
+            format!("{:>width$}", "Esc close", width = esc_w),
             Style::default().fg(CLAURST_MUTED),
         ),
     ]);
@@ -814,14 +1440,36 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     let all = all_entries(screen);
     let filtered: Vec<_> = all
         .iter()
-        .filter(|e| {
-            e.label
-                .to_lowercase()
-                .contains(&screen.search_query.to_lowercase())
-        })
+        .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
         .collect();
 
+    // Description of the selected entry, prefixed with its status: where the
+    // value comes from, when it applies, and what the default is. This is the
+    // "know their status" line — every setting answers all three at a glance.
+    let mut desc_lines: Vec<Line> = Vec::new();
     let desc_text = if let Some(entry) = filtered.get(screen.selected_idx) {
+        let origin = entry_origin(screen, entry.key);
+        let default_disp = if entry.default.is_empty() {
+            "—".to_string()
+        } else {
+            entry.default.clone()
+        };
+        desc_lines.push(Line::from(vec![
+            Span::styled("●", origin.color()),
+            Span::styled(
+                format!(
+                    " {}  ·  applies {}  ·  fallback {}",
+                    origin.label(),
+                    entry.effect.label(),
+                    default_disp
+                ),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        desc_lines.push(Line::from(""));
+
         // For Output Style, show current selection and all available options with descriptions
         if entry.key == "output_style" {
             let mut lines = vec![entry.description.to_string(), String::new()];
@@ -851,20 +1499,24 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     } else {
         String::new()
     };
+    for l in desc_text.lines() {
+        desc_lines.push(Line::from(l));
+    }
     // Append health warning to description if present
-    let display_desc = if !screen.health_warning.is_empty() {
-        format!("{}\n\n{}", desc_text, screen.health_warning)
-    } else {
-        desc_text
-    };
-    let desc_para = Paragraph::new(display_desc)
+    if !screen.health_warning.is_empty() {
+        desc_lines.push(Line::from(""));
+        desc_lines.push(Line::from(screen.health_warning.clone()));
+    }
+    let desc_para = Paragraph::new(desc_lines)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Left)
         .block(Block::default().padding(ratatui::widgets::Padding::new(1, 0, 1, 0)));
     frame.render_widget(desc_para, description_area);
 
-    // Footer
-    let footer = if screen.edit_field.is_some() {
+    // Footer — keys on the first line, status-legend on the second so the
+    // legend never truncates at the dialog edge.
+    let mut footer: Vec<Line> = Vec::new();
+    footer.push(if screen.edit_field.is_some() {
         Line::from(vec![
             Span::styled(
                 " Enter ",
@@ -905,8 +1557,31 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             ),
             Span::raw("close"),
         ])
-    };
-    let footer_para = Paragraph::new(vec![footer])
+    });
+    footer.push(Line::from(vec![
+        Span::styled(
+            "●default/global/project",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "now=applies now  ·  next=restart",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+    ]));
+    // Key hints for discoverable shortcuts: the section jumps, reset, and
+    // the customised-only filter (! prefix in search) all live here.
+    footer.push(Line::from(vec![Span::styled(
+        "! filter · 1-5 sections · r reset",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )]));
+    let footer_para = Paragraph::new(footer)
         .style(Style::default().fg(CLAURST_MUTED).bg(CLAURST_PANEL_BG))
         .alignment(Alignment::Center);
     frame.render_widget(footer_para, footer_area);
@@ -918,11 +1593,7 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
     // Filter entries by search query
     let filtered: Vec<_> = all
         .iter()
-        .filter(|e| {
-            e.label
-                .to_lowercase()
-                .contains(&screen.search_query.to_lowercase())
-        })
+        .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
         .collect();
 
     if filtered.is_empty() {
@@ -932,15 +1603,33 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
         return;
     }
 
-    // Build lines
+    // Width budget: label column, value column (grows with room), status tail.
+    let label_len = 36usize;
+    let status_w = 24u16; // "  ● global · next" + padding
+    let value_max = area
+        .width
+        .saturating_sub((label_len as u16) + status_w + 8)
+        .max(10) as usize;
+
+    // Build lines — section headers first, then per-row value + status.
     let mut lines: Vec<Line> = Vec::new();
     let visible_rows = area.height as usize;
+    let mut current_section: Option<&str> = None;
 
     for (i, entry) in filtered.iter().enumerate() {
+        // Dim section header, shown only when the section has visible entries.
+        if current_section != Some(entry.section) {
+            current_section = Some(entry.section);
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {} ", entry.section),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+        }
+
         let is_selected = i == screen.selected_idx;
         let marker = if is_selected { "►" } else { " " };
-
-        let label_len = 40usize;
 
         // Show edit value if currently editing this field, otherwise show the entry value
         let value_str = if screen.edit_field.as_deref() == Some(entry.key) && is_selected {
@@ -958,14 +1647,40 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
             Style::default()
         };
 
-        let line = Line::from(vec![
-            Span::styled(
-                format!("   {} {:<label_len$}", marker, entry.label),
-                row_style,
-            ),
-            Span::styled(value_str, row_style),
-        ]);
-        lines.push(line);
+        let origin = entry_origin(screen, entry.key);
+        let mut spans = vec![Span::styled(
+            format!("   {} {:<label_len$}", marker, entry.label),
+            row_style,
+        )];
+        // Empty override (e.g. "preferredSearchBackend": "") renders as a
+        // dash rather than a blank column — still shows the origin tag. The
+        // dash inherits row_style so it reads consistently on the selected row.
+        if value_str.is_empty() {
+            spans.push(Span::styled(
+                "—".to_string(),
+                row_style.add_modifier(Modifier::DIM),
+            ));
+        } else {
+            spans.push(Span::styled(truncate_end(&value_str, value_max), row_style));
+        }
+        // Status tail — shown on every row so the state of each setting is
+        // visible without extra interactions. Muted so it never competes with
+        // the label/value.
+        spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("●{}", origin.label()),
+            Style::default()
+                .fg(origin.color())
+                .add_modifier(Modifier::DIM),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            entry.effect.label(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+        lines.push(Line::from(spans));
     }
 
     // Scroll tracking is handled in update_scroll_offset_for_selection()
@@ -979,6 +1694,36 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
 
     let para = Paragraph::new(visible_lines);
     frame.render_widget(para, area);
+}
+
+/// Truncate a string to `max` chars, keeping the head and tail with an
+/// ellipsis in the middle (used for the header model name).
+fn truncate_mid(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = (max.saturating_sub(1)) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}…{}", head, tail)
+}
+
+/// Truncate a string to `max` chars with a trailing ellipsis (used for long
+/// setting values so the status tail never wraps off-screen).
+fn truncate_end(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +1765,7 @@ pub fn handle_settings_key(
     // Navigation mode
     match key.code {
         KeyCode::Enter => {
-            toggle_or_cycle_current(screen);
+            toggle_or_cycle_current(screen, config);
         }
         KeyCode::Esc => {
             if screen.confirming_discard {
@@ -1046,14 +1791,46 @@ pub fn handle_settings_key(
             let all = all_entries(screen);
             let filtered: Vec<_> = all
                 .iter()
-                .filter(|e| {
-                    e.label
-                        .to_lowercase()
-                        .contains(&screen.search_query.to_lowercase())
-                })
+                .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
                 .collect();
             screen.select_next(filtered.len());
             update_scroll_offset_for_selection(screen);
+        }
+        // Section quick-jump: 1-5 jump to each section's first visible entry.
+        // Mirrors the model picker's number-key section jumps.
+        KeyCode::Char(c @ ('1'..='5')) => {
+            let all = all_entries(screen);
+            let filtered: Vec<_> = all
+                .iter()
+                .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
+                .collect();
+            let section = match c {
+                '1' => SECTION_COMMON,
+                '2' => SECTION_INTERFACE,
+                '3' => SECTION_WORKSPACE,
+                '4' => SECTION_FREE_ROUTING,
+                '5' => SECTION_OLLAMA,
+                _ => unreachable!(),
+            };
+            if let Some(pos) = filtered.iter().position(|e| e.section == section) {
+                screen.selected_idx = pos;
+                update_scroll_offset_for_selection(screen);
+            }
+        }
+        // Reset the selected setting back to its built-in default, clearing
+        // any global override. Only available for rows tagged "global" or
+        // "project" — default rows are already at the built-in value.
+        KeyCode::Char('r') => {
+            let all = all_entries(screen);
+            let filtered: Vec<_> = all
+                .iter()
+                .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
+                .collect();
+            if let Some(entry) = filtered.get(screen.selected_idx) {
+                if !matches!(entry_origin(screen, entry.key), SettingOrigin::Default) {
+                    reset_setting_to_default(screen, entry.key);
+                }
+            }
         }
         KeyCode::Char(c) => {
             screen.push_search_char(c);
@@ -1064,23 +1841,213 @@ pub fn handle_settings_key(
 }
 
 fn update_scroll_offset_for_selection(screen: &mut SettingsScreen) {
-    let visible_rows = 10; // Rough estimate, will be actual in real usage
-    if screen.selected_idx < screen.scroll_offset {
-        screen.scroll_offset = screen.selected_idx;
-    } else if screen.selected_idx >= screen.scroll_offset + visible_rows {
-        screen.scroll_offset = screen.selected_idx.saturating_sub(visible_rows - 1);
-    }
-}
-
-fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
+    // The rendered list interleaves section-header rows, so scroll math must
+    // use the visual (header-augmented) line of the selection, not its index
+    // into the filtered entries.
     let all = all_entries(screen);
     let filtered: Vec<_> = all
         .iter()
-        .filter(|e| {
-            e.label
-                .to_lowercase()
-                .contains(&screen.search_query.to_lowercase())
-        })
+        .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
+        .collect();
+    if filtered.is_empty() {
+        return;
+    }
+    let visual = visual_line_for(&filtered, screen.selected_idx);
+    let visible_rows = 10; // Rough estimate, will be actual in real usage
+    if visual < screen.scroll_offset {
+        screen.scroll_offset = visual;
+    } else if visual >= screen.scroll_offset + visible_rows {
+        screen.scroll_offset = visual.saturating_sub(visible_rows - 1);
+    }
+}
+
+/// Visual row of the entry at `filtered_idx` in the header-augmented list,
+/// mirroring the header-insertion loop in `render_settings_list`.
+fn visual_line_for(filtered: &[&SettingsEntry], filtered_idx: usize) -> usize {
+    if filtered.is_empty() {
+        return 0;
+    }
+    let mut line = 0;
+    let mut prev_section: Option<&str> = None;
+    for (i, entry) in filtered.iter().enumerate() {
+        if prev_section != Some(entry.section) {
+            line += 1; // section header row
+            prev_section = Some(entry.section);
+        }
+        if i == filtered_idx {
+            break;
+        }
+        line += 1; // entry row
+    }
+    line
+}
+
+/// Reset a single setting back to its built-in default by clearing the global
+/// override from `settings_snapshot` and re-saving. The row's origin tag flips
+/// from Global/Project → Default immediately.
+fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
+    let s = &mut screen.settings_snapshot;
+    let c = &mut s.config;
+    match key {
+        // Bools — set to their serde default (true for default_true fields).
+        "auto_compact" => s.auto_compact = true,
+        "notifications" => s.notifications = true,
+        "terminal_progress_bar" => s.terminal_progress_bar = true,
+        "show_cwd" => s.show_cwd = true,
+        "show_git_branch" => s.show_git_branch = true,
+        "fileInjectionEnabled" => c.file_injection_enabled = true,
+        // mouse_capture: default is on (None = enabled).
+        "mouse_capture" => c.mouse_capture = None,
+        "show_turn_duration" => s.show_turn_duration = false,
+        "reduce_motion" => s.reduce_motion = false,
+        "verbose" => c.verbose = false,
+        "cursor_blink_enabled" => c.cursor_blink_enabled = false,
+        "auto_copy_enabled" => s.auto_copy_on_highlight = false,
+        "disable_claude_mds" => c.disable_claude_mds = false,
+        "fileAutocompleteShowHiddenFiles" => c.file_autocomplete_show_hidden_files = false,
+        "auto_commits" => c.auto_commits = None,
+        // Numbers / optionals — clear the explicit override.
+        "max_tokens" => c.max_tokens = None,
+        "compact_threshold" => c.compact_threshold = 0.0,
+        "fileAutocompleteLimit" => c.file_autocomplete_limit = 15,
+        "fileInjectionMaxSize" => c.file_injection_max_size = 100,
+        // Option-like strings — set to their default.
+        "output_style" => c.output_style = None,
+        "output_format" => c.output_format = clawde_core::config::OutputFormat::Text,
+        "permission_mode" => c.permission_mode = clawde_core::config::PermissionMode::Default,
+        "preferredSearchBackend" => s.preferred_search_backend = "auto".to_string(),
+        // Routing entries — remove from the routing JSON.
+        "routing_strategy" => {
+            c.provider_configs
+                .entry("free".to_string())
+                .or_default()
+                .options
+                .entry("routing".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|r| r.remove("strategy"));
+        }
+        "first_byte_timeout_secs"
+        | "upstream_5xx_cooldown_secs"
+        | "health_poll_interval_secs"
+        | "fallback_retries" => {
+            let rk = match key {
+                "first_byte_timeout_secs" => "first_byte_timeout_secs",
+                "upstream_5xx_cooldown_secs" => "upstream_5xx_cooldown_secs",
+                "health_poll_interval_secs" => "health_poll_interval_secs",
+                "fallback_retries" => "fallback_retries",
+                _ => "",
+            };
+            c.provider_configs
+                .entry("free".to_string())
+                .or_default()
+                .options
+                .entry("routing".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|r| r.remove(rk));
+        }
+        "staggered_probe" => {
+            c.provider_configs
+                .entry("free".to_string())
+                .or_default()
+                .options
+                .entry("routing".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|r| r.remove("staggered_probe"));
+        }
+        "disabled_upstreams" => {
+            c.provider_configs
+                .entry("free".to_string())
+                .or_default()
+                .options
+                .entry("routing".to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .map(|r| r.remove("disabled_upstreams"));
+        }
+        // Ollama — clear the provider option.
+        "ollama_num_ctx" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("num_ctx"))
+        }
+        "ollama_keep_alive" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("keep_alive"))
+        }
+        "ollama_num_predict" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("num_predict"))
+        }
+        _ => return,
+    }
+    let _ = s.save_sync();
+    // Reload the snapshot so `entry_origin` returns Default on the next
+    // render, then update the screen's display field for this key so the
+    // row value and origin tag agree. We do NOT call
+    // `apply_settings_from_snapshot()` here — that reads from the stale
+    // `effective_snapshot` and would undo the reset.
+    screen.settings_snapshot = Settings::load_sync().unwrap_or_default();
+    screen.pending_changes.remove(key);
+    // Propagate the reset value into the screen's display field.
+    sync_screen_field(screen, key);
+}
+
+/// After a reset writes the default value to `settings_snapshot`, mirror the
+/// same value into the screen's display field so the row value matches the
+/// origin tag. Avoids `apply_settings_from_snapshot` which would overwrite
+/// every field from the stale `effective_snapshot` and undo the reset.
+fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
+    match key {
+        "auto_compact" => screen.auto_compact = true,
+        "notifications" => screen.notifications = true,
+        "terminal_progress_bar" => screen.terminal_progress_bar = true,
+        "show_cwd" => screen.show_cwd = true,
+        "show_git_branch" => screen.show_git_branch = true,
+        "fileInjectionEnabled" => screen.file_injection_enabled = true,
+        "mouse_capture" => screen.mouse_capture = true,
+        "show_turn_duration" => screen.show_turn_duration = false,
+        "reduce_motion" => screen.reduce_motion = false,
+        "verbose" => screen.verbose = false,
+        "cursor_blink_enabled" => screen.cursor_blink_enabled = false,
+        "auto_copy_enabled" => screen.auto_copy_enabled = false,
+        "disable_claude_mds" => screen.disable_claude_mds = false,
+        "fileAutocompleteShowHiddenFiles" => screen.file_autocomplete_show_hidden_files = false,
+        "auto_commits" => screen.auto_commits = false,
+        "max_tokens" => {}
+        "compact_threshold" => screen.compact_threshold = "95".to_string(),
+        "fileAutocompleteLimit" => screen.file_autocomplete_limit = "15".to_string(),
+        "fileInjectionMaxSize" => screen.file_injection_max_size = "100".to_string(),
+        "output_style" => screen.output_style = "default".to_string(),
+        "output_format" => screen.output_format = "text".to_string(),
+        "permission_mode" => screen.permission_mode = "default".to_string(),
+        "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
+        "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
+        "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
+        "staggered_probe" => screen.staggered_probe = true,
+        "upstream_5xx_cooldown_secs" => screen.upstream_5xx_cooldown_secs = "45".to_string(),
+        "health_poll_interval_secs" => screen.health_poll_interval_secs = "300".to_string(),
+        "fallback_retries" => screen.fallback_retries = "0".to_string(),
+        "disabled_upstreams" => screen.disabled_upstreams = String::new(),
+        "ollama_num_ctx" => screen.ollama_num_ctx = "12K".to_string(),
+        "ollama_keep_alive" => screen.ollama_keep_alive = "forever".to_string(),
+        "ollama_num_predict" => screen.ollama_num_predict = "2K".to_string(),
+        _ => {}
+    }
+}
+
+fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
+    let all = all_entries(screen);
+    let filtered: Vec<_> = all
+        .iter()
+        .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
         .collect();
 
     if let Some(entry) = filtered.get(screen.selected_idx) {
@@ -1193,9 +2160,20 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                 let new_value = options[next_idx];
 
                 match entry.key {
+                    "permission_mode" => {
+                        let mode = parse_permission_mode(new_value);
+                        screen.permission_mode = new_value.to_string();
+                        screen.settings_snapshot.config.permission_mode = mode.clone();
+                        // Apply to the live config too so the mode changes
+                        // immediately, not just for the next session.
+                        config.permission_mode = mode;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     "output_style" => {
                         screen.output_style = new_value.to_string();
-                        screen.settings_snapshot.config.output_style = Some(new_value.to_string());
+                        let style = (new_value != "default").then(|| new_value.to_string());
+                        screen.settings_snapshot.config.output_style = style.clone();
+                        config.output_style = style; // live for the next request
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     "output_format" => {
@@ -1247,10 +2225,49 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                         }
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "ollama_num_ctx" => {
+                        screen.ollama_num_ctx = new_value.to_string();
+                        let val = serde_json::Value::from(preset_to_num_ctx(new_value));
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("num_ctx".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "ollama_keep_alive" => {
+                        screen.ollama_keep_alive = new_value.to_string();
+                        let val = serde_json::Value::String(preset_to_keep_alive(new_value));
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("keep_alive".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "ollama_num_predict" => {
+                        screen.ollama_num_predict = new_value.to_string();
+                        let val = serde_json::Value::from(preset_to_num_predict(new_value));
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("num_predict".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     _ => {}
                 }
             }
-            SettingKind::Number => {
+            SettingKind::Number | SettingKind::Text => {
                 screen.start_edit(entry.key, &entry.value);
             }
         }
@@ -1279,16 +2296,98 @@ mod tests {
     fn all_entries_returns_expected_settings() {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
-        // Base settings are always present, plus 0-3 conditional file injection settings
+        // Base settings are always present (30 with the permission-mode entry),
+        // plus 0-3 conditional file injection settings.
         assert!(
-            entries.len() >= 16,
-            "Should have at least 16 editable settings, got {}",
+            entries.len() >= 28,
+            "Should have at least 28 editable settings, got {}",
             entries.len()
         );
         assert!(
-            entries.len() <= 26,
-            "Should have at most 26 editable settings, got {}",
+            entries.len() <= 40,
+            "Should have at most 40 editable settings, got {}",
             entries.len()
+        );
+    }
+
+    #[test]
+    fn all_entries_puts_common_first_and_permission_mode_on_top() {
+        let screen = SettingsScreen::new();
+        let entries = all_entries(&screen);
+        assert_eq!(entries.first().unwrap().key, "permission_mode");
+        assert_eq!(entries.first().unwrap().section, SECTION_COMMON);
+        // Every entry must carry a section, a default, and an effect so the
+        // always-on status column renders something meaningful.
+        for e in &entries {
+            assert!(!e.section.is_empty(), "{} has no section", e.key);
+            assert!(
+                matches!(
+                    e.effect,
+                    SettingEffect::Immediate | SettingEffect::NextSession
+                ),
+                "{} has no effect",
+                e.key
+            );
+        }
+    }
+
+    /// Reset a fresh screen to controlled snapshots so the tests do not depend
+    /// on whatever `~/.clawde/settings.json` exists on the machine running them.
+    /// `Settings::default()` is NOT the same as the serde defaults (e.g.
+    /// `notifications` defaults to `true` via `#[serde(default = ...)]`), so
+    /// the fresh state is an empty-file deserialization.
+    fn fresh_controlled_screen() -> SettingsScreen {
+        let fresh: Settings = serde_json::from_str("{}").unwrap();
+        let mut screen = SettingsScreen::new();
+        screen.settings_snapshot = fresh.clone();
+        screen.effective_snapshot = fresh;
+        screen.project_snapshot = None;
+        screen
+    }
+
+    #[test]
+    fn entry_origin_reflects_global_customization() {
+        let mut screen = fresh_controlled_screen();
+        // Fresh defaults: nothing customized.
+        assert_eq!(
+            entry_origin(&screen, "notifications"),
+            SettingOrigin::Default
+        );
+        assert_eq!(
+            entry_origin(&screen, "routing_strategy"),
+            SettingOrigin::Default
+        );
+        // Setting a value in the global snapshot flips the origin to Global.
+        screen.settings_snapshot.config.verbose = true;
+        screen.settings_snapshot.config.output_style = Some("concise".to_string());
+        assert_eq!(entry_origin(&screen, "verbose"), SettingOrigin::Global);
+        assert_eq!(entry_origin(&screen, "output_style"), SettingOrigin::Global);
+    }
+
+    #[test]
+    fn entry_origin_detects_project_override() {
+        let mut screen = fresh_controlled_screen();
+        // Project sets the routing strategy while global keeps the default.
+        let mut project: Settings = serde_json::from_str("{}").unwrap();
+        project
+            .config
+            .provider_configs
+            .entry("free".to_string())
+            .or_default()
+            .options
+            .insert(
+                "routing".to_string(),
+                serde_json::json!({"strategy": "latency_based"}),
+            );
+        screen.project_snapshot = Some(project);
+        assert_eq!(
+            entry_origin(&screen, "routing_strategy"),
+            SettingOrigin::Project
+        );
+        // Unrelated keys stay Default.
+        assert_eq!(
+            entry_origin(&screen, "notifications"),
+            SettingOrigin::Default
         );
     }
 
@@ -1305,18 +2404,58 @@ mod tests {
             1,
             "Should find exactly 1 entry matching 'token'"
         );
-        assert_eq!(filtered[0].label, "Max Tokens");
+        assert_eq!(filtered[0].label, "Max tokens");
+    }
+
+    #[test]
+    fn visual_line_for_counts_section_headers() {
+        // The list renderer interleaves a section header whenever the section
+        // changes, so the visual row of a filtered entry is its index plus the
+        // number of headers above it. Scroll math must use this augmented row.
+        let screen = SettingsScreen::new();
+        let all = all_entries(&screen);
+        let filtered: Vec<_> = all.iter().collect();
+
+        let first = visual_line_for(&filtered, 0);
+        assert_eq!(
+            first, 1,
+            "first entry sits one row below its section header"
+        );
+
+        // Find the index of the first entry of the second section (a section
+        // boundary we cross when navigating).
+        let first_section = filtered[0].section;
+        let second_start = filtered
+            .iter()
+            .position(|e| e.section != first_section)
+            .unwrap();
+        let visual = visual_line_for(&filtered, second_start);
+        assert_eq!(
+            visual,
+            second_start + 2,
+            "entry after a boundary has one header for each section above it"
+        );
+
+        // Two consecutive entries in the same section differ by exactly one row.
+        let a = visual_line_for(&filtered, 1);
+        let b = visual_line_for(&filtered, 2);
+        if filtered[1].section == filtered[2].section {
+            assert_eq!(b, a + 1);
+        }
     }
 
     #[test]
     fn toggle_bool_entry_flips_value() {
         let mut screen = SettingsScreen::new();
         screen.notifications = true;
-        screen.open();
+        screen.open(Path::new("."));
 
         let initial = screen.notifications;
         let all = all_entries(&screen);
-        let entry = &all[2]; // notifications is at index 2
+        let entry = all
+            .iter()
+            .find(|e| e.label == "Desktop notifications")
+            .unwrap();
         assert_eq!(entry.label, "Desktop notifications");
 
         // Simulate toggle (manually, since toggle_or_cycle_current modifies internal state)

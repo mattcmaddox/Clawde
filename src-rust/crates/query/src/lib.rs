@@ -25,6 +25,7 @@ pub mod goal_loop;
 pub mod managed_orchestrator;
 pub mod sanitize;
 pub mod session_memory;
+pub mod session_title;
 pub mod skill_prefetch;
 
 mod runner;
@@ -1098,6 +1099,11 @@ pub async fn run_query_loop(
                             &model_id_str,
                             effective_effort_level,
                             effective_thinking_budget,
+                            tool_ctx
+                                .config
+                                .provider_configs
+                                .get(&provider_id_str)
+                                .map(|pc| &pc.options),
                         ),
                     };
 
@@ -2480,6 +2486,7 @@ mod tests {
             "gemini-3-flash-preview",
             Some(clawde_core::effort::EffortLevel::High),
             None,
+            None,
         );
         assert_eq!(
             options["thinkingConfig"]["thinkingLevel"],
@@ -2498,6 +2505,7 @@ mod tests {
             "gpt-5.4",
             Some(clawde_core::effort::EffortLevel::Medium),
             None,
+            None,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
@@ -2512,7 +2520,8 @@ mod tests {
             (clawde_core::effort::EffortLevel::Medium, "medium"),
             (clawde_core::effort::EffortLevel::High, "high"),
         ] {
-            let options = build_provider_options("openai-codex", "gpt-5.5", Some(level), None);
+            let options =
+                build_provider_options("openai-codex", "gpt-5.5", Some(level), None, None);
             assert_eq!(options["reasoningEffort"], serde_json::json!(expected));
         }
         // ...but the top "Max" tier becomes "xhigh" (extra high) on Codex.
@@ -2520,6 +2529,7 @@ mod tests {
             "openai-codex",
             "gpt-5.5",
             Some(clawde_core::effort::EffortLevel::Max),
+            None,
             None,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("xhigh"));
@@ -2530,6 +2540,7 @@ mod tests {
             "openrouter",
             "gpt-5.4",
             Some(clawde_core::effort::EffortLevel::Max),
+            None,
             None,
         );
         assert_eq!(other["reasoningEffort"], serde_json::json!("high"));
@@ -2542,6 +2553,7 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1",
             Some(clawde_core::effort::EffortLevel::High),
             Some(10_000),
+            None,
         );
         assert_eq!(
             options["reasoningConfig"]["budgetTokens"],

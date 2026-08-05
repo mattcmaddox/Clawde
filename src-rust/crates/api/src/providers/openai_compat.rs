@@ -556,6 +556,31 @@ impl OpenAiCompatProvider {
         })?;
 
         if !(200..300).contains(&(status as usize)) {
+            // Small local Ollama models (1B–3B) often don't support tool
+            // calling. When that's the 400 reason, retry without tools.
+            if status == 400 && text.contains("does not support tools") && !tools.is_empty() {
+                let retry_resp = self
+                    .retry_without_tools(&url, &mut body, None /* no Accept */)
+                    .await?;
+                let retry_status = retry_resp.status().as_u16();
+                let retry_text = retry_resp.text().await.map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Failed to read retry response: {}", e),
+                    status: Some(retry_status),
+                    body: None,
+                })?;
+                if !(200..300).contains(&(retry_status as usize)) {
+                    return Err(self.map_http_error(retry_status, &retry_text));
+                }
+                let json: Value =
+                    serde_json::from_str(&retry_text).map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("Failed to parse retry response JSON: {}", e),
+                        status: Some(retry_status),
+                        body: Some(retry_text.clone()),
+                    })?;
+                return OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id);
+            }
             return Err(self.map_http_error(status, &text));
         }
 
@@ -567,6 +592,37 @@ impl OpenAiCompatProvider {
         })?;
 
         OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
+    }
+
+    /// Retry the request without tools when the model doesn't support them.
+    /// Used by both streaming and non-streaming paths; small local Ollama
+    /// models (1B–3B) often lack tool-calling support in their modelfile.
+    async fn retry_without_tools(
+        &self,
+        url: &str,
+        body: &mut serde_json::Value,
+        accept_header: Option<&str>,
+    ) -> Result<reqwest::Response, ProviderError> {
+        body.as_object_mut().and_then(|obj| obj.remove("tools"));
+        let mut builder = self
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/json");
+        if let Some(h) = accept_header {
+            builder = builder.header("Accept", h);
+        }
+        builder = self.apply_auth(builder);
+        builder = self.apply_extra_headers(builder);
+        builder
+            .json(&*body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("HTTP request failed (retry without tools): {}", e),
+                status: None,
+                body: None,
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -632,6 +688,20 @@ impl OpenAiCompatProvider {
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
             let text = resp.text().await.unwrap_or_default();
+            // Small local Ollama models (1B–3B) often don't support tool
+            // calling. When that's the 400 reason, retry without tools so
+            // the user can still chat with these models.
+            if status == 400 && text.contains("does not support tools") && !tools.is_empty() {
+                let retry_resp = self
+                    .retry_without_tools(&url, &mut body, Some("text/event-stream"))
+                    .await?;
+                let retry_status = retry_resp.status().as_u16();
+                if !(200..300).contains(&(retry_status as usize)) {
+                    let retry_text = retry_resp.text().await.unwrap_or_default();
+                    return Err(self.map_http_error(retry_status, &retry_text));
+                }
+                return Ok(retry_resp);
+            }
             return Err(self.map_http_error(status, &text));
         }
 

@@ -237,6 +237,9 @@ pub struct SessionSummary {
     pub last_prompt: Option<String>,
     /// The custom title found in the tail, if any.
     pub title: Option<String>,
+    /// The AI-generated title found in the tail, if any (written by the
+    /// auto-titler at session exit).
+    pub ai_title: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +449,7 @@ pub async fn list_sessions_in(
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         // Read the tail of the file (up to 64 KB) to extract metadata.
-        let (last_prompt, title) = read_session_tail_metadata(&path).await;
+        let (last_prompt, title, ai_title) = read_session_tail_metadata(&path).await;
 
         sessions.push(SessionSummary {
             session_id,
@@ -454,6 +457,7 @@ pub async fn list_sessions_in(
             mtime,
             last_prompt,
             title,
+            ai_title,
         });
     }
 
@@ -526,6 +530,36 @@ pub async fn set_leaf(path: &Path, leaf_uuid: Option<&str>) -> crate::Result<()>
     write_transcript_entry(path, &entry).await
 }
 
+/// Append a `last-prompt` metadata entry recording the most recent user prompt.
+///
+/// Written at session exit so `list_sessions` can show a preview without
+/// loading the full transcript. Later writes supersede earlier ones (tail reads
+/// take the last occurrence).
+pub async fn write_last_prompt(
+    path: &Path,
+    session_id: &str,
+    last_prompt: &str,
+) -> crate::Result<()> {
+    let entry = TranscriptEntry::LastPrompt(LastPromptEntry {
+        session_id: session_id.to_string(),
+        last_prompt: last_prompt.to_string(),
+    });
+    write_transcript_entry(path, &entry).await
+}
+
+/// Append an `ai-title` metadata entry with the auto-generated session name.
+///
+/// Written by the session-exit auto-titler. The title survives as a first-class
+/// transcript entry so it is visible to the recent-sessions UI, `/stats`, and
+/// any future consumers of the project transcript.
+pub async fn write_ai_title(path: &Path, session_id: &str, ai_title: &str) -> crate::Result<()> {
+    let entry = TranscriptEntry::AiTitle(AiTitleEntry {
+        session_id: session_id.to_string(),
+        ai_title: ai_title.to_string(),
+    });
+    write_transcript_entry(path, &entry).await
+}
+
 /// Non-destructive counterpart to [`truncate_after`].
 ///
 /// Finds the entry whose *message* uuid matches `target_message_uuid` — the
@@ -586,25 +620,27 @@ pub async fn branch_before(path: &Path, target_message_uuid: &str) -> crate::Res
 // Internal helper: read tail metadata without a full parse
 // ---------------------------------------------------------------------------
 
-/// Reads up to 64 KB from the end of `path` and extracts `last-prompt` and
-/// `custom-title` values by scanning JSONL lines.
+/// Reads up to 64 KB from the end of `path` and extracts `last-prompt`,
+/// `custom-title`, and `ai-title` values by scanning JSONL lines.
 ///
-/// Returns `(last_prompt, custom_title)`.  Both are `None` if the relevant
-/// entries are absent or the file cannot be read.
-async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<String>) {
+/// Returns `(last_prompt, custom_title, ai_title)`.  All three are `None` if
+/// the relevant entries are absent or the file cannot be read.
+async fn read_session_tail_metadata(
+    path: &Path,
+) -> (Option<String>, Option<String>, Option<String>) {
     const TAIL_BUF: u64 = 65_536; // 64 KB
 
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
     let meta = match file.metadata().await {
         Ok(m) => m,
-        Err(_) => return (None, None),
+        Err(_) => return (None, None, None),
     };
     let file_size = meta.len();
     if file_size == 0 {
-        return (None, None);
+        return (None, None, None);
     }
 
     // Seek to the start of the tail window.
@@ -614,16 +650,17 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = file;
     if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
-        return (None, None);
+        return (None, None, None);
     }
     if file.read_exact(&mut buf).await.is_err() {
-        return (None, None);
+        return (None, None, None);
     }
 
     // Scan lines in reverse order so we get the last occurrence of each field.
     let text = String::from_utf8_lossy(&buf);
     let mut last_prompt: Option<String> = None;
     let mut title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
 
     for line in text.lines().rev() {
         let trimmed = line.trim();
@@ -653,12 +690,23 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
             }
         }
 
-        if last_prompt.is_some() && title.is_some() {
+        if ai_title.is_none()
+            && (trimmed.contains("\"type\":\"ai-title\"")
+                || trimmed.contains("\"type\": \"ai-title\""))
+        {
+            if let Ok(TranscriptEntry::AiTitle(at)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                ai_title = Some(at.ai_title);
+            }
+        }
+
+        if last_prompt.is_some() && title.is_some() && ai_title.is_some() {
             break;
         }
     }
 
-    (last_prompt, title)
+    (last_prompt, title, ai_title)
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +986,62 @@ mod tests {
         // Newest first.
         assert_eq!(sessions[0].session_id, "bbbb");
         assert_eq!(sessions[1].session_id, "aaaa");
+    }
+
+    // -----------------------------------------------------------------------
+    // last-prompt / ai-title writer helpers (session-exit metadata)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_last_prompt_and_ai_title_round_trip_in_tail_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.jsonl");
+
+        // A couple of chain messages so the file has real content.
+        let msg = make_msg(Role::User);
+        let uuid = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(
+            &path,
+            &make_user_entry(msg.clone(), &uuid, None, "sess", "/proj"),
+        )
+        .await
+        .unwrap();
+
+        write_last_prompt(&path, "sess", "Fix the flaky test")
+            .await
+            .unwrap();
+        write_ai_title(&path, "sess", "Fix flaky test")
+            .await
+            .unwrap();
+
+        // The tail reader extracts all three metadata fields.
+        let (last_prompt, custom_title, ai_title) = read_session_tail_metadata(&path).await;
+        assert_eq!(last_prompt.as_deref(), Some("Fix the flaky test"));
+        assert_eq!(custom_title, None, "no custom title written");
+        assert_eq!(ai_title.as_deref(), Some("Fix flaky test"));
+    }
+
+    #[tokio::test]
+    async fn list_sessions_surfaces_ai_title() {
+        let tmp = tempdir().unwrap();
+        let project_root = tmp.path().join("proj");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+
+        let tdir = transcript_dir_in(tmp.path(), &project_root);
+        tokio::fs::create_dir_all(&tdir).await.unwrap();
+
+        let p = tdir.join("aaaa.jsonl");
+        let msg = make_msg(Role::User);
+        let uuid = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(&p, &make_user_entry(msg, &uuid, None, "aaaa", "/proj"))
+            .await
+            .unwrap();
+        write_ai_title(&p, "aaaa", "Add auth tests").await.unwrap();
+
+        let sessions = list_sessions_in(tmp.path(), &project_root).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].ai_title.as_deref(), Some("Add auth tests"));
+        assert_eq!(sessions[0].title, None, "no custom title set");
     }
 
     // -----------------------------------------------------------------------

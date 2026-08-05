@@ -146,50 +146,80 @@ pub fn probe_sync_for(upstream_id: &str) -> ProbeOutcome {
 
 fn probe_sync_body(filter: Option<&str>) -> ProbeOutcome {
     let auth_store = clawde_core::AuthStore::load();
-    let mut outcome = ProbeOutcome::default();
 
+    // Fan out: spawn one thread per configured upstream so slow upstreams
+    // never block fast ones. Within each upstream thread, keys are still
+    // probed sequentially with a small inter-key delay for rate limiting.
+    let mut handles = Vec::new();
     for upstream in crate::providers::free::FREE_CATALOG {
-        // Targeted probe: only the requested upstream (e.g. /health nvidia).
         if filter.is_some_and(|f| f != upstream.id) {
             continue;
         }
-        // Probe every stored key for the upstream — a multi-key pool with a
-        // dead key 2 must be caught, not just the first key in the list.
         let Some(keys) = resolve_keys(&auth_store, upstream.id) else {
             continue;
         };
-        for (key_idx, key) in keys.iter().enumerate() {
-            if key.len() < 8 {
-                continue;
-            }
-            outcome.checked += 1;
-            match validate_upstream_key(upstream.id, key) {
-                Ok(()) => {
-                    debug!(upstream = upstream.id, key_idx, "health poll: key OK");
-                    outcome.results.push(HealthProbeResult {
-                        upstream: upstream.id.to_string(),
-                        key_idx,
-                        ok: true,
-                        err: None,
-                    });
+        let keys: Vec<String> = keys.iter().filter(|k| k.len() >= 8).cloned().collect();
+        if keys.is_empty() {
+            continue;
+        }
+        let upstream_id = upstream.id.to_string();
+        handles.push(std::thread::spawn(move || {
+            let mut results = Vec::new();
+            let mut unhealthy = 0usize;
+            let checked = keys.len();
+            for (key_idx, key) in keys.iter().enumerate() {
+                match validate_upstream_key(&upstream_id, key) {
+                    Ok(()) => {
+                        debug!(upstream = upstream_id, key_idx, "health poll: key OK");
+                        results.push(HealthProbeResult {
+                            upstream: upstream_id.clone(),
+                            key_idx,
+                            ok: true,
+                            err: None,
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            upstream = upstream_id,
+                            key_idx,
+                            err = %err,
+                            "health poll: key unhealthy"
+                        );
+                        unhealthy += 1;
+                        results.push(HealthProbeResult {
+                            upstream: upstream_id.clone(),
+                            key_idx,
+                            ok: false,
+                            err: Some(err),
+                        });
+                    }
                 }
-                Err(err) => {
-                    warn!(
-                        upstream = upstream.id,
-                        key_idx,
-                        err = %err,
-                        "health poll: key unhealthy"
-                    );
-                    outcome.unhealthy += 1;
-                    outcome.results.push(HealthProbeResult {
-                        upstream: upstream.id.to_string(),
-                        key_idx,
-                        ok: false,
-                        err: Some(err),
-                    });
-                }
+                // Small gap between keys within the same upstream to avoid
+                // triggering provider rate limits. Upstream threads run in
+                // parallel, so this doesn't block unrelated providers.
+                std::thread::sleep(Duration::from_millis(200));
             }
-            std::thread::sleep(Duration::from_millis(200));
+            ProbeOutcome {
+                unhealthy,
+                checked,
+                results,
+            }
+        }));
+    }
+
+    // Collect results from all upstream threads.
+    let mut outcome = ProbeOutcome::default();
+    for handle in handles {
+        match handle.join() {
+            Ok(upstream_outcome) => {
+                outcome.checked += upstream_outcome.checked;
+                outcome.unhealthy += upstream_outcome.unhealthy;
+                outcome.results.extend(upstream_outcome.results);
+            }
+            Err(_) => {
+                // Thread panicked — log and continue.
+                warn!("health poll: upstream probe thread panicked");
+            }
         }
     }
 

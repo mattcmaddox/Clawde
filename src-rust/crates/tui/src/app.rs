@@ -52,6 +52,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
     ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
+    ("new-agent", "Create a new sub-agent in the editor"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
     ("compact", "Compact the conversation context"),
@@ -74,6 +75,10 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
         "Probe free-mode key health — /health [<upstream>]",
     ),
     ("help", "Show help"),
+    (
+        "history",
+        "Show recent sessions for this project and where history lives",
+    ),
     ("hooks", "Browse configured hooks (read-only)"),
     (
         "image",
@@ -163,9 +168,9 @@ fn help_command_category(name: &str) -> &'static str {
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
+        "agent" | "agents" | "new-agent" | "memory" | "plugin" | "survey" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
-        | "quit" | "exit" => "Session",
+        | "history" | "quit" | "exit" => "Session",
         _ => "Commands",
     }
 }
@@ -178,7 +183,7 @@ fn help_overlay_entries(
         .iter()
         .map(|(name, description)| HelpEntry {
             name: (*name).to_string(),
-            // Surface hidden aliases (e.g. `/history` → `/session`) in the help
+            // Surface hidden aliases (e.g. `/remote` → `/session`) in the help
             // overlay so users can discover them. The alias table is keyed by
             // (alias, canonical, description); collect every alias whose
             // canonical command is this curated entry.
@@ -1327,16 +1332,25 @@ pub enum FocusTarget {
 /// from which a relative timestamp ("2h ago") is computed at render time.
 #[derive(Debug, Clone)]
 pub struct RecentSession {
-    /// Display label: the custom title, else a truncated last prompt, else
+    /// The session ID, used to resume the session on click.
+    pub session_id: String,
+    /// Display label: the custom title, else AI title, else truncated last prompt, else
     /// `"(untitled)"`.
     pub label: String,
     /// Transcript modification time, used to derive a relative timestamp.
     pub mtime: std::time::SystemTime,
 }
 
-/// Build the display label for a recent session: prefer the custom title, fall
-/// back to the first line of the last prompt (truncated), else `"(untitled)"`.
-pub fn recent_session_label(title: Option<String>, last_prompt: Option<String>) -> String {
+/// Build the display label for a recent session. Preference order:
+/// 1. the user's custom title,
+/// 2. the AI-generated title (written by the auto-titler at session exit),
+/// 3. the first line of the last prompt (truncated),
+/// 4. `"(untitled)"`.
+pub fn recent_session_label(
+    title: Option<String>,
+    ai_title: Option<String>,
+    last_prompt: Option<String>,
+) -> String {
     /// Cap stored labels so a huge prompt never bloats `App` state; the render
     /// path truncates further to the column width.
     const MAX_LABEL: usize = 80;
@@ -1353,6 +1367,7 @@ pub fn recent_session_label(title: Option<String>, last_prompt: Option<String>) 
 
     title
         .and_then(pick)
+        .or_else(|| ai_title.and_then(pick))
         .or_else(|| last_prompt.and_then(pick))
         .unwrap_or_else(|| "(untitled)".to_string())
 }
@@ -1793,6 +1808,20 @@ pub struct App {
     pub last_input_area: Cell<ratatui::layout::Rect>,
     /// The footer's right column area (where tips are shown) from the last render.
     pub footer_right_column_area: Cell<ratatui::layout::Rect>,
+    /// Absolute screen row where the "Recent activity" section starts inside the
+    /// right column of the welcome box.  Used by the mouse handler to compute
+    /// which session row was clicked, avoiding the fragile hardcoded offset.
+    /// Updated at each render of the welcome box; ignored when width is 0.
+    pub recent_activity_start_row: Cell<u16>,
+    /// The index of the recent session entry the mouse is currently hovering
+    /// over on the welcome screen, or `None` if not hovering a session row.
+    /// Updated on every mouse-move event; used by the renderer to apply a
+    /// highlight/underline style on the hovered row.
+    pub recent_activity_hovered_idx: Cell<Option<usize>>,
+    /// When the user clicks a recent session entry on the welcome screen, the
+    /// clicked session's ID is stored here.  The main loop checks this field and
+    /// triggers a resume of the clicked session.
+    pub clicked_recent_session_id: Option<String>,
     /// Last mouse position (screen coords) seen by the mouse handler — used for
     /// hover tooltips (e.g. the free-model task-sort badge).
     pub last_mouse_pos: Cell<Option<(u16, u16)>>,
@@ -2230,6 +2259,9 @@ impl App {
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
             footer_right_column_area: Cell::new(ratatui::layout::Rect::default()),
+            recent_activity_start_row: Cell::new(0),
+            recent_activity_hovered_idx: Cell::new(None),
+            clicked_recent_session_id: None,
             last_mouse_pos: Cell::new(None),
             task_badge_rect: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
@@ -2707,8 +2739,13 @@ impl App {
                 "google",
                 "groq",
                 "cerebras",
+                "cline",
+                "cloudflare",
                 "deepseek",
+                "huggingface",
                 "mistral",
+                "nvidia",
+                "sambanova",
                 "xai",
                 "openrouter",
                 "github-copilot",
@@ -2719,6 +2756,7 @@ impl App {
                 "together-ai",
                 "deepinfra",
                 "venice",
+                "zai",
                 "minimax",
                 "ollama",
                 "lmstudio",
@@ -2750,6 +2788,10 @@ impl App {
 
     /// Switch the active provider while clearing any explicit model override.
     fn set_provider_default(&mut self, provider_id: String) {
+        // Auto-unload Ollama models when switching away.
+        if self.config.provider.as_deref() == Some("ollama") && provider_id != "ollama" {
+            clawde_core::spawn_ollama_unload();
+        }
         self.config.provider = Some(provider_id.clone());
         self.config.model = None;
 
@@ -2907,6 +2949,10 @@ impl App {
         self.model_name = model.clone();
         self.config.model = Some(model.clone());
         if let Some(provider) = Self::infer_provider_from_model(&model) {
+            let old_provider = self.config.provider.as_deref().unwrap_or("");
+            if old_provider == "ollama" && provider != "ollama" {
+                clawde_core::spawn_ollama_unload();
+            }
             self.config.provider = Some(provider.clone());
             self.reset_free_task_sort_if_not_free(&provider);
         }
@@ -3098,6 +3144,11 @@ impl App {
                         .collect();
 
                     self.model_picker.set_models(filtered_models);
+                    // Track the provider this picker is showing so the confirm
+                    // handler prefixes correctly (and Ctrl+R refreshes the
+                    // right list). /model --capability shows the CURRENT
+                    // provider's models, unlike /models which is always free.
+                    self.model_picker_provider_id = Some(provider.clone());
                     self.model_picker.open_with_title(
                         format!("{} models — {}", label, provider),
                         "",
@@ -3127,6 +3178,7 @@ impl App {
                         .filter(|m| matches_capability_groups(m, &groups))
                         .collect();
                     self.model_picker.set_models(filtered_models);
+                    self.model_picker_provider_id = Some("free".to_string());
                     self.model_picker.open_with_title(
                         format!("Free {} models", label),
                         "",
@@ -3164,7 +3216,14 @@ impl App {
         self.dismiss_error_notifications();
         match cmd {
             "config" | "settings" => {
-                self.settings_screen.open();
+                // Pass the working directory so the screen can load the
+                // effective (global + project) view and tag origin per entry.
+                let cwd = self
+                    .current_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                self.settings_screen.open(cwd);
                 true
             }
             "theme" => {
@@ -3191,6 +3250,13 @@ impl App {
             }
             "agents" => {
                 self.open_agents_menu();
+                true
+            }
+            // /new-agent jumps straight into the create-agent editor (row 0 of
+            // the agents menu) instead of the list view.
+            "new-agent" => {
+                self.open_agents_menu();
+                self.agents_menu.open_editor(None);
                 true
             }
             "diff" | "review" => {
@@ -4398,6 +4464,21 @@ impl App {
             }
         }
 
+        // ---- Alt+R: resume the most recent session from the welcome screen. ----
+        // Only fires when the transcript is empty (welcome screen visible) and there
+        // is at least one recent session.  Sets the clicked-recent-session ID so the
+        // main loop picks it up the same way as a mouse click.
+        if key.code == KeyCode::Char('r')
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && self.messages.is_empty()
+            && !self.recent_sessions.is_empty()
+        {
+            if let Some(session) = self.recent_sessions.first() {
+                self.clicked_recent_session_id = Some(session.session_id.clone());
+                return false;
+            }
+        }
+
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
         // session exits immediately. Mirrors TS BypassPermissionsModeDialog.tsx.
         // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
@@ -5283,17 +5364,42 @@ impl App {
                         }
                         // Store explicit selections in the canonical
                         // "provider/model" form for non-Anthropic providers.
-                        // The "free" composite's picker entries already carry
-                        // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
-                        // so re-prefixing would produce nonsense like
-                        // `free/free/auto`.
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        // The prefixing provider is the one the picker was
+                        // opened for (`model_picker_provider_id`), NOT the
+                        // active config provider: `/models` always opens the
+                        // "free" picker even when another provider (e.g.
+                        // ollama via /connect) is active, and its entries
+                        // already carry a routing prefix (`free/…`, `zen/…`,
+                        // `openrouter/…`), so re-prefixing with the active
+                        // provider would produce nonsense like `ollama/free/auto`
+                        // and leave the user stuck on the old provider.
+                        let provider = self
+                            .model_picker_provider_id
+                            .clone()
+                            .or_else(|| self.config.provider.clone())
+                            .unwrap_or_else(|| "anthropic".to_string());
                         let full_model = if provider == "anthropic" || provider == "free" {
                             model_id.clone()
                         } else {
                             format!("{}/{}", provider, model_id)
                         };
                         self.set_model(full_model.clone());
+                        // /models is always the free picker: any row chosen
+                        // from it belongs to free mode, even when the active
+                        // provider is something else (e.g. ollama) or the entry
+                        // is an upstream pin whose id `infer_provider_from_model`
+                        // doesn't recognise (huggingface, nvidia, …). Forcing
+                        // the provider here routes the selection through the
+                        // free composite, whose resolve_route handles auto /
+                        // family / pin ids. No-op for users already on "free",
+                        // and /model is untouched (its picker provider IS the
+                        // active provider, so `provider` won't be "free").
+                        if provider == "free" && self.config.provider.as_deref() != Some("free") {
+                            if self.config.provider.as_deref() == Some("ollama") {
+                                clawde_core::spawn_ollama_unload();
+                            }
+                            self.config.provider = Some("free".to_string());
+                        }
                         self.persist_provider_and_model();
                         let effort_hint = effort
                             .map(|e| format!(" [{}]", e.label()))
@@ -7032,6 +7138,10 @@ impl App {
                 }
                 false
             }
+            "openSettings" => {
+                self.intercept_slash_command("settings");
+                false
+            }
             "cycleFreeUpstream" => {
                 let count = self.free_model_defaults.len();
                 if count > 0 {
@@ -7042,6 +7152,35 @@ impl App {
             }
             "cycleFreeTask" => {
                 self.cycle_free_task(1);
+                false
+            }
+            "toggleThinkingExpand" => {
+                // Ctrl+O: expand or collapse every collapsible block at once
+                // (thinking blocks + grouped parallel tool calls). Uses the
+                // same helpers as the transcript renderer so per-block click
+                // expansion and this toggle share the same key set.
+                let hashes: Vec<u64> = self
+                    .messages
+                    .iter()
+                    .flat_map(crate::messages::expandable_block_hashes)
+                    .collect();
+                if hashes.is_empty() {
+                    self.status_message = Some("Nothing to expand.".to_string());
+                } else {
+                    let all_expanded = hashes.iter().all(|h| self.thinking_expanded.contains(h));
+                    if all_expanded {
+                        for h in &hashes {
+                            self.thinking_expanded.remove(h);
+                        }
+                        self.status_message = Some("Collapsed all thinking blocks.".to_string());
+                    } else {
+                        for h in hashes {
+                            self.thinking_expanded.insert(h);
+                        }
+                        self.status_message = Some("Expanded all thinking blocks.".to_string());
+                    }
+                    self.invalidate_transcript();
+                }
                 false
             }
             "openEffort" => {
@@ -7892,6 +8031,31 @@ impl App {
         self.last_mouse_pos
             .set(Some((mouse_event.column, mouse_event.row)));
 
+        // Track which recent session row the mouse is hovering over on the
+        // welcome screen, so the renderer can highlight it.  Runs on every
+        // mouse event (including moves) to keep the highlight in sync.
+        if self.messages.is_empty() && !self.recent_sessions.is_empty() {
+            let rc = self.footer_right_column_area.get();
+            let start_row = self.recent_activity_start_row.get();
+            if start_row > 0
+                && rc.width > 0
+                && mouse_event.column >= rc.x
+                && mouse_event.column < rc.x.saturating_add(rc.width)
+                && mouse_event.row >= start_row
+            {
+                let idx = mouse_event.row.saturating_sub(start_row) as usize;
+                if idx < self.recent_sessions.len() {
+                    self.recent_activity_hovered_idx.set(Some(idx));
+                } else {
+                    self.recent_activity_hovered_idx.set(None);
+                }
+            } else {
+                self.recent_activity_hovered_idx.set(None);
+            }
+        } else {
+            self.recent_activity_hovered_idx.set(None);
+        }
+
         // The paste viewer modal swallows mouse input: the wheel scrolls its
         // body, everything else is inert (Esc/q close it).
         if self.paste_viewer.visible {
@@ -8199,6 +8363,26 @@ impl App {
                     && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
                     && mouse_event.column >= selectable_area.x
                     && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+
+                // Check for click on a recent session entry in the welcome screen's
+                // right column.  Uses the exact row stored at render time so the
+                // click target is always correct regardless of tip-text length.
+                if self.messages.is_empty() && !self.recent_sessions.is_empty() {
+                    let rc = self.footer_right_column_area.get();
+                    let start_row = self.recent_activity_start_row.get();
+                    if start_row > 0
+                        && rc.width > 0
+                        && mouse_event.row >= start_row
+                        && mouse_event.column >= rc.x
+                        && mouse_event.column < rc.x.saturating_add(rc.width)
+                    {
+                        let session_idx = mouse_event.row.saturating_sub(start_row) as usize;
+                        if let Some(session) = self.recent_sessions.get(session_idx) {
+                            self.clicked_recent_session_id = Some(session.session_id.clone());
+                            return;
+                        }
+                    }
+                }
 
                 // Check for click on a thinking block header (takes priority over text selection).
                 if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
@@ -8636,7 +8820,8 @@ impl App {
                         .into_iter()
                         .take(MAX_RECENT)
                         .map(|s| RecentSession {
-                            label: recent_session_label(s.title, s.last_prompt),
+                            session_id: s.session_id,
+                            label: recent_session_label(s.title, s.ai_title, s.last_prompt),
                             mtime: s.mtime,
                         })
                         .collect();
@@ -9016,28 +9201,48 @@ mod tests {
     fn recent_session_label_prefers_title() {
         let label = recent_session_label(
             Some("My Title".to_string()),
+            Some("ai title".to_string()),
             Some("some prompt".to_string()),
         );
         assert_eq!(label, "My Title");
     }
 
     #[test]
+    fn recent_session_label_uses_ai_title_when_no_custom() {
+        // No custom title → the auto-titler's name wins over the raw prompt.
+        let label = recent_session_label(
+            None,
+            Some("Fix flaky auth test".to_string()),
+            Some("some prompt".to_string()),
+        );
+        assert_eq!(label, "Fix flaky auth test");
+    }
+
+    #[test]
     fn recent_session_label_falls_back_to_first_prompt_line() {
-        let label = recent_session_label(None, Some("  fix the bug\nand more details".to_string()));
+        let label = recent_session_label(
+            None,
+            None,
+            Some("  fix the bug\nand more details".to_string()),
+        );
         assert_eq!(label, "fix the bug");
     }
 
     #[test]
     fn recent_session_label_skips_blank_title_and_untitled_default() {
-        // Blank/whitespace title is ignored in favour of the prompt.
+        // Blank/whitespace titles are ignored in favour of the next candidate.
         assert_eq!(
-            recent_session_label(Some("   ".to_string()), Some("do it".to_string())),
+            recent_session_label(Some("   ".to_string()), None, Some("do it".to_string())),
             "do it"
         );
-        // Nothing usable → untitled.
-        assert_eq!(recent_session_label(None, None), "(untitled)");
         assert_eq!(
-            recent_session_label(Some(String::new()), Some("\n\n".to_string())),
+            recent_session_label(Some(" ".to_string()), Some("ai".to_string()), None),
+            "ai"
+        );
+        // Nothing usable → untitled.
+        assert_eq!(recent_session_label(None, None, None), "(untitled)");
+        assert_eq!(
+            recent_session_label(Some(String::new()), None, Some("\n\n".to_string())),
             "(untitled)"
         );
     }
@@ -9045,7 +9250,7 @@ mod tests {
     #[test]
     fn recent_session_label_truncates_long_prompt() {
         let long = "x".repeat(200);
-        let label = recent_session_label(None, Some(long));
+        let label = recent_session_label(None, None, Some(long));
         assert_eq!(label.chars().count(), 80);
     }
 
@@ -9857,6 +10062,113 @@ mod tests {
     }
 
     #[test]
+    fn test_toggle_thinking_expand_expands_and_collapses_all() {
+        let mut app = make_app();
+
+        // No thinking blocks yet → no-op with a status message.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.thinking_expanded.is_empty());
+
+        // Two thinking blocks in one assistant message.
+        app.messages.push(Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "first reasoning".to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: "second reasoning".to_string(),
+                signature: "sig2".to_string(),
+            },
+        ]));
+        let h1 = crate::messages::thinking_block_hash("first reasoning");
+        let h2 = crate::messages::thinking_block_hash("second reasoning");
+
+        // First press expands every block.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.thinking_expanded.contains(&h1));
+        assert!(app.thinking_expanded.contains(&h2));
+
+        // Second press collapses everything again.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.thinking_expanded.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_thinking_expand_includes_grouped_tool_uses() {
+        let mut app = make_app();
+        app.messages.push(Message::assistant_blocks(vec![
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+                thought_signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "tu-2".to_string(),
+                name: "Grep".to_string(),
+                input: serde_json::json!({ "pattern": "foo" }),
+                thought_signature: None,
+            },
+        ]));
+        let (group_hash, _, _) = crate::messages::grouped_tool_use_runs(&app.messages[0])[0];
+
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(
+            app.thinking_expanded.contains(&group_hash),
+            "Ctrl+O must expand grouped parallel tool calls too"
+        );
+
+        // A second press collapses the group again.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.thinking_expanded.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_thinking_expand_includes_lsp_diagnostics() {
+        let mut app = make_app();
+        app.messages
+            .push(Message::assistant_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "tu-1".to_string(),
+                content: clawde_core::types::ToolResultContent::Text(
+                    "[ERROR] /src/main.rs:12:5 - missing semicolon\n\
+                 [WARNING] /src/lib.rs:3:9 - unused import"
+                        .to_string(),
+                ),
+                is_error: Some(false),
+            }]));
+        let hash = crate::messages::diagnostics_block_hash(
+            "[ERROR] /src/main.rs:12:5 - missing semicolon\n\
+             [WARNING] /src/lib.rs:3:9 - unused import",
+        );
+
+        // Ctrl+O expands the diagnostics summary.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(
+            app.thinking_expanded.contains(&hash),
+            "Ctrl+O must expand LSP diagnostics summaries too"
+        );
+
+        // Second press collapses it again.
+        assert!(!app.handle_keybinding_action("toggleThinkingExpand"));
+        assert!(app.thinking_expanded.is_empty());
+    }
+
+    #[test]
+    fn test_new_agent_slash_command_opens_create_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(temp.path().to_path_buf());
+
+        assert!(app.intercept_slash_command("new-agent"));
+        assert!(app.agents_menu.visible);
+        assert!(
+            matches!(app.agents_menu.route, AgentsRoute::Editor(None)),
+            "/new-agent must open the create-new editor, got {:?}",
+            app.agents_menu.route
+        );
+    }
+
+    #[test]
     fn test_switching_away_from_free_resets_task_sort() {
         let _home = TestHome::acquire();
         let mut app = make_app();
@@ -9924,6 +10236,95 @@ mod tests {
         assert!(
             settings.config.free_task_sort.is_none(),
             "returning to All must clear the persisted task sort"
+        );
+    }
+
+    #[test]
+    fn test_models_picker_confirm_switches_away_from_ollama() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Simulate /connect having set ollama, then /models picking an entry.
+        app.config.provider = Some("ollama".to_string());
+        app.config.model = None;
+
+        // Confirm the first row (free/auto): the picker was opened for "free",
+        // so the selection must route through free mode — not be mangled into
+        // "ollama/free/auto" with the provider left on ollama.
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.config.provider.as_deref(),
+            Some("free"),
+            "picking a free model from /models must switch the provider to free"
+        );
+        assert_eq!(app.config.model.as_deref(), Some("free/auto"));
+
+        // Same for a model-family row: move down one row and confirm.
+        app.config.provider = Some("ollama".to_string());
+        app.config.model = None;
+        assert!(app.intercept_slash_command("models"));
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.config.provider.as_deref(),
+            Some("free"),
+            "a free/family selection must also route through free mode"
+        );
+        let family_model = app.config.model.as_deref().unwrap_or_default();
+        assert!(
+            family_model.starts_with("free/family/"),
+            "family model must keep its routing prefix, got {family_model}"
+        );
+
+        // Upstream pins whose provider id `infer_provider_from_model` does not
+        // recognise (huggingface, nvidia, cloudflare, sambanova, cline, zai)
+        // must still route through free mode rather than leaving the user
+        // stuck on ollama with a broken model string.
+        app.config.provider = Some("ollama".to_string());
+        app.config.model = None;
+        assert!(app.intercept_slash_command("models"));
+        let pin_idx = app
+            .model_picker
+            .models
+            .iter()
+            .position(|m| m.id.starts_with("huggingface/"))
+            .expect("free picker must list a huggingface pin");
+        app.model_picker.selected_idx = pin_idx;
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.config.provider.as_deref(),
+            Some("free"),
+            "an upstream pin from /models must also route through free mode"
+        );
+        assert!(
+            app.config
+                .model
+                .as_deref()
+                .map(|m| m.starts_with("huggingface/"))
+                .unwrap_or(false),
+            "pin model must keep its upstream prefix"
+        );
+    }
+
+    #[test]
+    fn test_models_picker_confirm_keeps_non_free_provider_models() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // /model opens the picker for the CURRENT provider; a selection there
+        // must keep the provider and take the "provider/model" form.
+        app.config.provider = Some("ollama".to_string());
+        app.config.model = None;
+        assert!(app.intercept_slash_command("model"));
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.config.provider.as_deref(), Some("ollama"));
+        assert!(
+            app.config
+                .model
+                .as_deref()
+                .map(|m| m.starts_with("ollama/"))
+                .unwrap_or(false),
+            "/model must store the selection as ollama/<model>"
         );
     }
 
@@ -10142,8 +10543,8 @@ mod tests {
             "cargo build".to_string(),
             Some("cargo".to_string()),
         );
-        // Navigate to the prefix option (index 3 in a 5-option dialog).
-        pr.selected_option = 3;
+        // Navigate to the prefix option (index 4 in a 6-option dialog).
+        pr.selected_option = 4;
         app.permission_request = Some(pr);
 
         // Press Enter to confirm the currently selected (prefix) option.

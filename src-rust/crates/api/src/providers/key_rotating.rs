@@ -57,6 +57,10 @@ fn classify_exhaust(err: &ProviderError) -> Option<ExhaustSignal> {
         // classify the error. Treat HTTP 429 as rate-limit and 401/403 as auth
         // so the key still gets rotated and the full response body (which
         // Other carries) is passed to the cooldown estimator.
+        // HTTP 402 (Payment Required / insufficient credits) is intentionally
+        // NOT classified — Cline's negative-balance 402 is a known display
+        // issue that does not actually block free-model usage, so exhausting
+        // the key would unnecessarily remove a working upstream from rotation.
         ProviderError::Other {
             status: Some(429), ..
         } => Some(ExhaustSignal::RateLimit),
@@ -90,10 +94,14 @@ fn default_cooldown_for_signal(signal: ExhaustSignal) -> u64 {
 
 /// When ALL keys are exhausted and the shortest cooldown is at most this
 /// many seconds, the loop will wait and retry instead of returning an error.
-/// This lets short rate-limit cooldowns (typically 60s) recover transparently
-/// without the user seeing a failure. Longer cooldowns (quota, auth) surface
-/// the error immediately.
-const MAX_COOLDOWN_WAIT: u64 = 60;
+/// This lets short rate-limit cooldowns recover transparently without the
+/// user seeing a failure. Longer cooldowns surface the error immediately.
+///
+/// When the provider is nested inside a [`FreeProvider`] fallback chain,
+/// [`skip_recovery_loop`](Self::set_skip_recovery_loop) disables this path
+/// entirely — the FreeProvider already handles retry at a higher level and
+/// sleeping here just delays the overall fallback.
+const MAX_COOLDOWN_WAIT: u64 = 10;
 
 /// Maximum number of cooldown wait-retry cycles before giving up and
 /// returning a `RateLimited` error to the caller. Each cycle re-reads
@@ -123,6 +131,12 @@ pub struct KeyRotatingProvider {
     build_provider: ProviderFactory,
     /// Path to persisted cooldown state file. `None` = no persistence.
     state_path: Option<PathBuf>,
+    /// When `true`, the cooldown sleep+retry loop is skipped: on exhaustion
+    /// the error is returned immediately instead of sleeping and retrying.
+    /// Set by the [`FreeProvider`] chain builder so that individual upstream
+    /// providers don't waste time waiting for cooldowns — the FreeProvider
+    /// handles fallback at a higher level.
+    skip_recovery_loop: bool,
 }
 
 impl KeyRotatingProvider {
@@ -144,6 +158,7 @@ impl KeyRotatingProvider {
             ring: Arc::new(Mutex::new(KeyRing::new(pid, keys))),
             build_provider: Arc::new(build_provider),
             state_path: None,
+            skip_recovery_loop: false,
         }
     }
 
@@ -172,6 +187,7 @@ impl KeyRotatingProvider {
             ring,
             build_provider: Arc::new(build_provider),
             state_path: Some(state_path),
+            skip_recovery_loop: false,
         }
     }
 
@@ -190,6 +206,14 @@ impl KeyRotatingProvider {
     /// Number of exhausted keys. Poison-safe, see [`Self::active_key_count`].
     pub fn exhausted_key_count(&self) -> usize {
         self.ring.lock().map(|r| r.exhausted_count()).unwrap_or(0)
+    }
+
+    /// Disable the cooldown recovery loop. When set, exhaustion returns an
+    /// error immediately instead of sleeping and retrying. Call this when the
+    /// provider is nested inside a higher-level fallback chain (e.g.
+    /// [`FreeProvider`]) that handles retry at its own level.
+    pub fn set_skip_recovery_loop(&mut self, skip: bool) {
+        self.skip_recovery_loop = skip;
     }
 
     /// Reference to the key ring (for inspection).
@@ -237,7 +261,8 @@ impl KeyRotatingProvider {
                         }
                     };
 
-                    if should_wait && retry_count < MAX_COOLDOWN_RETRIES {
+                    if should_wait && retry_count < MAX_COOLDOWN_RETRIES && !self.skip_recovery_loop
+                    {
                         retry_count += 1;
                         tracing::info!(
                             "KeyRotatingProvider: all keys exhausted, \
@@ -406,10 +431,24 @@ impl LlmProvider for KeyRotatingProvider {
     }
 
     fn mark_key_healthy(&self, _upstream_id: Option<&str>, key_idx: usize) -> bool {
-        match self.ring.lock() {
+        let ok = match self.ring.lock() {
             Ok(mut ring) => ring.mark_healthy(key_idx),
             Err(_) => false,
+        };
+        // Persist the cleared cooldown so a restart doesn't resurrect stale
+        // exhaustion state from a previous session. Without this the health
+        // poller clears the key in memory every startup probe, but the disk
+        // file still carries the original cooldown and re-applies it on the
+        // next launch (the remaining-seconds value is relative to NOW, not
+        // to when the original exhaustion happened).
+        if ok {
+            if let Some(ref persist_path) = self.state_path {
+                if let Ok(ring) = self.ring.lock() {
+                    ring.save_to_file(persist_path);
+                }
+            }
         }
+        ok
     }
 
     fn mark_key_exhausted(
@@ -1214,5 +1253,38 @@ mod tests {
                 remaining
             );
         }
+    }
+
+    #[tokio::test]
+    async fn skip_recovery_loop_returns_immediately_on_exhaustion() {
+        // When skip_recovery_loop is set (FreeProvider nesting), the provider
+        // must return immediately on exhaustion instead of sleeping/retrying.
+        // The FreeProvider handles fallback at a higher level and any sleep
+        // here just delays the overall chain.
+        let counters = Arc::new(vec![Arc::new(AtomicUsize::new(0))]);
+
+        let fail_err = ProviderError::RateLimited {
+            provider: ProviderId::new("mock"),
+            retry_after: Some(1), // short cooldown that would normally trigger wait
+        };
+
+        let build = {
+            let c = counters.clone();
+            move |_key: &str| build_mock_provider("key", Some(fail_err.clone()), &c)
+        };
+
+        let mut provider = KeyRotatingProvider::new("mock", "Mock", vec!["key0".into()], build);
+        provider.set_skip_recovery_loop(true);
+
+        let start = std::time::Instant::now();
+        let result = provider.create_message(dummy_request()).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "should return error immediately");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "skip_recovery_loop should return immediately, took {:?}",
+            elapsed
+        );
     }
 }

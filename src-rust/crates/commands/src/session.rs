@@ -239,7 +239,7 @@ impl SlashCommand for SessionCommand {
         "session"
     }
     fn aliases(&self) -> Vec<&str> {
-        vec!["remote", "history"]
+        vec!["remote"]
     }
     fn description(&self) -> &str {
         "Show or manage conversation sessions"
@@ -341,6 +341,95 @@ impl SlashCommand for SessionCommand {
                 args
             )),
         }
+    }
+}
+
+// ---- /history ------------------------------------------------------------
+
+/// Show the current project's session history and where history is stored.
+///
+/// Reads the project-scoped JSONL transcripts (`session_storage::list_sessions`)
+/// — the same store that backs the welcome screen's "Recent activity" list —
+/// and prints each session with its timestamp, title, and id, plus pointers to
+/// the on-disk stores and related commands.
+pub struct HistoryCommand;
+
+#[async_trait]
+impl SlashCommand for HistoryCommand {
+    fn name(&self) -> &str {
+        "history"
+    }
+    fn description(&self) -> &str {
+        "Show recent sessions for this project and where history lives"
+    }
+    fn help(&self) -> &str {
+        "Usage: /history\n\n\
+         Lists the most recent sessions for the current project (the git repo\n\
+         root, or the working directory when not in a repo), newest first, with\n\
+         their timestamps and titles, plus pointers to the on-disk stores.\n\n\
+         See also: /session list (all sessions), /resume <id>, /stats."
+    }
+
+    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let project_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
+            .unwrap_or_else(|| ctx.working_dir.clone());
+
+        let sessions = match clawde_core::session_storage::list_sessions(&project_root).await {
+            Ok(s) => s,
+            Err(e) => return CommandResult::Error(format!("Failed to read session history: {e}")),
+        };
+
+        let sep = "-".repeat(60);
+        let mut lines = vec![format!(
+            "Project history for {}\n{}",
+            project_root.display(),
+            sep
+        )];
+
+        if sessions.is_empty() {
+            lines.push("  No sessions recorded for this project yet.".to_string());
+        } else {
+            for s in sessions.iter().take(15) {
+                let when = clawde_core::format_utils::format_short_absolute_time(s.mtime);
+                let label = s
+                    .title
+                    .clone()
+                    .or_else(|| s.ai_title.clone())
+                    .or_else(|| s.last_prompt.clone())
+                    .map(|t| {
+                        t.lines()
+                            .find(|l| !l.trim().is_empty())
+                            .map(|l| l.trim().to_string())
+                            .unwrap_or_else(|| "(untitled)".to_string())
+                    })
+                    .unwrap_or_else(|| "(untitled)".to_string());
+                let short_id: String = s.session_id.chars().take(8).collect();
+                lines.push(format!("  [{}] {}  ({})", when, label, short_id));
+            }
+            if sessions.len() > 15 {
+                lines.push(format!(
+                    "  ... and {} more (use /session list)",
+                    sessions.len() - 15
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("Where history lives:".to_string());
+        lines.push(
+            "  - Session store:    ~/.clawde/sessions/<id>.json    (/session, /resume)".to_string(),
+        );
+        lines.push(
+            "  - Project history:  ~/.clawde/projects/<dir>/<id>.jsonl  (recents, /stats)"
+                .to_string(),
+        );
+        lines.push(
+            "  - Prompt history:   ~/.clawde/history.jsonl         (up/down in the input box)"
+                .to_string(),
+        );
+        lines.push("  - File checkpoints: /checkpoints, /snapshot, /revert, /undo".to_string());
+
+        CommandResult::Message(lines.join("\n"))
     }
 }
 

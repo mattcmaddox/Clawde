@@ -497,7 +497,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         ("Ctrl+D", "Quit (empty input)"),
         ("Ctrl+L", "Clear screen"),
         ("Ctrl+Shift+S", "Show search source"),
-        ("t", "Expand/collapse thinking"),
+        ("Ctrl+O", "Expand/collapse thinking"),
     ] {
         left_lines.push(kb_line(key, desc));
     }
@@ -2315,6 +2315,7 @@ pub fn render_keybindings_overlay(
             "clearLine" => "Clear input",
             "historyPrev" => "History prev",
             "historyNext" => "History next",
+            "toggleThinkingExpand" => "Expand thinking",
             "previousMessage" => "Previous msg",
             "nextMessage" => "Next msg",
             "jumpToNextError" => "Next error",

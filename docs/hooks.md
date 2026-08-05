@@ -148,7 +148,7 @@ Fires **after** a tool completes successfully. The matcher field is compared aga
 **Payload fields:** `tool_name`, `inputs` (tool call arguments), `response` (tool output).
 
 **Exit codes:**
-- `0` — success; stdout is shown in transcript mode (`Ctrl+O`).
+- `0` — success; stdout is shown in the transcript.
 - `2` — show stderr to the model immediately.
 - Other — show stderr to user only.
 

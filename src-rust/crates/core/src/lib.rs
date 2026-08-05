@@ -97,9 +97,9 @@ pub use key_ring::{KeyRing, KeyStatus};
 
 // Re-export commonly used types at the crate root
 pub use config::{
-    builtin_managed_agent_presets, default_agents, is_ollama_network_blocked,
-    set_ollama_network_blocked, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
-    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    builtin_managed_agent_presets, default_agents, is_ollama_network_blocked, ollama_unload_models,
+    set_ollama_network_blocked, spawn_ollama_unload, strip_jsonc_comments, substitute_env_vars,
+    AcpServerConfig, AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaMode,
     OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
 };
@@ -979,6 +979,78 @@ pub mod config {
         OLLAMA_NETWORK_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Fire-and-forget: unload all currently loaded Ollama models from VRAM.
+    /// Safe to call from any thread; the HTTP work runs on a background thread.
+    pub fn spawn_ollama_unload() {
+        let _ = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            rt.block_on(async {
+                let _ = ollama_unload_models().await;
+            });
+        });
+    }
+
+    /// Resolve the Ollama host URL from settings/env.
+    fn resolve_ollama_host() -> String {
+        let settings = crate::config::Settings::load_sync().unwrap_or_default();
+        let host = settings
+            .providers
+            .get("ollama")
+            .and_then(|c| c.api_base.clone())
+            .or_else(|| std::env::var("OLLAMA_HOST").ok())
+            .unwrap_or_else(|| "http://localhost:11434".to_string());
+        host.trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string()
+    }
+
+    /// Send keep_alive=0 requests to unload all loaded Ollama models.
+    pub async fn ollama_unload_models() -> Result<usize, String> {
+        let base_url = resolve_ollama_host();
+        let client = reqwest::Client::new();
+
+        let ps_body = client
+            .get(format!("{}/api/ps", base_url))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to reach Ollama: {}", e))?
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+
+        let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&ps_body)
+            .ok()
+            .and_then(|v| {
+                v.get("models")?
+                    .as_array()?
+                    .iter()
+                    .map(|m| m.get("name")?.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut count = 0usize;
+        for model in &models {
+            let body = serde_json::json!({
+                "model": model,
+                "prompt": "",
+                "keep_alive": 0,
+            });
+            let _ = client
+                .post(format!("{}/api/generate", base_url))
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     // ---- ProviderConfig --------------------------------------------------
 
     /// Per-provider configuration: API keys, base URLs, and options.
@@ -1594,39 +1666,51 @@ pub mod config {
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
-        /// returns that provider's canonical default model instead of `DEFAULT_MODEL`
-        /// (which is Claude-specific).
+        /// returns that provider's canonical default model in `provider/model` form
+        /// instead of `DEFAULT_MODEL` (which is Claude-specific). The prefixed form
+        /// ensures the TUI status line shows the correct provider rather than "local".
         pub fn effective_model(&self) -> &str {
             if let Some(ref m) = self.model {
-                return m;
+                // An unprefixed bare model (e.g. "claude-opus-4-6") only makes
+                // sense when the active provider is anthropic (or unset). For
+                // any other explicitly-set provider, a bare model name stored
+                // in settings was likely saved from a different session — defer
+                // to the provider's own default instead of showing a stale name
+                // that conflicts with the active provider.
+                let has_prefix = m.contains('/');
+                let provider_is_anthropic_or_none =
+                    self.provider.as_deref().is_none_or(|p| p == "anthropic");
+                if has_prefix || provider_is_anthropic_or_none {
+                    return m;
+                }
             }
             match self.provider.as_deref() {
-                Some("openai") => "gpt-4o",
-                Some("google") => "gemini-2.5-flash",
-                Some("groq") => "llama-3.3-70b-versatile",
-                Some("cerebras") => "llama-3.3-70b",
-                Some("deepseek") => "deepseek-v4-pro",
-                Some("mistral") => "mistral-large-latest",
-                Some("xai") => "grok-2",
-                Some("openrouter") => "anthropic/claude-sonnet-4",
+                Some("openai") => "openai/gpt-4o",
+                Some("google") => "google/gemini-2.5-flash",
+                Some("groq") => "groq/llama-3.3-70b-versatile",
+                Some("cerebras") => "cerebras/llama-3.3-70b",
+                Some("deepseek") => "deepseek/deepseek-v4-pro",
+                Some("mistral") => "mistral/mistral-large-latest",
+                Some("xai") => "xai/grok-2",
+                Some("openrouter") => "openrouter/anthropic/claude-sonnet-4",
                 Some("togetherai") | Some("together-ai") => {
-                    "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+                    "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo"
                 }
-                Some("perplexity") => "sonar-pro",
-                Some("cohere") => "command-r-plus",
+                Some("perplexity") => "perplexity/sonar-pro",
+                Some("cohere") => "cohere/command-r-plus",
                 // DashScope runs as "qwen" at runtime but is "alibaba" in the
                 // models.dev catalog; terminal fallback keeps a qwen id so an
                 // unconfigured Qwen provider never resolves to a claude-* model.
-                Some("qwen") | Some("alibaba") => "qwen3-max",
-                Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
-                Some("github-copilot") => "gpt-4o-2024-11-20",
-                Some("ollama") => "llama3.2",
-                Some("lmstudio") => "default",
-                Some("llamacpp") => "default",
-                Some("custom-openai") => "default",
-                Some("azure") => "gpt-4o",
-                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
-                Some("venice") => "llama-3.3-70b",
+                Some("qwen") | Some("alibaba") => "alibaba/qwen3-max",
+                Some("deepinfra") => "deepinfra/meta-llama/Llama-3.3-70B-Instruct",
+                Some("github-copilot") => "github-copilot/gpt-4o-2024-11-20",
+                Some("ollama") => "ollama/llama3.2",
+                Some("lmstudio") => "lmstudio/default",
+                Some("llamacpp") => "llamacpp/default",
+                Some("custom-openai") => "custom-openai/default",
+                Some("azure") => "azure/gpt-4o",
+                Some("amazon-bedrock") => "amazon-bedrock/anthropic.claude-sonnet-4-6-v1",
+                Some("venice") => "venice/llama-3.3-70b",
                 _ => crate::constants::DEFAULT_MODEL, // Anthropic default
             }
         }
@@ -2109,6 +2193,65 @@ pub mod config {
                 }
             }
             None
+        }
+
+        /// Load project-level settings for `cwd` (synchronous twin of
+        /// [`Self::find_project_settings`]). Walks up from `cwd` looking for
+        /// `.clawde/settings.json` / `.clawde/settings.jsonc` (with a legacy
+        /// `.claurst/` fallback). Returns `None` when no project file exists
+        /// or the nearest candidate fails to parse.
+        ///
+        /// Used by the TUI settings screen to tag per-entry origin (global vs
+        /// project) so the user can see *where* an effective value comes from.
+        pub fn load_project_settings_sync(cwd: &std::path::Path) -> Option<Self> {
+            let global_path = Self::global_settings_path();
+            let mut dir = cwd;
+            loop {
+                for name in &["settings.json", "settings.jsonc"] {
+                    for dir_name in &[".clawde", ".claurst"] {
+                        let candidate = dir.join(dir_name).join(name);
+                        if candidate.exists() && candidate != global_path {
+                            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                                let stripped = strip_jsonc_comments(&content);
+                                if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                    // SECURITY: mirror find_project_settings — tag
+                                    // every server defined by this repository as
+                                    // project-origin so it is gated behind approval.
+                                    for server in &mut s.config.mcp_servers {
+                                        server.origin = McpServerOrigin::Project;
+                                    }
+                                    for ps in s.projects.values_mut() {
+                                        for server in &mut ps.mcp_servers {
+                                            server.origin = McpServerOrigin::Project;
+                                        }
+                                    }
+                                    return Some(s);
+                                }
+                            }
+                            // Found a file but couldn't parse — stop here, don't go up.
+                            return None;
+                        }
+                    }
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent,
+                    None => break,
+                }
+            }
+            None
+        }
+
+        /// Effective settings for `cwd` — global merged with project, project
+        /// winning — computed synchronously. Synchronous twin of
+        /// [`Self::load_hierarchical`] for TUI paths that cannot await
+        /// (the settings screen, which needs the merged view to display honest
+        /// per-entry values and origin tags).
+        pub fn load_effective_sync(cwd: &std::path::Path) -> Self {
+            let mut merged = Self::load_sync().unwrap_or_default();
+            if let Some(project_settings) = Self::load_project_settings_sync(cwd) {
+                merged = Self::merge(merged, project_settings);
+            }
+            merged
         }
 
         /// Merge two settings with `override_settings` taking priority.
@@ -5013,6 +5156,38 @@ mod tests {
             McpServerOrigin::Project,
             "project-defined server must be tagged Project origin and cannot forge User"
         );
+    }
+
+    /// Synchronous variants of the hierarchical load used by the TUI settings
+    /// screen: `load_project_settings_sync` must find the nearest project file
+    /// and `load_effective_sync` must merge it over the global settings with
+    /// the project winning.
+    #[test]
+    fn load_project_settings_sync_finds_project_overrides() {
+        use crate::config::Settings;
+        let dir = tempfile::tempdir().unwrap();
+        let clawde_dir = dir.path().join(".clawde");
+        std::fs::create_dir_all(&clawde_dir).unwrap();
+
+        let mut project = Settings::default();
+        project.config.model = Some("free/auto".to_string());
+        project.config.verbose = true;
+        std::fs::write(
+            clawde_dir.join("settings.json"),
+            serde_json::to_string_pretty(&project).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = Settings::load_project_settings_sync(dir.path());
+        let loaded = loaded.expect("project settings file should be found");
+        assert_eq!(loaded.config.model.as_deref(), Some("free/auto"));
+        assert!(loaded.config.verbose);
+
+        // Effective merge must carry the project values even when the real
+        // global file (in the home dir) has different ones.
+        let effective = Settings::load_effective_sync(dir.path());
+        assert_eq!(effective.config.model.as_deref(), Some("free/auto"));
+        assert!(effective.config.verbose);
     }
 
     #[test]

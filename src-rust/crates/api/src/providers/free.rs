@@ -205,9 +205,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "cline",
         title: "Cline",
         key_url: "app.cline.bot/settings",
-        default_model: "stepfun/step-3.7-flash",
-        model_family: "step-3.7-flash",
-        note: "live free-model API — auto-discovers best model at startup",
+        default_model: "deepseek/deepseek-v4-flash",
+        model_family: "deepseek-v4-flash",
+        note: "live free-model API — auto-discovers best model at startup (currently deepseek-v4-flash)",
         tool_calling: true,
         max_tokens_cap: Some(8_192),
         fallback_models: &[],
@@ -514,6 +514,69 @@ pub fn fetch_cline_free_model(cline_api_key: &str) -> Option<String> {
         );
 
         Some(model_id.to_string())
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+/// Fetch ALL current free models from Cline's recommended-models API.
+///
+/// Same endpoint as [`fetch_cline_free_model`] but returns every model ID
+/// instead of just the first. The model IDs are in `provider/model` format
+/// (e.g. `deepseek/deepseek-v4-flash`).
+///
+/// Returns the full list of free model IDs, or `None` if the API is
+/// unreachable, the key is invalid, or the response is unparseable.
+pub fn fetch_cline_free_models(cline_api_key: &str) -> Option<Vec<String>> {
+    let key = cline_api_key.to_string();
+    std::thread::spawn(move || {
+        let url = "https://api.cline.bot/api/v1/ai/cline/recommended-models";
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| {
+                client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {}", key))
+                    .send()
+            })
+        else {
+            tracing::warn!("fetch_cline_free_models: HTTP request failed");
+            return None;
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "fetch_cline_free_models: HTTP {} — check Cline API key",
+                response.status(),
+            );
+            return None;
+        }
+
+        let Ok(data) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_cline_free_models: failed to parse JSON");
+            return None;
+        };
+
+        let free_models = data.get("free").and_then(|v| v.as_array())?;
+        let ids: Vec<String> = free_models
+            .iter()
+            .filter_map(|m| m.get("id")?.as_str().map(String::from))
+            .collect();
+
+        if ids.is_empty() {
+            tracing::warn!("fetch_cline_free_models: no free models in response");
+            return None;
+        }
+
+        tracing::info!(
+            "Cline free models: {} (first: {})",
+            ids.len(),
+            ids.first().unwrap_or(&String::new()),
+        );
+
+        Some(ids)
     })
     .join()
     .ok()
@@ -1551,9 +1614,13 @@ fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLimitIn
 /// support GET at all (405), so every probe goes through the chat endpoint
 /// (see [`probe_cloudflare_chat`]).
 fn models_endpoint_validates_auth(upstream_id: &str) -> bool {
+    // Cline's /recommended-models endpoint DOES reject bad keys with 401,
+    // so the models response alone proves key validity — no chat probe needed.
+    // (Conversely, forcing a chat probe would flag keys as unhealthy during
+    // Cline's upstream chat outages even though the key itself is fine.)
     !matches!(
         upstream_id,
-        "nvidia" | "huggingface" | "openrouter" | "sambanova" | "cline" | "cloudflare"
+        "nvidia" | "huggingface" | "openrouter" | "sambanova" | "cloudflare"
     )
 }
 
@@ -1651,7 +1718,7 @@ fn chat_probe_for(upstream_id: &str) -> Option<(&'static str, &'static str)> {
         ),
         "openrouter" => ("https://openrouter.ai/api/v1", "openrouter/free"),
         "sambanova" => ("https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct"),
-        "cline" => ("https://api.cline.bot/v1", "stepfun/step-3.7-flash"),
+        "cline" => ("https://api.cline.bot/api/v1", "deepseek/deepseek-v4-flash"),
         // Only the 5 auth-lax upstreams reach this probe — every caller gates
         // on `!models_endpoint_validates_auth`. opencode-zen is handled by its
         // models 2xx, so this arm is defensive only.
@@ -1688,9 +1755,22 @@ fn validate_key_via_chat(
         .send()
     {
         Ok(response) => {
-            let status = response.status();
-            if status.as_u16() == 401 || status.as_u16() == 403 {
+            let status = response.status().as_u16();
+            if status == 401 || status == 403 {
                 Err(format!("Invalid API key (HTTP {})", status))
+            } else if status >= 500 {
+                // Server-side outage — read the body for diagnostic clues
+                // so the health probe doesn't treat a real key as healthy
+                // (e.g. Cline's "empty response content" upstream failure).
+                let body = response.text().unwrap_or_default();
+                let detail = if body.contains("empty response content") {
+                    "upstream provider returned empty response"
+                } else if !body.is_empty() {
+                    &body[..body.len().min(120)]
+                } else {
+                    "—"
+                };
+                Err(format!("Server error (HTTP {}): {}", status, detail))
             } else {
                 Ok(response)
             }
@@ -3371,7 +3451,6 @@ mod tests {
             "huggingface",
             "openrouter",
             "sambanova",
-            "cline",
             "cloudflare",
         ] {
             assert!(
@@ -3381,7 +3460,9 @@ mod tests {
             );
         }
         // Everything else validates the key on the models endpoint.
-        for id in ["groq", "cerebras", "google", "mistral", "cohere", "zai"] {
+        for id in [
+            "groq", "cerebras", "google", "mistral", "cohere", "zai", "cline",
+        ] {
             assert!(
                 models_endpoint_validates_auth(id),
                 "{} should validate auth",

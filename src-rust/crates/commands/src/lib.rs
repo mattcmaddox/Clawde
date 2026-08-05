@@ -1764,6 +1764,35 @@ impl SlashCommand for NamedCommandAdapter {
     }
 }
 
+// ---- /unload ------------------------------------------------------------
+
+/// Unload the Ollama model from VRAM by sending a request with keep_alive=0.
+pub struct UnloadCommand;
+
+#[async_trait]
+impl SlashCommand for UnloadCommand {
+    fn name(&self) -> &str {
+        "unload"
+    }
+    fn description(&self) -> &str {
+        "Unload the Ollama model from GPU VRAM"
+    }
+    fn help(&self) -> &str {
+        "Usage: /unload\n\n\
+         Forces Ollama to immediately unload the current model from VRAM,\n\
+         freeing the GPU for other applications (e.g. gaming). The model\n\
+         will reload on the next chat request."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        match clawde_core::ollama_unload_models().await {
+            Ok(0) => CommandResult::Message("No models currently loaded in Ollama.".to_string()),
+            Ok(n) => CommandResult::Message(format!("Unloaded {} model(s) from VRAM.", n)),
+            Err(e) => CommandResult::Error(e),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -1806,9 +1835,11 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(PlanCommand),
         Box::new(TasksCommand),
         Box::new(SessionCommand),
+        Box::new(HistoryCommand),
         Box::new(ForkCommand),
         Box::new(ThinkingCommand),
         Box::new(AutoCompactCommand),
+        Box::new(UnloadCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
         Box::new(KeybindingsCommand),
@@ -1839,6 +1870,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_description: "Manage and configure sub-agents",
             slash_help: "Usage: /agents [list|create|edit|delete] [name]",
         }),
+        Box::new(NewAgentCommand),
         Box::new(NamedCommandAdapter {
             slash_name: "branch",
             target_name: "branch",
@@ -2338,14 +2370,21 @@ mod tests {
     }
 
     #[test]
-    fn test_all_command_aliases_includes_session_history() {
+    fn test_history_is_a_real_command_not_an_alias() {
+        // `/history` was promoted from a `/session` alias to a dedicated command
+        // (lists the current project's sessions). It must resolve as its own
+        // command, not as an alias pointing at `/session`.
+        let cmd = find_command("history");
+        assert!(cmd.is_some(), "expected a dedicated /history command");
+        if let Some(cmd) = cmd {
+            assert_eq!(cmd.name(), "history");
+        }
         let aliases = all_command_aliases();
         assert!(
-            aliases
+            !aliases
                 .iter()
                 .any(|(a, c, _)| a == "history" && c == "session"),
-            "expected (history → session) in {:?}",
-            aliases
+            "/history must no longer alias /session"
         );
     }
 

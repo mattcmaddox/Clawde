@@ -210,7 +210,7 @@ impl PermissionRequest {
     // Option sets
     // ------------------------------------------------------------------
 
-    /// The four canonical options (matches TS interactive permission dialog).
+    /// The five canonical options (matches TS interactive permission dialog).
     pub fn default_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption {
@@ -224,6 +224,10 @@ impl PermissionRequest {
             PermissionOption {
                 label: "Yes, always allow (persistent)".to_string(),
                 key: 'p',
+            },
+            PermissionOption {
+                label: "Accept all for rest of session".to_string(),
+                key: 'a',
             },
             PermissionOption {
                 label: "No, deny".to_string(),
@@ -247,7 +251,7 @@ impl PermissionRequest {
         opts
     }
 
-    /// FileRead options (4): once / session / persistent / deny.
+    /// FileRead options (5): once / session / persistent / accept-all / deny.
     pub fn file_read_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption {
@@ -263,13 +267,17 @@ impl PermissionRequest {
                 key: 'p',
             },
             PermissionOption {
+                label: "Accept all for rest of session".to_string(),
+                key: 'a',
+            },
+            PermissionOption {
                 label: "No, deny".to_string(),
                 key: 'n',
             },
         ]
     }
 
-    /// FileWrite options (4): once / session / project / deny.
+    /// FileWrite options (5): once / session / project / accept-all / deny.
     pub fn file_write_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption {
@@ -283,6 +291,10 @@ impl PermissionRequest {
             PermissionOption {
                 label: "Yes, always allow for this project".to_string(),
                 key: 'p',
+            },
+            PermissionOption {
+                label: "Accept all for rest of session".to_string(),
+                key: 'a',
             },
             PermissionOption {
                 label: "No, deny".to_string(),
@@ -1350,17 +1362,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn standard_permission_request_has_four_options() {
+    fn standard_permission_request_has_five_options() {
         let pr = PermissionRequest::standard(
             "id1".to_string(),
             "Bash".to_string(),
             "Run a shell command".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
+        assert_eq!(pr.options.len(), 5);
         assert_eq!(pr.options[0].key, 'y');
         assert_eq!(pr.options[1].key, 'Y');
         assert_eq!(pr.options[2].key, 'p');
-        assert_eq!(pr.options[3].key, 'n');
+        assert_eq!(pr.options[3].key, 'a');
+        assert_eq!(pr.options[4].key, 'n');
     }
 
     #[test]
@@ -1498,7 +1511,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bash_without_prefix_has_four_options() {
+    fn bash_without_prefix_has_five_options() {
         let pr = PermissionRequest::bash(
             "id-bash-1".to_string(),
             "Bash".to_string(),
@@ -1506,7 +1519,7 @@ mod tests {
             "ls -la".to_string(),
             None,
         );
-        assert_eq!(pr.options.len(), 4);
+        assert_eq!(pr.options.len(), 5);
         assert_eq!(
             pr.kind,
             PermissionDialogKind::Bash {
@@ -1519,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_with_prefix_has_five_options() {
+    fn bash_with_prefix_has_six_options() {
         let pr = PermissionRequest::bash(
             "id-bash-2".to_string(),
             "Bash".to_string(),
@@ -1527,49 +1540,51 @@ mod tests {
             "git status".to_string(),
             Some("git ".to_string()),
         );
-        assert_eq!(pr.options.len(), 5);
-        // 5th option (index 3 before deny) carries the prefix label
+        assert_eq!(pr.options.len(), 6);
+        // 5th option (index 4, before deny) carries the prefix label
         assert!(
-            pr.options[3].label.contains("git "),
+            pr.options[4].label.contains("git "),
             "Expected prefix in label: {:?}",
-            pr.options[3].label
+            pr.options[4].label
         );
         assert!(
-            pr.options[3].label.ends_with('*'),
+            pr.options[4].label.ends_with('*'),
             "Expected * suffix: {:?}",
-            pr.options[3].label
+            pr.options[4].label
         );
         // Deny is still the last option
-        assert_eq!(pr.options[4].key, 'n');
+        assert_eq!(pr.options[5].key, 'n');
     }
 
     #[test]
-    fn file_read_has_four_options() {
+    fn file_read_has_five_options() {
         let pr = PermissionRequest::file_read(
             "id-fr".to_string(),
             "ReadFile".to_string(),
             "Wants to read /etc/hosts".to_string(),
             "/etc/hosts".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
+        assert_eq!(pr.options.len(), 5);
         assert_eq!(pr.options[0].key, 'y');
         assert_eq!(pr.options[1].key, 'Y');
         assert_eq!(pr.options[2].key, 'p'); // persistent allow
-        assert_eq!(pr.options[3].key, 'n');
+        assert_eq!(pr.options[3].key, 'a'); // accept all for session
+        assert_eq!(pr.options[4].key, 'n');
         assert!(matches!(pr.kind, PermissionDialogKind::FileRead { .. }));
     }
 
     #[test]
-    fn file_write_has_four_options() {
+    fn file_write_has_five_options() {
         let pr = PermissionRequest::file_write(
             "id-fw".to_string(),
             "WriteFile".to_string(),
             "Wants to write /tmp/out.txt".to_string(),
             "/tmp/out.txt".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
+        assert_eq!(pr.options.len(), 5);
         assert_eq!(pr.options[2].key, 'p'); // project-level allow
-        assert_eq!(pr.options[3].key, 'n');
+        assert_eq!(pr.options[3].key, 'a'); // accept all for session
+        assert_eq!(pr.options[4].key, 'n');
         assert!(matches!(pr.kind, PermissionDialogKind::FileWrite { .. }));
     }
 
@@ -1584,24 +1599,24 @@ mod tests {
     }
 
     #[test]
-    fn permission_key_digit_out_of_range_ignored_for_four_option_dialog() {
+    fn permission_key_digit_out_of_range_ignored_for_five_option_dialog() {
         let mut pr = PermissionRequest::file_read(
             "id".to_string(),
             "ReadFile".to_string(),
             "desc".to_string(),
             "/foo".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
-        // Press '5' — out of range for a 4-option dialog, should NOT confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
-        assert!(!confirmed);
-        // Press '6' — also out of range.
+        assert_eq!(pr.options.len(), 5);
+        // Press '6' — out of range for a 5-option dialog, should NOT confirm.
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('6')));
+        assert!(!confirmed);
+        // Press '7' — also out of range.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('7')));
         assert!(!confirmed);
     }
 
     #[test]
-    fn permission_key_digit_5_valid_for_five_option_bash_dialog() {
+    fn permission_key_digit_5_valid_for_six_option_bash_dialog() {
         let mut pr = PermissionRequest::bash(
             "id".to_string(),
             "Bash".to_string(),
@@ -1609,21 +1624,21 @@ mod tests {
             "git push".to_string(),
             Some("git ".to_string()),
         );
-        assert_eq!(pr.options.len(), 5);
-        // '5' should select the 5th option (deny) and confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
+        assert_eq!(pr.options.len(), 6);
+        // '6' should select the 6th option (deny) and confirm.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('6')));
         assert!(confirmed);
-        assert_eq!(pr.selected_option, 4);
+        assert_eq!(pr.selected_option, 5);
     }
 
     #[test]
     fn permission_key_char_shortcut_confirms() {
         let mut pr =
             PermissionRequest::standard("id".to_string(), "Bash".to_string(), "desc".to_string());
-        // Press 'n' → deny (index 3).
+        // Press 'n' → deny (index 4).
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('n')));
         assert!(confirmed);
-        assert_eq!(pr.selected_option, 3);
+        assert_eq!(pr.selected_option, 4);
     }
 
     #[test]

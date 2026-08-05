@@ -8,6 +8,7 @@ use async_trait::async_trait;
 pub struct ProvidersCommand;
 pub struct ConnectCommand;
 pub struct AgentCommand;
+pub struct NewAgentCommand;
 
 // ---- /providers -------------------------------------------------------------
 
@@ -79,6 +80,33 @@ impl SlashCommand for ProvidersCommand {
         }
 
         CommandResult::Message(lines.join("\n"))
+    }
+}
+
+// ---- /new-agent -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for NewAgentCommand {
+    fn name(&self) -> &str {
+        "new-agent"
+    }
+    fn description(&self) -> &str {
+        "Create a new sub-agent"
+    }
+    fn help(&self) -> &str {
+        "Usage: /new-agent\n\nIn the TUI this opens the agent editor pre-filled for a new agent.\nIn headless mode, create a definition by adding a markdown file to\n.clawde/agents/ (see `clawde agents create <name>` for the template)."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        // The TUI intercepts /new-agent before this executes and opens the
+        // agent editor directly. If we get here (headless mode), point the
+        // user at the template.
+        CommandResult::Message(
+            "Create a new agent by adding a markdown file to .clawde/agents/.\n\
+             Run `clawde agents create <name>` to see the template, or use /agents\n\
+             in the TUI and select 'Create new agent'."
+                .to_string(),
+        )
     }
 }
 

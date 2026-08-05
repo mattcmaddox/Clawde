@@ -533,8 +533,25 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // Determine working directory early — project-level settings (which can
+    // set `verbose: true`) live under the repo's `.clawde/`, so the cwd must
+    // be known before settings are loaded.
+    let cwd = cli
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // Load settings from disk (hierarchical: global < project) BEFORE the
+    // tracing subscriber initialises so a persisted `verbose: true` in
+    // settings.json can raise the log level. Anything logged while loading is
+    // dropped — nothing diagnostic is produced before logging is configured.
+    let mut settings = Settings::load_hierarchical(&cwd).await;
+
+    // CLI flag wins; otherwise honor the persisted `verbose` setting.
+    let verbose = cli.verbose || settings.config.verbose;
+
     // Setup logging
-    let log_level = if cli.verbose { "debug" } else { "warn" };
+    let log_level = if verbose { "debug" } else { "warn" };
     let base_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let log_filter = base_filter
@@ -577,16 +594,8 @@ async fn main() -> anyhow::Result<()> {
         .without_time()
         .init();
 
-    // Determine working directory
-    let cwd = cli
-        .cwd
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
     debug!(cwd = %cwd.display(), "Starting Clawde");
 
-    // Load settings from disk (hierarchical: global < project)
-    let mut settings = Settings::load_hierarchical(&cwd).await;
     // `--trust-project-mcp` (and automation use cases) flip on the same global
     // trust the user could set via `trustProjectMcpServers`. Folding it into
     // `settings` here keeps a single source of truth for the gate, including
@@ -609,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
     }
-    config.verbose = cli.verbose;
+    config.verbose = verbose;
     config.output_format = cli.output_format.into();
     // --bare implies --no-claude-md: opening an untrusted repo in bare mode
     // must not load or inject AGENTS.md memory files.
@@ -1014,7 +1023,16 @@ async fn main() -> anyhow::Result<()> {
             free_provider,
             None, // headless — no TUI to report to
         ));
-        run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
+        run_headless(
+            &cli,
+            verbose,
+            client,
+            tools,
+            tool_ctx,
+            query_config,
+            cost_tracker,
+        )
+        .await
     } else {
         let auth_store = clawde_core::AuthStore::load();
         let has_saved_credentials = !auth_store.credentials.is_empty()
@@ -1646,6 +1664,7 @@ fn filter_tools_for_agent(
 
 async fn run_headless(
     cli: &Cli,
+    verbose: bool,
     client: Arc<clawde_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     tool_ctx: ToolContext,
@@ -1871,7 +1890,7 @@ async fn run_headless(
         CliOutputFormat::Text => {
             // Streaming text was already printed; add newline
             println!();
-            if cli.verbose {
+            if verbose {
                 eprintln!(
                     "\nTokens: {} in / {} out | Cost: ${:.4}",
                     cost_tracker.input_tokens(),
@@ -1947,6 +1966,65 @@ fn permission_request_from_core(
             pending.request.path.clone(),
         ),
     }
+}
+
+/// Append any session messages not yet mirrored to the per-project JSONL
+/// transcript (`~/.clawde/projects/<encoded-root>/<session>.jsonl`).
+///
+/// The transcript is append-only, so `written` tracks how many of
+/// `session.messages` have already been written to avoid duplicate entries.
+/// When the session id changes (`/new`, or a resumed session) the counter
+/// resets and the new session's messages are written from scratch.
+///
+/// This is what makes the welcome screen's project-scoped "Recent activity"
+/// list (and `/history`, `/stats`) see real sessions instead of an empty
+/// directory — the JSONL transcript is the directory-project history store.
+async fn sync_transcript_to_disk(
+    session: &clawde_core::history::ConversationSession,
+    project_root: &std::path::Path,
+    cwd: &str,
+    written: &mut usize,
+    written_session: &mut String,
+) {
+    if *written_session != session.id {
+        *written_session = session.id.clone();
+        *written = 0;
+    }
+    if session.messages.len() <= *written {
+        return;
+    }
+    let Ok(path) = clawde_core::session_storage::transcript_path(project_root, &session.id) else {
+        return;
+    };
+    let msgs = &session.messages;
+    for (i, msg) in msgs[*written..].iter().enumerate() {
+        let idx = *written + i;
+        let parent_uuid = idx.checked_sub(1).and_then(|p| msgs[p].uuid.as_deref());
+        let uuid = match msg.uuid.clone() {
+            Some(u) => u,
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        let entry = match msg.role {
+            clawde_core::types::Role::User => clawde_core::session_storage::make_user_entry(
+                msg.clone(),
+                &uuid,
+                parent_uuid,
+                &session.id,
+                cwd,
+            ),
+            clawde_core::types::Role::Assistant => {
+                clawde_core::session_storage::make_assistant_entry(
+                    msg.clone(),
+                    &uuid,
+                    parent_uuid,
+                    &session.id,
+                    cwd,
+                )
+            }
+        };
+        let _ = clawde_core::session_storage::write_transcript_entry(&path, &entry).await;
+    }
+    *written = msgs.len();
 }
 
 async fn run_interactive(
@@ -2033,6 +2111,16 @@ async fn run_interactive(
     };
     let mut last_auto_save = std::time::Instant::now();
     let initial_messages = session.messages.clone();
+    // Project root for the directory-scoped JSONL transcript (git repo root,
+    // or the working dir when not in a repo) and the cwd stamped on entries.
+    let transcript_project_root = clawde_core::git_utils::get_repo_root(&tool_ctx.working_dir)
+        .unwrap_or_else(|| tool_ctx.working_dir.clone());
+    let transcript_cwd = tool_ctx.working_dir.display().to_string();
+    // Messages already mirrored to the transcript. A resumed session's history
+    // is assumed present on disk, so the mirror starts past it; `/new` resets
+    // via the id-mismatch guard inside `sync_transcript_to_disk`.
+    let mut transcript_written = session.messages.len();
+    let mut transcript_written_id = session.id.clone();
     // Extract provider_registry before query_config is moved below.
     let provider_registry = query_config.provider_registry.clone();
 
@@ -3535,6 +3623,16 @@ async fn run_interactive(
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
                                         match selected_key {
+                                            Some('a') => {
+                                                manager.mode =
+                                                    clawde_core::config::PermissionMode::BypassPermissions;
+                                                app.config.permission_mode =
+                                                    clawde_core::config::PermissionMode::BypassPermissions;
+                                                app.status_message = Some(
+                                                    "Accept all for rest of session enabled"
+                                                        .to_string(),
+                                                );
+                                            }
                                             Some('Y') => {
                                                 if let Some(path) = selected_path.as_deref() {
                                                     manager.add_session_allow_path(
@@ -3657,6 +3755,49 @@ async fn run_interactive(
                     // Terminal resize - will be handled on next draw
                 }
                 _ => {}
+            }
+        }
+
+        // Handle click on a recent session entry in the welcome screen's right
+        // column.  `app.handle_mouse_event` above may have set the field; take it
+        // here and kick off a session resume.
+        if let Some(session_id) = app.clicked_recent_session_id.take() {
+            if !session_id.is_empty() {
+                match clawde_core::history::load_session(&session_id).await {
+                    Ok(resumed_session) => {
+                        session = resumed_session;
+                        messages = session.messages.clone();
+                        app.replace_messages(messages.clone());
+                        cmd_ctx.config.model = Some(session.model.clone());
+                        app.config.model = Some(session.model.clone());
+                        tool_ctx.config.model = Some(session.model.clone());
+                        app.model_name = session.model.clone();
+                        tool_ctx.session_id = session.id.clone();
+                        tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                            clawde_core::file_history::FileHistory::new(),
+                        ));
+                        tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        cmd_ctx.session_id = session.id.clone();
+                        cmd_ctx.session_title = session.title.clone();
+                        if let Some(saved_dir) = session.working_dir.as_ref() {
+                            let saved_path = std::path::PathBuf::from(saved_dir);
+                            if saved_path.exists() {
+                                tool_ctx.working_dir = saved_path.clone();
+                                cmd_ctx.working_dir = saved_path;
+                            }
+                        }
+                        app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                        app.attach_turn_diff_state(
+                            tool_ctx.file_history.clone(),
+                            tool_ctx.current_turn.clone(),
+                        );
+                        clawde_tui::update_terminal_title(session.title.as_deref());
+                        app.status_message = Some(format!("Resumed session {}.", &session.id[..8]));
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Failed to resume session: {}", e));
+                    }
+                }
             }
         }
 
@@ -4780,6 +4921,16 @@ async fn run_interactive(
         if last_auto_save.elapsed() >= std::time::Duration::from_secs(30) {
             session.updated_at = chrono::Utc::now();
             let _ = clawde_core::history::save_session(&session).await;
+            // Mirror new messages into the project-scoped JSONL transcript so
+            // the welcome screen recents stay current even mid-session.
+            sync_transcript_to_disk(
+                &session,
+                &transcript_project_root,
+                &transcript_cwd,
+                &mut transcript_written,
+                &mut transcript_written_id,
+            )
+            .await;
             last_auto_save = std::time::Instant::now();
         }
 
@@ -4790,6 +4941,73 @@ async fn run_interactive(
 
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
+    }
+
+    // Finalise the project transcript before terminal restore (also covers the
+    // SIGTERM path where the event loop breaks and bypasses the per-turn save
+    // points): mirror any remaining messages, then append the session-exit
+    // metadata (last prompt + auto-generated short title).
+    sync_transcript_to_disk(
+        &session,
+        &transcript_project_root,
+        &transcript_cwd,
+        &mut transcript_written,
+        &mut transcript_written_id,
+    )
+    .await;
+    if !session.messages.is_empty() {
+        if let Ok(path) =
+            clawde_core::session_storage::transcript_path(&transcript_project_root, &session.id)
+        {
+            // Record the most recent user prompt for cheap tail-read previews.
+            if let Some(last_prompt) = session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == clawde_core::types::Role::User)
+                .map(|m| m.get_all_text())
+                .filter(|t| !t.trim().is_empty())
+            {
+                let _ = clawde_core::session_storage::write_last_prompt(
+                    &path,
+                    &session.id,
+                    last_prompt.trim(),
+                )
+                .await;
+            }
+
+            // Non-blocking auto-title generation.  Spawned as a fire-and-forget
+            // task so the exit path (session save, LSP shutdown, terminal restore)
+            // is never blocked by a slow provider.  The title is written to the
+            // JSONL transcript directly; the session JSON is saved below without
+            // waiting for the title to arrive.
+            if session.title.is_none() && session.messages.len() >= 2 {
+                let messages = session.messages.clone();
+                let session_id = session.id.clone();
+                let client = client.clone();
+                let path = path.clone();
+                tokio::spawn(async move {
+                    let cancel = CancellationToken::new();
+                    let title_cfg = clawde_query::session_title::SessionTitleConfig::default();
+                    let gen = clawde_query::session_title::generate_session_title(
+                        &messages, &client, &title_cfg, cancel,
+                    );
+                    if let Ok(Some(title)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(8), gen).await
+                    {
+                        let title = title.trim().to_string();
+                        if !title.is_empty() {
+                            let _ = clawde_core::session_storage::write_ai_title(
+                                &path,
+                                &session_id,
+                                &title,
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+        }
     }
 
     // Save session state before terminal restore (critical for SIGTERM path

@@ -211,6 +211,16 @@ fn short_relative_time(mtime: std::time::SystemTime) -> String {
     short_relative_secs(secs)
 }
 
+/// Whether a recent-session entry is old enough that a relative timestamp
+/// ("2h ago") is less useful than an absolute date/time ("Aug 3 14:22").
+/// Sessions older than 24 h get the absolute form.
+fn recent_activity_is_stale(mtime: std::time::SystemTime) -> bool {
+    match std::time::SystemTime::now().duration_since(mtime) {
+        Ok(d) => d.as_secs() >= 86_400,
+        Err(_) => false, // clock skew → treat as fresh
+    }
+}
+
 /// Formatter split out from [`short_relative_time`] so it can be unit-tested
 /// without depending on the wall clock.
 fn short_relative_secs(secs: u64) -> String {
@@ -231,7 +241,11 @@ fn short_relative_secs(secs: u64) -> String {
 /// truncated to fit `width`), or a single dimmed "No recent activity" line when
 /// there are none. Split out from [`render_welcome_box`] so it can be unit
 /// tested from controlled state without the surrounding layout.
-fn recent_activity_lines(recent: &[crate::app::RecentSession], width: usize) -> Vec<Line<'static>> {
+fn recent_activity_lines(
+    recent: &[crate::app::RecentSession],
+    width: usize,
+    hovered_idx: Option<usize>,
+) -> Vec<Line<'static>> {
     if recent.is_empty() {
         return vec![Line::from(Span::styled(
             "No recent activity",
@@ -242,16 +256,39 @@ fn recent_activity_lines(recent: &[crate::app::RecentSession], width: usize) -> 
     recent
         .iter()
         .take(5)
-        .map(|s| {
-            let when = short_relative_time(s.mtime);
+        .enumerate()
+        .map(|(i, s)| {
+            let is_hovered = hovered_idx == Some(i);
+            // Fresh sessions get a relative time ("2h ago"); stale ones get an
+            // absolute date/time ("Aug 3 14:22") so the list stays meaningful
+            // across days.
+            let when = if recent_activity_is_stale(s.mtime) {
+                clawde_core::format_utils::format_short_absolute_time(s.mtime)
+            } else {
+                short_relative_time(s.mtime)
+            };
             // Reserve room for the trailing " <time>" so the label truncates
             // instead of wrapping onto a second line.
             let label_w = width.saturating_sub(when.chars().count() + 1);
             let label = truncate_end(&s.label, label_w.max(1));
+            let label_style = if is_hovered {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let time_style = if is_hovered {
+                Style::default()
+                    .fg(Color::Rgb(180, 180, 180))
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::styled(label, label_style),
                 Span::raw(" "),
-                Span::styled(when, Style::default().fg(Color::DarkGray)),
+                Span::styled(when, time_style),
             ])
         })
         .collect()
@@ -2031,11 +2068,24 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // Record the absolute screen row where "Recent activity" starts, so the
+    // mouse handler can compute which session row was clicked without guessing
+    // the tip-text height.  The right column is rendered as a single Paragraph
+    // starting at h_chunks[2].y; the "Recent activity" header is at the row
+    // count of right_lines (before we push it).
+    let recent_header_row = h_chunks[2].y + right_lines.len() as u16;
+
     right_lines.push(Line::from(Span::styled(
         "Recent activity",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
-    right_lines.extend(recent_activity_lines(&app.recent_sessions, right_w_usize));
+    right_lines.extend(recent_activity_lines(
+        &app.recent_sessions,
+        right_w_usize,
+        app.recent_activity_hovered_idx.get(),
+    ));
+
+    app.recent_activity_start_row.set(recent_header_row + 1);
 
     frame.render_widget(
         Paragraph::new(right_lines).wrap(Wrap { trim: false }),
@@ -2140,6 +2190,22 @@ fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ),
         bottom,
     ];
+    // Show up to 3 recent sessions in the compact banner (only when the welcome
+    // screen is not showing — the full box already has the full list).
+    if !app.recent_sessions.is_empty() && !app.messages.is_empty() {
+        let recents = recent_activity_lines(&app.recent_sessions, inner_w, None);
+        if !recents.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " Recent activity",
+                Style::default()
+                    .fg(app.accent_color)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for rline in recents.into_iter().take(3) {
+                lines.push(rline);
+            }
+        }
+    }
     lines.extend(startup_notice_lines(app, width));
     lines.push(Line::from(""));
     lines
@@ -2985,13 +3051,17 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         Vec::new()
     };
 
-    // Append key-ring status when any keys are exhausted.
+    // Append key-ring status when any keys are exhausted. Only shown
+    // when the active provider is "free" — standalone providers surface
+    // their exhaustion through their own error paths, and free-catalog
+    // upstream status is noise on non-free providers (e.g. ollama).
     if let Some(ref registry) = app.provider_registry {
+        let active_provider = app.config.provider.as_deref().unwrap_or("anthropic");
         let summaries = registry.key_ring_summaries();
         let has_exhausted = summaries
             .iter()
             .any(|(_, active, total, _)| *active < *total);
-        if has_exhausted && !spans.is_empty() {
+        if has_exhausted && !spans.is_empty() && active_provider == "free" {
             spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
             for (provider, active, total, retry_secs) in &summaries {
                 if *active < *total {
@@ -3031,7 +3101,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         let has_cooled = cooldowns
             .iter()
             .any(|(_, entries)| entries.iter().any(|(_, _, retry)| retry.is_some()));
-        if has_cooled {
+        if has_cooled && active_provider == "free" {
             if !spans.is_empty() {
                 spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
             }
@@ -3358,14 +3428,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // Health sweep indicator — red warning marker when the last background
-        // probe found dead keys. Hidden when everything is healthy.
-        if let Some(sweep) = app.last_health_sweep.as_ref() {
-            if sweep.unhealthy > 0 {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    format!(" \u{26a0} {} dead ", sweep.unhealthy),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
+        // probe found dead keys. Hidden when everything is healthy, and only
+        // relevant when the active provider is the free composite.
+        if app.config.provider.as_deref() == Some("free") {
+            if let Some(sweep) = app.last_health_sweep.as_ref() {
+                if sweep.unhealthy > 0 {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        format!(" \u{26a0} {} dead ", sweep.unhealthy),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                }
             }
         }
 
@@ -4863,13 +4936,14 @@ mod recent_activity_tests {
 
     fn recent(label: &str, secs_ago: u64) -> RecentSession {
         RecentSession {
+            session_id: "test-session".to_string(),
             label: label.to_string(),
             mtime: SystemTime::now() - Duration::from_secs(secs_ago),
         }
     }
 
     fn lines_text(recent: &[RecentSession], width: usize) -> Vec<String> {
-        recent_activity_lines(recent, width)
+        recent_activity_lines(recent, width, None)
             .iter()
             .map(flatten_line_text)
             .collect()
@@ -4904,15 +4978,16 @@ mod recent_activity_tests {
 
     #[test]
     fn populated_state_shows_titles_and_relative_times() {
+        // Both sessions are under 24 h old → relative timestamps.
         let sessions = vec![
             recent("Fix the parser bug", 2 * 3_600),
-            recent("Wire up onboarding", 3 * 86_400),
+            recent("Wire up onboarding", 6 * 3_600),
         ];
         let out = lines_text(&sessions, 40).join("\n");
         assert!(out.contains("Fix the parser bug"), "first title: {out:?}");
         assert!(out.contains("2h ago"), "first time: {out:?}");
         assert!(out.contains("Wire up onboarding"), "second title: {out:?}");
-        assert!(out.contains("3d ago"), "second time: {out:?}");
+        assert!(out.contains("6h ago"), "second time: {out:?}");
         // The placeholder must NOT appear when there is real activity.
         assert!(
             !out.contains("No recent activity"),
@@ -4921,11 +4996,29 @@ mod recent_activity_tests {
     }
 
     #[test]
+    fn stale_sessions_show_absolute_date_time() {
+        // Older than 24 h → the list shows an absolute timestamp instead of
+        // "3d ago", so cross-day sessions stay unambiguous.
+        let sessions = vec![recent("Old task", 3 * 86_400)];
+        let out = lines_text(&sessions, 40).join("\n");
+        assert!(out.contains("Old task"), "title: {out:?}");
+        assert!(
+            !out.contains("3d ago"),
+            "stale sessions must not show relative time: {out:?}"
+        );
+        // Absolute form contains a space-separated month/day.
+        assert!(
+            out.len() > "Old task".len() + 9,
+            "expected trailing timestamp, got {out:?}"
+        );
+    }
+
+    #[test]
     fn caps_at_five_entries() {
         let sessions: Vec<RecentSession> = (0..8)
             .map(|i| recent(&format!("session {i}"), 60))
             .collect();
-        assert_eq!(recent_activity_lines(&sessions, 40).len(), 5);
+        assert_eq!(recent_activity_lines(&sessions, 40, None).len(), 5);
     }
 
     #[test]

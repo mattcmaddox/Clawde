@@ -288,6 +288,12 @@ pub struct KeyRingEntrySnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderKeyRingSnapshot {
     pub entries: Vec<KeyRingEntrySnapshot>,
+    /// Unix timestamp (seconds since epoch) when this snapshot was saved.
+    /// Used to adjust cooldowns on load: if 300s remained at save time and
+    /// 120s have elapsed, only 180s remain. Old snapshots without this field
+    /// are treated as if they were saved just now (no adjustment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_at_unix: Option<u64>,
 }
 
 impl KeyRing {
@@ -296,6 +302,10 @@ impl KeyRing {
     /// portable across process restarts.
     pub fn to_snapshot(&self) -> ProviderKeyRingSnapshot {
         let now = Instant::now();
+        let saved_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .ok();
         ProviderKeyRingSnapshot {
             entries: self
                 .entries
@@ -312,6 +322,7 @@ impl KeyRing {
                     }
                 })
                 .collect(),
+            saved_at_unix: saved_at,
         }
     }
 
@@ -320,15 +331,35 @@ impl KeyRing {
     /// ring are silently ignored. Keys in this ring that don't appear in the
     /// snapshot stay active — this naturally handles the case where new keys
     /// were added while the app was closed.
+    ///
+    /// When `saved_at_unix` is present, elapsed time since the snapshot was
+    /// written is subtracted from each cooldown so that a key saved with 300s
+    /// remaining and loaded 120s later only has 180s remaining. Snapshots
+    /// without this field (old format) are treated as if saved just now.
     pub fn apply_snapshot(&mut self, snapshot: &ProviderKeyRingSnapshot) {
         let now = Instant::now();
+        // Compute wall-clock elapsed seconds since the snapshot was saved.
+        // This adjusts cooldowns that span process restarts.
+        let elapsed = snapshot.saved_at_unix.and_then(|saved_at| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|now_unix| now_unix.as_secs().saturating_sub(saved_at))
+        });
         for entry in &mut self.entries {
             if let Some(saved) = snapshot.entries.iter().find(|s| s.key == entry.key) {
-                if saved.cooldown_remaining_secs > 0 {
-                    entry.cooldown_until =
-                        Some(now + std::time::Duration::from_secs(saved.cooldown_remaining_secs));
+                let adjusted = match elapsed {
+                    Some(elapsed_secs) => {
+                        saved.cooldown_remaining_secs.saturating_sub(elapsed_secs)
+                    }
+                    None => saved.cooldown_remaining_secs, // old snapshot, no adjustment
+                };
+                if adjusted > 0 {
+                    entry.cooldown_until = Some(now + std::time::Duration::from_secs(adjusted));
                     entry.last_error = saved.last_error.clone();
                 }
+                // If adjusted ≤ 0, the cooldown already expired while the app
+                // was closed — leave the key active (clear last_error too).
             }
         }
     }
@@ -662,6 +693,7 @@ mod tests {
                     last_error: Some("deleted key".into()),
                 },
             ],
+            saved_at_unix: None,
         };
 
         ring.apply_snapshot(&snapshot);
@@ -682,6 +714,7 @@ mod tests {
                 cooldown_remaining_secs: 60,
                 last_error: Some("rate limited".into()),
             }],
+            saved_at_unix: None,
         };
 
         ring.apply_snapshot(&snapshot);
@@ -753,6 +786,7 @@ mod tests {
                 cooldown_remaining_secs: 0, // expired
                 last_error: Some("rate limited".into()),
             }],
+            saved_at_unix: None,
         };
         serde_json::to_writer(std::fs::File::create(&path).unwrap(), &snapshot).unwrap();
 
@@ -765,6 +799,90 @@ mod tests {
         assert!(
             statuses[0].last_error.is_none(),
             "last_error should be None after expired cooldown"
+        );
+    }
+
+    #[test]
+    fn saved_at_unix_adjusts_cooldown_for_elapsed_time() {
+        // A snapshot saved with 300s remaining + saved_at_unix from 120s ago:
+        // cooldown should be 300 - 120 = 180s (not the full 300s).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.json");
+
+        let saved_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(120); // 120s ago
+
+        let snapshot = ProviderKeyRingSnapshot {
+            entries: vec![KeyRingEntrySnapshot {
+                key: "k1".into(),
+                cooldown_remaining_secs: 300,
+                last_error: Some("rate limited".into()),
+            }],
+            saved_at_unix: Some(saved_at),
+        };
+        serde_json::to_writer(std::fs::File::create(&path).unwrap(), &snapshot).unwrap();
+
+        let mut ring = make_ring(&["k1"]);
+        ring.load_from_file(&path);
+
+        // Key should be exhausted (180s remaining > 0).
+        assert_eq!(ring.active_count(), 0);
+        assert_eq!(ring.exhausted_count(), 1);
+
+        let statuses = ring.statuses();
+        assert!(!statuses[0].active);
+        // ~180s remaining, not the full 300s
+        let remaining = statuses[0].cooldown_remaining_secs.unwrap();
+        assert!(
+            (170..=190).contains(&remaining),
+            "expected ~180s remaining after 120s elapsed, got {}s",
+            remaining
+        );
+        assert_eq!(
+            statuses[0].last_error.as_deref(),
+            Some("rate limited"),
+            "last_error should be preserved for active cooldown"
+        );
+    }
+
+    #[test]
+    fn saved_at_unix_with_expired_cooldown_leaves_key_active() {
+        // A snapshot saved with 60s remaining + saved_at_unix from 120s ago:
+        // cooldown should be 0 → key is active.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("expired.json");
+
+        let saved_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(120); // 120s ago
+
+        let snapshot = ProviderKeyRingSnapshot {
+            entries: vec![KeyRingEntrySnapshot {
+                key: "k1".into(),
+                cooldown_remaining_secs: 60, // less than elapsed
+                last_error: Some("rate limited".into()),
+            }],
+            saved_at_unix: Some(saved_at),
+        };
+        serde_json::to_writer(std::fs::File::create(&path).unwrap(), &snapshot).unwrap();
+
+        let mut ring = make_ring(&["k1"]);
+        ring.load_from_file(&path);
+
+        // Key should be active (cooldown fully expired).
+        assert_eq!(ring.active_count(), 1, "expired cooldown => active");
+        assert_eq!(ring.exhausted_count(), 0);
+
+        let statuses = ring.statuses();
+        assert!(statuses[0].active);
+        assert!(
+            statuses[0].last_error.is_none(),
+            "last_error should be None for active key"
         );
     }
 }

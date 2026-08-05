@@ -155,7 +155,7 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         if let Some(keys) = multi_keys {
             let upstream_id = upstream.id.to_string();
             let upstream_name = upstream.title.to_string();
-            let rotating = KeyRotatingProvider::new_with_persistence(
+            let mut rotating = KeyRotatingProvider::new_with_persistence(
                 upstream_id.clone(),
                 upstream_name,
                 keys,
@@ -183,6 +183,10 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                     }
                 },
             );
+            // The FreeProvider already handles fallback at a higher level —
+            // disable the per-upstream recovery loop so that an exhausted
+            // key returns immediately instead of sleeping/retrying.
+            rotating.set_skip_recovery_loop(true);
             chain.push(FreeEntry {
                 upstream: *upstream,
                 provider: Arc::new(rotating),
