@@ -133,24 +133,13 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
             continue;
         }
         // --- multi-key path (2+ keys → wrap in KeyRotatingProvider) ---
-        let multi_keys: Option<Vec<String>> = match upstream.id {
-            // OpenCode Zen and Go share the same key env var; accept either slot.
-            "opencode-zen" => auth_store
-                .keys_for("opencode-zen")
-                .or_else(|| auth_store.keys_for("opencode-go")),
-            other => auth_store.keys_for(other),
-        }
-        .map(|k| k.to_vec())
-        // Cloud API keys are always at least 8 characters. Shorter values
-        // are placeholders or test artifacts that would fail with AuthFailed.
-        .filter(|k| k.iter().any(|k| k.trim().len() >= 8))
-        .map(|keys| {
-            keys.into_iter()
-                .map(|k| k.trim().to_string())
-                .filter(|k| k.len() >= 8)
-                .collect::<Vec<String>>()
-        })
-        .filter(|k| k.len() > 1);
+        // Uses the ring-aligned resolver so the ring's key order and slot
+        // indices are exactly the list the health poller probes (it forwards
+        // key_idx into these rings). OpenCode Zen/Go slot sharing and the
+        // >=8-char placeholder filter live in that one helper.
+        let multi_keys: Option<Vec<String>> =
+            crate::providers::free::resolve_free_upstream_keys(&auth_store, upstream.id)
+                .filter(|k| k.len() > 1);
 
         if let Some(keys) = multi_keys {
             let upstream_id = upstream.id.to_string();
