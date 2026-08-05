@@ -184,19 +184,11 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
             continue;
         }
 
-        // --- single-key path (existing logic) ---
-        let key = match upstream.id {
-            "opencode-zen" => auth_store
-                .api_key_for(clawde_core::ProviderId::OPENCODE_ZEN)
-                .or_else(|| auth_store.api_key_for(clawde_core::ProviderId::OPENCODE_GO)),
-            other => auth_store.api_key_for(other),
-        }
-        .filter(|k| !k.trim().is_empty())
-        // Cloud API keys are always at least 8 characters. Shorter values
-        // are placeholders or test artifacts that would fail with AuthFailed.
-        .filter(|k| k.len() >= 8);
-
-        let Some(key) = key else {
+        // --- single-key path ---
+        // Same validation as the multi-key resolver (trim + >=8 placeholder
+        // guard, OpenCode Zen/Go slot sharing) via first_free_upstream_key.
+        let Some(key) = crate::providers::free::first_free_upstream_key(&auth_store, upstream.id)
+        else {
             continue;
         };
 
