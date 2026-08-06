@@ -34,7 +34,8 @@ use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::file_history::FileHistory;
 use clawde_core::keybindings::{
-    KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
+    KeyContext, KeybindingPreset, KeybindingResolver, KeybindingResult, ParsedKeystroke,
+    UserKeybindings,
 };
 use clawde_core::types::{ContentBlock, Message, Role};
 use clawde_core::{sample_completion_verb, sample_spinner_verb};
@@ -850,56 +851,6 @@ pub enum ContextMenuItem {
     Fork,
 }
 
-/// State for the Go to Line dialog (Ctrl+G in message pane).
-#[derive(Debug, Clone)]
-pub struct GoToLineDialog {
-    /// Input field for line number.
-    pub input: String,
-    /// Whether the dialog is currently active.
-    pub active: bool,
-    /// Total number of lines (for validation feedback).
-    pub total_lines: usize,
-}
-
-impl Default for GoToLineDialog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GoToLineDialog {
-    pub fn new() -> Self {
-        Self {
-            input: String::new(),
-            active: false,
-            total_lines: 0,
-        }
-    }
-
-    pub fn open(&mut self, total_lines: usize) {
-        self.input.clear();
-        self.active = true;
-        self.total_lines = total_lines;
-    }
-
-    pub fn close(&mut self) {
-        self.active = false;
-        self.input.clear();
-    }
-
-    /// Parse the input as a line number (1-indexed).
-    /// Returns None if invalid or out of range.
-    #[allow(dead_code)]
-    pub fn parse_line_number(&self) -> Option<usize> {
-        let line_num: usize = self.input.trim().parse().ok()?;
-        if line_num >= 1 && line_num <= self.total_lines {
-            Some(line_num)
-        } else {
-            None
-        }
-    }
-}
-
 /// Status of an active or completed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -1428,6 +1379,10 @@ pub struct App {
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
+    /// Active keybinding preset ("default" / "vim" / "emacs").  Mirrors the
+    /// `preset` stored in keybindings.json; kept on the struct so the
+    /// cheat-sheet overlay can render the preset's actual bindings.
+    pub keybinding_preset: KeybindingPreset,
 
     // Cursor position within input (byte offset)
     pub cursor_pos: usize,
@@ -1574,8 +1529,6 @@ pub struct App {
     pub mcp_session_trusted: std::collections::HashSet<String>,
     /// Project root used to key persistent MCP trust approvals.
     pub mcp_project_root: Option<std::path::PathBuf>,
-    /// Go to Line dialog (Ctrl+G in message pane).
-    pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
@@ -2043,6 +1996,7 @@ impl App {
             accent_color: ACCENT_BUILD,
             agent_status: Vec::new(),
             history_search: None,
+            keybinding_preset: user_keybindings.preset,
             keybindings: KeybindingResolver::new(&user_keybindings),
             cursor_pos: 0,
             auto_scroll: true,
@@ -2118,7 +2072,6 @@ impl App {
             mcp_prompting: None,
             mcp_session_trusted: std::collections::HashSet::new(),
             mcp_project_root: None,
-            go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog:
                 crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
@@ -3024,6 +2977,35 @@ impl App {
 
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
+        }
+        // /keybindings preset <default|vim|emacs>: switch the active keybinding
+        // preset. `/keybindings` with no args falls through to the existing
+        // file-opening handler in intercept_slash_command.
+        if cmd == "keybindings" && args.trim().starts_with("preset") {
+            let name = args.trim().trim_start_matches("preset").trim();
+            match KeybindingPreset::from_name(name) {
+                Some(preset) => {
+                    let config_dir = Settings::config_dir();
+                    let mut kb = UserKeybindings::load(&config_dir);
+                    kb.preset = preset;
+                    if let Err(e) = kb.save(&config_dir) {
+                        self.status_message = Some(format!("Failed to save keybindings: {}", e));
+                    } else {
+                        self.keybinding_preset = preset;
+                        self.keybindings = KeybindingResolver::new(&kb);
+                        self.status_message = Some(format!(
+                            "Keybinding preset set to {}. User overrides preserved.",
+                            preset.label()
+                        ));
+                    }
+                }
+                None => {
+                    self.status_message = Some(format!(
+                        "Unknown keybinding preset '{name}'. Options: default, vim, emacs."
+                    ));
+                }
+            }
+            return true;
         }
         // /fast on|off and /speed on|off: set fast_mode explicitly.
         if matches!(cmd, "fast" | "speed") && !args.trim().is_empty() {
@@ -7300,6 +7282,54 @@ impl App {
                 }
                 false
             }
+            "moveCharBackward" => {
+                // Ctrl+B (emacs): move cursor one char left.
+                if !self.is_streaming {
+                    self.prompt_input.move_left();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "moveCharForward" => {
+                // Ctrl+F (emacs): move cursor one char right.
+                if !self.is_streaming {
+                    self.prompt_input.move_right();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "moveWordBackward" => {
+                // Ctrl+Left / Alt+B: move cursor to previous word.
+                if !self.is_streaming {
+                    self.prompt_input.move_word_backward();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "moveWordForward" => {
+                // Ctrl+Right / Alt+F: move cursor to next word.
+                if !self.is_streaming {
+                    self.prompt_input.move_word_forward();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "killToEnd" => {
+                // Ctrl+K (emacs): kill from cursor to end of line.
+                if !self.is_streaming {
+                    self.prompt_input.kill_line();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "yank" => {
+                // Ctrl+Y (emacs): yank the most recently killed text.
+                if !self.is_streaming {
+                    self.prompt_input.yank();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
             "expandPaste" => {
                 // Alt+E: expand the [Pasted text #N ...] placeholder at the
                 // cursor (or the first one in the buffer) so the full pasted
@@ -7595,6 +7625,8 @@ impl App {
                 self.keybindings_overlay.toggle();
                 if self.keybindings_overlay.visible {
                     self.keybindings_overlay.open_frame = self.frame_count;
+                    // Render the active preset's bindings in the cheat-sheet.
+                    self.keybindings_overlay.preset = self.keybinding_preset;
                 }
                 false
             }

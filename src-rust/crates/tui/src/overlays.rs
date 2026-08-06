@@ -2123,6 +2123,8 @@ pub struct KeybindingsOverlayState {
     pub open_frame: u64,
     /// Vim-modal insert-mode state for the filter bar (only used when vim is enabled).
     pub vim_search: VimSearch,
+    /// Active keybinding preset whose bindings the cheat-sheet renders.
+    pub preset: clawde_core::keybindings::KeybindingPreset,
 }
 
 impl KeybindingsOverlayState {
@@ -2274,7 +2276,7 @@ pub fn render_keybindings_overlay(
         frame,
         layout.header_area,
         "Keyboard Shortcuts",
-        "Esc: close",
+        &format!("preset: {}  ·  Esc: close", state.preset.label()),
     );
 
     let search_line = modal_search_line_with_insert(
@@ -2293,10 +2295,12 @@ pub fn render_keybindings_overlay(
         return;
     }
 
-    use clawde_core::keybindings::default_bindings;
+    use clawde_core::keybindings::preset_bindings;
     use std::collections::HashMap;
 
-    let bindings = default_bindings();
+    // Render the ACTIVE preset's bindings (not just the stock defaults) so
+    // the cheat-sheet reflects the user's selected keybinding preset.
+    let bindings = preset_bindings(&state.preset);
 
     let mut by_context: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut context_order: Vec<String> = Vec::new();
@@ -2377,11 +2381,6 @@ pub fn render_keybindings_overlay(
             "nextMessage" => "Next msg",
             "jumpToNextError" => "Next error",
             "jumpToPreviousError" => "Previous error",
-            "findInMessage" => "Find in message",
-            "globalSearch" => "Global search",
-            "findNext" => "Find next",
-            "findPrev" => "Find prev",
-            "goToLine" => "Go to line",
             "indent" => "Indent",
             "reverseIndent" => "Unindent",
             "expandPaste" => "Expand paste",

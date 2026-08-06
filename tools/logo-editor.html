@@ -1787,13 +1787,19 @@ function updateExport() {
 
   const durations = frames.map(f => (f.dur && f.dur > 0) ? Math.round(f.dur) : 1000).join(', ');
 
+  // The TUI's rustle.rs also defines CYCLE_MS as the sum of all frame
+  // durations — emit it too so the exported snippet compiles verbatim.
+  const cycleLines = frames.map((_, i) => `FRAME_DURATIONS_MS[${i}]`);
+  const cycleMs = 'const CYCLE_MS: u64 = ' + cycleLines.join('\n    + ') + ';';
+
   $export.value =
     `/// Animation frames for the mascot. Each frame is ${frames[0]?.rows || rows} rows × ${frames[0]?.cols || cols} cols.\n` +
     `/// chars used: ${charList}  |  color: rgb(${rr}, ${gg}, ${bb})\n` +
     `const FRAMES: [[&str; ${frames[0]?.rows || rows}]; ${frames.length}] = [\n` +
     frameArrays.join(',\n') +
     `\n];\n` +
-    `\nconst FRAME_DURATIONS_MS: [u64; ${frames.length}] = [${durations}];\n`;
+    `\nconst FRAME_DURATIONS_MS: [u64; ${frames.length}] = [${durations}];\n` +
+    `\n${cycleMs}\n`;
 }
 
 function copyCode() {

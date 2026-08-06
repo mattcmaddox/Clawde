@@ -224,7 +224,7 @@ on parse failure, and the default theme is used as fallback.
 - [ ] `/search` command exists but could be enhanced with full-text search across all sessions
 
 ### [polish] Keybinding presets
-- [ ] Add Vim/Emacs keybinding presets
+- [x] Add Vim/Emacs keybinding presets
 
 ### [polish] Multi-language LSP support
 - [ ] `lsp_tool.rs` / `core/src/lsp.rs` — expand language server support beyond Rust

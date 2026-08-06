@@ -334,6 +334,14 @@ impl RustleEditor {
         let updated = replace_consts(&source, &frames_text, &dur_line, &cycle_block)?;
         std::fs::write(&path, updated)
             .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+        // Keep the Rustle Animation Studio (tools/logo-editor.html) in sync so
+        // the `durations_match_rustle_studio` guard test stays green and the
+        // studio preview matches the TUI animation.
+        if let Err(e) = sync_studio_html(&self.frames) {
+            // Best-effort: the studio is a dev tool, so a failed sync must not
+            // fail the save (and lose the user's edits).
+            eprintln!("rustle_editor: studio sync failed: {e}");
+        }
         self.dirty = false;
         Ok(())
     }
@@ -437,6 +445,14 @@ fn rustle_source_path() -> PathBuf {
         .join("rustle.rs")
 }
 
+/// The path to the Rustle Animation Studio HTML — the editor keeps its
+/// `DEFAULT_FRAMES` durations in sync so the `durations_match_rustle_studio`
+/// guard test (which `include_str!`s the studio) stays green.
+fn studio_html_path() -> PathBuf {
+    // crates/tui/src → ../../../../tools/logo-editor.html (repo root).
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../tools/logo-editor.html")
+}
+
 /// Generate the full `const FRAMES: [[&str; 8]; N] = [...]` block.
 fn build_frames_const(frames: &[EditableFrame]) -> String {
     let n = frames.len();
@@ -520,6 +536,121 @@ fn replace_consts(
         out.replace_range(start..end, repl);
     }
     Ok(out)
+}
+
+/// Update the per-frame `dur:` values in the Rustle Animation Studio HTML to
+/// match `frames`, and bump its `STORAGE_VERSION` so the studio discards any
+/// stale localStorage copy of DEFAULT_FRAMES.
+///
+/// The studio marks each frame's duration with a
+/// `dur: N, // TUI FRAME_DURATIONS_MS[i]` line; the `durations_match_rustle_studio`
+/// test in rustle.rs parses those markers, so this function is what keeps the
+/// two sides in sync after a TUI editor save.  Pure string surgery — returns
+/// the updated HTML.
+pub fn sync_studio_html(frames: &[EditableFrame]) -> Result<(), String> {
+    let path = studio_html_path();
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    // `None` means either no markers (malformed file) or no change (no-op).
+    // Only the first case is an error; a no-op sync is silently OK.
+    let Some(updated) = rewrite_studio_durations(&source, frames) else {
+        // No markers at all — the studio HTML is malformed or has been
+        // manually edited.  Still not a hard error (the studio is a dev
+        // tool, not a runtime dependency).
+        return Ok(());
+    };
+    std::fs::write(&path, updated)
+        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+    Ok(())
+}
+
+/// Rewrite every `dur: N, // TUI FRAME_DURATIONS_MS[i]` marker line in the
+/// studio HTML to the matching duration from `frames`, and bump the
+/// `STORAGE_VERSION` constant (defaults to a +1 bump when present).  Returns
+/// `None` when the HTML has no marker lines at all (so callers can distinguish
+/// "nothing to sync" from a malformed file).
+fn rewrite_studio_durations(html: &str, frames: &[EditableFrame]) -> Option<String> {
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut frame_idx = 0usize;
+    let mut changed = false;
+
+    for line in html.lines() {
+        if line.contains("TUI FRAME_DURATIONS_MS") {
+            let dur = frames
+                .get(frame_idx)
+                .map(|f| f.dur_ms.to_string())
+                .unwrap_or_else(|| line.trim().to_string());
+            // `dur: N, // ...` — preserve the leading whitespace and the
+            // marker comment, replacing only the numeric value.
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            if let Some(rest) = trimmed.strip_prefix("dur:") {
+                if let Some(comment_idx) = rest.find("//") {
+                    let comment = &rest[comment_idx..];
+                    // Only count as a change if the value actually differs
+                    // (a no-op save must not bump the studio's version and
+                    // nuke a user's localStorage snapshot).
+                    let new_line = format!("{indent}dur: {dur}, {comment}");
+                    if new_line != line {
+                        changed = true;
+                    }
+                    out_lines.push(new_line);
+                } else {
+                    out_lines.push(line.to_string());
+                }
+            } else {
+                out_lines.push(line.to_string());
+            }
+            frame_idx += 1;
+        } else if line.contains("STORAGE_VERSION =") {
+            if changed {
+                // Durations moved → bump the studio's STORAGE_VERSION so
+                // browsers discard their localStorage snapshot of the old
+                // DEFAULT_FRAMES.  Only bumped when a real change happened.
+                match bump_storage_version(line) {
+                    Some(bumped) => {
+                        out_lines.push(bumped);
+                    }
+                    None => out_lines.push(line.to_string()),
+                }
+            } else {
+                out_lines.push(line.to_string());
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    let mut out = out_lines.join("\n");
+    // .lines() drops the trailing newline; restore it if the source had one.
+    if html.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Given a `const STORAGE_VERSION = N; ...` line, return it with N incremented
+/// and everything after the digits preserved (e.g. the `// bump` comment).
+fn bump_storage_version(line: &str) -> Option<String> {
+    let idx = line.find("STORAGE_VERSION =")?;
+    let rest = &line[idx + "STORAGE_VERSION =".len()..];
+    // Allow optional whitespace between `=` and the number.
+    let after_eq = rest.trim_start();
+    let digits_end = after_eq.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits_end == 0 {
+        return None;
+    }
+    let version: u64 = after_eq[..digits_end].parse().ok()?;
+    let suffix = &after_eq[digits_end..];
+    Some(format!(
+        "{}STORAGE_VERSION = {}{}",
+        &line[..idx],
+        version + 1,
+        suffix
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,5 +1295,53 @@ const CYCLE_MS: u64 = FRAME_DURATIONS_MS[0]
             "blank frame must not show confirm notice"
         );
         assert!(content.contains("Frame 2/6"), "title updates after removal");
+    }
+
+    #[test]
+    fn rewrite_studio_durations_updates_markers_and_bumps_version() {
+        let html = [
+            "const DEFAULT_FRAMES = [",
+            "  { // Frame 1",
+            "    dur: 3000, // TUI FRAME_DURATIONS_MS[0]",
+            "  },",
+            "  { // Frame 2",
+            "    dur: 1500, // TUI FRAME_DURATIONS_MS[1]",
+            "  },",
+            "];",
+            "const STORAGE_VERSION = 5;  // bump when DEFAULT_FRAMES changes",
+        ]
+        .join("\n");
+        let frames = vec![
+            EditableFrame {
+                rows: vec![],
+                dur_ms: 2500,
+            },
+            EditableFrame {
+                rows: vec![],
+                dur_ms: 700,
+            },
+        ];
+        let out = rewrite_studio_durations(&html, &frames).expect("markers present");
+        assert!(out.contains("dur: 2500, // TUI FRAME_DURATIONS_MS[0]"));
+        assert!(out.contains("dur: 700, // TUI FRAME_DURATIONS_MS[1]"));
+        // The studio must discard stale localStorage after a DEFAULT_FRAMES change.
+        assert!(
+            out.contains("const STORAGE_VERSION = 6;"),
+            "STORAGE_VERSION must be bumped so the studio drops stale frames"
+        );
+        // No marker lines → nothing to sync.
+        assert!(rewrite_studio_durations("<html></html>", &frames).is_none());
+    }
+
+    #[test]
+    fn bump_storage_version_increments_digits() {
+        let line = "const STORAGE_VERSION = 5;  // bump when DEFAULT_FRAMES changes";
+        let out = bump_storage_version(line).expect("version present");
+        assert!(out.contains("const STORAGE_VERSION = 6;"), "got: {out}");
+        assert!(
+            out.contains("// bump when DEFAULT_FRAMES changes"),
+            "trailing comment must survive: {out}"
+        );
+        assert!(bump_storage_version("no version here").is_none());
     }
 }

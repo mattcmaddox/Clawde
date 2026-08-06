@@ -5,6 +5,50 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
 
+/// Named keybinding presets.
+///
+/// A preset swaps in an alternative baseline on top of [`default_bindings`]:
+/// Vim and Emacs flavours adjust navigation chords and editing keys so users
+/// of either editor get muscle-memory-friendly defaults without hand-editing
+/// `keybindings.json`.  `Default` is the built-in table.  The chosen preset is
+/// stored on [`UserKeybindings::preset`] and applied when the resolver is
+/// built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KeybindingPreset {
+    /// The stock binding table (`default_bindings()`).
+    #[default]
+    Default,
+    /// Vim-flavoured bindings: `hjkl` navigation in list contexts
+    /// and vim-mode prompt editing enabled by default.
+    Vim,
+    /// Emacs-flavoured bindings: readline-style `Ctrl+B`/`Ctrl+F` char
+    /// movement, `Ctrl+P`/`Ctrl+N` history, `Ctrl+K` kill-to-end, `Ctrl+Y`
+    /// yank, and `Alt+B`/`Alt+F` word movement.
+    Emacs,
+}
+
+impl KeybindingPreset {
+    /// Resolve a preset from its name (case-insensitive).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "vim" => Some(Self::Vim),
+            "emacs" => Some(Self::Emacs),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label for the current preset.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Vim => "vim",
+            Self::Emacs => "emacs",
+        }
+    }
+}
+
 /// All keybinding contexts
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -220,14 +264,13 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Error/issue navigation
         ("ctrl+.", "jumpToNextError", KeyContext::Chat),
         ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
-        // Searching
-        ("ctrl+f", "findInMessage", KeyContext::Chat),
-        ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
-        ("f3", "findNext", KeyContext::Chat),
-        ("ctrl+]", "findNext", KeyContext::Chat),
-        ("shift+f3", "findPrev", KeyContext::Chat),
-        ("ctrl+[", "findPrev", KeyContext::Chat),
-        ("ctrl+g", "goToLine", KeyContext::Chat),
+        // None of the aspirational search/navigation bindings for which
+        // no handler arms exist are kept in the default table — a binding
+        // with no backend silently swallows the key, which is worse than
+        // having no binding at all.
+        //
+        // Removed: findInMessage (ctrl+f), globalSearch (ctrl+shift+f),
+        // findNext (f3/ctrl+]), findPrev (shift+f3/ctrl+[), goToLine (ctrl+g).
         // Indentation
         ("tab", "indent", KeyContext::Chat),
         ("shift+tab", "reverseIndent", KeyContext::Chat),
@@ -276,17 +319,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("enter", "select", KeyContext::HistorySearch),
         ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
-        // ========== TRANSCRIPT / MESSAGE SELECTION ==========
-        ("up", "prevMessage", KeyContext::Transcript),
-        ("down", "nextMessage", KeyContext::Transcript),
-        ("k", "prevMessage", KeyContext::Transcript),
-        ("j", "nextMessage", KeyContext::Transcript),
-        ("pageup", "pageUp", KeyContext::Transcript),
-        ("pagedown", "pageDown", KeyContext::Transcript),
-        ("home", "goStart", KeyContext::Transcript),
-        ("end", "goEnd", KeyContext::Transcript),
-        ("enter", "selectMessage", KeyContext::Transcript),
-        ("escape", "cancel", KeyContext::Transcript),
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
@@ -354,13 +386,84 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         .collect()
 }
 
+/// The full binding table for a [`KeybindingPreset`]: the stock defaults plus
+/// preset-specific additions/overrides appended after them.  The resolver
+/// matches the *last* exact binding for a given chord+context, so anything
+/// appended here wins over the default for the same keys.
+pub fn preset_bindings(preset: &KeybindingPreset) -> Vec<ParsedBinding> {
+    let mut bindings = default_bindings();
+    let extras: &[(&str, &str, KeyContext)] = match preset {
+        KeybindingPreset::Default => &[],
+        KeybindingPreset::Vim => VIM_PRESET_EXTRAS,
+        KeybindingPreset::Emacs => EMACS_PRESET_EXTRAS,
+    };
+    bindings.extend(extras.iter().filter_map(|(chord_str, action, context)| {
+        parse_chord(chord_str).map(|chord| ParsedBinding {
+            chord,
+            action: Some(action.to_string()),
+            context: context.clone(),
+        })
+    }));
+    bindings
+}
+
+/// Vim-flavoured additions on top of the defaults.
+///
+/// The stock table already navigates list contexts with `j`/`k`; the Vim
+/// preset completes the `hjkl` set (adding `h`/`l` as prev/next).  These only
+/// touch list/dialog contexts, never Chat — plain letters must keep typing
+/// into the prompt.
+///
+/// NOTE: `gg`/`G` jump-to-top/bottom is deliberately NOT included — the
+/// transcript context is never the active resolver context (see
+/// `App::current_key_context`), so such bindings would be dead config.
+const VIM_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
+    ("h", "prev", KeyContext::Select),
+    ("l", "next", KeyContext::Select),
+    ("h", "prev", KeyContext::ThemePicker),
+    ("l", "next", KeyContext::ThemePicker),
+    ("h", "prevResult", KeyContext::HistorySearch),
+    ("l", "nextResult", KeyContext::HistorySearch),
+    ("h", "prevMessage", KeyContext::MessageSelector),
+    ("l", "nextMessage", KeyContext::MessageSelector),
+    ("h", "prevTask", KeyContext::Task),
+    ("l", "nextTask", KeyContext::Task),
+    ("h", "prevDiff", KeyContext::DiffDialog),
+    ("l", "nextDiff", KeyContext::DiffDialog),
+];
+
+/// Emacs (readline-style) additions on top of the defaults.
+///
+/// The stock Chat table already provides `Ctrl+A`/`Ctrl+E` line edges,
+/// `Ctrl+W` kill-word, `Ctrl+U` kill-to-start, `Ctrl+H` delete-char and
+/// `Alt+D` delete-word.  This preset adds the remaining readline chords:
+/// `Ctrl+B`/`Ctrl+F` char movement, `Ctrl+P`/`Ctrl+N` history, `Ctrl+K`
+/// kill-to-end, `Ctrl+Y` yank, `Alt+B`/`Alt+F` word movement, and moves the
+/// command palette to `Ctrl+Shift+P` (classic emacs `M-x` style) so `Ctrl+K`
+/// stays free for kill-line.
+const EMACS_PRESET_EXTRAS: &[(&str, &str, KeyContext)] = &[
+    ("ctrl+b", "moveCharBackward", KeyContext::Chat),
+    ("ctrl+f", "moveCharForward", KeyContext::Chat),
+    ("ctrl+p", "historyPrev", KeyContext::Chat),
+    ("ctrl+n", "historyNext", KeyContext::Chat),
+    ("ctrl+k", "killToEnd", KeyContext::Chat),
+    ("ctrl+y", "yank", KeyContext::Chat),
+    ("alt+b", "moveWordBackward", KeyContext::Chat),
+    ("alt+f", "moveWordForward", KeyContext::Chat),
+    ("ctrl+shift+p", "openCommandPalette", KeyContext::Chat),
+];
+
 /// Current schema version for keybindings
 pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 1;
-/// User keybindings loaded from ~/.claurst/keybindings.json
+/// User keybindings loaded from ~/.clawde/keybindings.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserKeybindings {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    /// Active keybinding preset ("default", "vim" or "emacs").  Stored so the
+    /// resolver can layer the preset baseline on top of user overrides.
+    #[serde(default)]
+    pub preset: KeybindingPreset,
     pub bindings: Vec<UserBinding>,
 }
 
@@ -372,6 +475,7 @@ impl Default for UserKeybindings {
     fn default() -> Self {
         Self {
             schema_version: KEYBINDINGS_SCHEMA_VERSION,
+            preset: KeybindingPreset::Default,
             bindings: Vec::new(),
         }
     }
@@ -476,6 +580,7 @@ impl UserKeybindings {
             .collect();
         Ok(Self {
             schema_version: 0,
+            preset: KeybindingPreset::Default,
             bindings,
         })
     }
@@ -562,7 +667,7 @@ pub struct KeybindingResolver {
 
 impl KeybindingResolver {
     pub fn new(user: &UserKeybindings) -> Self {
-        let mut bindings = default_bindings();
+        let mut bindings = preset_bindings(&user.preset);
 
         // Apply user overrides (user bindings win, last match wins)
         for user_binding in &user.bindings {
@@ -990,6 +1095,193 @@ mod tests {
             ),
             "User customization (ctrl+shift+a -> openModelPicker) should be preserved"
         );
+    }
+
+    #[test]
+    fn test_preset_default_matches_stock_table() {
+        // The Default preset must be byte-for-byte the stock table so existing
+        // users see no behaviour change.
+        let stock = default_bindings();
+        let preset = preset_bindings(&KeybindingPreset::Default);
+        assert_eq!(stock.len(), preset.len());
+        for (a, b) in stock.iter().zip(preset.iter()) {
+            assert_eq!(a.chord, b.chord);
+            assert_eq!(a.action, b.action);
+            assert_eq!(a.context, b.context);
+        }
+    }
+
+    #[test]
+    fn test_vim_preset_adds_hjkl_navigation() {
+        let bindings = preset_bindings(&KeybindingPreset::Vim);
+        // h/l prev/next in Select context
+        let h = bindings.iter().find(|b| {
+            b.context == KeyContext::Select && b.chord.len() == 1 && b.chord[0].key == "h"
+        });
+        let l = bindings.iter().find(|b| {
+            b.context == KeyContext::Select && b.chord.len() == 1 && b.chord[0].key == "l"
+        });
+        assert_eq!(h.and_then(|b| b.action.as_deref()), Some("prev"));
+        assert_eq!(l.and_then(|b| b.action.as_deref()), Some("next"));
+        // No two-key chords: `gg`/`G` would be dead config because the
+        // transcript context is never the active resolver context.
+        assert!(
+            bindings.iter().all(|b| b.chord.len() == 1),
+            "vim preset must only add single-key chords"
+        );
+        // No vim bindings may bind a bare letter in Chat context (letters must
+        // keep typing into the prompt).  Stock defaults may bind unmodified
+        // non-letter keys (up/down/home/enter/tab) in Chat, so only flag
+        // single lowercase-letter chords.
+        let bare_letter_in_chat = |b: &ParsedBinding| {
+            b.context == KeyContext::Chat
+                && b.chord.len() == 1
+                && !b.chord[0].ctrl
+                && !b.chord[0].alt
+                && !b.chord[0].meta
+                && b.chord[0].key.len() == 1
+                && b.chord[0]
+                    .key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase())
+        };
+        assert!(
+            !bindings.iter().any(bare_letter_in_chat),
+            "vim preset must not bind bare letters in Chat context"
+        );
+    }
+
+    #[test]
+    fn test_emacs_preset_adds_readline_chords() {
+        let bindings = preset_bindings(&KeybindingPreset::Emacs);
+        // Last match wins (the resolver uses exact.last()), so take the LAST
+        // Chat-context binding for each chord — that is what actually fires.
+        let find = |key: &str, ctrl: bool, alt: bool| {
+            bindings
+                .iter()
+                .filter(|b| {
+                    b.context == KeyContext::Chat
+                        && b.chord.len() == 1
+                        && b.chord[0].key == key
+                        && b.chord[0].ctrl == ctrl
+                        && b.chord[0].alt == alt
+                        && !b.chord[0].shift
+                })
+                .next_back()
+                .and_then(|b| b.action.as_deref())
+        };
+        assert_eq!(find("b", true, false), Some("moveCharBackward"));
+        assert_eq!(find("f", true, false), Some("moveCharForward"));
+        assert_eq!(find("p", true, false), Some("historyPrev"));
+        assert_eq!(find("n", true, false), Some("historyNext"));
+        assert_eq!(find("k", true, false), Some("killToEnd"));
+        assert_eq!(find("y", true, false), Some("yank"));
+        assert_eq!(find("b", false, true), Some("moveWordBackward"));
+        assert_eq!(find("f", false, true), Some("moveWordForward"));
+        // Ctrl+K kill-line must override the stock openCommandPalette.
+        let ctrl_k = bindings
+            .iter()
+            .filter(|b| {
+                b.context == KeyContext::Chat
+                    && b.chord.len() == 1
+                    && b.chord[0].key == "k"
+                    && b.chord[0].ctrl
+            })
+            .next_back()
+            .expect("emacs ctrl+k")
+            .action
+            .as_deref()
+            .unwrap();
+        assert_eq!(ctrl_k, "killToEnd");
+        // Command palette stays reachable via ctrl+shift+p.
+        let ctrl_shift_p = bindings
+            .iter()
+            .filter(|b| {
+                b.context == KeyContext::Chat
+                    && b.chord.len() == 1
+                    && b.chord[0].key == "p"
+                    && b.chord[0].ctrl
+                    && b.chord[0].shift
+            })
+            .next_back()
+            .expect("emacs ctrl+shift+p")
+            .action
+            .as_deref()
+            .unwrap();
+        assert_eq!(ctrl_shift_p, "openCommandPalette");
+    }
+
+    #[test]
+    fn test_resolver_respects_user_preset() {
+        let user = UserKeybindings {
+            schema_version: KEYBINDINGS_SCHEMA_VERSION,
+            preset: KeybindingPreset::Emacs,
+            bindings: Vec::new(),
+        };
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("ctrl+b").unwrap();
+        let result = resolver.process(ks.clone(), &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "moveCharBackward"));
+
+        // And with the Default preset the same chord resolves to the stock
+        // Global binding (ctrl+b → createBranch), NOT the emacs one.
+        let default_user = UserKeybindings::default();
+        let mut default_resolver = KeybindingResolver::new(&default_user);
+        let result = default_resolver.process(ks, &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "createBranch"));
+    }
+
+    #[test]
+    fn test_preset_serialisation_round_trip() {
+        let user = UserKeybindings {
+            schema_version: KEYBINDINGS_SCHEMA_VERSION,
+            preset: KeybindingPreset::Vim,
+            bindings: Vec::new(),
+        };
+        let json = serde_json::to_string(&user).unwrap();
+        let parsed: UserKeybindings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.preset, KeybindingPreset::Vim);
+    }
+
+    #[test]
+    fn test_preset_from_name() {
+        assert_eq!(
+            KeybindingPreset::from_name("vim"),
+            Some(KeybindingPreset::Vim)
+        );
+        assert_eq!(
+            KeybindingPreset::from_name("Vim"),
+            Some(KeybindingPreset::Vim)
+        );
+        assert_eq!(
+            KeybindingPreset::from_name("emacs"),
+            Some(KeybindingPreset::Emacs)
+        );
+        assert_eq!(
+            KeybindingPreset::from_name("default"),
+            Some(KeybindingPreset::Default)
+        );
+        assert_eq!(KeybindingPreset::from_name("nope"), None);
+    }
+
+    #[test]
+    fn test_old_format_keybindings_get_upgraded_with_default_preset() {
+        let old_format_json = r#"{
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": {
+                        "ctrl+shift+a": "openModelPicker",
+                        "ctrl+e": "goLineEnd"
+                    }
+                }
+            ]
+        }"#;
+        let mut kb = UserKeybindings::from_json_str(old_format_json);
+        assert_eq!(kb.preset, KeybindingPreset::Default);
+        kb.smart_merge_with_defaults();
+        assert_eq!(kb.preset, KeybindingPreset::Default);
     }
 
     #[test]

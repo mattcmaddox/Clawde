@@ -69,11 +69,6 @@ These bindings are active when focus is in the chat input field.
 | `Alt+D` | deleteWord | Delete the word after the cursor |
 | `Ctrl+H` | deleteCharBefore | Delete character before cursor |
 | `Ctrl+L` | clearLine | Clear current input line |
-| `Ctrl+F` | findInMessage | Open inline search within the current conversation |
-| `Ctrl+Shift+F` | globalSearch | Open global codebase search |
-| `F3` / `Ctrl+]` | findNext | Jump to next search match |
-| `Shift+F3` / `Ctrl+[` | findPrev | Jump to previous search match |
-| `Ctrl+G` | goToLine | Jump to a specific line |
 | `Ctrl+.` | jumpToNextError | Jump to next error / issue |
 | `Ctrl+Shift+.` | jumpToPreviousError | Jump to previous error / issue |
 

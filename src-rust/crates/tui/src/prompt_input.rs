@@ -2288,7 +2288,6 @@ impl PromptInputState {
     }
 
     /// Ctrl+K: Cut from cursor to end of line and save to kill ring.
-    #[allow(dead_code)]
     pub fn kill_line(&mut self) {
         if self.mode == InputMode::Readonly {
             return;
