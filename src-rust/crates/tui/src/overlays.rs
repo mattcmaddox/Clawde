@@ -13,6 +13,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme_colors::current_palette;
+use crate::vim_search::VimSearch;
 
 pub const CLAURST_ACCENT: Color = Color::Rgb(233, 30, 99);
 pub const CLAURST_PANEL_BG: Color = Color::Rgb(20, 20, 28);
@@ -277,6 +278,28 @@ pub fn modal_search_line(
     }
 }
 
+/// [`modal_search_line`] with a trailing `-- INSERT --` hint shown while the
+/// popup's search bar is in vim insert mode. The hint only ever renders when
+/// vim mode was active (insert is only set through `VimSearch::handle_key`).
+pub fn modal_search_line_with_insert(
+    query: &str,
+    placeholder: &str,
+    placeholder_color: Color,
+    query_color: Color,
+    vim_insert: bool,
+) -> Line<'static> {
+    let mut line = modal_search_line(query, placeholder, placeholder_color, query_color);
+    if vim_insert {
+        line.spans.push(Span::styled(
+            "   -- INSERT --",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    line
+}
+
 /// Draw a thin vertical scrollbar along the right edge of `area`.
 /// `offset` is the first visible item index, `total` the item count, and
 /// `viewport` how many items fit on screen at once.
@@ -330,6 +353,8 @@ pub struct HelpOverlay {
     pub filter: String,
     /// Dynamically populated entries from the command registry.
     pub commands: Vec<HelpEntry>,
+    /// Vim-modal insert-mode state for the filter bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 /// A single command entry shown in the help overlay.
@@ -362,6 +387,7 @@ impl HelpOverlay {
             // Reset state when closing
             self.scroll_offset = 0;
             self.filter.clear();
+            self.vim_search.reset();
         }
     }
 
@@ -369,6 +395,7 @@ impl HelpOverlay {
         self.visible = false;
         self.scroll_offset = 0;
         self.filter.clear();
+        self.vim_search.reset();
     }
 
     pub fn scroll_up(&mut self) {
@@ -421,11 +448,12 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
 
     let layout = begin_modal_frame(frame, area, 100, 36, 3, 1);
     render_modal_title_frame(frame, layout.header_area, "Shortcuts & commands", "esc");
-    let search_line = modal_search_line(
+    let search_line = modal_search_line_with_insert(
         &overlay.filter,
         "Search shortcuts or commands",
         p.disabled,
         p.text_light,
+        overlay.vim_search.insert,
     );
     if let Some(search_area) = modal_header_line_area(layout.header_area, 2) {
         frame.render_widget(Paragraph::new(search_line), search_area);
@@ -823,6 +851,8 @@ pub struct HistorySearchOverlay {
     /// Snapshot of the history taken at `open()` time, stored as
     /// `HistoryEntry` so timestamps are available.
     pub snapshot: Vec<HistoryEntry>,
+    /// Vim-modal insert-mode state for the search bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 /// Convenience accessor: the plain list of `snapshot_idx` values from
@@ -870,6 +900,7 @@ impl HistorySearchOverlay {
             matches: Vec::new(),
             selected_idx: 0,
             snapshot: entries,
+            vim_search: VimSearch::new(),
         };
         s.recompute_matches();
         s
@@ -1051,7 +1082,7 @@ pub fn render_history_search_overlay(
 
     // --- Search query line ---------------------------------------------------
     let result_count_str = format!("{} results", overlay.matches.len());
-    lines.push(Line::from(vec![
+    let mut query_spans = vec![
         Span::raw("  Search: "),
         Span::styled(
             overlay.query.clone(),
@@ -1067,7 +1098,16 @@ pub fn render_history_search_overlay(
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
         ),
-    ]));
+    ];
+    if overlay.vim_search.insert {
+        query_spans.push(Span::styled(
+            "  -- INSERT --",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(query_spans));
     lines.push(Line::from(""));
 
     if overlay.matches.is_empty() {
@@ -1673,6 +1713,8 @@ pub struct GlobalSearchState {
     pub selected: usize,
     pub total_matches: usize,
     pub searching: bool,
+    /// Vim-modal insert-mode state for the search bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 /// A single search result from ripgrep.
@@ -1692,6 +1734,7 @@ impl GlobalSearchState {
         self.query.clear();
         self.results.clear();
         self.selected = 0;
+        self.vim_search.reset();
     }
 
     pub fn close(&mut self) {
@@ -1835,11 +1878,20 @@ pub fn render_global_search(
     };
 
     // Query input bar (first row)
-    let query_line = Line::from(vec![
+    let mut query_spans = vec![
         Span::styled("/ ", Style::default().fg(Color::Cyan)),
         Span::styled(state.query.clone(), Style::default().fg(Color::White)),
         Span::styled("\u{2588}", Style::default().fg(Color::Cyan)),
-    ]);
+    ];
+    if state.vim_search.insert {
+        query_spans.push(Span::styled(
+            "  -- INSERT --",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let query_line = Line::from(query_spans);
     Paragraph::new(query_line).render(
         Rect {
             x: inner.x,
@@ -2069,6 +2121,8 @@ pub struct KeybindingsOverlayState {
     /// Frame counter when the overlay was last opened, for slide-in animation.
     /// 0 = not animating.
     pub open_frame: u64,
+    /// Vim-modal insert-mode state for the filter bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 impl KeybindingsOverlayState {
@@ -2087,6 +2141,7 @@ impl KeybindingsOverlayState {
             self.filter.clear();
             self.open_frame = 0;
         }
+        self.vim_search.reset();
     }
 
     pub fn close(&mut self) {
@@ -2094,6 +2149,7 @@ impl KeybindingsOverlayState {
         self.scroll_offset = 0;
         self.filter.clear();
         self.open_frame = 0;
+        self.vim_search.reset();
     }
 
     pub fn scroll_up(&mut self) {
@@ -2221,11 +2277,12 @@ pub fn render_keybindings_overlay(
         "Esc: close",
     );
 
-    let search_line = modal_search_line(
+    let search_line = modal_search_line_with_insert(
         &state.filter,
         "Filter keybindings...",
         CLAURST_MUTED,
         CLAURST_TEXT,
+        state.vim_search.insert,
     );
     if let Some(search_area) = modal_header_line_area(layout.header_area, 2) {
         frame.render_widget(Paragraph::new(search_line), search_area);
@@ -2815,6 +2872,7 @@ mod tests {
             selected: 0,
             total_matches: 1,
             searching: false,
+            vim_search: VimSearch::default(),
         };
         let area = Rect {
             x: 0,

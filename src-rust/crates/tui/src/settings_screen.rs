@@ -5,9 +5,10 @@
 // Changes are persisted via Settings::save_sync() or settings.json writes.
 
 use crate::overlays::{
-    centered_rect, modal_search_line, render_dark_overlay, render_dialog_bg, CLAURST_ACCENT,
-    CLAURST_MUTED, CLAURST_PANEL_BG,
+    centered_rect, modal_search_line_with_insert, render_dark_overlay, render_dialog_bg,
+    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG,
 };
+use crate::vim_search::{VimSearch, VimSearchKey};
 use clawde_core::config::{Config, PermissionMode, Settings};
 use clawde_core::constants::DEFAULT_MAX_TOKENS;
 use clawde_core::output_styles::{builtin_styles, find_style};
@@ -110,6 +111,8 @@ pub struct SettingsScreen {
     pub search_query: String,
     pub selected_idx: usize,
     pub scroll_offset: usize,
+    /// Vim-modal insert-mode state for the search bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
     /// Which field is being edited (field name as key).
     pub edit_field: Option<String>,
     /// Current buffer content while editing a field.
@@ -174,6 +177,10 @@ pub struct SettingsScreen {
     pub ollama_keep_alive: String,
     /// Ollama: max output tokens (human label from OLLAMA_PREDICT_PRESETS).
     pub ollama_num_predict: String,
+    /// Ollama: require an explicit host (no localhost fallback).
+    pub ollama_require_explicit_host: bool,
+    /// Ollama: default host URL when no api_base or OLLAMA_HOST is set.
+    pub ollama_default_host: String,
     /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
     pub permission_mode: String,
 }
@@ -186,6 +193,7 @@ impl SettingsScreen {
             search_query: String::new(),
             selected_idx: 0,
             scroll_offset: 0,
+            vim_search: VimSearch::new(),
             edit_field: None,
             edit_value: String::new(),
             settings_snapshot: settings_snapshot.clone(),
@@ -225,6 +233,8 @@ impl SettingsScreen {
             ollama_num_ctx: "12K".to_string(),
             ollama_keep_alive: "forever".to_string(),
             ollama_num_predict: "2K".to_string(),
+            ollama_require_explicit_host: false,
+            ollama_default_host: String::new(),
             permission_mode: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
@@ -374,6 +384,13 @@ impl SettingsScreen {
             .and_then(|o| o.get("num_predict").and_then(|v| v.as_u64()))
             .map(num_predict_to_preset)
             .unwrap_or_else(|| "2K".to_string());
+        self.ollama_require_explicit_host = ollama_opts
+            .and_then(|o| o.get("require_explicit_host").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        self.ollama_default_host = ollama_opts
+            .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
 
         // Sync the env var so web_search.rs respects the stored preference immediately.
         let val = self.preferred_search_backend.trim();
@@ -404,6 +421,7 @@ impl SettingsScreen {
         self.edit_field = None;
         self.edit_value.clear();
         self.search_query.clear();
+        self.vim_search.reset();
         self.selected_idx = 0;
         self.scroll_offset = 0;
         self.visible = true;
@@ -416,6 +434,7 @@ impl SettingsScreen {
         self.visible = false;
         self.edit_field = None;
         self.edit_value.clear();
+        self.vim_search.reset();
     }
 
     pub fn push_search_char(&mut self, c: char) {
@@ -561,6 +580,40 @@ impl SettingsScreen {
                         .or_default()
                         .options
                         .insert("routing".to_string(), routing);
+                }
+                "ollama_require_explicit_host" => {
+                    let val = value == "true";
+                    self.ollama_require_explicit_host = val;
+                    config
+                        .provider_configs
+                        .entry("ollama".to_string())
+                        .or_default()
+                        .options
+                        .insert(
+                            "require_explicit_host".to_string(),
+                            serde_json::Value::from(val),
+                        );
+                }
+                "ollama_default_host" => {
+                    self.ollama_default_host = value.clone();
+                    if value.is_empty() {
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .remove("default_host");
+                    } else {
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert(
+                                "default_host".to_string(),
+                                serde_json::Value::from(value.clone()),
+                            );
+                    }
                 }
                 _ => {}
             }
@@ -750,6 +803,14 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         "ollama_num_ctx" => ollama_num_ctx_str(c),
         "ollama_keep_alive" => ollama_keep_alive_str(c),
         "ollama_num_predict" => ollama_num_predict_str(c),
+        "ollama_require_explicit_host" => ollama_opts(c)
+            .and_then(|o| o.get("require_explicit_host").and_then(|v| v.as_bool()))
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
+        "ollama_default_host" => ollama_opts(c)
+            .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -773,7 +834,9 @@ fn default_value_for(key: &str) -> String {
         | "fallback_retries"
         | "ollama_num_ctx"
         | "ollama_keep_alive"
-        | "ollama_num_predict" => String::new(),
+        | "ollama_num_predict"
+        | "ollama_require_explicit_host"
+        | "ollama_default_host" => String::new(),
         "auto_compact"
         | "notifications"
         | "terminal_progress_bar"
@@ -1294,6 +1357,26 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         },
         screen.ollama_num_predict.clone(),
     ));
+    entries.push(make_entry(
+        "ollama_require_explicit_host",
+        "Ollama: Require explicit host",
+        "When on, Ollama only connects if api_base or OLLAMA_HOST is explicitly set — never falls back to localhost. Use this when Ollama runs on a remote GPU machine.",
+        SECTION_OLLAMA,
+        "false".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Bool,
+        bool_v(screen.ollama_require_explicit_host),
+    ));
+    entries.push(make_entry(
+        "ollama_default_host",
+        "Ollama: Default host",
+        "Host URL used when no api_base or OLLAMA_HOST is set. Set this to point at a LAN GPU server so Ollama always targets the same machine across devices (e.g. http://devbox:11434).",
+        SECTION_OLLAMA,
+        "http://localhost:11434".to_string(),
+        SettingEffect::NextSession,
+        SettingKind::Text,
+        screen.ollama_default_host.clone(),
+    ));
 
     entries
 }
@@ -1422,11 +1505,12 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     );
 
     // Search
-    let search_line = modal_search_line(
+    let search_line = modal_search_line_with_insert(
         &screen.search_query,
         "Type to search settings...",
         Color::DarkGray,
         CLAURST_ACCENT,
+        screen.vim_search.insert,
     );
     frame.render_widget(
         Paragraph::new(search_line).style(Style::default().bg(CLAURST_PANEL_BG)),
@@ -1469,6 +1553,25 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             ),
         ]));
         desc_lines.push(Line::from(""));
+
+        // Surface the full current value for text/number entries — the list
+        // row truncates long values (e.g. Ollama host URLs) with an ellipsis,
+        // so the complete value is shown here where there is room to wrap.
+        if matches!(entry.kind, SettingKind::Text | SettingKind::Number) {
+            let is_editing = screen.edit_field.as_deref() == Some(entry.key);
+            let body = if is_editing {
+                format!("Editing: {}{}", screen.edit_value, "▏")
+            } else {
+                format!("Value: {}", entry.value)
+            };
+            desc_lines.push(Line::from(vec![Span::styled(
+                body,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            desc_lines.push(Line::from(""));
+        }
 
         // For Output Style, show current selection and all available options with descriptions
         if entry.key == "output_style" {
@@ -1660,6 +1763,10 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
                 "—".to_string(),
                 row_style.add_modifier(Modifier::DIM),
             ));
+        } else if screen.edit_field.as_deref() == Some(entry.key) && is_selected {
+            // While editing, show the full edit buffer (no ellipsis). The
+            // description panel repeats it in full if it overflows the row.
+            spans.push(Span::styled(value_str, row_style));
         } else {
             spans.push(Span::styled(truncate_end(&value_str, value_max), row_style));
         }
@@ -1734,6 +1841,7 @@ pub fn handle_settings_key(
     screen: &mut SettingsScreen,
     config: &mut Config,
     key: crossterm::event::KeyEvent,
+    vim_enabled: bool,
 ) -> bool {
     use crossterm::event::KeyCode;
 
@@ -1762,6 +1870,22 @@ pub fn handle_settings_key(
         return true;
     }
 
+    // Vim-modal search: letters only type into the search bar after `i`
+    // (insert mode); `Esc` exits insert before the usual close/clear logic.
+    // Skipped while editing a field — that is an insert-always text entry.
+    match screen.vim_search.handle_key(vim_enabled, &key) {
+        VimSearchKey::Consumed => return true,
+        VimSearchKey::PushChar(c) => {
+            screen.push_search_char(c);
+            return true;
+        }
+        VimSearchKey::PopChar => {
+            screen.pop_search_char();
+            return true;
+        }
+        VimSearchKey::Passthrough => {}
+    }
+
     // Navigation mode
     match key.code {
         KeyCode::Enter => {
@@ -1780,14 +1904,27 @@ pub fn handle_settings_key(
                 screen.close();
             }
         }
-        KeyCode::Backspace => {
+        KeyCode::Backspace if !vim_enabled => {
             screen.pop_search_char();
         }
         KeyCode::Up => {
             screen.select_prev();
             update_scroll_offset_for_selection(screen);
         }
+        KeyCode::Char('k') if vim_enabled => {
+            screen.select_prev();
+            update_scroll_offset_for_selection(screen);
+        }
         KeyCode::Down => {
+            let all = all_entries(screen);
+            let filtered: Vec<_> = all
+                .iter()
+                .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
+                .collect();
+            screen.select_next(filtered.len());
+            update_scroll_offset_for_selection(screen);
+        }
+        KeyCode::Char('j') if vim_enabled => {
             let all = all_entries(screen);
             let filtered: Vec<_> = all
                 .iter()
@@ -1832,7 +1969,7 @@ pub fn handle_settings_key(
                 }
             }
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !vim_enabled => {
             screen.push_search_char(c);
         }
         _ => {}
@@ -1985,6 +2122,18 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
                 .provider_configs
                 .get_mut("ollama")
                 .and_then(|pc| pc.options.remove("num_predict"))
+        }
+        "ollama_require_explicit_host" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("require_explicit_host"));
+        }
+        "ollama_default_host" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("default_host"));
         }
         _ => return,
     }
@@ -2149,6 +2298,21 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .settings_snapshot
                             .config
                             .file_autocomplete_show_hidden_files = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "ollama_require_explicit_host" => {
+                        screen.ollama_require_explicit_host = new_value;
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert(
+                                "require_explicit_host".to_string(),
+                                serde_json::Value::from(new_value),
+                            );
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
@@ -2483,5 +2647,22 @@ mod tests {
 
         idx = (idx + 1) % options.len();
         assert_eq!(options[idx], "default"); // Wraps around
+    }
+
+    #[test]
+    fn ollama_default_host_entry_is_editable_text() {
+        // The "Host URL" row must be a Text entry fed from the screen field,
+        // so Enter opens an inline editor (type → save) rather than a toggle
+        // or enum cycle, and the row value is the raw URL.
+        let mut screen = SettingsScreen::new();
+        screen.ollama_default_host = "http://devbox:11434".to_string();
+        let entries = all_entries(&screen);
+        let entry = entries
+            .iter()
+            .find(|e| e.key == "ollama_default_host")
+            .expect("ollama default host entry");
+        assert!(matches!(entry.kind, SettingKind::Text));
+        assert_eq!(entry.value, "http://devbox:11434");
+        assert_eq!(entry.section, SECTION_OLLAMA);
     }
 }

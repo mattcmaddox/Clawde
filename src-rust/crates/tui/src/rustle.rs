@@ -37,16 +37,16 @@ fn body_style() -> Style {
 ///
 /// chars used: ▄ ▛ ▜ ▟ ▙ █ ▔ ▌ ▗ ▖ ▐ ▝ ▘ ▚
 const FRAMES: [[&str; 8]; 6] = [
-    // Frame 0 — Rest claw (centered, no platform)
+    // Frame 0 — Rest claw (claws drawn in, feet on the ground)
     [
         "                             ",
         "                             ",
         "                   ▄▛▜▛▜▄    ",
         "                 ▟▛▜▙▟▙▟▛▜▙  ",
         "                 █▙▟▛▔▔▜▙▟█  ",
-        "                 ▜██▌▗▖▐██▛  ",
-        "                  ▝▜████▛▘   ",
-        "                   ▝████▘    ",
+        "                 ██▘    ▝██  ",
+        "                 ▜█▖ ▗▖ ▗█▛  ",
+        "                  ████████   ",
     ],
     // Frame 1 — Rest claw up-shifted + platform
     [
@@ -54,21 +54,21 @@ const FRAMES: [[&str; 8]; 6] = [
         "                   ▄▛▜▛▜▄    ",
         "                 ▟▛▜▙▟▙▟▛▜▙  ",
         "                 █▙▟▛▔▔▜▙▟█  ",
-        "                 ▜██▌▗▖▐██▛  ",
-        "                  ▝▜████▛▘   ",
-        "                   ▝████▘    ",
-        "                    ████     ",
+        "                 ██▘    ▝██  ",
+        "                 ▜█▖ ▗▖ ▗█▛  ",
+        "                  ████████   ",
+        "                  ████████   ",
     ],
-    // Frame 2 — Extend + stairs (fingers extended, with platform)
+    // Frame 2 — Extend + stairs (claws out, with platform)
     [
         "                  ▗ ▐  ▌ ▖   ",
         "                  ▐▄▛▜▛▜▄▌   ",
         "                 ▟▛▜▙▟▙▟▛▜▙  ",
         "                 █▙▟▛▔▔▜▙▟█  ",
-        "                 ▜██▌▗▖▐██▛  ",
-        "                  ▝▜████▛▘   ",
-        "                   ▝████▘    ",
-        "                    ████     ",
+        "                 ██▘    ▝██  ",
+        "                 ▜█▖ ▗▖ ▗█▛  ",
+        "                  ████████   ",
+        "                  ████████   ",
     ],
     // Frame 3 — Extend + stairs + staircase (with platform)
     [
@@ -76,21 +76,21 @@ const FRAMES: [[&str; 8]; 6] = [
         "    ▚  ▚          ▐▄▛▜▛▜▄▌   ",
         "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
         "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
-        " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
-        "  ▚  ▚  ▚         ▝▜████▛▘   ",
-        "   ▚  ▚            ▝████▘    ",
-        "                    ████     ",
+        " ▚  ▚  ▚         ██▘    ▝██  ",
+        "  ▚  ▚  ▚        ▜█▖ ▗▖ ▗█▛  ",
+        "   ▚  ▚           ████████   ",
+        "                  ████████   ",
     ],
-    // Frame 4 — Rest + staircase (with platform)
+    // Frame 4 — Rest + staircase (claws drawn in, with platform)
     [
         "                             ",
         "    ▚  ▚           ▄▛▜▛▜▄    ",
         "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
         "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
-        " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
-        "  ▚  ▚  ▚         ▝▜████▛▘   ",
-        "   ▚  ▚            ▝████▘    ",
-        "                    ████     ",
+        " ▚  ▚  ▚         ██▘    ▝██  ",
+        "  ▚  ▚  ▚        ▜█▖ ▗▖ ▗█▛  ",
+        "   ▚  ▚           ████████   ",
+        "                  ████████   ",
     ],
     // Frame 5 — Staircase down (loop back to rest)
     [
@@ -99,9 +99,9 @@ const FRAMES: [[&str; 8]; 6] = [
         "  ▚  ▚  ▚          ▄▛▜▛▜▄    ",
         "   ▚  ▚  ▚       ▟▛▜▙▟▙▟▛▜▙  ",
         " ▚  ▚  ▚         █▙▟▛▔▔▜▙▟█  ",
-        "  ▚  ▚  ▚        ▜██▌▗▖▐██▛  ",
-        "   ▚  ▚           ▝▜████▛▘   ",
-        "                   ▝████▘    ",
+        "  ▚  ▚  ▚        ██▘    ▝██  ",
+        "   ▚  ▚          ▜█▖ ▗▖ ▗█▛  ",
+        "                  ████████   ",
     ],
 ];
 
@@ -111,6 +111,10 @@ pub const FRAME_COUNT: usize = FRAMES.len();
 /// How long each frame is displayed (in milliseconds) during the loading
 /// animation.  Frame 0 (rest) holds for 3 s; frames 1-5 cycle faster at
 /// 1.5 s each so the gesture animation feels responsive.
+///
+/// These durations are duplicated in `tools/logo-editor.html` (the Rustle
+/// Animation Studio seed data); the `durations_match_rustle_studio` unit
+/// test fails if the two copies drift apart.
 const FRAME_DURATIONS_MS: [u64; FRAMES.len()] = [3000, 1500, 2000, 2000, 1500, 1500];
 
 /// Total duration of one full animation cycle in milliseconds.
@@ -137,6 +141,16 @@ pub fn loading_frame_for_elapsed(elapsed_ms: u64) -> u64 {
         }
     }
     0
+}
+
+/// Owned copy of the frames + durations, used by the in-TUI rustle editor.
+/// Each entry is `(frame rows as 29-char strings, duration in ms)`.
+pub(crate) fn rustle_frames_owned() -> Vec<(Vec<String>, u64)> {
+    FRAMES
+        .iter()
+        .zip(FRAME_DURATIONS_MS.iter())
+        .map(|(frame, &dur)| (frame.iter().map(|row| row.to_string()).collect(), dur))
+        .collect()
 }
 
 /// Returns 8 Lines representing the Rustle mascot.
@@ -175,16 +189,24 @@ mod tests {
 
     #[test]
     fn each_row_is_exactly_29_chars() {
-        let lines = rustle_lines(&RustlePose::Default);
-        for (i, line) in lines.iter().enumerate() {
-            let text = line_text(line);
-            assert_eq!(
-                text.chars().count(),
-                29,
-                "row {} should be 29 chars, got {:?}",
-                i,
-                text
-            );
+        // Check every frame, not just the default pose: the renderer centers
+        // the mascot assuming a fixed 29-col width, so any misaligned row
+        // would jitter the animation horizontally.
+        for frame_idx in 0..FRAME_COUNT {
+            let lines = rustle_lines(&RustlePose::Loading {
+                frame: frame_idx as u64,
+            });
+            for (i, line) in lines.iter().enumerate() {
+                let text = line_text(line);
+                assert_eq!(
+                    text.chars().count(),
+                    29,
+                    "row {} of frame {} should be 29 chars, got {:?}",
+                    i,
+                    frame_idx,
+                    text
+                );
+            }
         }
     }
 
@@ -195,9 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn default_pose_last_row_is_mascot_feet() {
+    fn default_pose_last_row_is_platform() {
         let lines = rustle_lines(&RustlePose::Default);
-        assert_eq!(line_text(&lines[7]), "                   ▝████▘    ");
+        assert_eq!(line_text(&lines[7]), "                  ████████   ");
     }
 
     #[test]
@@ -225,6 +247,56 @@ mod tests {
                 "frame index {} → frame {}",
                 f,
                 idx
+            );
+        }
+    }
+
+    /// Parse the per-frame `dur:` values out of the Rustle Animation Studio
+    /// (`tools/logo-editor.html`). Each studio frame carries a
+    /// `dur: N, // TUI FRAME_DURATIONS_MS[i]` line; scanning for those
+    /// markers yields the studio's copy of the timing in frame order.
+    fn studio_frame_durations_ms() -> Vec<u64> {
+        const STUDIO_HTML: &str = include_str!("../../../../tools/logo-editor.html");
+        let mut out = Vec::new();
+        for line in STUDIO_HTML.lines() {
+            if !line.contains("TUI FRAME_DURATIONS_MS") {
+                continue;
+            }
+            let after = line
+                .split_once("dur:")
+                .expect("marker line should contain a dur: field")
+                .1;
+            let digits: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            out.push(digits.parse().expect("studio dur should be a number"));
+        }
+        out
+    }
+
+    #[test]
+    fn durations_match_rustle_studio() {
+        // The Rustle Animation Studio (tools/logo-editor.html) stores the
+        // same per-frame durations in its DEFAULT_FRAMES `dur` fields.
+        // Keep the two in sync: if either side changes without the other,
+        // this test fails.
+        let studio = studio_frame_durations_ms();
+        assert_eq!(
+            studio.len(),
+            FRAME_DURATIONS_MS.len(),
+            "studio should define one duration per frame; the studio marks \
+             each one with a `dur: N, // TUI FRAME_DURATIONS_MS` line — if \
+             you changed the frames in tools/logo-editor.html, mirror the \
+             change in FRAME_DURATIONS_MS here"
+        );
+        for (i, (rust_ms, studio_ms)) in FRAME_DURATIONS_MS.iter().zip(&studio).enumerate() {
+            assert_eq!(
+                rust_ms, studio_ms,
+                "frame {i} duration diverged from the Rustle Animation Studio \
+                 (tools/logo-editor.html); keep FRAME_DURATIONS_MS and the \
+                 studio `dur` fields in sync"
             );
         }
     }

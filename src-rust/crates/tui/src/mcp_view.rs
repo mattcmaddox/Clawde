@@ -13,6 +13,7 @@ use crate::overlays::{
     centered_rect, render_dark_overlay_buf, render_dialog_bg_buf, CLAURST_ACCENT, CLAURST_MUTED,
     CLAURST_PANEL_BG, CLAURST_PANEL_BORDER, CLAURST_TEXT,
 };
+use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
 // Data types (view-level; mirrors cc_mcp types)
@@ -99,6 +100,8 @@ pub struct McpViewState {
     pub tool_scroll: usize,
     /// Whether the full error detail for the selected server is expanded.
     pub error_expanded: bool,
+    /// Vim-modal insert-mode state for the tool filter (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 impl McpViewState {
@@ -113,6 +116,7 @@ impl McpViewState {
             server_scroll: 0,
             tool_scroll: 0,
             error_expanded: false,
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -121,6 +125,7 @@ impl McpViewState {
         self.selected_server = 0;
         self.selected_tool = 0;
         self.tool_search.clear();
+        self.vim_search.reset();
         self.active_pane = McpViewPane::ServerList;
         self.error_expanded = false;
         self.visible = true;
@@ -544,7 +549,7 @@ fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     };
 
     // Search bar
-    let search_line = Line::from(vec![
+    let mut search_spans = vec![
         Span::styled("/ ", Style::default().fg(CLAURST_ACCENT)),
         Span::styled(
             if state.tool_search.is_empty() {
@@ -558,7 +563,16 @@ fn render_tool_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
                 CLAURST_TEXT
             }),
         ),
-    ]);
+    ];
+    if state.vim_search.insert {
+        search_spans.push(Span::styled(
+            "  -- INSERT --",
+            Style::default()
+                .fg(CLAURST_MUTED)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let search_line = Line::from(search_spans);
     Paragraph::new(search_line).render(
         Rect {
             x: inner.x,

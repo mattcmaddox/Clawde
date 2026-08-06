@@ -143,12 +143,16 @@ pub mod overlays;
 pub mod paste_viewer;
 /// Plugin hint/recommendation UI.
 pub mod plugin_views;
+/// Named animation preset store ($CLAWDE_HOME/rustle-presets/).
+pub mod preset_store;
 /// Complete prompt input with vim mode, history, typeahead, and paste handling.
 pub mod prompt_input;
 /// All ratatui rendering logic.
 pub mod render;
 /// Rustle mascot rendering.
 pub mod rustle;
+/// In-TUI pixel editor for the Rustle mascot animation (/rustle).
+pub mod rustle_editor;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 /// Session browser overlay (/session, /resume, /rename, /export).
@@ -167,6 +171,8 @@ pub mod theme_creator;
 pub mod theme_screen;
 /// Turn-aware transcript grouping and metadata helpers.
 pub mod transcript_turn;
+/// Vim-modal popup search convention (i to type, esc to exit insert).
+pub mod vim_search;
 /// Virtual scrollable list for efficient message rendering.
 pub mod virtual_list;
 /// Push-to-talk voice capture and Whisper transcription.
@@ -1228,6 +1234,424 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Esc));
         assert!(!app.mcp_view.visible);
+    }
+
+    // ---- Vim-modal popup search (i to type, esc to exit insert) ----------
+
+    #[test]
+    fn test_vim_popup_search_requires_insert_mode() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.model_picker.open("claude-opus-4-6");
+
+        // Normal mode: letters must NOT type into the filter.
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.model_picker.filter, "");
+
+        // i enters insert mode; letters now filter.
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        app.handle_key_event(key(KeyCode::Char('o')));
+        assert_eq!(app.model_picker.filter, "so");
+
+        // Esc exits insert mode without closing the picker.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.model_picker.visible);
+
+        // Letters no longer type after exiting insert.
+        app.handle_key_event(key(KeyCode::Char('n')));
+        assert_eq!(app.model_picker.filter, "so");
+
+        // Esc closes the picker from normal mode.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_vim_popup_navigation_uses_jk_and_search_stays_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.session_browser.open(vec![
+            SessionEntry {
+                id: "a".to_string(),
+                title: "Alpha".to_string(),
+                last_updated: "now".to_string(),
+                message_count: 1,
+                cost_usd: 0.0,
+            },
+            SessionEntry {
+                id: "b".to_string(),
+                title: "Beta".to_string(),
+                last_updated: "now".to_string(),
+                message_count: 2,
+                cost_usd: 0.0,
+            },
+            SessionEntry {
+                id: "c".to_string(),
+                title: "Gamma".to_string(),
+                last_updated: "now".to_string(),
+                message_count: 3,
+                cost_usd: 0.0,
+            },
+        ]);
+
+        // j/k navigate in normal mode instead of typing.
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.session_browser.selected_idx, 1);
+        assert_eq!(app.session_browser.search_query, "");
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.session_browser.selected_idx, 2);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.session_browser.selected_idx, 1);
+
+        // In insert mode, j/k type into the search bar instead of navigating.
+        // (Typing a filter resets the selection to the top — the browser's
+        // existing filter semantics — it does NOT move down the list.)
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('j')));
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.session_browser.search_query, "jk");
+        assert_eq!(app.session_browser.selected_idx, 0);
+
+        // Backspace edits the query in insert mode.
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.session_browser.search_query, "j");
+
+        // Esc exits insert; the overlay stays open.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.session_browser.visible);
+
+        // Esc closes from normal mode.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.session_browser.visible);
+    }
+
+    #[test]
+    fn test_popup_search_typing_unchanged_without_vim() {
+        let mut app = make_app();
+        app.session_browser.open(vec![SessionEntry {
+            id: "a".to_string(),
+            title: "Alpha".to_string(),
+            last_updated: "now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+        }]);
+        // Without vim, letters filter immediately and j/k stay as filter text.
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(app.session_browser.search_query, "l");
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.session_browser.search_query, "lj");
+    }
+
+    #[test]
+    fn test_vim_connect_dialog_modal_filter() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.connect_dialog.open();
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.connect_dialog.filter, "");
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.connect_dialog.filter, "s");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.connect_dialog.visible);
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.connect_dialog.visible);
+    }
+
+    #[test]
+    fn test_vim_popup_backspace_ignored_in_normal_mode() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.model_picker.open("claude-opus-4-6");
+
+        // Build a filter via insert mode, then exit insert.
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        app.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(app.model_picker.filter, "s");
+
+        // Backspace is an insert-mode edit — a no-op in normal mode.
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.model_picker.filter, "s");
+
+        // Backspace edits in insert mode.
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(app.model_picker.filter, "");
+    }
+
+    #[test]
+    fn test_vim_mcp_view_modal_tool_search() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.mcp_view.open(vec![McpServerView {
+            name: "filesystem".to_string(),
+            transport: "stdio".to_string(),
+            status: McpViewStatus::Connected,
+            tool_count: 2,
+            resource_count: 0,
+            prompt_count: 0,
+            resources: vec![],
+            prompts: vec![],
+            error_message: None,
+            tools: vec![
+                McpToolView {
+                    name: "read_file".to_string(),
+                    server: "filesystem".to_string(),
+                    description: "Read a file".to_string(),
+                    input_schema: None,
+                },
+                McpToolView {
+                    name: "write_file".to_string(),
+                    server: "filesystem".to_string(),
+                    description: "Write a file".to_string(),
+                    input_schema: None,
+                },
+            ],
+        }]);
+        app.mcp_view.switch_pane(); // tools pane — where the filter lives
+
+        // Normal mode: letters do not type and j/k navigate instead.
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.mcp_view.tool_search, "");
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.mcp_view.selected_tool, 1);
+
+        // i then letters filter.
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('r')));
+        assert_eq!(app.mcp_view.tool_search, "r");
+
+        // Esc exits insert without closing; a second Esc closes.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.mcp_view.visible);
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.mcp_view.visible);
+    }
+
+    #[test]
+    fn test_vim_help_overlay_modal_filter() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.help_overlay.toggle();
+
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.help_overlay.filter, "");
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.help_overlay.filter, "s");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.help_overlay.visible);
+
+        // j scrolls in normal mode.
+        let before = app.help_overlay.scroll_offset;
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.help_overlay.scroll_offset, before + 1);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.help_overlay.visible);
+    }
+
+    #[test]
+    fn test_vim_legacy_history_search_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        let mut hs = HistorySearch::new();
+        hs.update_matches(&["hello world".to_string()]);
+        app.history_search = Some(hs);
+        // The overlay stays hidden on purpose to exercise the legacy handler.
+
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.history_search.as_ref().unwrap().query, "");
+        app.handle_key_event(key(KeyCode::Char('i')));
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.history_search.as_ref().unwrap().query, "x");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(
+            app.history_search.is_some(),
+            "Esc exits insert mode, not the search"
+        );
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.history_search.is_none());
+    }
+
+    // ---- Vim-modal text-entry dialogs (insert-first; Esc exits insert) ----
+
+    #[test]
+    fn test_vim_key_input_dialog_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.key_input_dialog
+            .open("anthropic".to_string(), "Anthropic".to_string());
+
+        // The dialog is a text entry, so it opens in insert — typing works.
+        app.handle_key_event(key(KeyCode::Char('s')));
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.key_input_dialog.input, "sk");
+
+        // Esc exits insert without closing (key preserved).
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.key_input_dialog.visible);
+        assert_eq!(app.key_input_dialog.input, "sk");
+
+        // Letters no longer type in normal mode.
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.key_input_dialog.input, "sk");
+
+        // Esc closes from normal mode.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.key_input_dialog.visible);
+    }
+
+    #[test]
+    fn test_vim_custom_provider_dialog_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.custom_provider_dialog
+            .open("custom-openai".to_string(), "Custom".to_string(), None);
+
+        app.handle_key_event(key(KeyCode::Char('h')));
+        assert_eq!(app.custom_provider_dialog.url_input, "h");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.custom_provider_dialog.visible);
+        assert_eq!(app.custom_provider_dialog.url_input, "h");
+        app.handle_key_event(key(KeyCode::Char('t')));
+        assert_eq!(app.custom_provider_dialog.url_input, "h");
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.custom_provider_dialog.visible);
+    }
+
+    #[test]
+    fn test_vim_free_mode_dialog_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.free_mode_dialog.open(&[]);
+
+        // Opens in insert — typing a key works immediately.
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+
+        // Esc exits insert without clearing the typed key or closing.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.free_mode_dialog.visible);
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+
+        // Esc in normal mode runs the existing cascade: clear pending...
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.free_mode_dialog.visible);
+        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+
+        // ...then close.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.free_mode_dialog.visible);
+    }
+
+    #[test]
+    fn test_vim_free_mode_dialog_hjkl_navigation() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        let id0 = clawde_api::FREE_CATALOG[0].id;
+        let id1 = clawde_api::FREE_CATALOG[1].id;
+        app.free_mode_dialog
+            .open(&[(id0, vec!["k1".to_string()]), (id1, vec!["k2".to_string()])]);
+
+        // In insert mode, j/k/h/l belong to the typed key.
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "j");
+
+        // Esc exits insert. With a pending key, hjkl must NOT navigate
+        // (moving rows discards typed text) — the buffer stays intact.
+        app.handle_key_event(key(KeyCode::Esc));
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.free_mode_dialog.active_idx, 0);
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "j");
+
+        // Esc clears the pending text (existing cascade), then hjkl navigate.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.free_mode_dialog.active_idx, 1);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.free_mode_dialog.active_idx, 0);
+    }
+
+    #[test]
+    fn test_free_mode_dialog_typing_unchanged_without_vim() {
+        let mut app = make_app();
+        app.free_mode_dialog.open(&[]);
+        // j with an empty buffer navigates (legacy nav-while-empty); it does
+        // not type.
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert!(app.free_mode_dialog.fields[0].pending.is_empty());
+        // Once a key is being typed, letters belong to the key.
+        app.handle_key_event(key(KeyCode::Char('a')));
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "aj");
+    }
+
+    #[test]
+    fn test_text_entry_dialog_unchanged_without_vim() {
+        let mut app = make_app();
+        app.key_input_dialog
+            .open("anthropic".to_string(), "Anthropic".to_string());
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.key_input_dialog.input, "s");
+        // One Esc closes immediately — no insert-exit step without vim.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.key_input_dialog.visible);
+    }
+
+    #[test]
+    fn test_vim_elicitation_dialog_modal() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.elicitation.show(
+            "test-server",
+            Some("Please provide your credentials"),
+            vec![ElicitationField::text("username", "Username")],
+        );
+
+        // Insert-first: typing works immediately.
+        app.handle_key_event(key(KeyCode::Char('a')));
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(app.elicitation.fields[0].value, "al");
+
+        // Esc exits insert without cancelling (typed value preserved).
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.elicitation.visible);
+        assert_eq!(app.elicitation.fields[0].value, "al");
+
+        // Letters no longer type in normal mode.
+        app.handle_key_event(key(KeyCode::Char('x')));
+        assert_eq!(app.elicitation.fields[0].value, "al");
+
+        // j/k navigate fields in normal mode (single field wraps to itself).
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.elicitation.active_field, 0);
+
+        // Esc cancels from normal mode.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.elicitation.visible);
+        assert!(matches!(
+            app.elicitation.take_result(),
+            Some(ElicitationResult::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn test_elicitation_dialog_unchanged_without_vim() {
+        let mut app = make_app();
+        app.elicitation.show(
+            "test-server",
+            None::<String>,
+            vec![ElicitationField::text("username", "Username")],
+        );
+        app.handle_key_event(key(KeyCode::Char('s')));
+        assert_eq!(app.elicitation.fields[0].value, "s");
+        // One Esc cancels immediately — no insert-exit step without vim.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.elicitation.visible);
     }
 
     #[test]

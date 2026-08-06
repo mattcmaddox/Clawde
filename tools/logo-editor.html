@@ -709,8 +709,12 @@
   <div class="anim-controls">
     <button class="play-btn" id="playBtn" title="Play/Pause">▶</button>
     <button class="btn" id="speedDown" title="Slower">−</button>
-    <span id="speedLabel" style="font-size:9px;color:var(--muted);min-width:30px;text-align:center">1s</span>
+    <span id="speedLabel" style="font-size:9px;color:var(--muted);min-width:30px;text-align:center">1×</span>
     <button class="btn" id="speedUp" title="Faster">+</button>
+  </div>
+  <div class="ctrl">
+    <label title="Duration of the selected frame (ms)">Frame ms</label>
+    <input type="number" id="frameDurInput" min="100" max="10000" step="100" value="3000">
   </div>
 </div>
 
@@ -792,88 +796,94 @@
 //  FRAME DATA — the 6 Rustle mascot animation frames
 // ═══════════════════════════════════════════════════════════════════
 const DEFAULT_FRAMES = [
-  { // Frame 1 — Rest claw
+  { // Frame 1 — Rest claw (claws drawn in, feet on the ground)
     name: 'Rest claw',
     rows: 8, cols: 29,
+    dur: 3000, // TUI FRAME_DURATIONS_MS[0]
     grid: [
       "                             ",
       "                             ",
       "                   ▄▛▜▛▜▄    ",
       "                 ▟▛▜▙▟▙▟▛▜▙  ",
       "                 █▙▟▛▔▔▜▙▟█  ",
-      "                 ▜██▌▗▖▐██▛  ",
-      "                  ▝▜████▛▘   ",
-      "                   ▝████▘    ",
+      "                 ██▘    ▝██  ",
+      "                 ▜█▖ ▗▖ ▗█▛  ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
-  { // Frame 2 — Rest claw (copy)
-    name: 'Rest claw (copy)',
+  { // Frame 2 — Rest claw up-shifted + platform
+    name: 'Rest claw up-shift + platform',
     rows: 8, cols: 29,
+    dur: 1500, // TUI FRAME_DURATIONS_MS[1]
     grid: [
       "                             ",
       "                   ▄▛▜▛▜▄    ",
       "                 ▟▛▜▙▟▙▟▛▜▙  ",
       "                 █▙▟▛▔▔▜▙▟█  ",
-      "                 ▜██▌▗▖▐██▛  ",
-      "                  ▝▜████▛▘   ",
-      "                   ▝████▘    ",
-      "                    ████     ",
+      "                 ██▘    ▝██  ",
+      "                 ▜█▖ ▗▖ ▗█▛  ",
+      "                  ████████   ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
-  { // Frame 3 — Extend + stairs
+  { // Frame 3 — Extend + stairs (claws out, with platform)
     name: 'Extend + stairs',
     rows: 8, cols: 29,
+    dur: 2000, // TUI FRAME_DURATIONS_MS[2]
     grid: [
       "                  ▗ ▐  ▌ ▖   ",
       "                  ▐▄▛▜▛▜▄▌   ",
       "                 ▟▛▜▙▟▙▟▛▜▙  ",
       "                 █▙▟▛▔▔▜▙▟█  ",
-      "                 ▜██▌▗▖▐██▛  ",
-      "                  ▝▜████▛▘   ",
-      "                   ▝████▘    ",
-      "                    ████     ",
+      "                 ██▘    ▝██  ",
+      "                 ▜█▖ ▗▖ ▗█▛  ",
+      "                  ████████   ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
-  { // Frame 4 — Extend + stairs (copy)
-    name: 'Extend + stairs (copy)',
+  { // Frame 4 — Extend + staircase
+    name: 'Extend + staircase',
     rows: 8, cols: 29,
+    dur: 2000, // TUI FRAME_DURATIONS_MS[3]
     grid: [
       "                  ▗ ▐  ▌ ▖   ",
       "    ▚  ▚          ▐▄▛▜▛▜▄▌   ",
       "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
       "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
-      " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
-      "  ▚  ▚  ▚         ▝▜████▛▘   ",
-      "   ▚  ▚            ▝████▘    ",
-      "                    ████     ",
+      " ▚  ▚  ▚         ██▘    ▝██  ",
+      "  ▚  ▚  ▚        ▜█▖ ▗▖ ▗█▛  ",
+      "   ▚  ▚           ████████   ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
-  { // Frame 5 — Extend + stairs (copy) (copy)
-    name: 'Extend + stairs (copy) (copy)',
+  { // Frame 5 — Rest + staircase
+    name: 'Rest + staircase',
     rows: 8, cols: 29,
+    dur: 1500, // TUI FRAME_DURATIONS_MS[4]
     grid: [
       "                             ",
       "    ▚  ▚           ▄▛▜▛▜▄    ",
       "  ▚  ▚  ▚        ▟▛▜▙▟▙▟▛▜▙  ",
       "   ▚  ▚  ▚       █▙▟▛▔▔▜▙▟█  ",
-      " ▚  ▚  ▚         ▜██▌▗▖▐██▛  ",
-      "  ▚  ▚  ▚         ▝▜████▛▘   ",
-      "   ▚  ▚            ▝████▘    ",
-      "                    ████     ",
+      " ▚  ▚  ▚         ██▘    ▝██  ",
+      "  ▚  ▚  ▚        ▜█▖ ▗▖ ▗█▛  ",
+      "   ▚  ▚           ████████   ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
-  { // Frame 6 — Extend + stairs (loop back)
-    name: 'Extend + stairs',
+  { // Frame 6 — Staircase down (loop back to rest)
+    name: 'Staircase down',
     rows: 8, cols: 29,
+    dur: 1500, // TUI FRAME_DURATIONS_MS[5]
     grid: [
       "                             ",
-      "                   ▄▛▜▛▜▄    ",
-      "                 ▟▛▜▙▟▙▟▛▜▙  ",
-      "                 █▙▟▛▔▔▜▙▟█  ",
-      "                 ▜██▌▗▖▐██▛  ",
-      "                  ▝▜████▛▘   ",
-      "                   ▝████▘    ",
-      "                    ████     ",
+      "    ▚  ▚                     ",
+      "  ▚  ▚  ▚          ▄▛▜▛▜▄    ",
+      "   ▚  ▚  ▚       ▟▛▜▙▟▙▟▛▜▙  ",
+      " ▚  ▚  ▚         █▙▟▛▔▔▜▙▟█  ",
+      "  ▚  ▚  ▚        ██▘    ▝██  ",
+      "   ▚  ▚          ▜█▖ ▗▖ ▗█▛  ",
+      "                  ████████   ",
     ].map(r => [...r]),
   },
 ];
@@ -899,7 +909,7 @@ let grid = [];     // active grid = frames[selectedIdx].grid
 let animPlaying = false;
 let animTimer = null;
 let animFrameIdx = 0;
-let animSpeed = 1000; // ms per frame
+let animSpeed = 1; // playback speed multiplier (1× = exact TUI timing)
 
 // Selection
 let selectMode = false;
@@ -930,13 +940,14 @@ const $editLabel = document.getElementById('editFrameLabel');
 const $animPre = document.getElementById('animPre');
 const $playBtn = document.getElementById('playBtn');
 const $speedLabel = document.getElementById('speedLabel');
+const $frameDurInput = document.getElementById('frameDurInput');
 const $tuiEditorDims = document.getElementById('tuiEditorDims');
 const $tuiEditorRows = document.getElementById('tuiEditorRows');
 const $tuiEditorCols = document.getElementById('tuiEditorCols');
 
 // ─── PERSISTENCE ────────────────────────────────────────────────
 const STORAGE_KEY = 'rustle-studio-data';
-const STORAGE_VERSION = 3;  // bump when DEFAULT_FRAMES changes
+const STORAGE_VERSION = 5;  // bump when DEFAULT_FRAMES changes
 
 function saveState() {
   try {
@@ -944,6 +955,7 @@ function saveState() {
       version: STORAGE_VERSION,
       frames: frames.map(f => ({
         name: f.name, rows: f.rows, cols: f.cols,
+        dur: f.dur,
         grid: f.grid,
       })),
       selectedIdx,
@@ -964,6 +976,7 @@ function loadState() {
     if (!data.frames || !data.frames.length) return false;
     frames = data.frames.map(f => ({
       name: f.name, rows: f.rows, cols: f.cols,
+      dur: f.dur || 1000,
       grid: f.grid,
     }));
     if (data.fgColor) fgColor = data.fgColor;
@@ -1114,6 +1127,7 @@ function selectFrame(idx) {
   updateAnimPreview();
   updateExport();
   $editLabel.textContent = `Editing: ${frames[idx].name} (Frame ${idx + 1})`;
+  $frameDurInput.value = frames[idx].dur || 1000;
   autoSave();
 }
 
@@ -1122,6 +1136,7 @@ function addFrame() {
     name: `Frame ${frames.length + 1}`,
     rows,
     cols,
+    dur: 1000,
     grid: emptyGrid(rows, cols),
   };
   frames.push(blank);
@@ -1152,6 +1167,7 @@ function duplicateFrame(idx) {
     name: orig.name + ' (copy)',
     rows: orig.rows,
     cols: orig.cols,
+    dur: orig.dur || 1000,
     grid: deepCopyGrid(orig.grid),
   };
   frames.splice(idx + 1, 0, dup);
@@ -1229,7 +1245,7 @@ function renderFrameStrip() {
 
     const label = document.createElement('div');
     label.className = 'thumb-label';
-    label.innerHTML = `<span class="idx-badge">#${i + 1}</span> ${f.name}`;
+    label.innerHTML = `<span class="idx-badge">#${i + 1}</span> ${f.name}<span style="color:var(--muted);font-size:7px"> · ${((f.dur || 1000) / 1000).toFixed(1)}s</span>`;
     div.appendChild(label);
 
     const art = document.createElement('div');
@@ -1309,7 +1325,7 @@ function updateAnimPreview() {
   const right = rightTips.map(r => (r + ' '.repeat(RIGHT_W)).slice(0, RIGHT_W));
 
   // Build full TUI layout as text
-  const title = ' Clawde v0.1.7 ';
+  const title = ' Clawde v0.1.8 '; // keep in sync with clawde_core::constants::APP_VERSION
   const dashes = TOTAL - 2 - title.length;
   const lines = [];
   lines.push('╭' + title + '─'.repeat(dashes) + '╮');
@@ -1326,10 +1342,22 @@ function updateAnimPreview() {
   $animPre.style.color = fgColor;
 }
 
+function frameDurationMs(idx) {
+  const f = frames[idx];
+  const base = (f && f.dur != null && f.dur > 0) ? f.dur : 1000;
+  return Math.max(50, Math.round(base * animSpeed));
+}
+
 function animStep() {
   if (!animPlaying || frames.length === 0) return;
   animFrameIdx = (animFrameIdx + 1) % frames.length;
   updateAnimPreview();
+  scheduleNextStep();
+}
+
+function scheduleNextStep() {
+  if (!animPlaying) return;
+  animTimer = setTimeout(animStep, frameDurationMs(animFrameIdx));
 }
 
 function startAnim() {
@@ -1337,12 +1365,12 @@ function startAnim() {
   animPlaying = true;
   $playBtn.textContent = '⏸';
   $playBtn.classList.add('playing');
-  animTimer = setInterval(animStep, animSpeed);
+  scheduleNextStep();
 }
 
 function stopAnim() {
   animPlaying = false;
-  if (animTimer) { clearInterval(animTimer); animTimer = null; }
+  if (animTimer) { clearTimeout(animTimer); animTimer = null; }
   $playBtn.textContent = '▶';
   $playBtn.classList.remove('playing');
 }
@@ -1352,12 +1380,13 @@ function toggleAnim() {
   else startAnim();
 }
 
-function setAnimSpeed(ms) {
-  animSpeed = Math.max(100, Math.min(5000, ms));
-  $speedLabel.textContent = (animSpeed / 1000).toFixed(1) + 's';
+function setAnimSpeed(mult) {
+  animSpeed = Math.max(0.1, Math.min(5, mult));
+  $speedLabel.textContent = String(parseFloat(animSpeed.toFixed(2))) + '×';
   if (animPlaying) {
-    clearInterval(animTimer);
-    animTimer = setInterval(animStep, animSpeed);
+    clearTimeout(animTimer);
+    animTimer = null;
+    scheduleNextStep();
   }
   autoSave();
 }
@@ -1365,6 +1394,19 @@ function setAnimSpeed(ms) {
 $playBtn.onclick = toggleAnim;
 document.getElementById('speedDown').onclick = () => setAnimSpeed(animSpeed * 1.5);
 document.getElementById('speedUp').onclick = () => setAnimSpeed(animSpeed / 1.5);
+$frameDurInput.oninput = () => {
+  const v = Math.round(Number($frameDurInput.value));
+  if (!Number.isFinite(v) || !frames[selectedIdx]) return;
+  frames[selectedIdx].dur = Math.max(100, Math.min(10000, v));
+  $frameDurInput.value = String(frames[selectedIdx].dur);
+  renderFrameStrip();
+  autoSave();
+  if (animPlaying && animFrameIdx === selectedIdx) {
+    clearTimeout(animTimer);
+    animTimer = null;
+    scheduleNextStep();
+  }
+};
 
 // ═══════════════════════════════════════════════════════════════════
 //  SELECTION
@@ -1743,12 +1785,15 @@ function updateExport() {
   const bb = parseInt(hex.substr(4, 2), 16);
   const charList = [...allUsed].join(' ');
 
+  const durations = frames.map(f => (f.dur && f.dur > 0) ? Math.round(f.dur) : 1000).join(', ');
+
   $export.value =
     `/// Animation frames for the mascot. Each frame is ${frames[0]?.rows || rows} rows × ${frames[0]?.cols || cols} cols.\n` +
     `/// chars used: ${charList}  |  color: rgb(${rr}, ${gg}, ${bb})\n` +
     `const FRAMES: [[&str; ${frames[0]?.rows || rows}]; ${frames.length}] = [\n` +
     frameArrays.join(',\n') +
-    `\n];\n`;
+    `\n];\n` +
+    `\nconst FRAME_DURATIONS_MS: [u64; ${frames.length}] = [${durations}];\n`;
 }
 
 function copyCode() {
@@ -1865,6 +1910,7 @@ function importNew() {
     name: `Imported Frame ${frames.length + 1}`,
     rows: parsed.rows,
     cols: parsed.cols,
+    dur: 1000,
     grid: deepCopyGrid(parsed.grid),
   };
   frames.push(newFrame);
@@ -1894,6 +1940,7 @@ function init() {
       name: f.name,
       rows: f.rows,
       cols: f.cols,
+      dur: f.dur,
       grid: deepCopyGrid(f.grid).map(row => row.map(ch => ch === ' ' ? null : ch)),
     }));
     selectedIdx = 0;
@@ -1909,14 +1956,15 @@ function init() {
     cols = frames[selectedIdx].cols;
     $rowsIn.value = rows;
     $colsIn.value = cols;
-    $speedLabel.textContent = (animSpeed / 1000).toFixed(1) + 's';
     $color.dispatchEvent(new Event('input'));
   }
+  $speedLabel.textContent = String(parseFloat(animSpeed.toFixed(2))) + '×';
 
   renderFrameStrip();
   loadActiveGrid();
   updateAnimPreview();
   initColorPresets();
+  $frameDurInput.value = frames[selectedIdx].dur || 1000;
   $editLabel.textContent = `Editing: ${frames[selectedIdx].name} (Frame ${selectedIdx + 1})`;
 
   // Start animation by default

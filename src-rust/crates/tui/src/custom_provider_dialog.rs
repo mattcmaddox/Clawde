@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use crate::vim_search::VimSearch;
 use std::cell::Cell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,9 @@ pub struct CustomProviderDialogState {
     pub url_input: String,
     pub api_key_input: String,
     pub active_field: CustomProviderField,
+    /// Vim-modal insert state (only used when vim is enabled). The dialog is
+    /// a text entry, so it opens in insert; `Esc` exits insert before closing.
+    pub vim_search: VimSearch,
 }
 
 impl Default for CustomProviderDialogState {
@@ -46,6 +50,7 @@ impl CustomProviderDialogState {
             api_key_input: String::new(),
             active_field: CustomProviderField::Url,
             last_rect: Cell::new(Rect::default()),
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -61,6 +66,7 @@ impl CustomProviderDialogState {
         self.url_input = current_url.unwrap_or_default();
         self.api_key_input.clear();
         self.active_field = CustomProviderField::Url;
+        self.vim_search.enter_insert();
     }
 
     pub fn close(&mut self) {
@@ -68,6 +74,7 @@ impl CustomProviderDialogState {
         self.url_input.clear();
         self.api_key_input.clear();
         self.active_field = CustomProviderField::Url;
+        self.vim_search.reset();
     }
 
     pub fn move_next_field(&mut self) {
@@ -117,6 +124,7 @@ impl CustomProviderDialogState {
 pub fn render_custom_provider_dialog(
     frame: &mut Frame,
     state: &CustomProviderDialogState,
+    vim_enabled: bool,
     area: Rect,
 ) {
     if !state.visible {
@@ -229,11 +237,18 @@ pub fn render_custom_provider_dialog(
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" tab", Style::default().fg(dim)),
         Span::styled(" switch field  ", Style::default().fg(dim)),
         Span::styled(confirm_hint, Style::default().fg(dim)),
-    ]));
+    ];
+    if vim_enabled && state.vim_search.insert {
+        hint_spans.push(Span::styled(
+            "   -- INSERT --",
+            Style::default().fg(dim).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(hint_spans));
 
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);

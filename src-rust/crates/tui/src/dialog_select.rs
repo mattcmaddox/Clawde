@@ -12,8 +12,10 @@ use ratatui::Frame;
 use std::cell::{Cell, RefCell};
 
 use crate::overlays::{
-    centered_rect, modal_search_line, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG,
+    centered_rect, modal_search_line_with_insert, render_dark_overlay, render_dialog_bg,
+    CLAURST_PANEL_BG,
 };
+use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +44,8 @@ pub struct DialogSelectState {
     pub last_render_area: Cell<Rect>,
     /// Maps absolute screen row → filtered item index. Built during render.
     row_to_item: RefCell<Vec<(u16, usize)>>,
+    /// Vim-modal insert-mode state for the filter bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +65,7 @@ impl DialogSelectState {
             filtered_indices: filtered,
             last_render_area: Cell::new(Rect::default()),
             row_to_item: RefCell::new(Vec::new()),
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -68,6 +73,7 @@ impl DialogSelectState {
         self.visible = true;
         self.selected_index = 0;
         self.filter.clear();
+        self.vim_search.reset();
         self.refilter();
         self.last_render_area.set(Rect::default());
         self.row_to_item.borrow_mut().clear();
@@ -271,11 +277,12 @@ pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: 
 
     // Search field
     header_lines.push(Line::from(""));
-    header_lines.push(modal_search_line(
+    header_lines.push(modal_search_line_with_insert(
         &state.filter,
         "Search",
         dim,
         Color::White,
+        state.vim_search.insert,
     ));
 
     frame.render_widget(Paragraph::new(header_lines).bg(dialog_bg), header_area);

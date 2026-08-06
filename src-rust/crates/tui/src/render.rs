@@ -41,6 +41,7 @@ use crate::overlays::{
 use crate::plugin_views::render_plugin_hints;
 use crate::prompt_input::{input_height, render_prompt_input, InputMode, TypeaheadSource, VimMode};
 use crate::rustle::rustle_lines;
+use crate::rustle_editor::render_rustle_editor;
 use crate::session_branching::render_session_branching;
 use crate::session_browser::render_session_browser;
 use crate::settings_screen::render_settings_screen;
@@ -759,6 +760,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_theme_creator(frame, &app.theme_creator, size);
     }
 
+    // Rustle mascot editor overlay
+    if app.rustle_editor.visible {
+        render_rustle_editor(frame, &app.rustle_editor, size);
+    }
+
     if app.stats_dialog.visible {
         render_stats_dialog(&app.stats_dialog, size, frame.buffer_mut());
     }
@@ -895,17 +901,32 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // API key input dialog (opened from /connect for key-based providers)
     if app.key_input_dialog.visible {
-        render_key_input_dialog(frame, &app.key_input_dialog, size);
+        render_key_input_dialog(
+            frame,
+            &app.key_input_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
     }
 
     // Custom provider URL + API key dialog.
     if app.custom_provider_dialog.visible {
-        render_custom_provider_dialog(frame, &app.custom_provider_dialog, size);
+        render_custom_provider_dialog(
+            frame,
+            &app.custom_provider_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
     }
 
     // "Free" composite-provider setup dialog (Zen + OpenRouter).
     if app.free_mode_dialog.visible {
-        crate::free_mode_dialog::render_free_mode_dialog(frame, &app.free_mode_dialog, size);
+        crate::free_mode_dialog::render_free_mode_dialog(
+            frame,
+            &app.free_mode_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
     }
 
     // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
@@ -920,7 +941,12 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
     if app.elicitation.visible {
-        render_elicitation_dialog(&app.elicitation, size, frame.buffer_mut());
+        render_elicitation_dialog(
+            &app.elicitation,
+            size,
+            app.prompt_input.vim_enabled,
+            frame.buffer_mut(),
+        );
     }
 
     // Model picker overlay

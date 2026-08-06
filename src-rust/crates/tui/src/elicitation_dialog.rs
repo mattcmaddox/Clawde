@@ -22,6 +22,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use crate::vim_search::VimSearch;
+
 // ---------------------------------------------------------------------------
 // Field kinds
 // ---------------------------------------------------------------------------
@@ -180,6 +182,10 @@ pub struct ElicitationDialogState {
     pub fields: Vec<ElicitationField>,
     /// Index of the currently focused field.
     pub active_field: usize,
+    /// Vim-modal insert-mode state (only used when vim mode is enabled). The
+    /// dialog opens in insert so typing works immediately; `Esc` exits insert
+    /// before the second `Esc` cancels.
+    pub vim_search: VimSearch,
     /// Pending result; `None` until the user submits or cancels.
     result: Option<ElicitationResult>,
 }
@@ -202,6 +208,10 @@ impl ElicitationDialogState {
         self.active_field = 0;
         self.result = None;
         self.visible = true;
+        // Insert-first: the dialog's primary purpose is typing, so it opens in
+        // insert mode (like the key-input / custom-provider / free-mode dialogs)
+        // and `Esc` exits insert before the next `Esc` cancels.
+        self.vim_search.enter_insert();
     }
 
     /// Take the pending result, leaving `None` in place.
@@ -213,12 +223,14 @@ impl ElicitationDialogState {
     pub fn cancel(&mut self) {
         self.result = Some(ElicitationResult::Cancelled);
         self.visible = false;
+        self.vim_search.reset();
     }
 
     /// Close the dialog without taking any action.
     pub fn close(&mut self) {
         self.result = None;
         self.visible = false;
+        self.vim_search.reset();
     }
 
     /// Validate all fields and, if valid, submit the form.
@@ -383,7 +395,12 @@ impl ElicitationDialogState {
 // ---------------------------------------------------------------------------
 
 /// Render the elicitation dialog as a centered modal overlay.
-pub fn render_elicitation_dialog(state: &ElicitationDialogState, area: Rect, buf: &mut Buffer) {
+pub fn render_elicitation_dialog(
+    state: &ElicitationDialogState,
+    area: Rect,
+    vim_enabled: bool,
+    buf: &mut Buffer,
+) {
     if !state.visible || area.height < 10 || area.width < 40 {
         return;
     }
@@ -480,10 +497,19 @@ pub fn render_elicitation_dialog(state: &ElicitationDialogState, area: Rect, buf
         }
     }
 
-    // Hint line
+    // Hint line — with vim mode on, show the modal-mode legend and a dim
+    // `-- INSERT --` while typing (mirrors the popup search-bar convention).
+    // Keep each hint short enough to fit the 64-wide dialog without wrapping.
+    let hint = if vim_enabled && state.vim_search.insert {
+        "-- INSERT --   Esc: exit insert   Enter: submit"
+    } else if vim_enabled {
+        "  i: type   Tab/jk: next   Enter: submit   Esc: cancel"
+    } else {
+        "  Tab: next field   Enter: submit   Esc: cancel"
+    };
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Tab: next field   Enter: submit   Esc: cancel",
+        hint,
         Style::default().fg(Color::DarkGray),
     )]));
 
@@ -842,7 +868,7 @@ mod tests {
             height: 30,
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        render_elicitation_dialog(&s, area, &mut buf);
+        render_elicitation_dialog(&s, area, false, &mut buf);
         let rendered = buf
             .content
             .iter()
@@ -850,6 +876,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(rendered.contains("test-server") || rendered.contains("Input Required"));
+    }
+
+    #[test]
+    fn elicitation_render_shows_insert_hint_in_vim_insert_mode() {
+        let s = make_dialog();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        // vim on + dialog opened (insert-first) → hint mentions insert mode.
+        render_elicitation_dialog(&s, area, true, &mut buf);
+        let rendered = buf
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(rendered.contains("-- INSERT --"));
     }
 
     #[test]
@@ -862,7 +909,7 @@ mod tests {
             height: 30,
         };
         let mut buf = ratatui::buffer::Buffer::empty(area);
-        render_elicitation_dialog(&s, area, &mut buf);
+        render_elicitation_dialog(&s, area, false, &mut buf);
         let rendered = buf
             .content
             .iter()
@@ -870,6 +917,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(!rendered.contains("Input Required"));
+    }
+
+    #[test]
+    fn elicitation_opens_in_insert_and_resets_on_cancel() {
+        let mut s = ElicitationDialogState::new();
+        assert!(!s.vim_search.insert, "fresh state is normal mode");
+        s.show("srv", None::<String>, vec![]);
+        assert!(s.vim_search.insert, "dialog opens in insert (insert-first)");
+        s.cancel();
+        assert!(!s.vim_search.insert, "cancel resets to normal mode");
     }
 
     #[test]

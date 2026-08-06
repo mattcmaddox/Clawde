@@ -8,7 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
+use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAURST_PANEL_BG};
+use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
 // Effort level
@@ -972,6 +973,8 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// Vim-modal insert-mode state for the filter bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1004,7 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -1031,6 +1035,7 @@ impl ModelPickerState {
         self.selected_idx = self.models.iter().position(|m| m.is_current).unwrap_or(0);
         self.title = title.into();
         self.filter.clear();
+        self.vim_search.reset();
         self.effort_level = effort;
         self.fast_mode = fast_mode;
         self.fast_mode_model = fast_mode.then_some(current_model.to_string());
@@ -1041,6 +1046,7 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+        self.vim_search.reset();
     }
 
     pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
@@ -1448,11 +1454,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     // Search field
     header_lines.push(Line::from(""));
-    header_lines.push(modal_search_line(
+    header_lines.push(modal_search_line_with_insert(
         &state.filter,
         "Search",
         dim,
         Color::White,
+        state.vim_search.insert,
     ));
 
     // Task row + legend (free picker only): shows the active task sort, the

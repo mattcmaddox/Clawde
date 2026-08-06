@@ -12,6 +12,7 @@ use ratatui::Frame;
 use std::cell::Cell;
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
 // State
@@ -31,6 +32,9 @@ pub struct KeyInputDialogState {
     pub pending_token: Option<String>,
     /// The area used by this dialog in the last render (for click-outside detection).
     pub last_rect: Cell<Rect>,
+    /// Vim-modal insert state (only used when vim is enabled). The dialog is
+    /// a text entry, so it opens in insert; `Esc` exits insert before closing.
+    pub vim_search: VimSearch,
 }
 
 impl Default for KeyInputDialogState {
@@ -49,6 +53,7 @@ impl KeyInputDialogState {
             cursor_pos: 0,
             pending_token: None,
             last_rect: Cell::new(Rect::default()),
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -60,6 +65,7 @@ impl KeyInputDialogState {
         self.input.clear();
         self.cursor_pos = 0;
         self.pending_token = None;
+        self.vim_search.enter_insert();
     }
 
     /// Close and clear the dialog.
@@ -68,6 +74,7 @@ impl KeyInputDialogState {
         self.input.clear();
         self.cursor_pos = 0;
         self.pending_token = None;
+        self.vim_search.reset();
     }
 
     /// Capture the typed token and switch to the account-ID prompt.
@@ -146,7 +153,12 @@ impl KeyInputDialogState {
 
 /// Render the key input dialog overlay — OpenCode-style: dark overlay, no
 /// border, minimal and polished.
-pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, area: Rect) {
+pub fn render_key_input_dialog(
+    frame: &mut Frame,
+    state: &KeyInputDialogState,
+    vim_enabled: bool,
+    area: Rect,
+) {
     if !state.visible {
         return;
     }
@@ -237,10 +249,17 @@ pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, a
     lines.push(Line::from(""));
 
     // Hint row
-    lines.push(Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" enter", Style::default().fg(dim)),
         Span::styled(" confirm", Style::default().fg(dim)),
-    ]));
+    ];
+    if vim_enabled && state.vim_search.insert {
+        hint_spans.push(Span::styled(
+            "   -- INSERT --",
+            Style::default().fg(dim).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(hint_spans));
 
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);

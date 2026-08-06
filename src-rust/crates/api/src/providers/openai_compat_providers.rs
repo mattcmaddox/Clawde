@@ -66,37 +66,24 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
 /// the OpenAI-compatible `/v1` base URL and the native API host (used for
 /// health checks and model discovery) are derived from the same resolved host
 /// so a configured remote server is honored everywhere.
+///
+/// When `providers.ollama.options.require_explicit_host` is `true` and no
+/// explicit host is configured (neither settings nor `OLLAMA_HOST`), the
+/// provider will be unavailable — the `localhost:11434` fallback is skipped
+/// to prevent accidental CPU inference.
 pub fn ollama() -> OpenAiCompatProvider {
-    let settings = Settings::load_sync().unwrap_or_default();
-    let host = settings
-        .providers
-        .get("ollama")
-        .and_then(|config| config.api_base.as_deref())
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("OLLAMA_HOST")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "http://localhost:11434".to_string());
-
-    // Strip a trailing `/v1` (and slashes) so the native host targets the
-    // Ollama root, then rebuild the `/v1` base URL for chat completions.
-    let native_host = host
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/')
-        .to_string();
-    let base_url = format!("{}/v1", native_host);
+    let native_host = clawde_core::config::resolve_ollama_host();
+    let base_url = native_host
+        .as_deref()
+        .map(|host| format!("{}/v1", host))
+        .unwrap_or_else(|| "http://0.0.0.0:1/v1".to_string());
     OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", base_url).with_quirks(ProviderQuirks {
         overflow_patterns: vec![
             "prompt too long".to_string(),
             "exceeded.*context length".to_string(),
         ],
         no_api_key_required: true,
-        ollama_native_host: Some(native_host),
+        ollama_native_host: native_host,
         ..Default::default()
     })
 }

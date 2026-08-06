@@ -427,7 +427,7 @@ For the OpenAI-compatible protocol, use the custom provider with the correspondi
 
 ### Ollama
 
-Connects to a locally running Ollama instance. No API key required.
+Connects to a locally or remotely running Ollama instance. No API key required.
 
 **Base URL:** Reads `OLLAMA_HOST` (defaults to `http://localhost:11434`). Clawde appends `/v1` to construct the OpenAI-compatible endpoint.
 
@@ -453,6 +453,58 @@ Run a model locally first with `ollama pull llama3.2`, then:
 ```
 clawde --provider ollama --model llama3.2 "explain this code"
 ```
+
+**Remote GPU (require explicit host):**
+
+When running Ollama on a remote machine with a GPU (e.g. a LAN server),
+set `require_explicit_host` to prevent accidental fallback to a local CPU
+Ollama instance on `localhost:11434`:
+
+```json
+{
+  "provider": "ollama",
+  "providers": {
+    "ollama": {
+      "api_base": "http://devbox:11434",
+      "options": {
+        "require_explicit_host": true
+      }
+    }
+  }
+}
+```
+
+When `require_explicit_host` is `true` and no `api_base` or `OLLAMA_HOST` is
+configured, the Ollama provider becomes unavailable — Clawde will report it as
+unreachable rather than silently connecting to `localhost` and running on CPU.
+
+**Default host (LAN GPU server):**
+
+For a GPU server shared across machines on a LAN, set `default_host` so that
+every Clawde instance targets the same remote Ollama server without needing to
+set `api_base` on each machine:
+
+```json
+{
+  "provider": "ollama",
+  "providers": {
+    "ollama": {
+      "options": {
+        "default_host": "http://devbox:11434"
+      }
+    }
+  }
+}
+```
+
+The host resolution order is:
+1. `providers.ollama.api_base` (explicit override)
+2. `OLLAMA_HOST` env var
+3. `providers.ollama.options.default_host` (new default)
+4. `http://localhost:11434` (built-in fallback)
+
+Combine with `require_explicit_host: true` to completely disable the localhost
+fallback and ensure Ollama only runs on the remote GPU server.
 
 ---
 

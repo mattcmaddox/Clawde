@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlays::{centered_rect, modal_search_line, CLAURST_MUTED};
+use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAURST_MUTED};
+use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,6 +51,8 @@ pub struct SessionBrowserState {
     /// The actual session ID captured when entering rename mode (to avoid
     /// filtered-index mismatch when confirming the rename).
     rename_session_id: String,
+    /// Vim-modal insert-mode state for the search bar (only used when vim is enabled).
+    pub vim_search: VimSearch,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,7 @@ impl SessionBrowserState {
             rename_input: String::new(),
             search_query: String::new(),
             rename_session_id: String::new(),
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -78,6 +82,7 @@ impl SessionBrowserState {
         self.rename_input.clear();
         self.search_query.clear();
         self.rename_session_id.clear();
+        self.vim_search.reset();
         self.visible = true;
     }
 
@@ -113,6 +118,7 @@ impl SessionBrowserState {
         self.rename_input.clear();
         self.search_query.clear();
         self.rename_session_id.clear();
+        self.vim_search.reset();
     }
 
     /// Move selection up one row, wrapping to the end.
@@ -284,11 +290,12 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
     // --- Search line (always shown in Browse mode) -------------------------
     if state.mode == SessionBrowserMode::Browse {
-        let search_line = modal_search_line(
+        let search_line = modal_search_line_with_insert(
             &state.search_query,
             "Type to filter sessions...",
             CLAURST_MUTED,
             Color::Cyan,
+            state.vim_search.insert,
         );
         lines.push(search_line);
         lines.push(Line::from(""));

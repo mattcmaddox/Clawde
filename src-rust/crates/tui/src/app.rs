@@ -18,12 +18,14 @@ use crate::overlays::{
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
+use crate::rustle_editor::{RustleEditAction, RustleEditor};
 use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::theme_creator::ThemeCreator;
 use crate::theme_screen::{ThemePickAction, ThemeScreen};
+use crate::vim_search::VimSearchKey;
 use crate::{
     agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute},
     diff_viewer::DiffPane,
@@ -126,6 +128,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("resume", "Resume a previous session"),
     ("review", "Review changes (git diff)"),
     ("rewind", "Rewind to an earlier turn"),
+    ("rustle", "Edit the Rustle mascot animation frames"),
     ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
     (
@@ -168,7 +171,7 @@ fn help_command_category(name: &str) -> &'static str {
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "new-agent" | "memory" | "plugin" | "survey" => "Tools",
+        "agent" | "agents" | "new-agent" | "memory" | "plugin" | "survey" | "rustle" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "history" | "quit" | "exit" => "Session",
         _ => "Commands",
@@ -1512,6 +1515,7 @@ pub struct App {
     pub settings_screen: SettingsScreen,
     /// Theme quick-pick overlay (/theme).
     pub theme_screen: ThemeScreen,
+    pub rustle_editor: RustleEditor,
     /// Interactive theme creator + CRUD manager (/theme create).
     pub theme_creator: ThemeCreator,
     /// Current colour palette derived from the active theme.
@@ -2081,6 +2085,7 @@ impl App {
             stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
+            rustle_editor: RustleEditor::new(),
             theme_creator: ThemeCreator::new(),
             palette: ColorPalette::for_theme("default"),
             stats_dialog: StatsDialogState::new(),
@@ -3215,6 +3220,12 @@ impl App {
                 self.theme_screen.open(current);
                 true
             }
+            "rustle" => {
+                // In-TUI editor for the mascot animation frames; saves back
+                // into rustle.rs (rebuild required to see the change).
+                self.rustle_editor.open();
+                true
+            }
             "stats" => {
                 self.stats_dialog.open();
                 true
@@ -3575,6 +3586,7 @@ impl App {
         self.settings_screen.close();
         self.theme_screen.close();
         self.theme_creator.close();
+        self.rustle_editor.close();
     }
 
     pub fn any_modal_open(&self) -> bool {
@@ -3589,6 +3601,7 @@ impl App {
             || self.settings_screen.visible
             || self.theme_screen.visible
             || self.theme_creator.visible
+            || self.rustle_editor.visible
             || self.stats_dialog.visible
             || self.mcp_view.visible
             || self.agents_menu.visible
@@ -4669,6 +4682,25 @@ impl App {
         }
 
         if self.key_input_dialog.visible {
+            // Vim-modal text entry: the dialog opens in insert (typing works
+            // immediately); Esc exits insert before the close cascade runs.
+            match self
+                .key_input_dialog
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.key_input_dialog.insert_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.key_input_dialog.backspace();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     // Esc during the Cloudflare two-step flow cancels the
@@ -4786,7 +4818,7 @@ impl App {
                         self.activate_provider(provider_id, provider_name, "Connected to");
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.key_input_dialog.backspace();
                 }
                 KeyCode::Char('v')
@@ -4813,7 +4845,7 @@ impl App {
                         );
                     }
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     let c = self.shift_normalize(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
                 }
@@ -4842,6 +4874,26 @@ impl App {
                     _ => {}
                 }
                 return false;
+            }
+            // Vim-modal text entry: the dialog opens in insert (typing keys
+            // works immediately); Esc exits insert before the unreveal → clear
+            // → close cascade runs.
+            match self
+                .free_mode_dialog
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.free_mode_dialog.insert_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.free_mode_dialog.backspace();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
             }
             match key.code {
                 KeyCode::Esc => {
@@ -4881,12 +4933,18 @@ impl App {
                 KeyCode::Enter => {
                     self.free_mode_dialog.enter_active();
                 }
-                KeyCode::Backspace | KeyCode::Delete => {
+                KeyCode::Backspace | KeyCode::Delete if !self.prompt_input.vim_enabled => {
                     // Delete on a revealed key asks for confirmation; otherwise
                     // it edits the typed new-key text.
                     if !self.free_mode_dialog.try_open_delete_confirm() {
                         self.free_mode_dialog.backspace();
                     }
+                }
+                KeyCode::Delete if self.prompt_input.vim_enabled => {
+                    // With vim active, Backspace edits only in insert mode (the
+                    // guard above); Delete stays an action — offer the
+                    // delete-confirm without falling back to text editing.
+                    self.free_mode_dialog.try_open_delete_confirm();
                 }
                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && c == 's' => {
                     // Ctrl+S: Apply/save keys without closing the dialog
@@ -4917,11 +4975,41 @@ impl App {
                     // Toggle enabled/disabled for the active upstream
                     self.free_mode_dialog.toggle_enabled();
                 }
-                KeyCode::Char(c) => {
-                    // Vim-style navigation (h/j/k/l) is active only while the
-                    // new-key buffer is empty — once a key is being typed those
-                    // letters belong to the key, not the cursor. Arrow keys
-                    // always navigate.
+                KeyCode::Char(c)
+                    if self.prompt_input.vim_enabled
+                        && self.free_mode_dialog.pending_is_empty()
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                {
+                    // Vim normal mode: hjkl navigate, letters do NOT type
+                    // (typing happens in insert mode via the guard above).
+                    // Navigation is only offered while the new-key buffer is
+                    // empty — moving rows discards typed text, so hjkl must
+                    // never silently throw away a partially-typed key.
+                    match c.to_ascii_lowercase() {
+                        'j' => {
+                            self.free_mode_dialog.move_next();
+                            return false;
+                        }
+                        'k' => {
+                            self.free_mode_dialog.move_prev();
+                            return false;
+                        }
+                        'h' => {
+                            self.free_mode_dialog.move_node_prev();
+                            return false;
+                        }
+                        'l' => {
+                            self.free_mode_dialog.move_node_next();
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                    // Legacy (vim off): h/j/k/l navigate only while the new-key
+                    // buffer is empty — once a key is being typed those letters
+                    // belong to the key, not the cursor. Arrow keys always
+                    // navigate.
                     let lower = c.to_ascii_lowercase();
                     if self.free_mode_dialog.pending_is_empty() {
                         match lower {
@@ -4954,6 +5042,25 @@ impl App {
 
         // Custom provider dialog (URL + API key for OpenAI-compatible providers)
         if self.custom_provider_dialog.visible {
+            // Vim-modal text entry: opens in insert; Esc exits insert before
+            // the dialog closes.
+            match self
+                .custom_provider_dialog
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.custom_provider_dialog.insert_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.custom_provider_dialog.backspace();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.custom_provider_dialog.close();
@@ -4980,10 +5087,10 @@ impl App {
                         self.custom_provider_dialog.move_next_field();
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.custom_provider_dialog.backspace();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     let c = self.shift_normalize(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
@@ -4994,6 +5101,22 @@ impl App {
 
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
+            match self
+                .connect_dialog
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.connect_dialog.filter_push(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.connect_dialog.filter_pop();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.connect_dialog.close();
@@ -5163,10 +5286,10 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.connect_dialog.filter_pop();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     self.connect_dialog.filter_push(c);
                 }
                 _ => {}
@@ -5176,6 +5299,22 @@ impl App {
 
         // Import-config source picker
         if self.import_config_picker.visible {
+            match self
+                .import_config_picker
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.import_config_picker.filter_push(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.import_config_picker.filter_pop();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.import_config_picker.close();
@@ -5212,10 +5351,10 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.import_config_picker.filter_pop();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     self.import_config_picker.filter_push(c);
                 }
                 _ => {}
@@ -5235,6 +5374,22 @@ impl App {
 
         // Command palette (Ctrl+K)
         if self.command_palette.visible {
+            match self
+                .command_palette
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.command_palette.filter_push(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.command_palette.filter_pop();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.command_palette.close();
@@ -5271,10 +5426,10 @@ impl App {
                         return true; // signal to submit this as input
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.command_palette.filter_pop();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     self.command_palette.filter_push(c);
                 }
                 _ => {}
@@ -5295,14 +5450,42 @@ impl App {
 
         // Model picker intercepts navigation and Esc
         if self.model_picker.visible {
+            match self
+                .model_picker
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.model_picker.push_filter_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.model_picker.pop_filter_char();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => self.model_picker.close(),
                 KeyCode::Home => self.model_picker.select_first(),
                 KeyCode::End => self.model_picker.select_last(),
                 KeyCode::Up => self.model_picker.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.model_picker.select_prev()
+                }
                 KeyCode::Down => self.model_picker.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.model_picker.select_next()
+                }
                 KeyCode::Left => self.model_picker.effort_prev(),
+                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                    self.model_picker.effort_prev()
+                }
                 KeyCode::Right => self.model_picker.effort_next(),
+                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.model_picker.effort_next()
+                }
                 KeyCode::Tab => {
                     self.model_picker.task_next();
                     self.persist_free_task_sort();
@@ -5398,8 +5581,12 @@ impl App {
                         self.model_picker.loading_models = false;
                     }
                 }
-                KeyCode::Backspace => self.model_picker.pop_filter_char(),
-                KeyCode::Char(c) => self.model_picker.push_filter_char(c),
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
+                    self.model_picker.pop_filter_char()
+                }
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                    self.model_picker.push_filter_char(c)
+                }
                 _ => {}
             }
             return false;
@@ -5453,14 +5640,40 @@ impl App {
         // Session browser intercepts navigation and Esc
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
+            match self
+                .session_browser
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.session_browser.push_search_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.session_browser.pop_search_char();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => match key.code {
                     KeyCode::Esc => self.session_browser.close(),
                     KeyCode::Up => self.session_browser.select_prev(),
+                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                        self.session_browser.select_prev()
+                    }
                     KeyCode::Down => self.session_browser.select_next(),
+                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                        self.session_browser.select_next()
+                    }
                     KeyCode::Char('r') => self.session_browser.start_rename(),
-                    KeyCode::Backspace => self.session_browser.pop_search_char(),
-                    KeyCode::Char(c) => self.session_browser.push_search_char(c),
+                    KeyCode::Backspace if !self.prompt_input.vim_enabled => {
+                        self.session_browser.pop_search_char()
+                    }
+                    KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                        self.session_browser.push_search_char(c)
+                    }
                     _ => {}
                 },
                 SessionBrowserMode::Rename => match key.code {
@@ -5488,6 +5701,22 @@ impl App {
 
         // Keybindings overlay: Esc or q to close
         if self.keybindings_overlay.visible {
+            match self
+                .keybindings_overlay
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.keybindings_overlay.push_filter_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.keybindings_overlay.pop_filter_char();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.keybindings_overlay.close();
@@ -5500,8 +5729,12 @@ impl App {
                 KeyCode::PageDown => self.keybindings_overlay.page_down(u16::MAX),
                 KeyCode::Home => self.keybindings_overlay.scroll_to_top(),
                 KeyCode::End => self.keybindings_overlay.scroll_to_bottom(u16::MAX),
-                KeyCode::Backspace => self.keybindings_overlay.pop_filter_char(),
-                KeyCode::Char(c) => self.keybindings_overlay.push_filter_char(c),
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
+                    self.keybindings_overlay.pop_filter_char()
+                }
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
+                    self.keybindings_overlay.push_filter_char(c)
+                }
                 _ => {}
             }
             return false;
@@ -5664,6 +5897,7 @@ impl App {
                 &mut self.settings_screen,
                 &mut self.config,
                 key,
+                self.prompt_input.vim_enabled,
             );
             return false;
         }
@@ -5689,6 +5923,20 @@ impl App {
                     self.theme_creator.open_new_theme();
                 }
                 None => {}
+            }
+            return false;
+        }
+
+        // Rustle editor intercepts keys
+        if self.rustle_editor.visible {
+            if let Some(RustleEditAction::Saved) =
+                crate::rustle_editor::handle_rustle_editor_key(&mut self.rustle_editor, key)
+            {
+                self.push_notification(
+                    NotificationKind::Info,
+                    "Saved rustle.rs — run `clauded` to rebuild the mascot.".to_string(),
+                    None,
+                );
             }
             return false;
         }
@@ -5797,8 +6045,29 @@ impl App {
             return false;
         }
 
-        // MCP elicitation dialog — highest priority modal
+        // MCP elicitation dialog — highest priority modal. With vim mode on
+        // the dialog is insert-first: typing works immediately, `Esc` exits
+        // insert (dialog stays open), and a second `Esc` cancels. In vim
+        // normal mode j/k navigate fields and h/l cycle enum options; with
+        // vim off the dialog is insert-always, exactly as before.
         if self.elicitation.visible {
+            match self
+                .elicitation
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.elicitation.insert_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.elicitation.backspace();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.elicitation.cancel();
@@ -5820,6 +6089,24 @@ impl App {
                     self.elicitation.prev_field();
                     return false;
                 }
+                // Vim normal-mode navigation mirrors the popup convention:
+                // hjkl + arrows navigate; letters never type outside insert.
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.elicitation.next_field();
+                    return false;
+                }
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.elicitation.prev_field();
+                    return false;
+                }
+                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                    self.elicitation.cycle_enum_prev();
+                    return false;
+                }
+                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.elicitation.cycle_enum_next();
+                    return false;
+                }
                 KeyCode::Left => {
                     self.elicitation.cycle_enum_prev();
                     return false;
@@ -5832,11 +6119,11 @@ impl App {
                     self.elicitation.toggle_active();
                     return false;
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.elicitation.backspace();
                     return false;
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     let c = self.shift_normalize(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
@@ -6437,12 +6724,36 @@ impl App {
     }
 
     fn handle_mcp_view_key(&mut self, key: KeyEvent) -> bool {
+        // Vim-modal tool search — only applies to the tool panes (the server
+        // list pane has no filter bar).
+        if self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList {
+            match self
+                .mcp_view
+                .vim_search
+                .handle_key(self.prompt_input.vim_enabled, &key)
+            {
+                VimSearchKey::Consumed => return false,
+                VimSearchKey::PushChar(c) => {
+                    self.mcp_view.push_search_char(c);
+                    return false;
+                }
+                VimSearchKey::PopChar => {
+                    self.mcp_view.pop_search_char();
+                    return false;
+                }
+                VimSearchKey::Passthrough => {}
+            }
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
+            KeyCode::Char('h') if self.prompt_input.vim_enabled => self.mcp_view.switch_pane(),
+            KeyCode::Char('l') if self.prompt_input.vim_enabled => self.mcp_view.switch_pane(),
             KeyCode::Up => self.mcp_view.select_prev(),
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.mcp_view.select_prev(),
             KeyCode::Down => self.mcp_view.select_next(),
-            KeyCode::Backspace => self.mcp_view.pop_search_char(),
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.mcp_view.select_next(),
+            KeyCode::Backspace if !self.prompt_input.vim_enabled => self.mcp_view.pop_search_char(),
             KeyCode::Char('e') => self.mcp_view.toggle_error_detail(),
             KeyCode::Char('a')
                 if self.mcp_view.active_pane == crate::mcp_view::McpViewPane::ServerList =>
@@ -6463,7 +6774,8 @@ impl App {
                 self.status_message = Some("Reconnecting MCP runtime...".to_string());
             }
             KeyCode::Char(c)
-                if key.modifiers.is_empty()
+                if !self.prompt_input.vim_enabled
+                    && key.modifiers.is_empty()
                     && self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList =>
             {
                 self.mcp_view.push_search_char(c);
@@ -6542,6 +6854,22 @@ impl App {
     }
 
     fn handle_help_overlay_key(&mut self, key: KeyEvent) -> bool {
+        match self
+            .help_overlay
+            .vim_search
+            .handle_key(self.prompt_input.vim_enabled, &key)
+        {
+            VimSearchKey::Consumed => return false,
+            VimSearchKey::PushChar(c) => {
+                self.help_overlay.push_filter_char(c);
+                return false;
+            }
+            VimSearchKey::PopChar => {
+                self.help_overlay.pop_filter_char();
+                return false;
+            }
+            VimSearchKey::Passthrough => {}
+        }
         match key.code {
             KeyCode::Esc | KeyCode::F(1) => {
                 self.help_overlay.close();
@@ -6558,14 +6886,24 @@ impl App {
             KeyCode::Up => {
                 self.help_overlay.scroll_up();
             }
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                self.help_overlay.scroll_up();
+            }
             KeyCode::Down => {
                 let max = 50u16; // generous upper bound; renderer will clamp
                 self.help_overlay.scroll_down(max);
             }
-            KeyCode::Backspace => {
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                let max = 50u16; // generous upper bound; renderer will clamp
+                self.help_overlay.scroll_down(max);
+            }
+            KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                 self.help_overlay.pop_filter_char();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !self.prompt_input.vim_enabled
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.help_overlay.push_filter_char(c);
             }
             _ => {}
@@ -6574,6 +6912,33 @@ impl App {
     }
 
     fn handle_history_search_overlay_key(&mut self, key: KeyEvent) -> bool {
+        match self
+            .history_search_overlay
+            .vim_search
+            .handle_key(self.prompt_input.vim_enabled, &key)
+        {
+            VimSearchKey::Consumed => return false,
+            VimSearchKey::PushChar(c) => {
+                let c = self.shift_normalize(c, key.modifiers);
+                let history = self.prompt_input.history.clone();
+                self.history_search_overlay.push_char(c, &history);
+                if let Some(hs) = self.history_search.as_mut() {
+                    hs.query.push(c);
+                    hs.update_matches(&history);
+                }
+                return false;
+            }
+            VimSearchKey::PopChar => {
+                let history = self.prompt_input.history.clone();
+                self.history_search_overlay.pop_char(&history);
+                if let Some(hs) = self.history_search.as_mut() {
+                    hs.query.pop();
+                    hs.update_matches(&history);
+                }
+                return false;
+            }
+            VimSearchKey::Passthrough => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 self.history_search_overlay.close();
@@ -6611,7 +6976,29 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                self.history_search_overlay.select_prev();
+                if let Some(hs) = self.history_search.as_mut() {
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        if hs.selected == 0 {
+                            hs.selected = count - 1;
+                        } else {
+                            hs.selected -= 1;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                self.history_search_overlay.select_next();
+                if let Some(hs) = self.history_search.as_mut() {
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        hs.selected = (hs.selected + 1) % count;
+                    }
+                }
+            }
+            KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.pop_char(&history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -6628,7 +7015,10 @@ impl App {
             {
                 self.history_search_overlay.toggle_pin();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !self.prompt_input.vim_enabled
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 let c = self.shift_normalize(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
@@ -6684,6 +7074,25 @@ impl App {
     }
 
     fn handle_global_search_key(&mut self, key: KeyEvent) -> bool {
+        match self
+            .global_search
+            .vim_search
+            .handle_key(self.prompt_input.vim_enabled, &key)
+        {
+            VimSearchKey::Consumed => return false,
+            VimSearchKey::PushChar(c) => {
+                let c = self.shift_normalize(c, key.modifiers);
+                self.global_search.push_char(c);
+                self.refresh_global_search();
+                return false;
+            }
+            VimSearchKey::PopChar => {
+                self.global_search.pop_char();
+                self.refresh_global_search();
+                return false;
+            }
+            VimSearchKey::Passthrough => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 self.global_search.close();
@@ -6695,12 +7104,17 @@ impl App {
                 self.global_search.close();
             }
             KeyCode::Up => self.global_search.select_prev(),
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.global_search.select_prev(),
             KeyCode::Down => self.global_search.select_next(),
-            KeyCode::Backspace => {
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.global_search.select_next(),
+            KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                 self.global_search.pop_char();
                 self.refresh_global_search();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !self.prompt_input.vim_enabled
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 let c = self.shift_normalize(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
@@ -7268,6 +7682,32 @@ impl App {
             Some(h) => h,
             None => return false,
         };
+        // Vim-modal search — same convention as the overlay: letters type only
+        // after `i`, `Esc` exits insert mode before closing.
+        match self
+            .history_search_overlay
+            .vim_search
+            .handle_key(self.prompt_input.vim_enabled, &key)
+        {
+            VimSearchKey::Consumed => return false,
+            VimSearchKey::PushChar(c) => {
+                hs.query.push(c);
+                let history = self.prompt_input.history.clone();
+                if let Some(hs) = self.history_search.as_mut() {
+                    hs.update_matches(&history);
+                }
+                return false;
+            }
+            VimSearchKey::PopChar => {
+                hs.query.pop();
+                let history = self.prompt_input.history.clone();
+                if let Some(hs) = self.history_search.as_mut() {
+                    hs.update_matches(&history);
+                }
+                return false;
+            }
+            VimSearchKey::Passthrough => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 self.history_search = None;
@@ -7296,14 +7736,17 @@ impl App {
                     hs.selected = (hs.selected + 1) % count;
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                 hs.query.pop();
                 let history = self.prompt_input.history.clone();
                 if let Some(hs) = self.history_search.as_mut() {
                     hs.update_matches(&history);
                 }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c)
+                if !self.prompt_input.vim_enabled
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 hs.query.push(c);
                 let history = self.prompt_input.history.clone();
                 if let Some(hs) = self.history_search.as_mut() {
@@ -7790,6 +8233,7 @@ impl App {
             && !self.settings_screen.visible
             && !self.theme_screen.visible
             && !self.theme_creator.visible
+            && !self.rustle_editor.visible
             && !self.free_mode_dialog.visible
             && !self.key_input_dialog.visible
             && !self.custom_provider_dialog.visible
@@ -8097,6 +8541,7 @@ impl App {
         let any_dialog = self.settings_screen.visible
             || self.theme_screen.visible
             || self.theme_creator.visible
+            || self.rustle_editor.visible
             || self.stats_dialog.visible
             || self.mcp_view.visible
             || self.agents_menu.visible

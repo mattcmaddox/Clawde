@@ -46,6 +46,7 @@ use ratatui::Frame;
 use clawde_api::{FreeUpstream, FREE_CATALOG};
 
 use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use crate::vim_search::VimSearch;
 use std::cell::Cell;
 
 /// One background key-validation ping result: `(field_idx, key_idx, result)`.
@@ -116,6 +117,10 @@ pub struct FreeModeDialogState {
     pub show_all: bool,
     /// When `true`, a key validation is in progress (prevents rapid Ctrl+V).
     pub is_validating: bool,
+    /// Vim-modal insert state (only used when vim is enabled). The dialog is
+    /// a key-entry form, so it opens in insert; `Esc` exits insert before
+    /// the unreveal → clear → close cascade runs.
+    pub vim_search: VimSearch,
 }
 
 impl Default for FreeModeDialogState {
@@ -150,6 +155,7 @@ impl FreeModeDialogState {
             show_all: false,
             is_validating: false,
             last_rect: Cell::new(Rect::default()),
+            vim_search: VimSearch::new(),
         }
     }
 
@@ -173,6 +179,7 @@ impl FreeModeDialogState {
         self.show_all = false;
         self.active_node = NodePos::NewKey;
         self.delete_confirm = None;
+        self.vim_search.enter_insert();
         // Reset every field; the dialog is re-seeded from the store each
         // time it opens so discarded edits never leak back in.
         for field in &mut self.fields {
@@ -272,6 +279,7 @@ impl FreeModeDialogState {
         self.show_all = false;
         self.is_validating = false;
         self.delete_confirm = None;
+        self.vim_search.reset();
         for field in &mut self.fields {
             field.keys.clear();
             field.key_status.clear();
@@ -879,7 +887,12 @@ fn node_at(idx: usize) -> NodePos {
     }
 }
 
-pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, area: Rect) {
+pub fn render_free_mode_dialog(
+    frame: &mut Frame,
+    state: &FreeModeDialogState,
+    vim_enabled: bool,
+    area: Rect,
+) {
     if !state.visible {
         return;
     }
@@ -1217,7 +1230,7 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
     lines.push(Line::from(""));
 
     // Footer
-    lines.push(Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled(" \u{2191}/\u{2193} j/k", Style::default().fg(dim)),
         Span::styled(" provider   ", Style::default().fg(dim)),
         Span::styled("\u{2190}/\u{2192} h/l", Style::default().fg(dim)),
@@ -1226,7 +1239,14 @@ pub fn render_free_mode_dialog(frame: &mut Frame, state: &FreeModeDialogState, a
         Span::styled(" reveal/append   ", Style::default().fg(dim)),
         Span::styled("del", Style::default().fg(Color::Rgb(140, 140, 160))),
         Span::styled(" delete key", Style::default().fg(dim)),
-    ]));
+    ];
+    if vim_enabled && state.vim_search.insert {
+        footer_spans.push(Span::styled(
+            "  -- INSERT --",
+            Style::default().fg(dim).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(footer_spans));
     lines.push(Line::from(vec![
         Span::styled(" tab", Style::default().fg(Color::Rgb(140, 140, 160))),
         Span::styled(" show all   ", Style::default().fg(dim)),
@@ -1800,17 +1820,17 @@ mod tests {
         state.move_node_next();
         state.enter_active(); // reveal k1
         terminal
-            .draw(|frame| render_free_mode_dialog(frame, &state, frame.area()))
+            .draw(|frame| render_free_mode_dialog(frame, &state, false, frame.area()))
             .unwrap();
 
         // Open the delete popup and render again.
         assert!(state.try_open_delete_confirm());
         terminal
-            .draw(|frame| render_free_mode_dialog(frame, &state, frame.area()))
+            .draw(|frame| render_free_mode_dialog(frame, &state, false, frame.area()))
             .unwrap();
         state.confirm_delete();
         terminal
-            .draw(|frame| render_free_mode_dialog(frame, &state, frame.area()))
+            .draw(|frame| render_free_mode_dialog(frame, &state, false, frame.area()))
             .unwrap();
     }
 }
