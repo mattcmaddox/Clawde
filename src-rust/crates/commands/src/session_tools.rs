@@ -355,7 +355,7 @@ impl SlashCommand for RenameCommand {
             );
         }
 
-        let provider = match provider_for_config(&ctx.config).await {
+        let provider = match resolve_command_provider(ctx).await {
             Some(provider) => provider,
             None => {
                 return CommandResult::Error(
@@ -575,7 +575,7 @@ impl SlashCommand for SummaryCommand {
         }
 
         // Get the active provider.
-        let provider = match provider_for_config(&ctx.config).await {
+        let provider = match resolve_command_provider(ctx).await {
             Some(p) => p,
             None => {
                 return CommandResult::Error(

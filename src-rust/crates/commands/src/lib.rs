@@ -37,6 +37,10 @@ pub struct CommandContext {
     /// `/keys health` surface runtime state (e.g. free-mode upstream
     /// empty-completion cooldowns, spec §6.3) that is not persisted to disk.
     pub provider_registry: Option<std::sync::Arc<clawde_api::ProviderRegistry>>,
+    /// Test-only provider override. When set, commands that would otherwise
+    /// build a provider from config (`provider_for_config`) use this instead,
+    /// keeping unit tests hermetic (no network calls).
+    pub test_provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>>,
 }
 
 /// Result of running a slash command.
@@ -228,6 +232,18 @@ async fn provider_for_config(
                 .get(&clawde_core::ProviderId::new(lookup_id))
                 .cloned()
         })
+}
+
+/// Resolve the provider a command should use: an explicit test override wins,
+/// otherwise build one from config. The override keeps command unit tests
+/// hermetic (no network) while leaving production behavior unchanged.
+async fn resolve_command_provider(
+    ctx: &CommandContext,
+) -> Option<std::sync::Arc<dyn clawde_api::LlmProvider>> {
+    if let Some(provider) = &ctx.test_provider {
+        return Some(provider.clone());
+    }
+    provider_for_config(&ctx.config).await
 }
 
 fn text_from_content_blocks(blocks: &[ContentBlock]) -> String {
@@ -725,6 +741,11 @@ impl SlashCommand for ClearCommand {
 
 // ---- /compact ------------------------------------------------------------
 
+/// Timeout for the compaction summarisation API call. User-facing strings
+/// that mention the timeout must interpolate this value so they stay in sync
+/// when it changes.
+const COMPACT_API_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Errors that can occur during compact summary generation.
 #[derive(Debug)]
 enum CompactError {
@@ -753,7 +774,7 @@ async fn try_compact(
 ) -> Result<String, CompactError> {
     let transcript = build_conversation_transcript(&ctx.messages);
 
-    let provider = match provider_for_config(&ctx.config).await {
+    let provider = match resolve_command_provider(ctx).await {
         Some(p) => p,
         None => return Err(CompactError::NoProvider),
     };
@@ -786,19 +807,18 @@ async fn try_compact(
         provider_options: serde_json::Value::Object(Default::default()),
     };
 
-    let response = match tokio::time::timeout(
-        Duration::from_secs(120),
-        provider.create_message(request),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(_)) => return Err(CompactError::ProviderError),
-        Err(_) => {
-            tracing::warn!("Compact request timed out after 120s");
-            return Err(CompactError::Timeout);
-        }
-    };
+    let response =
+        match tokio::time::timeout(COMPACT_API_TIMEOUT, provider.create_message(request)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => return Err(CompactError::ProviderError),
+            Err(_) => {
+                tracing::warn!(
+                    "Compact request timed out after {}s",
+                    COMPACT_API_TIMEOUT.as_secs()
+                );
+                return Err(CompactError::Timeout);
+            }
+        };
 
     let raw_text = crate::text_from_content_blocks(&response.content);
     if raw_text.trim().is_empty() {
@@ -882,14 +902,15 @@ impl SlashCommand for CompactCommand {
             }
             Err(CompactError::Timeout) => {
                 if is_send {
-                    CommandResult::Error(
-                        "Compact send timed out after 120 seconds. Try /compact first to preview."
-                            .to_string(),
-                    )
+                    CommandResult::Error(format!(
+                        "Compact send timed out after {} seconds. Try /compact first to preview.",
+                        COMPACT_API_TIMEOUT.as_secs()
+                    ))
                 } else {
-                    CommandResult::Message(
-                        "Compact request timed out after 120 seconds. Try again or use /compact send to request the model to summarise the conversation in a new message.".to_string(),
-                    )
+                    CommandResult::Message(format!(
+                        "Compact request timed out after {} seconds. Try again or use /compact send to request the model to summarise the conversation in a new message.",
+                        COMPACT_API_TIMEOUT.as_secs()
+                    ))
                 }
             }
             Err(CompactError::EmptySummary) => {
@@ -2316,6 +2337,87 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    /// Build a [`CommandContext`] with a canned [`clawde_api::LlmProvider`]
+    /// injected so network-touching commands (`/compact`, `/summary`) run
+    /// hermetically in unit tests.
+    fn make_ctx_with_canned_provider() -> CommandContext {
+        let mut ctx = make_ctx();
+        ctx.test_provider = Some(std::sync::Arc::new(CannedProvider {}));
+        ctx
+    }
+
+    /// A deterministic [`clawde_api::LlmProvider`] returning a fixed text
+    /// response, so tests never touch the network. Mirror of the mock patterns
+    /// in `query/src/compact.rs` (GateMockProvider) and
+    /// `api/src/providers/key_rotating.rs` (MockProvider).
+    struct CannedProvider;
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for CannedProvider {
+        fn id(&self) -> &clawde_core::ProviderId {
+            static ID: std::sync::LazyLock<clawde_core::ProviderId> =
+                std::sync::LazyLock::new(|| clawde_core::ProviderId::new("canned"));
+            &ID
+        }
+
+        fn name(&self) -> &str {
+            "canned"
+        }
+
+        async fn create_message(
+            &self,
+            request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderResponse {
+                id: "canned".into(),
+                model: request.model,
+                content: vec![clawde_core::types::ContentBlock::Text {
+                    text: "Canned test summary response.".to_string(),
+                }],
+                stop_reason: clawde_api::StopReason::EndTurn,
+                usage: Default::default(),
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            unimplemented!("canned provider does not support streaming")
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: false,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
         }
     }
 
@@ -2909,61 +3011,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compact_two_messages_no_provider() {
-        let mut ctx = make_ctx();
+    async fn test_compact_two_messages_with_canned_provider() {
+        let mut ctx = make_ctx_with_canned_provider();
         ctx.messages.push(Message::user("Hello"));
         ctx.messages.push(Message::assistant("Hi there!"));
         let cmd = find_command("compact").unwrap();
         let result = cmd.execute("", &mut ctx).await;
-        // Falls back to UserMessage when the provider API call fails,
-        // or Error when provider_for_config returns None.
+        // The canned provider always succeeds, so /compact preview returns
+        // a Message with the generated summary.
         match result {
-            CommandResult::UserMessage(msg) => {
+            CommandResult::Message(msg) => {
                 assert!(
-                    msg.contains("Compact"),
-                    "Expected compact instruction, got: {}",
+                    msg.contains("Conversation Compact"),
+                    "Expected compact message, got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("Canned test summary response."),
+                    "Expected canned summary text, got: {}",
                     msg
                 );
             }
-            CommandResult::Error(msg) => {
-                assert!(
-                    msg.contains("No provider available"),
-                    "Expected provider error, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected UserMessage or Error, got {:?}", other),
+            other => panic!("expected Message, got {:?}", other),
         }
     }
 
     #[tokio::test]
-    async fn test_compact_send_with_two_messages() {
-        let mut ctx = make_ctx();
+    async fn test_compact_send_with_two_messages_with_canned_provider() {
+        let mut ctx = make_ctx_with_canned_provider();
         ctx.messages.push(Message::user("Hello"));
         ctx.messages.push(Message::assistant("Hi there!"));
         let cmd = find_command("compact").unwrap();
         let result = cmd.execute("send", &mut ctx).await;
-        // With no provider configured, falls back to Error "No provider available".
-        // With a provider but API failure, falls back to UserMessage with fallback
-        // instruction. Both are acceptable outcomes.
+        // The canned provider always succeeds, so /compact send injects the
+        // summary as a user message.
         match result {
             CommandResult::UserMessage(msg) => {
                 assert!(
-                    msg.contains("Compact"),
-                    "Expected compact instruction, got: {}",
+                    msg.contains("[Compact requested"),
+                    "Expected injected compact instruction, got: {}",
                     msg
                 );
             }
-            CommandResult::Error(msg) => {
-                assert!(
-                    msg.contains("No provider")
-                        || msg.contains("timed out")
-                        || msg.contains("Compact send failed"),
-                    "Expected provider or timeout error, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected UserMessage or Error, got {:?}", other),
+            other => panic!("expected UserMessage, got {:?}", other),
         }
     }
 
@@ -3135,6 +3225,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_summary_single_message_falls_back() {
+        // count < 3 short-circuits before any provider is resolved, so this
+        // never touches the network.
         let mut ctx = make_ctx();
         ctx.messages.push(Message::user("Hello"));
         let cmd = find_command("summary").unwrap();
@@ -3153,6 +3245,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_summary_two_messages_falls_back() {
+        // count < 3 short-circuits before any provider is resolved, so this
+        // never touches the network.
         let mut ctx = make_ctx();
         ctx.messages.push(Message::user("Hello"));
         ctx.messages.push(Message::assistant("Hi there!"));
@@ -3172,6 +3266,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_summary_with_focus_arg_small() {
+        // count < 3 short-circuits before any provider is resolved, so this
+        // never touches the network.
         let mut ctx = make_ctx();
         ctx.messages.push(Message::user("Hello"));
         let cmd = find_command("summary").unwrap();
@@ -3189,31 +3285,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_summary_three_messages_no_provider() {
-        let mut ctx = make_ctx();
+    async fn test_summary_three_messages_with_canned_provider() {
+        let mut ctx = make_ctx_with_canned_provider();
         ctx.messages.push(Message::user("Hello"));
         ctx.messages.push(Message::assistant("Hi there!"));
         ctx.messages.push(Message::user("What is Rust?"));
         let cmd = find_command("summary").unwrap();
         let result = cmd.execute("", &mut ctx).await;
-        // Falls back to UserMessage when the provider API call fails,
-        // or Error when provider_for_config returns None.
+        // The canned provider always succeeds, so /summary returns a Message
+        // with the generated summary.
         match result {
-            CommandResult::UserMessage(msg) => {
+            CommandResult::Message(msg) => {
                 assert!(
-                    msg.contains("summary"),
-                    "Expected summary fallback instruction, got: {}",
+                    msg.contains("Conversation Summary"),
+                    "Expected summary message, got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("Canned test summary response."),
+                    "Expected canned summary text, got: {}",
                     msg
                 );
             }
-            CommandResult::Error(msg) => {
-                assert!(
-                    msg.contains("No provider available"),
-                    "Expected provider error, got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected UserMessage or Error, got {:?}", other),
+            other => panic!("expected Message, got {:?}", other),
         }
     }
 

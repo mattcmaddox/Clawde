@@ -994,22 +994,106 @@ pub mod config {
     }
 
     /// Resolve the Ollama host URL from settings/env.
-    fn resolve_ollama_host() -> String {
-        let settings = crate::config::Settings::load_sync().unwrap_or_default();
-        let host = settings
-            .providers
+    ///
+    /// Priority:
+    /// 1. `api_base` (from either settings location, config wins)
+    /// 2. `OLLAMA_HOST` env var
+    /// 3. `options.default_host` (replaces `localhost:11434`)
+    /// 4. `http://localhost:11434` (hardcoded fallback)
+    ///
+    /// When `options.require_explicit_host` is `true` and no host is found at
+    /// steps 1 or 2, returns `None` — steps 3 and 4 are skipped so the caller
+    /// can treat Ollama as unavailable.
+    ///
+    /// Ollama options are read from **both** storage locations so a value
+    /// saved by either path takes effect:
+    /// - `config.provider_configs["ollama"]` — where the `/settings` UI
+    ///   writes `default_host` / `require_explicit_host`;
+    /// - top-level `providers["ollama"]` — the location documented in
+    ///   `docs/providers.md`.
+    ///
+    /// `provider_configs` wins on collision, mirroring
+    /// [`Settings::effective_config`] merge semantics.
+    pub fn resolve_ollama_host() -> Option<String> {
+        let settings = Settings::load_sync().unwrap_or_default();
+        resolve_ollama_host_from(&settings)
+    }
+
+    /// Shared resolution logic (testable with a constructed `Settings`).
+    fn resolve_ollama_host_from(settings: &Settings) -> Option<String> {
+        let require_explicit = ollama_option(settings, "require_explicit_host")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let explicit_host = ollama_api_base(settings)
+            .filter(|base| !base.trim().is_empty())
+            .or_else(|| {
+                std::env::var("OLLAMA_HOST")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+
+        if let Some(host) = explicit_host {
+            return Some(
+                host.trim_end_matches('/')
+                    .trim_end_matches("/v1")
+                    .to_string(),
+            );
+        }
+
+        if require_explicit {
+            // require_explicit_host: skip default_host and localhost fallbacks.
+            return None;
+        }
+
+        // Default host — user-configurable, e.g. for a LAN GPU server.
+        // Falls back to localhost when not set.
+        let default_host = ollama_option(settings, "default_host")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| "http://localhost:11434".to_string());
+
+        Some(default_host)
+    }
+
+    /// Look up one Ollama `options` value from either the embedded config's
+    /// `provider_configs` (the `/settings` UI write target) or the top-level
+    /// `providers` map (the documented location). Config wins on collision.
+    fn ollama_option<'a>(settings: &'a Settings, key: &str) -> Option<&'a serde_json::Value> {
+        settings
+            .config
+            .provider_configs
+            .get("ollama")
+            .and_then(|cfg| cfg.options.get(key))
+            .or_else(|| {
+                settings
+                    .providers
+                    .get("ollama")
+                    .and_then(|cfg| cfg.options.get(key))
+            })
+    }
+
+    /// Look up the Ollama `api_base` from either storage location.
+    fn ollama_api_base(settings: &Settings) -> Option<String> {
+        settings
+            .config
+            .provider_configs
             .get("ollama")
             .and_then(|c| c.api_base.clone())
-            .or_else(|| std::env::var("OLLAMA_HOST").ok())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        host.trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .to_string()
+            .or_else(|| {
+                settings
+                    .providers
+                    .get("ollama")
+                    .and_then(|c| c.api_base.clone())
+            })
     }
 
     /// Send keep_alive=0 requests to unload all loaded Ollama models.
     pub async fn ollama_unload_models() -> Result<usize, String> {
-        let base_url = resolve_ollama_host();
+        let Some(base_url) = resolve_ollama_host() else {
+            return Ok(0);
+        };
         let client = reqwest::Client::new();
 
         let ps_body = client
@@ -1660,27 +1744,27 @@ pub mod config {
                         .as_deref()
                         .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
                 })
-                .unwrap_or("anthropic")
+                .unwrap_or("free")
         }
 
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
-        /// returns that provider's canonical default model in `provider/model` form
-        /// instead of `DEFAULT_MODEL` (which is Claude-specific). The prefixed form
-        /// ensures the TUI status line shows the correct provider rather than "local".
+        /// returns that provider's canonical default model in `provider/model` form.
+        /// The default provider is `"free"` (default model `"free/auto"`), so a fresh
+        /// config without explicit model/provider settings routes to the free
+        /// composite provider.
         pub fn effective_model(&self) -> &str {
             if let Some(ref m) = self.model {
                 // An unprefixed bare model (e.g. "claude-opus-4-6") only makes
-                // sense when the active provider is anthropic (or unset). For
-                // any other explicitly-set provider, a bare model name stored
-                // in settings was likely saved from a different session — defer
-                // to the provider's own default instead of showing a stale name
-                // that conflicts with the active provider.
+                // sense when the active provider is explicitly anthropic. For
+                // any other provider (or unset), a bare model name stored in
+                // settings was likely saved from a different session — defer
+                // to the provider's own default instead of routing a stale name
+                // to the wrong provider.
                 let has_prefix = m.contains('/');
-                let provider_is_anthropic_or_none =
-                    self.provider.as_deref().is_none_or(|p| p == "anthropic");
-                if has_prefix || provider_is_anthropic_or_none {
+                let provider_is_anthropic = self.provider.as_deref() == Some("anthropic");
+                if has_prefix || provider_is_anthropic {
                     return m;
                 }
             }
@@ -1711,7 +1795,8 @@ pub mod config {
                 Some("azure") => "azure/gpt-4o",
                 Some("amazon-bedrock") => "amazon-bedrock/anthropic.claude-sonnet-4-6-v1",
                 Some("venice") => "venice/llama-3.3-70b",
-                _ => crate::constants::DEFAULT_MODEL, // Anthropic default
+                Some("free") => "free/auto",
+                _ => crate::constants::DEFAULT_MODEL, // free/auto default
             }
         }
 
@@ -2636,6 +2721,96 @@ pub mod config {
         }
 
         #[test]
+        fn resolve_ollama_host_reads_provider_configs_write_target() {
+            // The /settings UI writes Ollama options into the embedded config's
+            // provider_configs; the resolver must honour those values (this was
+            // the "saved but never used" Host URL bug).
+            let mut settings = Settings::default();
+            settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert(
+                    "default_host".to_string(),
+                    serde_json::json!("http://devbox:11434"),
+                );
+            assert_eq!(
+                resolve_ollama_host_from(&settings),
+                Some("http://devbox:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_reads_top_level_providers_location() {
+            // The documented location (docs/providers.md) keeps working too.
+            let mut settings = Settings::default();
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert(
+                    "default_host".to_string(),
+                    serde_json::json!("http://gpu:11434"),
+                );
+            assert_eq!(
+                resolve_ollama_host_from(&settings),
+                Some("http://gpu:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_prefers_api_base_over_default_host() {
+            let mut settings = Settings::default();
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .api_base = Some("http://remote:11434/v1".to_string());
+            settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert(
+                    "default_host".to_string(),
+                    serde_json::json!("http://devbox:11434"),
+                );
+            // api_base (priority 1) wins over default_host (priority 3); the
+            // trailing /v1 is normalised away.
+            assert_eq!(
+                resolve_ollama_host_from(&settings),
+                Some("http://remote:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_require_explicit_returns_none() {
+            let mut settings = Settings::default();
+            settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("require_explicit_host".to_string(), serde_json::json!(true));
+            // No explicit host + require_explicit_host → treated as unavailable.
+            assert_eq!(resolve_ollama_host_from(&settings), None);
+        }
+
+        #[test]
+        fn resolve_ollama_host_defaults_to_localhost() {
+            let settings = Settings::default();
+            assert_eq!(
+                resolve_ollama_host_from(&settings),
+                Some("http://localhost:11434".to_string())
+            );
+        }
+
+        #[test]
         fn effective_config_merges_top_level_model_overrides() {
             let mut settings = Settings::default();
             // Nested `config` block wins for a key present in both.
@@ -2720,7 +2895,7 @@ pub mod constants {
     pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
     // Models
-    pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
+    pub const DEFAULT_MODEL: &str = "free/auto";
     pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
     pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
     pub const OPUS_MODEL: &str = "claude-opus-4-6";
@@ -5264,6 +5439,7 @@ mod tests {
     fn test_config_effective_model_override() {
         let cfg = crate::config::Config {
             model: Some("claude-haiku-4-5-20251001".to_string()),
+            provider: Some("anthropic".to_string()),
             ..Default::default()
         };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
@@ -5291,6 +5467,9 @@ mod tests {
     fn test_config_resolve_api_key_from_config() {
         // When config.api_key is set, it should be returned regardless of env var
         // (Config key takes priority — resolve_api_key returns it first)
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
@@ -5308,6 +5487,9 @@ mod tests {
     #[test]
     fn test_config_resolve_api_key_none() {
         // Temporarily ensure no env var override
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
@@ -5328,7 +5510,13 @@ mod tests {
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
-        let cfg = crate::config::Config::default();
+        // selected_provider_id() defaults to "free" — the free provider has
+        // no canonical env var, so resolve_api_key() returns None.  To test
+        // env-var resolution, use an explicit anthropic provider.
+        let cfg = crate::config::Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-env-key".to_string()));
 
         // Restore

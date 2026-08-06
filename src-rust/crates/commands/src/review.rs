@@ -137,7 +137,7 @@ impl SlashCommand for ReviewCommand {
         // 3. Call the LLM for a structured PR review
         // ------------------------------------------------------------------
         let model = ctx.config.effective_model().to_string();
-        let provider = match provider_for_config(&ctx.config).await {
+        let provider = match resolve_command_provider(ctx).await {
             Some(provider) => provider,
             None => {
                 return CommandResult::Error(

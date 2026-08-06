@@ -272,6 +272,123 @@ on parse failure, and the default theme is used as fallback.
 
 ---
 
+## 🧪 Test Suite Speed Improvements
+
+**Date:** 2026-08-05 · **Refactored:** 2026-08-06 · **Owner:** whoever touches tests
+
+### Current state (measured 2026-08-06)
+
+- ~2,250 unit tests across 12 crates: tui 872 · core 578 · api 247 · commands 163 · tools 152 ·
+  query 147 · mcp 47 · plugins 13 · bridge 12 · cli 10 · buddy 9, plus 8 integration files
+  (`crates/{cli,core,tui}/tests/`; `api/tests/` holds fixtures only).
+- CI runs `cargo test --workspace --locked` on a 3-OS matrix — **parallel** (serial flag dropped
+  2026-08-06 once every env-mutating test was lock-guarded).
+  Root cause: many tests mutate process-global env vars (`HOME`, `ANTHROPIC_API_KEY`,
+  `CLAWDE_HOME`, …) and race under parallelism (see `CLAWDE_REFERENCE.md` "Testing Patterns").
+- Wall-clock is dominated by **compilation, not test execution**: cold `cargo test -p clawde-commands --lib`
+  is ~30s wall (core 16s · api 16s · query 19s · tools 11s · tui 47s · mcp 6s cold), yet the 157
+  commands tests finish in <1s once built. Execution-speed tools (nextest) do not fix the real cost.
+
+### Done (2026-08-05 quick fix)
+
+- [x] Marked 6 slow API-calling tests `#[ignore]` in `clawde-commands` (compact + summary commands that hit the free provider)
+- [x] Reduced `try_compact` timeout from 120s → 10s so failures fail fast
+- [x] Result: `clawde-commands --lib` test *execution* 37s → 0.97s (157 passed, 6 ignored)
+
+### Plan (ordered by ROI; each step has files → commands → acceptance)
+
+#### Step 1 — Fix the stale "120 seconds" messaging (bug, ~5 min) ✅ 2026-08-06
+
+The timeout is now 10s but the log and user-facing strings still say 120s.
+
+- [x] Introduced `COMPACT_API_TIMEOUT: Duration = Duration::from_secs(10)` in
+  `src-rust/crates/commands/src/lib.rs` and interpolate `.as_secs()` in the log
+  (`tracing::warn!`) and both `Err(CompactError::Timeout)` user messages — the value
+  can no longer drift.
+- Acceptance: `grep -rn "120" src-rust/crates/commands/src/lib.rs` returns nothing.
+
+#### Step 2 — Mock the 6 network tests so they run offline again ✅ 2026-08-06
+
+They were `#[ignore]`'d, not fixed. Reused the mock patterns that already exist:
+
+- [x] Added `CommandContext.test_provider: Option<Arc<dyn LlmProvider>>`
+  (`commands/src/lib.rs`) + `resolve_command_provider(ctx)` helper consulted by
+  `/compact` (`try_compact`), `/summary` and `/rename` (`session_tools.rs`), and `/review`
+  (`review.rs`) — test override wins, otherwise `provider_for_config` as before.
+- [x] Added a `CannedProvider` mock in the commands test module (mirrors
+  `GateMockProvider` in `query/src/compact.rs` and `MockProvider` in
+  `api/src/providers/key_rotating.rs`).
+- [x] Un-ignored all 6 tests; 3 short-conversation summary tests never resolve a
+  provider (count < 3 short-circuit) — just lost `#[ignore]`. The 3 provider-touching
+  tests now assert deterministic canned output.
+- [x] Result: `cargo test -p clawde-commands --lib` → **163 passed, 0 ignored, 0 failed**
+  in ~1.1s with no network.
+
+#### Step 3 — Finish parallel-safety and drop `--test-threads=1` ✅ 2026-08-06 (audit + local proof)
+
+Full-workspace audit of every `set_var`/`remove_var` site against `#[cfg(test)]`
+modules completed. The three stragglers named in the original plan were already
+handled or never were tests:
+
+- [x] `query/src/coordinator.rs` (`COORDINATOR_ENV_VAR`) — **already guarded**: local `ENV_LOCK` at `coordinator.rs:236`
+- [x] `core/src/voice.rs` (`KILL_SWITCH_ENV`) — **already guarded**: local `ENV_LOCK` at `voice.rs:598`
+- [x] `tui/src/settings_screen.rs` (`PREFERRED_SEARCH_BACKEND`) — the 4 mutations are **production settings-apply code**, not tests; nothing to guard
+- [x] Re-audit found exactly **2 genuinely unguarded** test env mutations: `core/src/lib.rs`
+  `test_config_resolve_api_key_from_config` + `test_config_resolve_api_key_none` mutate
+  `ANTHROPIC_API_KEY` without a lock (the sibling test at 5501 holds one). Both now take
+  `crate::paths::ENV_LOCK`.
+- [x] Other sites verified guarded: `render.rs`/`app.rs` local `HOME_LOCK`, `commands`
+  `CLAWDE_HOME_LOCK`, `mcp`/`paths`/`github`/`auth_store`/`accounts`/`share_export`
+  `ENV_LOCK` (via `TestHome`), `api/test_support.rs` own `CLAWDE_HOME_LOCK`.
+
+Measured locally (warm cache, 2,368 tests):
+
+| Run | Wall | Result |
+|---|---|---|
+| Serial (`--test-threads=1`) | **151.9s** | 2,368 ok / 0 failed |
+| Parallel (default) run 1 | **83.3s** | 2,368 ok / 0 failed |
+| Parallel (default) run 2 | **80.7s** | 2,368 ok / 0 failed |
+| Parallel (default) run 3 | **82.0s** | 2,368 ok / 0 failed |
+
+→ **1.8× speedup, green 3× (83.3 / 80.7 / 82.0s).** Parallel is safe to use locally.
+
+- [x] Permanent regression guard: `scripts/audit-env-tests.py` (exit 1 on any
+  unguarded `set_var`/`remove_var`/`set_current_dir` inside a `#[cfg(test)]`
+  module). Currently clean: 110 process-global mutations, all lock-guarded.
+
+- [x] `ENV_LOCK` in `core/src/paths.rs` is now platform-independent (`#[cfg(test)]`, was
+  `#[cfg(all(test, unix))]`) — the canonical lock exists on every target.
+- [x] Removed the `#[cfg(unix)]` gating from the `TestHome` lock in `core/src/auth_store.rs`
+  and `core/src/github.rs` — Windows CI is now fully serialized too (locks work on Windows).
+- [x] Dropped `--test-threads=1` from `.github/workflows/ci.yml` (both the main test run and
+  the dead-code guard) with a comment pointing at the ENV_LOCK discipline + audit script.
+- [x] Updated the "serial due to env var mutation" notes in `CLAWDE_REFERENCE.md` and added a
+  parallel-safety guard note to `AGENTS.md`.
+
+#### Step 4 — Baseline script + optional `cargo nextest` (execution only) ✅ 2026-08-06 (script)
+
+- [x] Added `scripts/test-timing.sh` — warms each crate (`cargo test --no-run`), then times
+  the real lib-test run and prints a summary. Usage: `bash scripts/test-timing.sh [crate...]`.
+- [ ] `cargo nextest` (not installed) only helps after Step 3 unlocks parallelism: cross-crate
+  parallelization + per-test retries. It does NOT reduce compile time, which is the dominant cost
+  here — keep expectations honest.
+- [x] Baseline recorded: `clawde-commands` lib tests = **~1.1s warm** (163 tests).
+
+#### Step 5 — CI split: fast push / slow nightly
+
+- [ ] Push: unit + hermetic tests (Steps 2–3 make everything hermetic), run in parallel.
+- [ ] Nightly (`schedule`): `cargo test --workspace -- --ignored` for the network/regression suite;
+  the dead-code-guard job stays Linux-only fail-fast.
+- [ ] Acceptance: PR CI wall time drops measurably; the ignored suite still runs nightly.
+
+#### Step 6 — Compile time (the real bottleneck, P3)
+
+- [ ] `target/` is already cached in CI (`actions/cache` in `.github/workflows/ci.yml`) — keep it.
+- [ ] For test-only compile checks use `cargo check -p clawde-tui --tests` (pre-commit hook already does).
+- [ ] Investigate `sccache` for cold CI rebuilds before believing nextest is the win.
+
+---
+
 ## 🧪 Experimental Features
 
 Marked as `[EXPERIMENTAL]` in the README. May be unstable or incomplete:

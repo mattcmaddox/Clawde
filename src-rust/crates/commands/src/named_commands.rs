@@ -1291,6 +1291,7 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             provider_registry: None,
+            test_provider: None,
         }
     }
 

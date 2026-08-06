@@ -119,6 +119,16 @@ git config core.hooksPath .githooks
 
 Opt out of a single commit: `SKIP_CLAWDE_HOOK=1 git commit ...`
 
+### Parallel-safe tests (env mutations)
+
+`cargo test --workspace` runs on the default **parallel** runner — CI no longer
+passes `--test-threads=1`. Any test that mutates process-global state (env vars
+like `CLAWDE_HOME`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `HOME`, or the working
+directory) MUST serialize on a crate-level `ENV_LOCK` mutex before mutating
+(see the canonical lock at `crates/core/src/paths.rs`). New tests that miss a
+guard will race under parallelism and flake CI. `scripts/audit-env-tests.py`
+scans for unguarded mutations — keep it green when adding tests.
+
 ## Issues & PR Comments
 
 When posting issue/PR comments:

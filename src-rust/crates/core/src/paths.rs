@@ -7,6 +7,14 @@
 
 use std::path::PathBuf;
 
+// The env-mutating tests across the crate (paths, lib, auth_store, github,
+// accounts, share_export) serialize on this lock. Deliberately
+// platform-independent: `CLAWDE_HOME` / `ANTHROPIC_API_KEY` / `GITHUB_TOKEN`
+// mutations race on Windows CI just the same as on Unix, so the lock must exist
+// on every target. Re-exported at `crate::paths::ENV_LOCK`.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The canonical claurst home directory — the single source of truth for where
 /// claurst keeps its data. Thin wrapper over
 /// [`crate::config::Settings::config_dir`]; prefer this at call sites that only
@@ -25,13 +33,9 @@ pub fn clawde_home() -> PathBuf {
 // profile API and can't be pinned via env, so they'd be non-hermetic there.
 #[cfg(all(test, unix))]
 mod tests {
+    use super::ENV_LOCK;
     use crate::config::Settings;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    // The resolver reads process-global env (`CLAWDE_HOME`, `HOME`,
-    // `XDG_CONFIG_HOME`). Serialize every test that mutates them.
-    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -198,8 +202,3 @@ mod tests {
         );
     }
 }
-
-// Re-export so the lock is accessible from sibling modules (lib.rs, accounts.rs, etc.)
-// without exposing the private `tests` module itself.
-#[cfg(all(test, unix))]
-pub(crate) use tests::ENV_LOCK;

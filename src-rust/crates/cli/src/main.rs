@@ -507,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager: None,
                     mcp_auth_runner: None,
                     provider_registry: None,
+                    test_provider: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -2468,6 +2469,7 @@ async fn run_interactive(
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
         provider_registry: base_query_config.provider_registry.clone(),
+        test_provider: None,
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2588,6 +2590,7 @@ async fn run_interactive(
 
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
+        app.rustle_editor.tick_blink();
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)

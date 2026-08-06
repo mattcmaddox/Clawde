@@ -804,7 +804,7 @@ repeating the same warning level.
 - Async tests with `#[tokio::test]`
 - Registry validation tests for commands and tools
 - `#[test] fn test_<name>()` naming convention
-- Run with `cargo test --workspace -- --test-threads=1` (serial due to env var mutation)
+- Run with `cargo test --workspace` (parallel-safe: every env-mutating test holds a crate `ENV_LOCK` guard — see `crates/core/src/paths.rs` and `scripts/audit-env-tests.py`)
 
 ### Build Commands
 ```bash
@@ -812,7 +812,7 @@ repeating the same warning level.
 cargo check --workspace              # Quick compilation check
 cargo clippy --workspace --all-targets -- -D warnings  # Lint
 cargo fmt --all                      # Format
-cargo test --workspace -- --test-threads=1              # Test (serial!)
+cargo test --workspace                              # Test (parallel-safe, env mutations lock-guarded)
 cargo test --package clawde-core                        # Single crate
 cargo build --release --package clawde-cli              # Release build
 ```

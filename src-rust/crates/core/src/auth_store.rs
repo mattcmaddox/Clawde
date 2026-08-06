@@ -363,20 +363,18 @@ mod tests {
     /// during unwinding from a panic.
     ///
     /// Serialized against every other env-mutating test in this crate via
-    /// `crate::paths::ENV_LOCK` (unix). Without this, the store-level tests
-    /// below (`set_keys`, `add_key`, `remove_key`, `remove`, `set`) all call
-    /// `save()`, which writes placeholder keys into the user's real config
+    /// `crate::paths::ENV_LOCK` (all platforms). Without this, the store-level
+    /// tests below (`set_keys`, `add_key`, `remove_key`, `remove`, `set`) all
+    /// call `save()`, which writes placeholder keys into the user's real config
     /// dir whenever `cargo test` runs.
     struct TestHome {
         _tmp: tempfile::TempDir,
         prev_clawde_home: Option<std::ffi::OsString>,
-        #[cfg(unix)]
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestHome {
         fn new() -> Self {
-            #[cfg(unix)]
             let _lock = crate::paths::ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -386,7 +384,6 @@ mod tests {
             TestHome {
                 _tmp: tmp,
                 prev_clawde_home: prev,
-                #[cfg(unix)]
                 _lock,
             }
         }

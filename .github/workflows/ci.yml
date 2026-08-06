@@ -58,10 +58,20 @@ jobs:
 
       - name: Run tests
         working-directory: src-rust
-        # Run serially: a number of tests mutate process-global state (env vars
-        # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
-        # parallel execution, flaking non-deterministically across runners.
-        run: cargo test --workspace --locked -- --test-threads=1
+        # Tests mutate process-global state (env vars like HOME /
+        # ANTHROPIC_API_KEY / CLAWDE_HOME), but every such test is serialized
+        # behind a crate-level ENV_LOCK guard (canonical one in
+        # crates/core/src/paths.rs, audited by scripts/audit-env-tests.py), so
+        # the default parallel runner is safe — verified 3x locally at 1.8x the
+        # serial speed. Keep audit-env-tests.py green when adding tests.
+        run: cargo test --workspace --locked
+
+      # Env-mutation audit: fails if any test-module code mutates process-global
+      # state (env vars, working dir) without holding a crate ENV_LOCK guard —
+      # the discipline that makes the parallel test run above safe to trust.
+      - name: Env-mutation audit
+        if: runner.os == 'Linux'
+        run: python3 scripts/audit-env-tests.py
 
       # Dead-code guard: rustc's `dead_code` lint never fires for `pub` items,
       # so every workspace crate carries a `test_no_unreferenced_pub_functions_in_workspace`
@@ -74,7 +84,7 @@ jobs:
       - name: Dead-code guard
         if: runner.os == 'Linux'
         working-directory: src-rust
-        run: cargo test --workspace --locked test_no_unreferenced_pub_functions_in_workspace -- --test-threads=1
+        run: cargo test --workspace --locked test_no_unreferenced_pub_functions_in_workspace
 
       # Both gates are REQUIRED now: the workspace is clippy-clean with
       # -D warnings and rustfmt-clean, so regressions must fail CI loudly

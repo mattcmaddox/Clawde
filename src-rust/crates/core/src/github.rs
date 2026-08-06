@@ -283,13 +283,11 @@ mod tests {
         _tmp: tempfile::TempDir,
         prev_clawde_home: Option<std::ffi::OsString>,
         prev_github_token: Option<std::ffi::OsString>,
-        #[cfg(unix)]
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestHome {
         fn new() -> Self {
-            #[cfg(unix)]
             let _lock = crate::paths::ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -302,7 +300,6 @@ mod tests {
                 _tmp: tmp,
                 prev_clawde_home,
                 prev_github_token,
-                #[cfg(unix)]
                 _lock,
             }
         }
