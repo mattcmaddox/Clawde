@@ -264,6 +264,57 @@ mod tests {
     use clawde_core::config::ProviderConfig;
     use std::collections::HashMap;
 
+    /// Minimal [`CommandContext`] for running `RoutingCommand::execute`
+    /// hermetically (the settings write is redirected by the `TestHome`
+    /// guard, which holds the crate's shared `CLAWDE_HOME_LOCK`).
+    fn make_test_ctx() -> CommandContext {
+        CommandContext {
+            config: Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_auto_config_change_carries_strategy_for_refresh() {
+        // /routing auto's ConfigChangeMessage is what the CLI applies to the
+        // in-memory config; /refresh then rebuilds the free provider from
+        // that config. This locks the contract: the returned config must
+        // carry providers.free.options.routing.strategy = "auto" so the
+        // switch takes effect in-session without a restart.
+        let _home = crate::keys::tests::TestHome::new();
+        let mut ctx = make_test_ctx();
+        let result = RoutingCommand.execute("auto", &mut ctx).await;
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(
+                    msg.contains("'auto'"),
+                    "status message should name the new strategy, got: {msg}"
+                );
+                let strategy = new_cfg
+                    .provider_configs
+                    .get("free")
+                    .and_then(|pc| pc.options.get("routing"))
+                    .and_then(|v| v.get("strategy"))
+                    .and_then(|v| v.as_str());
+                assert_eq!(
+                    strategy,
+                    Some("auto"),
+                    "new config must carry the strategy for /refresh to apply it"
+                );
+            }
+            other => panic!("expected ConfigChangeMessage, got {other:?}"),
+        }
+    }
+
     #[test]
     fn resolve_routing_defaults_to_auto() {
         let config = Config::default();

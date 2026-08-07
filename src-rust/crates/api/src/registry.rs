@@ -1064,3 +1064,102 @@ impl Default for ProviderRegistry {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests — routing-strategy wiring through the /refresh rebuild path
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::config::{Config, ProviderConfig};
+
+    /// Build a [`Config`] whose free-provider routing options carry the given
+    /// strategy JSON, mirroring what `providers.free.options.routing` looks
+    /// like after `/routing <strategy>` writes it to settings.json.
+    fn config_with_routing_strategy(strategy: &str) -> Config {
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "routing".to_string(),
+            serde_json::json!({ "strategy": strategy }),
+        );
+        let mut provider_configs = std::collections::HashMap::new();
+        provider_configs.insert(
+            "free".to_string(),
+            ProviderConfig {
+                options,
+                ..Default::default()
+            },
+        );
+        Config {
+            provider_configs,
+            ..Default::default()
+        }
+    }
+
+    /// Seed a fake key for an upstream that has no live model discovery
+    /// (mistral → `FreeModelDiscovery::None`) so `build_free_provider` builds
+    /// its chain without a live-discovery call. (The unconditional
+    /// `fetch_best_free_models_from_modelsdev` OnceLock may still attempt one
+    /// HTTP fetch per test process; it degrades to an empty map on failure.)
+    fn seed_key(store: &mut clawde_core::AuthStore) {
+        store.set(
+            "mistral",
+            clawde_core::StoredCredential::ApiKey {
+                key: "fake-mistral-key-1234567890".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn build_free_provider_applies_auto_strategy_from_config() {
+        // /refresh rebuilds the registry from the in-memory config that
+        // /routing auto returned via ConfigChangeMessage — this asserts that
+        // the rebuild actually applies the strategy (spec §8.4), so switching
+        // /routing auto takes effect in-session without a restart.
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        seed_key(&mut store);
+        let config = config_with_routing_strategy("auto");
+
+        let provider = build_free_provider(&config)
+            .expect("a seeded free-mode key should build the free chain");
+        assert_eq!(
+            provider.routing_strategy_name(),
+            Some("Auto"),
+            "rebuilt free provider must use the Auto strategy from the config"
+        );
+    }
+
+    #[test]
+    fn build_free_provider_respects_explicit_sequential_strategy() {
+        // An explicit `sequential` in settings.json survives the rebuild —
+        // only configs WITHOUT a strategy key get the Auto default.
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        seed_key(&mut store);
+        let config = config_with_routing_strategy("sequential");
+
+        let provider = build_free_provider(&config)
+            .expect("a seeded free-mode key should build the free chain");
+        assert_eq!(
+            provider.routing_strategy_name(),
+            Some("Seq"),
+            "explicit sequential strategy must survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn build_free_provider_defaults_to_auto_without_strategy_key() {
+        // No routing key at all → the Auto default (smart routing, §8.4).
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        seed_key(&mut store);
+        let config = Config::default();
+
+        let provider = build_free_provider(&config)
+            .expect("a seeded free-mode key should build the free chain");
+        assert_eq!(
+            provider.routing_strategy_name(),
+            Some("Auto"),
+            "missing strategy key must fall back to the Auto default"
+        );
+    }
+}
