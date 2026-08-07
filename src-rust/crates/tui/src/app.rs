@@ -4889,6 +4889,10 @@ impl App {
                                 // once the current turn finishes (issue #149).
                                 self.queued_messages.push_back(msg);
                                 self.pending_auto_submit = true;
+                                // The accepted version becomes the diff baseline
+                                // (§10.2): a later re-open shows what changed
+                                // since approval, not just since the last look.
+                                self.spec_review.mark_accepted();
                                 // Accepting exits spec mode (§10.2): the review
                                 // gate has served its purpose, and the queued
                                 // implementation turn must not stop again to
@@ -4944,7 +4948,7 @@ impl App {
                         .map(|spec| {
                             crate::spec_review::spec_content_line_count(
                                 spec,
-                                self.spec_review.changes.as_deref(),
+                                self.spec_review.changes.as_ref(),
                             )
                         })
                         .unwrap_or(0);
@@ -4958,7 +4962,7 @@ impl App {
                         .map(|spec| {
                             crate::spec_review::spec_content_line_count(
                                 spec,
-                                self.spec_review.changes.as_deref(),
+                                self.spec_review.changes.as_ref(),
                             )
                         })
                         .unwrap_or(0);

@@ -674,7 +674,7 @@ Navigation: `↑/↓` or `j/k` scroll the content, `←/→` or `h/l` move betwe
 
 With several specs in `specs/`, a bare `/spec-review` opens a picker (newest first): `↑/↓` or `j/k` highlights a spec, `Enter` opens it, `Esc` closes. In spec mode the dialog also opens automatically after a turn that generated a spec — and after a plain `/spec` that writes one.
 
-If you edit a spec's JSON externally (e.g. via Edit Spec) and re-open it, a **Changes since your last review** section at the top shows exactly which lines changed (green `+` / red `-`), so you can verify your edits before Accepting.
+If you edit a spec's JSON externally (e.g. via Edit Spec) and re-open it, a **Changes since your last review** section at the top shows exactly which lines changed (green `+` / red `-`), so you can verify your edits before Accepting. Once you have **Accepted** a spec, later re-opens compare against that approved version (**Changes since the accepted version**) — so drift from what you approved is always visible.
 
 ---
 

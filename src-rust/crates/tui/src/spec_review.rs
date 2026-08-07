@@ -84,6 +84,24 @@ pub struct ChangeLine {
     pub text: String,
 }
 
+/// What the changes are compared against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeBaseline {
+    /// Compared against the version accepted in this session (§10.2 approval
+    /// gate) — the baseline that matters when the spec drifts after approval.
+    Accepted,
+    /// Compared against the last version opened for review.
+    LastReview,
+}
+
+/// The "Changes since …" section shown when a re-opened spec differs from
+/// its baseline.
+#[derive(Debug, Clone)]
+pub struct ChangesSince {
+    pub baseline: ChangeBaseline,
+    pub lines: Vec<ChangeLine>,
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -110,13 +128,20 @@ pub struct SpecReviewState {
     pub available: Vec<PathBuf>,
     /// Highlighted index into `available` (picker mode).
     pub picked: usize,
-    /// Diff of the current spec against the last version reviewed in this
-    /// session (externally edited specs), or `None` when there is nothing to
-    /// compare or nothing changed.
-    pub changes: Option<Vec<ChangeLine>>,
+    /// Diff of the current spec against its baseline (accepted version when
+    /// one exists, otherwise the last version reviewed), or `None` when there
+    /// is nothing to compare or nothing changed.
+    pub changes: Option<ChangesSince>,
     /// Path → raw JSON content of the last reviewed version, so a re-opened
     /// (typically externally edited) spec can show what changed.
     last_reviewed: std::collections::HashMap<PathBuf, String>,
+    /// Path → raw JSON content of the version accepted in this session, so
+    /// later re-opens diff against what was approved (§10.2) rather than just
+    /// the last-opened version.
+    accepted: std::collections::HashMap<PathBuf, String>,
+    /// Raw JSON of the spec currently on screen, captured at `open` time so
+    /// `mark_accepted` records exactly what the user approved.
+    last_opened_raw: Option<String>,
 }
 
 impl Default for SpecReviewState {
@@ -133,6 +158,8 @@ impl Default for SpecReviewState {
             picked: 0,
             changes: None,
             last_reviewed: std::collections::HashMap::new(),
+            accepted: std::collections::HashMap::new(),
+            last_opened_raw: None,
         }
     }
 }
@@ -148,14 +175,26 @@ impl SpecReviewState {
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
         let spec = Spec::parse_json(&raw)?;
-        // Diff against the version last reviewed in this session so an
-        // externally edited spec shows exactly what changed since then.
-        self.changes = match self.last_reviewed.get(&path) {
-            Some(prev) if *prev != raw => Some(build_changes(prev, &raw)),
-            _ => None,
+        // Diff against the strongest baseline: the version accepted in this
+        // session when one exists (the approval gate — §10.2), otherwise the
+        // last version opened for review. A re-opened, externally edited spec
+        // then shows exactly what changed since approval.
+        self.changes = match self.accepted.get(&path) {
+            Some(approved) if *approved != raw => Some(ChangesSince {
+                baseline: ChangeBaseline::Accepted,
+                lines: build_changes(approved, &raw),
+            }),
+            _ => match self.last_reviewed.get(&path) {
+                Some(prev) if *prev != raw => Some(ChangesSince {
+                    baseline: ChangeBaseline::LastReview,
+                    lines: build_changes(prev, &raw),
+                }),
+                _ => None,
+            },
         };
-        // Snapshot this open as the new baseline for the next review.
-        self.last_reviewed.insert(path.clone(), raw);
+        // Snapshot this open as the new fallback baseline for the next review.
+        self.last_reviewed.insert(path.clone(), raw.clone());
+        self.last_opened_raw = Some(raw);
         self.spec = Some(spec);
         self.path = Some(path);
         self.selected_action = ACTION_ACCEPT;
@@ -233,6 +272,10 @@ impl SpecReviewState {
         self.picking = false;
         self.available.clear();
         self.picked = 0;
+        // Drop the on-screen raw so a later mark_accepted can never pair it
+        // with a stale path from a previous open (defensive; access is
+        // visible-gated, but this removes the latent pitfall).
+        self.last_opened_raw = None;
     }
 
     /// Move the action selection left/right (clamped).
@@ -252,6 +295,15 @@ impl SpecReviewState {
     pub fn scroll_down(&mut self, content_lines: usize, visible: usize) {
         let max = content_lines.saturating_sub(visible);
         self.scroll = (self.scroll + 1).min(max);
+    }
+
+    /// Record the spec currently on screen as the accepted version, so any
+    /// later re-open diffs against what was approved (§10.2). No-op when the
+    /// dialog holds no spec.
+    pub fn mark_accepted(&mut self) {
+        if let (Some(path), Some(raw)) = (self.path.clone(), self.last_opened_raw.clone()) {
+            self.accepted.insert(path, raw);
+        }
     }
 
     /// The accepted-spec implementation message queued when the user presses
@@ -320,11 +372,11 @@ fn build_changes(prev: &str, cur: &str) -> Vec<ChangeLine> {
 /// Number of content lines a spec renders to (scroll bounds).
 ///
 /// Public so app.rs can bound `scroll_down` without building the styled lines.
-pub fn spec_content_line_count(spec: &Spec, changes: Option<&[ChangeLine]>) -> usize {
+pub fn spec_content_line_count(spec: &Spec, changes: Option<&ChangesSince>) -> usize {
     let mut count = 2; // title + blank
     if let Some(changes) = changes {
-        if !changes.is_empty() {
-            count += 2 + changes.len(); // header + blank + rows
+        if !changes.lines.is_empty() {
+            count += 2 + changes.lines.len(); // header + blank + rows
         }
     }
     if !spec.requirements.is_empty() {
@@ -352,7 +404,7 @@ pub fn spec_content_line_count(spec: &Spec, changes: Option<&[ChangeLine]>) -> u
 }
 
 /// Build the scrollable content lines for the spec (title + sections).
-fn content_lines(spec: &Spec, changes: Option<&[ChangeLine]>) -> Vec<Line<'static>> {
+fn content_lines(spec: &Spec, changes: Option<&ChangesSince>) -> Vec<Line<'static>> {
     use clawde_core::spec::AcceptanceTest;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -363,15 +415,20 @@ fn content_lines(spec: &Spec, changes: Option<&[ChangeLine]>) -> Vec<Line<'stati
     )]));
     lines.push(Line::from(""));
 
-    // Changes since the last review (externally edited spec) — shown first
-    // so the user sees exactly what changed before re-deciding.
+    // Changes since the baseline (accepted version when one exists, else the
+    // last review) — shown first so the user sees exactly what changed
+    // before re-deciding.
     if let Some(changes) = changes {
-        if !changes.is_empty() {
+        if !changes.lines.is_empty() {
+            let header = match changes.baseline {
+                ChangeBaseline::Accepted => "## Changes since the accepted version",
+                ChangeBaseline::LastReview => "## Changes since your last review",
+            };
             lines.push(Line::from(Span::styled(
-                "## Changes since your last review",
+                header,
                 Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
             )));
-            for c in changes {
+            for c in &changes.lines {
                 let (marker, color) = match c.kind {
                     ChangeKind::Added => ("+", TAG_NEW),
                     ChangeKind::Removed => ("-", TAG_DEL),
@@ -623,7 +680,7 @@ pub fn render_spec_review(
         return;
     }
 
-    let lines = content_lines(spec, state.changes.as_deref());
+    let lines = content_lines(spec, state.changes.as_ref());
     let visible_rows = inner.height as usize;
     let scroll = state.scroll.min(lines.len().saturating_sub(visible_rows));
     let paragraph = Paragraph::new(lines)
@@ -884,19 +941,95 @@ mod tests {
             .edge_cases
             .push("Loopback traffic ignored".to_string());
         edited.write_to(&path).unwrap();
-
         dialog.open(path.clone()).unwrap();
-        let changes = dialog.changes.expect("changes present after edit");
-        assert!(changes
+        let cs = dialog.changes.expect("changes present after edit");
+        assert_eq!(cs.baseline, ChangeBaseline::LastReview);
+        assert!(cs
+            .lines
             .iter()
             .any(|c| { c.kind == ChangeKind::Added && c.text.contains("sliding window") }));
         // The removed requirement line and the added edge case both surface.
-        assert!(changes
+        assert!(cs
+            .lines
             .iter()
             .any(|c| { c.kind == ChangeKind::Removed && c.text.contains("Per-IP rate limiting") }));
-        assert!(changes
+        assert!(cs.lines.iter().any(|c| {
+            c.kind == ChangeKind::Added && c.text.contains("Loopback traffic ignored")
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_version_becomes_diff_baseline() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-acc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        sample_spec().write_to(&path).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open(path.clone()).unwrap();
+        dialog.mark_accepted();
+
+        // The spec drifts after approval (e.g. the implementation turn or an
+        // external edit rewrites it).
+        let mut edited = sample_spec();
+        edited.requirements = vec!["Per-IP rate limiting with sliding window".to_string()];
+        edited.write_to(&path).unwrap();
+
+        dialog.open(path.clone()).unwrap();
+        let cs = dialog
+            .changes
+            .as_ref()
+            .expect("drift vs accepted version shown");
+        assert_eq!(cs.baseline, ChangeBaseline::Accepted);
+        assert!(cs
+            .lines
             .iter()
-            .any(|c| c.kind == ChangeKind::Added && c.text.contains("Loopback traffic ignored")));
+            .any(|c| c.kind == ChangeKind::Added && c.text.contains("sliding window")));
+
+        // Opening the same (already drifted) version again keeps diffing
+        // against the accepted baseline, not the last-opened one.
+        dialog.open(path).unwrap();
+        assert_eq!(
+            dialog.changes.as_ref().expect("still drifted").baseline,
+            ChangeBaseline::Accepted
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepted_baseline_does_not_leak_across_paths() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-isol-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let a = dir.join("specs/a.json");
+        let b = dir.join("specs/b.json");
+        sample_spec().write_to(&a).unwrap();
+        sample_spec().write_to(&b).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open(a).unwrap();
+        dialog.mark_accepted();
+        dialog.close();
+
+        // First open of a different spec: no baseline of its own, so no diff.
+        dialog.open(b).unwrap();
+        assert!(dialog.changes.is_none(), "accepted A must not baseline B");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_accepted_unchanged_spec_has_no_changes() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-accok-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        sample_spec().write_to(&path).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open(path.clone()).unwrap();
+        dialog.mark_accepted();
+        // Re-open without any edit: identical to the approved version.
+        dialog.open(path).unwrap();
+        assert!(dialog.changes.is_none(), "no drift from accepted version");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
