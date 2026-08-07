@@ -1637,6 +1637,44 @@ mod tests {
         assert_eq!(app.free_mode_dialog.active_idx, 1);
         app.handle_key_event(key(KeyCode::Char('k')));
         assert_eq!(app.free_mode_dialog.active_idx, 0);
+
+        // h/l move the horizontal node cursor (new-key line → key dots) with
+        // the same pending-text guard. Field 0 has one key (k1), so there are
+        // two nodes: NewKey → Key(0) → wraps.
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(
+            app.free_mode_dialog.active_node,
+            crate::free_mode_dialog::NodePos::Key(0)
+        );
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(
+            app.free_mode_dialog.active_node,
+            crate::free_mode_dialog::NodePos::NewKey
+        );
+        app.handle_key_event(key(KeyCode::Char('h')));
+        assert_eq!(
+            app.free_mode_dialog.active_node,
+            crate::free_mode_dialog::NodePos::Key(0)
+        );
+        app.handle_key_event(key(KeyCode::Char('h')));
+        assert_eq!(
+            app.free_mode_dialog.active_node,
+            crate::free_mode_dialog::NodePos::NewKey
+        );
+
+        // With pending text in the active field, h/l must NOT move the node
+        // cursor (they belong to the typed key).
+        app.handle_key_event(key(KeyCode::Char('i'))); // enter insert
+        app.handle_key_event(key(KeyCode::Char('x'))); // type into pending
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
+        app.handle_key_event(key(KeyCode::Esc)); // exit insert
+        app.handle_key_event(key(KeyCode::Char('l')));
+        assert_eq!(
+            app.free_mode_dialog.active_node,
+            crate::free_mode_dialog::NodePos::NewKey,
+            "h/l must not navigate while pending text is present"
+        );
+        assert_eq!(app.free_mode_dialog.fields[0].pending, "x");
     }
 
     #[test]

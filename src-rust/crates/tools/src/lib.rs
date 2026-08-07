@@ -27,6 +27,7 @@ pub mod bundled_skills;
 pub mod computer_use;
 pub mod config_tool;
 pub mod cron;
+pub mod detect_project;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
 pub mod file_edit;
@@ -46,6 +47,8 @@ pub mod powershell;
 pub mod pty_bash;
 pub mod remote_trigger;
 pub mod repl_tool;
+pub mod run_lints;
+pub mod run_tests;
 pub mod send_message;
 pub mod skill_tool;
 pub mod sleep;
@@ -68,6 +71,7 @@ pub use brief::BriefTool;
 pub use computer_use::ComputerUseTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
+pub use detect_project::{detect_project_info, DetectProjectTool, ProjectInfo, ProjectLanguage};
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use file_edit::FileEditTool;
@@ -86,6 +90,8 @@ pub use powershell::PowerShellTool;
 pub use pty_bash::PtyBashTool;
 pub use remote_trigger::RemoteTriggerTool;
 pub use repl_tool::ReplTool;
+pub use run_lints::RunLintsTool;
+pub use run_tests::RunTestsTool;
 pub use send_message::{drain_inbox, peek_inbox, SendMessageTool};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
@@ -612,6 +618,9 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(SkillTool),
         Box::new(LspTool),
         Box::new(ReplTool),
+        Box::new(DetectProjectTool),
+        Box::new(RunTestsTool),
+        Box::new(RunLintsTool),
         Box::new(TeamCreateTool),
         Box::new(TeamDeleteTool),
         Box::new(SyntheticOutputTool),
@@ -781,6 +790,9 @@ mod tests {
             "WebSearch",
             "TodoWrite",
             "Skill",
+            "DetectProject",
+            "RunTests",
+            "RunLints",
         ];
         for name in &expected {
             assert!(
