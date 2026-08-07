@@ -44,7 +44,7 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    fn pass(label: impl Into<String>) -> Self {
+    pub(crate) fn pass(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             ok: true,
@@ -54,7 +54,11 @@ impl CheckResult {
         }
     }
 
-    fn fail(label: impl Into<String>, output: impl Into<String>, timed_out: bool) -> Self {
+    pub(crate) fn fail(
+        label: impl Into<String>,
+        output: impl Into<String>,
+        timed_out: bool,
+    ) -> Self {
         Self {
             label: label.into(),
             ok: false,
@@ -64,7 +68,7 @@ impl CheckResult {
         }
     }
 
-    fn skipped(label: impl Into<String>, output: impl Into<String>) -> Self {
+    pub(crate) fn skipped(label: impl Into<String>, output: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             ok: false,
@@ -98,6 +102,8 @@ pub struct VerifyReport {
     /// One-line summary of the round's outcome, e.g. "All checks passed" or
     /// "Auto-fix exhausted (3 attempts)".
     pub headline: String,
+    /// Sandbox mode the round ran in (`direct` vs `git worktree`).
+    pub sandbox: VerifySandbox,
 }
 
 /// Execute-and-verify continuation policy (audit spec Phase 1).
@@ -141,6 +147,7 @@ impl VerifyPolicy {
             attempt,
             max_retries,
             headline: headline.into(),
+            sandbox: self.config.sandbox,
         });
     }
 
@@ -341,15 +348,7 @@ fn run_checks(config: &VerifyConfig, working_dir: &Path) -> Result<Vec<CheckResu
             crate::verify_sandbox::run_checks_in_worktree(config, working_dir)
         }
         VerifySandbox::Container => {
-            // Defense-in-depth: `preflight` already stops with a clearer
-            // "not implemented" notice before `run_checks` is reached. This
-            // arm exists only so the match stays exhaustive if callers ever
-            // invoke `run_checks` directly.
-            Err(
-                "Verify sandbox 'container' is not implemented yet — verification skipped. Set \
-                 \"verify\": {\"sandbox\": \"direct\"} in settings.json."
-                    .to_string(),
-            )
+            crate::verify_container::run_checks_in_container(config, working_dir)
         }
     }
 }
@@ -413,6 +412,24 @@ pub fn run_command_sync(
     timeout_secs: u64,
 ) -> (String, Option<i32>, bool) {
     let parts = clawde_tools::run_tests::split_command(command);
+    if parts.is_empty() {
+        return (String::new(), None, false);
+    }
+    run_argv_sync(&parts, working_dir, timeout_secs)
+}
+
+/// Run `argv` to completion in `working_dir`, returning
+/// `(stdout+stderr, exit_code, timed_out)`.
+///
+/// The argv form exists so sandbox modes can invoke commands with arguments
+/// that must not be shell-split (e.g. a `docker run` line carrying a mount
+/// path with spaces); `run_command_sync` is the string-splitting wrapper over
+/// this same core.
+pub fn run_argv_sync(
+    parts: &[String],
+    working_dir: &Path,
+    timeout_secs: u64,
+) -> (String, Option<i32>, bool) {
     if parts.is_empty() {
         return (String::new(), None, false);
     }
@@ -558,24 +575,6 @@ mod tests {
         assert!(!decision.is_continue());
         match decision {
             ContinuationDecision::Stop { note } => assert!(note.is_none()),
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
-    fn unimplemented_sandbox_reports_clearly() {
-        // `container` remains unimplemented: preflight must stop with a clear
-        // "not implemented" note instead of silently skipping verification.
-        let mut cfg = default_config();
-        cfg.sandbox = clawde_core::config::VerifySandbox::Container;
-        let decision = policy(cfg).decide(&ctx());
-        assert!(!decision.is_continue());
-        match decision {
-            ContinuationDecision::Stop { note } => {
-                let note = note.expect("sandbox note must be present");
-                assert!(note.contains("not implemented"), "note: {note}");
-                assert!(note.contains("container"), "note: {note}");
-            }
             _ => unreachable!(),
         }
     }

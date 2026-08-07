@@ -340,10 +340,6 @@ mod tests {
             clawde_core::config::VerifySandbox::Worktree.is_implemented(),
             "worktree must no longer report 'not implemented'"
         );
-        assert!(
-            !clawde_core::config::VerifySandbox::Container.is_implemented(),
-            "container stays unimplemented"
-        );
     }
 
     #[test]

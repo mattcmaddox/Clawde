@@ -1478,8 +1478,10 @@ pub mod config {
         /// no side effects on the working tree; the worktree is removed after
         /// the round. Requires the project to be inside a git repository.
         Worktree,
-        /// Verify inside a container (Docker/podman). Maximum isolation.
-        /// Not implemented yet.
+        /// Verify inside a container (Docker/podman). Maximum isolation —
+        /// the project is mounted into a fresh `--rm` container, so the
+        /// toolchain and everything outside the mount are isolated. Requires
+        /// a container runtime.
         Container,
     }
 
@@ -1493,11 +1495,23 @@ pub mod config {
             }
         }
 
+        /// The `settings.json` key for this mode (kebab-case, as serialized).
+        pub fn config_name(self) -> &'static str {
+            match self {
+                VerifySandbox::Direct => "direct",
+                VerifySandbox::Worktree => "worktree",
+                VerifySandbox::Container => "container",
+            }
+        }
+
         /// Whether this sandbox mode is implemented. Unimplemented modes fall
         /// back to a clear "not implemented" notice instead of silently
         /// skipping verification or running un-sandboxed.
         pub fn is_implemented(self) -> bool {
-            matches!(self, VerifySandbox::Direct | VerifySandbox::Worktree)
+            matches!(
+                self,
+                VerifySandbox::Direct | VerifySandbox::Worktree | VerifySandbox::Container
+            )
         }
     }
 
@@ -1519,8 +1533,8 @@ pub mod config {
         pub enabled: bool,
         /// Maximum auto-fix attempts before failures are surfaced to the user.
         pub max_retries: u32,
-        /// Sandbox mode for verification. `direct` (default) and `git worktree`
-        /// are implemented; `container` reports a clear notice instead.
+        /// Sandbox mode for verification. `direct` (default), `git worktree`,
+        /// and `container` (Docker/podman) are implemented.
         pub sandbox: VerifySandbox,
         /// Run the linter/typechecker during verification.
         pub auto_lint: bool,

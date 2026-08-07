@@ -192,6 +192,8 @@ pub struct SettingsScreen {
     pub ollama_default_host: String,
     /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
     pub permission_mode: String,
+    /// Verify sandbox mode ("direct" / "worktree" / "container").
+    pub verify_sandbox: String,
 }
 
 impl SettingsScreen {
@@ -246,6 +248,7 @@ impl SettingsScreen {
             ollama_require_explicit_host: false,
             ollama_default_host: "http://localhost:11434".to_string(),
             permission_mode: "default".to_string(),
+            verify_sandbox: "direct".to_string(),
             keybinding_preset: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
@@ -292,6 +295,7 @@ impl SettingsScreen {
         self.file_autocomplete_show_hidden_files = s.config.file_autocomplete_show_hidden_files;
         self.file_injection_max_size = s.config.file_injection_max_size.to_string();
         self.permission_mode = permission_mode_str(&s.config.permission_mode);
+        self.verify_sandbox = s.config.verify.sandbox.label().to_string();
 
         // Read routing strategy from provider config
         self.routing_strategy = s
@@ -891,6 +895,7 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         .to_string(),
         "disable_claude_mds" => c.disable_claude_mds.to_string(),
         "permission_mode" => permission_mode_str(&c.permission_mode),
+        "verify_sandbox" => c.verify.sandbox.config_name().to_string(),
         "routing_strategy" => routing_str_value(c, "strategy"),
         "first_byte_timeout_secs" => routing_u64_str(c, "first_byte_timeout_secs"),
         "staggered_probe" => routing_bool_str(c, "staggered_probe"),
@@ -952,6 +957,7 @@ fn default_value_for(key: &str) -> String {
         | "fileInjectionEnabled"
         | "mouse_capture" => "true".to_string(),
         "permission_mode" => "default".to_string(),
+        "verify_sandbox" => "direct".to_string(),
         "output_format" => "text".to_string(),
         "preferredSearchBackend" => "auto".to_string(),
         "fileAutocompleteLimit" => "15".to_string(),
@@ -1113,6 +1119,18 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
                 options: vec!["default", "acceptEdits", "bypassPermissions", "plan"],
             },
             screen.permission_mode.clone(),
+        ),
+        make_entry(
+            "verify_sandbox",
+            "Verify sandbox",
+            "Where the execute-and-verify loop runs tests/lints: direct (in the project dir, fast but leaves build artifacts), worktree (temporary git worktree, clean isolation, requires git), container (Docker/podman, max isolation).",
+            SECTION_COMMON,
+            "direct".to_string(),
+            SettingEffect::Immediate,
+            SettingKind::Enum {
+                options: vec!["direct", "worktree", "container"],
+            },
+            screen.verify_sandbox.clone(),
         ),
         make_entry(
             "output_style",
@@ -2174,6 +2192,7 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
         "output_style" => c.output_style = None,
         "output_format" => c.output_format = clawde_core::config::OutputFormat::Text,
         "permission_mode" => c.permission_mode = clawde_core::config::PermissionMode::Default,
+        "verify_sandbox" => c.verify.sandbox = clawde_core::config::VerifySandbox::Direct,
         "preferredSearchBackend" => s.preferred_search_backend = "auto".to_string(),
         // Routing entries — remove from the routing JSON.
         "routing_strategy" => {
@@ -2299,6 +2318,7 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "output_style" => screen.output_style = "default".to_string(),
         "output_format" => screen.output_format = "text".to_string(),
         "permission_mode" => screen.permission_mode = "default".to_string(),
+        "verify_sandbox" => screen.verify_sandbox = "direct".to_string(),
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
         "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
         "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
@@ -2464,6 +2484,19 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                         // Apply to the live config too so the mode changes
                         // immediately, not just for the next session.
                         config.permission_mode = mode;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "verify_sandbox" => {
+                        let sandbox = match new_value {
+                            "worktree" => clawde_core::config::VerifySandbox::Worktree,
+                            "container" => clawde_core::config::VerifySandbox::Container,
+                            _ => clawde_core::config::VerifySandbox::Direct,
+                        };
+                        screen.verify_sandbox = new_value.to_string();
+                        screen.settings_snapshot.config.verify.sandbox = sandbox;
+                        // Apply to the live config too so the change takes
+                        // effect immediately, not just for the next session.
+                        config.verify.sandbox = sandbox;
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     "keybinding_preset" => {
@@ -2814,6 +2847,34 @@ mod tests {
 
         idx = (idx + 1) % options.len();
         assert_eq!(options[idx], "default"); // Wraps around
+    }
+
+    #[test]
+    fn verify_sandbox_entry_is_enum_with_three_modes() {
+        let screen = SettingsScreen::new();
+        let entries = all_entries(&screen);
+        let entry = entries
+            .iter()
+            .find(|e| e.key == "verify_sandbox")
+            .expect("verify_sandbox entry must exist");
+        assert_eq!(entry.label, "Verify sandbox");
+        assert_eq!(entry.section, SECTION_COMMON);
+        match &entry.kind {
+            SettingKind::Enum { options } => {
+                assert_eq!(options, &vec!["direct", "worktree", "container"]);
+            }
+            other => panic!("verify_sandbox must be an enum, got: {other:?}"),
+        }
+        assert_eq!(entry.value, "direct");
+    }
+
+    #[test]
+    fn verify_sandbox_value_reads_from_config() {
+        // The value getter must read the sandbox out of the config, so a
+        // project/global override shows up in the row and in the origin tag.
+        let mut settings = Settings::default();
+        settings.config.verify.sandbox = clawde_core::config::VerifySandbox::Worktree;
+        assert_eq!(value_from_settings(&settings, "verify_sandbox"), "worktree");
     }
 
     #[test]

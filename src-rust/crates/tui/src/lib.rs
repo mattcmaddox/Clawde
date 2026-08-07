@@ -1959,6 +1959,7 @@ mod tests {
             attempt: 1,
             max_retries: 3,
             headline: "All checks passed".to_string(),
+            sandbox: clawde_core::config::VerifySandbox::Direct,
         };
         app.handle_query_event(clawde_query::QueryEvent::Verify(report));
         assert_eq!(app.system_annotations.len(), 1);

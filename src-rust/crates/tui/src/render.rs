@@ -2271,8 +2271,8 @@ fn render_verify_block(
     let box_w = width.saturating_sub(2).clamp(12, 96);
     let area = box_w.saturating_sub(6); // content between "│ " and " │"
 
-    // ┌─ Verify ──────...──┐
-    let title = " Verify ";
+    // ┌─ Verify · git worktree ──...──┐
+    let title = format!(" Verify · {} ", report.sandbox.label());
     let title_fill = box_w.saturating_sub(5 + title.chars().count());
     lines.push(Line::from(vec![
         Span::raw("  "),
@@ -5017,6 +5017,7 @@ mod stream_cache_tests {
             attempt: 1,
             max_retries: 3,
             headline: "Auto-fix attempt 1/3".to_string(),
+            sandbox: clawde_core::config::VerifySandbox::Worktree,
         };
         app.push_verify_annotation(report);
 
@@ -5026,7 +5027,7 @@ mod stream_cache_tests {
 
         // Box chrome + per-check statuses + the attempt headline are all
         // present in the transcript, anchored after the assistant turn.
-        assert!(text.contains("Verify"), "text: {text}");
+        assert!(text.contains("Verify · git worktree"), "text: {text}");
         assert!(text.contains("FAIL"), "text: {text}");
         assert!(text.contains("PASS"), "text: {text}");
         assert!(text.contains("Auto-fix attempt 1/3"), "text: {text}");
