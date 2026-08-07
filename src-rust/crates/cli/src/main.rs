@@ -2134,6 +2134,16 @@ async fn run_interactive(
     if clawde_core::goals_enabled() {
         base_query_config.continuation = clawde_query::ContinuationMode::Goal;
     }
+    // Execute-and-verify (audit spec Phase 1): when enabled in settings.json
+    // (`config.verify.enabled`, default true) and goal autonomy is not active,
+    // select the verify continuation mode so the loop runs the project's
+    // tests/lints after turns that wrote files and feeds failures back to the
+    // model for auto-fix. Goal autonomy wins over verify when both are enabled.
+    if base_query_config.continuation == clawde_query::ContinuationMode::Default
+        && config.verify.enabled
+    {
+        base_query_config.continuation = clawde_query::ContinuationMode::Verify(config.verify);
+    }
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());

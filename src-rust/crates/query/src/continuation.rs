@@ -25,6 +25,12 @@ pub struct TurnEndContext<'a> {
     pub total_tokens_used: u64,
     /// Wall-clock seconds this turn took (goal time accounting).
     pub turn_elapsed_secs: u64,
+    /// Working directory of the run — the project root verification commands
+    /// are detected against and executed in.
+    pub working_dir: &'a std::path::Path,
+    /// Whether the turn's tool round included a file-writing tool. Used by the
+    /// verify policy to skip verification for pure read/search turns.
+    pub turn_made_writes: bool,
 }
 
 /// Decision returned by a continuation policy at the end of a completed turn.
@@ -112,14 +118,25 @@ pub enum ContinuationMode {
     Default,
     /// Goal-driven autonomous continuation (the `/goal` feature).
     Goal,
+    /// Execute-and-verify continuation (audit spec Phase 1): after a turn
+    /// that wrote files, run the project's tests/lints and feed failures back
+    /// to the model for auto-fix, up to `max_retries`.
+    Verify(clawde_core::config::VerifyConfig),
 }
 
 impl ContinuationMode {
     /// Build the concrete policy for this mode.
-    pub fn policy(self) -> Box<dyn ContinuationPolicy> {
+    ///
+    /// `working_dir` is the project root verification commands are detected
+    /// against and executed in (only used by the verify policy).
+    pub fn policy(self, working_dir: &std::path::Path) -> Box<dyn ContinuationPolicy> {
         match self {
             ContinuationMode::Default => Box::new(StopPolicy),
             ContinuationMode::Goal => Box::new(GoalPolicy),
+            ContinuationMode::Verify(config) => Box::new(crate::verify::VerifyPolicy::new(
+                config,
+                working_dir.to_path_buf(),
+            )),
         }
     }
 }
@@ -133,6 +150,8 @@ mod tests {
             session_id: "sess",
             total_tokens_used: 0,
             turn_elapsed_secs: 0,
+            working_dir: std::path::Path::new("."),
+            turn_made_writes: true,
         }
     }
 
@@ -148,7 +167,22 @@ mod tests {
 
     #[test]
     fn default_mode_resolves_to_stop() {
-        let policy = ContinuationMode::default().policy();
+        let policy = ContinuationMode::default().policy(std::path::Path::new("."));
         assert!(!policy.decide(&ctx()).is_continue());
+    }
+    #[test]
+    fn verify_mode_resolves_to_verify_policy() {
+        let cfg = clawde_core::config::VerifyConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let policy = ContinuationMode::Verify(cfg).policy(std::path::Path::new("."));
+        // A disabled verify config stops silently, even on a writing turn.
+        let decision = policy.decide(&ctx());
+        assert!(!decision.is_continue());
+        match decision {
+            ContinuationDecision::Stop { note } => assert!(note.is_none()),
+            _ => unreachable!(),
+        }
     }
 }

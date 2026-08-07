@@ -101,7 +101,8 @@ pub use config::{
     set_ollama_network_blocked, spawn_ollama_unload, strip_jsonc_comments, substitute_env_vars,
     AcpServerConfig, AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaMode,
-    OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
+    OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, VerifyConfig,
+    VerifySandbox,
 };
 pub use error::{ClaudeError, Result};
 pub use import_config::{
@@ -1371,6 +1372,9 @@ pub mod config {
             skip_serializing_if = "Option::is_none"
         )]
         pub mouse_capture: Option<bool>,
+        /// Execute-and-verify loop configuration (audit spec Phase 1).
+        #[serde(default)]
+        pub verify: VerifyConfig,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1457,6 +1461,99 @@ pub mod config {
         /// Git repository URLs to fetch skills from (cloned once, then cached).
         #[serde(default)]
         pub urls: Vec<String>,
+    }
+
+    // ---- VerifyConfig ----------------------------------------------------
+
+    /// Sandbox mode for the execute-and-verify loop (audit spec Phase 1).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum VerifySandbox {
+        /// Run tests/lints directly in the project directory. Fastest, but has
+        /// side effects (build artifacts, network access for deps).
+        #[default]
+        Direct,
+        /// Create a temporary git worktree and verify there. Clean isolation,
+        /// no side effects on the working tree. Not implemented yet.
+        Worktree,
+        /// Verify inside a container (Docker/podman). Maximum isolation.
+        /// Not implemented yet.
+        Container,
+    }
+
+    impl VerifySandbox {
+        /// Human-readable label for status messages.
+        pub fn label(self) -> &'static str {
+            match self {
+                VerifySandbox::Direct => "direct",
+                VerifySandbox::Worktree => "git worktree",
+                VerifySandbox::Container => "container",
+            }
+        }
+
+        /// Whether this sandbox mode is implemented. Non-`Direct` modes fall
+        /// back to a clear "not implemented" notice instead of silently
+        /// skipping verification or running un-sandboxed.
+        pub fn is_implemented(self) -> bool {
+            matches!(self, VerifySandbox::Direct)
+        }
+    }
+
+    /// Configuration for the execute-and-verify loop (audit spec Phase 1):
+    /// after a turn that wrote files, the query loop automatically runs the
+    /// project's test suite and linter, feeds failures back to the model for
+    /// auto-fix, and repeats up to `max_retries` before surfacing the result.
+    ///
+    /// Mirrors the spec's `settings.json` schema (field names are the JSON
+    /// keys — snake_case, matching the docs):
+    /// ```json
+    /// { "verify": { "enabled": true, "max_retries": 3, "sandbox": "direct",
+    ///               "auto_lint": true, "auto_test": true, "timeout_secs": 180 } }
+    /// ```
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct VerifyConfig {
+        /// Enable the verify loop. Defaults to `true` (zero-config sensible
+        /// default per the audit spec); disable with `"verify": {"enabled": false}`.
+        pub enabled: bool,
+        /// Maximum auto-fix attempts before failures are surfaced to the user.
+        pub max_retries: u32,
+        /// Sandbox mode for verification. Only `direct` is implemented today.
+        pub sandbox: VerifySandbox,
+        /// Run the linter/typechecker during verification.
+        pub auto_lint: bool,
+        /// Run the test suite during verification.
+        pub auto_test: bool,
+        /// Skip verification when the turn wrote no files (pure read/search
+        /// turns have nothing to verify).
+        pub skip_when_no_writes: bool,
+        /// Per-command timeout in seconds. A command exceeding this is killed
+        /// and reported as a failure (a hung test suite must not stall the
+        /// loop forever).
+        pub timeout_secs: u64,
+    }
+
+    impl Default for VerifyConfig {
+        /// Zero-config sensible defaults: verification on, 3 auto-fix attempts,
+        /// direct sandbox, tests + lints, read-only turns skipped, 180s
+        /// per-command timeout.
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                max_retries: 3,
+                sandbox: VerifySandbox::Direct,
+                auto_lint: true,
+                auto_test: true,
+                skip_when_no_writes: true,
+                timeout_secs: 180,
+            }
+        }
+    }
+
+    impl VerifyConfig {
+        /// Whether any verification step is enabled at all.
+        pub fn has_any_check(&self) -> bool {
+            self.enabled && (self.auto_test || self.auto_lint)
+        }
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2469,6 +2566,9 @@ pub mod config {
                     .config
                     .request_timeout_secs
                     .or(base.config.request_timeout_secs),
+                // Override wins for this scalar struct (project settings take
+                // precedence over global).
+                verify: over.config.verify,
             };
             Self {
                 config: merged_config,

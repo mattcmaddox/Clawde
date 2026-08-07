@@ -105,6 +105,44 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | `custom_system_prompt` | string \| null | null | Replace the default Clawde system prompt entirely with this text. |
 | `append_system_prompt` | string \| null | null | Append this text to the end of the assembled system prompt (after AGENTS.md content). |
 
+### Verify loop (execute-and-verify)
+
+After a turn that wrote or edited files, Clawde automatically runs the
+project's test suite and linter (detected from the project structure — cargo
+test/clippy for Rust, pytest/ruff for Python, npm test/eslint for JS/TS, …),
+feeds any failures back to the model for auto-fix, and repeats up to
+`max_retries` times before surfacing the result. This happens inside the query
+loop via the `Verify` continuation mode; disable it entirely with
+`"enabled": false`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `verify.enabled` | boolean | true | Enable the execute-and-verify loop. Set `false` to return to the plain stop-after-one-turn behaviour. |
+| `verify.max_retries` | integer | 3 | Maximum auto-fix attempts before failures are surfaced to you. |
+| `verify.sandbox` | string | `direct` | Where verification runs. Only `direct` is implemented today; `worktree` and `container` are planned and currently report a clear "not implemented" notice instead of silently skipping. |
+| `verify.auto_test` | boolean | true | Run the detected test suite during verification. |
+| `verify.auto_lint` | boolean | true | Run the detected linter/typechecker during verification. |
+| `verify.skip_when_no_writes` | boolean | true | Skip verification on turns that only read/searched and wrote no files. |
+| `verify.timeout_secs` | integer | 180 | Per-command timeout in seconds. A hung command is killed and reported as a failure. |
+
+Example:
+
+```json
+{
+  "config": {
+    "verify": {
+      "enabled": true,
+      "max_retries": 3,
+      "sandbox": "direct",
+      "auto_lint": true,
+      "auto_test": true,
+      "skip_when_no_writes": true,
+      "timeout_secs": 180
+    }
+  }
+}
+```
+
 ### Tool access
 
 | Key | Type | Default | Description |

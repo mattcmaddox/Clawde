@@ -44,7 +44,7 @@ fn default_timeout() -> u64 {
 /// `sh -c 'exit 0'`) and backslash escapes. Not a full POSIX parser —
 /// env-var expansion, globs, and nested substitutions are passed through
 /// verbatim as arguments, which is fine for detected test/lint commands.
-pub(crate) fn split_command(command: &str) -> Vec<String> {
+pub fn split_command(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
@@ -277,7 +277,7 @@ impl Tool for RunTestsTool {
 ///
 /// Slices on UTF-8 char boundaries so multi-byte output (CJK, emoji, unicode
 /// test names) never panics on a byte-index-outside-char-boundary.
-pub(crate) fn truncate_output(output: &str) -> String {
+pub fn truncate_output(output: &str) -> String {
     const MAX_LEN: usize = 60_000;
     if output.len() <= MAX_LEN {
         return output.to_string();

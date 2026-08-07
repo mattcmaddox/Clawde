@@ -27,6 +27,7 @@ pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
+pub mod verify;
 
 mod runner;
 pub use agent_tool::{init_team_swarm_runner, AgentTool};
@@ -56,6 +57,7 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
+pub use verify::{CheckResult, VerifyPolicy};
 
 use clawde_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, LlmProvider,
@@ -341,6 +343,19 @@ fn effective_effort_for_turn(
     config_effort
 }
 
+/// Whether a tool name writes files — drives the verify loop's
+/// `skip_when_no_writes` gating (audit spec Phase 1).
+fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        clawde_core::constants::TOOL_NAME_FILE_EDIT
+            | clawde_core::constants::TOOL_NAME_FILE_WRITE
+            | clawde_core::constants::TOOL_NAME_BATCH_EDIT
+            | clawde_core::constants::TOOL_NAME_NOTEBOOK_EDIT
+            | clawde_core::constants::TOOL_NAME_APPLY_PATCH
+    )
+}
+
 /// Resolve the effective output-style persona for a turn.
 ///
 /// Personas (`rocky` / `caveman` / `normal`) mirror the ultracode keyword: an
@@ -410,6 +425,10 @@ pub async fn run_query_loop(
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    // Execute-and-verify (audit spec Phase 1): tracks whether the run has
+    // executed a file-writing tool, so the verify continuation policy can skip
+    // pure read/search turns.
+    let mut wrote_files = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -446,8 +465,9 @@ pub async fn run_query_loop(
     // In-loop continuation policy (issue #230 / MI-3). Consulted at the end of
     // every turn that finishes with `end_turn`. The default policy stops after
     // one turn; the goal policy keeps the loop running while an active goal's
-    // guards allow. Built once per run.
-    let continuation_policy = config.continuation.policy();
+    // guards allow; the verify policy runs the project's tests/lints after
+    // writing turns. Built once per run.
+    let continuation_policy = config.continuation.policy(&tool_ctx.working_dir);
     // Wall-clock start of the current "continuation turn" (a span from a user /
     // continuation message to the next `end_turn`). Reset on each accepted
     // continuation so goal time/turn accounting matches the old per-dispatch
@@ -569,14 +589,24 @@ pub async fn run_query_loop(
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
                     turn_elapsed_secs: goal_turn_start.elapsed().as_secs(),
+                    working_dir: &tool_ctx.working_dir,
+                    turn_made_writes: wrote_files,
                 });
                 match decision {
                     crate::continuation::ContinuationDecision::Continue { message } => {
                         if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::Status(
-                                "Goal: continuing autonomously… (use /goal pause to stop)"
-                                    .to_string(),
-                            ));
+                            // Keep the goal wording for goal turns; verify
+                            // continuations get their own status line.
+                            let status = if matches!(
+                                config.continuation,
+                                crate::continuation::ContinuationMode::Goal
+                            ) {
+                                "Goal: continuing autonomously… (use /goal pause to stop)".to_string()
+                            } else {
+                                "Verifying changes — continuing autonomously… (press Esc to stop)"
+                                    .to_string()
+                            };
+                            let _ = tx.send(QueryEvent::Status(status));
                         }
                         messages.push(Message::user(message));
                         // Fresh per-continuation-turn budget, mirroring the old
@@ -1391,6 +1421,7 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
+                            wrote_files |= is_write_tool(&tool_name);
                             let result = if malformed_tool_calls.contains(&tool_id) {
                                 // Never execute a tool whose arguments could not
                                 // be parsed — return an error the model can see
@@ -2055,6 +2086,7 @@ pub async fn run_query_loop(
                                     input_json: input.to_string(),
                                 });
                             }
+                            wrote_files |= is_write_tool(&name);
 
                             let hooks = &tool_ctx.config.hooks;
                             let hook_ctx = clawde_core::hooks::HookContext {
