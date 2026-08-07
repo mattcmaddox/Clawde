@@ -1787,6 +1787,28 @@ mod tests {
     }
 
     #[test]
+    fn mcp_approval_jk_navigation_requires_vim_mode() {
+        // Without vim mode, j/k are not navigation — selection is unchanged.
+        let mut state = McpApprovalDialogState::new();
+        state.show("s", None, None, vec![]);
+        assert_eq!(state.selected, McpApprovalChoice::AllowSession);
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('j')), false);
+        assert_eq!(r, None);
+        assert_eq!(state.selected, McpApprovalChoice::AllowSession);
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('k')), false);
+        assert_eq!(r, None);
+        assert_eq!(state.selected, McpApprovalChoice::AllowSession);
+
+        // With vim mode on, j moves to the next choice, k to the previous.
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('j')), true);
+        assert_eq!(r, None);
+        assert_eq!(state.selected, McpApprovalChoice::AllowAlways);
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('k')), true);
+        assert_eq!(r, None);
+        assert_eq!(state.selected, McpApprovalChoice::AllowSession);
+    }
+
+    #[test]
     fn mcp_approval_tool_list_capped_at_five_in_display() {
         let tools: Vec<String> = (0..10).map(|i| format!("tool_{}", i)).collect();
         let mut state = McpApprovalDialogState::new();

@@ -1360,6 +1360,69 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_dialog_jk_navigation_requires_vim_mode() {
+        let mut app = make_app();
+        let items = app.connect_dialog.items.len();
+        assert!(
+            items > 1,
+            "connect dialog needs at least 2 items to navigate"
+        );
+
+        // Without vim, j/k are ordinary characters: they type into the
+        // filter instead of navigating (they would previously navigate
+        // unconditionally). Selection must not move.
+        app.connect_dialog.open();
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.connect_dialog.filter, "j");
+        assert_eq!(app.connect_dialog.selected_index, 0);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.connect_dialog.filter, "jk");
+        assert_eq!(app.connect_dialog.selected_index, 0);
+
+        // With vim mode on, j/k navigate. Re-open to reset the filter so the
+        // list is fully populated.
+        app.prompt_input.vim_enabled = true;
+        app.connect_dialog.open();
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.connect_dialog.selected_index, 1);
+        assert_eq!(app.connect_dialog.filter, "", "j navigated, did not type");
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.connect_dialog.selected_index, 0);
+    }
+
+    #[test]
+    fn test_tasks_overlay_jk_navigation_requires_vim_mode() {
+        let mut app = make_app();
+        app.tasks_overlay.toggle();
+        app.tasks_overlay.tasks = vec![
+            tasks_overlay::TaskDisplay {
+                id: "t1".to_string(),
+                subject: "First".to_string(),
+                status: clawde_tools::TaskStatus::Pending,
+            },
+            tasks_overlay::TaskDisplay {
+                id: "t2".to_string(),
+                subject: "Second".to_string(),
+                status: clawde_tools::TaskStatus::Pending,
+            },
+        ];
+
+        // Without vim, j/k are no-ops here (this overlay has no filter bar,
+        // so there is nothing for them to type into) — selection stays put.
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.tasks_overlay.selected_idx, 0);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.tasks_overlay.selected_idx, 0);
+
+        // With vim on, j/k navigate.
+        app.prompt_input.vim_enabled = true;
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.tasks_overlay.selected_idx, 1);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.tasks_overlay.selected_idx, 0);
+    }
+
+    #[test]
     fn test_vim_popup_backspace_ignored_in_normal_mode() {
         let mut app = make_app();
         app.prompt_input.vim_enabled = true;

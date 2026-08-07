@@ -281,6 +281,22 @@ In vim mode the input field has three modes:
 
 When vim mode is active, a mode indicator (`NORMAL`, `INSERT`, `VISUAL`) is displayed in the status line.
 
+### Vim Navigation in Dialogs and Overlays
+
+When vim mode is enabled, list-based dialogs and overlays (connect, model picker, tasks, help, history search, session browser, mcp view, command palette, and others) accept `j`/`k` (and `h`/`l` for horizontal pickers like effort) as navigation, in addition to the arrow keys. The `j`/`k`/`h`/`l` navigation is **only active when vim mode is on**:
+
+| Vim mode | `j` / `k` in a list dialog |
+|----------|---------------------------|
+| Off | Types into the search/filter bar (legacy type-to-filter behavior) |
+| On | Moves selection up/down (arrow keys keep working in both modes) |
+
+This matches the modal search-bar convention: in vim mode, letters do not type into a popup's filter until you press `i` to enter insert mode. In normal mode, `j`/`k` navigate and `Esc` exits insert first (a second `Esc` closes the popup). Text-entry dialogs (key input, custom provider, free-mode fields) open in insert mode so typing works immediately.
+
+A few dialogs have extra guards:
+
+- **Free-mode dialog:** `j`/`k`/`h`/`l` only navigate when the active field has no pending typed text, so you can't lose a partially typed key by moving rows.
+- **Ask-user dialog:** `j`/`k` navigate only when not typing a custom answer.
+
 ---
 
 ## Special Input Behaviors
