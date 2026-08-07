@@ -69,6 +69,21 @@ pub const ACTION_ACCEPT: usize = 0;
 pub const ACTION_EDIT: usize = 1;
 pub const ACTION_REJECT: usize = 2;
 
+/// A single changed line in the "Changes since your last review" section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// Line present in the previously reviewed spec, now removed.
+    Removed,
+    /// Line added since the last review.
+    Added,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeLine {
+    pub kind: ChangeKind,
+    pub text: String,
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -95,6 +110,13 @@ pub struct SpecReviewState {
     pub available: Vec<PathBuf>,
     /// Highlighted index into `available` (picker mode).
     pub picked: usize,
+    /// Diff of the current spec against the last version reviewed in this
+    /// session (externally edited specs), or `None` when there is nothing to
+    /// compare or nothing changed.
+    pub changes: Option<Vec<ChangeLine>>,
+    /// Path → raw JSON content of the last reviewed version, so a re-opened
+    /// (typically externally edited) spec can show what changed.
+    last_reviewed: std::collections::HashMap<PathBuf, String>,
 }
 
 impl Default for SpecReviewState {
@@ -109,6 +131,8 @@ impl Default for SpecReviewState {
             picking: false,
             available: Vec::new(),
             picked: 0,
+            changes: None,
+            last_reviewed: std::collections::HashMap::new(),
         }
     }
 }
@@ -124,6 +148,14 @@ impl SpecReviewState {
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
         let spec = Spec::parse_json(&raw)?;
+        // Diff against the version last reviewed in this session so an
+        // externally edited spec shows exactly what changed since then.
+        self.changes = match self.last_reviewed.get(&path) {
+            Some(prev) if *prev != raw => Some(build_changes(prev, &raw)),
+            _ => None,
+        };
+        // Snapshot this open as the new baseline for the next review.
+        self.last_reviewed.insert(path.clone(), raw);
         self.spec = Some(spec);
         self.path = Some(path);
         self.selected_action = ACTION_ACCEPT;
@@ -253,11 +285,48 @@ impl SpecReviewState {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// Build a compact line diff between the previously reviewed spec JSON and
+/// the current file, so an externally edited spec shows exactly what changed.
+fn build_changes(prev: &str, cur: &str) -> Vec<ChangeLine> {
+    use similar::{ChangeTag, TextDiff};
+    const MAX_CHANGES: usize = 40;
+    let mut all: Vec<ChangeLine> = Vec::new();
+    for change in TextDiff::from_lines(prev, cur).iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => all.push(ChangeLine {
+                kind: ChangeKind::Removed,
+                text: change.value().trim_end().to_string(),
+            }),
+            ChangeTag::Insert => all.push(ChangeLine {
+                kind: ChangeKind::Added,
+                text: change.value().trim_end().to_string(),
+            }),
+            ChangeTag::Equal => {}
+        }
+    }
+    if all.len() > MAX_CHANGES {
+        let more = all.len() - MAX_CHANGES;
+        all.truncate(MAX_CHANGES);
+        all.push(ChangeLine {
+            kind: ChangeKind::Added,
+            text: format!(
+                "\u{2026} {more} more changed lines — see the JSON file for the full picture"
+            ),
+        });
+    }
+    all
+}
+
 /// Number of content lines a spec renders to (scroll bounds).
 ///
 /// Public so app.rs can bound `scroll_down` without building the styled lines.
-pub fn spec_content_line_count(spec: &Spec) -> usize {
+pub fn spec_content_line_count(spec: &Spec, changes: Option<&[ChangeLine]>) -> usize {
     let mut count = 2; // title + blank
+    if let Some(changes) = changes {
+        if !changes.is_empty() {
+            count += 2 + changes.len(); // header + blank + rows
+        }
+    }
     if !spec.requirements.is_empty() {
         count += 2 + spec.requirements.len(); // header + blank + rows
     }
@@ -283,7 +352,7 @@ pub fn spec_content_line_count(spec: &Spec) -> usize {
 }
 
 /// Build the scrollable content lines for the spec (title + sections).
-fn content_lines(spec: &Spec) -> Vec<Line<'static>> {
+fn content_lines(spec: &Spec, changes: Option<&[ChangeLine]>) -> Vec<Line<'static>> {
     use clawde_core::spec::AcceptanceTest;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -293,6 +362,29 @@ fn content_lines(spec: &Spec) -> Vec<Line<'static>> {
         title_style,
     )]));
     lines.push(Line::from(""));
+
+    // Changes since the last review (externally edited spec) — shown first
+    // so the user sees exactly what changed before re-deciding.
+    if let Some(changes) = changes {
+        if !changes.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "## Changes since your last review",
+                Style::default().fg(HEADER).add_modifier(Modifier::BOLD),
+            )));
+            for c in changes {
+                let (marker, color) = match c.kind {
+                    ChangeKind::Added => ("+", TAG_NEW),
+                    ChangeKind::Removed => ("-", TAG_DEL),
+                };
+                let style = Style::default().fg(color);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(c.text.clone(), style),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+    }
 
     if !spec.requirements.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -531,7 +623,7 @@ pub fn render_spec_review(
         return;
     }
 
-    let lines = content_lines(spec);
+    let lines = content_lines(spec, state.changes.as_deref());
     let visible_rows = inner.height as usize;
     let scroll = state.scroll.min(lines.len().saturating_sub(visible_rows));
     let paragraph = Paragraph::new(lines)
@@ -772,5 +864,67 @@ mod tests {
             dialog.scroll_down(50, 20);
         }
         assert_eq!(dialog.scroll, 30); // 50 - 20
+    }
+
+    #[test]
+    fn reopen_edited_spec_shows_changes_since_last_review() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-chg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        sample_spec().write_to(&path).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open(path.clone()).unwrap();
+        assert!(dialog.changes.is_none(), "first review has no baseline");
+
+        // Externally edit the spec: change a requirement and add an edge case.
+        let mut edited = sample_spec();
+        edited.requirements = vec!["Per-IP rate limiting with sliding window".to_string()];
+        edited
+            .edge_cases
+            .push("Loopback traffic ignored".to_string());
+        edited.write_to(&path).unwrap();
+
+        dialog.open(path.clone()).unwrap();
+        let changes = dialog.changes.expect("changes present after edit");
+        assert!(changes
+            .iter()
+            .any(|c| { c.kind == ChangeKind::Added && c.text.contains("sliding window") }));
+        // The removed requirement line and the added edge case both surface.
+        assert!(changes
+            .iter()
+            .any(|c| { c.kind == ChangeKind::Removed && c.text.contains("Per-IP rate limiting") }));
+        assert!(changes
+            .iter()
+            .any(|c| c.kind == ChangeKind::Added && c.text.contains("Loopback traffic ignored")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_unchanged_spec_has_no_changes() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-nochg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        sample_spec().write_to(&path).unwrap();
+        let mut dialog = SpecReviewState::new();
+        dialog.open(path.clone()).unwrap();
+        dialog.open(path).unwrap();
+        assert!(dialog.changes.is_none(), "identical content means no diff");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_changes_caps_large_diffs() {
+        // 200 completely different lines → far more than the cap.
+        let prev = (0..100)
+            .map(|i| format!("old line {i}\n"))
+            .collect::<String>();
+        let cur = (0..100)
+            .map(|i| format!("new line {i}\n"))
+            .collect::<String>();
+        let changes = build_changes(&prev, &cur);
+        // MAX_CHANGES rows + the ellipsis marker.
+        assert!(changes.len() <= 41, "len: {}", changes.len());
+        assert!(changes.last().unwrap().text.contains("more changed lines"));
     }
 }

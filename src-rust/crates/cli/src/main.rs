@@ -3131,6 +3131,22 @@ async fn run_interactive(
                                         app.push_message(clawde_core::types::Message::assistant(
                                             msg,
                                         ));
+                                    } // /spec success: the spec was just written to
+                                      // specs/<title>.json — present it for review
+                                      // (audit spec §10.2) instead of relying on the
+                                      // user remembering /spec-review. Single spec
+                                      // opens directly; several enter the picker with
+                                      // the newest (the one just written) highlighted.
+                                      // The `/spec list` subcommand also returns a
+                                      // Message but must never pop a modal.
+                                    if cmd_name.as_str() == "spec" && cmd_args.trim() != "list" {
+                                        let dir = clawde_core::git_utils::get_repo_root(
+                                            &cmd_ctx.working_dir,
+                                        )
+                                        .unwrap_or_else(|| cmd_ctx.working_dir.clone());
+                                        if let Err(e) = app.spec_review.open_latest(&dir) {
+                                            app.status_message = Some(format!("Spec review: {e}"));
+                                        }
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {

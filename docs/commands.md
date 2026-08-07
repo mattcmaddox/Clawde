@@ -636,9 +636,14 @@ Generate a structured specification for a non-trivial task *before* writing code
 
 ```
 /spec add a rate-limiting middleware to the API server
+/spec list
 ```
 
+When the spec is written, the TUI automatically opens the review dialog (Accept / Edit Spec / Reject) for it — no need to remember `/spec-review`.
+
 The acceptance tests in the spec become the verification criteria when the task is later implemented (see the Verify loop).
+
+`/spec list` prints every spec in `specs/` (newest first) with its title, path, and last-modified time — the headless counterpart to the `/spec-review` picker.
 
 ---
 
@@ -667,7 +672,9 @@ Open the Spec-Driven Development review dialog for a generated spec (audit spec 
 
 Navigation: `↑/↓` or `j/k` scroll the content, `←/→` or `h/l` move between the Accept / Edit Spec / Reject actions, `Enter` activates the selected action, `Esc` closes.
 
-With several specs in `specs/`, a bare `/spec-review` opens a picker (newest first): `↑/↓` or `j/k` highlights a spec, `Enter` opens it, `Esc` closes. In spec mode the dialog also opens automatically after a turn that generated a spec.
+With several specs in `specs/`, a bare `/spec-review` opens a picker (newest first): `↑/↓` or `j/k` highlights a spec, `Enter` opens it, `Esc` closes. In spec mode the dialog also opens automatically after a turn that generated a spec — and after a plain `/spec` that writes one.
+
+If you edit a spec's JSON externally (e.g. via Edit Spec) and re-open it, a **Changes since your last review** section at the top shows exactly which lines changed (green `+` / red `-`), so you can verify your edits before Accepting.
 
 ---
 

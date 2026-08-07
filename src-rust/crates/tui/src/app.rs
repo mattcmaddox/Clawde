@@ -3039,6 +3039,10 @@ impl App {
                     .as_ref()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                // Specs are written to the repository root's specs/ dir —
+                // resolve the project root (matches /spec's write path) so
+                // running from a subdirectory still finds them.
+                let dir = clawde_core::git_utils::get_repo_root(&dir).unwrap_or(dir);
                 self.spec_review.open_latest(&dir)
             } else {
                 self.spec_review.open(std::path::PathBuf::from(arg))
@@ -4937,7 +4941,12 @@ impl App {
                         .spec_review
                         .spec
                         .as_ref()
-                        .map(crate::spec_review::spec_content_line_count)
+                        .map(|spec| {
+                            crate::spec_review::spec_content_line_count(
+                                spec,
+                                self.spec_review.changes.as_deref(),
+                            )
+                        })
                         .unwrap_or(0);
                     self.spec_review.scroll_down(content_lines, 16);
                 }
@@ -4946,7 +4955,12 @@ impl App {
                         .spec_review
                         .spec
                         .as_ref()
-                        .map(crate::spec_review::spec_content_line_count)
+                        .map(|spec| {
+                            crate::spec_review::spec_content_line_count(
+                                spec,
+                                self.spec_review.changes.as_deref(),
+                            )
+                        })
                         .unwrap_or(0);
                     self.spec_review.scroll_down(content_lines, 16);
                 }

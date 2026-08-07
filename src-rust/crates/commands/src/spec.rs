@@ -26,20 +26,24 @@ impl SlashCommand for SpecCommand {
         "Generate a structured specification for a task before writing code"
     }
     fn help(&self) -> &str {
-        "Usage: /spec <task description>\n\n\
+        "Usage: /spec <task description> | /spec list\n\n\
          Analyzes the repository (tracked files + current diff), asks the LLM\n\
          for a structured spec, and writes it to specs/<title>.json. The spec\n\
          contains requirements, a file plan, data models, acceptance tests,\n\
          and edge cases.\n\n\
-         Example:\n\
-           /spec Add a rate-limiting middleware to the API server"
+         /spec list prints every spec in specs/ (newest first) with its title\n\
+         and last-modified time — the headless counterpart to the TUI's\n\
+         /spec-review picker.\n\n\
+         Examples:\n\
+           /spec Add a rate-limiting middleware to the API server\n\
+           /spec list"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let task = args.trim();
         if task.is_empty() {
             return CommandResult::Message(
-                "Usage: /spec <task description>\n\
+                "Usage: /spec <task description> | /spec list\n\
                  e.g. /spec add a rate-limiting middleware to the API server"
                     .to_string(),
             );
@@ -50,6 +54,40 @@ impl SlashCommand for SpecCommand {
         // ------------------------------------------------------------------
         let repo_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
             .unwrap_or_else(|| ctx.working_dir.clone());
+
+        // /spec list: enumerate every parseable spec, newest first — the
+        // headless counterpart to the /spec-review picker.
+        if task == "list" {
+            let specs = clawde_core::spec::Spec::list_specs(&repo_root);
+            if specs.is_empty() {
+                return CommandResult::Message(
+                    "No specs found — run /spec <task> to generate one first.".to_string(),
+                );
+            }
+            let mut out = String::from("# Specs\n");
+            for (i, path) in specs.iter().enumerate() {
+                let title = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|raw| clawde_core::spec::Spec::parse_json(&raw).ok())
+                    .map(|s| s.title)
+                    .unwrap_or_else(|| path.display().to_string());
+                let modified = std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|t| format_modified(&t));
+                let modified = modified.unwrap_or_else(|| "?".to_string());
+                out.push_str(&format!(
+                    "{}. {} — {} ({modified})\n",
+                    i + 1,
+                    title,
+                    path.display()
+                ));
+            }
+            out.push_str(
+                "\nReview a spec with /spec-review <path> (or the picker with /spec-review).",
+            );
+            return CommandResult::Message(out);
+        }
 
         let file_tree = tracked_files(&repo_root);
 
@@ -305,6 +343,12 @@ fn slugify(title: &str) -> String {
 }
 
 /// Render the spec as a markdown message for the TUI / REPL.
+/// Format a file modification time as a compact local date-time.
+fn format_modified(t: &std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = (*t).into();
+    dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
 fn format_spec_message(spec: &clawde_core::spec::Spec, path: &std::path::Path) -> String {
     use clawde_core::spec::FileAction;
 
@@ -378,6 +422,58 @@ mod tests {
             provider_registry: None,
             test_provider: None,
         }
+    }
+
+    #[test]
+    fn spec_list_lists_specs_newest_first() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-list-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let old = clawde_core::spec::Spec {
+            title: "Old Spec".to_string(),
+            ..Default::default()
+        };
+        old.write_to(&dir.join("specs/old.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let fresh = clawde_core::spec::Spec {
+            title: "Fresh Spec".to_string(),
+            ..Default::default()
+        };
+        fresh.write_to(&dir.join("specs/fresh.json")).unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.working_dir = dir.clone();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(SpecCommand.execute("list", &mut ctx));
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Old Spec"), "msg: {msg}");
+                assert!(msg.contains("Fresh Spec"), "msg: {msg}");
+                // Newest (by mtime) is listed first.
+                let fresh_at = msg.find("Fresh Spec").expect("fresh listed");
+                let old_at = msg.find("Old Spec").expect("old listed");
+                assert!(fresh_at < old_at, "newest spec must sort first");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_list_reports_none_without_specs() {
+        let dir =
+            std::env::temp_dir().join(format!("clawde-spec-list-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ctx = make_ctx();
+        ctx.working_dir = dir.clone();
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(SpecCommand.execute("list", &mut ctx));
+        match result {
+            CommandResult::Message(msg) => assert!(msg.contains("No specs found")),
+            other => panic!("expected Message, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A deterministic provider returning a fixed spec JSON.
