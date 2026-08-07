@@ -122,6 +122,7 @@ pub use types::{
 /// for `pub` items).
 pub mod dead_code_guard;
 pub mod skill_discovery;
+pub mod spec;
 pub use cost::CostTracker;
 pub use feature_flags::FeatureFlagManager;
 pub use history::ConversationSession;

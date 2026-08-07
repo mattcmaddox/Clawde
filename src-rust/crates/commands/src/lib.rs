@@ -281,6 +281,8 @@ mod accounts;
 pub use accounts::*;
 mod review;
 pub use review::*;
+mod spec;
+pub use spec::*;
 mod mcp;
 pub use mcp::*;
 mod export;
@@ -1854,6 +1856,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(NormalCommand),
         Box::new(InitCommand),
         Box::new(ReviewCommand),
+        Box::new(SpecCommand),
         Box::new(HooksCommand),
         Box::new(ImportConfigCommand),
         Box::new(McpCommand),

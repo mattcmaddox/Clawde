@@ -10,7 +10,7 @@ This document is the complete reference for every slash command available in Cla
 2. [Session & Navigation](#session--navigation)
 3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
 4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
-5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/security-review`, `/init`, `/search`
+5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/security-review`, `/init`, `/search`
 6. [Search & Files](#search--files) — `/files`, `/context`
 7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
 8. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
@@ -627,6 +627,18 @@ Initiate a code review pass over recent changes. The model examines all modified
 /review <file-path>
 /review --since HEAD~3
 ```
+
+---
+
+### /spec
+
+Generate a structured specification for a non-trivial task *before* writing code (Spec-Driven Development). The model analyzes the repository (tracked files + current diff) and produces a spec containing requirements, a file plan, data models, acceptance tests, and edge cases, saved to `specs/<title>.json` in the repository root.
+
+```
+/spec add a rate-limiting middleware to the API server
+```
+
+The acceptance tests in the spec become the verification criteria when the task is later implemented (see the Verify loop).
 
 ---
 
