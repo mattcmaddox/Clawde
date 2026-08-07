@@ -57,7 +57,7 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
-pub use verify::{CheckResult, VerifyPolicy};
+pub use verify::{CheckResult, VerifyPolicy, VerifyReport};
 
 use clawde_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, LlmProvider,
@@ -281,6 +281,11 @@ pub enum QueryEvent {
         /// Fraction of requests budget used (0.0–1.0).
         requests_pct_used: f32,
     },
+    /// Structured result of an execute-and-verify round (audit spec Phase 1).
+    /// Emitted after a writing turn when the verify continuation policy ran
+    /// the project's checks, so the TUI can render the boxed per-check
+    /// indicator instead of a plain status line.
+    Verify(crate::verify::VerifyReport),
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +597,16 @@ pub async fn run_query_loop(
                     working_dir: &tool_ctx.working_dir,
                     turn_made_writes: wrote_files,
                 });
+                // Structured verify report (audit spec Phase 1 §15.1): forward
+                // the round's per-check results to the TUI so it renders the
+                // boxed Verify indicator. Emitted for both Continue and Stop
+                // outcomes; skipped rounds (read-only turns, no checks) carry
+                // no report and emit nothing.
+                if let Some(report) = continuation_policy.verify_report() {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Verify(report));
+                    }
+                }
                 match decision {
                     crate::continuation::ContinuationDecision::Continue { message } => {
                         if let Some(ref tx) = event_tx {

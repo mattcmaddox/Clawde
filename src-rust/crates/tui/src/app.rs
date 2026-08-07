@@ -795,6 +795,9 @@ pub enum SystemMessageStyle {
     Warning,
     /// Compact / auto-compact boundary marker.
     Compact,
+    /// Execute-and-verify round indicator (audit spec Phase 1 §15.1) — a
+    /// boxed block with per-check PASS/FAIL/SKIP lines.
+    Verify,
 }
 
 /// A synthetic system annotation inserted between conversation messages.
@@ -805,6 +808,8 @@ pub struct SystemAnnotation {
     pub after_index: usize,
     pub text: String,
     pub style: SystemMessageStyle,
+    /// Structured per-check results when `style` is [`SystemMessageStyle::Verify`].
+    pub verify: Option<clawde_query::VerifyReport>,
 }
 
 /// A displayable item in the conversation pane — either a real message or
@@ -3901,6 +3906,18 @@ impl App {
             after_index: self.messages.len(),
             text,
             style,
+            verify: None,
+        });
+        self.invalidate_transcript();
+    }
+
+    /// Push the structured verify-round annotation (audit spec Phase 1 §15.1).
+    pub fn push_verify_annotation(&mut self, report: clawde_query::VerifyReport) {
+        self.system_annotations.push(SystemAnnotation {
+            after_index: self.messages.len(),
+            text: report.headline.clone(),
+            style: SystemMessageStyle::Verify,
+            verify: Some(report),
         });
         self.invalidate_transcript();
     }
@@ -9287,6 +9304,12 @@ impl App {
 
             QueryEvent::Status(msg) => {
                 self.status_message = Some(msg);
+            }
+
+            QueryEvent::Verify(report) => {
+                // Boxed per-check indicator inserted right after the assistant
+                // message that ended the writing turn.
+                self.push_verify_annotation(report);
             }
 
             QueryEvent::Error(msg) => {

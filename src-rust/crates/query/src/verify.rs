@@ -84,6 +84,22 @@ impl CheckResult {
     }
 }
 
+/// Structured outcome of one verification round, surfaced to the TUI so it
+/// can render the boxed per-check indicator (audit spec §15.1).
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    /// Per-check results in execution order (tests first, then lints).
+    pub results: Vec<CheckResult>,
+    /// Which auto-fix attempt this round was (1-based). 0 when no round ran
+    /// (verification skipped).
+    pub attempt: u32,
+    /// Configured max auto-fix attempts.
+    pub max_retries: u32,
+    /// One-line summary of the round's outcome, e.g. "All checks passed" or
+    /// "Auto-fix exhausted (3 attempts)".
+    pub headline: String,
+}
+
 /// Execute-and-verify continuation policy (audit spec Phase 1).
 ///
 /// See the module docs for the decision flow. The attempt counter is shared
@@ -93,6 +109,11 @@ pub struct VerifyPolicy {
     config: VerifyConfig,
     working_dir: PathBuf,
     attempts: AtomicU32,
+    /// The most recent round's structured report, read by the query loop to
+    /// emit `QueryEvent::Verify` for the TUI indicator. Cleared whenever a
+    /// round is skipped (preflight) so a skipped turn never re-displays an
+    /// old box.
+    last_report: std::sync::Mutex<Option<VerifyReport>>,
 }
 
 impl VerifyPolicy {
@@ -103,7 +124,24 @@ impl VerifyPolicy {
             config,
             working_dir,
             attempts: AtomicU32::new(0),
+            last_report: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Stash the round's structured report for `verify_report`.
+    fn stash_report(
+        &self,
+        results: &[CheckResult],
+        attempt: u32,
+        max_retries: u32,
+        headline: impl Into<String>,
+    ) {
+        *self.last_report.lock().unwrap() = Some(VerifyReport {
+            results: results.to_vec(),
+            attempt,
+            max_retries,
+            headline: headline.into(),
+        });
     }
 
     /// Cheap pre-flight guards that avoid spawning any commands. Returns the
@@ -136,9 +174,16 @@ impl VerifyPolicy {
         results: &[CheckResult],
     ) -> ContinuationDecision {
         if let Some(decision) = self.preflight(ctx) {
+            self.clear_report();
             return decision;
         }
         if results.is_empty() {
+            self.stash_report(
+                results,
+                0,
+                self.config.max_retries.max(1),
+                "No test or lint commands detected",
+            );
             return ContinuationDecision::Stop {
                 note: Some(
                     "No test or lint commands were detected for this project — \
@@ -157,6 +202,12 @@ impl VerifyPolicy {
                 .map(|r| format!("[{}] {}", r.label, r.output))
                 .collect::<Vec<_>>()
                 .join("\n");
+            self.stash_report(
+                results,
+                0,
+                self.config.max_retries.max(1),
+                "Verification could not run — commands missing",
+            );
             return ContinuationDecision::Stop {
                 note: Some(format!(
                     "Verification could not run — none of the detected commands could be \
@@ -183,6 +234,7 @@ impl VerifyPolicy {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            self.stash_report(results, attempt, max_retries, "All checks passed");
             return ContinuationDecision::Stop {
                 note: Some(format!("All checks passed:\n{}", summary)),
             };
@@ -212,6 +264,12 @@ impl VerifyPolicy {
         // `attempt` counts verification rounds; the first failing round is
         // auto-fix attempt 1, so up to `max_retries` fix attempts are allowed.
         if attempt <= max_retries {
+            self.stash_report(
+                results,
+                attempt,
+                max_retries,
+                format!("Auto-fix attempt {attempt}/{max_retries}"),
+            );
             return ContinuationDecision::Continue {
                 message: format!(
                     "Verify your changes before finishing — the last verification run reported \
@@ -222,21 +280,40 @@ impl VerifyPolicy {
             };
         }
 
+        self.stash_report(
+            results,
+            attempt,
+            max_retries,
+            format!("Auto-fix exhausted ({max_retries} attempts)"),
+        );
         ContinuationDecision::Stop {
             note: Some(format!(
                 "Auto-fix exhausted ({max_retries} attempts) — verification still failing:\n\n{failures_text}",
             )),
         }
     }
+
+    /// Clear any stashed report (called when a round is skipped via preflight
+    /// so a skipped turn never re-displays an old verify box).
+    fn clear_report(&self) {
+        *self.last_report.lock().unwrap() = None;
+    }
 }
 
 impl ContinuationPolicy for VerifyPolicy {
     fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision {
         if let Some(decision) = self.preflight(ctx) {
+            self.clear_report();
             return decision;
         }
         let results = run_checks(&self.config, &self.working_dir);
         self.decide_with_results(ctx, &results)
+    }
+
+    /// The structured report of the most recent verification round, if one
+    /// ran. Consulted by the query loop after `decide` returns.
+    fn verify_report(&self) -> Option<VerifyReport> {
+        self.last_report.lock().unwrap().clone()
     }
 }
 
@@ -561,6 +638,44 @@ mod tests {
             }
             _ => panic!("real failure must continue, got: {decision:?}"),
         }
+    }
+
+    #[test]
+    fn verify_report_reflects_last_round_and_clears_on_skip() {
+        let cfg = default_config();
+        let p = policy(cfg);
+
+        // Nothing ran yet.
+        assert!(p.verify_report().is_none());
+
+        // A failing round stashes a structured report (attempt 1/3).
+        let decision = p.decide_with_results(&ctx(), &[failing_check()]);
+        assert!(decision.is_continue());
+        let report = p.verify_report().expect("report after failing round");
+        assert_eq!(report.attempt, 1);
+        assert_eq!(report.max_retries, 3);
+        assert!(
+            report.headline.contains("Auto-fix attempt"),
+            "{}",
+            report.headline
+        );
+        assert_eq!(report.results.len(), 1);
+        assert!(!report.results[0].ok);
+
+        // A passing round overwrites it with the pass headline.
+        let decision = p.decide_with_results(&ctx(), &[passing_check()]);
+        assert!(!decision.is_continue());
+        let report = p.verify_report().expect("report after passing round");
+        assert_eq!(report.headline, "All checks passed");
+        assert!(report.results[0].ok);
+
+        // A preflight-skipped round (read-only turn) clears the report so a
+        // skipped turn never re-displays an old box.
+        let mut read_ctx = ctx();
+        read_ctx.turn_made_writes = false;
+        let decision = p.decide_with_results(&read_ctx, &[failing_check()]);
+        assert!(!decision.is_continue());
+        assert!(p.verify_report().is_none(), "skip must clear the report");
     }
 
     #[test]

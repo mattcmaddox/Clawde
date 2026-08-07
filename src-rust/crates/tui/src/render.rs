@@ -2257,6 +2257,104 @@ fn build_tool_names(
 
 // â”€â”€ System annotation (compact boundary, info notices) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+/// Execute-and-verify round indicator (audit spec Phase 1 §15.1): a boxed
+/// block with one line per check (✓/✗/△ + right-aligned PASS/FAIL/SKIP) and a
+/// summary headline coloured by outcome.
+fn render_verify_block(
+    lines: &mut Vec<Line<'static>>,
+    report: &clawde_query::VerifyReport,
+    width: usize,
+) {
+    let border = Style::default().fg(Color::DarkGray);
+    // Cap the box width so very wide terminals don't produce a giant rule;
+    // also leave a small left margin so the box reads as an annotation.
+    let box_w = width.saturating_sub(2).clamp(12, 96);
+    let area = box_w.saturating_sub(6); // content between "│ " and " │"
+
+    // ┌─ Verify ──────...──┐
+    let title = " Verify ";
+    let title_fill = box_w.saturating_sub(5 + title.chars().count());
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("┌─{}{}┐", title, "─".repeat(title_fill)), border),
+    ]));
+
+    // One row per check: ✓/✗/△ + label + right-aligned status.
+    for r in &report.results {
+        let (icon, status, color) = if r.skipped {
+            ("△", "SKIP", Color::Yellow)
+        } else if r.ok {
+            ("✓", "PASS", Color::Green)
+        } else if r.timed_out {
+            ("✗", "TIMEOUT", Color::Red)
+        } else {
+            ("✗", "FAIL", Color::Red)
+        };
+        let status_disp = format!(" {status}");
+        let label_max = area.saturating_sub(2 + status_disp.chars().count() + 1);
+        let label = truncate_end(&r.label, label_max.max(4));
+        let content = format!("{icon} {label}");
+        let pad = area.saturating_sub(content.chars().count() + status_disp.chars().count());
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("│ ", border),
+            Span::styled(content, Style::default().fg(color)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                status_disp,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │", border),
+        ]));
+    }
+
+    // Summary headline row: the policy's headline text, coloured by outcome.
+    let headline = report.headline.clone();
+    let hcolor = verify_headline_color(report);
+    let pad = area.saturating_sub(headline.chars().count());
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("│ ", border),
+        Span::styled(
+            headline,
+            Style::default().fg(hcolor).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(" │", border),
+    ]));
+
+    // └─────...──┘
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("└{}┘", "─".repeat(box_w.saturating_sub(4))), border),
+    ]));
+}
+
+/// Summary colour for a verify round's headline.
+///
+/// The headline TEXT comes from [`VerifyPolicy`](clawde_query::VerifyPolicy) —
+/// the single source of truth for what happened ("All checks passed",
+/// "Auto-fix attempt 1/3", "Verification could not run — commands missing",
+/// ...). Only the colour is derived here, from the per-check results.
+fn verify_headline_color(report: &clawde_query::VerifyReport) -> Color {
+    let any_failure = report.results.iter().any(|r| !r.ok && !r.skipped);
+    let all_skipped = !report.results.is_empty() && report.results.iter().all(|r| r.skipped);
+    if report.results.is_empty() {
+        Color::DarkGray
+    } else if any_failure && report.attempt > report.max_retries {
+        // Auto-fix retries exhausted — still failing.
+        Color::Red
+    } else if any_failure {
+        // Mid-loop auto-fix round — fixing.
+        Color::Yellow
+    } else if all_skipped {
+        // Every command failed to start — an environment gap, not a pass.
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
 fn render_system_annotation_lines(
     lines: &mut Vec<Line<'static>>,
     ann: &SystemAnnotation,
@@ -2280,10 +2378,24 @@ fn render_system_annotation_lines(
         return;
     }
 
+    // Execute-and-verify round indicator (audit spec Phase 1 §15.1): a boxed
+    // block with one line per check plus a summary headline.
+    if ann.style == SystemMessageStyle::Verify {
+        if let Some(report) = &ann.verify {
+            render_verify_block(lines, report, width);
+            lines.push(Line::from(""));
+            return;
+        }
+        // No structured data (shouldn't happen) — fall through to the plain rule.
+    }
+
     let (text_color, border_color) = match ann.style {
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        // Defensive: a Verify annotation without structured data degrades to
+        // the plain centered rule (push_verify_annotation always sets it).
+        SystemMessageStyle::Verify => (Color::DarkGray, Color::DarkGray),
     };
 
     // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"
@@ -4876,6 +4988,58 @@ mod stream_cache_tests {
         let text = joined_text(&completed);
         assert!(text.contains("a1 committed"));
         assert!(text.contains("live answer body"));
+    }
+
+    #[test]
+    fn verify_annotation_renders_boxed_check_block() {
+        let mut app = test_app();
+        app.messages.push(Message::user("add tests"));
+        app.messages.push(Message::assistant("done writing tests"));
+
+        // Mixed round: one passing check, one failing check.
+        let report = clawde_query::VerifyReport {
+            results: vec![
+                clawde_query::CheckResult {
+                    label: "test: cargo test --workspace".to_string(),
+                    ok: false,
+                    output: "1 test failed".to_string(),
+                    timed_out: false,
+                    skipped: false,
+                },
+                clawde_query::CheckResult {
+                    label: "lint: cargo clippy".to_string(),
+                    ok: true,
+                    output: String::new(),
+                    timed_out: false,
+                    skipped: false,
+                },
+            ],
+            attempt: 1,
+            max_retries: 3,
+            headline: "Auto-fix attempt 1/3".to_string(),
+        };
+        app.push_verify_annotation(report);
+
+        reset_render_caches();
+        let items = render_message_items(&app, WIDTH);
+        let text = joined_text(&items);
+
+        // Box chrome + per-check statuses + the attempt headline are all
+        // present in the transcript, anchored after the assistant turn.
+        assert!(text.contains("Verify"), "text: {text}");
+        assert!(text.contains("FAIL"), "text: {text}");
+        assert!(text.contains("PASS"), "text: {text}");
+        assert!(text.contains("Auto-fix attempt 1/3"), "text: {text}");
+        assert!(text.contains("cargo test --workspace"), "text: {text}");
+        assert!(text.contains("cargo clippy"), "text: {text}");
+
+        // The rendered block must appear AFTER the assistant message (not
+        // before the user prompt): the annotation is anchored at the end.
+        let verify_pos = text.find("Verify").expect("verify box present");
+        let done_pos = text
+            .find("done writing tests")
+            .expect("assistant text present");
+        assert!(verify_pos > done_pos, "verify box must follow the turn");
     }
 }
 

@@ -469,7 +469,7 @@ mod tests {
     use clawde_core::config::Config;
     use clawde_core::cost::CostTracker;
     use clawde_core::file_history::FileHistory;
-    use clawde_core::types::{ContentBlock, Role, ToolResultContent};
+    use clawde_core::types::{ContentBlock, Message, Role, ToolResultContent};
     use dialogs::PermissionRequest;
     use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
@@ -1942,6 +1942,32 @@ mod tests {
         let mut app = make_app();
         app.handle_query_event(clawde_query::QueryEvent::Status("working".to_string()));
         assert_eq!(app.status_message.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn test_handle_verify_event_pushes_annotation() {
+        let mut app = make_app();
+        app.messages.push(Message::assistant("wrote the fix"));
+        let report = clawde_query::VerifyReport {
+            results: vec![clawde_query::CheckResult {
+                label: "test: cargo test --workspace".to_string(),
+                ok: true,
+                output: String::new(),
+                timed_out: false,
+                skipped: false,
+            }],
+            attempt: 1,
+            max_retries: 3,
+            headline: "All checks passed".to_string(),
+        };
+        app.handle_query_event(clawde_query::QueryEvent::Verify(report));
+        assert_eq!(app.system_annotations.len(), 1);
+        assert_eq!(
+            app.system_annotations[0].style,
+            crate::app::SystemMessageStyle::Verify
+        );
+        assert!(app.system_annotations[0].verify.is_some());
+        assert_eq!(app.system_annotations[0].after_index, app.messages.len());
     }
 
     #[test]

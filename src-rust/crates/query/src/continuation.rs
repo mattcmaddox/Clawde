@@ -57,6 +57,15 @@ impl ContinuationDecision {
 /// an `.await` (it is fully synchronous by design).
 pub trait ContinuationPolicy: Send + Sync {
     fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision;
+
+    /// Structured report of the most recent verification round, when this
+    /// policy is the execute-and-verify policy and a round actually ran.
+    /// Default: `None` — only `VerifyPolicy` overrides this. The query loop
+    /// forwards the report as `QueryEvent::Verify` so the TUI can render the
+    /// boxed per-check indicator.
+    fn verify_report(&self) -> Option<crate::verify::VerifyReport> {
+        None
+    }
 }
 
 /// Default policy: always stop after the turn completes.
