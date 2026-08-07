@@ -1976,6 +1976,27 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_spec_for_review_opens_dialog() {
+        let mut app = make_app();
+        let dir = std::env::temp_dir().join(format!("clawde-tui-spec-ev-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/review.json");
+        std::fs::write(
+            &path,
+            r#"{"title":"Test Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+        app.handle_query_event(clawde_query::QueryEvent::SpecForReview(
+            path.display().to_string(),
+        ));
+        // The Accept/Edit/Reject dialog auto-opens on the generated spec.
+        assert!(app.spec_review.visible);
+        assert_eq!(app.spec_review.spec.as_ref().unwrap().title, "Test Spec");
+        assert!(app.status_message.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_handle_error_event() {
         let mut app = make_app();
         app.is_streaming = true;

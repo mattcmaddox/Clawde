@@ -306,6 +306,12 @@ pub enum QueryEvent {
     /// the project's checks, so the TUI can render the boxed per-check
     /// indicator instead of a plain status line.
     Verify(crate::verify::VerifyReport),
+    /// A spec was generated this turn and should be surfaced for review
+    /// (spec-driven development, audit spec §10.2). Carries the path to the
+    /// spec JSON. Emitted by the spec-mode continuation policy after a
+    /// writing turn so the TUI can open the Accept/Edit/Reject dialog
+    /// instead of only printing a status line.
+    SpecForReview(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +639,15 @@ pub async fn run_query_loop(
                 if let Some(report) = continuation_policy.verify_report() {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Verify(report));
+                    }
+                }
+                // Spec-driven development (audit spec §10.2): when the
+                // spec-mode policy decided the stop because a spec was
+                // generated, forward its path so the TUI can auto-open the
+                // Accept/Edit/Reject dialog for this very spec.
+                if let Some(path) = continuation_policy.spec_for_review() {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::SpecForReview(path.display().to_string()));
                     }
                 }
                 match decision {

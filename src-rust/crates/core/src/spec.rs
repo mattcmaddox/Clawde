@@ -82,15 +82,20 @@ impl Spec {
         std::fs::write(path, self.to_json())
     }
 
-    /// Load the most recently modified spec from `dir/specs/*.json`, if any.
+    /// List the parseable spec JSON files in `dir/specs/`, newest-first by
+    /// modification time.
     ///
-    /// Used by the spec-mode continuation policy and the verify loop to find
-    /// the spec currently under review. `None` when the `specs/` directory
-    /// does not exist, holds no `.json` files, or none of them parse. A single
-    /// unreadable or unparseable entry never aborts the scan — it is skipped.
-    pub fn latest_in(dir: &std::path::Path) -> Option<(std::path::PathBuf, Spec)> {
+    /// Used by the spec review dialog's picker (several specs) and by
+    /// [`Spec::latest_in`]. Entries that cannot be read, have no usable
+    /// mtime, or fail to parse are skipped — never aborting the scan — so a
+    /// broken spec never hides the valid ones around it. Returns an empty
+    /// vec when the `specs/` directory is absent or holds nothing usable.
+    pub fn list_specs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let specs_dir = dir.join("specs");
-        let entries = std::fs::read_dir(&specs_dir).ok()?;
+        let entries = match std::fs::read_dir(&specs_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
         // Collect every spec JSON with its mtime; unreadable entries are
         // skipped (never abort the scan).
         let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -105,17 +110,32 @@ impl Spec {
                 }
             }
         }
-        // Walk newest-first, skipping files that fail to parse, so an
-        // unreadable/broken newest spec falls back to an older valid one.
+        // Newest first, dropping anything that fails to parse so every
+        // returned path opens cleanly in the review dialog.
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
-        for (path, _) in candidates {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(spec) = Spec::parse_json(&raw) {
-                    return Some((path, spec));
-                }
-            }
-        }
-        None
+        candidates
+            .into_iter()
+            .filter_map(|(path, _)| {
+                let raw = std::fs::read_to_string(&path).ok()?;
+                Spec::parse_json(&raw).ok()?;
+                Some(path)
+            })
+            .collect()
+    }
+
+    /// Load the most recently modified spec from `dir/specs/*.json`, if any.
+    ///
+    /// Used by the spec-mode continuation policy and the verify loop to find
+    /// the spec currently under review. `None` when the `specs/` directory
+    /// does not exist, holds no `.json` files, or none of them parse. A single
+    /// unreadable or unparseable entry never aborts the scan — it is skipped.
+    pub fn latest_in(dir: &std::path::Path) -> Option<(std::path::PathBuf, Spec)> {
+        let path = Spec::list_specs(dir).into_iter().next()?;
+        // list_specs only returns parseable files, so re-reading cannot fail
+        // on a race-free filesystem; skip on any IO error regardless.
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let spec = Spec::parse_json(&raw).ok()?;
+        Some((path, spec))
     }
 
     /// Parse a spec from raw LLM output.
@@ -272,6 +292,37 @@ mod tests {
         let (path, spec) = Spec::latest_in(&dir).expect("fallback to valid spec");
         assert!(path.ends_with("valid.json"), "path: {}", path.display());
         assert_eq!(spec.title, "Rate-Limiting Middleware");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_specs_returns_newest_first_and_skips_broken() {
+        let dir = std::env::temp_dir().join(format!("clawde-list-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        // A non-JSON file and a broken JSON file must both be skipped.
+        std::fs::write(dir.join("specs/notes.txt"), "not a spec").unwrap();
+        std::fs::write(dir.join("specs/broken.json"), "not json").unwrap();
+        let mut first = sample_spec();
+        first.title = "First Spec".to_string();
+        first.write_to(&dir.join("specs/first.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut second = sample_spec();
+        second.title = "Second Spec".to_string();
+        second.write_to(&dir.join("specs/second.json")).unwrap();
+
+        let specs = Spec::list_specs(&dir);
+        assert_eq!(specs.len(), 2, "broken and non-JSON entries skipped");
+        // Newest by mtime first.
+        assert!(specs[0].ends_with("second.json"));
+        assert!(specs[1].ends_with("first.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_specs_empty_without_specs_dir() {
+        let dir = std::env::temp_dir().join(format!("clawde-list-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Spec::list_specs(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

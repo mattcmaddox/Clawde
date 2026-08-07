@@ -652,7 +652,7 @@ Toggle Spec-Driven Development mode (audit spec §10). When enabled, the agent s
 /spec-mode off      # disable
 ```
 
-The setting is persisted in settings.json as `"specMode"`. In spec mode the agent writes a structured spec first (via `/spec` or the `EnterSpecMode` tool), then stops for review.
+The setting is persisted in settings.json as `"specMode"`. In spec mode the agent writes a structured spec first (via `/spec` or the `EnterSpecMode` tool), then stops for review — the review dialog auto-opens on the generated spec (§10.2). **Accepting** a spec in the review dialog also turns spec mode off, so the implementation turn runs to completion instead of stopping again to re-offer the same spec.
 
 ---
 
@@ -661,11 +661,13 @@ The setting is persisted in settings.json as `"specMode"`. In spec mode the agen
 Open the Spec-Driven Development review dialog for a generated spec (audit spec §10). Shows the structured spec — requirements, file plan, data models, acceptance tests, edge cases — and lets you **Accept** (queue an implementation turn against the spec), **Edit** (open the JSON in your editor), or **Reject**.
 
 ```
-/spec-review              # newest spec in ./specs/
+/spec-review              # newest spec in ./specs/ (picker when several exist)
 /spec-review specs/foo.json
 ```
 
 Navigation: `↑/↓` or `j/k` scroll the content, `←/→` or `h/l` move between the Accept / Edit Spec / Reject actions, `Enter` activates the selected action, `Esc` closes.
+
+With several specs in `specs/`, a bare `/spec-review` opens a picker (newest first): `↑/↓` or `j/k` highlights a spec, `Enter` opens it, `Esc` closes. In spec mode the dialog also opens automatically after a turn that generated a spec.
 
 ---
 

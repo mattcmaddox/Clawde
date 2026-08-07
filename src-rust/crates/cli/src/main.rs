@@ -2028,6 +2028,26 @@ async fn sync_transcript_to_disk(
     *written = msgs.len();
 }
 
+/// Derive the in-loop continuation mode from the live config.
+///
+/// Precedence (highest first): goal autonomy, spec-driven development
+/// (review gate before implementation), execute-and-verify, then plain
+/// stop-after-one-turn. Re-derived per submit — not just once at startup —
+/// so mid-session config changes (e.g. Accept in `/spec-review` disabling
+/// spec mode) take effect on the very next turn.
+fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::ContinuationMode {
+    if clawde_core::goals_enabled() {
+        return clawde_query::ContinuationMode::Goal;
+    }
+    if config.spec_mode {
+        return clawde_query::ContinuationMode::SpecMode;
+    }
+    if config.verify.enabled {
+        return clawde_query::ContinuationMode::Verify(config.verify.clone());
+    }
+    clawde_query::ContinuationMode::Default
+}
+
 async fn run_interactive(
     config: Config,
     settings: clawde_core::config::Settings,
@@ -2126,39 +2146,11 @@ async fn run_interactive(
     let provider_registry = query_config.provider_registry.clone();
 
     let mut base_query_config = query_config;
-    // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
-    // run_query_loop itself decides whether to continue toward an active goal
-    // after each turn, instead of the REPL re-dispatching a fresh turn. Select
-    // the goal policy for interactive user turns when the /goal feature is on;
-    // the GoalPolicy is a no-op (stops after one turn) when no goal is active.
-    if clawde_core::goals_enabled() {
-        base_query_config.continuation = clawde_query::ContinuationMode::Goal;
-    }
-    // Execute-and-verify (audit spec Phase 1): when enabled in settings.json
-    // (`config.verify.enabled`, default true) and goal autonomy is not active,
-    // select the verify continuation mode so the loop runs the project's
-    // tests/lints after turns that wrote files and feeds failures back to the
-    // model for auto-fix. Goal autonomy wins over verify when both are enabled.
-    if base_query_config.continuation == clawde_query::ContinuationMode::Default
-        && config.verify.enabled
-    {
-        base_query_config.continuation =
-            clawde_query::ContinuationMode::Verify(config.verify.clone());
-    }
-    // Spec-driven development (audit spec Phase 4, §10): when `config.specMode`
-    // is enabled, the continuation policy stops after a turn that produced a
-    // spec so the user can review it before implementation. Spec mode wins
-    // over verify when both are enabled (the review gate precedes execution):
-    // once a spec is generated the user must approve it before any auto-fix
-    // verify rounds make sense. Goal autonomy still wins over both.
-    if config.spec_mode
-        && matches!(
-            base_query_config.continuation,
-            clawde_query::ContinuationMode::Default | clawde_query::ContinuationMode::Verify(_)
-        )
-    {
-        base_query_config.continuation = clawde_query::ContinuationMode::SpecMode;
-    }
+    // Continuation mode (goal autonomy / spec mode / execute-and-verify) is
+    // derived from the live config. It is also re-derived per submit below so
+    // mid-session changes — e.g. Accept in /spec-review turning spec mode off —
+    // apply to the very next turn instead of only the next session.
+    base_query_config.continuation = derive_continuation_mode(&config);
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -3581,6 +3573,7 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let mut ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
+                        qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                         qcfg.model = clawde_api::effective_model_for_config(
                             &cmd_ctx.config,
                             &model_registry,
@@ -4213,6 +4206,7 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
+                        qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                         qcfg.model = clawde_api::effective_model_for_config(
                             &cmd_ctx.config,
                             &model_registry,
@@ -4327,6 +4321,7 @@ async fn run_interactive(
                 let tools_arc_clone = tools_arc.clone();
                 let ctx_clone = tool_ctx.clone();
                 let mut qcfg = base_query_config.clone();
+                qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                 qcfg.model =
                     clawde_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();

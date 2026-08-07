@@ -87,6 +87,14 @@ pub struct SpecReviewState {
     pub selected_action: usize,
     /// Scroll offset into the rendered content lines.
     pub scroll: usize,
+    /// True while the dialog is in multi-spec picker mode (`/spec-review`
+    /// with several specs in `specs/`). While picking, Enter opens the
+    /// highlighted spec; Esc leaves the dialog.
+    pub picking: bool,
+    /// Parseable specs in the working dir, newest-first (picker mode).
+    pub available: Vec<PathBuf>,
+    /// Highlighted index into `available` (picker mode).
+    pub picked: usize,
 }
 
 impl Default for SpecReviewState {
@@ -98,6 +106,9 @@ impl Default for SpecReviewState {
             path: None,
             selected_action: ACTION_ACCEPT,
             scroll: 0,
+            picking: false,
+            available: Vec::new(),
+            picked: 0,
         }
     }
 }
@@ -117,20 +128,79 @@ impl SpecReviewState {
         self.path = Some(path);
         self.selected_action = ACTION_ACCEPT;
         self.scroll = 0;
+        self.picking = false;
+        self.available.clear();
+        self.picked = 0;
         self.visible = true;
         Ok(())
     }
 
-    /// Open the most recently modified spec in `dir/specs/`, if any.
+    /// Open the most recently modified spec in `dir/specs/`. With several
+    /// specs present, enters picker mode (newest-first) so the user chooses;
+    /// with exactly one, opens it directly; with none, returns an error.
     pub fn open_latest(&mut self, dir: &std::path::Path) -> Result<(), String> {
-        match Spec::latest_in(dir) {
-            Some((path, _)) => self.open(path),
-            None => Err("No spec found — run /spec <task> to generate one first.".to_string()),
+        let mut specs = Spec::list_specs(dir);
+        match specs.len() {
+            0 => Err("No spec found — run /spec <task> to generate one first.".to_string()),
+            1 => {
+                let path = specs.remove(0);
+                self.open(path)
+            }
+            _ => {
+                // Picker mode: show the candidates, newest first.
+                self.available = specs;
+                self.picked = 0;
+                self.picking = true;
+                self.spec = None;
+                self.path = None;
+                self.selected_action = ACTION_ACCEPT;
+                self.scroll = 0;
+                self.visible = true;
+                Ok(())
+            }
+        }
+    }
+
+    /// Confirm the highlighted entry in picker mode, opening that spec.
+    /// Returns `Some(message)` when the spec can no longer be read/parsed
+    /// (e.g. deleted between the scan and the open), leaving the dialog
+    /// closed instead of a blank zombie modal.
+    pub fn confirm_pick(&mut self) -> Option<String> {
+        if !self.picking {
+            return None;
+        }
+        let path = self.available.get(self.picked).cloned()?;
+        self.picking = false;
+        self.available.clear();
+        match self.open(path) {
+            Ok(()) => None,
+            Err(msg) => {
+                self.visible = false;
+                Some(msg)
+            }
+        }
+    }
+
+    /// Move the picker highlight up (clamped at the first entry).
+    pub fn pick_prev(&mut self) {
+        if self.picking {
+            self.picked = self.picked.saturating_sub(1);
+        }
+    }
+
+    /// Move the picker highlight down (clamped at the last entry).
+    pub fn pick_next(&mut self) {
+        if self.picking {
+            let max = self.available.len().saturating_sub(1);
+            self.picked = (self.picked + 1).min(max);
         }
     }
 
     pub fn close(&mut self) {
         self.visible = false;
+        self.picking = false;
+        self.available.clear();
+        self.picked = 0;
     }
 
     /// Move the action selection left/right (clamped).
@@ -312,6 +382,114 @@ fn content_lines(spec: &Spec) -> Vec<Line<'static>> {
     lines
 }
 
+/// Render the multi-spec picker as a centered modal (entered by
+/// `/spec-review` when several specs exist in `specs/`).
+pub fn render_spec_picker(frame: &mut Frame, state: &SpecReviewState, size: Rect) {
+    let width = 92.min(size.width.saturating_sub(2));
+    let height = 26.min(size.height.saturating_sub(2));
+    let area = centered_rect(width, height, size);
+    state.last_rect.set(area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(
+            " Choose Spec ",
+            Style::default().fg(SEL_FG).add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(ratatui::layout::Alignment::Left);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block.clone(), area);
+
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(5), // content rows; 4 for hint
+    };
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let buf = frame.buffer_mut();
+    let visible = inner.height as usize;
+    let count = state.available.len();
+    // Keep the highlighted entry inside the visible window when the list
+    // overflows the modal: scroll the window with the highlight.
+    let scroll = state
+        .picked
+        .saturating_sub(visible)
+        .min(count.saturating_sub(visible));
+    let shown = count.min(visible);
+    let mut row = inner.y;
+    for i in 0..shown {
+        let path = &state.available[scroll + i];
+        let selected = i == state.picked;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let name_style = if selected {
+            Style::default()
+                .fg(SEL_FG)
+                .bg(SEL_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(BODY)
+        };
+        let mut x = inner.x;
+        if selected {
+            for (j, ch) in "\u{203a} ".chars().enumerate() {
+                if x + j as u16 >= inner.x + inner.width {
+                    break;
+                }
+                buf[(x + j as u16, row)]
+                    .set_symbol(&ch.to_string())
+                    .set_style(name_style);
+            }
+            x += 2;
+        }
+        for (j, ch) in name.chars().enumerate() {
+            let bx = x + j as u16;
+            if bx >= inner.x + inner.width {
+                break;
+            }
+            buf[(bx, row)]
+                .set_symbol(&ch.to_string())
+                .set_style(name_style);
+        }
+        let dim_style = if selected {
+            Style::default().fg(SEL_FG).bg(SEL_BG)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let dx = x + name.chars().count() as u16 + 2;
+        let rel = path.display().to_string();
+        for (j, ch) in rel.chars().enumerate() {
+            let bx = dx + j as u16;
+            if bx >= inner.x + inner.width {
+                break;
+            }
+            buf[(bx, row)]
+                .set_symbol(&ch.to_string())
+                .set_style(dim_style);
+        }
+        row += 1;
+    }
+
+    let hint_y = area.y + area.height - 2;
+    let hint = "\u{2191}/\u{2193} j/k navigate \u{b7} enter open \u{b7} esc";
+    for (i, ch) in hint.chars().enumerate() {
+        let bx = area.x + i as u16;
+        if bx >= area.x + area.width - 1 {
+            break;
+        }
+        buf[(bx, hint_y)]
+            .set_symbol(&ch.to_string())
+            .set_style(Style::default().fg(DIM));
+    }
+}
+
 /// Render the spec review dialog as a centered modal.
 pub fn render_spec_review(
     frame: &mut Frame,
@@ -320,6 +498,10 @@ pub fn render_spec_review(
     size: Rect,
 ) {
     if !state.visible {
+        return;
+    }
+    if state.picking {
+        render_spec_picker(frame, state, size);
         return;
     }
     let Some(spec) = &state.spec else { return };
@@ -460,21 +642,17 @@ mod tests {
     }
 
     #[test]
-    fn open_latest_finds_most_recent_spec() {
+    fn open_latest_single_spec_opens_directly() {
         let dir = std::env::temp_dir().join(format!("clawde-spec-latest-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("specs")).unwrap();
-        let mut old = sample_spec();
-        old.title = "Old Spec".to_string();
-        old.write_to(&dir.join("specs/old.json")).unwrap();
-        // Distinct, later mtime even on coarse-granularity filesystems.
-        std::thread::sleep(std::time::Duration::from_millis(10));
         let mut fresh = sample_spec();
         fresh.title = "Fresh Spec".to_string();
         fresh.write_to(&dir.join("specs/fresh.json")).unwrap();
 
         let mut dialog = SpecReviewState::new();
         dialog.open_latest(&dir).expect("latest spec found");
-        // The newest spec by mtime wins.
+        // Exactly one spec: open it directly, no picker.
+        assert!(!dialog.picking);
         assert_eq!(dialog.spec.as_ref().unwrap().title, "Fresh Spec");
         assert_eq!(dialog.selected_action, ACTION_ACCEPT);
         let _ = std::fs::remove_dir_all(&dir);
@@ -488,6 +666,75 @@ mod tests {
         let err = dialog.open_latest(&dir).expect_err("no specs dir");
         assert!(err.contains("No spec found"));
         assert!(!dialog.visible);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_latest_enters_picker_with_multiple_specs() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-pick-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        sample_spec().write_to(&dir.join("specs/one.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        sample_spec().write_to(&dir.join("specs/two.json")).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open_latest(&dir).expect("picker entered");
+        assert!(dialog.visible);
+        assert!(dialog.picking);
+        assert_eq!(dialog.available.len(), 2);
+        // Newest spec is listed first and pre-highlighted.
+        assert!(dialog.available[0].ends_with("two.json"));
+        assert_eq!(dialog.picked, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_pick_opens_selected_spec() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-confirm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let mut one = sample_spec();
+        one.title = "One".to_string();
+        one.write_to(&dir.join("specs/one.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut two = sample_spec();
+        two.title = "Two".to_string();
+        two.write_to(&dir.join("specs/two.json")).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open_latest(&dir).unwrap();
+        assert!(dialog.picking);
+        // Highlight the older spec, then open it.
+        dialog.pick_next();
+        dialog.confirm_pick();
+        assert!(!dialog.picking);
+        assert!(dialog.visible);
+        assert_eq!(dialog.spec.as_ref().unwrap().title, "One");
+        assert!(dialog.path.as_ref().unwrap().ends_with("one.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_navigation_clamps() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-nav-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        sample_spec().write_to(&dir.join("specs/a.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        sample_spec().write_to(&dir.join("specs/b.json")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        sample_spec().write_to(&dir.join("specs/c.json")).unwrap();
+
+        let mut dialog = SpecReviewState::new();
+        dialog.open_latest(&dir).unwrap();
+        dialog.pick_prev(); // clamps at 0
+        assert_eq!(dialog.picked, 0);
+        for _ in 0..10 {
+            dialog.pick_next();
+        }
+        assert_eq!(dialog.picked, 2); // clamps at last
+                                      // Navigation is a no-op once the spec is open.
+        dialog.confirm_pick();
+        dialog.pick_next();
+        assert!(!dialog.picking);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

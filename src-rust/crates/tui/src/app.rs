@@ -3805,6 +3805,18 @@ impl App {
         }
     }
 
+    /// Persist `spec_mode: false` to settings.json after a spec is accepted
+    /// in the review dialog (§10.2). Mirrors `save_routing_dialog`'s disk
+    /// sync; the live config is already updated by the caller. Best-effort:
+    /// a failed write is swallowed (the live config still wins for this
+    /// session, so the review loop cannot recur).
+    fn persist_spec_mode_off(&mut self) {
+        if let Ok(mut settings) = clawde_core::config::Settings::load_sync() {
+            settings.config.spec_mode = false;
+            let _ = settings.save_sync();
+        }
+    }
+
     /// Whether the main event loop needs a fast (~60fps) repaint cadence.
     ///
     /// True only while something on screen is actually animating: streaming
@@ -4834,6 +4846,31 @@ impl App {
 
         // Spec review dialog (/spec-review — audit spec §10 Accept/Edit/Reject).
         if self.spec_review.visible {
+            // Picker sub-mode (several specs in specs/): route its own keys.
+            if self.spec_review.picking {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.spec_review.close();
+                        self.status_message =
+                            Some("Spec review closed — nothing changed.".to_string());
+                    }
+                    KeyCode::Up => self.spec_review.pick_prev(),
+                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                        self.spec_review.pick_prev()
+                    }
+                    KeyCode::Down => self.spec_review.pick_next(),
+                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                        self.spec_review.pick_next()
+                    }
+                    KeyCode::Enter => {
+                        if let Some(msg) = self.spec_review.confirm_pick() {
+                            self.status_message = Some(format!("Spec review: {msg}"));
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.spec_review.close();
@@ -4848,8 +4885,21 @@ impl App {
                                 // once the current turn finishes (issue #149).
                                 self.queued_messages.push_back(msg);
                                 self.pending_auto_submit = true;
-                                self.status_message =
-                                    Some("Spec accepted — implementing against it.".to_string());
+                                // Accepting exits spec mode (§10.2): the review
+                                // gate has served its purpose, and the queued
+                                // implementation turn must not stop again to
+                                // re-offer the same spec. Persist so future
+                                // sessions start in normal mode too.
+                                let exit_msg = if self.config.spec_mode {
+                                    self.config.spec_mode = false;
+                                    self.persist_spec_mode_off();
+                                    " — spec mode off"
+                                } else {
+                                    ""
+                                };
+                                self.status_message = Some(format!(
+                                    "Spec accepted — implementing against it{exit_msg}."
+                                ));
                             }
                             self.spec_review.close();
                         }
@@ -9648,6 +9698,23 @@ impl App {
                 self.push_verify_annotation(report);
             }
 
+            QueryEvent::SpecForReview(path) => {
+                // Spec mode: the agent just produced a spec — auto-open the
+                // Accept/Edit/Reject dialog for it (§10.2).
+                let path_buf = std::path::PathBuf::from(&path);
+                match self.spec_review.open(path_buf.clone()) {
+                    Ok(()) => {
+                        self.status_message = Some(format!(
+                            "Spec generated — review before implementing: {}",
+                            path_buf.display()
+                        ));
+                    }
+                    Err(msg) => {
+                        self.status_message = Some(format!("Spec review unavailable: {msg}"));
+                    }
+                }
+            }
+
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
                 self.spinner_verb = None;
@@ -10175,6 +10242,58 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    // ---- spec review (§10) ----
+
+    #[test]
+    fn accept_spec_disables_spec_mode_and_queues_implementation() {
+        let _home = TestHome::acquire(); // keep settings writes off the real file
+        let mut app = make_app();
+        app.config.spec_mode = true;
+        let dir = std::env::temp_dir().join(format!("clawde-accept-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"title":"Task Spec","requirements":["do it"],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+        app.spec_review.open(path).unwrap();
+        assert!(app.spec_review.visible);
+
+        // Enter on the default Accept action queues the implementation turn
+        // and exits spec mode so the loop cannot re-offer the same spec.
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.queued_messages[0].contains("ACCEPTED"));
+        assert!(!app.config.spec_mode, "accept must disable spec mode");
+        assert!(!app.spec_review.visible);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_spec_keeps_spec_mode_enabled() {
+        let mut app = make_app();
+        app.config.spec_mode = true;
+        let dir = std::env::temp_dir().join(format!("clawde-reject-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"title":"Task Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+        app.spec_review.open(path).unwrap();
+        // Move the selection to Reject and press Enter.
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.spec_review.visible);
+        // Rejecting discards the spec — spec mode stays on for the next task.
+        assert!(app.config.spec_mode);
+        assert!(app.queued_messages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- recent-activity label (issue #277) ----
