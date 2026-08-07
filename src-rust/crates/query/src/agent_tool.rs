@@ -359,6 +359,7 @@ impl Tool for AgentTool {
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
             thinking_budget: None,
+            memory_max_tokens: None,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,

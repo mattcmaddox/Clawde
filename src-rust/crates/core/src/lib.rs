@@ -1381,6 +1381,9 @@ pub mod config {
         /// Execute-and-verify loop configuration (audit spec Phase 1).
         #[serde(default)]
         pub verify: VerifyConfig,
+        /// Project-memory injection settings (audit spec §18.3 token budget).
+        #[serde(default)]
+        pub memory: MemoryConfig,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1588,6 +1591,23 @@ pub mod config {
         pub fn has_any_check(&self) -> bool {
             self.enabled && (self.auto_test || self.auto_lint)
         }
+    }
+
+    // ---- MemoryConfig ----------------------------------------------------
+
+    /// Configuration for project-memory injection (audit spec §18.3 token
+    /// budget): caps how many tokens the `<memory>` block may consume from the
+    /// context window.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct MemoryConfig {
+        /// Cap on the combined `<memory>` injection (MEMORY.md index + most
+        /// recent session summary) in tokens. When set, the session summary is
+        /// dropped first (least durable signal), then the index is clamped at a
+        /// line boundary, to stay under the cap (~4 bytes per token). `None`
+        /// (default) relies on the built-in per-file caps (25 KB index /
+        /// 4 KB summary).
+        pub max_tokens: Option<u32>,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2603,6 +2623,13 @@ pub mod config {
                 // Override wins for this scalar struct (project settings take
                 // precedence over global).
                 verify: over.config.verify,
+                memory: MemoryConfig {
+                    max_tokens: over
+                        .config
+                        .memory
+                        .max_tokens
+                        .or(base.config.memory.max_tokens),
+                },
             };
             Self {
                 config: merged_config,

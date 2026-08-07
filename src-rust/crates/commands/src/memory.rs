@@ -34,10 +34,15 @@ impl SlashCommand for MemoryCommand {
                 description: "Show project memory (auto-memory) status".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "init".into(),
+                description: "Seed project memory templates".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
-        "Usage: /memory [edit|clear|status] [global]\n\n\
+        "Usage: /memory [edit|clear|status|init] [global]\n\n\
          Shows the content of AGENTS.md files that provide project context to Clawde.\n\
          Clawde reads these files automatically at session start.\n\n\
          Subcommands:\n\
@@ -46,7 +51,8 @@ impl SlashCommand for MemoryCommand {
            /memory edit global  — open global ~/.clawde/AGENTS.md in your editor\n\
            /memory clear        — clear the project AGENTS.md\n\
            /memory clear global — clear the global ~/.clawde/AGENTS.md\n\
-           /memory status       — show project memory dir, index, and session summaries\n\n\
+           /memory status       — show project memory dir, index, and session summaries\n\
+           /memory init         — seed architecture/conventions/decisions/tasks + MEMORY.md\n\n\
          Locations checked (in priority order):\n\
            1. <project>/.claurst/AGENTS.md\n\
            2. <project>/AGENTS.md\n\
@@ -166,6 +172,85 @@ impl SlashCommand for MemoryCommand {
                     CommandResult::Error(format!("Failed to clear {}: {}", target.display(), e))
                 }
             };
+        }
+
+        // ---- /memory init -------------------------------------------------------
+        if cmd == "init" {
+            use clawde_core::memdir::{
+                auto_memory_path, ensure_memory_dir_exists, MEMORY_ENTRYPOINT,
+            };
+            const ARCHITECTURE: &str = "# Architecture\n\n\
+                Project structure, key abstractions, and the module map.\n\
+                Keep this current as the codebase evolves.\n\n\
+                ## Overview\n\n\
+                ## Key modules\n\n\
+                ## Data flow\n";
+            const CONVENTIONS: &str = "# Conventions\n\n\
+                Code style, naming, test/build commands, and lint rules.\n\n\
+                ## Style\n\n\
+                ## Commands\n\n\
+                ## Testing\n";
+            const DECISIONS: &str = "# Decisions\n\n\
+                Architectural decision log (ADR style). Append one entry per decision.\n\n\
+                ## YYYY-MM-DD — <title>\n\n\
+                ### Context\n\n\
+                ### Decision\n\n\
+                ### Consequences\n";
+            const TASKS: &str = "# Tasks\n\n\
+                Pending work and its status.\n\n\
+                - [ ] \n";
+            const MEMORY_INDEX: &str = "# Memory Index\n\n\
+                - [Architecture](architecture.md) — project structure and key abstractions\n\
+                - [Conventions](conventions.md) — style, build/test/lint commands\n\
+                - [Decisions](decisions.md) — architectural decisions log\n\
+                - [Tasks](tasks.md) — pending tasks\n";
+
+            let mem_dir = auto_memory_path(&ctx.working_dir);
+            ensure_memory_dir_exists(&mem_dir);
+
+            let templates: &[(&str, &str)] = &[
+                ("architecture.md", ARCHITECTURE),
+                ("conventions.md", CONVENTIONS),
+                ("decisions.md", DECISIONS),
+                ("tasks.md", TASKS),
+            ];
+            let mut created: Vec<String> = Vec::new();
+            let mut kept: Vec<String> = Vec::new();
+            for (name, content) in templates {
+                let path = mem_dir.join(name);
+                if path.exists() {
+                    kept.push((*name).to_string());
+                } else if std::fs::write(&path, content).is_ok() {
+                    created.push((*name).to_string());
+                } else {
+                    kept.push(format!("{} (write failed)", name));
+                }
+            }
+            // Seed a starter MEMORY.md index so the system-prompt injection
+            // activates immediately — the index is what the model reads.
+            let index_path = mem_dir.join(MEMORY_ENTRYPOINT);
+            if !index_path.exists() {
+                let _ = std::fs::write(&index_path, MEMORY_INDEX);
+                created.push(MEMORY_ENTRYPOINT.to_string());
+            } else {
+                kept.push(MEMORY_ENTRYPOINT.to_string());
+            }
+
+            let mut out = String::from("Project memory initialized\n═══════════════════════════\n");
+            out.push_str(&format!("Directory: {}\n", mem_dir.display()));
+            if created.is_empty() {
+                out.push_str("All memory files already exist — nothing was created.\n");
+            } else {
+                out.push_str(&format!("Created: {}\n", created.join(", ")));
+            }
+            if !kept.is_empty() {
+                out.push_str(&format!("Existing (kept as-is): {}\n", kept.join(", ")));
+            }
+            out.push_str(
+                "\nThese files are injected into the system prompt at session start.\n\
+                 Edit them directly, or let the agent maintain them over time.",
+            );
+            return CommandResult::Message(out);
         }
 
         // ---- /memory status ----------------------------------------------------
@@ -329,6 +414,45 @@ mod tests {
         assert!(out.contains("Memory files: 1"), "got: {}", out);
         assert!(out.contains("Session summaries: 1"), "got: {}", out);
         assert!(out.contains("Most recent summary: "), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_init_creates_templates() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("init", &mut ctx).await);
+
+        assert!(out.contains("Created"), "got: {}", out);
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        for name in [
+            "architecture.md",
+            "conventions.md",
+            "decisions.md",
+            "tasks.md",
+            "MEMORY.md",
+        ] {
+            assert!(mem_dir.join(name).is_file(), "missing {}", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_init_does_not_overwrite_existing() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("conventions.md"), "# Custom conventions\n").unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("init", &mut ctx).await);
+
+        assert!(out.contains("Existing (kept as-is)"), "got: {}", out);
+        let content = std::fs::read_to_string(mem_dir.join("conventions.md")).unwrap();
+        assert_eq!(content, "# Custom conventions\n");
     }
 
     #[tokio::test]

@@ -108,6 +108,9 @@ pub struct QueryConfig {
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
+    /// Optional cap (tokens) on the `<memory>` block injected into the system
+    /// prompt (audit spec §18.3). Copied from `Config::memory.max_tokens`.
+    pub memory_max_tokens: Option<u32>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
@@ -188,6 +191,7 @@ impl Default for QueryConfig {
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
+            memory_max_tokens: None,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -214,6 +218,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_max_tokens: cfg.memory.max_tokens,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -232,6 +237,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_max_tokens: cfg.memory.max_tokens,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -2363,6 +2369,7 @@ mod tests {
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            memory_max_tokens: None,
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,

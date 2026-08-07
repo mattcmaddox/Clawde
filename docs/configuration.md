@@ -149,6 +149,39 @@ Example:
 }
 ```
 
+### Memory injection (project auto-memory)
+
+Project memory lives under `~/.clawde/projects/<project>/memory/` (the memdir
+convention; `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` overrides the whole path, and
+`CLAURST_DISABLE_AUTO_MEMORY` disables the injection). When present, the
+`MEMORY.md` index plus the most recent `sessions/*.md` summary are injected
+into the system prompt's `<memory>` block every turn, so each session starts
+already knowing the project's architecture, conventions, and recent work.
+
+The auto-dream consolidation pass maintains these files automatically (now
+per-project, so different projects never share memory); `/memory init` seeds
+the `architecture.md` / `conventions.md` / `decisions.md` / `tasks.md`
+templates plus a starter index, and `/memory status` shows their state. After
+a verify round detects the project's test/lint commands, they are recorded
+into `conventions.md` (idempotently) so future sessions know how to build and
+verify without re-discovery.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.maxTokens` | integer | unset | Cap on the combined `<memory>` injection in tokens (~4 bytes per token). When the index + session summary exceed it, the summary is dropped first, then the index is clamped at a line boundary. Unset uses the built-in per-file caps (25 KB index / 4 KB summary). |
+
+Example:
+
+```json
+{
+  "config": {
+    "memory": {
+      "maxTokens": 1500
+    }
+  }
+}
+```
+
 ### Tool access
 
 | Key | Type | Default | Description |

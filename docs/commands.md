@@ -701,6 +701,8 @@ Manage memory files: the AGENTS.md instruction files that provide project contex
 /memory clear global  — clear the global ~/.clawde/AGENTS.md
 /memory status        — show the project auto-memory dir, MEMORY.md index state,
                         memory-file count, and session summaries
+/memory init          — seed architecture/conventions/decisions/tasks templates
+                        plus a starter MEMORY.md index
 ```
 
 AGENTS.md locations checked (in priority order):

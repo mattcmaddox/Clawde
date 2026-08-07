@@ -242,6 +242,52 @@ fn short_relative_secs(secs: u64) -> String {
 /// truncated to fit `width`), or a single dimmed "No recent activity" line when
 /// there are none. Split out from [`render_welcome_box`] so it can be unit
 /// tested from controlled state without the surrounding layout.
+/// Build the compact project-memory status line for the welcome screen
+/// (audit spec §15.3): `⚡ Project memory: N files · updated <age>`, or `None`
+/// when the project has no memory files yet.
+///
+/// Takes the resolved memory dir (not a project path) so tests can point it at
+/// a temp dir without touching env vars. Day-granular freshness reuses the
+/// memdir age helper ("today" / "yesterday" / "N days ago").
+fn project_memory_line(mem_dir: &std::path::Path) -> Option<Line<'static>> {
+    let files = clawde_core::memdir::scan_memory_dir(mem_dir);
+    let index_path = mem_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
+    let index_present = index_path.is_file();
+    if files.is_empty() && !index_present {
+        return None;
+    }
+    let mut newest = files.iter().map(|f| f.modified_secs).max().unwrap_or(0);
+    if index_present {
+        if let Ok(meta) = std::fs::metadata(&index_path) {
+            if let Ok(mtime) = meta.modified() {
+                let secs = mtime
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                newest = newest.max(secs);
+            }
+        }
+    }
+    let count = files.len() + usize::from(index_present);
+    Some(Line::from(vec![
+        Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            "Project memory",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                ": {} files · {}",
+                count,
+                clawde_core::memdir::memory_age(newest)
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
+}
+
 fn recent_activity_lines(
     recent: &[crate::app::RecentSession],
     width: usize,
@@ -2107,6 +2153,21 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
+    }
+
+    // Project memory status (audit spec §15.3): one compact line when the
+    // project has memory files, so freshness is visible at a glance. Only
+    // rendered on the welcome screen, so the small dir scan is not a per-frame
+    // cost during active conversation.
+    if let Some(mem_line) = app
+        .config
+        .project_dir
+        .as_deref()
+        .map(clawde_core::memdir::auto_memory_path)
+        .and_then(|dir| project_memory_line(&dir))
+    {
+        right_lines.push(Line::from(""));
+        right_lines.push(mem_line);
     }
 
     // Record the absolute screen row where "Recent activity" starts, so the
@@ -5828,5 +5889,30 @@ mod task_badge_tooltip_tests {
             !rendered.contains("(0s)"),
             "a never-started check must not show timing: {rendered}"
         );
+    }
+
+    // ---- project_memory_line (spec §15.3) ----------------------------------
+
+    #[test]
+    fn project_memory_line_renders_when_files_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("2026-08-01.md"),
+            "summary\n",
+        )
+        .unwrap();
+        let line = project_memory_line(dir.path()).expect("line should render");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Project memory"), "got: {text}");
+        // MEMORY.md + the session summary = 2 files.
+        assert!(text.contains("2 files"), "got: {text}");
+    }
+
+    #[test]
+    fn project_memory_line_none_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(project_memory_line(dir.path()).is_none());
     }
 }

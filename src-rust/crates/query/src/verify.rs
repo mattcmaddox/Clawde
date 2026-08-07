@@ -401,6 +401,28 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
         });
     }
     let results = run_checks(config, working_dir)?;
+
+    // Audit spec §9.5 trigger 1: persist the detected test/lint commands into
+    // the project's `conventions.md` so future sessions know how to build and
+    // verify without re-discovery. Gated on project memory already existing
+    // (i.e. the user opted in via `/memory init` or auto-dream) — verification
+    // alone never creates the memory system, keeping zero-footprint for
+    // projects without memory.
+    {
+        use clawde_core::memdir::{
+            auto_memory_path, is_auto_memory_enabled, record_verify_conventions,
+        };
+        let memory_dir = auto_memory_path(working_dir);
+        if is_auto_memory_enabled(None) && memory_dir.is_dir() {
+            let info = clawde_tools::detect_project::detect_project_info(working_dir);
+            record_verify_conventions(
+                &memory_dir,
+                info.test_commands.first().map(String::as_str),
+                info.lint_commands.first().map(String::as_str),
+            );
+        }
+    }
+
     let max_retries = config.max_retries.max(1);
     if results.is_empty() {
         return Ok(VerifyReport {

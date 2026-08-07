@@ -563,12 +563,26 @@ pub fn most_recent_session_summary(memory_dir: &Path) -> Option<String> {
 }
 
 /// Build the memory content string to inject into the system prompt's
-/// `<memory>` block.
+/// `<memory>` block (no token budget — uses the per-file caps only).
 ///
 /// Includes the `MEMORY.md` index when it exists, plus the most recent
 /// session summary from `sessions/` when one is available.
 /// Called during `build_system_prompt` → `SystemPromptOptions::memory_content`.
 pub fn build_memory_prompt_content(memory_dir: &Path) -> String {
+    build_memory_prompt_content_with_budget(memory_dir, None)
+}
+
+/// Build the memory content to inject, capped at `budget_bytes` when set
+/// (audit spec §18.3 memory token budget).
+///
+/// When the combined index + summary exceed the budget, the session summary
+/// (least durable signal) is dropped first; if the index alone still exceeds
+/// the budget it is clamped at a line boundary with a warning. `None` keeps
+/// both parts at their built-in caps.
+pub fn build_memory_prompt_content_with_budget(
+    memory_dir: &Path,
+    budget_bytes: Option<usize>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(index) = load_memory_index(memory_dir) {
@@ -579,7 +593,87 @@ pub fn build_memory_prompt_content(memory_dir: &Path) -> String {
         parts.push(format!("## Recent Session Summary\n{}", summary));
     }
 
-    parts.join("\n\n")
+    let mut joined = parts.join("\n\n");
+    if let Some(budget) = budget_bytes {
+        if joined.len() > budget {
+            if parts.len() >= 2 {
+                // Drop the session summary first — the index is the durable
+                // anchor and the summary is rebuilt each consolidation.
+                joined = parts[0].clone();
+            }
+            if joined.len() > budget {
+                // Clamp the remaining content at a line boundary. Newlines are
+                // ASCII, so a boundary found via `rfind` is a safe char
+                // boundary; `floor_char_boundary` guards the initial slice.
+                let boundary = joined.floor_char_boundary(budget);
+                let cut_at = joined[..boundary].rfind('\n').unwrap_or(boundary);
+                joined = format!(
+                    "{}…\n\n> WARNING: memory injection truncated to {} bytes by the \
+                     memory token budget (`memory.maxTokens` in settings).",
+                    &joined[..cut_at],
+                    budget
+                );
+            }
+        }
+    }
+    joined
+}
+
+/// Idempotently record detected build/verify commands into `conventions.md`
+/// (audit spec §9.5 trigger 1): after a verify round discovers the project's
+/// test/lint commands, they are worth persisting so future sessions know how
+/// to build and verify without re-discovery.
+///
+/// Only appends — never overwrites. A `## Build & verify commands` section is
+/// created on first write; a command already listed under it is left alone.
+/// Returns `true` when the file was modified.
+pub fn record_verify_conventions(
+    memory_dir: &Path,
+    test_command: Option<&str>,
+    lint_command: Option<&str>,
+) -> bool {
+    let commands: Vec<(&str, &str)> = test_command
+        .into_iter()
+        .map(|c| ("Test", c))
+        .chain(lint_command.into_iter().map(|c| ("Lint", c)))
+        .filter(|(_, c)| !c.trim().is_empty())
+        .collect();
+    if commands.is_empty() {
+        return false;
+    }
+
+    ensure_memory_dir_exists(memory_dir);
+    let path = memory_dir.join("conventions.md");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut has_section = existing
+        .lines()
+        .any(|l| l.trim() == "## Build & verify commands");
+
+    let mut additions: Vec<String> = Vec::new();
+    for (kind, cmd) in &commands {
+        let needle = format!("- {}: {}", kind, cmd);
+        if existing.lines().any(|l| l.trim() == needle) {
+            continue;
+        }
+        if !has_section {
+            additions.push("## Build & verify commands".to_string());
+            additions.push(String::new());
+            has_section = true;
+        }
+        additions.push(needle);
+    }
+    if additions.is_empty() {
+        return false;
+    }
+
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&additions.join("\n"));
+    out.push('\n');
+    let _ = std::fs::write(&path, out);
+    true
 }
 
 /// Ensure the memory directory exists, creating it (and any parents) if needed.
@@ -1010,6 +1104,112 @@ mod tests {
     fn test_build_memory_prompt_content_empty_dir() {
         let dir = make_temp_dir();
         assert!(build_memory_prompt_content(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_budget_keeps_everything_when_roomy() {
+        let dir = make_temp_dir();
+        write_file(dir.path(), "MEMORY.md", "- [a.md](a.md) — index entry");
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("2026-08-01.md"),
+            "summary content",
+        )
+        .unwrap();
+        let content = build_memory_prompt_content_with_budget(dir.path(), Some(10_000));
+        assert!(content.contains("Memory Index"));
+        assert!(content.contains("Recent Session Summary"));
+    }
+
+    #[test]
+    fn test_budget_drops_summary_when_over() {
+        let dir = make_temp_dir();
+        write_file(dir.path(), "MEMORY.md", "- [a.md](a.md) — index entry");
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(
+            dir.path().join("sessions").join("2026-08-01.md"),
+            "a very long session summary that alone exceeds the tight budget",
+        )
+        .unwrap();
+        // Tight budget: index + summary combined exceed it, but the index
+        // alone fits — so the summary is dropped and the index survives.
+        let content = build_memory_prompt_content_with_budget(dir.path(), Some(120));
+        assert!(content.contains("Memory Index"), "got: {}", content);
+        assert!(
+            !content.contains("Recent Session Summary"),
+            "got: {}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_budget_clamps_oversized_index() {
+        let dir = make_temp_dir();
+        write_file(
+            dir.path(),
+            "MEMORY.md",
+            "- [a.md](a.md) — index entry that is deliberately long",
+        );
+        let content = build_memory_prompt_content_with_budget(dir.path(), Some(50));
+        assert!(
+            content.contains("truncated to 50 bytes"),
+            "got: {}",
+            content
+        );
+    }
+
+    // ---- record_verify_conventions ----------------------------------------
+
+    #[test]
+    fn test_record_verify_conventions_creates_section() {
+        let dir = make_temp_dir();
+        assert!(record_verify_conventions(
+            dir.path(),
+            Some("cargo test --workspace"),
+            Some("cargo clippy --workspace")
+        ));
+        let content = std::fs::read_to_string(dir.path().join("conventions.md")).unwrap();
+        assert!(content.contains("## Build & verify commands"));
+        assert!(content.contains("- Test: cargo test --workspace"));
+        assert!(content.contains("- Lint: cargo clippy --workspace"));
+    }
+
+    #[test]
+    fn test_record_verify_conventions_is_idempotent() {
+        let dir = make_temp_dir();
+        let args = (Some("cargo test"), Some("cargo clippy"));
+        assert!(record_verify_conventions(dir.path(), args.0, args.1));
+        let once = std::fs::read_to_string(dir.path().join("conventions.md")).unwrap();
+        // Second call: nothing new → no write.
+        assert!(!record_verify_conventions(dir.path(), args.0, args.1));
+        let twice = std::fs::read_to_string(dir.path().join("conventions.md")).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_record_verify_conventions_appends_without_overwriting() {
+        let dir = make_temp_dir();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("conventions.md"),
+            "# Conventions\n\nUse tabs.\n",
+        )
+        .unwrap();
+        assert!(record_verify_conventions(
+            dir.path(),
+            Some("cargo test"),
+            None
+        ));
+        let content = std::fs::read_to_string(dir.path().join("conventions.md")).unwrap();
+        assert!(content.contains("Use tabs."), "got: {}", content);
+        assert!(content.contains("- Test: cargo test"));
+    }
+
+    #[test]
+    fn test_record_verify_conventions_no_commands_is_noop() {
+        let dir = make_temp_dir();
+        assert!(!record_verify_conventions(dir.path(), None, None));
+        assert!(!dir.path().join("conventions.md").exists());
     }
 
     // ---- is_auto_memory_enabled -------------------------------------------
