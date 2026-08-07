@@ -1473,8 +1473,10 @@ pub mod config {
         /// side effects (build artifacts, network access for deps).
         #[default]
         Direct,
-        /// Create a temporary git worktree and verify there. Clean isolation,
-        /// no side effects on the working tree. Not implemented yet.
+        /// Create a temporary git worktree at HEAD, apply the session's
+        /// uncommitted changes to it, and verify there. Clean isolation with
+        /// no side effects on the working tree; the worktree is removed after
+        /// the round. Requires the project to be inside a git repository.
         Worktree,
         /// Verify inside a container (Docker/podman). Maximum isolation.
         /// Not implemented yet.
@@ -1491,11 +1493,11 @@ pub mod config {
             }
         }
 
-        /// Whether this sandbox mode is implemented. Non-`Direct` modes fall
+        /// Whether this sandbox mode is implemented. Unimplemented modes fall
         /// back to a clear "not implemented" notice instead of silently
         /// skipping verification or running un-sandboxed.
         pub fn is_implemented(self) -> bool {
-            matches!(self, VerifySandbox::Direct)
+            matches!(self, VerifySandbox::Direct | VerifySandbox::Worktree)
         }
     }
 
@@ -1517,7 +1519,8 @@ pub mod config {
         pub enabled: bool,
         /// Maximum auto-fix attempts before failures are surfaced to the user.
         pub max_retries: u32,
-        /// Sandbox mode for verification. Only `direct` is implemented today.
+        /// Sandbox mode for verification. `direct` (default) and `git worktree`
+        /// are implemented; `container` reports a clear notice instead.
         pub sandbox: VerifySandbox,
         /// Run the linter/typechecker during verification.
         pub auto_lint: bool,

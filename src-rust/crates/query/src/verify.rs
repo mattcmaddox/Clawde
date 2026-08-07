@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use clawde_core::config::VerifyConfig;
+use clawde_core::config::{VerifyConfig, VerifySandbox};
 
 use crate::continuation::{ContinuationDecision, ContinuationPolicy, TurnEndContext};
 
@@ -306,7 +306,18 @@ impl ContinuationPolicy for VerifyPolicy {
             self.clear_report();
             return decision;
         }
-        let results = run_checks(&self.config, &self.working_dir);
+        let results = match run_checks(&self.config, &self.working_dir) {
+            Ok(results) => results,
+            Err(message) => {
+                // Sandbox setup failed (e.g. the worktree sandbox needs a git
+                // repository): stop with a clear note rather than silently
+                // skipping verification or running un-sandboxed.
+                self.clear_report();
+                return ContinuationDecision::Stop {
+                    note: Some(message),
+                };
+            }
+        };
         self.decide_with_results(ctx, &results)
     }
 
@@ -317,9 +328,35 @@ impl ContinuationPolicy for VerifyPolicy {
     }
 }
 
-/// Detect and run the project's configured test/lint commands, in order:
-/// tests first (they find behavioral regressions), then lints.
-fn run_checks(config: &VerifyConfig, working_dir: &Path) -> Vec<CheckResult> {
+/// Detect and run the project's configured test/lint commands inside the
+/// configured sandbox, in order: tests first (they find behavioral
+/// regressions), then lints.
+///
+/// Returns `Err` only when the sandbox itself cannot be set up (e.g. the
+/// `worktree` sandbox requires a git repository) — never for a failing check.
+fn run_checks(config: &VerifyConfig, working_dir: &Path) -> Result<Vec<CheckResult>, String> {
+    match config.sandbox {
+        VerifySandbox::Direct => Ok(run_checks_direct(config, working_dir)),
+        VerifySandbox::Worktree => {
+            crate::verify_sandbox::run_checks_in_worktree(config, working_dir)
+        }
+        VerifySandbox::Container => {
+            // Defense-in-depth: `preflight` already stops with a clearer
+            // "not implemented" notice before `run_checks` is reached. This
+            // arm exists only so the match stays exhaustive if callers ever
+            // invoke `run_checks` directly.
+            Err(
+                "Verify sandbox 'container' is not implemented yet — verification skipped. Set \
+                 \"verify\": {\"sandbox\": \"direct\"} in settings.json."
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Detect and run the project's configured test/lint commands directly in
+/// `working_dir`, in order: tests first, then lints.
+pub(crate) fn run_checks_direct(config: &VerifyConfig, working_dir: &Path) -> Vec<CheckResult> {
     let info = clawde_tools::detect_project::detect_project_info(working_dir);
     let mut results = Vec::new();
     if config.auto_test {
@@ -527,15 +564,17 @@ mod tests {
 
     #[test]
     fn unimplemented_sandbox_reports_clearly() {
+        // `container` remains unimplemented: preflight must stop with a clear
+        // "not implemented" note instead of silently skipping verification.
         let mut cfg = default_config();
-        cfg.sandbox = clawde_core::config::VerifySandbox::Worktree;
+        cfg.sandbox = clawde_core::config::VerifySandbox::Container;
         let decision = policy(cfg).decide(&ctx());
         assert!(!decision.is_continue());
         match decision {
             ContinuationDecision::Stop { note } => {
                 let note = note.expect("sandbox note must be present");
                 assert!(note.contains("not implemented"), "note: {note}");
-                assert!(note.contains("worktree"), "note: {note}");
+                assert!(note.contains("container"), "note: {note}");
             }
             _ => unreachable!(),
         }

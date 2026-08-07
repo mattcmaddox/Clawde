@@ -119,7 +119,7 @@ loop via the `Verify` continuation mode; disable it entirely with
 |-----|------|---------|-------------|
 | `verify.enabled` | boolean | true | Enable the execute-and-verify loop. Set `false` to return to the plain stop-after-one-turn behaviour. |
 | `verify.max_retries` | integer | 3 | Maximum auto-fix attempts before failures are surfaced to you. |
-| `verify.sandbox` | string | `direct` | Where verification runs. Only `direct` is implemented today; `worktree` and `container` are planned and currently report a clear "not implemented" notice instead of silently skipping. |
+| `verify.sandbox` | string | `direct` | Where verification runs. `direct` runs in the project directory (fast, but leaves build artifacts and other side effects). `git worktree` creates a temporary detached worktree, copies your uncommitted changes into it (tracked edits via a git diff, new files verbatim — gitignored files are excluded), runs the checks there, and removes it afterwards — clean isolation with no side effects on your working tree, but it requires the project to be inside a git repository and the first build is cold (no shared `target/` cache). `container` is not implemented yet and reports a clear "not implemented" notice instead of silently skipping. |
 | `verify.auto_test` | boolean | true | Run the detected test suite during verification. |
 | `verify.auto_lint` | boolean | true | Run the detected linter/typechecker during verification. |
 | `verify.skip_when_no_writes` | boolean | true | Skip verification on turns that only read/searched and wrote no files. |

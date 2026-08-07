@@ -28,6 +28,7 @@ pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
 pub mod verify;
+mod verify_sandbox;
 
 mod runner;
 pub use agent_tool::{init_team_swarm_runner, AgentTool};
