@@ -214,6 +214,14 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Per-upstream historical average latency in seconds, for the routing
+    /// dialog's model-performance view (spec §8.6). `None` means no samples
+    /// recorded yet. The default returns an empty vector — only composite
+    /// providers that multiplex upstreams override this.
+    fn upstream_latencies(&self) -> Vec<(String, Option<f64>)> {
+        Vec::new()
+    }
+
     /// Inject an external key exhaustion signal into the provider's key ring
     /// (e.g. from the health poller — spec §6.4).  Returns `true` if the
     /// key was marked exhausted; `false` when this provider has no key ring

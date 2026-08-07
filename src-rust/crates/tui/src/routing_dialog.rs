@@ -87,6 +87,9 @@ pub struct RoutingDialogState {
     pub overrides: HashMap<String, Vec<String>>,
     /// Routing strategy when the dialog opened (shown in the header).
     pub strategy: String,
+    /// Per-upstream average latency in seconds (`None` = no samples yet),
+    /// captured at open time for the model-performance view (spec §8.6).
+    pub latencies: Vec<(String, Option<f64>)>,
 }
 
 impl Default for RoutingDialogState {
@@ -101,6 +104,7 @@ impl Default for RoutingDialogState {
             last_upstream_visible: Cell::new(0),
             overrides: HashMap::new(),
             strategy: "sequential".to_string(),
+            latencies: Vec::new(),
         }
     }
 }
@@ -111,15 +115,25 @@ impl RoutingDialogState {
     }
 
     /// Open the dialog, seeding the overrides from the live config's
-    /// `providers.free.options.routing.task_preferences`.
-    pub fn open(&mut self, config: &Config) {
+    /// `providers.free.options.routing.task_preferences` and the per-upstream
+    /// latency snapshot for the model-performance view.
+    pub fn open(&mut self, config: &Config, latencies: Vec<(String, Option<f64>)>) {
         self.overrides = parse_task_preferences(config);
         self.strategy = parse_routing_strategy(config);
+        self.latencies = latencies;
         self.selected_task = 0;
         self.pane = RoutingPane::Tasks;
         self.upstream_idx = 0;
         self.upstream_scroll = 0;
         self.visible = true;
+    }
+
+    /// The recorded average latency for an upstream id, if any.
+    pub fn latency_for(&self, upstream_id: &str) -> Option<f64> {
+        self.latencies
+            .iter()
+            .find(|(id, _)| id == upstream_id)
+            .and_then(|(_, avg)| *avg)
     }
 
     pub fn close(&mut self) {
@@ -448,6 +462,11 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
         if !pinned && is_default {
             row.push_str(" (default)");
         }
+        // Model-performance column (spec §8.6): average latency when recorded.
+        match state.latency_for(upstream.id) {
+            Some(secs) => row.push_str(&format!("  {:.1}s", secs)),
+            None => row.push_str("  \u{2014}"),
+        }
 
         let style = if focused {
             Style::default()
@@ -531,7 +550,7 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg);
+        dialog.open(&cfg, Vec::new());
         assert!(dialog.visible);
         assert_eq!(dialog.strategy, "task_based");
         assert_eq!(
@@ -544,7 +563,7 @@ mod tests {
     #[test]
     fn toggle_pin_adds_and_removes() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default());
+        dialog.open(&Config::default(), Vec::new());
         dialog.selected_task = 0; // CodeGeneration
         assert!(!dialog.is_pinned("groq"));
         dialog.toggle_pin("groq");
@@ -570,7 +589,7 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg);
+        dialog.open(&cfg, Vec::new());
         dialog.selected_task = 0;
         dialog.reset_task();
         assert!(dialog.task_override(TaskType::CodeGeneration).is_empty());
@@ -583,7 +602,7 @@ mod tests {
     #[test]
     fn build_task_preferences_drops_empty_entries() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default());
+        dialog.open(&Config::default(), Vec::new());
         dialog.toggle_pin("groq");
         dialog.toggle_pin("groq"); // back to empty
         assert!(dialog.build_task_preferences().is_empty());
@@ -598,7 +617,7 @@ mod tests {
     #[test]
     fn assignment_summary_shows_pins_or_auto_defaults() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default());
+        dialog.open(&Config::default(), Vec::new());
         let auto = dialog.assignment_summary(TaskType::Verification);
         assert!(auto.starts_with("auto \u{b7} "), "got: {auto}");
         dialog.toggle_pin("groq");
@@ -609,7 +628,7 @@ mod tests {
     #[test]
     fn navigation_clamps_to_bounds() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default());
+        dialog.open(&Config::default(), Vec::new());
         dialog.select_prev();
         assert_eq!(dialog.selected_task, 0);
         for _ in 0..10 {
@@ -630,9 +649,25 @@ mod tests {
     }
 
     #[test]
+    fn open_captures_latency_snapshot() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            vec![
+                ("groq".to_string(), Some(1.25)),
+                ("cerebras".to_string(), None),
+            ],
+        );
+        assert_eq!(dialog.latency_for("groq"), Some(1.25));
+        assert_eq!(dialog.latency_for("cerebras"), None);
+        // Unknown upstreams (e.g. not configured) are absent.
+        assert_eq!(dialog.latency_for("google"), None);
+    }
+
+    #[test]
     fn scroll_keeps_cursor_visible() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default());
+        dialog.open(&Config::default(), Vec::new());
         dialog.switch_pane();
         dialog.last_upstream_visible.set(5);
         // Navigate past the window — select_next must scroll to keep the

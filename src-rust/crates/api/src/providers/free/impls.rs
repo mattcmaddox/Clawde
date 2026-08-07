@@ -1398,6 +1398,25 @@ impl LlmProvider for FreeProvider {
             .collect()
     }
 
+    fn upstream_latencies(&self) -> Vec<(String, Option<f64>)> {
+        // Per-upstream sliding-window average latency (seconds), for the
+        // routing dialog's model-performance view (spec §8.6). `None` when
+        // the upstream has no samples yet (`avg_latency`'s f64::MAX sentinel
+        // for empty windows). Locked once, never across an await.
+        let lat = self.latencies.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let avg = lat.avg_latency(idx);
+                (
+                    entry.upstream.id.to_string(),
+                    if avg >= f64::MAX { None } else { Some(avg) },
+                )
+            })
+            .collect()
+    }
+
     fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
         // Both cooldown kinds: "5xx" (server-error / circuit-breaker) and
         // "empty" (empty-completion). Locked once, never across an await.
@@ -1626,6 +1645,9 @@ mod tests {
         /// `(upstream_id, key_idx, cooldown_secs)` so tests can assert
         /// exhaustion forwarding from the composite provider.
         exhaustion: Option<ExhaustionRecorder>,
+        /// When set, records the `request.model` of every `create_message`
+        /// call so tests can assert dispatch ORDER through the plan.
+        attempt_log: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     #[async_trait]
@@ -1645,6 +1667,11 @@ mod tests {
             if let Some(rec) = &self.seen_max_tokens {
                 if let Ok(mut g) = rec.lock() {
                     *g = Some(request.max_tokens);
+                }
+            }
+            if let Some(log) = &self.attempt_log {
+                if let Ok(mut l) = log.lock() {
+                    l.push(request.model.clone());
                 }
             }
             if self.ok {
@@ -1731,6 +1758,23 @@ mod tests {
                 seen_max_tokens: None,
                 ring_status: None,
                 exhaustion: None,
+                attempt_log: None,
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn entry_with_log(id: &'static str, ok: bool, log: Arc<Mutex<Vec<String>>>) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok,
+                seen_max_tokens: None,
+                ring_status: None,
+                exhaustion: None,
+                attempt_log: Some(log),
             }),
             effective_model: None,
         }
@@ -1750,6 +1794,7 @@ mod tests {
                 seen_max_tokens: Some(recorder),
                 ring_status: None,
                 exhaustion: None,
+                attempt_log: None,
             }),
             effective_model: None,
         }
@@ -1765,6 +1810,7 @@ mod tests {
                 seen_max_tokens: None,
                 ring_status: None,
                 exhaustion: Some(recorder),
+                attempt_log: None,
             }),
             effective_model: None,
         }
@@ -1780,6 +1826,7 @@ mod tests {
                 seen_max_tokens: None,
                 ring_status: Some(ring),
                 exhaustion: None,
+                attempt_log: None,
             }),
             effective_model: None,
         }
@@ -2322,6 +2369,73 @@ mod tests {
             .await
             .expect("should succeed via cerebras");
         assert_eq!(resp.model, "gpt-oss-120b");
+    }
+
+    // ---- task-based dispatch through the real LlmProvider path -----------
+
+    #[tokio::test]
+    async fn task_based_dispatch_tries_task_preferred_upstream_first() {
+        // End-to-end plan → dispatch → fallback for a reasoning request:
+        // groq is in the reasoning preference list, huggingface is not, so
+        // the plan must try groq before huggingface even though the chain is
+        // ordered [huggingface, groq] in the catalog.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let chain = vec![
+            entry_with_log("huggingface", false, log.clone()),
+            entry_with_log("groq", false, log.clone()),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                ..Default::default()
+            },
+            false,
+        );
+        let req = ProviderRequest {
+            messages: vec![Message::user("why does the pool keep exhausting?")],
+            ..dummy_request("free/auto")
+        };
+        // Both upstreams fail — the round errors, but the ORDER of attempts
+        // is what this test asserts.
+        let _err = provider.create_message(req).await.unwrap_err();
+        let attempts: Vec<String> = log.lock().unwrap().clone();
+        let groq_model = catalog_entry("groq").unwrap().default_model;
+        let hf_model = catalog_entry("huggingface").unwrap().default_model;
+        assert_eq!(attempts.len(), 2, "both upstreams attempted");
+        assert_eq!(attempts[0], groq_model, "task-preferred upstream first");
+        assert_eq!(attempts[1], hf_model, "remaining upstream after prefs");
+    }
+
+    #[tokio::test]
+    async fn task_based_dispatch_falls_back_from_preferred_to_remaining() {
+        // Same chain, but groq fails and huggingface succeeds: the request
+        // must still reach huggingface after groq, and only after groq.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let chain = vec![
+            entry_with_log("huggingface", true, log.clone()),
+            entry_with_log("groq", false, log.clone()),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                ..Default::default()
+            },
+            false,
+        );
+        let req = ProviderRequest {
+            messages: vec![Message::user("why does the pool keep exhausting?")],
+            ..dummy_request("free/auto")
+        };
+        let resp = provider
+            .create_message(req)
+            .await
+            .expect("should fall back to huggingface");
+        let attempts: Vec<String> = log.lock().unwrap().clone();
+        let hf_model = catalog_entry("huggingface").unwrap().default_model;
+        assert_eq!(attempts.len(), 2, "groq tried before huggingface");
+        assert_eq!(resp.model, hf_model);
     }
 
     // -------------------------------------------------------------------

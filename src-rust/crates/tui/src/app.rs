@@ -3010,7 +3010,19 @@ impl App {
         }
         // /routing edit|pin: open the task-pinning dialog (spec §8.6).
         if cmd == "routing" && matches!(args.trim(), "edit" | "pin" | "tasks") {
-            self.routing_dialog.open(&self.config);
+            // Snapshot the free provider's per-upstream latency averages so
+            // the dialog can show the model-performance column (§8.6).
+            let latencies = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_latencies())
+                .unwrap_or_default();
+            self.routing_dialog.open(&self.config, latencies);
             return true;
         }
         // /keybindings preset <default|vim|emacs>: switch the active keybinding
