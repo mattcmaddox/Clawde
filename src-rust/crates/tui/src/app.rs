@@ -3667,7 +3667,10 @@ impl App {
     /// the loop stretches its poll interval so an idle session does not burn
     /// a core repainting a static screen at full rate.
     pub fn needs_fast_repaint(&self) -> bool {
-        self.is_streaming || self.effort_picker.wants_animation() || self.any_modal_open()
+        self.is_streaming
+            || self.is_verifying
+            || self.effort_picker.wants_animation()
+            || self.any_modal_open()
     }
 
     fn dismiss_error_notifications(&mut self) {

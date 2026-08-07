@@ -16,6 +16,29 @@ pub struct VerifyCommand;
 
 // ---- /verify -------------------------------------------------------------
 
+/// Run a manual `/verify` round: apply the subset argument (`test` / `lint` /
+/// `all`), then run the checks on a blocking thread.
+///
+/// Shared by [`VerifyCommand::execute`] and the CLI's async TUI dispatch (see
+/// `crates/cli/src/main.rs`) so the two paths can never diverge — the command
+/// registry stays the single source of truth for how a round runs.
+pub async fn run_verify_command(
+    config: &clawde_core::config::VerifyConfig,
+    working_dir: &std::path::Path,
+    args: &str,
+) -> Result<clawde_query::VerifyReport, String> {
+    let mut config = config.clone();
+    clawde_query::verify::apply_verify_subset(&mut config, args)?;
+    let working_dir = working_dir.to_path_buf();
+    // Spawn on a blocking thread: the checks run bounded external commands
+    // (tests/lints) and may take up to `timeout_secs` each.
+    let run = move || clawde_query::verify::run_verify_round(&config, &working_dir);
+    match tokio::task::spawn_blocking(run).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("Verification task failed: {e}")),
+    }
+}
+
 #[async_trait]
 impl SlashCommand for VerifyCommand {
     fn name(&self) -> &str {
@@ -59,28 +82,11 @@ impl SlashCommand for VerifyCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // Subset selection: default to both checks. A manual /verify must work
-        // even when the auto-loop is disabled, so only auto_test/auto_lint
-        // gate what runs — never `verify.enabled`.
-        let mut config = ctx.config.verify.clone();
-        match args.trim() {
-            "" | "all" => {}
-            "test" => config.auto_lint = false,
-            "lint" => config.auto_test = false,
-            other => {
-                return CommandResult::Error(format!(
-                    "Unknown /verify argument '{other}' — use test, lint, or all"
-                ));
-            }
-        }
-        let working_dir = ctx.working_dir.clone();
-        // Spawn on a blocking thread: the checks run bounded external commands
-        // (tests/lints) and may take up to `timeout_secs` each.
-        let run = move || clawde_query::verify::run_verify_round(&config, &working_dir);
-        match tokio::task::spawn_blocking(run).await {
-            Ok(Ok(report)) => CommandResult::Verify(report),
-            Ok(Err(message)) => CommandResult::Error(message),
-            Err(e) => CommandResult::Error(format!("Verification task failed: {}", e)),
+        // A manual /verify must work even when the auto-loop is disabled, so
+        // only auto_test/auto_lint gate what runs — never `verify.enabled`.
+        match run_verify_command(&ctx.config.verify, &ctx.working_dir, args).await {
+            Ok(report) => CommandResult::Verify(report),
+            Err(message) => CommandResult::Error(message),
         }
     }
 }

@@ -367,6 +367,29 @@ impl ContinuationPolicy for VerifyPolicy {
 ///
 /// Returns `Err` only when the sandbox itself cannot be set up (e.g. the
 /// `worktree` sandbox requires a git repository) — never for a failing check.
+/// Apply a `/verify` subset argument (`test` / `lint` / `all`) to a config
+/// clone. `Err` carries a user-facing message for an unknown argument.
+///
+/// Single source of truth shared by the `/verify` command's `execute` and the
+/// CLI's async dispatch, so the subset parsing can never diverge between the
+/// two paths.
+pub fn apply_verify_subset(config: &mut VerifyConfig, args: &str) -> Result<(), String> {
+    match args.trim() {
+        "" | "all" => Ok(()),
+        "test" => {
+            config.auto_lint = false;
+            Ok(())
+        }
+        "lint" => {
+            config.auto_test = false;
+            Ok(())
+        }
+        other => Err(format!(
+            "Unknown /verify argument '{other}' — use test, lint, or all"
+        )),
+    }
+}
+
 pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<VerifyReport, String> {
     if !config.auto_test && !config.auto_lint {
         return Ok(VerifyReport {
@@ -649,6 +672,33 @@ mod tests {
             ContinuationDecision::Stop { note } => assert!(note.is_none()),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn apply_verify_subset_selects_checks() {
+        let full = default_config();
+
+        // Default / all → both checks.
+        let mut cfg = full.clone();
+        apply_verify_subset(&mut cfg, "").unwrap();
+        assert!(cfg.auto_test && cfg.auto_lint);
+        apply_verify_subset(&mut cfg, "all").unwrap();
+        assert!(cfg.auto_test && cfg.auto_lint);
+
+        // test → lints off; lint → tests off.
+        let mut cfg = full.clone();
+        apply_verify_subset(&mut cfg, "test").unwrap();
+        assert!(cfg.auto_test && !cfg.auto_lint);
+        let mut cfg = full.clone();
+        apply_verify_subset(&mut cfg, "lint").unwrap();
+        assert!(!cfg.auto_test && cfg.auto_lint);
+
+        // Unknown arg → user-facing error.
+        let mut cfg = full.clone();
+        let err = apply_verify_subset(&mut cfg, "bogus").unwrap_err();
+        assert!(err.contains("Unknown /verify argument 'bogus'"));
+        // Failed parse must not have mutated the config.
+        assert!(cfg.auto_test && cfg.auto_lint);
     }
 
     #[test]

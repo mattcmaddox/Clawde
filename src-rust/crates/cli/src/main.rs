@@ -2844,6 +2844,46 @@ async fn run_interactive(
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
+
+                            // ── /verify: async dispatch ───────────────────────────
+                            // A manual round runs bounded external commands and can
+                            // take 30-180s (cold container image). Executing it
+                            // inline would freeze the render loop, so spawn it on a
+                            // background task and stream the result back through the
+                            // query event channel — the status row shows the same
+                            // 'verifying…' spinner the auto-verify loop uses. The
+                            // round itself runs through the shared command helper
+                            // (`verify_cmd::run_verify_command`) so this path can
+                            // never diverge from the command registry.
+                            if cmd_name == "verify" {
+                                if app.is_verifying {
+                                    app.push_notification(
+                                        clawde_tui::NotificationKind::Info,
+                                        "A verification round is already running".to_string(),
+                                        Some(3),
+                                    );
+                                    continue;
+                                }
+                                app.is_verifying = true;
+                                let vconfig = cmd_ctx.config.verify.clone();
+                                let wd = cmd_ctx.working_dir.clone();
+                                let args = cmd_args.clone();
+                                let tx = event_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = clawde_commands::verify_cmd::run_verify_command(
+                                        &vconfig, &wd, &args,
+                                    )
+                                    .await;
+                                    let _ = tx.send(match result {
+                                        Ok(report) => QueryEvent::Verify(report),
+                                        Err(message) => {
+                                            QueryEvent::Status(format!("Error: {message}"))
+                                        }
+                                    });
+                                });
+                                continue;
+                            }
+
                             let cli_result = execute_command(&input, &mut cmd_ctx).await;
                             // Key / auth mutations (/keys, /logout, /refresh clears
                             // saved auth) change the free-mode chain — refresh the

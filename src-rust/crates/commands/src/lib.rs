@@ -328,7 +328,7 @@ pub use diagnostics::*;
 mod providers;
 pub use providers::*;
 mod usage;
-mod verify_cmd;
+pub mod verify_cmd;
 pub use usage::*;
 pub use verify_cmd::*;
 mod extras;
