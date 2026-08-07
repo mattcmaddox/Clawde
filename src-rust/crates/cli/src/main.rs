@@ -1620,6 +1620,26 @@ fn normalize_provider_from_model(config: &mut Config) {
     }
 }
 
+/// Whether the free-mode routing strategy differs between two configs.
+///
+/// Compares only `providers.free.options.routing.strategy` — task-preference
+/// edits or unrelated config fields must NOT trigger a provider rebuild.
+fn routing_strategy_changed(before: &Config, after: &Config) -> bool {
+    let before_strategy = before
+        .provider_configs
+        .get("free")
+        .and_then(|pc| pc.options.get("routing"))
+        .and_then(|v| v.get("strategy"))
+        .and_then(|v| v.as_str());
+    let after_strategy = after
+        .provider_configs
+        .get("free")
+        .and_then(|pc| pc.options.get("routing"))
+        .and_then(|v| v.get("strategy"))
+        .and_then(|v| v.as_str());
+    before_strategy != after_strategy
+}
+
 /// Filter the tool list based on the agent's access level.
 /// - "full"        → all tools allowed (no filtering)
 /// - "read-only"   → only ReadOnly/None permission tools and AskUserQuestion
@@ -3152,6 +3172,12 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // Routing-strategy changes flow through
+                                    // ConfigChangeMessage (the /routing command) and
+                                    // rebuild the provider registry in that arm. If a
+                                    // future command flips the strategy via plain
+                                    // ConfigChange, mirror the routing_changed →
+                                    // reload_provider_runtime_state block there.
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     app.config = applied_cfg.clone();
@@ -3181,6 +3207,10 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // Captured BEFORE assigning cmd_ctx.config so the
+                                    // comparison sees the pre-change strategy.
+                                    let routing_changed =
+                                        routing_strategy_changed(&cmd_ctx.config, &applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     // Sync model/provider + fast_mode visual indicator.
@@ -3200,6 +3230,33 @@ async fn run_interactive(
                                     );
                                     let status_for_message = msg.clone();
                                     app.status_message = Some(status_for_message);
+                                    // A free-mode routing strategy change applies
+                                    // immediately: rebuild the provider registry in place
+                                    // so /routing auto (or sequential/random/latency/task)
+                                    // takes effect without /refresh. Non-destructive —
+                                    // unlike /refresh it does not clear saved provider
+                                    // state. A fresh FreeProvider resets in-memory
+                                    // cooldown/latency samples, acceptable for an explicit
+                                    // strategy switch (key-ring exhaustion state survives
+                                    // via its disk persistence).
+                                    if routing_changed {
+                                        match reload_provider_runtime_state(&applied_cfg).await {
+                                            Ok(refreshed) => {
+                                                cmd_ctx.provider_registry =
+                                                    Some(refreshed.provider_registry.clone());
+                                                base_query_config.provider_registry =
+                                                    Some(refreshed.provider_registry.clone());
+                                                app.provider_registry =
+                                                    Some(refreshed.provider_registry.clone());
+                                            }
+                                            Err(e) => {
+                                                app.status_message = Some(format!(
+                                                    "Routing strategy changed but applying \
+                                                     it failed: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.

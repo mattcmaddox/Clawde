@@ -2,8 +2,9 @@
 //
 // The routing strategy controls how the FreeProvider selects which upstream
 // to try first (sequential, random, latency-based). The setting is persisted
-// in settings.json under `providers.free.options.routing.strategy` and takes
-// effect after /refresh or restart.
+// in settings.json under `providers.free.options.routing.strategy` and the
+// CLI rebuilds the active provider on the strategy change, so it applies
+// immediately (no /refresh needed).
 
 use async_trait::async_trait;
 
@@ -49,7 +50,7 @@ impl SlashCommand for RoutingCommand {
            /tr                     — shortcut for /routing task\n\
 \
          The setting is persisted in settings.json under providers.free.options.routing\n\
-         and takes effect after /refresh or restart."
+         and applies immediately — the active provider is rebuilt on the change."
     }
 
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
@@ -239,7 +240,7 @@ async fn set_routing_strategy(ctx: &mut CommandContext, strategy: &str) -> Comma
         new_config,
         format!(
             "Routing strategy changed to '{}'.\n\
-             Run /refresh to apply it to the active provider.",
+             The active provider is rebuilt immediately — no /refresh needed.",
             display_name
         ),
     )

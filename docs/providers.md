@@ -131,8 +131,9 @@ selects upstream providers:
 ```
 
 The setting is persisted in `~/.clawde/settings.json` under
-`providers.free.options.routing.strategy` and takes effect after a restart
-or `/refresh`.
+`providers.free.options.routing.strategy` and applies immediately — the
+active provider is rebuilt on the change, so no restart or `/refresh` is
+needed.
 
 **Task-based routing (audit spec Phase 2):** with `strategy: "task_based"`,
 Clawde classifies each request into a task type (`code_generation`, `code_edit`,
