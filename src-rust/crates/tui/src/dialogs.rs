@@ -1295,13 +1295,22 @@ pub fn render_mcp_approval_dialog_frame(state: &McpApprovalDialogState, frame: &
 pub fn handle_mcp_approval_key(
     state: &mut McpApprovalDialogState,
     key: KeyEvent,
+    vim_enabled: bool,
 ) -> Option<McpApprovalChoice> {
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             state.select_prev();
             None
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Char('k') if vim_enabled => {
+            state.select_prev();
+            None
+        }
+        KeyCode::Down => {
+            state.select_next();
+            None
+        }
+        KeyCode::Char('j') if vim_enabled => {
             state.select_next();
             None
         }
@@ -1725,7 +1734,7 @@ mod tests {
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
         state.select_next(); // AllowAlways
-        let result = handle_mcp_approval_key(&mut state, key(KeyCode::Enter));
+        let result = handle_mcp_approval_key(&mut state, key(KeyCode::Enter), false);
         assert_eq!(result, Some(McpApprovalChoice::AllowAlways));
         assert!(!state.visible);
     }
@@ -1734,7 +1743,7 @@ mod tests {
     fn mcp_approval_key_esc_denies() {
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
-        let result = handle_mcp_approval_key(&mut state, key(KeyCode::Esc));
+        let result = handle_mcp_approval_key(&mut state, key(KeyCode::Esc), false);
         assert_eq!(result, Some(McpApprovalChoice::Deny));
         assert!(!state.visible);
     }
@@ -1744,17 +1753,17 @@ mod tests {
         // '1' → AllowSession
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('1')));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('1')), false);
         assert_eq!(r, Some(McpApprovalChoice::AllowSession));
 
         // '2' → AllowAlways
         state.show("s", None, None, vec![]);
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('2')));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('2')), false);
         assert_eq!(r, Some(McpApprovalChoice::AllowAlways));
 
         // '3' → Deny
         state.show("s", None, None, vec![]);
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('3')));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('3')), false);
         assert_eq!(r, Some(McpApprovalChoice::Deny));
     }
 
@@ -1762,7 +1771,7 @@ mod tests {
     fn mcp_approval_key_n_denies() {
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('n')));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('n')), false);
         assert_eq!(r, Some(McpApprovalChoice::Deny));
     }
 
@@ -1770,10 +1779,10 @@ mod tests {
     fn mcp_approval_key_navigation_returns_none() {
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Down));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Down), false);
         assert_eq!(r, None);
         assert!(state.visible); // still open
-        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Up));
+        let r = handle_mcp_approval_key(&mut state, key(KeyCode::Up), false);
         assert_eq!(r, None);
     }
 

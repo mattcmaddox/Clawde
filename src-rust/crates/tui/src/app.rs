@@ -3323,6 +3323,17 @@ impl App {
                 } else {
                     "disabled"
                 };
+                // Persist: save the preset to keybindings.json so it survives restarts.
+                let config_dir = Settings::config_dir();
+                let mut kb = UserKeybindings::load(&config_dir);
+                kb.preset = if self.prompt_input.vim_enabled {
+                    KeybindingPreset::Vim
+                } else {
+                    KeybindingPreset::Default
+                };
+                self.keybinding_preset = kb.preset;
+                self.keybindings = KeybindingResolver::new(&kb);
+                let _ = kb.save(&config_dir);
                 self.status_message = Some(format!("Vim mode {}.", status));
                 self.refresh_prompt_input();
                 true
@@ -4465,8 +4476,14 @@ impl App {
                     self.bypass_permissions_dialog.dismiss();
                     let _ = Self::persist_bypass_permissions_accepted();
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
+                KeyCode::Up => self.bypass_permissions_dialog.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.bypass_permissions_dialog.select_prev()
+                }
+                KeyCode::Down => self.bypass_permissions_dialog.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.bypass_permissions_dialog.select_next()
+                }
                 KeyCode::Enter => {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
@@ -4504,6 +4521,22 @@ impl App {
                     }
                     self.file_injection_dialog.dismiss();
                 }
+                KeyCode::Up => {
+                    self.file_injection_dialog.selected =
+                        self.file_injection_dialog.selected.min(1).saturating_sub(1);
+                }
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.file_injection_dialog.selected =
+                        self.file_injection_dialog.selected.min(1).saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.file_injection_dialog.selected =
+                        (self.file_injection_dialog.selected + 1).min(1);
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.file_injection_dialog.selected =
+                        (self.file_injection_dialog.selected + 1).min(1);
+                }
                 _ => {}
             }
             return false;
@@ -4535,8 +4568,14 @@ impl App {
         if self.effort_picker.visible {
             match key.code {
                 KeyCode::Esc => self.effort_picker.close(),
-                KeyCode::Left | KeyCode::Char('h') => self.effort_picker.select_prev(),
-                KeyCode::Right | KeyCode::Char('l') => self.effort_picker.select_next(),
+                KeyCode::Left => self.effort_picker.select_prev(),
+                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                    self.effort_picker.select_prev()
+                }
+                KeyCode::Right => self.effort_picker.select_next(),
+                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.effort_picker.select_next()
+                }
                 KeyCode::Enter => {
                     // Applying `Ultracode` here is equivalent to typing the
                     // `ultracode` keyword: it sets the effort to the top level.
@@ -4632,10 +4671,20 @@ impl App {
                 KeyCode::Enter => {
                     self.ask_user_dialog.confirm();
                 }
-                KeyCode::Up | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab if !self.ask_user_dialog.in_custom_input => {
                     self.ask_user_dialog.select_prev();
                 }
-                KeyCode::Down | KeyCode::Tab => {
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled && !self.ask_user_dialog.in_custom_input =>
+                {
+                    self.ask_user_dialog.select_prev();
+                }
+                KeyCode::Down | KeyCode::Tab if !self.ask_user_dialog.in_custom_input => {
+                    self.ask_user_dialog.select_next();
+                }
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled && !self.ask_user_dialog.in_custom_input =>
+                {
                     self.ask_user_dialog.select_next();
                 }
                 KeyCode::Char(c)
@@ -4877,6 +4926,11 @@ impl App {
                 }
                 VimSearchKey::Passthrough => {}
             }
+            let active_pending_empty = self
+                .free_mode_dialog
+                .fields
+                .get(self.free_mode_dialog.active_idx)
+                .is_none_or(|f| f.pending.is_empty());
             match key.code {
                 KeyCode::Esc => {
                     // Esc cascade: hide a revealed key → drop typed text → close.
@@ -4893,13 +4947,25 @@ impl App {
                 KeyCode::Down => {
                     self.free_mode_dialog.move_next();
                 }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled && active_pending_empty => {
+                    self.free_mode_dialog.move_next();
+                }
                 KeyCode::Up | KeyCode::BackTab => {
+                    self.free_mode_dialog.move_prev();
+                }
+                KeyCode::Char('k') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.free_mode_dialog.move_prev();
                 }
                 KeyCode::Right => {
                     self.free_mode_dialog.move_node_next();
                 }
+                KeyCode::Char('l') if self.prompt_input.vim_enabled && active_pending_empty => {
+                    self.free_mode_dialog.move_node_next();
+                }
                 KeyCode::Left => {
+                    self.free_mode_dialog.move_node_prev();
+                }
+                KeyCode::Char('h') if self.prompt_input.vim_enabled && active_pending_empty => {
                     self.free_mode_dialog.move_node_prev();
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -5050,7 +5116,13 @@ impl App {
                 KeyCode::Tab | KeyCode::Down => {
                     self.custom_provider_dialog.move_next_field();
                 }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.custom_provider_dialog.move_next_field();
+                }
                 KeyCode::Up => {
+                    self.custom_provider_dialog.move_prev_field();
+                }
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
                     self.custom_provider_dialog.move_prev_field();
                 }
                 KeyCode::Enter => {
@@ -5109,10 +5181,16 @@ impl App {
                 KeyCode::End => {
                     self.connect_dialog.move_end();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.connect_dialog.move_up();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Down => {
+                    self.connect_dialog.move_down();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.connect_dialog.move_down();
                 }
                 KeyCode::PageUp => {
@@ -5307,10 +5385,16 @@ impl App {
                 KeyCode::End => {
                     self.import_config_picker.move_end();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.import_config_picker.move_up();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.import_config_picker.move_up();
+                }
+                KeyCode::Down => {
+                    self.import_config_picker.move_down();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.import_config_picker.move_down();
                 }
                 KeyCode::PageUp => {
@@ -5382,10 +5466,16 @@ impl App {
                 KeyCode::End => {
                     self.command_palette.move_end();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.command_palette.move_up();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.command_palette.move_up();
+                }
+                KeyCode::Down => {
+                    self.command_palette.move_down();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.command_palette.move_down();
                 }
                 KeyCode::PageUp => {
@@ -5423,8 +5513,14 @@ impl App {
         if self.invalid_config_dialog.visible {
             match key.code {
                 KeyCode::Enter | KeyCode::Esc => self.invalid_config_dialog.dismiss(),
-                KeyCode::Up | KeyCode::Char('k') => self.invalid_config_dialog.scroll_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.invalid_config_dialog.scroll_down(20),
+                KeyCode::Up => self.invalid_config_dialog.scroll_up(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.invalid_config_dialog.scroll_up()
+                }
+                KeyCode::Down => self.invalid_config_dialog.scroll_down(20),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.invalid_config_dialog.scroll_down(20)
+                }
                 _ => {}
             }
             return false;
@@ -5580,8 +5676,14 @@ impl App {
             match self.session_branching.mode {
                 BranchBrowserMode::Browse => match key.code {
                     KeyCode::Esc => self.session_branching.cancel(),
-                    KeyCode::Up | KeyCode::Char('k') => self.session_branching.select_prev(),
-                    KeyCode::Down | KeyCode::Char('j') => self.session_branching.select_next(),
+                    KeyCode::Up => self.session_branching.select_prev(),
+                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                        self.session_branching.select_prev()
+                    }
+                    KeyCode::Down => self.session_branching.select_next(),
+                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                        self.session_branching.select_next()
+                    }
                     KeyCode::Char('n') => self.session_branching.start_create_new(),
                     KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
                     KeyCode::Enter => {
@@ -5703,8 +5805,12 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.keybindings_overlay.close();
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.keybindings_overlay.scroll_up(),
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Up => self.keybindings_overlay.scroll_up(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.keybindings_overlay.scroll_up()
+                }
+                KeyCode::Down => self.keybindings_overlay.scroll_down(u16::MAX),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.keybindings_overlay.scroll_down(u16::MAX)
                 }
                 KeyCode::PageUp => self.keybindings_overlay.page_up(),
@@ -5726,8 +5832,14 @@ impl App {
         if self.tasks_overlay.visible {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
-                KeyCode::Up | KeyCode::Char('k') => self.tasks_overlay.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.tasks_overlay.select_next(),
+                KeyCode::Up => self.tasks_overlay.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.tasks_overlay.select_prev()
+                }
+                KeyCode::Down => self.tasks_overlay.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.tasks_overlay.select_next()
+                }
                 KeyCode::Enter => {
                     if let Some((task_id, new_status)) =
                         self.tasks_overlay.cycle_and_persist_status()
@@ -5764,6 +5876,12 @@ impl App {
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
                     self.export_dialog.toggle();
                 }
+                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                    self.export_dialog.toggle();
+                }
+                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.export_dialog.toggle();
+                }
                 KeyCode::Char('1') => {
                     self.export_dialog.selected = ExportFormat::Json;
                 }
@@ -5786,8 +5904,12 @@ impl App {
                 }
                 // Scroll the modal body when the content overflows (long
                 // free-model chains push lower sections out of view).
-                KeyCode::Up | KeyCode::Char('k') => self.context_viz.scroll_up(),
-                KeyCode::Down | KeyCode::Char('j') => self.context_viz.scroll_down(),
+                KeyCode::Up => self.context_viz.scroll_up(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => self.context_viz.scroll_up(),
+                KeyCode::Down => self.context_viz.scroll_down(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.context_viz.scroll_down()
+                }
                 KeyCode::PageUp => self.context_viz.page_up(),
                 KeyCode::PageDown => self.context_viz.page_down(),
                 KeyCode::Home => self.context_viz.scroll_to_top(),
@@ -5799,9 +5921,11 @@ impl App {
 
         // MCP approval dialog
         if self.mcp_approval.visible {
-            if let Some(choice) =
-                crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key)
-            {
+            if let Some(choice) = crate::dialogs::handle_mcp_approval_key(
+                &mut self.mcp_approval,
+                key,
+                self.prompt_input.vim_enabled,
+            ) {
                 self.handle_mcp_approval_decision(choice);
             }
             return false;
@@ -5826,8 +5950,14 @@ impl App {
         if self.memory_file_selector.visible {
             match key.code {
                 KeyCode::Esc => self.memory_file_selector.close(),
-                KeyCode::Up | KeyCode::Char('k') => self.memory_file_selector.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.memory_file_selector.select_next(),
+                KeyCode::Up => self.memory_file_selector.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.memory_file_selector.select_prev()
+                }
+                KeyCode::Down => self.memory_file_selector.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.memory_file_selector.select_next()
+                }
                 KeyCode::Enter => {
                     // Selection acknowledged — consumer can read selected_path()
                     self.memory_file_selector.close();
@@ -5842,8 +5972,14 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.back(),
                 KeyCode::Enter => self.hooks_config_menu.enter(),
-                KeyCode::Up | KeyCode::Char('k') => self.hooks_config_menu.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.hooks_config_menu.select_next(),
+                KeyCode::Up => self.hooks_config_menu.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.hooks_config_menu.select_prev()
+                }
+                KeyCode::Down => self.hooks_config_menu.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.hooks_config_menu.select_next()
+                }
                 _ => {}
             }
             return false;
@@ -6695,10 +6831,12 @@ impl App {
             KeyCode::Tab | KeyCode::Right => self.stats_dialog.next_tab(),
             KeyCode::BackTab | KeyCode::Left => self.stats_dialog.prev_tab(),
             KeyCode::Char('r') => self.stats_dialog.cycle_range(),
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1),
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
                 self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1)
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1),
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                 self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1)
             }
             _ => {}
@@ -6796,8 +6934,10 @@ impl App {
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.agents_menu.go_back(),
-            KeyCode::Up | KeyCode::Char('k') => self.agents_menu.select_prev(),
-            KeyCode::Down | KeyCode::Char('j') => self.agents_menu.select_next(),
+            KeyCode::Up => self.agents_menu.select_prev(),
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.agents_menu.select_prev(),
+            KeyCode::Down => self.agents_menu.select_next(),
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.agents_menu.select_next(),
             KeyCode::Enter | KeyCode::Right => self.agents_menu.confirm_selection(),
             KeyCode::Left => self.agents_menu.go_back(),
             _ => {}
@@ -6812,14 +6952,28 @@ impl App {
                 let root = self.project_root();
                 self.diff_viewer.toggle_diff_type(&root);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if self.diff_viewer.active_pane == DiffPane::FileList {
                     self.diff_viewer.select_prev();
                 } else {
                     self.diff_viewer.scroll_detail_up();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_prev();
+                } else {
+                    self.diff_viewer.scroll_detail_up();
+                }
+            }
+            KeyCode::Down => {
+                if self.diff_viewer.active_pane == DiffPane::FileList {
+                    self.diff_viewer.select_next();
+                } else {
+                    self.diff_viewer.scroll_detail_down();
+                }
+            }
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                 if self.diff_viewer.active_pane == DiffPane::FileList {
                     self.diff_viewer.select_next();
                 } else {
@@ -7024,10 +7178,16 @@ impl App {
                 KeyCode::Enter => {
                     self.rewind_flow.confirm_selection();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.rewind_flow.selector.select_prev();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.rewind_flow.selector.select_prev();
+                }
+                KeyCode::Down => {
+                    self.rewind_flow.selector.select_next();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.rewind_flow.selector.select_next();
                 }
                 _ => {}
@@ -8432,8 +8592,10 @@ impl App {
         use crossterm::event::{KeyCode, KeyModifiers};
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.paste_viewer.close(),
-            KeyCode::Up | KeyCode::Char('k') => self.paste_viewer.scroll_up(1),
-            KeyCode::Down | KeyCode::Char('j') => self.paste_viewer.scroll_down(1),
+            KeyCode::Up => self.paste_viewer.scroll_up(1),
+            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.paste_viewer.scroll_up(1),
+            KeyCode::Down => self.paste_viewer.scroll_down(1),
+            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.paste_viewer.scroll_down(1),
             KeyCode::PageUp => self.paste_viewer.page_up(),
             KeyCode::PageDown => self.paste_viewer.page_down(),
             KeyCode::Home | KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),

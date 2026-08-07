@@ -8,9 +8,12 @@ use crate::overlays::{
     centered_rect, modal_search_line_with_insert, render_dark_overlay, render_dialog_bg,
     CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG,
 };
+use std::cell::Cell;
+
 use crate::vim_search::{VimSearch, VimSearchKey};
 use clawde_core::config::{Config, PermissionMode, Settings};
 use clawde_core::constants::DEFAULT_MAX_TOKENS;
+use clawde_core::keybindings::UserKeybindings;
 use clawde_core::output_styles::{builtin_styles, find_style};
 use clawde_tools::web_search::check_backend_configured;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -169,6 +172,12 @@ pub struct SettingsScreen {
     pub preferred_search_backend: String,
     /// Health warning message for the search backend (shown in description area).
     pub health_warning: String,
+    /// Keybinding preset from keybindings.json ("default"/"vim"/"emacs").
+    pub keybinding_preset: String,
+    /// Last known visible row count from the render pass, used by scroll tracking.
+    /// Uses Cell for interior mutability — set during render (behind &self),
+    /// read during key handling.
+    pub last_visible_rows: Cell<usize>,
     /// When true, the user is asked to confirm before discarding pending changes.
     pub confirming_discard: bool,
     /// Ollama: context window size (human label from OLLAMA_CTX_PRESETS).
@@ -229,13 +238,15 @@ impl SettingsScreen {
             fallback_retries: "1".to_string(),
             preferred_search_backend: "auto".to_string(),
             health_warning: String::new(),
+            last_visible_rows: Cell::new(10),
             confirming_discard: false,
             ollama_num_ctx: "12K".to_string(),
             ollama_keep_alive: "forever".to_string(),
             ollama_num_predict: "2K".to_string(),
             ollama_require_explicit_host: false,
-            ollama_default_host: String::new(),
+            ollama_default_host: "http://localhost:11434".to_string(),
             permission_mode: "default".to_string(),
+            keybinding_preset: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
         screen.apply_settings_from_snapshot();
@@ -389,7 +400,14 @@ impl SettingsScreen {
             .unwrap_or(false);
         self.ollama_default_host = ollama_opts
             .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
-            .unwrap_or("")
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://localhost:11434")
+            .to_string();
+
+        // Read keybinding preset from keybindings.json
+        self.keybinding_preset = UserKeybindings::load(&Settings::config_dir())
+            .preset
+            .label()
             .to_string();
 
         // Sync the env var so web_search.rs respects the stored preference immediately.
@@ -486,30 +504,36 @@ impl SettingsScreen {
                 "max_tokens" => {
                     if let Ok(n) = value.parse::<u32>() {
                         config.max_tokens = Some(n);
+                        self.settings_snapshot.config.max_tokens = Some(n);
                     }
                 }
                 "output_style" => {
-                    config.output_style = if value.is_empty() {
+                    let v = if value.is_empty() {
                         None
                     } else {
                         Some(value.clone())
                     };
+                    config.output_style = v.clone();
+                    self.settings_snapshot.config.output_style = v;
                 }
                 "compact_threshold" => {
                     if let Ok(n) = value.parse::<f32>() {
                         config.compact_threshold = n;
+                        self.settings_snapshot.config.compact_threshold = n;
                         self.compact_threshold = value.clone();
                     }
                 }
                 "fileAutocompleteLimit" => {
                     if let Ok(n) = value.parse::<usize>() {
                         config.file_autocomplete_limit = n;
+                        self.settings_snapshot.config.file_autocomplete_limit = n;
                         self.file_autocomplete_limit = value.clone();
                     }
                 }
                 "fileInjectionMaxSize" => {
                     if let Ok(n) = value.parse::<usize>() {
                         config.file_injection_max_size = n;
+                        self.settings_snapshot.config.file_injection_max_size = n;
                         self.file_injection_max_size = value.clone();
                     }
                 }
@@ -519,6 +543,13 @@ impl SettingsScreen {
                         let mut routing = get_or_create_routing_json(config);
                         routing["first_byte_timeout_secs"] = serde_json::Value::from(n);
                         config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing.clone());
+                        self.settings_snapshot
+                            .config
                             .provider_configs
                             .entry("free".to_string())
                             .or_default()
@@ -536,6 +567,13 @@ impl SettingsScreen {
                             .entry("free".to_string())
                             .or_default()
                             .options
+                            .insert("routing".to_string(), routing.clone());
+                        self.settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
                             .insert("routing".to_string(), routing);
                     }
                 }
@@ -545,6 +583,13 @@ impl SettingsScreen {
                         let mut routing = get_or_create_routing_json(config);
                         routing["health_poll_interval_secs"] = serde_json::Value::from(n);
                         config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing.clone());
+                        self.settings_snapshot
+                            .config
                             .provider_configs
                             .entry("free".to_string())
                             .or_default()
@@ -562,6 +607,13 @@ impl SettingsScreen {
                             .entry("free".to_string())
                             .or_default()
                             .options
+                            .insert("routing".to_string(), routing.clone());
+                        self.settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
                             .insert("routing".to_string(), routing);
                     }
                 }
@@ -573,8 +625,15 @@ impl SettingsScreen {
                         .filter(|s| !s.is_empty())
                         .collect();
                     let mut routing = get_or_create_routing_json(config);
-                    routing["disabled_upstreams"] = serde_json::Value::from(parsed);
+                    routing["disabled_upstreams"] = serde_json::Value::from(parsed.clone());
                     config
+                        .provider_configs
+                        .entry("free".to_string())
+                        .or_default()
+                        .options
+                        .insert("routing".to_string(), routing.clone());
+                    self.settings_snapshot
+                        .config
                         .provider_configs
                         .entry("free".to_string())
                         .or_default()
@@ -593,11 +652,46 @@ impl SettingsScreen {
                             "require_explicit_host".to_string(),
                             serde_json::Value::from(val),
                         );
+                    self.settings_snapshot
+                        .config
+                        .provider_configs
+                        .entry("ollama".to_string())
+                        .or_default()
+                        .options
+                        .insert(
+                            "require_explicit_host".to_string(),
+                            serde_json::Value::from(val),
+                        );
                 }
                 "ollama_default_host" => {
-                    self.ollama_default_host = value.clone();
-                    if value.is_empty() {
+                    let trimmed = value.trim();
+                    // Show a warning for URLs that don't look like HTTP endpoints,
+                    // but don't block the save — the user may have a valid reason.
+                    if !trimmed.is_empty()
+                        && !trimmed.starts_with("http://")
+                        && !trimmed.starts_with("https://")
+                    {
+                        self.health_warning = format!(
+                            "Saved '{}' — URL should start with http:// or https://",
+                            trimmed
+                        );
+                    } else {
+                        self.health_warning.clear();
+                    }
+                    self.ollama_default_host = if trimmed.is_empty() {
+                        "http://localhost:11434".to_string()
+                    } else {
+                        trimmed.to_string()
+                    };
+                    if trimmed.is_empty() {
                         config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .remove("default_host");
+                        self.settings_snapshot
+                            .config
                             .provider_configs
                             .entry("ollama".to_string())
                             .or_default()
@@ -613,12 +707,21 @@ impl SettingsScreen {
                                 "default_host".to_string(),
                                 serde_json::Value::from(value.clone()),
                             );
+                        self.settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert(
+                                "default_host".to_string(),
+                                serde_json::Value::from(value.clone()),
+                            );
                     }
                 }
                 _ => {}
             }
         }
-        self.settings_snapshot.config = config.clone();
         let _ = self.settings_snapshot.save_sync();
         self.pending_changes.clear();
     }
@@ -811,6 +914,9 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
             .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
             .unwrap_or_default()
             .to_string(),
+        // Keybinding preset lives in keybindings.json, not settings.json.
+        // Origin tracking for this entry is handled through the screen field.
+        "keybinding_preset" => String::new(),
         _ => String::new(),
     }
 }
@@ -836,7 +942,8 @@ fn default_value_for(key: &str) -> String {
         | "ollama_keep_alive"
         | "ollama_num_predict"
         | "ollama_require_explicit_host"
-        | "ollama_default_host" => String::new(),
+        | "ollama_default_host"
+        | "keybinding_preset" => String::new(),
         "auto_compact"
         | "notifications"
         | "terminal_progress_bar"
@@ -1181,6 +1288,18 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             SettingKind::Bool,
             bool_v(screen.mouse_capture),
         ),
+        make_entry(
+            "keybinding_preset",
+            "Keybinding preset",
+            "Keyboard shortcuts profile: default, vim (hjkl navigation), or emacs (readline chords). Takes effect on next session.",
+            SECTION_INTERFACE,
+            "default".to_string(),
+            SettingEffect::NextSession,
+            SettingKind::Enum {
+                options: vec!["default", "vim", "emacs"],
+            },
+            screen.keybinding_preset.clone(),
+        ),
         // ---- Workspace & files ------------------------------------------
         make_entry(
             "show_cwd",
@@ -1516,6 +1635,9 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         Paragraph::new(search_line).style(Style::default().bg(CLAURST_PANEL_BG)),
         search_area,
     );
+
+    // Store the actual visible row count for scroll tracking.
+    screen.last_visible_rows.set(content_area.height as usize);
 
     // Content
     render_settings_list(frame, screen, content_area);
@@ -1990,7 +2112,7 @@ fn update_scroll_offset_for_selection(screen: &mut SettingsScreen) {
         return;
     }
     let visual = visual_line_for(&filtered, screen.selected_idx);
-    let visible_rows = 10; // Rough estimate, will be actual in real usage
+    let visible_rows = screen.last_visible_rows.get().max(1);
     if visual < screen.scroll_offset {
         screen.scroll_offset = visual;
     } else if visual >= screen.scroll_offset + visible_rows {
@@ -2263,6 +2385,13 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .entry("free".to_string())
                             .or_default()
                             .options
+                            .insert("routing".to_string(), routing.clone());
+                        // Also update the live config so the change takes effect immediately.
+                        config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
                             .insert("routing".to_string(), routing);
                         let _ = screen.settings_snapshot.save_sync();
                     }
@@ -2302,6 +2431,7 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                     }
                     "ollama_require_explicit_host" => {
                         screen.ollama_require_explicit_host = new_value;
+                        let val = serde_json::Value::from(new_value);
                         screen
                             .settings_snapshot
                             .config
@@ -2309,10 +2439,13 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .entry("ollama".to_string())
                             .or_default()
                             .options
-                            .insert(
-                                "require_explicit_host".to_string(),
-                                serde_json::Value::from(new_value),
-                            );
+                            .insert("require_explicit_host".to_string(), val.clone());
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("require_explicit_host".to_string(), val);
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
@@ -2332,6 +2465,15 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                         // immediately, not just for the next session.
                         config.permission_mode = mode;
                         let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "keybinding_preset" => {
+                        screen.keybinding_preset = new_value.to_string();
+                        let config_dir = Settings::config_dir();
+                        let mut kb = UserKeybindings::load(&config_dir);
+                        kb.preset =
+                            clawde_core::keybindings::KeybindingPreset::from_name(new_value)
+                                .unwrap_or_default();
+                        let _ = kb.save(&config_dir);
                     }
                     "output_style" => {
                         screen.output_style = new_value.to_string();
@@ -2357,6 +2499,13 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                         screen
                             .settings_snapshot
                             .config
+                            .provider_configs
+                            .entry("free".to_string())
+                            .or_default()
+                            .options
+                            .insert("routing".to_string(), routing.clone());
+                        // Also update the live config so the change takes effect immediately.
+                        config
                             .provider_configs
                             .entry("free".to_string())
                             .or_default()
@@ -2399,6 +2548,12 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .entry("ollama".to_string())
                             .or_default()
                             .options
+                            .insert("num_ctx".to_string(), val.clone());
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
                             .insert("num_ctx".to_string(), val);
                         let _ = screen.settings_snapshot.save_sync();
                     }
@@ -2412,6 +2567,12 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .entry("ollama".to_string())
                             .or_default()
                             .options
+                            .insert("keep_alive".to_string(), val.clone());
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
                             .insert("keep_alive".to_string(), val);
                         let _ = screen.settings_snapshot.save_sync();
                     }
@@ -2421,6 +2582,12 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                         screen
                             .settings_snapshot
                             .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("num_predict".to_string(), val.clone());
+                        config
                             .provider_configs
                             .entry("ollama".to_string())
                             .or_default()
