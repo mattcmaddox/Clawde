@@ -1985,7 +1985,28 @@ pub async fn run_query_loop(
                     // its own future (which would make the future !Send).
                     {
                         let clawde_home = clawde_core::config::Settings::config_dir();
-                        let memory_dir = Some(clawde_home.join("memory"));
+                        // Consolidate into the project-scoped auto-memory dir
+                        // (memdir convention) so the files maintained here are
+                        // exactly the ones injected into the system prompt at
+                        // session start. Resolve the project from the same
+                        // source the prompt builder uses (`working_directory`,
+                        // i.e. project_dir) with the session cwd as fallback,
+                        // so consolidation and injection can never target
+                        // different dirs. Falls back to the legacy global
+                        // `memory/` dir when neither is a real project path.
+                        let memory_dir = {
+                            let project = config
+                                .working_directory
+                                .as_deref()
+                                .filter(|d| !d.is_empty())
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|| tool_ctx.working_dir.clone());
+                            if project.is_dir() {
+                                Some(clawde_core::memdir::auto_memory_path(&project))
+                            } else {
+                                Some(clawde_home.join("memory"))
+                            }
+                        };
                         let conversations_dir = Some(clawde_home.join("conversations"));
                         if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
                             let dreamer = crate::auto_dream::AutoDream::new(mem, conv);

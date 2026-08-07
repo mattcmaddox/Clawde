@@ -446,9 +446,9 @@ pub fn truncate_entrypoint_content(raw: &str) -> EntrypointTruncation {
     };
 
     if truncated.len() > MAX_ENTRYPOINT_BYTES {
-        let cut_at = truncated[..MAX_ENTRYPOINT_BYTES]
-            .rfind('\n')
-            .unwrap_or(MAX_ENTRYPOINT_BYTES);
+        // floor_char_boundary guards against slicing mid-UTF-8-char.
+        let boundary = truncated.floor_char_boundary(MAX_ENTRYPOINT_BYTES);
+        let cut_at = truncated[..boundary].rfind('\n').unwrap_or(boundary);
         truncated.truncate(cut_at);
     }
 
@@ -494,18 +494,89 @@ pub fn load_memory_index(memory_dir: &Path) -> Option<EntrypointTruncation> {
 
 // ---------------------------------------------------------------------------
 // System-prompt memory content builder
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------/// Maximum bytes loaded from a single session summary. Kept conservative so
+/// the combined memory injection (index + summary) stays within a few percent
+/// of a typical 128K context window (audit spec §18.3 token-budget concern).
+const MAX_SESSION_SUMMARY_BYTES: usize = 4_000;
+
+/// Load the most recently modified session summary from `sessions/`.
+///
+/// Returns `None` when the directory is missing or empty.  Summaries are
+/// capped at `MAX_SESSION_SUMMARY_BYTES` — a session summary is a supplement
+/// to the primary `MEMORY.md` index, not a replacement for it.  Equal-mtime
+/// ties break by filename (summaries are date-named, so the newest date wins)
+/// for determinism.
+pub fn most_recent_session_summary(memory_dir: &Path) -> Option<String> {
+    let sessions_dir = memory_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+        return None;
+    };
+
+    let mut newest: Option<(u64, String, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_md = path.extension().map(|e| e == "md").unwrap_or(false);
+        if !is_md {
+            continue;
+        }
+        let modified_secs = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or(0);
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let is_newer = newest
+            .as_ref()
+            .map(|(t, name, _)| (modified_secs, &file_name) > (*t, name))
+            .unwrap_or(true);
+        if is_newer {
+            newest = Some((modified_secs, file_name, path));
+        }
+    }
+
+    let (_modified_secs, _file_name, path) = newest?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+
+    if raw.len() > MAX_SESSION_SUMMARY_BYTES {
+        // Cut at a line boundary (newlines are ASCII, so a boundary found via
+        // `rfind` is a safe char boundary). `floor_char_boundary` keeps the
+        // initial slice from panicking when the cap splits a multibyte char.
+        let boundary = raw.floor_char_boundary(MAX_SESSION_SUMMARY_BYTES);
+        let cut_at = raw[..boundary].rfind('\n').unwrap_or(boundary);
+        Some(format!(
+            "{}…\n\n> WARNING: session summary truncated — larger than {} bytes.",
+            &raw[..cut_at],
+            MAX_SESSION_SUMMARY_BYTES
+        ))
+    } else {
+        Some(raw)
+    }
+}
 
 /// Build the memory content string to inject into the system prompt's
 /// `<memory>` block.
 ///
-/// Always includes the `MEMORY.md` index when it exists.
+/// Includes the `MEMORY.md` index when it exists, plus the most recent
+/// session summary from `sessions/` when one is available.
 /// Called during `build_system_prompt` → `SystemPromptOptions::memory_content`.
 pub fn build_memory_prompt_content(memory_dir: &Path) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(index) = load_memory_index(memory_dir) {
         parts.push(format!("## Memory Index (MEMORY.md)\n{}", index.content));
+    }
+
+    if let Some(summary) = most_recent_session_summary(memory_dir) {
+        parts.push(format!("## Recent Session Summary\n{}", summary));
     }
 
     parts.join("\n\n")
@@ -869,6 +940,76 @@ mod tests {
     #[test]
     fn test_memory_type_unknown_returns_none() {
         assert!(MemoryType::parse("bogus").is_none());
+    }
+
+    // ---- most_recent_session_summary --------------------------------------
+
+    #[test]
+    fn test_most_recent_session_summary_missing_dir() {
+        let dir = make_temp_dir();
+        assert!(most_recent_session_summary(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_most_recent_session_summary_empty_sessions_dir() {
+        let dir = make_temp_dir();
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        assert!(most_recent_session_summary(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_most_recent_session_summary_picks_newest() {
+        let dir = make_temp_dir();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let old = sessions.join("2026-07-01.md");
+        let new = sessions.join("2026-08-01.md");
+        std::fs::write(&old, "Old summary").unwrap();
+        std::fs::write(&new, "New summary").unwrap();
+        // Bump the new file's mtime into the future to disambiguate filesystem
+        // timestamp granularity. Tolerate filesystems that coerce the mtime.
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&new)
+            .and_then(|f| f.set_modified(future));
+        // The filename tiebreak makes the choice deterministic even when both
+        // mtimes are equal (date-named summaries sort newest-date-last).
+        let summary = most_recent_session_summary(dir.path()).unwrap();
+        assert!(summary.contains("New summary"));
+    }
+
+    #[test]
+    fn test_most_recent_session_summary_ignores_non_md() {
+        let dir = make_temp_dir();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("notes.txt"), "not a summary").unwrap();
+        assert!(most_recent_session_summary(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_build_memory_prompt_content_includes_index_and_summary() {
+        let dir = make_temp_dir();
+        write_file(dir.path(), "MEMORY.md", "- [a.md](a.md) — index entry");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("2026-08-01.md"),
+            "## Yesterday\nShipped the routing dialog.",
+        )
+        .unwrap();
+        let content = build_memory_prompt_content(dir.path());
+        assert!(content.contains("Memory Index"));
+        assert!(content.contains("index entry"));
+        assert!(content.contains("Recent Session Summary"));
+        assert!(content.contains("Shipped the routing dialog."));
+    }
+
+    #[test]
+    fn test_build_memory_prompt_content_empty_dir() {
+        let dir = make_temp_dir();
+        assert!(build_memory_prompt_content(dir.path()).is_empty());
     }
 
     // ---- is_auto_memory_enabled -------------------------------------------

@@ -15,7 +15,7 @@ impl SlashCommand for MemoryCommand {
         "memory"
     }
     fn description(&self) -> &str {
-        "View, edit, or clear AGENTS.md memory files"
+        "View, edit, or clear memory files (AGENTS.md + project memory)"
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
@@ -29,10 +29,15 @@ impl SlashCommand for MemoryCommand {
                 description: "Clear project AGENTS.md".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show project memory (auto-memory) status".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
-        "Usage: /memory [edit|clear] [global]\n\n\
+        "Usage: /memory [edit|clear|status] [global]\n\n\
          Shows the content of AGENTS.md files that provide project context to Clawde.\n\
          Clawde reads these files automatically at session start.\n\n\
          Subcommands:\n\
@@ -40,7 +45,8 @@ impl SlashCommand for MemoryCommand {
            /memory edit         — open project AGENTS.md in your editor\n\
            /memory edit global  — open global ~/.clawde/AGENTS.md in your editor\n\
            /memory clear        — clear the project AGENTS.md\n\
-           /memory clear global — clear the global ~/.clawde/AGENTS.md\n\n\
+           /memory clear global — clear the global ~/.clawde/AGENTS.md\n\
+           /memory status       — show project memory dir, index, and session summaries\n\n\
          Locations checked (in priority order):\n\
            1. <project>/.claurst/AGENTS.md\n\
            2. <project>/AGENTS.md\n\
@@ -162,6 +168,51 @@ impl SlashCommand for MemoryCommand {
             };
         }
 
+        // ---- /memory status ----------------------------------------------------
+        if cmd == "status" {
+            use clawde_core::memdir::{
+                auto_memory_path, load_memory_index, most_recent_session_summary, scan_memory_dir,
+            };
+            let mem_dir = auto_memory_path(&ctx.working_dir);
+            let mut out =
+                String::from("Project Memory (auto-memory)\n══════════════════════════════\n");
+            out.push_str(&format!("Directory: {}\n", mem_dir.display()));
+            if !mem_dir.is_dir() {
+                out.push_str(
+                    "No project memory yet. It is created automatically when the agent\n\
+                     first writes a memory file (auto-dream consolidation or the memory tools).",
+                );
+                return CommandResult::Message(out);
+            }
+            match load_memory_index(&mem_dir) {
+                Some(index) => out.push_str(&format!(
+                    "Index (MEMORY.md): {} lines, {} bytes{}\n",
+                    index.line_count,
+                    index.byte_count,
+                    if index.was_line_truncated || index.was_byte_truncated {
+                        " (truncated)"
+                    } else {
+                        ""
+                    }
+                )),
+                None => out.push_str("Index (MEMORY.md): not present\n"),
+            }
+            let files = scan_memory_dir(&mem_dir);
+            out.push_str(&format!("Memory files: {}\n", files.len()));
+            let sessions_dir = mem_dir.join("sessions");
+            let session_count = std::fs::read_dir(&sessions_dir)
+                .map(|e| e.flatten().filter(|f| f.path().is_file()).count())
+                .unwrap_or(0);
+            out.push_str(&format!("Session summaries: {}\n", session_count));
+            if let Some(summary) = most_recent_session_summary(&mem_dir) {
+                out.push_str(&format!(
+                    "Most recent summary: {} chars (injected into system prompt)\n",
+                    summary.len()
+                ));
+            }
+            return CommandResult::Message(out);
+        }
+
         // ---- /memory (show all) -----------------------------------------------
         let mut output = String::from("AGENTS.md Memory Files\n══════════════════════\n");
         let mut found_any = false;
@@ -219,5 +270,76 @@ impl SlashCommand for MemoryCommand {
         }
 
         CommandResult::Message(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx() -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    fn message_text(result: CommandResult) -> String {
+        match result {
+            CommandResult::Message(text) => text,
+            other => panic!("expected CommandResult::Message, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_status_shows_project_memory() {
+        // Point CLAWDE_HOME at a temp dir (auto_memory_path resolves under it)
+        // and seed a project-scoped memory dir for a fake working dir.
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(mem_dir.join("sessions")).unwrap();
+        std::fs::write(
+            mem_dir.join("MEMORY.md"),
+            "- [architecture.md](architecture.md) — index",
+        )
+        .unwrap();
+        std::fs::write(
+            mem_dir.join("sessions").join("2026-08-01.md"),
+            "## Session\nShipped the routing dialog.",
+        )
+        .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("status", &mut ctx).await);
+
+        assert!(out.contains("Project Memory (auto-memory)"), "got: {}", out);
+        assert!(out.contains("Index (MEMORY.md): 1 lines"), "got: {}", out);
+        // The session summary is a `.md` file, so scan_memory_dir counts it.
+        assert!(out.contains("Memory files: 1"), "got: {}", out);
+        assert!(out.contains("Session summaries: 1"), "got: {}", out);
+        assert!(out.contains("Most recent summary: "), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_status_empty_dir_reports_nothing_configured() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("status", &mut ctx).await);
+
+        assert!(out.contains("No project memory yet"), "got: {}", out);
     }
 }

@@ -15,14 +15,32 @@ use crate::*;
 pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     use clawde_core::system_prompt::SystemPromptOptions;
 
+    // Load project memory (memdir) into the dynamic `<memory>` section when a
+    // working directory is known and auto-memory is enabled.  Empty when no
+    // memory files exist yet, so the injection is a no-op on first runs.
+    let memory_content = config
+        .working_directory
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| {
+            use clawde_core::memdir::{
+                auto_memory_path, build_memory_prompt_content, is_auto_memory_enabled,
+            };
+            if !is_auto_memory_enabled(None) {
+                return String::new();
+            }
+            build_memory_prompt_content(&auto_memory_path(std::path::Path::new(dir)))
+        })
+        .unwrap_or_default();
+
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
         // All other fields use sensible defaults:
         // - prefix:                auto-detect from env
-        // - memory_content:        empty (callers inject via append if needed)
         // - replace_system_prompt: false (additive mode)
         // - coordinator_mode:      false
+        memory_content,
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),

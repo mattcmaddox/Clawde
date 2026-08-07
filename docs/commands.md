@@ -691,15 +691,31 @@ Analyze context window usage. Shows a breakdown of tokens consumed by system pro
 
 ### /memory
 
-Manage session memory. Memory entries are short notes persisted across sessions. The model can read these at session start to maintain continuity.
+Manage memory files: the AGENTS.md instruction files that provide project context, plus the project auto-memory store (`MEMORY.md` index + session summaries) that is injected into the system prompt at session start.
 
 ```
-/memory
-/memory list
-/memory add <note>
-/memory delete <id>
-/memory clear
+/memory               — show all AGENTS.md memory files
+/memory edit          — open the project AGENTS.md in your editor
+/memory edit global   — open the global ~/.clawde/AGENTS.md in your editor
+/memory clear         — clear the project AGENTS.md
+/memory clear global  — clear the global ~/.clawde/AGENTS.md
+/memory status        — show the project auto-memory dir, MEMORY.md index state,
+                        memory-file count, and session summaries
 ```
+
+AGENTS.md locations checked (in priority order):
+
+1. `<project>/.claurst/AGENTS.md`
+2. `<project>/AGENTS.md`
+3. `~/.clawde/AGENTS.md`  (global)
+
+Project auto-memory lives under `~/.clawde/projects/<project>/memory/`
+(`MEMORY.md` plus `sessions/`). When present, the index and the most recent
+session summary are injected into the system prompt's `<memory>` block each
+turn, so the model starts every session already knowing the project's
+architecture, conventions, and recent work. The auto-dream consolidation
+pass maintains these files automatically; `/memory status` shows their
+state. Disable the injection with the `CLAURST_DISABLE_AUTO_MEMORY` env var.
 
 ---
 
