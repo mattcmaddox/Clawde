@@ -124,6 +124,36 @@ impl ContinuationPolicy for GoalPolicy {
     }
 }
 
+/// Spec-driven development continuation policy (audit spec Phase 4, §10).
+///
+/// After a turn that wrote files, checks whether a structured spec was
+/// produced (`specs/<title>.json` in the working dir). If one exists, the
+/// loop stops and surfaces the spec for the user to review (Accept / Edit /
+/// Reject — the TUI review dialog or `/spec-review <file>`); the agent must
+/// not implement against an unreviewed spec (§10.2). If the turn produced no
+/// spec, behaves like `StopPolicy`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecModePolicy;
+
+impl ContinuationPolicy for SpecModePolicy {
+    fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision {
+        if ctx.turn_made_writes {
+            if let Some((path, spec)) = clawde_core::spec::Spec::latest_in(ctx.working_dir) {
+                return ContinuationDecision::Stop {
+                    note: Some(format!(
+                        "Spec generated: \"{}\" ({}). Review it before implementing — \
+                         run /spec-review {}",
+                        spec.title,
+                        path.display(),
+                        path.display()
+                    )),
+                };
+            }
+        }
+        ContinuationDecision::Stop { note: None }
+    }
+}
+
 /// Selects which continuation policy `run_query_loop` uses for a run.
 ///
 /// Stored on `QueryConfig` so callers opt in per invocation. Subagents,
@@ -139,6 +169,9 @@ pub enum ContinuationMode {
     /// that wrote files, run the project's tests/lints and feed failures back
     /// to the model for auto-fix, up to `max_retries`.
     Verify(clawde_core::config::VerifyConfig),
+    /// Spec-driven development (audit spec Phase 4, §10): after a turn that
+    /// produced a spec, stop so the user can review it before implementation.
+    SpecMode,
 }
 
 impl ContinuationMode {
@@ -154,6 +187,7 @@ impl ContinuationMode {
                 config,
                 working_dir.to_path_buf(),
             )),
+            ContinuationMode::SpecMode => Box::new(SpecModePolicy),
         }
     }
 }
@@ -201,5 +235,56 @@ mod tests {
             ContinuationDecision::Stop { note } => assert!(note.is_none()),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn spec_mode_stops_with_review_note_when_spec_written() {
+        let dir = std::env::temp_dir().join(format!("clawde-spec-mode-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).expect("create specs dir");
+        let spec = clawde_core::spec::Spec {
+            title: "Rate-Limiting Middleware".to_string(),
+            ..Default::default()
+        };
+        spec.write_to(&dir.join("specs/rate-limiting.json"))
+            .expect("write spec");
+
+        let decision = SpecModePolicy.decide(&TurnEndContext {
+            session_id: "sess",
+            total_tokens_used: 0,
+            turn_elapsed_secs: 0,
+            working_dir: &dir,
+            turn_made_writes: true,
+        });
+        assert!(!decision.is_continue());
+        match decision {
+            ContinuationDecision::Stop { note } => {
+                let note = note.expect("review note present");
+                assert!(note.contains("Spec generated"));
+                assert!(note.contains("Rate-Limiting Middleware"));
+                assert!(note.contains("/spec-review"));
+            }
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_mode_stops_silently_without_spec() {
+        let dir =
+            std::env::temp_dir().join(format!("clawde-spec-mode-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let decision = SpecModePolicy.decide(&TurnEndContext {
+            session_id: "sess",
+            total_tokens_used: 0,
+            turn_elapsed_secs: 0,
+            working_dir: &dir,
+            turn_made_writes: true,
+        });
+        assert!(!decision.is_continue());
+        match decision {
+            ContinuationDecision::Stop { note } => assert!(note.is_none()),
+            _ => unreachable!(),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

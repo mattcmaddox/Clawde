@@ -82,6 +82,42 @@ impl Spec {
         std::fs::write(path, self.to_json())
     }
 
+    /// Load the most recently modified spec from `dir/specs/*.json`, if any.
+    ///
+    /// Used by the spec-mode continuation policy and the verify loop to find
+    /// the spec currently under review. `None` when the `specs/` directory
+    /// does not exist, holds no `.json` files, or none of them parse. A single
+    /// unreadable or unparseable entry never aborts the scan — it is skipped.
+    pub fn latest_in(dir: &std::path::Path) -> Option<(std::path::PathBuf, Spec)> {
+        let specs_dir = dir.join("specs");
+        let entries = std::fs::read_dir(&specs_dir).ok()?;
+        // Collect every spec JSON with its mtime; unreadable entries are
+        // skipped (never abort the scan).
+        let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    candidates.push((path, modified));
+                }
+            }
+        }
+        // Walk newest-first, skipping files that fail to parse, so an
+        // unreadable/broken newest spec falls back to an older valid one.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        for (path, _) in candidates {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(spec) = Spec::parse_json(&raw) {
+                    return Some((path, spec));
+                }
+            }
+        }
+        None
+    }
+
     /// Parse a spec from raw LLM output.
     ///
     /// Strips surrounding markdown code fences (```` ```json ```` / ```` ``` ````)
@@ -198,6 +234,53 @@ mod tests {
     fn parse_json_rejects_empty_title() {
         let json = r#"{"title":"  ","requirements":[]}"#;
         assert!(Spec::parse_json(json).is_err());
+    }
+
+    #[test]
+    fn latest_in_picks_newest_parsable_spec() {
+        let dir = std::env::temp_dir().join(format!("clawde-latest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let mut old = sample_spec();
+        old.title = "Old Spec".to_string();
+        old.write_to(&dir.join("specs/old.json")).unwrap();
+        // Ensure a distinct, later mtime even on coarse-granularity
+        // filesystems so the recency selection is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Newer spec, different title — must win by mtime.
+        let mut fresh = sample_spec();
+        fresh.title = "Fresh Spec".to_string();
+        fresh.write_to(&dir.join("specs/fresh.json")).unwrap();
+
+        let (path, spec) = Spec::latest_in(&dir).expect("latest spec");
+        assert!(path.ends_with("fresh.json"), "path: {}", path.display());
+        assert_eq!(spec.title, "Fresh Spec");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_in_skips_broken_newest_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!("clawde-latest-fb-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        sample_spec()
+            .write_to(&dir.join("specs/valid.json"))
+            .unwrap();
+        // A broken spec that is (by mtime) the newest — must be skipped in
+        // favour of the valid older one.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.join("specs/broken.json"), "not json").unwrap();
+
+        let (path, spec) = Spec::latest_in(&dir).expect("fallback to valid spec");
+        assert!(path.ends_with("valid.json"), "path: {}", path.display());
+        assert_eq!(spec.title, "Rate-Limiting Middleware");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_in_returns_none_without_specs_dir() {
+        let dir = std::env::temp_dir().join(format!("clawde-latest-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(Spec::latest_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

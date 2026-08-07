@@ -1385,6 +1385,11 @@ pub mod config {
         /// Project-memory injection settings (audit spec §18.3 token budget).
         #[serde(default)]
         pub memory: MemoryConfig,
+        /// Spec-driven development mode (audit spec Phase 4, §10). When true,
+        /// the continuation policy stops after a turn that produced a spec so
+        /// the user can review (Accept/Edit/Reject) it before implementation.
+        #[serde(default, rename = "specMode")]
+        pub spec_mode: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2636,6 +2641,7 @@ pub mod config {
                 // Override wins for this scalar struct (project settings take
                 // precedence over global).
                 verify: over.config.verify,
+                spec_mode: over.config.spec_mode || base.config.spec_mode,
                 memory: MemoryConfig {
                     max_tokens: over
                         .config
@@ -3140,6 +3146,8 @@ pub mod constants {
     pub const TOOL_NAME_TASK_OUTPUT: &str = "TaskOutput";
     pub const TOOL_NAME_ENTER_PLAN_MODE: &str = "EnterPlanMode";
     pub const TOOL_NAME_EXIT_PLAN_MODE: &str = "ExitPlanMode";
+    pub const TOOL_NAME_ENTER_SPEC_MODE: &str = "EnterSpecMode";
+    pub const TOOL_NAME_EXIT_SPEC_MODE: &str = "ExitSpecMode";
     pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
     pub const TOOL_NAME_MCP: &str = "mcp";
     pub const TOOL_NAME_NOTEBOOK_EDIT: &str = "NotebookEdit";

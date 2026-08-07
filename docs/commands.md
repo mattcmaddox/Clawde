@@ -10,7 +10,7 @@ This document is the complete reference for every slash command available in Cla
 2. [Session & Navigation](#session--navigation)
 3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
 4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
-5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/security-review`, `/init`, `/search`
+5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
 6. [Search & Files](#search--files) — `/files`, `/context`
 7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
 8. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
@@ -639,6 +639,33 @@ Generate a structured specification for a non-trivial task *before* writing code
 ```
 
 The acceptance tests in the spec become the verification criteria when the task is later implemented (see the Verify loop).
+
+---
+
+### /spec-mode
+
+Toggle Spec-Driven Development mode (audit spec §10). When enabled, the agent stops after generating a spec (`specs/<title>.json`) and waits for your review before writing any code.
+
+```
+/spec-mode          # toggle
+/spec-mode on       # enable
+/spec-mode off      # disable
+```
+
+The setting is persisted in settings.json as `"specMode"`. In spec mode the agent writes a structured spec first (via `/spec` or the `EnterSpecMode` tool), then stops for review.
+
+---
+
+### /spec-review
+
+Open the Spec-Driven Development review dialog for a generated spec (audit spec §10). Shows the structured spec — requirements, file plan, data models, acceptance tests, edge cases — and lets you **Accept** (queue an implementation turn against the spec), **Edit** (open the JSON in your editor), or **Reject**.
+
+```
+/spec-review              # newest spec in ./specs/
+/spec-review specs/foo.json
+```
+
+Navigation: `↑/↓` or `j/k` scroll the content, `←/→` or `h/l` move between the Accept / Edit Spec / Reject actions, `Enter` activates the selected action, `Esc` closes.
 
 ---
 

@@ -161,6 +161,7 @@ pub mod session_branching;
 pub mod session_browser;
 /// Full-screen tabbed settings interface.
 pub mod settings_screen;
+pub mod spec_review;
 /// Stats dialog with token usage and cost charts.
 pub mod stats_dialog;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.

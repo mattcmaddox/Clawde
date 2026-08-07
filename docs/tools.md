@@ -619,6 +619,30 @@ No parameters.
 
 ---
 
+### EnterSpecModeTool
+
+**Permission level:** None
+
+Switch the session into Spec-Driven Development mode (audit spec §10). For non-trivial tasks, the agent generates a structured specification — requirements, files to touch, data models, acceptance tests, and edge cases — and writes it to `specs/<title>.json` **before** writing any code, then waits for the user to review and accept it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task` | string | no | The task to write a specification for |
+
+---
+
+### ExitSpecModeTool
+
+**Permission level:** None
+
+Exit Spec-Driven Development mode and begin implementing against the accepted specification. The implementation runs the spec's acceptance tests (see the Verify loop) and reports progress such as "2/4 tests passing, fixing…" until all pass.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `summary` | string | no | Summary of the accepted spec being implemented |
+
+---
+
 ## Worktree Tools
 
 Worktree tools manage git worktrees, enabling the agent to work on multiple branches simultaneously in isolated directories.

@@ -29,7 +29,9 @@ pub mod config_tool;
 pub mod cron;
 pub mod detect_project;
 pub mod enter_plan_mode;
+pub mod enter_spec_mode;
 pub mod exit_plan_mode;
+pub mod exit_spec_mode;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -73,7 +75,9 @@ pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 pub use detect_project::{detect_project_info, DetectProjectTool, ProjectInfo, ProjectLanguage};
 pub use enter_plan_mode::EnterPlanModeTool;
+pub use enter_spec_mode::EnterSpecModeTool;
 pub use exit_plan_mode::ExitPlanModeTool;
+pub use exit_spec_mode::ExitSpecModeTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -602,6 +606,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(AskUserQuestionTool),
         Box::new(EnterPlanModeTool),
         Box::new(ExitPlanModeTool),
+        Box::new(EnterSpecModeTool),
+        Box::new(ExitSpecModeTool),
         Box::new(PowerShellTool),
         Box::new(SleepTool),
         Box::new(CronCreateTool),

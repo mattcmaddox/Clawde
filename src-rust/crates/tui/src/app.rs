@@ -1559,6 +1559,8 @@ pub struct App {
     pub effort_picker: crate::effort_picker::EffortPickerState,
     /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
     pub routing_dialog: crate::routing_dialog::RoutingDialogState,
+    /// Spec review dialog (/spec-review <file> — audit spec §10 Accept/Edit/Reject).
+    pub spec_review: crate::spec_review::SpecReviewState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
@@ -2107,6 +2109,7 @@ impl App {
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
             routing_dialog: crate::routing_dialog::RoutingDialogState::new(),
+            spec_review: crate::spec_review::SpecReviewState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
@@ -3025,6 +3028,35 @@ impl App {
             self.routing_dialog.open(&self.config, latencies);
             return true;
         }
+        // /spec-review [<file>]: open the spec review dialog (audit spec §10)
+        // for a generated spec. With no arg, opens the newest spec in the
+        // working dir's specs/ directory.
+        if cmd == "spec-review" {
+            let arg = args.trim();
+            let result = if arg.is_empty() {
+                let dir = self
+                    .current_dir
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                self.spec_review.open_latest(&dir)
+            } else {
+                self.spec_review.open(std::path::PathBuf::from(arg))
+            };
+            match result {
+                Ok(()) => {
+                    self.status_message = Some(
+                        "Review the spec — Accept to implement, Edit to change, Reject to discard."
+                            .to_string(),
+                    );
+                }
+                Err(e) => {
+                    self.spec_review.close();
+                    self.status_message = Some(format!("Spec review: {e}"));
+                }
+            }
+            return true;
+        }
         // /keybindings preset <default|vim|emacs>: switch the active keybinding
         // preset. `/keybindings` with no args falls through to the existing
         // file-opening handler in intercept_slash_command.
@@ -3622,6 +3654,7 @@ impl App {
         self.device_auth_dialog.close();
         self.effort_picker.close();
         self.routing_dialog.close();
+        self.spec_review.close();
         self.elicitation.close();
         self.ask_user_dialog.close();
         self.settings_screen.close();
@@ -4794,6 +4827,79 @@ impl App {
                 }
                 KeyCode::Char('r') => self.routing_dialog.reset_task(),
                 KeyCode::Char('a') | KeyCode::Char('R') => self.routing_dialog.reset_all(),
+                _ => {}
+            }
+            return false;
+        }
+
+        // Spec review dialog (/spec-review — audit spec §10 Accept/Edit/Reject).
+        if self.spec_review.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.spec_review.close();
+                    self.status_message = Some("Spec review closed — nothing changed.".to_string());
+                }
+                KeyCode::Enter => {
+                    use crate::spec_review::{ACTION_ACCEPT, ACTION_EDIT, ACTION_REJECT};
+                    match self.spec_review.selected_action {
+                        ACTION_ACCEPT => {
+                            if let Some(msg) = self.spec_review.accept_message() {
+                                // Queue the implementation turn: it auto-submits
+                                // once the current turn finishes (issue #149).
+                                self.queued_messages.push_back(msg);
+                                self.pending_auto_submit = true;
+                                self.status_message =
+                                    Some("Spec accepted — implementing against it.".to_string());
+                            }
+                            self.spec_review.close();
+                        }
+                        ACTION_EDIT => {
+                            if let Some(path) = self.spec_review.path.clone() {
+                                let _ = crate::app::open_file_externally(&path);
+                                self.status_message = Some(format!(
+                                    "Opened {} in your editor — edit and save, then re-run /spec-review {} to review the changes.",
+                                    path.display(),
+                                    path.display()
+                                ));
+                            }
+                            self.spec_review.close();
+                        }
+                        ACTION_REJECT => {
+                            self.spec_review.close();
+                            self.status_message =
+                                Some("Spec rejected — nothing will be implemented.".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Left => self.spec_review.select_prev(),
+                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                    self.spec_review.select_prev()
+                }
+                KeyCode::Right => self.spec_review.select_next(),
+                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.spec_review.select_next()
+                }
+                KeyCode::Up => self.spec_review.scroll_up(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => self.spec_review.scroll_up(),
+                KeyCode::Down => {
+                    let content_lines = self
+                        .spec_review
+                        .spec
+                        .as_ref()
+                        .map(crate::spec_review::spec_content_line_count)
+                        .unwrap_or(0);
+                    self.spec_review.scroll_down(content_lines, 16);
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    let content_lines = self
+                        .spec_review
+                        .spec
+                        .as_ref()
+                        .map(crate::spec_review::spec_content_line_count)
+                        .unwrap_or(0);
+                    self.spec_review.scroll_down(content_lines, 16);
+                }
                 _ => {}
             }
             return false;

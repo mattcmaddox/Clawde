@@ -985,6 +985,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         );
     }
 
+    // Spec review dialog (/spec-review — audit spec §10 Accept/Edit/Reject).
+    if app.spec_review.visible {
+        crate::spec_review::render_spec_review(
+            frame,
+            &app.spec_review,
+            app.prompt_input.vim_enabled,
+            size,
+        );
+    }
+
     // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
     if app.device_auth_dialog.visible {
         render_device_auth_dialog(frame, &app.device_auth_dialog, size);

@@ -2145,6 +2145,20 @@ async fn run_interactive(
         base_query_config.continuation =
             clawde_query::ContinuationMode::Verify(config.verify.clone());
     }
+    // Spec-driven development (audit spec Phase 4, §10): when `config.specMode`
+    // is enabled, the continuation policy stops after a turn that produced a
+    // spec so the user can review it before implementation. Spec mode wins
+    // over verify when both are enabled (the review gate precedes execution):
+    // once a spec is generated the user must approve it before any auto-fix
+    // verify rounds make sense. Goal autonomy still wins over both.
+    if config.spec_mode
+        && matches!(
+            base_query_config.continuation,
+            clawde_query::ContinuationMode::Default | clawde_query::ContinuationMode::Verify(_)
+        )
+    {
+        base_query_config.continuation = clawde_query::ContinuationMode::SpecMode;
+    }
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());

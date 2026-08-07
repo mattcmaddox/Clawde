@@ -1857,6 +1857,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(InitCommand),
         Box::new(ReviewCommand),
         Box::new(SpecCommand),
+        Box::new(SpecModeCommand),
         Box::new(HooksCommand),
         Box::new(ImportConfigCommand),
         Box::new(McpCommand),

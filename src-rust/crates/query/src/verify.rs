@@ -280,6 +280,26 @@ impl VerifyPolicy {
             failures_text.push_str(&format!("\n\nSkipped (not run):\n{}", skip_note));
         }
 
+        // Audit spec §10.4: when a structured spec exists, its acceptance
+        // tests are the precise verification criteria — append them so the
+        // model knows EXACTLY what to satisfy, not just "tests failed".
+        if let Some((_, spec)) = clawde_core::spec::Spec::latest_in(ctx.working_dir) {
+            if !spec.acceptance_tests.is_empty() {
+                let criteria = spec
+                    .acceptance_tests
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("{}. {}", i + 1, t.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                failures_text.push_str(&format!(
+                    "\n\nSpec acceptance criteria (spec: \"{}\") — every criterion \
+                     must pass:\n{criteria}",
+                    spec.title
+                ));
+            }
+        }
+
         // `attempt` counts verification rounds; the first failing round is
         // auto-fix attempt 1, so up to `max_retries` fix attempts are allowed.
         if attempt <= max_retries {
@@ -846,6 +866,51 @@ mod tests {
                 assert!(note.contains("no-such-binary-xyz"), "note: {note}");
             }
             _ => panic!("all-skipped must stop cleanly, got: {decision:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_acceptance_criteria_appended_to_failure_feedback() {
+        // Audit spec §10.4: with a spec present, the auto-fix message carries
+        // the acceptance criteria verbatim so the model knows the target.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("specs")).unwrap();
+        let spec = clawde_core::spec::Spec {
+            title: "Rate-Limiting Middleware".to_string(),
+            acceptance_tests: vec![
+                clawde_core::spec::AcceptanceTest {
+                    description: "Requests under limit pass through".to_string(),
+                },
+                clawde_core::spec::AcceptanceTest {
+                    description: "Requests over limit return 429".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        spec.write_to(&dir.path().join("specs/rate-limiting.json"))
+            .unwrap();
+
+        let ctx = TurnEndContext {
+            session_id: "sess",
+            total_tokens_used: 0,
+            turn_elapsed_secs: 0,
+            working_dir: dir.path(),
+            turn_made_writes: true,
+        };
+        let p = VerifyPolicy::new(default_config(), dir.path().to_path_buf());
+        let decision = p.decide_with_results(&ctx, &[failing_check()]);
+        match &decision {
+            ContinuationDecision::Continue { message } => {
+                assert!(
+                    message.contains("Spec acceptance criteria"),
+                    "message: {message}"
+                );
+                assert!(message.contains("Rate-Limiting Middleware"));
+                assert!(message.contains("Requests under limit pass through"));
+                assert!(message.contains("Requests over limit return 429"));
+                assert!(message.contains("every criterion must pass"));
+            }
+            _ => panic!("failure must continue for auto-fix, got: {decision:?}"),
         }
     }
 

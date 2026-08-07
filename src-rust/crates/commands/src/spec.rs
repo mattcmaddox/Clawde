@@ -206,6 +206,88 @@ fn tracked_files(repo_root: &std::path::Path) -> String {
     list
 }
 
+// ---- /spec-mode ----------------------------------------------------------
+
+/// Toggle Spec-Driven Development mode (`/spec-mode [on|off]`).
+///
+/// When enabled, the continuation policy stops after a turn that produced a
+/// spec (`specs/<title>.json`) so the user can review (Accept/Edit/Reject)
+/// it before implementation (audit spec §10.2).
+pub struct SpecModeCommand;
+
+#[async_trait]
+impl SlashCommand for SpecModeCommand {
+    fn name(&self) -> &str {
+        "spec-mode"
+    }
+    fn description(&self) -> &str {
+        "Toggle Spec-Driven Development mode on/off"
+    }
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        vec![
+            ArgCompletion {
+                value: "on".into(),
+                description: "Enable spec mode".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "off".into(),
+                description: "Disable spec mode".into(),
+                available: true,
+            },
+        ]
+    }
+    fn help(&self) -> &str {
+        "Usage: /spec-mode [on|off]\n\n\
+         Toggles Spec-Driven Development mode (audit spec §10). When enabled, the\n\
+         agent stops after generating a spec (specs/<title>.json) so you can\n\
+         review it — Accept to implement, Edit to change, Reject to discard —\n\
+         before any code is written.\n\n\
+         Subcommands:\n\
+           /spec-mode        - toggle status\n\
+           /spec-mode on     - enable spec mode\n\
+           /spec-mode off    - disable spec mode\n\
+         The setting is persisted in settings.json (\"specMode\")."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let current = ctx.config.spec_mode;
+        let new_value = match args.trim() {
+            "on" | "enable" | "1" | "true" => true,
+            "off" | "disable" | "0" | "false" => false,
+            "" => !current,
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown argument '{other}'. Use 'on', 'off', or no argument to toggle."
+                ));
+            }
+        };
+
+        if new_value == current {
+            return CommandResult::Message(format!(
+                "Spec mode is already {}.",
+                if current { "enabled" } else { "disabled" }
+            ));
+        }
+
+        // Persist the setting via settings.json.
+        if let Err(e) = save_settings_mutation(|settings| {
+            settings.config.spec_mode = new_value;
+        }) {
+            return CommandResult::Error(format!("Failed to save setting: {e}"));
+        }
+
+        let mut new_config = ctx.config.clone();
+        new_config.spec_mode = new_value;
+        let msg = format!(
+            "Spec mode {}. In this mode the agent writes a structured spec and waits\
+             for your review before implementing.",
+            if new_value { "enabled" } else { "disabled" }
+        );
+        CommandResult::ConfigChangeMessage(new_config, msg)
+    }
+}
+
 /// Lowercase, hyphenated, filesystem-safe slug from a title.
 fn slugify(title: &str) -> String {
     let mut slug: Vec<char> = Vec::new();
@@ -404,6 +486,42 @@ mod tests {
         );
         assert_eq!(slugify(""), "");
         assert_eq!(slugify("Hello, World"), "hello-world");
+    }
+
+    #[test]
+    fn spec_mode_command_toggles_config() {
+        // The command persists via settings.json — point CLAWDE_HOME at a
+        // temp dir (with the shared env lock) so the real settings file is
+        // never touched.
+        let _home = crate::keys::tests::TestHome::new();
+        let mut ctx = make_ctx();
+        assert!(!ctx.config.spec_mode);
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(SpecModeCommand.execute("on", &mut ctx));
+        let new_cfg = match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(new_cfg.spec_mode, "spec_mode must flip on");
+                assert!(msg.contains("Spec mode enabled"), "msg: {msg}");
+                new_cfg
+            }
+            other => panic!("expected ConfigChangeMessage, got: {other:?}"),
+        };
+        // The caller applies the returned config before the next invocation
+        // (mirrors the CLI's `cmd_ctx.config = applied_cfg.clone()`).
+        ctx.config = new_cfg;
+
+        // Off flips it back.
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(SpecModeCommand.execute("off", &mut ctx));
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(!new_cfg.spec_mode);
+                assert!(msg.contains("Spec mode disabled"), "msg: {msg}");
+            }
+            other => panic!("expected ConfigChangeMessage, got: {other:?}"),
+        }
     }
 
     #[test]
