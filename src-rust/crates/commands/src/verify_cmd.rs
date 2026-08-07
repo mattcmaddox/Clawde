@@ -5,6 +5,9 @@
 // sandbox (direct / git worktree / container), then hands the structured
 // `VerifyReport` to the CLI so the TUI can render the boxed per-check
 // indicator — the same box the auto-verify loop draws after writing turns.
+//
+// Works even when `verify.enabled` is false (the auto-loop's off-switch):
+// `/verify` is a manual, always-available check.
 
 use super::*;
 use async_trait::async_trait;
@@ -22,19 +25,55 @@ impl SlashCommand for VerifyCommand {
         "Run one verification round (tests + lints) now and show the report"
     }
     fn help(&self) -> &str {
-        "Usage: /verify\n\n\
+        "Usage: /verify [test|lint|all]\n\n\
          Runs the project's detected test suite and linter/typechecker once, in\n\
          the sandbox configured by `verify.sandbox` (direct, git worktree, or\n\
          container), and shows the boxed per-check report. This is the same\n\
          loop that runs automatically after writing turns — use it to check\n\
-         the tree at any time, or after disabling auto-verify.\n\n\
+         the tree at any time, or after disabling auto-verify (it overrides\n\
+         `verify.enabled: false`).\n\n\
+         Args:\n\
+           test  — run only the test suite\n\
+           lint  — run only the linter/typechecker\n\
+           all   — run both (default)\n\n\
          Configure via settings.json:\n\
            \"verify\": { \"sandbox\": \"worktree\", \"auto_test\": true, \"auto_lint\": true }"
     }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let candidates = ["test", "lint", "all"];
+        candidates
+            .into_iter()
+            .filter(|c| c.starts_with(partial))
+            .map(|value| ArgCompletion {
+                value: value.to_string(),
+                description: match value {
+                    "test" => "Run only the test suite",
+                    "lint" => "Run only the linter/typechecker",
+                    _ => "Run both tests and lints (default)",
+                }
+                .to_string(),
+                available: true,
+            })
+            .collect()
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // Subset selection: default to both checks. A manual /verify must work
+        // even when the auto-loop is disabled, so only auto_test/auto_lint
+        // gate what runs — never `verify.enabled`.
+        let mut config = ctx.config.verify.clone();
+        match args.trim() {
+            "" | "all" => {}
+            "test" => config.auto_lint = false,
+            "lint" => config.auto_test = false,
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown /verify argument '{other}' — use test, lint, or all"
+                ));
+            }
+        }
         let working_dir = ctx.working_dir.clone();
-        let config = ctx.config.verify.clone();
         // Spawn on a blocking thread: the checks run bounded external commands
         // (tests/lints) and may take up to `timeout_secs` each.
         let run = move || clawde_query::verify::run_verify_round(&config, &working_dir);
@@ -42,6 +81,65 @@ impl SlashCommand for VerifyCommand {
             Ok(Ok(report)) => CommandResult::Verify(report),
             Ok(Err(message)) => CommandResult::Error(message),
             Err(e) => CommandResult::Error(format!("Verification task failed: {}", e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx() -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: Vec::new(),
+            working_dir: std::env::temp_dir(),
+            session_id: "test".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_command_rejects_unknown_arg() {
+        let cmd = VerifyCommand;
+        let mut ctx = test_ctx();
+        let result = cmd.execute("bogus", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => assert!(msg.contains("Unknown /verify argument")),
+            other => panic!("expected Error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_command_subset_arg_selects_checks() {
+        // test → lints disabled; lint → tests disabled. Run in an empty temp
+        // dir so no checks are detected (no side effects); the report headline
+        // must reflect that a round was attempted, not that it was disabled.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.verify.enabled = false; // manual override must still run
+        ctx.config.verify.sandbox = clawde_core::config::VerifySandbox::Direct;
+
+        let cmd = VerifyCommand;
+        for arg in ["test", "lint", "all"] {
+            let result = cmd.execute(arg, &mut ctx).await;
+            match result {
+                CommandResult::Verify(report) => {
+                    assert_eq!(
+                        report.headline, "No test or lint commands detected",
+                        "arg {arg}: expected empty-dir report, got {}",
+                        report.headline
+                    );
+                }
+                other => panic!("arg {arg}: expected Verify, got: {other:?}"),
+            }
         }
     }
 }

@@ -340,15 +340,20 @@ impl ContinuationPolicy for VerifyPolicy {
 /// policy this never asks the model to fix anything — it is a user-triggered
 /// "is the tree green right now?" check.
 ///
+/// Deliberately ignores `verify.enabled`: the auto-loop's off-switch must not
+/// block a manual `/verify` (the help text promises it works "after disabling
+/// auto-verify"). It only refuses when no checks are configured at all
+/// (`auto_test` and `auto_lint` both false).
+///
 /// Returns `Err` only when the sandbox itself cannot be set up (e.g. the
 /// `worktree` sandbox requires a git repository) — never for a failing check.
 pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<VerifyReport, String> {
-    if !config.enabled || !config.has_any_check() {
+    if !config.auto_test && !config.auto_lint {
         return Ok(VerifyReport {
             results: Vec::new(),
             attempt: 0,
             max_retries: config.max_retries.max(1),
-            headline: "Verification disabled".to_string(),
+            headline: "No checks configured (verify.auto_test / auto_lint)".to_string(),
             sandbox: config.sandbox,
         });
     }
@@ -926,13 +931,30 @@ mod tests {
         );
         assert!(report.results.iter().any(|r| !r.ok && !r.skipped));
 
-        // Disabled config → "Verification disabled", no checks run.
-        let disabled = VerifyConfig {
+        // `enabled: false` must NOT block a manual /verify — only the
+        // auto-loop's preflight honours the off-switch. The round still runs.
+        write_cargo_crate(dir.path(), "#[cfg(test)]\nmod t { #[test] fn ok() {} }\n");
+        let manual = VerifyConfig {
             enabled: false,
             ..default_config()
         };
-        let report = run_verify_round(&disabled, dir.path()).unwrap();
-        assert_eq!(report.headline, "Verification disabled");
+        let report = run_verify_round(&manual, dir.path()).unwrap();
+        assert_eq!(report.headline, "All checks passed");
+        assert!(!report.results.is_empty());
+        assert_eq!(report.attempt, 1);
+
+        // Both checks off → no round, clear headline (the failing crate from
+        // the previous block is still in the dir — irrelevant, nothing runs).
+        let none = VerifyConfig {
+            auto_test: false,
+            auto_lint: false,
+            ..default_config()
+        };
+        let report = run_verify_round(&none, dir.path()).unwrap();
+        assert_eq!(
+            report.headline,
+            "No checks configured (verify.auto_test / auto_lint)"
+        );
         assert!(report.results.is_empty());
         assert_eq!(report.attempt, 0);
     }

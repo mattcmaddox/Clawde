@@ -1236,10 +1236,13 @@ and linter/typechecker, runs them in the sandbox configured by
 `verify.sandbox` (`direct` / `git worktree` / `container`), and renders the
 boxed per-check report — the same box the auto-verify loop draws after a
 writing turn. Use it to check the tree at any time, or after disabling
-auto-verify.
+auto-verify: a manual `/verify` overrides `verify.enabled: false`, so the
+auto-loop's off-switch never blocks an on-demand check.
 
 ```
-/verify
+/verify          # run both tests and lints (default)
+/verify test     # run only the test suite
+/verify lint     # run only the linter/typechecker
 ```
 
 Configure the round via `settings.json` (see the Verify loop section of
