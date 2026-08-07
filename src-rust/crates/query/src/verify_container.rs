@@ -150,14 +150,14 @@ fn resolve_image(config: &VerifyConfig, working_dir: &Path) -> Result<String, St
 /// if missing a bounded `image pull`. A pull that fails (registry down, image
 /// does not exist) is a setup error — the round stops with a clear note.
 fn ensure_image(runtime: &str, image: &str, working_dir: &Path) -> Result<(), String> {
-    let (_out, code, _timed_out) =
+    let (_out, code, _timed_out, _elapsed) =
         run_setup_command(runtime, &["image", "inspect", image], working_dir);
     if code == Some(0) {
         return Ok(());
     }
     // Inspect failed (missing image, or a daemon error). Attempt a pull; the
     // pull's own failure message is more useful than inspect's.
-    let (out, code, _timed_out) =
+    let (out, code, _timed_out, _elapsed) =
         run_setup_command(runtime, &["image", "pull", image], working_dir);
     if code == Some(0) {
         return Ok(());
@@ -175,7 +175,7 @@ fn run_setup_command(
     runtime: &str,
     args: &[&str],
     working_dir: &Path,
-) -> (String, Option<i32>, bool) {
+) -> (String, Option<i32>, bool, u64) {
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(runtime.to_string());
     argv.extend(args.iter().map(|s| s.to_string()));
@@ -215,8 +215,8 @@ fn run_container_check(
         "-c".to_string(),
         command.to_string(),
     ];
-    let (output, code, timed_out) = run_argv_sync(&argv, working_dir, timeout_secs);
-    if !timed_out && code == Some(0) {
+    let (output, code, timed_out, elapsed) = run_argv_sync(&argv, working_dir, timeout_secs);
+    let result = if !timed_out && code == Some(0) {
         CheckResult::pass(label)
     } else if !timed_out && code.is_none() {
         // The runtime never started the container (daemon down, image cannot
@@ -224,6 +224,12 @@ fn run_container_check(
         CheckResult::skipped(label, output)
     } else {
         CheckResult::fail(label, output, timed_out)
+    };
+    // Only attach a duration when the container command actually started.
+    if timed_out || code.is_some() {
+        result.with_elapsed(elapsed)
+    } else {
+        result
     }
 }
 
@@ -412,7 +418,7 @@ mod tests {
 
         // No leaked containers: every run used `--rm` plus a unique
         // `clawde-verify-*` name, so a ps filter catches any straggler.
-        let (out, code, _) = run_setup_command(
+        let (out, code, _, _) = run_setup_command(
             detect_runtime().unwrap(),
             &["ps", "-aq", "--filter", "name=clawde-verify"],
             dir.path(),

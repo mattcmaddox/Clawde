@@ -1334,6 +1334,10 @@ pub struct App {
     /// Most recent execute-and-verify round, kept for the footer badge even
     /// after its boxed annotation scrolls out of view. None until a round ran.
     pub verify: Option<clawde_query::VerifyReport>,
+    /// True between [`QueryEvent::VerifyStarted`] and [`QueryEvent::Verify`]:
+    /// a verify round is running its checks (potentially slow) and the status
+    /// row should show a `verifying…` spinner instead of silent wait.
+    pub is_verifying: bool,
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
@@ -1785,6 +1789,17 @@ pub struct App {
     /// scrolling up past the top can't inflate it unboundedly (#223).
     pub last_max_scroll: Cell<usize>,
 
+    /// On-screen `(row, start_col, end_col)` of the verify footer badge from
+    /// the last render. Written by the renderer; read on mouse-down so a click
+    /// on the badge can jump the transcript to the latest verify box.
+    /// `None` when no badge was drawn (no verify round yet, or footer hidden).
+    pub last_verify_badge_area: Cell<Option<(u16, u16, u16)>>,
+
+    /// Line index (within the transcript's rendered line list) where the most
+    /// recent verify box starts. Written by the renderer alongside the box;
+    /// read on badge click to compute the scroll offset that reveals it.
+    pub last_verify_box_line: Cell<Option<usize>>,
+
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
     pub selection_anchor: Option<(u16, u16)>,
@@ -1976,6 +1991,7 @@ impl App {
             display_messages: Vec::new(),
             system_annotations: Vec::new(),
             verify: None,
+            is_verifying: false,
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
@@ -2213,6 +2229,8 @@ impl App {
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
             last_max_scroll: Cell::new(0),
+            last_verify_badge_area: Cell::new(None),
+            last_verify_box_line: Cell::new(None),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
@@ -3875,8 +3893,12 @@ impl App {
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
         // The verify badge reflects the current conversation's last round;
-        // swapping in a different conversation must not carry a stale badge.
+        // swapping in a different conversation must not carry a stale badge
+        // (nor an in-flight spinner, nor click geometry).
         self.verify = None;
+        self.is_verifying = false;
+        self.last_verify_badge_area.set(None);
+        self.last_verify_box_line.set(None);
         self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
     }
@@ -3923,6 +3945,7 @@ impl App {
     /// persistent at-a-glance badge for the last round's outcome even after
     /// the box scrolls out of view.
     pub fn push_verify_annotation(&mut self, report: clawde_query::VerifyReport) {
+        self.is_verifying = false;
         self.verify = Some(report.clone());
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
@@ -8990,6 +9013,29 @@ impl App {
                     return;
                 }
 
+                // Click on the verify footer badge: jump the transcript to
+                // the latest verify box (which may have scrolled out of view).
+                if self.verify.is_some() {
+                    if let Some((row, start, end)) = self.last_verify_badge_area.get() {
+                        if mouse_event.row == row
+                            && mouse_event.column >= start
+                            && mouse_event.column < end
+                        {
+                            if let Some(line) = self.last_verify_box_line.get() {
+                                // scroll_offset counts lines above the bottom;
+                                // putting the box's first line at the top of
+                                // the viewport needs offset = max - line.
+                                let max_scroll = self.last_max_scroll.get();
+                                self.scroll_offset =
+                                    max_scroll.saturating_sub(line).min(max_scroll);
+                                self.auto_scroll = false;
+                                self.invalidate_transcript();
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
@@ -9315,11 +9361,23 @@ impl App {
 
             QueryEvent::Status(msg) => {
                 self.status_message = Some(msg);
+                // A status line arrives after the verify round's synchronous
+                // decide() returns (e.g. the sandbox-setup-error note when no
+                // Verify event was produced). Clear the in-flight spinner so a
+                // failed round can never leave `verifying…` stuck on screen.
+                self.is_verifying = false;
+            }
+
+            QueryEvent::VerifyStarted => {
+                // Checks are about to spawn (potentially slow) — surface a
+                // spinner in the status row until the round's report lands.
+                self.is_verifying = true;
             }
 
             QueryEvent::Verify(report) => {
                 // Boxed per-check indicator inserted right after the assistant
                 // message that ended the writing turn.
+                self.is_verifying = false;
                 self.push_verify_annotation(report);
             }
 
@@ -11045,6 +11103,92 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_verify_badge_click_jumps_to_verify_box() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        // A completed verify round: badge drawn at footer row 23, cols 1..10;
+        // the box's first line sits at line 50 of the transcript, which has
+        // scrolled 40 lines up (max_scroll 100).
+        app.verify = Some(clawde_query::VerifyReport {
+            results: vec![clawde_query::CheckResult {
+                label: "test: npm test".to_string(),
+                ok: true,
+                output: String::new(),
+                timed_out: false,
+                skipped: false,
+                elapsed_secs: None,
+            }],
+            attempt: 1,
+            max_retries: 2,
+            headline: "All checks passed".to_string(),
+            sandbox: clawde_core::config::VerifySandbox::Direct,
+        });
+        app.last_verify_badge_area.set(Some((23, 1, 10)));
+        app.last_verify_box_line.set(Some(50));
+        app.last_max_scroll.set(100);
+        app.scroll_offset = 60; // user has scrolled up past the box
+        app.auto_scroll = false;
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 23,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        // max(100) - box_line(50) = 50 puts the box at the top of the viewport.
+        assert_eq!(app.scroll_offset, 50);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn test_verify_spinner_lifecycle_events() {
+        let mut app = make_app();
+        assert!(!app.is_verifying);
+
+        // VerifyStarted arms the spinner.
+        app.handle_query_event(QueryEvent::VerifyStarted);
+        assert!(app.is_verifying);
+
+        // A status line (surfaced for the sandbox-setup-error Stop note when
+        // no Verify event follows) must disarm it — otherwise the spinner
+        // would stick forever on a failed round.
+        app.handle_query_event(QueryEvent::Status(
+            "Verify sandbox 'container' could not prepare image".to_string(),
+        ));
+        assert!(!app.is_verifying);
+    }
+
+    #[test]
+    fn test_verify_badge_click_outside_badge_does_not_jump() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.verify = Some(clawde_query::VerifyReport {
+            results: Vec::new(),
+            attempt: 1,
+            max_retries: 2,
+            headline: "All checks passed".to_string(),
+            sandbox: clawde_core::config::VerifySandbox::Direct,
+        });
+        app.last_verify_badge_area.set(Some((23, 1, 10)));
+        app.last_verify_box_line.set(Some(50));
+        app.last_max_scroll.set(100);
+        app.scroll_offset = 60;
+
+        // Same row, but a column well right of the badge (e.g. over the
+        // ollama indicator) — must not trigger the jump.
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 50,
+            row: 23,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.scroll_offset, 60);
     }
 
     // ---- Help overlay -------------------------------------------------------

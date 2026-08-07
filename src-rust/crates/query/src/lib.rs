@@ -283,6 +283,11 @@ pub enum QueryEvent {
         /// Fraction of requests budget used (0.0–1.0).
         requests_pct_used: f32,
     },
+    /// The auto-verify round is about to start (checks will actually spawn).
+    /// Emitted before the blocking `decide()` call so the TUI can show a
+    /// `verifying…` indicator instead of a silent wait; paired with
+    /// [`QueryEvent::Verify`], which reports the outcome.
+    VerifyStarted,
     /// Structured result of an execute-and-verify round (audit spec Phase 1).
     /// Emitted after a writing turn when the verify continuation policy ran
     /// the project's checks, so the TUI can render the boxed per-check
@@ -592,13 +597,21 @@ pub async fn run_query_loop(
                         usage: $usage,
                     };
                 }
-                let decision = continuation_policy.decide(&crate::continuation::TurnEndContext {
+                let turn_ctx = crate::continuation::TurnEndContext {
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
                     turn_elapsed_secs: goal_turn_start.elapsed().as_secs(),
                     working_dir: &tool_ctx.working_dir,
                     turn_made_writes: wrote_files,
-                });
+                };
+                // Announce a slow round up front so the TUI can show a
+                // spinner instead of a silent wait during the checks.
+                if continuation_policy.will_run_checks(&turn_ctx) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::VerifyStarted);
+                    }
+                }
+                let decision = continuation_policy.decide(&turn_ctx);
                 // Structured verify report (audit spec Phase 1 §15.1): forward
                 // the round's per-check results to the TUI so it renders the
                 // boxed Verify indicator. Emitted for both Continue and Stop

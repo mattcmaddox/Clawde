@@ -1724,6 +1724,11 @@ fn build_message_items_range(
         {
             let mut lines = Vec::new();
             render_system_annotation_lines(&mut lines, ann, width as usize);
+            // Record where the verify box lands in the rendered line list so a
+            // click on the footer badge can scroll it into view later.
+            if ann.style == SystemMessageStyle::Verify {
+                app.last_verify_box_line.set(Some(items.len()));
+            }
             push_rendered_items(items, lines, None, false);
         }
 
@@ -2279,7 +2284,9 @@ fn render_verify_block(
         Span::styled(format!("┌─{}{}┐", title, "─".repeat(title_fill)), border),
     ]));
 
-    // One row per check: ✓/✗/△ + label + right-aligned status.
+    // One row per check: ✓/✗/△ + label + right-aligned status. The status
+    // carries the check's wall-clock duration when it actually ran, so a slow
+    // test is visible at a glance: `PASS (42s)`.
     for r in &report.results {
         let (icon, status, color) = if r.skipped {
             ("△", "SKIP", Color::Yellow)
@@ -2290,7 +2297,16 @@ fn render_verify_block(
         } else {
             ("✗", "FAIL", Color::Red)
         };
-        let status_disp = format!(" {status}");
+        // A skipped check never ran, so it must not show a duration even if a
+        // stray value were attached upstream.
+        let timing = if r.skipped {
+            String::new()
+        } else {
+            r.elapsed_secs
+                .map(|s| format!(" ({s}s)"))
+                .unwrap_or_default()
+        };
+        let status_disp = format!(" {status}{timing}");
         let label_max = area.saturating_sub(2 + status_disp.chars().count() + 1);
         let label = truncate_end(&r.label, label_max.max(4));
         let content = format!("{icon} {label}");
@@ -3127,6 +3143,7 @@ fn should_render_status_row(app: &App) -> bool {
     // active (voice, streaming, or an idle status message). Free-mode routing
     // and key health are shown in the prompt config row (Row 2) instead.
     app.voice_recording
+        || app.is_verifying
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
         || has_exhausted_keys
@@ -3193,6 +3210,16 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         s.push(Span::raw(" "));
         s.extend(shimmer_spans(&label, app.frame_count));
         s
+    } else if app.is_verifying {
+        // A verify round is running its checks — spinning indicator so the
+        // potentially 30-180s wait never looks like a hang.
+        let spinner = SPINNER[(app.frame_count as usize) % SPINNER.len()];
+        vec![Span::styled(
+            format!("{spinner} verifying…"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]
     } else if let (Some(verb), Some(elapsed)) =
         (app.last_turn_verb, app.last_turn_elapsed.as_deref())
     {
@@ -3434,6 +3461,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // No verify badge on screen yet this frame — stale click targets must not
+    // linger from a previous render (cleared here unconditionally, including
+    // the voice-recording footer which never draws the badge).
+    app.last_verify_badge_area.set(None);
+
     // Use only the first line of the footer area, leaving bottom padding
     let footer_area = Rect {
         x: area.x,
@@ -3573,12 +3605,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
         // Verify badge — persistent at-a-glance outcome of the most recent
         // execute-and-verify round (auto-loop or /verify). Survives after
-        // the boxed report scrolls out of view.
+        // the boxed report scrolls out of view. Clickable: a click on the
+        // badge jumps the transcript to the latest verify box.
         if let Some(report) = &app.verify {
             if !spans.is_empty() {
                 spans.push(Span::raw("  "));
             }
             let (label, color) = verify_footer_badge(report);
+            // Record the badge's column span (relative to the left edge of
+            // the footer's padded drawing area) so mouse clicks on it can be
+            // recognised; translated to absolute screen columns at draw time.
+            let offset_start: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let offset_end = offset_start + UnicodeWidthStr::width(label.as_str());
+            // Row placeholder (0) is replaced with the real footer row at draw
+            // time; only the column span is known at badge-construction time.
+            app.last_verify_badge_area
+                .set(Some((0, offset_start as u16, offset_end as u16)));
             spans.push(Span::styled(
                 label,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -4034,6 +4079,16 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         height: footer_area.height,
     };
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
+
+    // Translate the verify badge's column span into absolute screen
+    // coordinates for the mouse handler, carrying the footer's exact row.
+    if let Some((_, start, end)) = app.last_verify_badge_area.get() {
+        app.last_verify_badge_area.set(Some((
+            footer_area.y,
+            padded_area.x.saturating_add(start),
+            padded_area.x.saturating_add(end),
+        )));
+    }
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
@@ -5042,6 +5097,7 @@ mod stream_cache_tests {
                     output: "1 test failed".to_string(),
                     timed_out: false,
                     skipped: false,
+                    elapsed_secs: None,
                 },
                 clawde_query::CheckResult {
                     label: "lint: cargo clippy".to_string(),
@@ -5049,6 +5105,7 @@ mod stream_cache_tests {
                     output: String::new(),
                     timed_out: false,
                     skipped: false,
+                    elapsed_secs: None,
                 },
             ],
             attempt: 1,
@@ -5675,6 +5732,7 @@ mod task_badge_tooltip_tests {
                     output: String::new(),
                     timed_out: false,
                     skipped,
+                    elapsed_secs: None,
                 })
                 .collect(),
             attempt: 1,
@@ -5727,6 +5785,38 @@ mod task_badge_tooltip_tests {
         assert!(
             !label.contains('('),
             "exhausted round must stay compact: {label}"
+        );
+    }
+
+    #[test]
+    fn verify_block_shows_elapsed_timing() {
+        let mut report = verify_report_with(vec![(true, false), (false, false)]);
+        report.results[0].elapsed_secs = Some(42);
+        report.results[1].elapsed_secs = Some(7);
+        let mut lines = Vec::new();
+        render_verify_block(&mut lines, &report, 80);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(rendered.contains("PASS (42s)"), "rendered: {rendered}");
+        assert!(rendered.contains("FAIL (7s)"), "rendered: {rendered}");
+    }
+
+    #[test]
+    fn verify_block_hides_timing_for_skipped_checks() {
+        let mut report = verify_report_with(vec![(false, true)]);
+        report.results[0].elapsed_secs = Some(0);
+        let mut lines = Vec::new();
+        render_verify_block(&mut lines, &report, 80);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(rendered.contains("SKIP"), "rendered: {rendered}");
+        assert!(
+            !rendered.contains("(0s)"),
+            "a never-started check must not show timing: {rendered}"
         );
     }
 }

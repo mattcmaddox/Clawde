@@ -1248,7 +1248,12 @@ auto-loop's off-switch never blocks an on-demand check.
 After any verification round (auto-loop or manual `/verify`) the footer shows
 a persistent `✓ verify` / `✗ verify` badge so the last round's outcome stays
 visible even after the boxed report scrolls out of view; mid-loop auto-fix
-rounds add the attempt counter (e.g. `✗ verify (2/3)`).
+rounds add the attempt counter (e.g. `✗ verify (2/3)`). Click the badge to
+jump the transcript back to the latest verify box. While a round is running,
+the status row shows a spinning `verifying…` indicator so the checks (which
+can take a while in the container sandbox) never look like a hang. Each check
+row in the box carries its wall-clock duration — e.g. `PASS (12s)` /
+`FAIL (1s)` — so a slow test is visible at a glance.
 
 Configure the round via `settings.json` (see the Verify loop section of
 `configuration.md`): `verify.sandbox`, `verify.auto_test`, `verify.auto_lint`,

@@ -1955,6 +1955,7 @@ mod tests {
                 output: String::new(),
                 timed_out: false,
                 skipped: false,
+                elapsed_secs: None,
             }],
             attempt: 1,
             max_retries: 3,

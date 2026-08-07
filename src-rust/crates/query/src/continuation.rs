@@ -66,6 +66,14 @@ pub trait ContinuationPolicy: Send + Sync {
     fn verify_report(&self) -> Option<crate::verify::VerifyReport> {
         None
     }
+
+    /// Whether the end-of-turn checks will actually spawn. Default: `false`
+    /// — only the execute-and-verify policy overrides this. The query loop
+    /// calls it BEFORE the potentially slow checks run so the TUI can show a
+    /// `verifying…` indicator instead of a silent wait.
+    fn will_run_checks(&self, _ctx: &TurnEndContext<'_>) -> bool {
+        false
+    }
 }
 
 /// Default policy: always stop after the turn completes.

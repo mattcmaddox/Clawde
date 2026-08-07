@@ -41,6 +41,9 @@ pub struct CheckResult {
     /// binary is not installed). An environment gap, not a code failure the
     /// model can fix — never counts as a failure.
     pub skipped: bool,
+    /// Wall-clock seconds the check ran, when the command actually started.
+    /// None when the command never spawned or timing was not captured.
+    pub elapsed_secs: Option<u64>,
 }
 
 impl CheckResult {
@@ -51,6 +54,7 @@ impl CheckResult {
             output: String::new(),
             timed_out: false,
             skipped: false,
+            elapsed_secs: None,
         }
     }
 
@@ -65,6 +69,7 @@ impl CheckResult {
             output: truncate_output(&output.into(), 4_000),
             timed_out,
             skipped: false,
+            elapsed_secs: None,
         }
     }
 
@@ -75,7 +80,14 @@ impl CheckResult {
             output: truncate_output(&output.into(), 4_000),
             timed_out: false,
             skipped: true,
+            elapsed_secs: None,
         }
+    }
+
+    /// Attach the measured wall-clock duration to the result.
+    pub(crate) fn with_elapsed(mut self, elapsed_secs: u64) -> Self {
+        self.elapsed_secs = Some(elapsed_secs);
+        self
     }
 
     /// One-line reason for a skipped check (the first line of the spawn error).
@@ -308,6 +320,14 @@ impl VerifyPolicy {
 }
 
 impl ContinuationPolicy for VerifyPolicy {
+    /// Cheap pre-flight guard: will this round actually spawn checks?
+    /// Mirror of [`Self::preflight`] (None there means checks run). The
+    /// query loop calls this BEFORE the potentially slow checks start, so the
+    /// TUI can show a `verifying…` indicator instead of silent wait.
+    fn will_run_checks(&self, ctx: &TurnEndContext<'_>) -> bool {
+        self.preflight(ctx).is_none()
+    }
+
     fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision {
         if let Some(decision) = self.preflight(ctx) {
             self.clear_report();
@@ -432,8 +452,8 @@ pub(crate) fn run_checks_direct(config: &VerifyConfig, working_dir: &Path) -> Ve
 }
 
 fn run_check(label: &str, command: &str, working_dir: &Path, timeout_secs: u64) -> CheckResult {
-    let (output, code, timed_out) = run_command_sync(command, working_dir, timeout_secs);
-    if !timed_out && code == Some(0) {
+    let (output, code, timed_out, elapsed) = run_command_sync(command, working_dir, timeout_secs);
+    let result = if !timed_out && code == Some(0) {
         CheckResult::pass(label)
     } else if !timed_out && code.is_none() {
         // The command never started (binary missing, spawn error). That is an
@@ -442,6 +462,13 @@ fn run_check(label: &str, command: &str, working_dir: &Path, timeout_secs: u64) 
         CheckResult::skipped(label, output)
     } else {
         CheckResult::fail(label, output, timed_out)
+    };
+    // Only attach a duration when the command actually started (spawn or
+    // timeout); a skipped check never ran, so it shows no timing.
+    if timed_out || code.is_some() {
+        result.with_elapsed(elapsed)
+    } else {
+        result
     }
 }
 
@@ -450,7 +477,7 @@ fn run_check(label: &str, command: &str, working_dir: &Path, timeout_secs: u64) 
 static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Run `command` to completion in `working_dir`, returning
-/// `(stdout+stderr, exit_code, timed_out)`.
+/// `(stdout+stderr, exit_code, timed_out, elapsed_secs)`.
 ///
 /// The child's output is redirected to a temp file rather than piped: the
 /// parent never reads pipes while the child runs, so a full pipe buffer would
@@ -460,10 +487,10 @@ pub fn run_command_sync(
     command: &str,
     working_dir: &Path,
     timeout_secs: u64,
-) -> (String, Option<i32>, bool) {
+) -> (String, Option<i32>, bool, u64) {
     let parts = clawde_tools::run_tests::split_command(command);
     if parts.is_empty() {
-        return (String::new(), None, false);
+        return (String::new(), None, false, 0);
     }
     run_argv_sync(&parts, working_dir, timeout_secs)
 }
@@ -479,10 +506,11 @@ pub fn run_argv_sync(
     parts: &[String],
     working_dir: &Path,
     timeout_secs: u64,
-) -> (String, Option<i32>, bool) {
+) -> (String, Option<i32>, bool, u64) {
     if parts.is_empty() {
-        return (String::new(), None, false);
+        return (String::new(), None, false, 0);
     }
+    let start = std::time::Instant::now();
 
     let log_path = std::env::temp_dir().join(format!(
         "clawde-verify-{}-{}.log",
@@ -491,13 +519,13 @@ pub fn run_argv_sync(
     ));
     let file = match std::fs::File::create(&log_path) {
         Ok(f) => f,
-        Err(e) => return (format!("Failed to create log file: {e}"), None, false),
+        Err(e) => return (format!("Failed to create log file: {e}"), None, false, 0),
     };
     let err_file = match file.try_clone() {
         Ok(f) => f,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
-            return (format!("Failed to set up log file: {e}"), None, false);
+            return (format!("Failed to set up log file: {e}"), None, false, 0);
         }
     };
 
@@ -512,7 +540,12 @@ pub fn run_argv_sync(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
-            return (format!("Failed to spawn '{}': {e}", parts[0]), None, false);
+            return (
+                format!("Failed to spawn '{}': {e}", parts[0]),
+                None,
+                false,
+                0,
+            );
         }
     };
 
@@ -538,6 +571,7 @@ pub fn run_argv_sync(
                     format!("Failed to wait for '{}': {e}", parts[0]),
                     None,
                     false,
+                    0,
                 );
             }
         }
@@ -546,7 +580,7 @@ pub fn run_argv_sync(
     let output = std::fs::read_to_string(&log_path).unwrap_or_default();
     let _ = std::fs::remove_file(&log_path);
     let code = exit_status.and_then(|s| s.code());
-    (output, code, timed_out)
+    (output, code, timed_out, start.elapsed().as_secs())
 }
 
 /// Truncate `output` at a char boundary so a huge failure log cannot blow up
@@ -615,6 +649,31 @@ mod tests {
             ContinuationDecision::Stop { note } => assert!(note.is_none()),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn will_run_checks_mirrors_preflight_guards() {
+        let cfg = default_config();
+        let p = policy(cfg.clone());
+        let write_ctx = ctx();
+        assert!(write_ctx.turn_made_writes);
+        assert!(p.will_run_checks(&write_ctx));
+
+        // Disabled -> checks never spawn.
+        let mut off = cfg.clone();
+        off.enabled = false;
+        assert!(!policy(off).will_run_checks(&write_ctx));
+
+        // Read-only turn -> checks never spawn.
+        let mut read_ctx = ctx();
+        read_ctx.turn_made_writes = false;
+        assert!(!p.will_run_checks(&read_ctx));
+
+        // No checks configured -> checks never spawn.
+        let mut none = cfg.clone();
+        none.auto_test = false;
+        none.auto_lint = false;
+        assert!(!policy(none).will_run_checks(&write_ctx));
     }
 
     #[test]
@@ -802,11 +861,13 @@ mod tests {
         );
         assert!(!result.ok);
         assert!(result.timed_out);
+        // A timed-out check ran for the full timeout, so timing is attached.
+        assert!(result.elapsed_secs.is_some());
     }
 
     #[test]
     fn run_command_sync_captures_output_and_exit_code() {
-        let (out, code, timed_out) = run_command_sync(
+        let (out, code, timed_out, _elapsed) = run_command_sync(
             "sh -c 'echo hello world; exit 0'",
             std::path::Path::new("."),
             10,
@@ -815,17 +876,20 @@ mod tests {
         assert_eq!(code, Some(0));
         assert!(out.contains("hello world"), "out: {out}");
 
-        let (out, code, timed_out) =
+        let (out, code, timed_out, elapsed) =
             run_command_sync("sh -c 'echo boom; exit 3'", std::path::Path::new("."), 10);
         assert!(!timed_out);
         assert_eq!(code, Some(3));
         assert!(out.contains("boom"), "out: {out}");
+        // Sub-second runs legitimately round down to 0 — the value must simply
+        // be present (the timeout path below proves it measures real time).
+        let _ = elapsed;
     }
 
     #[test]
     fn run_command_sync_kills_children_on_timeout() {
         let start = std::time::Instant::now();
-        let (out, code, timed_out) =
+        let (out, code, timed_out, elapsed) =
             run_command_sync("sh -c 'sleep 30'", std::path::Path::new("."), 1);
         assert!(timed_out, "must report the timeout");
         assert_eq!(code, None);
@@ -834,6 +898,7 @@ mod tests {
             "child must be killed, not waited out"
         );
         assert!(out.is_empty() || !out.contains("elapsed"), "out: {out}");
+        assert!(elapsed > 0, "timeout run must report a duration");
     }
 
     #[test]
