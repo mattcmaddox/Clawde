@@ -38,7 +38,7 @@ impl FreeProvider {
     }
 
     /// Create a new `FreeProvider` with the default [`RoutingConfig`]
-    /// (sequential failover in catalog order).
+    /// (Auto strategy: task-based routing refined by latency).
     pub const ENABLE_EMPTY_COOLDOWN_PERSISTENCE: bool = true;
 
     pub fn new(chain: Vec<FreeEntry>) -> Self {
@@ -165,18 +165,23 @@ impl FreeProvider {
     /// Build the per-attempt (provider, model) sequence for a given request,
     /// applying the configured [`RoutingStrategy`].
     ///
-    /// `request` is only consulted by the [`RoutingStrategy::TaskBased`] arm
-    /// (Phase 2 smart routing); the other strategies are request-agnostic.
+    /// `request` is only consulted by the task-routing arms
+    /// ([`RoutingStrategy::Auto`] and [`RoutingStrategy::TaskBased`], the
+    /// Phase 2 smart router); the other strategies are request-agnostic.
     fn attempt_plan(
         &self,
         route: &Route,
         request: Option<&ProviderRequest>,
     ) -> Vec<(usize, String)> {
         match self.routing.strategy {
+            // Auto is the smart default — it routes by task just like the
+            // explicit TaskBased strategy (audit spec §8.4).
+            RoutingStrategy::Auto | RoutingStrategy::TaskBased => {
+                self.attempt_plan_task(route, request)
+            }
             RoutingStrategy::RandomFailover => self.attempt_plan_random(route),
             RoutingStrategy::LatencyBased => self.attempt_plan_latency(route),
             RoutingStrategy::Sequential => self.attempt_plan_sequential(route),
-            RoutingStrategy::TaskBased => self.attempt_plan_task(route, request),
         }
     }
 
@@ -239,26 +244,41 @@ impl FreeProvider {
             Route::Auto => {}
         }
 
-        // Task preference list first, then every remaining upstream in
+        // Task-preferred upstreams first, then every remaining upstream in
         // catalog order — each contributing its primary + fallback models.
-        let mut ordered: Vec<usize> = Vec::with_capacity(self.chain_len());
+        // Within the preferred group, order by historical average latency
+        // (fastest first, spec §8.4 criterion 2) so a task-appropriate
+        // upstream that has proven slow yields to a faster one. Upstreams
+        // without samples (avg_latency = f64::MAX) sort to the group tail,
+        // keeping their preference order via the stable sort.
+        let mut preferred: Vec<usize> = Vec::with_capacity(self.chain_len());
         for pref in &prefs {
             if let Some(idx) = self
                 .chain
                 .iter()
                 .position(|e| e.upstream.id == pref.as_str())
             {
-                if !used.contains(&idx) && !ordered.contains(&idx) {
-                    ordered.push(idx);
+                if !used.contains(&idx) && !preferred.contains(&idx) {
+                    preferred.push(idx);
                 }
             }
         }
+        let mut rest: Vec<usize> = Vec::with_capacity(self.chain_len());
         for idx in 0..self.chain.len() {
-            if !used.contains(&idx) && !ordered.contains(&idx) {
-                ordered.push(idx);
+            if !used.contains(&idx) && !preferred.contains(&idx) {
+                rest.push(idx);
             }
         }
-        for idx in ordered {
+        if preferred.len() > 1 {
+            let latencies = self.latencies.lock().unwrap();
+            preferred.sort_by(|a, b| {
+                latencies
+                    .avg_latency(*a)
+                    .partial_cmp(&latencies.avg_latency(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        for idx in preferred.into_iter().chain(rest) {
             plan.extend(self.plan_rows_for_entry(idx));
         }
         plan
@@ -1240,6 +1260,7 @@ impl LlmProvider for FreeProvider {
 
     fn routing_strategy_name(&self) -> Option<&'static str> {
         Some(match self.routing.strategy {
+            RoutingStrategy::Auto => "Auto",
             RoutingStrategy::Sequential => "Seq",
             RoutingStrategy::RandomFailover => "Random",
             RoutingStrategy::LatencyBased => "Latency",
@@ -1975,6 +1996,80 @@ mod tests {
     }
 
     #[test]
+    fn auto_strategy_routes_by_task() {
+        // The smart default (Auto, spec §8.4) uses the task-based plan, not
+        // plain catalog order: a request classifying as code generation
+        // leads with the code-focused upstreams even though the chain lists
+        // huggingface first.
+        let provider = FreeProvider::new(vec![
+            entry("huggingface", true),
+            entry("groq", true),
+            entry("cerebras", true),
+        ]);
+        let req = ProviderRequest {
+            messages: vec![Message::user("write a parser module")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        // CodeGeneration prefs (openrouter, cerebras, huggingface, groq, ...)
+        // filtered to the chain: cerebras, then huggingface, then groq —
+        // NOT the chain's catalog order (huggingface first).
+        assert_eq!(order, vec!["cerebras", "huggingface", "groq"]);
+    }
+
+    #[test]
+    fn task_plan_refines_preferred_group_by_latency() {
+        // §8.4 criterion 2: within the task-preferred group, faster upstreams
+        // lead even when the preference list names them later; no-sample
+        // upstreams keep preference order at the group tail.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "code_generation".to_string(),
+            vec![
+                "cerebras".to_string(),
+                "groq".to_string(),
+                "huggingface".to_string(),
+            ],
+        );
+        let chain = vec![
+            entry("huggingface", true),
+            entry("groq", true),
+            entry("cerebras", true),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                task_preferences: Some(overrides),
+                ..Default::default()
+            },
+            false,
+        );
+        // Record latencies: groq is fast, cerebras slow, huggingface unknown.
+        {
+            let mut lat = provider.latencies.lock().unwrap();
+            lat.record(1, 0.3, 10); // groq
+            lat.record(2, 5.0, 10); // cerebras
+        }
+        let req = ProviderRequest {
+            messages: vec![Message::user("write a parser module")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        // Preferred group sorted by latency: groq (0.3s), cerebras (5s),
+        // then no-sample huggingface (f64::MAX) at the group tail.
+        assert_eq!(order, vec!["groq", "cerebras", "huggingface"]);
+    }
+
+    #[test]
     fn route_auto_for_free_aliases() {
         let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         assert!(matches!(provider.resolve_route("free"), Route::Auto));
@@ -2001,11 +2096,21 @@ mod tests {
 
     #[test]
     fn nvidia_plan_includes_8b_fallback_after_70b() {
-        let provider = FreeProvider::new(vec![
-            entry("nvidia", true),
-            entry("cerebras", true),
-            entry("groq", true),
-        ]);
+        // Sequential explicitly — this test is about fallback-row adjacency
+        // (primary then per-upstream fallbacks), not the task-based default
+        // plan ordering.
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("nvidia", true),
+                entry("cerebras", true),
+                entry("groq", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
         // Sequential Auto plan: nvidia's 70B primary, then its 8B fallback on
         // the SAME index, then the other upstreams.
         let plan = provider.attempt_plan(&Route::Auto, None);
@@ -2019,11 +2124,20 @@ mod tests {
 
     #[test]
     fn pinned_route_tries_pinned_model_then_upstream_fallbacks() {
-        let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
-            entry("nvidia", true),
-            entry("cerebras", true),
-        ]);
+        // Sequential explicitly — this test is about pinned-then-catalog
+        // fallback order, not the task-based default plan ordering.
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("nvidia", true),
+                entry("cerebras", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
         // Pinning nvidia: the pinned model, then nvidia's 8B fallback, then
         // the rest of the chain in catalog order.
         let plan = provider.attempt_plan(
@@ -2138,14 +2252,17 @@ mod tests {
     }
 
     #[test]
-    fn attempt_plan_auto_uses_each_default() {
+    fn attempt_plan_default_auto_routes_by_task_preference() {
+        // The default strategy is Auto (task-based, spec §8.4). Both entries
+        // contribute their default model; the order follows the
+        // code-generation preference list, so cerebras leads huggingface.
         let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].0, 0);
-        assert_eq!(plan[0].1, "meta-llama/Llama-3.3-70B-Instruct");
-        assert_eq!(plan[1].0, 1);
-        assert_eq!(plan[1].1, "gpt-oss-120b");
+        assert_eq!(plan[0].0, 1);
+        assert_eq!(plan[0].1, "gpt-oss-120b");
+        assert_eq!(plan[1].0, 0);
+        assert_eq!(plan[1].1, "meta-llama/Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -2213,11 +2330,11 @@ mod tests {
     }
 
     #[test]
-    fn routing_config_default_is_sequential() {
+    fn routing_config_default_is_auto() {
         let provider = FreeProvider::new(vec![entry("huggingface", true)]);
         assert!(matches!(
             provider.routing_config().strategy,
-            RoutingStrategy::Sequential
+            RoutingStrategy::Auto
         ));
     }
 
@@ -2240,11 +2357,12 @@ mod tests {
 
     #[test]
     fn routing_strategy_serde_round_trip() {
-        // Sequential → JSON → deserialize
-        let seq = RoutingConfig::default();
-        let json = serde_json::to_string(&seq).unwrap();
+        // Default (Auto) → JSON → deserialize
+        let auto = RoutingConfig::default();
+        let json = serde_json::to_string(&auto).unwrap();
+        assert!(json.contains("\"strategy\":\"auto\""), "json: {json}");
         let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized.strategy, RoutingStrategy::Sequential));
+        assert!(matches!(deserialized.strategy, RoutingStrategy::Auto));
 
         // RandomFailover → JSON → deserialize
         let rng = RoutingConfig {
@@ -2309,11 +2427,20 @@ mod tests {
 
     #[test]
     fn attempt_plan_pinned_tries_pin_then_others() {
-        let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
-            entry("cerebras", true),
-            entry("google", true),
-        ]);
+        // Sequential explicitly — this test asserts pinned-then-catalog
+        // order, not the task-based default plan ordering.
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("cerebras", true),
+                entry("google", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
         let plan = provider.attempt_plan(
             &Route::Pinned {
                 start_idx: 2,
@@ -2362,8 +2489,17 @@ mod tests {
 
     #[tokio::test]
     async fn create_message_falls_back_to_next_upstream() {
-        let provider =
-            FreeProvider::new(vec![entry("huggingface", false), entry("cerebras", true)]);
+        // Sequential explicitly so the failing huggingface is genuinely first
+        // in the plan — the default Auto plan would prefer cerebras and
+        // never exercise the fallback.
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", false), entry("cerebras", true)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
         let resp = provider
             .create_message(dummy_request("free/auto"))
             .await
@@ -2512,8 +2648,17 @@ mod tests {
         // Use a *working* first upstream so the skip is observable: with the
         // old buggy is_in_cooldown gate the loop would try huggingface,
         // succeed, and return its model; with the fix it skips the cooled
-        // upstream and lands on cerebras.
-        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        // upstream and lands on cerebras. Sequential explicitly so huggingface
+        // is genuinely first in the plan — the default Auto plan would prefer
+        // cerebras and never exercise the skip.
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", true), entry("cerebras", true)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
         let err = ProviderError::ServerError {
             provider: ProviderId::new("huggingface"),
             status: Some(503),

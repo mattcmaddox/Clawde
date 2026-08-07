@@ -8,7 +8,7 @@
 //
 // Layout (centered modal):
 //
-//     ┌─ Task routing · strategy: sequential ─────────────── esc ┐
+//     ┌─ Task routing · strategy: auto ────────────────────── esc ┐
 //     │  Tasks                  │  Upstreams for code generation │
 //     │  ▸ code generation  …   │  [x] groq       Groq           │
 //     │    code edit        …   │  [ ] cerebras   Cerebras       │
@@ -103,7 +103,7 @@ impl Default for RoutingDialogState {
             upstream_scroll: 0,
             last_upstream_visible: Cell::new(0),
             overrides: HashMap::new(),
-            strategy: "sequential".to_string(),
+            strategy: "auto".to_string(),
             latencies: Vec::new(),
         }
     }
@@ -297,7 +297,7 @@ fn parse_routing_strategy(config: &Config) -> String {
     routing_value(config)
         .and_then(|v| v.get("strategy"))
         .and_then(|v| v.as_str())
-        .unwrap_or("sequential")
+        .unwrap_or("auto")
         .to_string()
 }
 
@@ -319,8 +319,11 @@ pub fn render_routing_dialog(
     let height = 22.min(size.height.saturating_sub(2));
     let area = centered_rect(width, height, size);
     state.last_rect.set(area);
-    let strategy_note = if state.strategy == "task_based" {
-        "strategy: task_based".to_string()
+    // auto and task_based both route by task, so neither needs the
+    // "saving pins switches to task" note (that only applies when the
+    // current strategy is sequential/random/latency).
+    let strategy_note = if state.strategy == "task_based" || state.strategy == "auto" {
+        format!("strategy: {}", state.strategy)
     } else {
         format!(
             "strategy: {} \u{b7} saving pins switches to task",

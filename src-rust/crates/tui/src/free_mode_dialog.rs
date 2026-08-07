@@ -326,7 +326,7 @@ impl FreeModeDialogState {
                     .get("free")
                     .and_then(|pc| pc.options.get("routing"))
                     .cloned()
-                    .unwrap_or_else(|| serde_json::json!({"strategy": "sequential"}));
+                    .unwrap_or_else(|| serde_json::json!({"strategy": "auto"}));
                 if let Some(obj) = cfg.as_object_mut() {
                     obj.insert(
                         "disabled_upstreams".to_string(),

@@ -83,8 +83,13 @@ pub struct FreeEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
-    /// Try upstreams in catalog (priority) order. Current default.
+    /// Smart default (audit spec §8.4 "Auto, no user config needed"):
+    /// classify each request by task and try the upstreams best suited to it
+    /// first, refined by historical latency within the task-preferred group.
+    /// Behaves like [`RoutingStrategy::TaskBased`].
     #[default]
+    Auto,
+    /// Try upstreams in catalog (priority) order.
     Sequential,
     /// Randomly select an upstream with failover to the next on failure.
     RandomFailover,

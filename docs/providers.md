@@ -108,8 +108,9 @@ selects upstream providers:
 
 | Command | Description |
 |---|---|
-| `/routing` | Show the current routing strategy (and per-task assignments when task-based) |
-| `/routing sequential` | Try upstreams in catalog priority order (default) |
+| `/routing` | Show the current routing strategy (and per-task assignments when auto/task-based) |
+| `/routing auto` | **Default.** Classify each request by task and dispatch to the upstreams best suited to it first, ordered by historical latency within the task-preferred group (spec §8.4 — no user config needed) |
+| `/routing sequential` | Try upstreams in catalog priority order |
 | `/routing random` | Randomize upstream order each request |
 | `/routing latency` | Route to the lowest-latency upstream first |
 | `/routing task` | Route by request type — each request is classified (code generation, reasoning, verification, …) and dispatched to the upstreams best suited to that task first, falling through the rest on failure |

@@ -247,7 +247,7 @@ impl SettingsScreen {
             file_autocomplete_limit: "15".to_string(),
             file_autocomplete_show_hidden_files: false,
             file_injection_max_size: "100".to_string(),
-            routing_strategy: "sequential".to_string(),
+            routing_strategy: "auto".to_string(),
             disabled_upstreams: String::new(),
             first_byte_timeout_secs: "0".to_string(),
             staggered_probe: true,
@@ -334,7 +334,7 @@ impl SettingsScreen {
             .and_then(|pc| pc.options.get("routing"))
             .and_then(|v| v.get("strategy"))
             .and_then(|v| v.as_str())
-            .unwrap_or("sequential")
+            .unwrap_or("auto")
             .to_string();
 
         // Read disabled upstreams from provider config
@@ -1315,12 +1315,13 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         make_entry(
             "routing_strategy",
             "Free routing",
-            "How free-mode selects upstream providers (sequential/random/latency/task).",
+            "How free-mode selects upstream providers (auto/sequential/random/latency/task).",
             SECTION_COMMON,
-            "sequential".to_string(),
+            "auto".to_string(),
             SettingEffect::Immediate,
             SettingKind::Enum {
                 options: vec![
+                    "auto",
                     "sequential",
                     "random_failover",
                     "latency_based",
@@ -2561,7 +2562,7 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
             screen.refresh_memory_readout();
         }
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
-        "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
+        "routing_strategy" => screen.routing_strategy = "auto".to_string(),
         "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
         "staggered_probe" => screen.staggered_probe = true,
         "upstream_5xx_cooldown_secs" => screen.upstream_5xx_cooldown_secs = "45".to_string(),

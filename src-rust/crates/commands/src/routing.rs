@@ -23,15 +23,16 @@ impl SlashCommand for RoutingCommand {
     }
 
     fn description(&self) -> &str {
-        "Show or change the free-mode routing strategy (sequential, random, latency, task)"
+        "Show or change the free-mode routing strategy (auto, sequential, random, latency, task)"
     }
 
     fn help(&self) -> &str {
-        "Usage: /routing [sequential|random|latency]\n\n\
+        "Usage: /routing [auto|sequential|random|latency|task]\n\n\
          Show or change the free-mode routing strategy.\n\n\
          Strategies:\n\
            /routing                — show current strategy\n\
-           /routing sequential     — try upstreams in priority order (default)\n\
+           /routing auto           — route by request type, refined by latency (default)\n\
+           /routing sequential     — try upstreams in priority order\n\
            /routing random         — randomize upstream order each request\n\
            /routing latency        — route to the lowest-latency upstream first\n\
            /routing task           — route by request type (code gen, reasoning,\n\
@@ -45,7 +46,8 @@ impl SlashCommand for RoutingCommand {
            /sr                     — shortcut for /routing sequential\n\
            /rr                     — shortcut for /routing random\n\
            /lr                     — shortcut for /routing latency\n\
-           /tr                     — shortcut for /routing task\n\n\
+           /tr                     — shortcut for /routing task\n\
+\
          The setting is persisted in settings.json under providers.free.options.routing\n\
          and takes effect after /refresh or restart."
     }
@@ -53,8 +55,13 @@ impl SlashCommand for RoutingCommand {
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
             ArgCompletion {
+                value: "auto".into(),
+                description: "Smart default: route by task, refined by latency".into(),
+                available: true,
+            },
+            ArgCompletion {
                 value: "sequential".into(),
-                description: "Try upstreams in priority order (default)".into(),
+                description: "Try upstreams in priority order".into(),
                 available: true,
             },
             ArgCompletion {
@@ -103,11 +110,13 @@ impl SlashCommand for RoutingCommand {
             let strategy = resolve_routing_strategy_name(&ctx.config);
             let mut msg = format!(
                 "Free-mode routing strategy: {}\n\n\
-                 Use /routing <sequential|random|latency|task> to change.\n\
+                 Use /routing <auto|sequential|random|latency|task> to change.\n\
                  Run /refresh to apply the change.",
                 strategy
             );
-            if strategy == "task_based" {
+            // Auto and task_based both route by task, so both show the
+            // per-task assignments.
+            if strategy == "task_based" || strategy == "auto" {
                 msg.push_str("\n\nTask assignments (top 3 upstreams):\n");
                 for task in TaskType::ALL {
                     let ids = task_preference_ids(task);
@@ -135,13 +144,14 @@ impl SlashCommand for RoutingCommand {
         }
 
         let new_strategy = match args.to_lowercase().as_str() {
+            "auto" | "smart" => "auto",
             "sequential" | "seq" | "sr" => "sequential",
             "random" | "random_failover" | "random-failover" | "rr" => "random_failover",
             "latency" | "latency_based" | "latency-based" | "lr" => "latency_based",
             "task" | "task_based" | "task-based" | "tb" => "task_based",
             other => {
                 return CommandResult::Error(format!(
-                    "Unknown strategy '{}'. Valid options: sequential, random, latency, task",
+                    "Unknown strategy '{}'. Valid options: auto, sequential, random, latency, task",
                     other
                 ));
             }
@@ -173,6 +183,7 @@ impl SlashCommand for RoutingAlias {
 
     fn description(&self) -> &str {
         match self.target {
+            "auto" => "Set free-mode routing to auto (task-based, latency-refined)",
             "sequential" => "Set free-mode routing to sequential (catalog order)",
             "random_failover" => "Set free-mode routing to random (shuffle each request)",
             "latency_based" => "Set free-mode routing to latency (fastest first)",
@@ -193,6 +204,7 @@ impl SlashCommand for RoutingAlias {
 /// Persist a routing strategy and return a ConfigChangeMessage.
 async fn set_routing_strategy(ctx: &mut CommandContext, strategy: &str) -> CommandResult {
     let display_name = match strategy {
+        "auto" => "auto",
         "sequential" => "sequential",
         "random_failover" => "random_failover",
         "latency_based" => "latency_based",
@@ -234,7 +246,7 @@ async fn set_routing_strategy(ctx: &mut CommandContext, strategy: &str) -> Comma
 }
 
 /// Read the current routing strategy name from the config, defaulting to
-/// "sequential" when the config key is absent.
+/// "auto" when the config key is absent (the smart default, spec §8.4).
 fn resolve_routing_strategy_name(config: &Config) -> String {
     config
         .provider_configs
@@ -242,7 +254,7 @@ fn resolve_routing_strategy_name(config: &Config) -> String {
         .and_then(|pc| pc.options.get("routing"))
         .and_then(|v| v.get("strategy"))
         .and_then(|v| v.as_str())
-        .unwrap_or("sequential")
+        .unwrap_or("auto")
         .to_string()
 }
 
@@ -253,9 +265,9 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn resolve_routing_defaults_to_sequential() {
+    fn resolve_routing_defaults_to_auto() {
         let config = Config::default();
-        assert_eq!(resolve_routing_strategy_name(&config), "sequential");
+        assert_eq!(resolve_routing_strategy_name(&config), "auto");
     }
 
     #[test]
@@ -309,6 +321,7 @@ mod tests {
         // CommandContext.
         let resolve = |arg: &str| -> Option<&'static str> {
             match arg.to_lowercase().as_str() {
+                "auto" | "smart" => Some("auto"),
                 "sequential" | "seq" | "sr" => Some("sequential"),
                 "random" | "random_failover" | "random-failover" | "rr" => Some("random_failover"),
                 "latency" | "latency_based" | "latency-based" | "lr" => Some("latency_based"),
@@ -318,6 +331,7 @@ mod tests {
         };
 
         // Full names still work
+        assert_eq!(resolve("auto"), Some("auto"));
         assert_eq!(resolve("sequential"), Some("sequential"));
         assert_eq!(resolve("random"), Some("random_failover"));
         assert_eq!(resolve("latency"), Some("latency_based"));
@@ -325,6 +339,7 @@ mod tests {
         assert_eq!(resolve("task_based"), Some("task_based"));
 
         // Short aliases work
+        assert_eq!(resolve("smart"), Some("auto"));
         assert_eq!(resolve("seq"), Some("sequential"));
         assert_eq!(resolve("sr"), Some("sequential"));
         assert_eq!(resolve("rr"), Some("random_failover"));
