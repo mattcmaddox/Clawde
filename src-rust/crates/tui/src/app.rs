@@ -1331,6 +1331,9 @@ pub struct App {
     pub display_messages: Vec<DisplayMessage>,
     /// Synthetic system annotations interleaved between real messages at render time.
     pub system_annotations: Vec<SystemAnnotation>,
+    /// Most recent execute-and-verify round, kept for the footer badge even
+    /// after its boxed annotation scrolls out of view. None until a round ran.
+    pub verify: Option<clawde_query::VerifyReport>,
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
@@ -1972,6 +1975,7 @@ impl App {
             messages: Vec::new(),
             display_messages: Vec::new(),
             system_annotations: Vec::new(),
+            verify: None,
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
@@ -3870,6 +3874,9 @@ impl App {
 
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        // The verify badge reflects the current conversation's last round;
+        // swapping in a different conversation must not carry a stale badge.
+        self.verify = None;
         self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
     }
@@ -3912,7 +3919,11 @@ impl App {
     }
 
     /// Push the structured verify-round annotation (audit spec Phase 1 §15.1).
+    /// Also records the round on `self.verify` so the footer can show a
+    /// persistent at-a-glance badge for the last round's outcome even after
+    /// the box scrolls out of view.
     pub fn push_verify_annotation(&mut self, report: clawde_query::VerifyReport) {
+        self.verify = Some(report.clone());
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
             text: report.headline.clone(),

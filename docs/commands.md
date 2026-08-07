@@ -1245,6 +1245,11 @@ auto-loop's off-switch never blocks an on-demand check.
 /verify lint     # run only the linter/typechecker
 ```
 
+After any verification round (auto-loop or manual `/verify`) the footer shows
+a persistent `✓ verify` / `✗ verify` badge so the last round's outcome stays
+visible even after the boxed report scrolls out of view; mid-loop auto-fix
+rounds add the attempt counter (e.g. `✗ verify (2/3)`).
+
 Configure the round via `settings.json` (see the Verify loop section of
 `configuration.md`): `verify.sandbox`, `verify.auto_test`, `verify.auto_lint`,
 `verify.timeout_secs`, and for the container sandbox `verify.container_image`.

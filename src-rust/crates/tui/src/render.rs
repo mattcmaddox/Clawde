@@ -2355,6 +2355,29 @@ fn verify_headline_color(report: &clawde_query::VerifyReport) -> Color {
     }
 }
 
+/// Footer badge for the most recent verify round: icon + colour + optional
+/// attempt counter. Green ✓ when everything passed, red ✗ when any check
+/// failed, neutral △ when nothing ran (no checks configured / skipped).
+/// The attempt counter is shown only for mid-loop auto-fix rounds so a
+/// `✓ verify` or `✗ verify` stays compact.
+fn verify_footer_badge(report: &clawde_query::VerifyReport) -> (String, Color) {
+    let (icon, color) = if report.results.is_empty() {
+        ("△", Color::DarkGray)
+    } else if report.results.iter().all(|r| r.ok || r.skipped) {
+        ("✓", Color::Green)
+    } else {
+        ("✗", Color::Red)
+    };
+    // Show the attempt counter only for mid-loop auto-fix rounds; the final
+    // round (passed, or auto-fix exhausted) stays a compact ✓/✗.
+    let attempt = if report.attempt > 1 && report.attempt <= report.max_retries {
+        format!(" ({}/{})", report.attempt, report.max_retries)
+    } else {
+        String::new()
+    };
+    (format!("{icon} verify{attempt}"), color)
+}
+
 fn render_system_annotation_lines(
     lines: &mut Vec<Line<'static>>,
     ann: &SystemAnnotation,
@@ -3546,6 +3569,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             };
             spans.push(Span::styled(label, style));
+        }
+
+        // Verify badge — persistent at-a-glance outcome of the most recent
+        // execute-and-verify round (auto-loop or /verify). Survives after
+        // the boxed report scrolls out of view.
+        if let Some(report) = &app.verify {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            let (label, color) = verify_footer_badge(report);
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
         }
 
         // Ollama connectivity mode indicator — dim and unobtrusive.
@@ -5622,5 +5659,74 @@ mod task_badge_tooltip_tests {
             .map(|c| c.symbol())
             .collect();
         assert!(!drawn.contains("coding"));
+    }
+
+    // ---- verify footer badge --------------------------------------------
+
+    fn verify_report_with(results: Vec<(bool, bool)>) -> clawde_query::VerifyReport {
+        // (ok, skipped) pairs -> CheckResult (constructors are pub(crate) in
+        // query, so build the struct directly here).
+        clawde_query::VerifyReport {
+            results: results
+                .into_iter()
+                .map(|(ok, skipped)| clawde_query::CheckResult {
+                    label: "check".to_string(),
+                    ok,
+                    output: String::new(),
+                    timed_out: false,
+                    skipped,
+                })
+                .collect(),
+            attempt: 1,
+            max_retries: 3,
+            headline: "h".to_string(),
+            sandbox: clawde_core::config::VerifySandbox::Direct,
+        }
+    }
+
+    #[test]
+    fn verify_footer_badge_is_green_on_pass() {
+        let report = verify_report_with(vec![(true, false), (true, false)]);
+        let (label, color) = verify_footer_badge(&report);
+        assert!(label.starts_with("✓"), "label: {label}");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn verify_footer_badge_is_red_on_failure() {
+        let report = verify_report_with(vec![(true, false), (false, false)]);
+        let (label, color) = verify_footer_badge(&report);
+        assert!(label.starts_with("✗"), "label: {label}");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn verify_footer_badge_is_neutral_when_nothing_ran() {
+        let report = verify_report_with(vec![]);
+        let (label, color) = verify_footer_badge(&report);
+        assert!(label.starts_with("△"), "label: {label}");
+        assert_eq!(color, Color::DarkGray);
+    }
+    #[test]
+    fn verify_footer_badge_shows_attempt_only_for_mid_loop_rounds() {
+        let mut report = verify_report_with(vec![(false, false)]);
+        let (label, _) = verify_footer_badge(&report);
+        assert!(
+            !label.contains('('),
+            "first round must stay compact: {label}"
+        );
+
+        // Mid-loop auto-fix round → counter shown.
+        report.attempt = 2;
+        let (label, _) = verify_footer_badge(&report);
+        assert!(label.contains("(2/3)"), "attempt counter missing: {label}");
+
+        // Exhausted (attempt > max) is a final round → back to compact.
+        report.attempt = 4;
+        let (label, _) = verify_footer_badge(&report);
+        assert!(
+            !label.contains('('),
+            "exhausted round must stay compact: {label}"
+        );
     }
 }
