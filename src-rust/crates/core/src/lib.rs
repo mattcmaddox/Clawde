@@ -1596,8 +1596,12 @@ pub mod config {
     // ---- MemoryConfig ----------------------------------------------------
 
     /// Configuration for project-memory injection (audit spec §18.3 token
-    /// budget): caps how many tokens the `<memory>` block may consume from the
-    /// context window.
+    /// budget): controls whether the `<memory>` block is injected at all and
+    /// caps how many tokens it may consume from the context window.
+    ///
+    /// JSON keys accept both camelCase (`maxTokens`, `autoMemoryEnabled`) and
+    /// snake_case (`max_tokens`, `auto_memory_enabled`) so the block reads
+    /// naturally at either nesting level.
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[serde(default)]
     pub struct MemoryConfig {
@@ -1607,7 +1611,15 @@ pub mod config {
         /// line boundary, to stay under the cap (~4 bytes per token). `None`
         /// (default) relies on the built-in per-file caps (25 KB index /
         /// 4 KB summary).
+        #[serde(rename = "maxTokens", alias = "max_tokens")]
         pub max_tokens: Option<u32>,
+        /// Master switch for the project-memory system (memdir injection +
+        /// auto-dream consolidation + conventions recording). `Some(false)`
+        /// disables it even when a memory dir exists; `None` (default) defers
+        /// to the env vars and defaults in
+        /// [`crate::memdir::is_auto_memory_enabled`].
+        #[serde(rename = "autoMemoryEnabled", alias = "auto_memory_enabled")]
+        pub enabled: Option<bool>,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2629,6 +2641,7 @@ pub mod config {
                         .memory
                         .max_tokens
                         .or(base.config.memory.max_tokens),
+                    enabled: over.config.memory.enabled.or(base.config.memory.enabled),
                 },
             };
             Self {

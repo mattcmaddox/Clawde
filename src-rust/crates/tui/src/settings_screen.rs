@@ -94,6 +94,7 @@ const SECTION_INTERFACE: &str = "Interface";
 const SECTION_WORKSPACE: &str = "Workspace & files";
 const SECTION_FREE_ROUTING: &str = "Free-mode routing";
 const SECTION_OLLAMA: &str = "Ollama (local)";
+const SECTION_MEMORY: &str = "Memory & project";
 
 #[derive(Debug, Clone)]
 pub struct SettingsEntry {
@@ -197,6 +198,11 @@ pub struct SettingsScreen {
     pub verify_sandbox: String,
     /// Container image for the `container` verify sandbox (empty = auto).
     pub verify_container_image: String,
+    /// Project-memory master switch (`config.memory.autoMemoryEnabled`).
+    /// Default true (enabled).
+    pub memory_enabled: bool,
+    /// Cap on the `<memory>` injection in tokens (empty = built-in caps).
+    pub memory_max_tokens: String,
 }
 
 impl SettingsScreen {
@@ -253,6 +259,8 @@ impl SettingsScreen {
             permission_mode: "default".to_string(),
             verify_sandbox: "direct".to_string(),
             verify_container_image: String::new(),
+            memory_enabled: true,
+            memory_max_tokens: String::new(),
             keybinding_preset: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
@@ -301,6 +309,13 @@ impl SettingsScreen {
         self.permission_mode = permission_mode_str(&s.config.permission_mode);
         self.verify_sandbox = s.config.verify.sandbox.label().to_string();
         self.verify_container_image = s.config.verify.container_image.clone().unwrap_or_default();
+        self.memory_enabled = s.config.memory.enabled.unwrap_or(true);
+        self.memory_max_tokens = s
+            .config
+            .memory
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_default();
 
         // Read routing strategy from provider config
         self.routing_strategy = s
@@ -514,6 +529,20 @@ impl SettingsScreen {
                     if let Ok(n) = value.parse::<u32>() {
                         config.max_tokens = Some(n);
                         self.settings_snapshot.config.max_tokens = Some(n);
+                    }
+                }
+                "memory_max_tokens" => {
+                    // Empty clears the cap back to the built-in defaults; a
+                    // parse failure is ignored (keeps the previous value).
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        config.memory.max_tokens = None;
+                        self.settings_snapshot.config.memory.max_tokens = None;
+                        self.memory_max_tokens = String::new();
+                    } else if let Ok(n) = trimmed.parse::<u32>() {
+                        config.memory.max_tokens = Some(n);
+                        self.settings_snapshot.config.memory.max_tokens = Some(n);
+                        self.memory_max_tokens = trimmed.to_string();
                     }
                 }
                 "output_style" => {
@@ -913,6 +942,16 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         "permission_mode" => permission_mode_str(&c.permission_mode),
         "verify_sandbox" => c.verify.sandbox.config_name().to_string(),
         "verify_container_image" => c.verify.container_image.clone().unwrap_or_default(),
+        "memory_max_tokens" => c
+            .memory
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        "memory_enabled" => c
+            .memory
+            .enabled
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "true".to_string()),
         "routing_strategy" => routing_str_value(c, "strategy"),
         "first_byte_timeout_secs" => routing_u64_str(c, "first_byte_timeout_secs"),
         "staggered_probe" => routing_bool_str(c, "staggered_probe"),
@@ -966,14 +1005,16 @@ fn default_value_for(key: &str) -> String {
         | "ollama_require_explicit_host"
         | "ollama_default_host"
         | "keybinding_preset"
-        | "verify_container_image" => String::new(),
+        | "verify_container_image"
+        | "memory_max_tokens" => String::new(),
         "auto_compact"
         | "notifications"
         | "terminal_progress_bar"
         | "show_cwd"
         | "show_git_branch"
         | "fileInjectionEnabled"
-        | "mouse_capture" => "true".to_string(),
+        | "mouse_capture"
+        | "memory_enabled" => "true".to_string(),
         "permission_mode" => "default".to_string(),
         "verify_sandbox" => "direct".to_string(),
         "output_format" => "text".to_string(),
@@ -1546,6 +1587,28 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         SettingEffect::NextSession,
         SettingKind::Text,
         screen.ollama_default_host.clone(),
+    ));
+
+    // ---- Memory & project ------------------------------------------------
+    entries.push(make_entry(
+        "memory_enabled",
+        "Project memory",
+        "Injects the project's MEMORY.md index + most recent session summary into the system prompt, and auto-consolidates session summaries into the project memory dir. Off disables injection even when memory files exist (env vars still win: CLAURST_DISABLE_AUTO_MEMORY=1 overrides this).",
+        SECTION_MEMORY,
+        "true".to_string(),
+        SettingEffect::NextSession,
+        SettingKind::Bool,
+        bool_v(screen.memory_enabled),
+    ));
+    entries.push(make_entry(
+        "memory_max_tokens",
+        "Memory token budget",
+        "Cap on the combined <memory> injection (index + session summary) in tokens (~4 bytes per token). Over budget: the session summary is dropped first, then the index is clamped at a line boundary. Empty = built-in caps (25 KB index / 4 KB summary).",
+        SECTION_MEMORY,
+        String::new(),
+        SettingEffect::NextSession,
+        SettingKind::Number,
+        screen.memory_max_tokens.clone(),
     ));
 
     entries
@@ -2227,6 +2290,8 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
         "permission_mode" => c.permission_mode = clawde_core::config::PermissionMode::Default,
         "verify_sandbox" => c.verify.sandbox = clawde_core::config::VerifySandbox::Direct,
         "verify_container_image" => c.verify.container_image = None,
+        "memory_enabled" => c.memory.enabled = None,
+        "memory_max_tokens" => c.memory.max_tokens = None,
         "preferredSearchBackend" => s.preferred_search_backend = "auto".to_string(),
         // Routing entries — remove from the routing JSON.
         "routing_strategy" => {
@@ -2354,6 +2419,8 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "permission_mode" => screen.permission_mode = "default".to_string(),
         "verify_sandbox" => screen.verify_sandbox = "direct".to_string(),
         "verify_container_image" => screen.verify_container_image = String::new(),
+        "memory_enabled" => screen.memory_enabled = true,
+        "memory_max_tokens" => screen.memory_max_tokens = String::new(),
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
         "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
         "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
@@ -2501,6 +2568,12 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .or_default()
                             .options
                             .insert("require_explicit_host".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "memory_enabled" => {
+                        screen.memory_enabled = new_value;
+                        screen.settings_snapshot.config.memory.enabled = Some(new_value);
+                        config.memory.enabled = Some(new_value);
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
@@ -2798,12 +2871,14 @@ mod tests {
             .iter()
             .filter(|e| e.label.to_lowercase().contains("token"))
             .collect();
+        // "Max tokens" (Common) and "Memory token budget" (Memory & project)
+        // both match 'token' — the Common entry sorts first.
+        let labels: Vec<&str> = filtered.iter().map(|e| e.label).collect();
         assert_eq!(
-            filtered.len(),
-            1,
-            "Should find exactly 1 entry matching 'token'"
+            labels,
+            vec!["Max tokens", "Memory token budget"],
+            "Unexpected 'token' matches: {labels:?}"
         );
-        assert_eq!(filtered[0].label, "Max tokens");
     }
 
     #[test]
@@ -2841,6 +2916,71 @@ mod tests {
         if filtered[1].section == filtered[2].section {
             assert_eq!(b, a + 1);
         }
+    }
+
+    #[test]
+    fn memory_entries_exist_in_memory_section() {
+        let mut screen = fresh_controlled_screen();
+        // The screen display fields are not reset by fresh_controlled_screen
+        // (only the snapshots), so force the memory defaults.
+        screen.memory_enabled = true;
+        screen.memory_max_tokens = String::new();
+        let entries = all_entries(&screen);
+        let enabled = entries
+            .iter()
+            .find(|e| e.key == "memory_enabled")
+            .expect("memory_enabled entry must exist");
+        assert_eq!(enabled.section, SECTION_MEMORY);
+        assert!(matches!(enabled.kind, SettingKind::Bool));
+        assert_eq!(enabled.default, "true");
+        assert_eq!(enabled.value, "true");
+
+        let budget = entries
+            .iter()
+            .find(|e| e.key == "memory_max_tokens")
+            .expect("memory_max_tokens entry must exist");
+        assert_eq!(budget.section, SECTION_MEMORY);
+        assert!(matches!(budget.kind, SettingKind::Number));
+        assert_eq!(budget.default, "");
+    }
+
+    #[test]
+    fn memory_toggle_flips_snapshot_and_config() {
+        let mut screen = fresh_controlled_screen();
+        let mut config = Config::default();
+        // Select the memory_enabled row — toggle_or_cycle_current acts on the
+        // filtered entry under selected_idx.
+        let all = all_entries(&screen);
+        screen.selected_idx = all
+            .iter()
+            .position(|e| e.key == "memory_enabled")
+            .expect("memory_enabled entry must exist");
+        screen.memory_enabled = true;
+        screen.settings_snapshot.config.memory.enabled = None;
+        toggle_or_cycle_current(&mut screen, &mut config);
+        assert!(!screen.memory_enabled);
+        assert_eq!(screen.settings_snapshot.config.memory.enabled, Some(false));
+        assert_eq!(config.memory.enabled, Some(false));
+    }
+
+    #[test]
+    fn memory_max_tokens_value_from_settings_roundtrip() {
+        let mut screen = fresh_controlled_screen();
+        screen.settings_snapshot.config.memory.max_tokens = Some(1500);
+        assert_eq!(
+            value_from_settings(&screen.settings_snapshot, "memory_max_tokens"),
+            "1500"
+        );
+        // Default: absent in the file.
+        assert_eq!(default_value_for("memory_max_tokens"), "");
+        assert_eq!(default_value_for("memory_enabled"), "true");
+        // apply_settings_from_snapshot reads the *effective* snapshot, so set
+        // it there to exercise the screen-field population.
+        screen.effective_snapshot.config.memory.max_tokens = Some(1500);
+        screen.effective_snapshot.config.memory.enabled = None;
+        screen.apply_settings_from_snapshot();
+        assert_eq!(screen.memory_max_tokens, "1500");
+        assert!(screen.memory_enabled);
     }
 
     #[test]

@@ -168,7 +168,8 @@ verify without re-discovery.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory.maxTokens` | integer | unset | Cap on the combined `<memory>` injection in tokens (~4 bytes per token). When the index + session summary exceed it, the summary is dropped first, then the index is clamped at a line boundary. Unset uses the built-in per-file caps (25 KB index / 4 KB summary). |
+| `memory.autoMemoryEnabled` | boolean \| null | enabled | Master switch for the project-memory system (injection + auto-dream consolidation + conventions recording). `false` disables injection even when memory files exist. `null` (unset) defers to the env vars and defaults in `is_auto_memory_enabled` — note `CLAURST_DISABLE_AUTO_MEMORY=1` always wins over this setting. |
+| `memory.maxTokens` | integer | unset | Cap on the combined `<memory>` injection in tokens (~4 bytes per token). When the index + session summary exceed it, the summary is dropped first, then the index is clamped at a line boundary. Unset uses the built-in per-file caps (25 KB index / 4 KB summary). Snake_case keys (`auto_memory_enabled`, `max_tokens`) are also accepted. |
 
 Example:
 
@@ -176,6 +177,7 @@ Example:
 {
   "config": {
     "memory": {
+      "autoMemoryEnabled": true,
       "maxTokens": 1500
     }
   }

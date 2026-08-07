@@ -412,8 +412,15 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
         use clawde_core::memdir::{
             auto_memory_path, is_auto_memory_enabled, record_verify_conventions,
         };
+        // Honor the settings toggle (`config.memory.autoMemoryEnabled`):
+        // when the user disabled the memory system, the conventions recording
+        // stops too. Loaded from Settings because `run_verify_round` only
+        // receives the VerifyConfig slice.
+        let memory_enabled = clawde_core::config::Settings::load_sync()
+            .ok()
+            .and_then(|s| s.config.memory.enabled);
         let memory_dir = auto_memory_path(working_dir);
-        if is_auto_memory_enabled(None) && memory_dir.is_dir() {
+        if is_auto_memory_enabled(memory_enabled) && memory_dir.is_dir() {
             let info = clawde_tools::detect_project::detect_project_info(working_dir);
             record_verify_conventions(
                 &memory_dir,

@@ -360,6 +360,7 @@ impl Tool for AgentTool {
             working_directory: Some(working_dir_str),
             thinking_budget: None,
             memory_max_tokens: None,
+            memory_enabled: None,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,

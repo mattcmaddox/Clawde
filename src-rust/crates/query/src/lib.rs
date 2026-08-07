@@ -111,6 +111,10 @@ pub struct QueryConfig {
     /// Optional cap (tokens) on the `<memory>` block injected into the system
     /// prompt (audit spec §18.3). Copied from `Config::memory.max_tokens`.
     pub memory_max_tokens: Option<u32>,
+    /// Master switch for the project-memory system. Copied from
+    /// `Config::memory.enabled`; `Some(false)` disables injection even when a
+    /// memory dir exists, `None` defers to env vars / defaults.
+    pub memory_enabled: Option<bool>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
@@ -192,6 +196,7 @@ impl Default for QueryConfig {
             working_directory: None,
             thinking_budget: None,
             memory_max_tokens: None,
+            memory_enabled: None,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -219,6 +224,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             memory_max_tokens: cfg.memory.max_tokens,
+            memory_enabled: cfg.memory.enabled,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -238,6 +244,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             memory_max_tokens: cfg.memory.max_tokens,
+            memory_enabled: cfg.memory.enabled,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -2370,6 +2377,7 @@ mod tests {
             output_style_prompt: None,
             working_directory: None,
             memory_max_tokens: None,
+            memory_enabled: None,
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,

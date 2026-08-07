@@ -26,7 +26,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
             use clawde_core::memdir::{
                 auto_memory_path, build_memory_prompt_content_with_budget, is_auto_memory_enabled,
             };
-            if !is_auto_memory_enabled(None) {
+            if !is_auto_memory_enabled(config.memory_enabled) {
                 return String::new();
             }
             // Optional token budget (audit spec §18.3): cap the `<memory>`
