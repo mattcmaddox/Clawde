@@ -9951,8 +9951,16 @@ impl App {
     }
 }
 
-// Helper function to open a file in the user's external editor
-fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Open a file or directory with the OS default application (xdg-open on
+/// Linux, `open` on macOS, `start` on Windows). Spawns a detached process so
+/// it is safe to call while the TUI holds raw mode — the child takes over a
+/// separate window/desktop session and the terminal keeps rendering.
+///
+/// Used by `/keybindings` and the settings screen's "open memory files"
+/// action. `pub(crate)` so sibling modules can reuse it.
+pub(crate) fn open_file_externally(
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Try to open with the system's default application
     #[cfg(target_os = "macos")]
     {

@@ -203,6 +203,13 @@ pub struct SettingsScreen {
     pub memory_enabled: bool,
     /// Cap on the `<memory>` injection in tokens (empty = built-in caps).
     pub memory_max_tokens: String,
+    /// Project root passed to [`SettingsScreen::open`], used to resolve the
+    /// project memory dir for the live-size readout and the Ctrl+O open action.
+    pub project_root: std::path::PathBuf,
+    /// Cached readout of the current `<memory>` injection (bytes + est. tokens),
+    /// refreshed on open / after memory edits so the description area shows it
+    /// without per-frame filesystem IO.
+    pub memory_readout: String,
 }
 
 impl SettingsScreen {
@@ -261,6 +268,8 @@ impl SettingsScreen {
             verify_container_image: String::new(),
             memory_enabled: true,
             memory_max_tokens: String::new(),
+            project_root: std::path::PathBuf::new(),
+            memory_readout: String::new(),
             keybinding_preset: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
@@ -459,6 +468,7 @@ impl SettingsScreen {
         self.settings_snapshot = Settings::load_sync().unwrap_or_default();
         self.effective_snapshot = Settings::load_effective_sync(cwd);
         self.project_snapshot = Settings::load_project_settings_sync(cwd);
+        self.project_root = cwd.to_path_buf();
         self.pending_changes.clear();
         self.edit_field = None;
         self.edit_value.clear();
@@ -470,6 +480,87 @@ impl SettingsScreen {
 
         // Wire real settings from the effective snapshot
         self.apply_settings_from_snapshot();
+        self.refresh_memory_readout();
+    }
+
+    /// Recompute the cached `<memory>` injection readout (bytes + est. tokens)
+    /// for the project memory dir. Uses the same budget rule as the query
+    /// loop (`memory_max_tokens` × 4 bytes/token), so the number shown matches
+    /// what actually gets injected. Cheap enough to call on open and after
+    /// edits — the description render only reads the cached string.
+    pub fn refresh_memory_readout(&mut self) {
+        if self.project_root.as_os_str().is_empty() {
+            self.memory_readout.clear();
+            return;
+        }
+        use clawde_core::memdir::{
+            auto_memory_path, build_memory_prompt_content_with_budget, is_auto_memory_enabled,
+        };
+        // The displayed toggle state drives the readout; env vars still win
+        // inside is_auto_memory_enabled (e.g. CLAURST_DISABLE_AUTO_MEMORY).
+        if !is_auto_memory_enabled(Some(self.memory_enabled)) {
+            self.memory_readout = "memory injection disabled".to_string();
+            return;
+        }
+        let mem_dir = auto_memory_path(&self.project_root);
+        if !mem_dir.is_dir() {
+            self.memory_readout = "no memory files yet — /memory init".to_string();
+            return;
+        }
+        let budget_bytes = self
+            .memory_max_tokens
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(|t| t as usize * 4);
+        let content = build_memory_prompt_content_with_budget(&mem_dir, budget_bytes);
+        let bytes = content.len();
+        if bytes == 0 {
+            self.memory_readout = "memory dir empty".to_string();
+            return;
+        }
+        let est_tokens = bytes / 4;
+        let clamped = content.contains("truncated to");
+        let mut readout = format!(
+            "live injection: {:.1} KB · ~{} tokens{}",
+            bytes as f64 / 1024.0,
+            est_tokens,
+            if clamped { " · clamped to budget" } else { "" }
+        );
+        // Name the injected parts (e.g. "Memory Index (MEMORY.md)") so the
+        // user sees at a glance whether the session summary is being dropped.
+        let parts: Vec<String> = content
+            .split("## ")
+            .skip(1)
+            .map(|s| s.lines().next().unwrap_or("").to_string())
+            .collect();
+        if !parts.is_empty() {
+            readout.push_str(&format!(" · [{}]", parts.join(" + ")));
+        }
+        self.memory_readout = readout;
+    }
+
+    /// Open the project memory directory in the OS file manager (detached
+    /// spawn — safe under raw mode). Creates the directory first so the
+    /// action always has a target. Feedback goes to the description-area
+    /// warning slot.
+    pub fn open_memory_files(&mut self) {
+        if self.project_root.as_os_str().is_empty() {
+            self.health_warning = "No project directory — cannot open memory files.".to_string();
+            return;
+        }
+        use clawde_core::memdir::{auto_memory_path, ensure_memory_dir_exists};
+        let mem_dir = auto_memory_path(&self.project_root);
+        ensure_memory_dir_exists(&mem_dir);
+        match crate::app::open_file_externally(&mem_dir) {
+            Ok(()) => {
+                self.health_warning = format!("Opened memory directory: {}", mem_dir.display());
+            }
+            Err(e) => {
+                self.health_warning = format!("Could not open memory directory: {e}");
+            }
+        }
+        self.refresh_memory_readout();
     }
 
     pub fn close(&mut self) {
@@ -523,6 +614,9 @@ impl SettingsScreen {
 
     /// Apply all pending changes to settings and persist them.
     pub fn apply_and_save(&mut self, config: &mut Config) {
+        // Deferred refresh so a memory edit inside the loop doesn't conflict
+        // with the immutable borrow of pending_changes.
+        let mut refresh_memory = false;
         for (field, value) in &self.pending_changes {
             match field.as_str() {
                 "max_tokens" => {
@@ -539,10 +633,12 @@ impl SettingsScreen {
                         config.memory.max_tokens = None;
                         self.settings_snapshot.config.memory.max_tokens = None;
                         self.memory_max_tokens = String::new();
+                        refresh_memory = true;
                     } else if let Ok(n) = trimmed.parse::<u32>() {
                         config.memory.max_tokens = Some(n);
                         self.settings_snapshot.config.memory.max_tokens = Some(n);
                         self.memory_max_tokens = trimmed.to_string();
+                        refresh_memory = true;
                     }
                 }
                 "output_style" => {
@@ -773,6 +869,9 @@ impl SettingsScreen {
         }
         let _ = self.settings_snapshot.save_sync();
         self.pending_changes.clear();
+        if refresh_memory {
+            self.refresh_memory_readout();
+        }
     }
 }
 
@@ -1809,8 +1908,22 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             desc_lines.push(Line::from(""));
         }
 
-        // For Output Style, show current selection and all available options with descriptions
-        if entry.key == "output_style" {
+        // For Memory & project rows, surface the live <memory> injection size
+        // (cached readout — no per-frame IO) plus the Ctrl+O open action.
+        if entry.section == SECTION_MEMORY {
+            let mut lines = vec![entry.description.to_string(), String::new()];
+            if !screen.memory_readout.is_empty() {
+                lines.push(format!("Current: {}", screen.memory_readout));
+                lines.push(String::new());
+            }
+            if !screen.project_root.as_os_str().is_empty() {
+                let mem_dir = clawde_core::memdir::auto_memory_path(&screen.project_root);
+                lines.push(format!("Memory dir: {}", mem_dir.display()));
+                lines.push(String::new());
+            }
+            lines.push("Ctrl+O — open the memory directory in your file manager".to_string());
+            lines.join("\n")
+        } else if entry.key == "output_style" {
             let mut lines = vec![entry.description.to_string(), String::new()];
 
             let all_styles = builtin_styles();
@@ -1915,7 +2028,7 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     // Key hints for discoverable shortcuts: the section jumps, reset, and
     // the customised-only filter (! prefix in search) all live here.
     footer.push(Line::from(vec![Span::styled(
-        "! filter · 1-5 sections · r reset",
+        "! filter · 1-6 sections · r reset · ^o open memory",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
@@ -2124,6 +2237,25 @@ pub fn handle_settings_key(
 
     // Navigation mode
     match key.code {
+        // Ctrl+O — open the project memory directory in the OS file manager
+        // (only meaningful on the Memory & project rows). Detached spawn, so
+        // the TUI keeps rendering underneath.
+        KeyCode::Char('o')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            let all = all_entries(screen);
+            let filtered: Vec<_> = all
+                .iter()
+                .filter(|e| entry_matches_filter(e, &screen.search_query, screen))
+                .collect();
+            if let Some(entry) = filtered.get(screen.selected_idx) {
+                if entry.section == SECTION_MEMORY {
+                    screen.open_memory_files();
+                }
+            }
+        }
         KeyCode::Enter => {
             toggle_or_cycle_current(screen, config);
         }
@@ -2171,7 +2303,7 @@ pub fn handle_settings_key(
         }
         // Section quick-jump: 1-5 jump to each section's first visible entry.
         // Mirrors the model picker's number-key section jumps.
-        KeyCode::Char(c @ ('1'..='5')) => {
+        KeyCode::Char(c @ ('1'..='6')) => {
             let all = all_entries(screen);
             let filtered: Vec<_> = all
                 .iter()
@@ -2183,6 +2315,7 @@ pub fn handle_settings_key(
                 '3' => SECTION_WORKSPACE,
                 '4' => SECTION_FREE_ROUTING,
                 '5' => SECTION_OLLAMA,
+                '6' => SECTION_MEMORY,
                 _ => unreachable!(),
             };
             if let Some(pos) = filtered.iter().position(|e| e.section == section) {
@@ -2419,8 +2552,14 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "permission_mode" => screen.permission_mode = "default".to_string(),
         "verify_sandbox" => screen.verify_sandbox = "direct".to_string(),
         "verify_container_image" => screen.verify_container_image = String::new(),
-        "memory_enabled" => screen.memory_enabled = true,
-        "memory_max_tokens" => screen.memory_max_tokens = String::new(),
+        "memory_enabled" => {
+            screen.memory_enabled = true;
+            screen.refresh_memory_readout();
+        }
+        "memory_max_tokens" => {
+            screen.memory_max_tokens = String::new();
+            screen.refresh_memory_readout();
+        }
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
         "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
         "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
@@ -2575,6 +2714,7 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                         screen.settings_snapshot.config.memory.enabled = Some(new_value);
                         config.memory.enabled = Some(new_value);
                         let _ = screen.settings_snapshot.save_sync();
+                        screen.refresh_memory_readout();
                     }
                     _ => {}
                 }
@@ -2961,6 +3101,149 @@ mod tests {
         assert!(!screen.memory_enabled);
         assert_eq!(screen.settings_snapshot.config.memory.enabled, Some(false));
         assert_eq!(config.memory.enabled, Some(false));
+    }
+
+    /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test
+    /// (mirrors TestHome in app.rs / commands keys.rs) so `auto_memory_path`
+    /// resolves under the temp home instead of the real `~/.clawde`.
+    struct MemoryTestHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl MemoryTestHome {
+        fn acquire() -> MemoryTestHome {
+            use std::sync::Mutex;
+            static HOME_LOCK: Mutex<()> = Mutex::new(());
+            let _lock = HOME_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            MemoryTestHome {
+                _lock,
+                _tmp: tmp,
+                prev,
+            }
+        }
+    }
+
+    impl Drop for MemoryTestHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    fn memory_fixture_dir(project: &std::path::Path) -> std::path::PathBuf {
+        clawde_core::memdir::auto_memory_path(project)
+    }
+
+    #[test]
+    fn memory_readout_reports_injection_size() {
+        let _home = MemoryTestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = memory_fixture_dir(project.path());
+        std::fs::create_dir_all(mem_dir.join("sessions")).unwrap();
+        std::fs::write(
+            mem_dir.join("MEMORY.md"),
+            "# Index\n- [a.md](a.md) — entry\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem_dir.join("sessions").join("2026-08-01.md"),
+            "session summary",
+        )
+        .unwrap();
+
+        let mut screen = fresh_controlled_screen();
+        screen.project_root = project.path().to_path_buf();
+        screen.memory_enabled = true;
+        screen.refresh_memory_readout();
+
+        assert!(
+            screen.memory_readout.contains("live injection"),
+            "got: {}",
+            screen.memory_readout
+        );
+        assert!(
+            screen.memory_readout.contains("KB"),
+            "got: {}",
+            screen.memory_readout
+        );
+        assert!(
+            screen.memory_readout.contains("tokens"),
+            "got: {}",
+            screen.memory_readout
+        );
+        assert!(
+            screen.memory_readout.contains("Memory Index"),
+            "index part should be named: {}",
+            screen.memory_readout
+        );
+    }
+
+    #[test]
+    fn memory_readout_empty_dir_after_init_hint() {
+        let _home = MemoryTestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let mut screen = fresh_controlled_screen();
+        screen.project_root = project.path().to_path_buf();
+        screen.memory_enabled = true;
+        screen.refresh_memory_readout();
+        assert_eq!(screen.memory_readout, "no memory files yet — /memory init");
+    }
+
+    #[test]
+    fn memory_readout_clamped_when_budget_over() {
+        let _home = MemoryTestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = memory_fixture_dir(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("MEMORY.md"),
+            format!("# Index\n{}", "long index line\n".repeat(40)),
+        )
+        .unwrap();
+
+        let mut screen = fresh_controlled_screen();
+        screen.project_root = project.path().to_path_buf();
+        screen.memory_enabled = true;
+        screen.memory_max_tokens = "8".to_string(); // 8 tokens × 4 = 32 bytes
+        screen.refresh_memory_readout();
+        assert!(
+            screen.memory_readout.contains("clamped to budget"),
+            "got: {}",
+            screen.memory_readout
+        );
+    }
+
+    #[test]
+    fn memory_readout_disabled_when_toggle_off() {
+        let _home = MemoryTestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let mut screen = fresh_controlled_screen();
+        screen.project_root = project.path().to_path_buf();
+        screen.memory_enabled = false;
+        screen.effective_snapshot.config.memory.enabled = Some(false);
+        screen.refresh_memory_readout();
+        assert_eq!(screen.memory_readout, "memory injection disabled");
+    }
+
+    #[test]
+    fn memory_open_without_project_sets_warning() {
+        let mut screen = fresh_controlled_screen();
+        screen.project_root = std::path::PathBuf::new();
+        screen.open_memory_files();
+        assert!(
+            screen.health_warning.contains("No project directory"),
+            "got: {}",
+            screen.health_warning
+        );
     }
 
     #[test]
