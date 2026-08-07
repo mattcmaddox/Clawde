@@ -20,7 +20,7 @@
 //   * anything else                  →  passed through verbatim
 //     to the first upstream in the chain.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use std::time::Instant;
@@ -52,11 +52,13 @@ pub use discovery::{
 };
 
 // Further sub-modules: inherent impl + streaming + trait impl (mutually
-// coupled through private helpers, so one module), and the models.dev
-// auto-detection helper.
+// coupled through private helpers, so one module), the models.dev
+// auto-detection helper, and the Phase 2 task classifier (smart router).
 mod impls;
 mod modelsdev;
+mod task_classifier;
 pub use modelsdev::fetch_best_free_models_from_modelsdev;
+pub use task_classifier::{classify_request, task_preference_ids, TaskType};
 
 // ---------------------------------------------------------------------------
 // FreeProvider
@@ -88,6 +90,10 @@ pub enum RoutingStrategy {
     RandomFailover,
     /// Route to the upstream with the lowest historical latency.
     LatencyBased,
+    /// Route by task (audit spec Phase 2): classify each request and try the
+    /// upstreams best suited to the task first, then the rest in catalog
+    /// order. See `task_classifier::task_preference_ids` for the defaults.
+    TaskBased,
 }
 
 /// Circuit breaker configuration for the FreeProvider.
@@ -220,6 +226,12 @@ fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
 pub struct RoutingConfig {
     #[serde(default)]
     pub strategy: RoutingStrategy,
+    /// Per-task upstream preference overrides (audit spec Phase 2 §8.4):
+    /// `{ "code_generation": ["groq", "cerebras"], ... }` keyed by
+    /// `TaskType::key()`. A task with an override uses it verbatim; tasks
+    /// without one fall back to the built-in `task_preference_ids` list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_preferences: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +294,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             strategy: RoutingStrategy::default(),
+            task_preferences: None,
             circuit_breaker: None,
             latency: None,
             upstream_timeout_secs: default_upstream_timeout(),

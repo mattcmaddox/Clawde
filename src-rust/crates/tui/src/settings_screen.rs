@@ -154,7 +154,8 @@ pub struct SettingsScreen {
     pub file_autocomplete_limit: String,
     pub file_autocomplete_show_hidden_files: bool,
     pub file_injection_max_size: String,
-    /// Current free-mode routing strategy ("sequential", "random_failover", "latency_based").
+    /// Current free-mode routing strategy ("sequential", "random_failover",
+    /// "latency_based", "task_based").
     pub routing_strategy: String,
     /// Comma-separated list of disabled free upstream IDs.
     pub disabled_upstreams: String,
@@ -1174,12 +1175,17 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         make_entry(
             "routing_strategy",
             "Free routing",
-            "How free-mode selects upstream providers (sequential/random/latency).",
+            "How free-mode selects upstream providers (sequential/random/latency/task).",
             SECTION_COMMON,
             "sequential".to_string(),
             SettingEffect::Immediate,
             SettingKind::Enum {
-                options: vec!["sequential", "random_failover", "latency_based"],
+                options: vec![
+                    "sequential",
+                    "random_failover",
+                    "latency_based",
+                    "task_based",
+                ],
             },
             screen.routing_strategy.clone(),
         ),

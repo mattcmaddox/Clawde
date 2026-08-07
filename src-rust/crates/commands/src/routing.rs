@@ -8,6 +8,7 @@
 use async_trait::async_trait;
 
 use super::*;
+use clawde_api::providers::free::{task_preference_ids, TaskType};
 
 pub struct RoutingCommand;
 
@@ -22,7 +23,7 @@ impl SlashCommand for RoutingCommand {
     }
 
     fn description(&self) -> &str {
-        "Show or change the free-mode routing strategy (sequential, random, latency)"
+        "Show or change the free-mode routing strategy (sequential, random, latency, task)"
     }
 
     fn help(&self) -> &str {
@@ -33,12 +34,18 @@ impl SlashCommand for RoutingCommand {
            /routing sequential     — try upstreams in priority order (default)\n\
            /routing random         — randomize upstream order each request\n\
            /routing latency        — route to the lowest-latency upstream first\n\
+           /routing task           — route by request type (code gen, reasoning,\n\
+                                     verification, …) using per-task upstream\n\
+                                     preferences; overridable per task via\n\
+                                     providers.free.options.routing.task_preferences\n\
            /routing sr             — quick alias for sequential\n\
            /routing rr             — quick alias for random\n\
            /routing lr             — quick alias for latency\n\
+           /routing tr             — quick alias for task\n\
            /sr                     — shortcut for /routing sequential\n\
            /rr                     — shortcut for /routing random\n\
-           /lr                     — shortcut for /routing latency\n\n\
+           /lr                     — shortcut for /routing latency\n\
+           /tr                     — shortcut for /routing task\n\n\
          The setting is persisted in settings.json under providers.free.options.routing\n\
          and takes effect after /refresh or restart."
     }
@@ -75,6 +82,16 @@ impl SlashCommand for RoutingCommand {
                 description: "Quick alias for latency".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "task".into(),
+                description: "Route by request type using per-task preferences".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "tb".into(),
+                description: "Quick alias for task".into(),
+                available: true,
+            },
         ]
     }
 
@@ -82,23 +99,36 @@ impl SlashCommand for RoutingCommand {
         let args = args.trim();
 
         if args.is_empty() {
-            // Show current strategy
+            // Show current strategy (and per-task assignments when task-based).
             let strategy = resolve_routing_strategy_name(&ctx.config);
-            return CommandResult::Message(format!(
+            let mut msg = format!(
                 "Free-mode routing strategy: {}\n\n\
-                 Use /routing <sequential|random|latency> to change.\n\
+                 Use /routing <sequential|random|latency|task> to change.\n\
                  Run /refresh to apply the change.",
                 strategy
-            ));
+            );
+            if strategy == "task_based" {
+                msg.push_str("\n\nTask assignments (top 3 upstreams):\n");
+                for task in TaskType::ALL {
+                    let ids = task_preference_ids(task);
+                    let top: Vec<&str> = ids.iter().take(3).copied().collect();
+                    msg.push_str(&format!("  {:<16} → {}\n", task.label(), top.join(", ")));
+                }
+                msg.push_str(
+                    "\nOverride per task in settings.json:\n  providers.free.options.routing.task_preferences",
+                );
+            }
+            return CommandResult::Message(msg);
         }
 
         let new_strategy = match args.to_lowercase().as_str() {
             "sequential" | "seq" | "sr" => "sequential",
             "random" | "random_failover" | "random-failover" | "rr" => "random_failover",
             "latency" | "latency_based" | "latency-based" | "lr" => "latency_based",
+            "task" | "task_based" | "task-based" | "tb" => "task_based",
             other => {
                 return CommandResult::Error(format!(
-                    "Unknown strategy '{}'. Valid options: sequential, random, latency",
+                    "Unknown strategy '{}'. Valid options: sequential, random, latency, task",
                     other
                 ));
             }
@@ -133,6 +163,7 @@ impl SlashCommand for RoutingAlias {
             "sequential" => "Set free-mode routing to sequential (catalog order)",
             "random_failover" => "Set free-mode routing to random (shuffle each request)",
             "latency_based" => "Set free-mode routing to latency (fastest first)",
+            "task_based" => "Set free-mode routing to task (route by request type)",
             _ => "Set free-mode routing strategy",
         }
     }
@@ -152,6 +183,7 @@ async fn set_routing_strategy(ctx: &mut CommandContext, strategy: &str) -> Comma
         "sequential" => "sequential",
         "random_failover" => "random_failover",
         "latency_based" => "latency_based",
+        "task_based" => "task_based",
         _ => {
             return CommandResult::Error(format!("Unknown strategy '{}'", strategy));
         }
@@ -267,6 +299,7 @@ mod tests {
                 "sequential" | "seq" | "sr" => Some("sequential"),
                 "random" | "random_failover" | "random-failover" | "rr" => Some("random_failover"),
                 "latency" | "latency_based" | "latency-based" | "lr" => Some("latency_based"),
+                "task" | "task_based" | "task-based" | "tb" => Some("task_based"),
                 _ => None,
             }
         };
@@ -275,12 +308,15 @@ mod tests {
         assert_eq!(resolve("sequential"), Some("sequential"));
         assert_eq!(resolve("random"), Some("random_failover"));
         assert_eq!(resolve("latency"), Some("latency_based"));
+        assert_eq!(resolve("task"), Some("task_based"));
+        assert_eq!(resolve("task_based"), Some("task_based"));
 
         // Short aliases work
         assert_eq!(resolve("seq"), Some("sequential"));
         assert_eq!(resolve("sr"), Some("sequential"));
         assert_eq!(resolve("rr"), Some("random_failover"));
         assert_eq!(resolve("lr"), Some("latency_based"));
+        assert_eq!(resolve("tb"), Some("task_based"));
 
         // Canonical names work
         assert_eq!(resolve("random_failover"), Some("random_failover"));

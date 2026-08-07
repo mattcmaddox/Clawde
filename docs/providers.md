@@ -108,13 +108,15 @@ selects upstream providers:
 
 | Command | Description |
 |---|---|
-| `/routing` | Show the current routing strategy |
+| `/routing` | Show the current routing strategy (and per-task assignments when task-based) |
 | `/routing sequential` | Try upstreams in catalog priority order (default) |
 | `/routing random` | Randomize upstream order each request |
 | `/routing latency` | Route to the lowest-latency upstream first |
+| `/routing task` | Route by request type — each request is classified (code generation, reasoning, verification, …) and dispatched to the upstreams best suited to that task first, falling through the rest on failure |
 | `/routing sr` / `/sr` | Quick alias for sequential |
 | `/routing rr` / `/rr` | Quick alias for random |
 | `/routing lr` / `/lr` | Quick alias for latency |
+| `/routing tr` / `/tr` | Quick alias for task |
 
 **Examples:**
 
@@ -122,11 +124,49 @@ selects upstream providers:
 /routing
 /routing random
 /rr
+/routing task
+/tr
 ```
 
 The setting is persisted in `~/.clawde/settings.json` under
 `providers.free.options.routing.strategy` and takes effect after a restart
 or `/refresh`.
+
+**Task-based routing (audit spec Phase 2):** with `strategy: "task_based"`,
+Clawde classifies each request into a task type (`code_generation`, `code_edit`,
+`reasoning`, `planning`, `verification`, `simple_edit`, `search`) and tries the
+upstreams best suited to that task first, then the remaining upstreams in
+catalog order. The built-in preferences are:
+
+- **code generation** → OpenRouter (DeepSeek), Cerebras, Hugging Face, …
+- **reasoning** → Gemini, Groq, SambaNova, …
+- **verification** → Groq, Cloudflare, OpenCode Zen, … (fastest tokens)
+- **simple edit** → Z.AI, OpenCode Zen, SambaNova, … (cheapest)
+
+Override the per-task preference lists in `settings.json` — a task with an
+override uses it verbatim; tasks without one keep their built-in defaults:
+
+```json
+{
+  "providers": {
+    "free": {
+      "options": {
+        "routing": {
+          "strategy": "task_based",
+          "task_preferences": {
+            "code_generation": ["groq", "cerebras"],
+            "verification": ["groq", "cloudflare"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
+`huggingface`, `google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
+`sambanova`, `nvidia`, `cohere`, `mistral`, `cline`).
 
 ---
 

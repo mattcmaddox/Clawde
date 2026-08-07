@@ -164,12 +164,104 @@ impl FreeProvider {
 
     /// Build the per-attempt (provider, model) sequence for a given request,
     /// applying the configured [`RoutingStrategy`].
-    fn attempt_plan(&self, route: &Route) -> Vec<(usize, String)> {
+    ///
+    /// `request` is only consulted by the [`RoutingStrategy::TaskBased`] arm
+    /// (Phase 2 smart routing); the other strategies are request-agnostic.
+    fn attempt_plan(
+        &self,
+        route: &Route,
+        request: Option<&ProviderRequest>,
+    ) -> Vec<(usize, String)> {
         match self.routing.strategy {
             RoutingStrategy::RandomFailover => self.attempt_plan_random(route),
             RoutingStrategy::LatencyBased => self.attempt_plan_latency(route),
             RoutingStrategy::Sequential => self.attempt_plan_sequential(route),
+            RoutingStrategy::TaskBased => self.attempt_plan_task(route, request),
         }
+    }
+
+    /// Task-based plan (audit spec Phase 2): order the upstreams by how well
+    /// they fit the request's task, then fall through the rest in catalog
+    /// order. The route anchor still leads — a pinned upstream/model or a
+    /// family's hosts go first, then the task-preferred list, then the rest.
+    fn attempt_plan_task(
+        &self,
+        route: &Route,
+        request: Option<&ProviderRequest>,
+    ) -> Vec<(usize, String)> {
+        let task = request
+            .map(classify_request)
+            .unwrap_or(TaskType::CodeGeneration);
+        // Per-task upstream preferences: user overrides from
+        // `providers.free.options.routing.task_preferences` win over the
+        // built-in defaults (audit spec §8.4/§8.5).
+        let prefs: Vec<String> = match &self.routing.task_preferences {
+            Some(overrides) => overrides
+                .get(task.key())
+                .filter(|p| !p.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    task_preference_ids(task)
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }),
+            None => task_preference_ids(task)
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+
+        let mut plan: Vec<(usize, String)> = Vec::with_capacity(self.chain_len() * 2);
+        let mut used: Vec<usize> = Vec::with_capacity(self.chain_len());
+
+        // Route anchor first: a pinned model (with its per-upstream fallbacks)
+        // or every upstream hosting the pinned family leads the plan.
+        match route {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
+                plan.push((*start_idx, pinned_model.clone()));
+                for fb in self.chain[*start_idx].upstream.fallback_models {
+                    plan.push((*start_idx, fb.to_string()));
+                }
+                used.push(*start_idx);
+            }
+            Route::Family { model_family } => {
+                for (idx, entry) in self.chain.iter().enumerate() {
+                    if entry.upstream.model_family == *model_family {
+                        plan.extend(self.plan_rows_for_entry(idx));
+                        used.push(idx);
+                    }
+                }
+            }
+            Route::Auto => {}
+        }
+
+        // Task preference list first, then every remaining upstream in
+        // catalog order — each contributing its primary + fallback models.
+        let mut ordered: Vec<usize> = Vec::with_capacity(self.chain_len());
+        for pref in &prefs {
+            if let Some(idx) = self
+                .chain
+                .iter()
+                .position(|e| e.upstream.id == pref.as_str())
+            {
+                if !used.contains(&idx) && !ordered.contains(&idx) {
+                    ordered.push(idx);
+                }
+            }
+        }
+        for idx in 0..self.chain.len() {
+            if !used.contains(&idx) && !ordered.contains(&idx) {
+                ordered.push(idx);
+            }
+        }
+        for idx in ordered {
+            plan.extend(self.plan_rows_for_entry(idx));
+        }
+        plan
     }
 
     /// One chain entry's contribution to the dispatch plan: the effective
@@ -975,7 +1067,7 @@ impl LlmProvider for FreeProvider {
         }
 
         let route = self.resolve_route(&request.model);
-        let plan = self.attempt_plan(&route);
+        let plan = self.attempt_plan(&route, Some(&request));
         let mut last_err: Option<ProviderError> = None;
 
         for (idx, upstream_model) in plan {
@@ -1063,7 +1155,7 @@ impl LlmProvider for FreeProvider {
         }
 
         let route = self.resolve_route(&request.model);
-        let plan_vec = self.attempt_plan(&route);
+        let plan_vec = self.attempt_plan(&route, Some(&request));
         let mut last_err: Option<ProviderError> = None;
 
         for (pos, (idx, upstream_model)) in plan_vec.into_iter().enumerate() {
@@ -1088,7 +1180,7 @@ impl LlmProvider for FreeProvider {
                     // Wrap in RetryingFreeStream for empty-completion re-dispatch.
                     // Rebuild plan to get remaining entries by position.
                     let remaining: VecDeque<_> = self
-                        .attempt_plan(&route)
+                        .attempt_plan(&route, Some(&request))
                         .into_iter()
                         .skip(pos + 1)
                         .collect();
@@ -1151,6 +1243,7 @@ impl LlmProvider for FreeProvider {
             RoutingStrategy::Sequential => "Seq",
             RoutingStrategy::RandomFailover => "Random",
             RoutingStrategy::LatencyBased => "Latency",
+            RoutingStrategy::TaskBased => "Task",
         })
     }
 
@@ -1708,6 +1801,132 @@ mod tests {
         }
     }
 
+    // ---- task-based routing (audit spec Phase 2) -------------------------
+
+    fn task_provider(ids: &[&'static str]) -> FreeProvider {
+        let chain = ids.iter().map(|id| entry(id, true)).collect();
+        FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                ..Default::default()
+            },
+            false,
+        )
+    }
+
+    #[test]
+    fn task_plan_respects_user_preference_overrides() {
+        // User pins code_generation to groq/cerebras in settings.json — the
+        // plan must lead with those, even though the built-in preference
+        // list would put openrouter first (and openrouter isn't configured).
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "code_generation".to_string(),
+            vec!["groq".to_string(), "cerebras".to_string()],
+        );
+        let chain = vec![
+            entry("huggingface", true),
+            entry("groq", true),
+            entry("cerebras", true),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                task_preferences: Some(overrides),
+                ..Default::default()
+            },
+            false,
+        );
+        let req = ProviderRequest {
+            messages: vec![Message::user("write a parser module")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(&order[..2], &["groq", "cerebras"]);
+        // Unlisted upstreams still appear, in catalog order, after the prefs.
+        assert_eq!(order.last(), Some(&"huggingface"));
+    }
+
+    #[test]
+    fn task_plan_orders_by_reasoning_preferences() {
+        // Reasoning prefers google, groq, sambanova — so with a chain ordered
+        // [huggingface, sambanova, google, groq] the plan must lead with
+        // google, then sambanova/groq by preference, then huggingface last.
+        let provider = task_provider(&["huggingface", "sambanova", "google", "groq"]);
+        let req = ProviderRequest {
+            messages: vec![Message::user("why does the pool keep exhausting?")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(&order[..3], &["google", "groq", "sambanova"]);
+        // Every remaining upstream still appears (huggingface last).
+        assert_eq!(order.last(), Some(&"huggingface"));
+        assert_eq!(order.len(), 4);
+    }
+
+    #[test]
+    fn task_plan_verification_prefers_fast_upstreams() {
+        let provider = task_provider(&["google", "huggingface", "groq", "cloudflare"]);
+        let req = ProviderRequest {
+            messages: vec![Message::user("run the tests and report failures")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        // groq + cloudflare lead the verification plan; google is not in the
+        // verification preference list so it lands last (catalog order).        assert_eq!(order[0], "groq");
+        assert!(order.iter().position(|id| *id == "cloudflare").unwrap() < order.len() - 1);
+        // Neither google nor huggingface are verification preferences, so they
+        // follow in catalog order (google idx 0, then huggingface idx 1).
+        assert_eq!(order.last(), Some(&"huggingface"));
+    }
+
+    #[test]
+    fn task_plan_pinned_route_keeps_pin_first() {
+        let provider = task_provider(&["huggingface", "cerebras", "groq"]);
+        let req = ProviderRequest {
+            messages: vec![Message::user("fix the sorting bug")],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 0,
+                pinned_model: "custom-model".to_string(),
+            },
+            Some(&req),
+        );
+        // The pin leads; the task order follows for the rest.
+        assert_eq!(plan[0], (0, "custom-model".to_string()));
+    }
+
+    #[test]
+    fn task_plan_without_request_uses_code_generation_prefs() {
+        let provider = task_provider(&["zai", "cohere", "mistral"]);
+        // No request (e.g. a plan built for the stream re-dispatch without
+        // classification) degrades to the code-generation defaults: mistral
+        // is in that preference list and leads, the rest follow in catalog
+        // order.
+        let plan = provider.attempt_plan(&Route::Auto, None);
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(order, vec!["mistral", "zai", "cohere"]);
+    }
+
     #[test]
     fn route_auto_for_free_aliases() {
         let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
@@ -1742,7 +1961,7 @@ mod tests {
         ]);
         // Sequential Auto plan: nvidia's 70B primary, then its 8B fallback on
         // the SAME index, then the other upstreams.
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan[0], (0, "meta/llama-3.3-70b-instruct".to_string()));
         assert_eq!(plan[1], (0, "meta/llama-3.1-8b-instruct".to_string()));
         assert_eq!(plan[2], (1, "gpt-oss-120b".to_string()));
@@ -1760,10 +1979,13 @@ mod tests {
         ]);
         // Pinning nvidia: the pinned model, then nvidia's 8B fallback, then
         // the rest of the chain in catalog order.
-        let plan = provider.attempt_plan(&Route::Pinned {
-            start_idx: 1,
-            pinned_model: "meta/llama-3.3-70b-instruct".to_string(),
-        });
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 1,
+                pinned_model: "meta/llama-3.3-70b-instruct".to_string(),
+            },
+            None,
+        );
         assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
         assert_eq!(plan[1], (1, "meta/llama-3.1-8b-instruct".to_string()));
         assert_eq!(
@@ -1837,9 +2059,12 @@ mod tests {
             entry("nvidia", true),
             entry("groq", true),
         ]);
-        let plan = provider.attempt_plan(&Route::Family {
-            model_family: "llama-3.3-70b",
-        });
+        let plan = provider.attempt_plan(
+            &Route::Family {
+                model_family: "llama-3.3-70b",
+            },
+            None,
+        );
         // Family hosts first in catalog order — huggingface (idx 0), then
         // nvidia (idx 2) with its 8B fallback on the same index.
         assert_eq!(
@@ -1868,7 +2093,7 @@ mod tests {
     #[test]
     fn attempt_plan_auto_uses_each_default() {
         let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].0, 0);
         assert_eq!(plan[0].1, "meta-llama/Llama-3.3-70B-Instruct");
@@ -1891,7 +2116,7 @@ mod tests {
             cfg,
             false,
         );
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
 
         // Must have all upstreams.
         assert_eq!(plan.len(), 3);
@@ -1922,10 +2147,13 @@ mod tests {
             cfg,
             false,
         );
-        let plan = provider.attempt_plan(&Route::Pinned {
-            start_idx: 2,
-            pinned_model: "gemini-2.5-pro".into(),
-        });
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 2,
+                pinned_model: "gemini-2.5-pro".into(),
+            },
+            None,
+        );
 
         // Pinned entry must be first.
         assert_eq!(plan[0].0, 2);
@@ -2008,16 +2236,44 @@ mod tests {
     }
 
     #[test]
+    fn task_based_config_serde_round_trip() {
+        // The exact settings.json path users hit: strategy "task_based" plus
+        // a per-task override map.
+        let mut prefs = std::collections::HashMap::new();
+        prefs.insert(
+            "code_generation".to_string(),
+            vec!["groq".to_string(), "cerebras".to_string()],
+        );
+        let cfg = RoutingConfig {
+            strategy: RoutingStrategy::TaskBased,
+            task_preferences: Some(prefs),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"task_based\""), "json: {json}");
+        let back: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.strategy, RoutingStrategy::TaskBased));
+        let prefs = back.task_preferences.unwrap();
+        assert_eq!(
+            prefs.get("code_generation"),
+            Some(&vec!["groq".to_string(), "cerebras".to_string()])
+        );
+    }
+
+    #[test]
     fn attempt_plan_pinned_tries_pin_then_others() {
         let provider = FreeProvider::new(vec![
             entry("huggingface", true),
             entry("cerebras", true),
             entry("google", true),
         ]);
-        let plan = provider.attempt_plan(&Route::Pinned {
-            start_idx: 2,
-            pinned_model: "gemini-2.5-pro".into(),
-        });
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 2,
+                pinned_model: "gemini-2.5-pro".into(),
+            },
+            None,
+        );
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].0, 2);
         assert_eq!(plan[0].1, "gemini-2.5-pro");
@@ -2420,7 +2676,7 @@ mod tests {
         provider.record_success(1, Duration::from_millis(1100));
 
         // Latency-based plan should put faster upstream first
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan.len(), 2);
         // Upstream 0 (avg 150ms) comes before upstream 1 (avg 1000ms)
         assert_eq!(plan[0].0, 0);
@@ -2455,7 +2711,7 @@ mod tests {
         provider.record_success(2, Duration::from_millis(500));
         provider.record_success(3, Duration::from_millis(300));
 
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
 
         // nvidia (idx 1, fastest) first: 70B then its 8B fallback adjacent.
         assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
@@ -2493,10 +2749,13 @@ mod tests {
         provider.record_success(2, Duration::from_millis(500));
 
         // Pin to cerebras (idx 1) — should be first, then rest sorted by latency
-        let plan = provider.attempt_plan(&Route::Pinned {
-            start_idx: 1,
-            pinned_model: "custom-model".into(),
-        });
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 1,
+                pinned_model: "custom-model".into(),
+            },
+            None,
+        );
 
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].0, 1); // pinned first
@@ -2524,7 +2783,7 @@ mod tests {
 
         // No latency data recorded — all avg_latency returns f64::MAX,
         // so partial_cmp returns Equal and order is stable (catalog order).
-        let plan = provider.attempt_plan(&Route::Auto);
+        let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].0, 0);
         assert_eq!(plan[1].0, 1);

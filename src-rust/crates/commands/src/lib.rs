@@ -2034,6 +2034,10 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             name: "lr",
             target: "latency_based",
         }),
+        Box::new(RoutingAlias {
+            name: "tr",
+            target: "task_based",
+        }),
         // Search source tracking
         Box::new(SourcesCommand),
         // Session navigation ported from opencode: /new (lazy home) + /move.
