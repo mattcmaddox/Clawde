@@ -335,6 +335,51 @@ impl ContinuationPolicy for VerifyPolicy {
     }
 }
 
+/// Run a single verification round on demand (the `/verify` command) and
+/// return the structured report for the TUI box. Unlike the continuation
+/// policy this never asks the model to fix anything — it is a user-triggered
+/// "is the tree green right now?" check.
+///
+/// Returns `Err` only when the sandbox itself cannot be set up (e.g. the
+/// `worktree` sandbox requires a git repository) — never for a failing check.
+pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<VerifyReport, String> {
+    if !config.enabled || !config.has_any_check() {
+        return Ok(VerifyReport {
+            results: Vec::new(),
+            attempt: 0,
+            max_retries: config.max_retries.max(1),
+            headline: "Verification disabled".to_string(),
+            sandbox: config.sandbox,
+        });
+    }
+    let results = run_checks(config, working_dir)?;
+    let max_retries = config.max_retries.max(1);
+    if results.is_empty() {
+        return Ok(VerifyReport {
+            results,
+            attempt: 0,
+            max_retries,
+            headline: "No test or lint commands detected".to_string(),
+            sandbox: config.sandbox,
+        });
+    }
+    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
+    let headline = if results.iter().all(|r| r.skipped) {
+        "Verification could not run — commands missing".to_string()
+    } else if failures.is_empty() {
+        "All checks passed".to_string()
+    } else {
+        format!("{} check(s) failed", failures.len())
+    };
+    Ok(VerifyReport {
+        results,
+        attempt: 1,
+        max_retries,
+        headline,
+        sandbox: config.sandbox,
+    })
+}
+
 /// Detect and run the project's configured test/lint commands inside the
 /// configured sandbox, in order: tests first (they find behavioral
 /// regressions), then lints.
@@ -539,6 +584,7 @@ mod tests {
             auto_test: true,
             skip_when_no_writes: true,
             timeout_secs: 30,
+            container_image: None,
         }
     }
 
@@ -848,5 +894,46 @@ mod tests {
             }
             _ => panic!("failing crate must continue for auto-fix, got: {decision:?}"),
         }
+    }
+
+    // Real-cargo test of the one-shot `/verify` round: report carries the
+    // right headline and per-check results without any continuation logic.
+    #[test]
+    fn run_verify_round_reports_pass_and_fail_headlines() {
+        if !cargo_available() {
+            eprintln!("skipping: cargo not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        // Passing crate → "All checks passed".
+        write_cargo_crate(dir.path(), "#[cfg(test)]\nmod t { #[test] fn ok() {} }\n");
+        let report = run_verify_round(&default_config(), dir.path()).unwrap();
+        assert_eq!(report.headline, "All checks passed");
+        assert!(report.results.iter().all(|r| r.ok));
+        assert_eq!(report.attempt, 1);
+        assert_eq!(report.sandbox, default_config().sandbox);
+
+        // Failing crate → "N check(s) failed" with the failure flagged.
+        write_cargo_crate(dir.path(), "#[test]\nfn fails() { assert!(false); }\n");
+        let report = run_verify_round(&default_config(), dir.path()).unwrap();
+        // Both the test and lint checks fail on a broken crate; assert the
+        // headline shape and that at least one real failure was flagged.
+        assert!(
+            report.headline.ends_with("check(s) failed"),
+            "headline: {}",
+            report.headline
+        );
+        assert!(report.results.iter().any(|r| !r.ok && !r.skipped));
+
+        // Disabled config → "Verification disabled", no checks run.
+        let disabled = VerifyConfig {
+            enabled: false,
+            ..default_config()
+        };
+        let report = run_verify_round(&disabled, dir.path()).unwrap();
+        assert_eq!(report.headline, "Verification disabled");
+        assert!(report.results.is_empty());
+        assert_eq!(report.attempt, 0);
     }
 }

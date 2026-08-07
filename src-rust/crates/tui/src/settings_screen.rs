@@ -194,6 +194,8 @@ pub struct SettingsScreen {
     pub permission_mode: String,
     /// Verify sandbox mode ("direct" / "worktree" / "container").
     pub verify_sandbox: String,
+    /// Container image for the `container` verify sandbox (empty = auto).
+    pub verify_container_image: String,
 }
 
 impl SettingsScreen {
@@ -249,6 +251,7 @@ impl SettingsScreen {
             ollama_default_host: "http://localhost:11434".to_string(),
             permission_mode: "default".to_string(),
             verify_sandbox: "direct".to_string(),
+            verify_container_image: String::new(),
             keybinding_preset: "default".to_string(),
         };
         // Apply settings from snapshot immediately on initialization
@@ -296,6 +299,7 @@ impl SettingsScreen {
         self.file_injection_max_size = s.config.file_injection_max_size.to_string();
         self.permission_mode = permission_mode_str(&s.config.permission_mode);
         self.verify_sandbox = s.config.verify.sandbox.label().to_string();
+        self.verify_container_image = s.config.verify.container_image.clone().unwrap_or_default();
 
         // Read routing strategy from provider config
         self.routing_strategy = s
@@ -723,6 +727,17 @@ impl SettingsScreen {
                             );
                     }
                 }
+                "verify_container_image" => {
+                    let trimmed = value.trim();
+                    let image = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                    self.verify_container_image = trimmed.to_string();
+                    config.verify.container_image = image.clone();
+                    self.settings_snapshot.config.verify.container_image = image;
+                }
                 _ => {}
             }
         }
@@ -896,6 +911,7 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         "disable_claude_mds" => c.disable_claude_mds.to_string(),
         "permission_mode" => permission_mode_str(&c.permission_mode),
         "verify_sandbox" => c.verify.sandbox.config_name().to_string(),
+        "verify_container_image" => c.verify.container_image.clone().unwrap_or_default(),
         "routing_strategy" => routing_str_value(c, "strategy"),
         "first_byte_timeout_secs" => routing_u64_str(c, "first_byte_timeout_secs"),
         "staggered_probe" => routing_bool_str(c, "staggered_probe"),
@@ -948,7 +964,8 @@ fn default_value_for(key: &str) -> String {
         | "ollama_num_predict"
         | "ollama_require_explicit_host"
         | "ollama_default_host"
-        | "keybinding_preset" => String::new(),
+        | "keybinding_preset"
+        | "verify_container_image" => String::new(),
         "auto_compact"
         | "notifications"
         | "terminal_progress_bar"
@@ -1131,6 +1148,16 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
                 options: vec!["direct", "worktree", "container"],
             },
             screen.verify_sandbox.clone(),
+        ),
+        make_entry(
+            "verify_container_image",
+            "Verify container image",
+            "Image used by the container verify sandbox, e.g. node:20-slim. Overrides the CLAWDE_VERIFY_IMAGE env var and the per-language default. Empty = auto (env var, then language default).",
+            SECTION_COMMON,
+            String::new(),
+            SettingEffect::Immediate,
+            SettingKind::Text,
+            screen.verify_container_image.clone(),
         ),
         make_entry(
             "output_style",
@@ -2193,6 +2220,7 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
         "output_format" => c.output_format = clawde_core::config::OutputFormat::Text,
         "permission_mode" => c.permission_mode = clawde_core::config::PermissionMode::Default,
         "verify_sandbox" => c.verify.sandbox = clawde_core::config::VerifySandbox::Direct,
+        "verify_container_image" => c.verify.container_image = None,
         "preferredSearchBackend" => s.preferred_search_backend = "auto".to_string(),
         // Routing entries — remove from the routing JSON.
         "routing_strategy" => {
@@ -2319,6 +2347,7 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "output_format" => screen.output_format = "text".to_string(),
         "permission_mode" => screen.permission_mode = "default".to_string(),
         "verify_sandbox" => screen.verify_sandbox = "direct".to_string(),
+        "verify_container_image" => screen.verify_container_image = String::new(),
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
         "routing_strategy" => screen.routing_strategy = "sequential".to_string(),
         "first_byte_timeout_secs" => screen.first_byte_timeout_secs = "0".to_string(),
@@ -2866,6 +2895,30 @@ mod tests {
             other => panic!("verify_sandbox must be an enum, got: {other:?}"),
         }
         assert_eq!(entry.value, "direct");
+    }
+
+    #[test]
+    fn verify_container_image_entry_is_editable_text() {
+        let mut screen = SettingsScreen::new();
+        // The value getter reads straight from the config's container_image.
+        screen.settings_snapshot.config.verify.container_image = Some("node:20-slim".to_string());
+        let entries = all_entries(&screen);
+        let entry = entries
+            .iter()
+            .find(|e| e.key == "verify_container_image")
+            .expect("verify_container_image entry must exist");
+        assert_eq!(entry.label, "Verify container image");
+        assert_eq!(entry.section, SECTION_COMMON);
+        match &entry.kind {
+            SettingKind::Text => {}
+            other => panic!("verify_container_image must be Text, got: {other:?}"),
+        }
+        assert_eq!(
+            value_from_settings(&screen.settings_snapshot, "verify_container_image"),
+            "node:20-slim"
+        );
+        // Default is empty (auto image resolution).
+        assert_eq!(default_value_for("verify_container_image"), "");
     }
 
     #[test]

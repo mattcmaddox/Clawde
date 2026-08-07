@@ -18,7 +18,7 @@ This document is the complete reference for every slash command available in Cla
 10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
 11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
 12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/rocky`, `/normal`, `/mobile`, `/color`, `/stickers`
-13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/version`, `/update`
+13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
 14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
 15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
 16. [Command Availability](#command-availability)
@@ -1226,6 +1226,25 @@ key without waiting for the whole catalog.
 The same probe runs automatically at startup and every
 `health_poll_interval_secs` (default 300s) in the background; the footer shows
 a `⚠ N dead` marker when the last sweep found unhealthy keys.
+
+---
+
+### /verify
+
+Run a single execute-and-verify round now: detects the project's test suite
+and linter/typechecker, runs them in the sandbox configured by
+`verify.sandbox` (`direct` / `git worktree` / `container`), and renders the
+boxed per-check report — the same box the auto-verify loop draws after a
+writing turn. Use it to check the tree at any time, or after disabling
+auto-verify.
+
+```
+/verify
+```
+
+Configure the round via `settings.json` (see the Verify loop section of
+`configuration.md`): `verify.sandbox`, `verify.auto_test`, `verify.auto_lint`,
+`verify.timeout_secs`, and for the container sandbox `verify.container_image`.
 
 ---
 

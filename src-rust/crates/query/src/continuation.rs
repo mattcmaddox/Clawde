@@ -120,7 +120,7 @@ impl ContinuationPolicy for GoalPolicy {
 ///
 /// Stored on `QueryConfig` so callers opt in per invocation. Subagents,
 /// headless runs, and every non-goal interactive turn use `Default`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ContinuationMode {
     /// Stop after the turn completes (default, non-goal behaviour).
     #[default]

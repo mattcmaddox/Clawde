@@ -2142,7 +2142,8 @@ async fn run_interactive(
     if base_query_config.continuation == clawde_query::ContinuationMode::Default
         && config.verify.enabled
     {
-        base_query_config.continuation = clawde_query::ContinuationMode::Verify(config.verify);
+        base_query_config.continuation =
+            clawde_query::ContinuationMode::Verify(config.verify.clone());
     }
     let mut live_config = config.clone();
     if !session.model.is_empty() {
@@ -3070,6 +3071,11 @@ async fn run_interactive(
                                         "MCP OAuth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
                                         server_name, auth_url, redirect_uri
                                     ));
+                                }
+                                Some(CommandResult::Verify(report)) => {
+                                    // Render the boxed per-check verify indicator
+                                    // (same as the auto-verify loop's box).
+                                    app.push_verify_annotation(report);
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an

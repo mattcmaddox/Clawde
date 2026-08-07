@@ -1248,7 +1248,13 @@ pub mod config {
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
+    ///
+    /// `#[serde(default)]` lets a project settings file contain a *partial*
+    /// `config` block (e.g. just `permissionMode` or just `verify`) — missing
+    /// fields fall back to the defaults instead of making the whole project
+    /// file fail to parse and get silently dropped.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -1526,7 +1532,12 @@ pub mod config {
     /// { "verify": { "enabled": true, "max_retries": 3, "sandbox": "direct",
     ///               "auto_lint": true, "auto_test": true, "timeout_secs": 180 } }
     /// ```
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    /// Missing fields fall back to [`VerifyConfig::default`] so a partial
+    /// `"verify": { ... }` block in settings.json (e.g. just `enabled` and
+    /// `sandbox`) cannot make the whole project settings file fail to parse
+    /// and get silently dropped.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct VerifyConfig {
         /// Enable the verify loop. Defaults to `true` (zero-config sensible
         /// default per the audit spec); disable with `"verify": {"enabled": false}`.
@@ -1547,6 +1558,11 @@ pub mod config {
         /// and reported as a failure (a hung test suite must not stall the
         /// loop forever).
         pub timeout_secs: u64,
+        /// Container image used by the `container` sandbox. When set, wins over
+        /// the `CLAWDE_VERIFY_IMAGE` env var and the per-language default
+        /// (`rust:latest`, `node:latest`, `python:latest`, `golang:latest`,
+        /// `eclipse-temurin:latest`, `gcc:latest`).
+        pub container_image: Option<String>,
     }
 
     impl Default for VerifyConfig {
@@ -1562,6 +1578,7 @@ pub mod config {
                 auto_test: true,
                 skip_when_no_writes: true,
                 timeout_secs: 180,
+                container_image: None,
             }
         }
     }
@@ -2988,6 +3005,31 @@ pub mod config {
             let ov = &s.model_overrides["ollama/y"];
             assert_eq!(ov.context_window, Some(262144));
             assert_eq!(ov.status.as_deref(), Some("beta"));
+        }
+
+        #[test]
+        fn partial_project_config_block_parses_with_defaults() {
+            // A project settings file with a *partial* `config` block (just
+            // permissionMode + a verify block missing fields) must parse —
+            // missing fields fall back to defaults. Regression: before
+            // `#[serde(default)]`, this failed to parse and the whole project
+            // file was silently dropped, losing every override (permission
+            // mode, provider config, verify sandbox) — the verify loop then
+            // silently ran in the global default `direct` sandbox.
+            let raw = r#"{
+                "config": {
+                    "permission_mode": "bypassPermissions",
+                    "verify": { "enabled": true, "sandbox": "worktree" }
+                }
+            }"#;
+            let s: Settings = serde_json::from_str(raw).expect("partial config must parse");
+            assert_eq!(s.config.permission_mode, PermissionMode::BypassPermissions);
+            assert!(s.config.verify.enabled);
+            assert_eq!(s.config.verify.sandbox, VerifySandbox::Worktree);
+            // Missing fields take the defaults, not zero/empty values.
+            assert_eq!(s.config.verify.max_retries, 3);
+            assert!(s.config.verify.auto_lint);
+            assert_eq!(s.config.verify.timeout_secs, 180);
         }
 
         #[test]

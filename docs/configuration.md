@@ -124,6 +124,7 @@ loop via the `Verify` continuation mode; disable it entirely with
 | `verify.auto_lint` | boolean | true | Run the detected linter/typechecker during verification. |
 | `verify.skip_when_no_writes` | boolean | true | Skip verification on turns that only read/searched and wrote no files. |
 | `verify.timeout_secs` | integer | 180 | Per-command timeout in seconds. A hung command is killed and reported as a failure. |
+| `verify.container_image` | string | unset | Image used by the `container` sandbox. When set it wins over the `CLAWDE_VERIFY_IMAGE` env var and the per-language default, so a project can pin its own toolchain image (e.g. `node:20-slim`) in settings. |
 
 Example:
 
@@ -139,6 +140,11 @@ Example:
       "skip_when_no_writes": true,
       "timeout_secs": 180
     }
+    // ...or, to verify inside a pinned container image:
+    // "verify": {
+    //   "sandbox": "container",
+    //   "container_image": "node:20-slim"
+    // }
   }
 }
 ```

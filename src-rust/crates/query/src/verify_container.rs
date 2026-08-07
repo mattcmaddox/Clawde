@@ -5,9 +5,9 @@
 // sandbox verifies inside a disposable Docker/podman container:
 //
 //   1. detect a container runtime (docker preferred, podman fallback);
-//   2. pick an image — the `CLAWDE_VERIFY_IMAGE` env var when set, otherwise a
-//      language-appropriate default (rust:latest, node:latest, ...) derived
-//      from project detection;
+//   2. pick an image — `verify.container_image` in settings when set, else the
+//      `CLAWDE_VERIFY_IMAGE` env var, else a language-appropriate default
+//      (rust:latest, node:latest, ...) derived from project detection;
 //   3. ensure the image is present (`image inspect`, then a bounded `pull`);
 //   4. run each detected test/lint command inside a fresh `--rm` container
 //      with the project directory mounted at `/workspace`, so the checks see
@@ -53,7 +53,7 @@ pub fn run_checks_in_container(
          {\"sandbox\": \"direct\"} in settings.json to verify in place."
             .to_string()
     })?;
-    let image = resolve_image(working_dir)?;
+    let image = resolve_image(config, working_dir)?;
     ensure_image(runtime, &image, working_dir)?;
 
     // Mirror `run_checks_direct`: tests first, then lints, each in its own
@@ -106,11 +106,21 @@ fn detect_runtime() -> Option<&'static str> {
     None
 }
 
-/// The image to verify in: `CLAWDE_VERIFY_IMAGE` wins, otherwise a default per
-/// detected project language. Unknown languages fall back to a small Linux
-/// base so a project with no recognized toolchain still gets a (fast-failing,
-/// reported) round rather than a setup error.
-fn resolve_image(working_dir: &Path) -> Result<String, String> {
+/// The image to verify in, in priority order:
+/// 1. `verify.container_image` from settings (persistent, project-specific),
+/// 2. the `CLAWDE_VERIFY_IMAGE` env var (runtime/CI override),
+/// 3. a default per detected project language. Unknown languages fall back
+///    to a small Linux base so a project with no recognized toolchain still
+///    gets a (fast-failing, reported) round rather than a setup error.
+fn resolve_image(config: &VerifyConfig, working_dir: &Path) -> Result<String, String> {
+    if let Some(img) = config
+        .container_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(img.to_string());
+    }
     if let Ok(over) = std::env::var("CLAWDE_VERIFY_IMAGE") {
         let over = over.trim();
         if !over.is_empty() {
@@ -259,6 +269,7 @@ mod tests {
             auto_test: true,
             skip_when_no_writes: true,
             timeout_secs: 120,
+            container_image: None,
         }
     }
 
@@ -276,9 +287,31 @@ mod tests {
         std::env::set_var("CLAWDE_VERIFY_IMAGE", "custom/verify:tag");
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_image(dir.path()).unwrap(),
+            resolve_image(&container_config(), dir.path()).unwrap(),
             "custom/verify:tag",
             "CLAWDE_VERIFY_IMAGE must win over the language default"
+        );
+        std::env::remove_var("CLAWDE_VERIFY_IMAGE");
+    }
+
+    #[test]
+    fn container_image_resolution_config_wins_over_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("CLAWDE_VERIFY_IMAGE", "env/override:1");
+        let mut cfg = container_config();
+        cfg.container_image = Some("settings/image:2".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_image(&cfg, dir.path()).unwrap(),
+            "settings/image:2",
+            "verify.container_image from settings must win over the env var"
+        );
+        // A whitespace-only config value falls through to the env var.
+        cfg.container_image = Some("   ".to_string());
+        assert_eq!(
+            resolve_image(&cfg, dir.path()).unwrap(),
+            "env/override:1",
+            "blank container_image must not shadow the env var"
         );
         std::env::remove_var("CLAWDE_VERIFY_IMAGE");
     }
@@ -291,13 +324,16 @@ mod tests {
         // A Rust project resolves to the Rust image.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
-        assert_eq!(resolve_image(dir.path()).unwrap(), "rust:latest");
+        assert_eq!(
+            resolve_image(&container_config(), dir.path()).unwrap(),
+            "rust:latest"
+        );
 
         // An unrecognized project is a setup error telling the user to set
         // the image explicitly.
         let bare = tempfile::tempdir().unwrap();
         assert!(
-            resolve_image(bare.path()).is_err(),
+            resolve_image(&container_config(), bare.path()).is_err(),
             "unknown-language projects must demand an explicit image"
         );
     }

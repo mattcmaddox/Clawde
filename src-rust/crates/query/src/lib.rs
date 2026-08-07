@@ -474,7 +474,7 @@ pub async fn run_query_loop(
     // one turn; the goal policy keeps the loop running while an active goal's
     // guards allow; the verify policy runs the project's tests/lints after
     // writing turns. Built once per run.
-    let continuation_policy = config.continuation.policy(&tool_ctx.working_dir);
+    let continuation_policy = config.continuation.clone().policy(&tool_ctx.working_dir);
     // Wall-clock start of the current "continuation turn" (a span from a user /
     // continuation message to the next `end_turn`). Reset on each accepted
     // continuation so goal time/turn accounting matches the old per-dispatch

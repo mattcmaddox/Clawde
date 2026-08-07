@@ -99,6 +99,9 @@ pub enum CommandResult {
     OpenHooksOverlay,
     /// Open the import-config overlay in the TUI.
     OpenImportConfigOverlay,
+    /// Render a verification-round report as the boxed verify indicator
+    /// (the same box the auto-verify loop draws after writing turns).
+    Verify(clawde_query::VerifyReport),
     /// Clear saved provider auth, model selection, and model caches, then
     /// rebuild the live runtime state.
     RefreshProviderState,
@@ -325,7 +328,9 @@ pub use diagnostics::*;
 mod providers;
 pub use providers::*;
 mod usage;
+mod verify_cmd;
 pub use usage::*;
+pub use verify_cmd::*;
 mod extras;
 pub use extras::*;
 mod keys;
@@ -1988,6 +1993,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(BtwCommand),
         Box::new(CtxVizCommand),
         Box::new(SandboxToggleCommand),
+        Box::new(VerifyCommand),
         // Advisor
         Box::new(AdvisorCommand),
         // Diagnostics / analysis
