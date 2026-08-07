@@ -121,6 +121,19 @@ impl SlashCommand for RoutingCommand {
             return CommandResult::Message(msg);
         }
 
+        // TUI-only subcommands: /routing edit|pin|tasks opens the task-pinning
+        // dialog (spec §8.6). The TUI intercepts these before they reach the
+        // CLI, so in interactive mode this message is suppressed; headless
+        // users get a pointer to the JSON they would otherwise write.
+        if matches!(args.to_lowercase().as_str(), "edit" | "pin" | "tasks") {
+            return CommandResult::Message(
+                "Task pinning is an interactive TUI dialog (/routing edit). \
+                 Headless: set providers.free.options.routing.task_preferences \
+                 in settings.json."
+                    .to_string(),
+            );
+        }
+
         let new_strategy = match args.to_lowercase().as_str() {
             "sequential" | "seq" | "sr" => "sequential",
             "random" | "random_failover" | "random-failover" | "rr" => "random_failover",

@@ -1557,6 +1557,8 @@ pub struct App {
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
     pub effort_picker: crate::effort_picker::EffortPickerState,
+    /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
+    pub routing_dialog: crate::routing_dialog::RoutingDialogState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
@@ -2104,6 +2106,7 @@ impl App {
             file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
+            routing_dialog: crate::routing_dialog::RoutingDialogState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
@@ -3005,6 +3008,11 @@ impl App {
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
+        // /routing edit|pin: open the task-pinning dialog (spec §8.6).
+        if cmd == "routing" && matches!(args.trim(), "edit" | "pin" | "tasks") {
+            self.routing_dialog.open(&self.config);
+            return true;
+        }
         // /keybindings preset <default|vim|emacs>: switch the active keybinding
         // preset. `/keybindings` with no args falls through to the existing
         // file-opening handler in intercept_slash_command.
@@ -3601,6 +3609,7 @@ impl App {
         self.free_mode_dialog.close();
         self.device_auth_dialog.close();
         self.effort_picker.close();
+        self.routing_dialog.close();
         self.elicitation.close();
         self.ask_user_dialog.close();
         self.settings_screen.close();
@@ -3650,6 +3659,7 @@ impl App {
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
+            || self.routing_dialog.visible
             || self.session_browser.visible
             || self.session_branching.visible
             || self.export_dialog.visible
@@ -3657,6 +3667,97 @@ impl App {
             || self.mcp_approval.visible
             || self.file_injection_dialog.visible
             || self.context_menu_state.is_some()
+    }
+    /// Insert or remove the routing pins on a routing JSON object. Pinning
+    /// implies task routing, so a strategy change to `task_based` rides along;
+    /// clearing the last pin only removes `task_preferences` (the strategy is
+    /// left as the user set it).
+    fn apply_routing_pins(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        pins_json: &serde_json::Value,
+        has_pins: bool,
+    ) {
+        if has_pins {
+            obj.insert("task_preferences".to_string(), pins_json.clone());
+            obj.insert("strategy".to_string(), serde_json::json!("task_based"));
+        } else {
+            obj.remove("task_preferences");
+        }
+    }
+
+    /// Persist the routing dialog's task pins to settings.json and the live
+    /// config, returning a status message. Saving with any pin also flips the
+    /// routing strategy to `task_based` (pinning implies task routing); with
+    /// no pins left, `task_preferences` is removed and the strategy is left
+    /// untouched.
+    fn save_routing_dialog(&mut self) -> String {
+        let pins = self.routing_dialog.build_task_preferences();
+        let has_pins = !pins.is_empty();
+        let pins_json = serde_json::json!(pins);
+
+        // Persist to both settings shapes: the embedded `config` block (what
+        // the settings screen writes and what wins at load via
+        // `effective_config`'s or_insert merge) and the top-level `providers`
+        // map (what the /routing command writes). Writing both keeps a later
+        // `/routing sequential` from resurrecting stale pins from the other
+        // shape.
+        let mut disk_failed = false;
+        match clawde_core::config::Settings::load_sync() {
+            Ok(mut settings) => {
+                let routing = settings
+                    .config
+                    .provider_configs
+                    .entry("free".to_string())
+                    .or_default()
+                    .options
+                    .entry("routing".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = routing.as_object_mut() {
+                    Self::apply_routing_pins(obj, &pins_json, has_pins);
+                }
+                let top_routing = settings
+                    .providers
+                    .entry("free".to_string())
+                    .or_default()
+                    .options
+                    .entry("routing".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = top_routing.as_object_mut() {
+                    Self::apply_routing_pins(obj, &pins_json, has_pins);
+                }
+                if settings.save_sync().is_err() {
+                    disk_failed = true;
+                }
+            }
+            Err(_) => disk_failed = true,
+        }
+
+        // Mirror into the live config so /refresh and status agree.
+        let live_routing = self
+            .config
+            .provider_configs
+            .entry("free".to_string())
+            .or_default()
+            .options
+            .entry("routing".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = live_routing.as_object_mut() {
+            Self::apply_routing_pins(obj, &pins_json, has_pins);
+        }
+
+        let saved = if has_pins {
+            format!(
+                "Task routing saved: {} pinned task(s), strategy \u{2192} task_based. Run /refresh to apply.",
+                pins.len()
+            )
+        } else {
+            "Task pins cleared; built-in defaults restored. Run /refresh to apply.".to_string()
+        };
+        if disk_failed {
+            format!("{saved} (Warning: settings.json write failed — live config updated.)")
+        } else {
+            saved
+        }
     }
 
     /// Whether the main event loop needs a fast (~60fps) repaint cadence.
@@ -4642,6 +4743,45 @@ impl App {
                         chosen.label()
                     ));
                 }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Task-routing dialog (/routing edit — spec §8.6 task pinning).
+        if self.routing_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.routing_dialog.close();
+                    self.status_message = Some("Task routing unchanged.".to_string());
+                }
+                KeyCode::Enter => {
+                    let msg = self.save_routing_dialog();
+                    self.routing_dialog.close();
+                    self.status_message = Some(msg);
+                }
+                KeyCode::Tab | KeyCode::BackTab => self.routing_dialog.switch_pane(),
+                KeyCode::Left | KeyCode::Right => self.routing_dialog.switch_pane(),
+                KeyCode::Char('h') | KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                    self.routing_dialog.switch_pane()
+                }
+                KeyCode::Up => self.routing_dialog.select_prev(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.routing_dialog.select_prev()
+                }
+                KeyCode::Down => self.routing_dialog.select_next(),
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.routing_dialog.select_next()
+                }
+                KeyCode::Char(' ') => {
+                    if self.routing_dialog.pane == crate::routing_dialog::RoutingPane::Upstreams {
+                        self.routing_dialog.toggle_selected_upstream();
+                    } else {
+                        self.routing_dialog.switch_pane();
+                    }
+                }
+                KeyCode::Char('r') => self.routing_dialog.reset_task(),
+                KeyCode::Char('a') | KeyCode::Char('R') => self.routing_dialog.reset_all(),
                 _ => {}
             }
             return false;
@@ -8276,6 +8416,11 @@ impl App {
             if r.area() > 0 {
                 return Some(r);
             }
+        } else if self.routing_dialog.visible {
+            let r = self.routing_dialog.last_rect.get();
+            if r.area() > 0 {
+                return Some(r);
+            }
         } else if self.ask_user_dialog.visible {
             let r = self.ask_user_dialog.last_rect.get();
             if r.area() > 0 {
@@ -8816,6 +8961,7 @@ impl App {
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
+            || self.routing_dialog.visible
             || self.session_browser.visible
             || self.session_branching.visible
             || self.export_dialog.visible

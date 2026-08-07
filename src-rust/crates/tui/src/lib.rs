@@ -149,6 +149,8 @@ pub mod preset_store;
 pub mod prompt_input;
 /// All ratatui rendering logic.
 pub mod render;
+/// Task-routing pinning dialog (/routing edit — audit spec §8.6).
+pub mod routing_dialog;
 /// Rustle mascot rendering.
 pub mod rustle;
 /// In-TUI pixel editor for the Rustle mascot animation (/rustle).

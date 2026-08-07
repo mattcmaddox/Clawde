@@ -117,6 +117,7 @@ selects upstream providers:
 | `/routing rr` / `/rr` | Quick alias for random |
 | `/routing lr` / `/lr` | Quick alias for latency |
 | `/routing tr` / `/tr` | Quick alias for task |
+| `/routing edit` | Open the interactive task-pinning dialog in the TUI (spec §8.6) — shows the 7 task types with their assignments and lets you pin/unpin upstreams per task with the space bar |
 
 **Examples:**
 

@@ -929,6 +929,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         );
     }
 
+    // Task-routing pinning dialog (/routing edit — audit spec §8.6).
+    if app.routing_dialog.visible {
+        crate::routing_dialog::render_routing_dialog(
+            frame,
+            &app.routing_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
+    }
+
     // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
     if app.device_auth_dialog.visible {
         render_device_auth_dialog(frame, &app.device_auth_dialog, size);
