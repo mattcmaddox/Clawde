@@ -61,3 +61,49 @@ pub(crate) fn test_auth_store() -> (clawde_core::AuthStore, TestHome) {
     let home = TestHome::new();
     (clawde_core::AuthStore::default(), home)
 }
+
+/// Serializes tests that mutate arbitrary env vars (anything beyond
+/// `CLAWDE_HOME`, which [`TestHome`] guards separately). See
+/// [`EnvVarGuard`].
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Panic-safe guard that sets an arbitrary env var for its lifetime and
+/// restores the previous value on drop — even during unwinding from a
+/// panic. Holds the shared [`ENV_LOCK`] so parallel tests never race each
+/// other's env mutations (crate-level ENV_LOCK rule in AGENTS.md).
+///
+/// `ENV_LOCK` is a plain non-reentrant mutex: at most ONE guard may be
+/// alive per thread at a time, so a test needing two env vars must scope
+/// the first guard (drop it) before setting the second. The lock only
+/// serializes guard-holding tests — unguarded readers of the same var
+/// must not assert on values another test writes.
+pub(crate) struct EnvVarGuard {
+    _lock: MutexGuard<'static, ()>,
+    var: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(var: &'static str, value: &str) -> Self {
+        let lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os(var);
+        std::env::set_var(var, value);
+        EnvVarGuard {
+            _lock: lock,
+            var,
+            prev,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.var, v),
+            None => std::env::remove_var(self.var),
+        }
+    }
+}

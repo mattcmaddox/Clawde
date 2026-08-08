@@ -1782,6 +1782,104 @@ mod tests {
     }
 
     #[test]
+    fn free_upstream_base_url_override_reads_env_var() {
+        // Dev-only override: CLAWDE_FREE_BASE_URL_<ID> points an upstream at
+        // a local mock so 5xx / empty-completion cooldown paths are testable
+        // live. Hyphenated ids map to underscore env vars. The two guards
+        // are scoped separately because ENV_LOCK is non-reentrant.
+        let groq_result = {
+            let _g = crate::test_support::EnvVarGuard::set(
+                "CLAWDE_FREE_BASE_URL_GROQ",
+                "http://127.0.0.1:9876/v1",
+            );
+            free_upstream_base_url_override("groq")
+        };
+        assert_eq!(groq_result, Some("http://127.0.0.1:9876/v1".to_string()));
+
+        let _g2 = crate::test_support::EnvVarGuard::set(
+            "CLAWDE_FREE_BASE_URL_OPENCODE_ZEN",
+            "http://127.0.0.1:9877",
+        );
+        assert_eq!(
+            free_upstream_base_url_override("opencode-zen"),
+            Some("http://127.0.0.1:9877".to_string())
+        );
+    }
+
+    #[test]
+    fn free_upstream_base_url_override_empty_or_unset_is_none() {
+        // Whitespace-only overrides are treated as absent.
+        let _g = crate::test_support::EnvVarGuard::set("CLAWDE_FREE_BASE_URL_GROQ", "   ");
+        assert_eq!(free_upstream_base_url_override("groq"), None);
+        // The cline var is never set in this process.
+        assert_eq!(free_upstream_base_url_override("cline"), None);
+    }
+
+    #[test]
+    fn chat_probe_for_honors_base_url_override() {
+        // The startup /health probe must also hit the mock, otherwise the
+        // 401 against the real endpoint would cool every ring key before the
+        // 5xx chat path could ever be exercised.
+        let _g = crate::test_support::EnvVarGuard::set(
+            "CLAWDE_FREE_BASE_URL_HUGGINGFACE",
+            "http://127.0.0.1:9878/v1",
+        );
+        let (base, model) = chat_probe_for("huggingface").expect("hf probe");
+        assert_eq!(base, "http://127.0.0.1:9878/v1");
+        assert_eq!(model, "meta-llama/Llama-3.3-70B-Instruct");
+    }
+
+    #[tokio::test]
+    async fn overridden_base_url_5xx_applies_cooldown_and_is_reported() {
+        // A local mock returning 500 exercises the exact live path the env
+        // override unlocks: dispatch → 5xx → circuit cooldown → reported via
+        // upstream_cooldowns() (the /routing dialog's `·cool Ns` tag).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ready = spawn_mock_server(
+            listener,
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 0\r\n\r\n"
+                .to_string(),
+        );
+        wait_for_mock_server(&ready);
+
+        let upstream = *catalog_entry("groq").expect("groq catalog entry");
+        let compat = crate::providers::openai_compat_providers::groq()
+            .with_api_key("fake-groq-key-1234567890".to_string())
+            .with_base_url(format!("http://127.0.0.1:{}", port));
+        let provider = FreeProvider::new(vec![FreeEntry {
+            upstream,
+            provider: Arc::new(compat) as Arc<dyn LlmProvider>,
+            effective_model: None,
+        }]);
+
+        let err = provider
+            .create_message(dummy_request("free/auto"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ProviderError::ServerError {
+                    status: Some(500),
+                    ..
+                }
+            ),
+            "mock 500 should surface as a server error, got {:?}",
+            err
+        );
+
+        let cooldowns = provider.upstream_cooldowns();
+        assert!(
+            cooldowns
+                .iter()
+                .any(|(id, kind, secs)| id == "groq" && kind == "5xx" && secs.is_some()),
+            "5xx must apply a cooldown reported to the dialog, got {:?}",
+            cooldowns
+        );
+    }
+
+    #[test]
     fn probe_status_classification() {
         // Success on an auth-checking upstream is a clean pass.
         assert_eq!(classify_probe_status("groq", 200), Ok(()));

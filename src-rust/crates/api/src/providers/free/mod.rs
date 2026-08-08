@@ -778,7 +778,7 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         return Ok(parse_rate_limit_headers(response.headers()));
     }
 
-    let base_url = match upstream_id {
+    let native: &str = match upstream_id {
         "huggingface" => "https://router.huggingface.co/v1/models",
         "cerebras" => "https://api.cerebras.ai/v1/models",
         "nvidia" => "https://integrate.api.nvidia.com/v1/models",
@@ -792,6 +792,10 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
         _ => return Err(format!("No validation endpoint for '{}'", upstream_id)),
+    };
+    let base_url = match free_upstream_base_url_override(upstream_id) {
+        Some(override_base) => format!("{}/models", override_base.trim_end_matches('/')),
+        None => native.to_string(),
     };
 
     let client = reqwest::blocking::Client::builder()
@@ -972,7 +976,30 @@ fn split_cloudflare_key(key: &str) -> Result<(&str, &str), String> {
 /// 503s or 30s+ responses well past the 5s probe timeout), which marks
 /// VALID keys unhealthy. Probing the fallback answers in <1s and proves the
 /// key just as well. Upstreams without a fallback probe their default model.
-fn chat_probe_for(upstream_id: &str) -> Option<(&'static str, &'static str)> {
+/// Dev-only base-URL override for a free upstream.
+///
+/// Reads `CLAWDE_FREE_BASE_URL_<UPSTREAM_ID>` (upper-cased, `-` -> `_`),
+/// e.g. `CLAWDE_FREE_BASE_URL_GROQ=http://127.0.0.1:9876/v1`, and lets a
+/// local mock server stand in for a real upstream so the 5xx /
+/// empty-completion cooldown paths are deterministically testable live.
+///
+/// Only OpenAI-compatible upstreams honour the override on the chat
+/// dispatch path; `google`, `cohere` and `github-copilot` use native wire
+/// formats and keep their real endpoints. The key-validation / probe
+/// endpoints honour it where applicable (cloudflare's chat probe is
+/// account-scoped and ignores it). Not for production use.
+pub fn free_upstream_base_url_override(upstream_id: &str) -> Option<String> {
+    let var = format!(
+        "CLAWDE_FREE_BASE_URL_{}",
+        upstream_id.to_uppercase().replace('-', "_")
+    );
+    std::env::var(&var)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {
     let (base_url, default_model) = match upstream_id {
         "nvidia" => (
             "https://integrate.api.nvidia.com/v1",
@@ -994,6 +1021,8 @@ fn chat_probe_for(upstream_id: &str) -> Option<(&'static str, &'static str)> {
         .and_then(|u| u.fallback_models.first())
         .copied()
         .unwrap_or(default_model);
+    let base_url =
+        free_upstream_base_url_override(upstream_id).unwrap_or_else(|| base_url.to_string());
     Some((base_url, model))
 }
 
@@ -1074,7 +1103,7 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         return Ok(());
     }
 
-    let base_url = match upstream_id {
+    let native: &str = match upstream_id {
         "huggingface" => "https://router.huggingface.co/v1/models",
         "cerebras" => "https://api.cerebras.ai/v1/models",
         "nvidia" => "https://integrate.api.nvidia.com/v1/models",
@@ -1089,6 +1118,10 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
         "github-copilot" => "https://api.githubcopilot.com/models",
         _ => return Err(format!("No validation endpoint for '{}'", upstream_id)),
+    };
+    let base_url = match free_upstream_base_url_override(upstream_id) {
+        Some(override_base) => format!("{}/models", override_base.trim_end_matches('/')),
+        None => native.to_string(),
     };
 
     let client = match reqwest::blocking::Client::builder()

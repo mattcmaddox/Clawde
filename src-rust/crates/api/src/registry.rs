@@ -157,17 +157,32 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                         "cohere" => {
                             Arc::new(CohereProvider::new(key_owned)) as Arc<dyn LlmProvider>
                         }
-                        "cloudflare" => Arc::new(
-                            crate::providers::openai_compat_providers::cloudflare_with_key(
-                                &key_owned,
-                            ),
-                        ) as Arc<dyn LlmProvider>,
+                        "cloudflare" => {
+                            let mut p =
+                                crate::providers::openai_compat_providers::cloudflare_with_key(
+                                    &key_owned,
+                                );
+                            if let Some(base) =
+                                crate::providers::free::free_upstream_base_url_override(
+                                    "cloudflare",
+                                )
+                            {
+                                p = p.with_base_url(base);
+                            }
+                            Arc::new(p) as Arc<dyn LlmProvider>
+                        }
                         id => {
                             let p = crate::providers::openai_compat_providers::provider_for_id(id)
                                 .unwrap_or_else(|| {
                                     panic!("KeyRotatingProvider: no upstream factory for '{}'", id)
                                 });
-                            Arc::new(p.with_api_key(key_owned)) as Arc<dyn LlmProvider>
+                            let mut p = p.with_api_key(key_owned);
+                            if let Some(base) =
+                                crate::providers::free::free_upstream_base_url_override(id)
+                            {
+                                p = p.with_base_url(base);
+                            }
+                            Arc::new(p) as Arc<dyn LlmProvider>
                         }
                     }
                 },
@@ -195,12 +210,23 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         let provider: Option<Arc<dyn LlmProvider>> = match upstream.id {
             "google" => Some(Arc::new(GoogleProvider::new(key))),
             "cohere" => Some(Arc::new(CohereProvider::new(key))),
-            "cloudflare" => Some(Arc::new(
-                crate::providers::openai_compat_providers::cloudflare_with_key(&key),
-            ) as Arc<dyn LlmProvider>),
+            "cloudflare" => {
+                let mut p = crate::providers::openai_compat_providers::cloudflare_with_key(&key);
+                if let Some(base) =
+                    crate::providers::free::free_upstream_base_url_override("cloudflare")
+                {
+                    p = p.with_base_url(base);
+                }
+                Some(Arc::new(p) as Arc<dyn LlmProvider>)
+            }
             "github-copilot" => Some(Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>),
-            id => crate::providers::openai_compat_providers::provider_for_id(id)
-                .map(|p| Arc::new(p.with_api_key(key)) as Arc<dyn LlmProvider>),
+            id => crate::providers::openai_compat_providers::provider_for_id(id).map(|p| {
+                let mut p = p.with_api_key(key);
+                if let Some(base) = crate::providers::free::free_upstream_base_url_override(id) {
+                    p = p.with_base_url(base);
+                }
+                Arc::new(p) as Arc<dyn LlmProvider>
+            }),
         };
 
         if let Some(provider) = provider {
@@ -1162,6 +1188,87 @@ mod tests {
             provider.routing_strategy_name(),
             Some("Auto"),
             "missing strategy key must fall back to the Auto default"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_free_provider_honors_env_base_url_override() {
+        // CLAWDE_FREE_BASE_URL_MISTRAL points mistral's chat dispatch at a
+        // dead port. A fake key against the real endpoint would 401, so a
+        // transport error mentioning the mock host proves the override
+        // reached the inner provider through build_free_provider — the
+        // end-to-end wiring the dev-only env hook exists for.
+        use crate::provider_types::ProviderRequest;
+        use clawde_core::types::Message;
+
+        let (mut store, _home) = crate::test_support::test_auth_store();
+        seed_key(&mut store);
+        let _guard = crate::test_support::EnvVarGuard::set(
+            "CLAWDE_FREE_BASE_URL_MISTRAL",
+            "http://127.0.0.1:1",
+        );
+
+        // Disable every upstream except mistral so a developer machine with
+        // real *_API_KEY env vars can't build other upstreams into the chain
+        // (which would dispatch a real network call instead of the dead port).
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "routing".to_string(),
+            serde_json::json!({
+                "disabled_upstreams": [
+                    "huggingface", "nvidia", "cerebras", "google", "cloudflare",
+                    "groq", "sambanova", "cline", "cohere", "opencode-zen",
+                    "zai", "openrouter"
+                ]
+            }),
+        );
+        let mut provider_configs = std::collections::HashMap::new();
+        provider_configs.insert(
+            "free".to_string(),
+            ProviderConfig {
+                options,
+                ..Default::default()
+            },
+        );
+        // Ollama mode defaults to Auto and would be appended to the chain as
+        // a local fallback (masking mistral's transport error with its own
+        // ModelNotFound). Isolated keeps the chain to exactly mistral.
+        let mut ollama_options = std::collections::HashMap::new();
+        ollama_options.insert("mode".to_string(), serde_json::json!("isolated"));
+        provider_configs.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                options: ollama_options,
+                ..Default::default()
+            },
+        );
+        let config = Config {
+            provider_configs,
+            ..Default::default()
+        };
+
+        let provider = build_free_provider(&config)
+            .expect("a seeded free-mode key should build the free chain");
+
+        let req = ProviderRequest {
+            model: "free/auto".to_string(),
+            messages: vec![Message::user("hi")],
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 8,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: serde_json::Value::Null,
+        };
+        let err = provider.create_message(req).await.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("127.0.0.1:1"),
+            "request must go to the overridden base URL, error was: {}",
+            msg
         );
     }
 }
