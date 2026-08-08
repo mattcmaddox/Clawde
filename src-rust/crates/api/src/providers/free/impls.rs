@@ -30,7 +30,10 @@ impl FreeProvider {
     /// for Auto-ordering. One or two samples are noise — a single failure
     /// must not relegate a strong upstream to the tail, nor a single win
     /// promote a flaky one ahead of a proven provider.
-    const MIN_SUCCESS_RATE_SAMPLES: u32 = 3;
+    ///
+    /// Public so the routing dialog's perf view applies the exact same
+    /// threshold when it ranks upstreams for the selected task.
+    pub const MIN_SUCCESS_RATE_SAMPLES: u32 = 3;
 
     /// Resolve the effective default model for the entry at `idx`.
     /// Uses the auto-detected override when available, otherwise falls
@@ -1703,6 +1706,20 @@ impl LlmProvider for FreeProvider {
                     .collect();
                 (entry.upstream.id.to_string(), rates)
             })
+            .collect()
+    }
+
+    fn upstream_dispatch_counts(&self) -> Vec<(String, u32)> {
+        // Per-upstream recorded dispatch counts (spec §8.6) — the trust
+        // signal behind a success rate: the router only treats a rate as
+        // reliable once `MIN_SUCCESS_RATE_SAMPLES` dispatches exist, and the
+        // routing dialog's perf view uses the same gate to tier its ranking.
+        // Locked once, never across an await.
+        let lat = self.latencies.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| (entry.upstream.id.to_string(), lat.dispatches(idx)))
             .collect()
     }
 

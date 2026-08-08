@@ -289,6 +289,7 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: clawde_core::config::Config::default(),
+            provider_registry: None,
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,

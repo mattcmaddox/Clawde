@@ -62,6 +62,7 @@ pub async fn handle(
         non_interactive: false, // ACP routes permissions via the bridge
         mcp_manager: runtime.mcp_manager.clone(),
         config: runtime.config.clone(),
+        provider_registry: Some(runtime.provider_registry.clone()),
         managed_agent_config: runtime.config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),

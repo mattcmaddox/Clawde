@@ -530,6 +530,10 @@ pub type UpstreamLatencySummaries = Vec<(String, Vec<(String, Option<f64>)>)>;
 pub type UpstreamTaskSuccessRateSummaries =
     Vec<(String, Vec<(String, Vec<(String, Option<f64>)>)>)>;
 
+/// Type alias for per-upstream dispatch-count summaries returned by
+/// [`ProviderRegistry::upstream_dispatch_count_summaries`].
+pub type UpstreamDispatchCountSummaries = Vec<(String, Vec<(String, u32)>)>;
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
@@ -702,6 +706,23 @@ impl ProviderRegistry {
         let mut summaries = Vec::new();
         for (id, provider) in &self.providers {
             let entries = provider.upstream_task_success_rates();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream recorded dispatch counts from all registered
+    /// composite providers. Each entry is `(provider_name, Vec<(upstream_id,
+    /// dispatch_count)>)` — the trust signal behind a success rate (spec
+    /// §8.6), surfaced by the routing dialog's perf view and the agent-facing
+    /// UpstreamHealth tool. Sorted by provider name.
+    pub fn upstream_dispatch_count_summaries(&self) -> UpstreamDispatchCountSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_dispatch_counts();
             if !entries.is_empty() {
                 summaries.push((id.to_string(), entries));
             }

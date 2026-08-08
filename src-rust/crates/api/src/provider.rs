@@ -244,6 +244,16 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Per-upstream recorded dispatch counts `(upstream_id, n)` — the trust
+    /// signal behind a success rate (spec §8.4/§8.6). The router only treats
+    /// a rate as reliable once an upstream has `MIN_SUCCESS_RATE_SAMPLES`
+    /// dispatches, so the perf view shows how much history a rate is based
+    /// on. The default returns an empty vector — only composite providers
+    /// that multiplex upstreams override this.
+    fn upstream_dispatch_counts(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
     /// Per-upstream capability metadata for the routing dialog's model view
     /// (spec §8.6): `(upstream_id, vision, context_window_tokens)`. Lets the
     /// UI explain why the capability gate (spec §8.4) routes image-bearing or

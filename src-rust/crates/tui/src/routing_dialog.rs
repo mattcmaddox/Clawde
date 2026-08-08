@@ -16,17 +16,20 @@
 //     │    …                   │   … (default)                   │
 //     │                         │  ·128K = context window, ·vision = images │
 //     │                         │                                 │
-//     │  ↑/↓ j/k navigate · Tab/←/→ pane · space pin · r reset ·  │
-//     │  a reset all · enter save · esc cancel                    │
+//     │  ↑/↓ j/k navigate · Tab/←/→ pane · p perf · space pin ·   │
+//     │  r reset · a reset all · enter save · esc cancel          │
 //     └───────────────────────────────────────────────────────────┘
 //
 // The left column shows each task's effective assignment: the pinned list
 // when overridden, otherwise the built-in default preferences ("auto · …").
+// Tab cycles the right pane between the pin list (Upstreams) and the
+// model-performance leaderboard (Perf), which ranks every upstream by the
+// same success-rate + latency key the router uses to auto-prioritize.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use clawde_api::providers::free::{task_preference_ids, TaskType, FREE_CATALOG};
+use clawde_api::providers::free::{task_preference_ids, FreeProvider, TaskType, FREE_CATALOG};
 use clawde_core::config::Config;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -70,6 +73,10 @@ pub enum RoutingPane {
     Tasks,
     /// The upstream checkbox list for the selected task.
     Upstreams,
+    /// The ranked model-performance leaderboard for the selected task
+    /// (spec §8.6): upstreams ordered by the same success-rate + latency
+    /// key the router uses to auto-prioritize its plan.
+    Perf,
 }
 
 /// Interactive state for the `/routing edit` task-pinning dialog.
@@ -119,6 +126,28 @@ pub struct RoutingDialogState {
     /// upstreams wrapped in a KeyRotatingProvider (2+ keys), captured at open
     /// time for the upstream pane's key-health dots.
     pub key_health: Vec<(String, usize, usize, Option<u64>)>,
+    /// Per-upstream recorded dispatch counts `(upstream_id, n)` — the trust
+    /// signal behind each success rate, captured at open time for the perf
+    /// view's ranking tiers (spec §8.6).
+    pub dispatch_counts: Vec<(String, u32)>,
+}
+
+/// One row of the perf leaderboard: an upstream ranked by the same
+/// success-rate + latency key the router uses to order its task-preferred
+/// group (spec §8.4 criterion 2 + §8.6 model-performance view).
+#[derive(Debug, Clone)]
+pub struct PerfRow {
+    pub upstream_id: String,
+    pub title: &'static str,
+    /// 0 = reliable (≥ `MIN_SUCCESS_RATE_SAMPLES` dispatches), ordered by
+    /// success rate then latency; 1 = learning (1–2 dispatches), ordered by
+    /// latency; 2 = no history, trailing in catalog order.
+    pub tier: u8,
+    /// Task-aware success rate (0.0–1.0), falling back to the aggregate when
+    /// the selected task has no recorded dispatch on this upstream.
+    pub success_rate: Option<f64>,
+    pub avg_latency: Option<f64>,
+    pub dispatches: u32,
 }
 
 impl Default for RoutingDialogState {
@@ -139,6 +168,7 @@ impl Default for RoutingDialogState {
             capabilities: Vec::new(),
             cooldowns: Vec::new(),
             key_health: Vec::new(),
+            dispatch_counts: Vec::new(),
         }
     }
 }
@@ -162,6 +192,7 @@ impl RoutingDialogState {
         capabilities: Vec<(String, bool, u32)>,
         cooldowns: Vec<(String, String, Option<u64>)>,
         key_health: Vec<(String, usize, usize, Option<u64>)>,
+        dispatch_counts: Vec<(String, u32)>,
     ) {
         self.overrides = parse_task_preferences(config);
         self.strategy = parse_routing_strategy(config);
@@ -171,6 +202,7 @@ impl RoutingDialogState {
         self.capabilities = capabilities;
         self.cooldowns = cooldowns;
         self.key_health = key_health;
+        self.dispatch_counts = dispatch_counts;
         self.selected_task = 0;
         self.pane = RoutingPane::Tasks;
         self.upstream_idx = 0;
@@ -206,6 +238,16 @@ impl RoutingDialogState {
                     .find(|(key, _)| key == task_key)
                     .and_then(|(_, rate)| *rate)
             })
+    }
+
+    /// The recorded dispatch count for an upstream id (0 when the snapshot
+    /// has no entry — no recorded dispatches).
+    pub fn dispatch_count_for(&self, upstream_id: &str) -> u32 {
+        self.dispatch_counts
+            .iter()
+            .find(|(id, _)| id == upstream_id)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
     }
 
     /// The recorded capability metadata `(vision, context_window)` for an
@@ -317,11 +359,69 @@ impl RoutingDialogState {
             .collect()
     }
 
+    /// The model-performance leaderboard for `task`: every catalog upstream
+    /// ranked by the same reliability key the router applies inside its
+    /// task-preferred group (spec §8.4 criterion 2 + success-rate
+    /// refinement) — tier 0 first (enough dispatches → success rate desc,
+    /// then latency asc), then tier 1 (a couple of samples → latency asc),
+    /// then tier 2 (no history → trailing, catalog order via the stable
+    /// sort).
+    ///
+    /// The sort rate is the selected task's OWN success rate when recorded
+    /// (falling back to the aggregate) — so for a task with dispatch history
+    /// the ranking shows who performs best AT THAT TASK, which refines the
+    /// router's aggregate-based ordering of its preferred group. The % and
+    /// the ranking therefore always agree.
+    pub fn perf_ranking_for(&self, task: TaskType) -> Vec<PerfRow> {
+        let task_key = task.key();
+        let mut rows: Vec<PerfRow> = FREE_CATALOG
+            .iter()
+            .map(|u| {
+                let dispatches = self.dispatch_count_for(u.id);
+                let rate = self
+                    .task_success_rate_for(u.id, task_key)
+                    .or_else(|| self.success_rate_for(u.id));
+                let tier = match (dispatches, rate) {
+                    (n, Some(_)) if n >= FreeProvider::MIN_SUCCESS_RATE_SAMPLES => 0,
+                    (n, _) if n > 0 => 1,
+                    _ => 2,
+                };
+                PerfRow {
+                    upstream_id: u.id.to_string(),
+                    title: u.title,
+                    tier,
+                    success_rate: rate,
+                    avg_latency: self.latency_for(u.id),
+                    dispatches,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            Self::perf_order_key(a)
+                .partial_cmp(&Self::perf_order_key(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    }
+
+    /// Ordering key for the perf leaderboard — mirrors the router's
+    /// `preferred_order_key` tiering (see `FreeProvider::preferred_order_key`),
+    /// with the task-aware rate substituted for the aggregate.
+    fn perf_order_key(row: &PerfRow) -> (u8, f64, f64) {
+        let avg = row.avg_latency.unwrap_or(f64::MAX);
+        match (row.dispatches, row.success_rate) {
+            (n, Some(rate)) if n >= FreeProvider::MIN_SUCCESS_RATE_SAMPLES => (0, -rate, avg),
+            (n, _) if n > 0 => (1, 0.0, avg),
+            _ => (2, 0.0, avg),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Navigation
     // -----------------------------------------------------------------------
 
-    /// Move up within the active pane.
+    /// Move up within the active pane. The perf pane is a static ranked list
+    /// (every upstream fits in the modal), so navigation is a no-op there.
     pub fn select_prev(&mut self) {
         match self.pane {
             RoutingPane::Tasks => {
@@ -333,10 +433,12 @@ impl RoutingDialogState {
                 }
                 self.scroll_upstream_into_view(self.last_upstream_visible.get().max(1));
             }
+            RoutingPane::Perf => {}
         }
     }
 
-    /// Move down within the active pane.
+    /// Move down within the active pane. The perf pane is a static ranked list
+    /// (every upstream fits in the modal), so navigation is a no-op there.
     pub fn select_next(&mut self) {
         match self.pane {
             RoutingPane::Tasks => {
@@ -350,6 +452,7 @@ impl RoutingDialogState {
                 }
                 self.scroll_upstream_into_view(self.last_upstream_visible.get().max(1));
             }
+            RoutingPane::Perf => {}
         }
     }
 
@@ -367,12 +470,18 @@ impl RoutingDialogState {
             .min(FREE_CATALOG.len().saturating_sub(visible));
     }
 
-    /// Switch the focused pane.
+    /// Switch the focused pane: Tasks → Upstreams → Perf → Tasks.
     pub fn switch_pane(&mut self) {
         self.pane = match self.pane {
             RoutingPane::Tasks => RoutingPane::Upstreams,
-            RoutingPane::Upstreams => RoutingPane::Tasks,
+            RoutingPane::Upstreams => RoutingPane::Perf,
+            RoutingPane::Perf => RoutingPane::Tasks,
         };
+    }
+
+    /// Jump straight to the perf (ranking) pane.
+    pub fn show_perf(&mut self) {
+        self.pane = RoutingPane::Perf;
     }
 }
 
@@ -467,11 +576,16 @@ pub fn render_routing_dialog(
 
     let buf = frame.buffer_mut();
     render_tasks_pane(buf, left_area, state);
-    render_upstreams_pane(buf, right_area, state);
+    match state.pane {
+        RoutingPane::Perf => render_perf_pane(buf, right_area, state),
+        RoutingPane::Tasks | RoutingPane::Upstreams => {
+            render_upstreams_pane(buf, right_area, state)
+        }
+    }
 
     // Hint row — one row above the bottom border (the inner rect already
     // leaves `area.height - 3` for the panes, so this row is free).
-    let hint = "\u{2191}/\u{2193} j/k nav \u{b7} Tab/\u{2190}/\u{2192} pane \u{b7} space pin \u{b7} r reset \u{b7} a reset all \u{b7} enter save \u{b7} esc";
+    let hint = "\u{2191}/\u{2193} j/k nav \u{b7} Tab/\u{2190}/\u{2192} pane \u{b7} p perf \u{b7} space pin \u{b7} r reset \u{b7} a reset all \u{b7} enter save \u{b7} esc";
     let hint_y = area.y + area.height - 2;
     for (i, ch) in hint.chars().enumerate() {
         if area.x + i as u16 >= area.x + area.width {
@@ -626,6 +740,79 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
         );
     }
 }
+/// Render the model-performance leaderboard for the selected task.
+///
+/// Lists every catalog upstream ranked by the router's reliability key
+/// (see [`RoutingDialogState::perf_ranking_for`]) so the user sees, at a
+/// glance, which upstreams perform best for this task and how much history
+/// each ranking is based on.
+fn render_perf_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogState) {
+    let task = state.current_task();
+    let pane = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(Span::styled(
+            format!(" Perf ranking \u{b7} {} ", task.label()),
+            Style::default().fg(BORDER),
+        ));
+    pane.render(area, buf);
+
+    // Bottom note — what the ordering means.
+    let note_y = area.y + area.height - 2;
+    let note = "task ranking: reliable (\u{2265}3 dispatch) \u{2192} learning \u{2192} no history";
+    for (i, ch) in note.chars().enumerate() {
+        if i as u16 >= area.width.saturating_sub(2) {
+            break;
+        }
+        buf[(area.x + 1 + i as u16, note_y)]
+            .set_symbol(&ch.to_string())
+            .set_style(Style::default().fg(DEFAULT_TAG));
+    }
+
+    let rows = state.perf_ranking_for(task);
+    for (i, row) in rows.iter().enumerate() {
+        let row_y = area.y + 1 + i as u16;
+        if row_y >= note_y {
+            break;
+        }
+        let rank = i + 1;
+        let is_first = rank == 1;
+        let rate = match row.success_rate {
+            Some(r) => format!("{:>3.0}%", r * 100.0),
+            None => "   \u{2014}".to_string(),
+        };
+        let latency = match row.avg_latency {
+            Some(secs) => format!("{:.1}s", secs),
+            None => "\u{2014}".to_string(),
+        };
+        let tier_label = match row.tier {
+            0 => "reliable",
+            1 => "learning",
+            _ => "no history",
+        };
+        let text = format!(
+            "#{:<3}{} \u{b7} {:<12}{} \u{b7} {} \u{b7} {} \u{b7} {}",
+            rank, row.upstream_id, row.title, rate, latency, row.dispatches, tier_label,
+        );
+        let style = if is_first {
+            Style::default()
+                .fg(SEL_FG)
+                .bg(SEL_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        draw_clipped(
+            buf,
+            area.x + 1,
+            row_y,
+            area.width.saturating_sub(2),
+            &text,
+            style,
+        );
+    }
+}
+
 /// Write `text` at (x, y), clipping to `max_chars` columns with an
 /// ellipsis when the text is cut short.
 fn draw_clipped(buf: &mut Buffer, x: u16, y: u16, max_chars: u16, text: &str, style: Style) {
@@ -698,6 +885,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(dialog.visible);
         assert_eq!(dialog.strategy, "task_based");
@@ -713,6 +901,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -753,6 +942,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         dialog.selected_task = 0;
         dialog.reset_task();
@@ -768,6 +958,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -797,6 +988,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         let auto = dialog.assignment_summary(TaskType::Verification);
         assert!(auto.starts_with("auto \u{b7} "), "got: {auto}");
@@ -810,6 +1002,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -850,6 +1043,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.latency_for("groq"), Some(1.25));
         assert_eq!(dialog.latency_for("cerebras"), None);
@@ -867,6 +1061,7 @@ mod tests {
                 ("groq".to_string(), Some(0.8)),
                 ("cerebras".to_string(), None),
             ],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -895,6 +1090,7 @@ mod tests {
                 ),
                 ("cerebras".to_string(), Vec::new()),
             ],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -934,6 +1130,7 @@ mod tests {
             ],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.capability_for("google"), Some((true, 128_000)));
         assert_eq!(dialog.capability_for("huggingface"), Some((false, 128_000)));
@@ -956,6 +1153,7 @@ mod tests {
                 ("cerebras".to_string(), "5xx".to_string(), None),
             ],
             vec![("google".to_string(), 2, 3, Some(60))],
+            Vec::new(),
         );
         // cooldown_for returns the SHORTEST remaining retry across kinds.
         assert_eq!(dialog.cooldown_for("groq"), Some(("5xx".to_string(), 45)));
@@ -968,10 +1166,149 @@ mod tests {
     }
 
     #[test]
+    fn perf_ranking_orders_by_reliability_then_latency() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            vec![
+                ("groq".to_string(), Some(0.4)),
+                ("google".to_string(), Some(1.0)),
+                ("huggingface".to_string(), Some(0.2)),
+            ],
+            vec![
+                ("groq".to_string(), Some(1.0)),
+                ("google".to_string(), Some(1.0)),
+                ("huggingface".to_string(), Some(0.8)),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ("groq".to_string(), 5),
+                ("google".to_string(), 5),
+                ("huggingface".to_string(), 5),
+            ],
+        );
+        let rows = dialog.perf_ranking_for(TaskType::CodeGeneration);
+        // Tier-0 (reliable) upstreams lead: 100% groq before 100% google
+        // (same rate, faster latency), then 80% huggingface. No-history
+        // upstreams trail behind them.
+        let ids: Vec<&str> = rows
+            .iter()
+            .take(3)
+            .map(|r| r.upstream_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["groq", "google", "huggingface"]);
+        assert!(rows.iter().all(|r| r.tier == 0 || r.tier == 2));
+        assert!(rows.iter().skip(3).all(|r| r.tier == 2));
+    }
+
+    #[test]
+    fn perf_ranking_tiers_by_dispatch_count() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            vec![
+                ("groq".to_string(), Some(1.0)),
+                ("cerebras".to_string(), Some(1.0)),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![("groq".to_string(), 8), ("cerebras".to_string(), 2)],
+        );
+        let rows = dialog.perf_ranking_for(TaskType::CodeGeneration);
+        // groq has enough history (8 ≥ 3) → reliable; cerebras (2) is still
+        // learning; an upstream with no snapshot data → no history, trailing.
+        let groq = rows.iter().find(|r| r.upstream_id == "groq").unwrap();
+        let cerebras = rows.iter().find(|r| r.upstream_id == "cerebras").unwrap();
+        let mistral = rows.iter().find(|r| r.upstream_id == "mistral").unwrap();
+        assert_eq!(groq.tier, 0);
+        assert_eq!(cerebras.tier, 1);
+        assert_eq!(mistral.tier, 2);
+        assert_eq!(groq.dispatches, 8);
+        assert_eq!(cerebras.dispatches, 2);
+        let groq_pos = rows.iter().position(|r| r.upstream_id == "groq").unwrap();
+        let cerebras_pos = rows
+            .iter()
+            .position(|r| r.upstream_id == "cerebras")
+            .unwrap();
+        let mistral_pos = rows
+            .iter()
+            .position(|r| r.upstream_id == "mistral")
+            .unwrap();
+        assert!(groq_pos < cerebras_pos);
+        assert!(cerebras_pos < mistral_pos);
+    }
+
+    #[test]
+    fn perf_ranking_uses_task_specific_rate() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            vec![("groq".to_string(), Some(1.0))],
+            vec![(
+                "groq".to_string(),
+                vec![("code_generation".to_string(), Some(0.0))],
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![("groq".to_string(), 5)],
+        );
+        // The % shown is the SELECTED task's own rate (0% on code_generation)
+        // even though groq's aggregate is 100% — the same task-aware rule the
+        // upstream pane uses.
+        let rows = dialog.perf_ranking_for(TaskType::CodeGeneration);
+        let groq = rows.iter().find(|r| r.upstream_id == "groq").unwrap();
+        assert_eq!(groq.success_rate, Some(0.0));
+        // Switching to a task groq has no recorded dispatch for falls back to
+        // the aggregate.
+        let rows = dialog.perf_ranking_for(TaskType::Reasoning);
+        let groq = rows.iter().find(|r| r.upstream_id == "groq").unwrap();
+        assert_eq!(groq.success_rate, Some(1.0));
+    }
+
+    #[test]
+    fn switch_pane_cycles_through_perf() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(dialog.pane, RoutingPane::Tasks);
+        dialog.switch_pane();
+        assert_eq!(dialog.pane, RoutingPane::Upstreams);
+        dialog.switch_pane();
+        assert_eq!(dialog.pane, RoutingPane::Perf);
+        dialog.show_perf();
+        assert_eq!(dialog.pane, RoutingPane::Perf);
+        dialog.switch_pane();
+        assert_eq!(dialog.pane, RoutingPane::Tasks);
+        // Navigation in the static perf pane is a no-op (no panic, no cursor
+        // movement).
+        dialog.show_perf();
+        dialog.select_prev();
+        dialog.select_next();
+        assert_eq!(dialog.pane, RoutingPane::Perf);
+    }
+
+    #[test]
     fn scroll_keeps_cursor_visible() {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

@@ -851,7 +851,11 @@ async fn main() -> anyhow::Result<()> {
         Some(user_question_rx)
     };
 
-    let tool_ctx = ToolContext {
+    // `provider_registry` here is the raw (pre-Arc) registry; the canonical
+    // Arc is created below. The ToolContext's handle is filled in right after
+    // that wrap so the UpstreamHealth tool shares the SAME instance the query
+    // loop rebuilds on /routing changes (a clone taken now would go stale).
+    let mut tool_ctx = ToolContext {
         working_dir: cwd.clone(),
         permission_mode: config.permission_mode.clone(),
         permission_handler: permission_handler.clone(),
@@ -862,6 +866,7 @@ async fn main() -> anyhow::Result<()> {
         non_interactive: is_non_interactive,
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
+        provider_registry: None, // filled below with the canonical Arc
         managed_agent_config: config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(pending_permissions.clone()),
@@ -974,6 +979,7 @@ async fn main() -> anyhow::Result<()> {
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
+    tool_ctx.provider_registry = Some(provider_registry.clone());
 
     // Wire in the named agent (--agent flag).
     // Merge built-in default agents with user-defined agents (user wins on collision).

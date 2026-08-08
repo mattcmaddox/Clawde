@@ -3082,6 +3082,16 @@ impl App {
                 })
                 .map(|p| p.upstream_key_health())
                 .unwrap_or_default();
+            let dispatch_counts = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_dispatch_counts())
+                .unwrap_or_default();
             self.routing_dialog.open(
                 &self.config,
                 latencies,
@@ -3090,6 +3100,7 @@ impl App {
                 capabilities,
                 cooldowns,
                 key_health,
+                dispatch_counts,
             );
             return true;
         }
@@ -4928,6 +4939,7 @@ impl App {
                         self.routing_dialog.switch_pane();
                     }
                 }
+                KeyCode::Char('p') => self.routing_dialog.show_perf(),
                 KeyCode::Char('r') => self.routing_dialog.reset_task(),
                 KeyCode::Char('a') | KeyCode::Char('R') => self.routing_dialog.reset_all(),
                 _ => {}

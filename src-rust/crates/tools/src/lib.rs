@@ -61,6 +61,7 @@ pub mod team_tool;
 pub(crate) mod test_support;
 pub mod todo_write;
 pub mod tool_search;
+pub mod upstream_health;
 pub mod web_fetch;
 pub mod web_search;
 pub mod worktree;
@@ -107,6 +108,7 @@ pub use tasks::{
 pub use team_tool::{register_agent_runner, AgentRunFn, TeamCreateTool, TeamDeleteTool};
 pub use todo_write::TodoWriteTool;
 pub use tool_search::ToolSearchTool;
+pub use upstream_health::UpstreamHealthTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use worktree::{EnterWorktreeTool, ExitWorktreeTool};
@@ -310,6 +312,11 @@ pub struct ToolContext {
     pub mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: clawde_core::config::Config,
+    /// Live provider registry when the query loop has one, so read-only
+    /// health tools (e.g. `UpstreamHealthTool`) can report measured upstream
+    /// performance to the model. `None` in contexts without a registry (the
+    /// tool then reports "no provider health data available").
+    pub provider_registry: Option<std::sync::Arc<clawde_api::ProviderRegistry>>,
     /// Managed agent (manager-executor) configuration, if active.
     pub managed_agent_config: Option<clawde_core::config::ManagedAgentConfig>,
     /// Optional notifier for injecting completion messages into the next agent turn.
@@ -620,6 +627,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ToolSearchTool),
         Box::new(BriefTool),
         Box::new(ConfigTool),
+        Box::new(UpstreamHealthTool),
         Box::new(SendMessageTool),
         Box::new(SkillTool),
         Box::new(LspTool),
@@ -703,6 +711,7 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            provider_registry: None,
             managed_agent_config: None,
             completion_notifier: None,
             pending_permissions: None,
