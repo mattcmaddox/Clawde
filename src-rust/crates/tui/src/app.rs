@@ -6361,9 +6361,42 @@ impl App {
                 KeyCode::Char('j') if self.prompt_input.vim_enabled => {
                     self.memory_file_selector.select_next()
                 }
-                KeyCode::Enter => {
-                    // Selection acknowledged — consumer can read selected_path()
-                    self.memory_file_selector.close();
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    if let Some(path) = self
+                        .memory_file_selector
+                        .selected_path()
+                        .map(std::path::PathBuf::from)
+                    {
+                        let create = matches!(key.code, KeyCode::Char('e'));
+                        match prepare_memory_file(&path, create) {
+                            Ok(true) => {
+                                let result = open_file_externally(&path);
+                                self.status_message = Some(match result {
+                                    Ok(()) => format!("Opened memory file: {}", path.display()),
+                                    Err(error) => format!(
+                                        "Could not open memory file {}: {}",
+                                        path.display(),
+                                        error
+                                    ),
+                                });
+                                self.memory_file_selector.close();
+                            }
+                            Ok(false) => {
+                                self.status_message = Some(format!(
+                                    "Memory file does not exist: {} (press e to create)",
+                                    path.display()
+                                ));
+                            }
+                            Err(error) => {
+                                self.status_message = Some(format!(
+                                    "Could not create memory file {}: {}",
+                                    path.display(),
+                                    error
+                                ));
+                                self.memory_file_selector.close();
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -10180,6 +10213,28 @@ impl App {
 
         self.status_message = Some("No previous errors found.".to_string());
     }
+}
+
+/// Prepare a selected memory file for opening.
+///
+/// Returns `Ok(true)` when the file exists and is ready to open, `Ok(false)`
+/// when it is missing and creation was not explicitly requested, and `Err`
+/// when an explicitly requested creation fails.
+pub(crate) fn prepare_memory_file(
+    path: &std::path::Path,
+    create: bool,
+) -> Result<bool, std::io::Error> {
+    if path.exists() {
+        return Ok(true);
+    }
+    if !create {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, "")?;
+    Ok(true)
 }
 
 /// Open a file or directory with the OS default application (xdg-open on

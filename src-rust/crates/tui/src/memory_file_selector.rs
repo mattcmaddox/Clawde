@@ -27,6 +27,8 @@ pub struct MemoryFile {
     pub display_path: String,
     pub file_type: MemoryFileType,
     pub exists: bool,
+    /// Modification time in Unix seconds when the file exists.
+    pub modified_secs: Option<u64>,
 }
 
 pub struct MemoryFileSelectorState {
@@ -70,32 +72,26 @@ impl MemoryFileSelectorState {
             let rel = user_path.strip_prefix(&home).unwrap_or(&user_path);
             format!("~/{}", rel.display())
         };
-        self.files.push(MemoryFile {
-            exists: user_path.exists(),
-            path: user_path.to_string_lossy().into_owned(),
-            display_path: user_display,
-            file_type: MemoryFileType::User,
-        });
+        self.files
+            .push(memory_file(user_path, user_display, MemoryFileType::User));
 
         // Project-level: {project_root}/AGENTS.md
         let project_path = project_root.join("AGENTS.md");
         let project_display = project_path.display().to_string();
-        self.files.push(MemoryFile {
-            exists: project_path.exists(),
-            path: project_path.to_string_lossy().into_owned(),
-            display_path: project_display,
-            file_type: MemoryFileType::Project,
-        });
+        self.files.push(memory_file(
+            project_path,
+            project_display,
+            MemoryFileType::Project,
+        ));
 
         // Local-level: {project_root}/.claurst/AGENTS.md
         let local_path = project_root.join(".claurst").join("AGENTS.md");
         let local_display = local_path.display().to_string();
-        self.files.push(MemoryFile {
-            exists: local_path.exists(),
-            path: local_path.to_string_lossy().into_owned(),
-            display_path: local_display,
-            file_type: MemoryFileType::Local,
-        });
+        self.files.push(memory_file(
+            local_path,
+            local_display,
+            MemoryFileType::Local,
+        ));
 
         self.visible = true;
     }
@@ -127,6 +123,25 @@ impl MemoryFileSelectorState {
     /// Return the path of the currently highlighted file, if any.
     pub fn selected_path(&self) -> Option<&str> {
         self.files.get(self.selected).map(|f| f.path.as_str())
+    }
+}
+
+fn memory_file(
+    path: std::path::PathBuf,
+    display_path: String,
+    file_type: MemoryFileType,
+) -> MemoryFile {
+    let modified_secs = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    MemoryFile {
+        exists: path.exists(),
+        path: path.to_string_lossy().into_owned(),
+        display_path,
+        file_type,
+        modified_secs,
     }
 }
 
@@ -186,16 +201,31 @@ pub fn render_memory_file_selector(state: &MemoryFileSelectorState, area: Rect, 
             MemoryFileType::Local => "Local   ",
         };
 
-        let new_tag = if !file.exists {
-            Span::styled(" (new)", Style::default().fg(CLAURST_MUTED))
-        } else {
-            Span::raw("")
-        };
+        let freshness = file
+            .modified_secs
+            .map(|modified| format!(" · updated {}", clawde_core::memdir::memory_age(modified)))
+            .unwrap_or_else(|| " · not created".to_string());
+        let new_tag = Span::styled(
+            if file.exists {
+                freshness.clone()
+            } else {
+                " · new".to_string()
+            },
+            Style::default().fg(CLAURST_MUTED),
+        );
 
         if i == state.selected {
             lines.push(Line::from(vec![Span::styled(
                 pad_line(
-                    &format!("  \u{203a} {type_label} {}", file.display_path),
+                    &format!(
+                        "  \u{203a} {type_label} {}{}",
+                        file.display_path,
+                        if file.exists {
+                            freshness.as_str()
+                        } else {
+                            " · new"
+                        }
+                    ),
                     inner.width,
                 ),
                 Style::default()
@@ -216,7 +246,7 @@ pub fn render_memory_file_selector(state: &MemoryFileSelectorState, area: Rect, 
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  \u{2191}\u{2193} navigate  Enter select  Esc close",
+        "  \u{2191}\u{2193}/jk navigate  Enter open  e create/open  Esc close",
         Style::default().fg(CLAURST_MUTED),
     )]));
 
@@ -236,4 +266,61 @@ fn pad_line(text: &str, width: u16) -> String {
         clipped.push_str(&" ".repeat(max_width - visible));
     }
     clipped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_records_existing_file_freshness_and_marks_missing_files() {
+        let project = tempfile::tempdir().unwrap();
+        let project_file = project.path().join("AGENTS.md");
+        std::fs::write(&project_file, "# Project memory\n").unwrap();
+
+        let mut state = MemoryFileSelectorState::new();
+        state.open(project.path());
+
+        let project_entry = state
+            .files
+            .iter()
+            .find(|file| file.path == project_file.to_string_lossy())
+            .unwrap();
+        assert!(project_entry.exists);
+        assert!(project_entry.modified_secs.is_some());
+
+        let local_entry = state
+            .files
+            .iter()
+            .find(|file| file.file_type == MemoryFileType::Local)
+            .unwrap();
+        assert!(!local_entry.exists);
+        assert!(local_entry.modified_secs.is_none());
+    }
+
+    #[test]
+    fn render_shows_freshness_and_new_file_state() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "memory\n").unwrap();
+
+        let mut state = MemoryFileSelectorState::new();
+        state.open(project.path());
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 20,
+        };
+        let mut buffer = Buffer::empty(area);
+        render_memory_file_selector(&state, area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("updated today"));
+        assert!(rendered.contains(" · new"));
+    }
 }

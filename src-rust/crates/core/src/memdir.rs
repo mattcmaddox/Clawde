@@ -112,8 +112,13 @@ pub fn scan_memory_dir(dir: &Path) -> Vec<MemoryFileMeta> {
     // dependency-free (only std).
     collect_md_files(dir, dir, &mut files);
 
-    // Sort newest-first.
-    files.sort_by_key(|b| std::cmp::Reverse(b.modified_secs));
+    // Sort newest-first, breaking equal-mtime ties by filename so status and
+    // browser ordering remain deterministic on filesystems with coarse clocks.
+    files.sort_by(|a, b| {
+        b.modified_secs
+            .cmp(&a.modified_secs)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
     files.truncate(MAX_MEMORY_FILES);
     files
 }

@@ -270,23 +270,52 @@ impl SlashCommand for MemoryCommand {
                 return CommandResult::Message(out);
             }
             match load_memory_index(&mem_dir) {
-                Some(index) => out.push_str(&format!(
-                    "Index (MEMORY.md): {} lines, {} bytes{}\n",
-                    index.line_count,
-                    index.byte_count,
-                    if index.was_line_truncated || index.was_byte_truncated {
-                        " (truncated)"
-                    } else {
-                        ""
-                    }
-                )),
+                Some(index) => {
+                    let index_age = std::fs::metadata(mem_dir.join("MEMORY.md"))
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| clawde_core::memdir::memory_age(duration.as_secs()));
+                    out.push_str(&format!(
+                        "Index (MEMORY.md): {} lines, {} bytes{}{}\n",
+                        index.line_count,
+                        index.byte_count,
+                        if index.was_line_truncated || index.was_byte_truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        },
+                        index_age
+                            .as_deref()
+                            .map(|age| format!(", updated {}", age))
+                            .unwrap_or_default()
+                    ));
+                }
                 None => out.push_str("Index (MEMORY.md): not present\n"),
             }
             let files = scan_memory_dir(&mem_dir);
             out.push_str(&format!("Memory files: {}\n", files.len()));
+            if let Some(newest) = files.first() {
+                out.push_str(&format!(
+                    "Newest memory file: {} (updated {})\n",
+                    newest.filename,
+                    clawde_core::memdir::memory_age(newest.modified_secs)
+                ));
+            }
             let sessions_dir = mem_dir.join("sessions");
             let session_count = std::fs::read_dir(&sessions_dir)
-                .map(|e| e.flatten().filter(|f| f.path().is_file()).count())
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry.path().is_file()
+                                && entry
+                                    .path()
+                                    .extension()
+                                    .is_some_and(|extension| extension == "md")
+                        })
+                        .count()
+                })
                 .unwrap_or(0);
             out.push_str(&format!("Session summaries: {}\n", session_count));
             if let Some(summary) = most_recent_session_summary(&mem_dir) {
@@ -414,6 +443,13 @@ mod tests {
         assert!(out.contains("Memory files: 1"), "got: {}", out);
         assert!(out.contains("Session summaries: 1"), "got: {}", out);
         assert!(out.contains("Most recent summary: "), "got: {}", out);
+        assert!(out.contains("Index (MEMORY.md): 1 lines, "), "got: {}", out);
+        assert!(out.contains("updated "), "got: {}", out);
+        assert!(
+            out.contains("Newest memory file: sessions/2026-08-01.md"),
+            "got: {}",
+            out
+        );
     }
 
     #[tokio::test]

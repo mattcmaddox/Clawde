@@ -519,6 +519,35 @@ mod tests {
     // ---- App::take_input ------------------------------------------------
 
     #[test]
+    fn test_prepare_memory_file_does_not_create_without_explicit_request() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("memory").join("AGENTS.md");
+
+        assert!(!app::prepare_memory_file(&path, false).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_prepare_memory_file_creates_when_requested() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("memory").join("AGENTS.md");
+
+        assert!(app::prepare_memory_file(&path, true).unwrap());
+        assert!(path.is_file());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn test_prepare_memory_file_accepts_existing_file_without_rewriting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "keep this content").unwrap();
+
+        assert!(app::prepare_memory_file(&path, false).unwrap());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep this content");
+    }
+
+    #[test]
     fn test_take_input_pushes_history() {
         let mut app = make_app();
         app.set_prompt_text("hello".to_string());
