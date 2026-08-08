@@ -2116,6 +2116,49 @@ mod tests {
     }
 
     #[test]
+    fn test_context_usage_uses_current_turn_input_and_cache_tokens() {
+        let mut app = make_app();
+        app.context_used_tokens = 999;
+        app.handle_query_event(clawde_query::QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageStart {
+                id: "message-1".to_string(),
+                model: "test-model".to_string(),
+                usage: clawde_core::UsageInfo {
+                    input_tokens: 120,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 30,
+                    cache_read_input_tokens: 450,
+                },
+            },
+        ));
+        assert_eq!(app.context_used_tokens, 600);
+
+        app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: Some(clawde_core::UsageInfo {
+                input_tokens: 200,
+                output_tokens: 80,
+                cache_creation_input_tokens: 20,
+                cache_read_input_tokens: 300,
+            }),
+            observability: None,
+        });
+        assert_eq!(app.context_used_tokens, 520);
+
+        // A completion without usage must not replace authoritative data with
+        // an estimate or zero; the next request will reconcile it at
+        // MessageStart when fresh usage is available.
+        app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
+            turn: 2,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+            observability: None,
+        });
+        assert_eq!(app.context_used_tokens, 520);
+    }
+
+    #[test]
     fn test_turn_complete_flushes_streaming_thinking_into_blocks() {
         let mut app = make_app();
         app.is_streaming = true;

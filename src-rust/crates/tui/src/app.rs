@@ -1728,6 +1728,8 @@ pub struct App {
     /// Total context window size for the current model (tokens).
     pub context_window_size: u64,
     /// How many tokens are currently used in the context window.
+    /// Current request context size in tokens, from the provider's latest usage.
+    /// This is replaced per turn rather than accumulated across requests.
     pub context_used_tokens: u64,
     /// Anthropic footer rate limit — 5-hour token usage (0.0–1.0).
     /// Populated from Anthropic API headers. Rendered in the status bar.
@@ -9621,6 +9623,11 @@ impl App {
                 }
                 self.is_streaming = true;
                 match stream_evt {
+                    clawde_api::AnthropicStreamEvent::MessageStart { usage, .. } => {
+                        // MessageStart carries the authoritative input context
+                        // for this request, including prompt-cache tokens.
+                        self.context_used_tokens = usage.total_input();
+                    }
                     clawde_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
@@ -9734,13 +9741,11 @@ impl App {
                 self.is_streaming = false;
                 self.spinner_verb = None;
 
-                // Update context window usage from the usage info.
+                // Reconcile the visualizer with the provider's authoritative
+                // input context for this request. Do not accumulate output or
+                // prior turns: the bar represents the current context window.
                 if let Some(ref u) = usage {
-                    let turn_tokens = u.input_tokens
-                        + u.output_tokens
-                        + u.cache_creation_input_tokens
-                        + u.cache_read_input_tokens;
-                    self.context_used_tokens = self.context_used_tokens.saturating_add(turn_tokens);
+                    self.context_used_tokens = u.total_input();
                 }
                 // Record elapsed time and pick a completion verb
                 let seed = self.frame_count as usize ^ (self.messages.len() * 7);
