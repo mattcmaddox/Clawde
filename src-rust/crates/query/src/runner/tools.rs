@@ -50,11 +50,15 @@ pub(crate) async fn execute_tool(
     tools: &[Box<dyn Tool>],
     ctx: &ToolContext,
 ) -> ToolResult {
-    let tool = tools.iter().find(|t| t.name() == name);
+    let tool = find_tool_for_name(name, tools);
 
     match tool {
         Some(tool) => {
-            debug!(tool = name, "Executing tool");
+            debug!(
+                requested_tool = name,
+                resolved_tool = tool.name(),
+                "Executing tool"
+            );
             // Central permission backstop (issue #210): if a tool does not gate
             // itself (`self_gates() == false`) and requires a gated permission
             // level, prompt here BEFORE executing. On denial, return a blocked
@@ -63,9 +67,14 @@ pub(crate) async fn execute_tool(
             // and read-only / no-permission tools are skipped. This makes a tool
             // that forgets to gate itself secure by default.
             if !tool.self_gates() && permission_level_is_gated(tool.permission_level()) {
-                let description = synthesize_permission_description(name, input);
-                if let Err(e) = ctx.check_permission(name, &description, false) {
-                    warn!(tool = name, "Tool blocked by central permission backstop");
+                let canonical_name = tool.name();
+                let description = synthesize_permission_description(canonical_name, input);
+                if let Err(e) = ctx.check_permission(canonical_name, &description, false) {
+                    warn!(
+                        tool = canonical_name,
+                        requested_tool = name,
+                        "Tool blocked by central permission backstop"
+                    );
                     return ToolResult::error(e.to_string());
                 }
             }
@@ -73,8 +82,70 @@ pub(crate) async fn execute_tool(
         }
         None => {
             warn!(tool = name, "Unknown tool requested");
-            ToolResult::error(format!("Unknown tool: {}", name))
+            let hint = tool_name_hint(name, tools);
+            if hint.is_empty() {
+                ToolResult::error(format!("Unknown tool: {}", name))
+            } else {
+                ToolResult::error(format!("Unknown tool: {}. {}", name, hint))
+            }
         }
+    }
+}
+
+/// Resolve a provider-supplied tool name against the registered tools.
+/// Exact names win; a unique case-insensitive match is accepted as a recovery
+/// path for providers that normalize tool names unexpectedly.
+fn find_tool_for_name<'a>(name: &str, tools: &'a [Box<dyn Tool>]) -> Option<&'a dyn Tool> {
+    if let Some(tool) = tools.iter().find(|tool| tool.name() == name) {
+        return Some(tool.as_ref());
+    }
+
+    let mut matches = tools
+        .iter()
+        .filter(|tool| tool.name().eq_ignore_ascii_case(name));
+    let first = matches.next();
+    if first.is_some() && matches.next().is_none() {
+        first.map(|tool| tool.as_ref())
+    } else {
+        None
+    }
+}
+
+/// Build a short recovery hint for an unknown provider-supplied tool name.
+fn tool_name_hint(name: &str, tools: &[Box<dyn Tool>]) -> String {
+    let requested = name.to_lowercase();
+    let mut suggestions: Vec<(&str, usize)> = tools
+        .iter()
+        .filter_map(|tool| {
+            let candidate = tool.name();
+            let candidate_lower = candidate.to_lowercase();
+            let score =
+                if candidate_lower.contains(&requested) || requested.contains(&candidate_lower) {
+                    100
+                } else {
+                    candidate_lower
+                        .chars()
+                        .zip(requested.chars())
+                        .take_while(|(left, right)| left == right)
+                        .count()
+                };
+            (score > 0).then_some((candidate, score))
+        })
+        .collect();
+    suggestions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    suggestions.truncate(3);
+
+    if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Available tools with a similar name: {}",
+            suggestions
+                .iter()
+                .map(|(candidate, _)| *candidate)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -123,5 +194,170 @@ pub(crate) fn build_todo_nudge(session_id: &str) -> String {
             incomplete_count,
             if incomplete_count == 1 { "" } else { "s" }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    struct NamedTool(&'static str, PermissionLevel);
+
+    struct RecordingPermissionHandler {
+        seen_tool: Arc<parking_lot::Mutex<Option<String>>>,
+    }
+
+    impl clawde_core::permissions::PermissionHandler for RecordingPermissionHandler {
+        fn check_permission(
+            &self,
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            *self.seen_tool.lock() = Some(request.tool_name.clone());
+            clawde_core::permissions::PermissionDecision::Allow
+        }
+
+        fn request_permission(
+            &self,
+            request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            self.1
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("named tool executed")
+        }
+    }
+
+    fn test_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: clawde_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(clawde_core::permissions::AutoPermissionHandler {
+                mode: clawde_core::config::PermissionMode::Default,
+            }),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            session_id: "tool-dispatch-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                clawde_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: clawde_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_accepts_unique_case_insensitive_tool_name() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
+        let result = execute_tool(
+            "toolsearch",
+            &serde_json::json!({"query": ""}),
+            &tools,
+            &test_context(),
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "case-insensitive dispatch failed: {}",
+            result.content
+        );
+        assert!(result.content.contains("Empty query"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_error_suggests_similar_registered_name() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
+        let result =
+            execute_tool("ToolSeach", &serde_json::json!({}), &tools, &test_context()).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Unknown tool: ToolSeach."));
+        assert!(
+            result.content.contains("ToolSearch"),
+            "missing recovery hint: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_name_wins_over_case_insensitive_candidates() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedTool("tool", PermissionLevel::None)),
+            Box::new(NamedTool("Tool", PermissionLevel::None)),
+        ];
+        let result = execute_tool("Tool", &serde_json::json!({}), &tools, &test_context()).await;
+        assert!(!result.is_error);
+        assert_eq!(result.content, "named tool executed");
+        assert_eq!(
+            find_tool_for_name("Tool", &tools).map(Tool::name),
+            Some("Tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_case_insensitive_name_is_rejected() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedTool("tool", PermissionLevel::None)),
+            Box::new(NamedTool("TOOL", PermissionLevel::None)),
+        ];
+        let result = execute_tool("ToOl", &serde_json::json!({}), &tools, &test_context()).await;
+        assert!(result.is_error);
+        assert!(result.content.starts_with("Unknown tool: ToOl."));
+        assert!(result.content.contains("TOOL, tool"));
+    }
+
+    #[tokio::test]
+    async fn unknown_name_without_match_keeps_legacy_error_text() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Bash", PermissionLevel::None))];
+        let result = execute_tool(
+            "CompletelyUnknown",
+            &serde_json::json!({}),
+            &tools,
+            &test_context(),
+        )
+        .await;
+        assert!(result.is_error);
+        assert_eq!(result.content, "Unknown tool: CompletelyUnknown");
+    }
+
+    #[tokio::test]
+    async fn case_insensitive_alias_uses_canonical_permission_name() {
+        let seen_tool = Arc::new(parking_lot::Mutex::new(None));
+        let mut ctx = test_context();
+        ctx.permission_handler = Arc::new(RecordingPermissionHandler {
+            seen_tool: seen_tool.clone(),
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Write", PermissionLevel::Write))];
+
+        let result = execute_tool("write", &serde_json::json!({"path": "x"}), &tools, &ctx).await;
+        assert!(!result.is_error);
+        assert_eq!(seen_tool.lock().as_deref(), Some("Write"));
     }
 }
