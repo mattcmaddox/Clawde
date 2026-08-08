@@ -3869,7 +3869,7 @@ impl App {
 
     /// Perform the export based on the selected format. Returns the path written.
     pub fn perform_export(&mut self) -> Option<String> {
-        use crate::export_dialog::{export_as_json, export_as_markdown};
+        use crate::export_dialog::{export_as_json, export_as_markdown, export_as_plain_text};
         use crate::message_copy::copy_to_clipboard;
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let (filename, content) = match self.export_dialog.selected {
@@ -3881,6 +3881,10 @@ impl App {
             ExportFormat::Markdown => {
                 let md = export_as_markdown(&self.messages, self.session_title.as_deref());
                 (format!("claude-export-{}.md", ts), md)
+            }
+            ExportFormat::PlainText => {
+                let text = export_as_plain_text(&self.messages, self.session_title.as_deref());
+                (format!("claude-export-{}.txt", ts), text)
             }
             ExportFormat::Clipboard => {
                 let md = export_as_markdown(&self.messages, self.session_title.as_deref());
@@ -6294,6 +6298,9 @@ impl App {
                     self.export_dialog.selected = ExportFormat::Markdown;
                 }
                 KeyCode::Char('3') => {
+                    self.export_dialog.selected = ExportFormat::PlainText;
+                }
+                KeyCode::Char('4') => {
                     self.export_dialog.selected = ExportFormat::Clipboard;
                 }
                 _ => {}

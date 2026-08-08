@@ -1,6 +1,7 @@
 // export_dialog.rs — Format picker dialog for /export command.
 //
-// Shows a two-option dialog (JSON | Markdown). On confirm, caller writes the file.
+// Shows a format picker (JSON | Markdown | Plain text | Clipboard). On confirm,
+// the caller writes the file or copies the transcript.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -22,6 +23,7 @@ pub enum ExportFormat {
     #[default]
     Json,
     Markdown,
+    PlainText,
     Clipboard,
 }
 
@@ -48,7 +50,8 @@ impl ExportDialogState {
     pub fn toggle(&mut self) {
         self.selected = match self.selected {
             ExportFormat::Json => ExportFormat::Markdown,
-            ExportFormat::Markdown => ExportFormat::Clipboard,
+            ExportFormat::Markdown => ExportFormat::PlainText,
+            ExportFormat::PlainText => ExportFormat::Clipboard,
             ExportFormat::Clipboard => ExportFormat::Json,
         };
     }
@@ -63,7 +66,7 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         return;
     }
 
-    let layout = begin_modal_frame(frame, area, 62, 14, 2, 1);
+    let layout = begin_modal_frame(frame, area, 66, 16, 2, 1);
     render_modal_title_frame(frame, layout.header_area, "Export conversation", "esc");
     if let Some(subtitle_area) = modal_header_line_area(layout.header_area, 1) {
         frame.render_widget(
@@ -95,6 +98,14 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         Line::from(""),
         export_option_row(
             "3",
+            "Plain text",
+            "Portable transcript for terminals and plain files",
+            state.selected == ExportFormat::PlainText,
+            layout.body_area.width,
+        ),
+        Line::from(""),
+        export_option_row(
+            "4",
             "Clipboard",
             "Copy transcript to system clipboard",
             state.selected == ExportFormat::Clipboard,
@@ -115,7 +126,7 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            " tab/←/→ switch  ·  enter export  ·  1/2 choose",
+            " tab/←/→ switch  ·  enter export  ·  1/2/3/4 choose",
             Style::default()
                 .fg(CLAURST_MUTED)
                 .add_modifier(Modifier::ITALIC),
@@ -187,6 +198,34 @@ pub fn export_as_markdown(
     out
 }
 
+/// Render a readable transcript without Markdown or JSON syntax.
+pub fn export_as_plain_text(
+    messages: &[clawde_core::types::Message],
+    session_title: Option<&str>,
+) -> String {
+    use clawde_core::types::Role;
+
+    let mut out = String::new();
+    out.push_str(session_title.unwrap_or("Clawde Conversation Export"));
+    out.push('\n');
+    out.push_str("=========================\n\n");
+
+    for (index, msg) in messages.iter().enumerate() {
+        let label = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Clawde",
+        };
+        if index > 0 {
+            out.push_str("\n-------------------------\n\n");
+        }
+        out.push_str(label);
+        out.push_str(":\n");
+        out.push_str(&msg.get_all_text());
+        out.push('\n');
+    }
+    out
+}
+
 pub fn export_as_json(
     messages: &[clawde_core::types::Message],
     session_title: Option<&str>,
@@ -240,9 +279,25 @@ mod tests {
         state.toggle();
         assert_eq!(state.selected, ExportFormat::Markdown);
         state.toggle();
+        assert_eq!(state.selected, ExportFormat::PlainText);
+        state.toggle();
         assert_eq!(state.selected, ExportFormat::Clipboard);
         state.toggle();
         assert_eq!(state.selected, ExportFormat::Json);
+    }
+
+    #[test]
+    fn plain_text_export_is_readable_and_unformatted() {
+        let messages = vec![
+            clawde_core::types::Message::user("hello"),
+            clawde_core::types::Message::assistant("world"),
+        ];
+        let text = export_as_plain_text(&messages, Some("Test session"));
+        assert!(text.starts_with("Test session\n"));
+        assert!(text.contains("User:\nhello"));
+        assert!(text.contains("Clawde:\nworld"));
+        assert!(!text.contains("**User**"));
+        assert!(!text.contains("```"));
     }
 
     #[test]

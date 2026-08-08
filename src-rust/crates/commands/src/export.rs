@@ -148,6 +148,39 @@ fn build_markdown_export(ctx: &CommandContext) -> String {
     out
 }
 
+/// Build a readable plain-text export without Markdown or JSON syntax.
+fn build_plain_text_export(ctx: &CommandContext) -> String {
+    use clawde_core::types::Role;
+
+    let mut out = String::new();
+    out.push_str(
+        ctx.session_title
+            .as_deref()
+            .unwrap_or("Clawde Conversation Export"),
+    );
+    out.push('\n');
+    out.push_str("Session ID: ");
+    out.push_str(&ctx.session_id);
+    out.push('\n');
+    out.push_str("Model: ");
+    out.push_str(ctx.config.effective_model());
+    out.push_str("\n\n");
+
+    for (index, msg) in ctx.messages.iter().enumerate() {
+        if index > 0 {
+            out.push_str("\n-------------------------\n\n");
+        }
+        out.push_str(match msg.role {
+            Role::User => "User:",
+            Role::Assistant => "Clawde:",
+        });
+        out.push('\n');
+        out.push_str(&msg.get_all_text());
+        out.push('\n');
+    }
+    out
+}
+
 /// Build the full JSON export value.
 fn build_json_export(ctx: &CommandContext) -> serde_json::Value {
     serde_json::json!({
@@ -172,13 +205,13 @@ impl SlashCommand for ExportCommand {
         "export"
     }
     fn description(&self) -> &str {
-        "Export conversation to markdown or JSON"
+        "Export conversation to Markdown, plain text, or JSON"
     }
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
         let mut completions = vec![
             ArgCompletion {
                 value: "--format".into(),
-                description: "Set output format (markdown or json)".into(),
+                description: "Set output format (markdown, text, or json)".into(),
                 available: true,
             },
             ArgCompletion {
@@ -199,19 +232,26 @@ impl SlashCommand for ExportCommand {
                 description: "Full structured JSON export".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "--format text".into(),
+                description: "Portable plain-text transcript".into(),
+                available: true,
+            });
         }
         completions
     }
     fn help(&self) -> &str {
-        "Usage: /export [--format markdown|json] [--output <file>]\n\n\
+        "Usage: /export [--format markdown|text|json] [--output <file>]\n\n\
          Export the current conversation.\n\n\
          Flags:\n\
            --format markdown   Render as readable Markdown (default for .md files)\n\
+           --format text       Portable plain-text transcript (default for .txt files)\n\
            --format json       Full structured JSON export (default)\n\
            --output <path>     Write to file; if omitted, prints to the terminal\n\n\
          Examples:\n\
            /export\n\
            /export --format markdown\n\
+           /export --format text --output conversation.txt\n\
            /export --format json --output chat.json\n\
            /export --output conversation.md"
     }
@@ -219,7 +259,7 @@ impl SlashCommand for ExportCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         // ── Parse flags ────────────────────────────────────────────────────
         let args = args.trim();
-        let mut format: Option<&str> = None; // "markdown" | "json"
+        let mut format: Option<&str> = None; // "markdown" | "text" | "json"
         let mut output_path: Option<String> = None;
 
         // Simple hand-rolled flag parser (no clap dep in commands crate)
@@ -233,7 +273,7 @@ impl SlashCommand for ExportCommand {
                         i += 2;
                     } else {
                         return CommandResult::Error(
-                            "--format requires a value: markdown or json".to_string(),
+                            "--format requires a value: markdown, text, or json".to_string(),
                         );
                     }
                 }
@@ -261,10 +301,11 @@ impl SlashCommand for ExportCommand {
         // ── Determine format from output path extension if not explicit ─────
         let resolved_format = match format {
             Some("markdown") | Some("md") => "markdown",
+            Some("text") | Some("txt") | Some("plain") | Some("plain-text") => "text",
             Some("json") => "json",
             Some(other) => {
                 return CommandResult::Error(format!(
-                    "Unknown format '{}'. Use 'markdown' or 'json'.",
+                    "Unknown format '{}'. Use 'markdown', 'text', or 'json'.",
                     other
                 ));
             }
@@ -273,6 +314,8 @@ impl SlashCommand for ExportCommand {
                 if let Some(ref path) = output_path {
                     if path.ends_with(".md") || path.ends_with(".markdown") {
                         "markdown"
+                    } else if path.ends_with(".txt") {
+                        "text"
                     } else {
                         "json"
                     }
@@ -285,6 +328,7 @@ impl SlashCommand for ExportCommand {
         // ── Build content ───────────────────────────────────────────────────
         let content: String = match resolved_format {
             "markdown" => build_markdown_export(ctx),
+            "text" => build_plain_text_export(ctx),
             _ => {
                 let val = build_json_export(ctx);
                 match serde_json::to_string_pretty(&val) {
@@ -302,10 +346,10 @@ impl SlashCommand for ExportCommand {
                     format!(
                         "{}.{}",
                         filename,
-                        if resolved_format == "markdown" {
-                            "md"
-                        } else {
-                            "json"
+                        match resolved_format {
+                            "markdown" => "md",
+                            "text" => "txt",
+                            _ => "json",
                         }
                     )
                 } else {
@@ -335,5 +379,84 @@ impl SlashCommand for ExportCommand {
                 CommandResult::Message(content)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_ctx() -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![
+                clawde_core::types::Message::user("hello"),
+                clawde_core::types::Message::assistant("world"),
+            ],
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "export-test-session".to_string(),
+            session_title: Some("Test session".to_string()),
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    #[test]
+    fn plain_text_export_is_portable() {
+        let text = build_plain_text_export(&make_ctx());
+        assert!(text.starts_with("Test session\nSession ID: export-test-session\n"));
+        assert!(text.contains("User:\nhello"));
+        assert!(text.contains("Clawde:\nworld"));
+        assert!(!text.contains("**User**"));
+        assert!(!text.contains("```"));
+    }
+
+    #[tokio::test]
+    async fn text_format_can_be_returned_without_writing_a_file() {
+        let mut ctx = make_ctx();
+        let result = ExportCommand.execute("--format text", &mut ctx).await;
+        match result {
+            CommandResult::Message(text) => {
+                assert!(text.contains("User:\nhello"));
+                assert!(text.contains("Clawde:\nworld"));
+            }
+            other => panic!("expected text export, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn txt_extension_infers_plain_text_and_default_extension_is_txt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut ctx = make_ctx();
+        ctx.working_dir = temp.path().to_path_buf();
+        let result = ExportCommand
+            .execute("--output conversation.txt", &mut ctx)
+            .await;
+        match result {
+            CommandResult::Message(message) => {
+                assert!(message.contains("text format"));
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("conversation.txt"))
+                        .expect("text export file"),
+                    build_plain_text_export(&ctx)
+                );
+            }
+            other => panic!("expected successful text export, got {other:?}"),
+        }
+
+        let result = ExportCommand
+            .execute("--format text --output transcript", &mut ctx)
+            .await;
+        match result {
+            CommandResult::Message(message) => {
+                assert!(message.ends_with("transcript.txt (2 messages, text format)"))
+            }
+            other => panic!("expected successful default extension, got {other:?}"),
+        }
+        assert!(temp.path().join("transcript.txt").exists());
     }
 }
