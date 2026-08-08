@@ -3599,6 +3599,43 @@ mod tests {
     }
 
     #[test]
+    fn stale_cooldown_file_is_removed_when_state_empties() {
+        // save()'s `remove_file` branch: a file whose only track has already
+        // expired loads to nothing, and the next save() must delete the stale
+        // file so a later restart starts clean instead of re-reading it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.json");
+
+        // Write a snapshot whose 5xx cooldown expired 60s ago.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stale = vec![UpstreamCooldownSnapshot {
+            upstream: "groq".to_string(),
+            consecutive_empties: 0,
+            empty_cooldown_until_unix: None,
+            cooldown_until_unix: Some(now_unix.saturating_sub(60)),
+        }];
+        std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+
+        // Load: the expired cooldown must NOT be restored.
+        let mut cd = CooldownState::new(1, CircuitBreakerConfig::default())
+            .with_persistence(vec!["groq".to_string()], Some(path.clone()));
+        assert!(
+            !cd.is_in_cooldown(0),
+            "expired 5xx cooldown must not be restored on load"
+        );
+
+        // A state transition that saves with nothing active removes the file.
+        cd.record_success(0);
+        assert!(
+            !path.exists(),
+            "stale file must be removed once no cooldown track remains"
+        );
+    }
+
+    #[test]
     fn upstream_key_health_reports_ring_backed_upstreams() {
         let provider = FreeProvider::new(vec![
             entry("huggingface", true),
