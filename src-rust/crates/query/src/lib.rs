@@ -1098,7 +1098,22 @@ pub async fn run_query_loop(
                 // that keys added at runtime via /connect are picked up
                 // immediately — even when the provider was pre-registered at
                 // startup with a stale or missing key.
-                let runtime_provider = clawde_api::registry::runtime_provider_for(&provider_id_str);
+                //
+                // EXCEPTION: the composite "free" provider. A fresh per-request
+                // build would throw away the instance's in-memory per-upstream
+                // cooldown / key-ring state the instant the request ends — 5xx
+                // circuit-breakers would never persist across requests, and the
+                // TUI /routing dialog reads cooldowns from the registry
+                // instance, so its `·cool Ns` tags would never appear. The
+                // registry's free provider IS rebuilt on config / key changes
+                // (/routing, /refresh, /connect, /keys, free-mode dialog) via
+                // rebuild_free, so runtime mutations are still picked up — the
+                // registry is the single source of truth for "free".
+                let runtime_provider = if provider_id_str == "free" {
+                    None
+                } else {
+                    clawde_api::registry::runtime_provider_for(&provider_id_str)
+                };
 
                 let registry_provider = if runtime_provider.is_some() {
                     // Fresh auth_store key available — use it instead of the
