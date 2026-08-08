@@ -21,7 +21,8 @@
 //     to the first upstream in the chain.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use std::time::Instant;
 
@@ -151,6 +152,9 @@ const fn default_latency_samples() -> usize {
     10
 }
 
+const TELEMETRY_HALF_LIFE_SECS: u64 = 7 * 24 * 60 * 60;
+const TELEMETRY_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
 impl Default for LatencyConfig {
     fn default() -> Self {
         Self { max_samples: 10 }
@@ -220,11 +224,328 @@ fn is_upstream_server_error(err: &ProviderError) -> bool {
 /// Single source of truth for the per-upstream token cap — used by every
 /// dispatch site (non-streaming fallback, streaming fallback,
 /// `RetryingFreeStream` re-dispatch, and the first-byte watchdog probe).
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn current_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
     if let Some(cap) = entry.upstream.max_tokens_cap {
         req.max_tokens = req.max_tokens.min(cap);
     }
 }
+
+/// Serialize provider-state writes in this process. The per-file lock below
+/// extends the same guarantee across separate Clawde processes.
+static PERSISTENCE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const PERSISTENCE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PERSISTENCE_STALE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Write a snapshot only when it is at least as new as the snapshot already
+/// on disk. A process may build a snapshot, get descheduled, and then write it
+/// after another process has persisted a newer snapshot; timestamp ordering
+/// prevents that older snapshot from rolling state back.
+fn write_private_json_if_newer(path: &std::path::Path, json: &str) {
+    let _guard = PERSISTENCE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    write_private_json_locked(path, Some(json), true, true);
+}
+
+fn write_private_json_preserving_newer(path: &std::path::Path, json: &str) {
+    let _guard = PERSISTENCE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    write_private_json_locked(path, Some(json), true, false);
+}
+
+fn write_private_json_locked(
+    path: &std::path::Path,
+    json: Option<&str>,
+    preserve_newer: bool,
+    merge_telemetry: bool,
+) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    set_private_dir_permissions(parent);
+
+    let Some(file_lock) = acquire_persistence_file_lock(path) else {
+        return;
+    };
+
+    let Some(json) = json else {
+        let _ = std::fs::remove_file(path);
+        drop(file_lock);
+        return;
+    };
+
+    let merged_json = if preserve_newer && merge_telemetry {
+        merge_telemetry_snapshot(path, json)
+    } else {
+        None
+    };
+    let json = merged_json.as_deref().unwrap_or(json);
+    if preserve_newer && incoming_snapshot_is_older(path, json) {
+        drop(file_lock);
+        return;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let tmp = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    else {
+        drop(file_lock);
+        return;
+    };
+    if file.write_all(json.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        drop(file_lock);
+        return;
+    }
+    set_private_file_permissions(&tmp);
+    if replace_file_atomically(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    drop(file_lock);
+}
+
+struct PersistenceFileLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for PersistenceFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_persistence_file_lock(path: &std::path::Path) -> Option<PersistenceFileLock> {
+    let file_name = path.file_name()?.to_str()?;
+    let lock_path = path.with_file_name(format!(".{file_name}.lock"));
+    let deadline = Instant::now() + PERSISTENCE_LOCK_TIMEOUT;
+
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock_file) => {
+                let _ = writeln!(lock_file, "pid={}", std::process::id());
+                set_private_file_permissions(&lock_path);
+                return Some(PersistenceFileLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= PERSISTENCE_STALE_LOCK_AGE);
+                if stale && persistence_lock_can_be_reclaimed(&lock_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn persistence_lock_can_be_reclaimed(path: &std::path::Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Some(pid) = contents
+        .strip_prefix("pid=")
+        .and_then(|value| value.lines().next())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+    !std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .try_exists()
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn persistence_lock_can_be_reclaimed(_path: &std::path::Path) -> bool {
+    // Other platforms lack a portable process-existence probe here; the age
+    // threshold remains the conservative fallback.
+    true
+}
+
+fn merge_telemetry_snapshot(path: &std::path::Path, incoming: &str) -> Option<String> {
+    let existing = std::fs::read_to_string(path).ok()?;
+    let mut existing_entries =
+        serde_json::from_str::<Vec<UpstreamTelemetrySnapshot>>(&existing).ok()?;
+    let incoming_entries = serde_json::from_str::<Vec<UpstreamTelemetrySnapshot>>(incoming).ok()?;
+
+    for incoming_entry in incoming_entries {
+        let Some(existing_entry) = existing_entries
+            .iter_mut()
+            .find(|entry| entry.upstream == incoming_entry.upstream)
+        else {
+            existing_entries.push(incoming_entry);
+            continue;
+        };
+
+        let existing_timestamp = existing_entry.saved_at_unix_nanos;
+        let incoming_timestamp = incoming_entry.saved_at_unix_nanos;
+        existing_entry.successes = existing_entry.successes.max(incoming_entry.successes);
+        existing_entry.failures = existing_entry.failures.max(incoming_entry.failures);
+        existing_entry.saved_at_unix = existing_entry
+            .saved_at_unix
+            .max(incoming_entry.saved_at_unix);
+        existing_entry.saved_at_unix_nanos = existing_timestamp.max(incoming_timestamp);
+        for (task, count) in incoming_entry.task_successes {
+            let current = existing_entry.task_successes.entry(task).or_insert(0);
+            *current = (*current).max(count);
+        }
+        for (task, count) in incoming_entry.task_failures {
+            let current = existing_entry.task_failures.entry(task).or_insert(0);
+            *current = (*current).max(count);
+        }
+        if incoming_timestamp >= existing_timestamp
+            || incoming_entry.samples.len() > existing_entry.samples.len()
+        {
+            existing_entry.samples = incoming_entry.samples;
+        }
+    }
+
+    serde_json::to_string_pretty(&existing_entries).ok()
+}
+
+fn remove_snapshot_if_unchanged(path: &std::path::Path) {
+    let observed = std::fs::read_to_string(path).ok();
+    let _guard = PERSISTENCE_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(file_lock) = acquire_persistence_file_lock(path) else {
+        return;
+    };
+    if observed == std::fs::read_to_string(path).ok() {
+        let _ = std::fs::remove_file(path);
+    }
+    drop(file_lock);
+}
+
+fn incoming_snapshot_is_older(path: &std::path::Path, incoming: &str) -> bool {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let incoming_time = snapshot_timestamp_nanos(incoming);
+    let existing_time = snapshot_timestamp_nanos(&existing);
+    matches!((incoming_time, existing_time), (Some(incoming), Some(existing)) if incoming < existing)
+}
+
+#[derive(Deserialize)]
+struct PersistenceTimestamp {
+    #[serde(default)]
+    saved_at_unix_nanos: u64,
+}
+
+fn snapshot_timestamp_nanos(json: &str) -> Option<u64> {
+    let entries = serde_json::from_str::<Vec<PersistenceTimestamp>>(json).ok()?;
+    entries
+        .iter()
+        .map(|entry| entry.saved_at_unix_nanos)
+        .filter(|timestamp| *timestamp > 0)
+        .max()
+}
+
+fn replace_file_atomically(
+    tmp: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(tmp, destination) {
+            Ok(()) => return Ok(()),
+            Err(first_error) if destination.exists() => {
+                let backup = destination.with_file_name(format!(
+                    ".{}.bak-{}",
+                    destination
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("state"),
+                    uuid::Uuid::new_v4()
+                ));
+                if let Err(backup_error) = std::fs::rename(destination, &backup) {
+                    return Err(backup_error);
+                }
+                return match std::fs::rename(tmp, destination) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(backup);
+                        Ok(())
+                    }
+                    Err(replace_error) => {
+                        let _ = std::fs::rename(&backup, destination);
+                        Err(replace_error)
+                    }
+                };
+            }
+            Err(first_error) => return Err(first_error),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, destination)
+    }
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &std::path::Path) {}
 
 /// Routing configuration for a [`FreeProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +668,9 @@ struct UpstreamCooldownSnapshot {
     /// 5xx / circuit-breaker cooldown expiry as a unix timestamp.
     #[serde(default)]
     cooldown_until_unix: Option<u64>,
+    /// Nanosecond timestamp used to reject stale cross-process snapshots.
+    #[serde(default)]
+    saved_at_unix_nanos: u64,
 }
 
 impl CooldownState {
@@ -533,24 +857,19 @@ impl CooldownState {
                     consecutive_empties: count,
                     empty_cooldown_until_unix: empty_until_unix,
                     cooldown_until_unix,
+                    saved_at_unix_nanos: current_unix_nanos(),
                 })
             })
             .collect();
         if entries.is_empty() {
-            let _ = std::fs::remove_file(path);
+            remove_snapshot_if_unchanged(path);
             return;
         }
         let json = match serde_json::to_string_pretty(&entries) {
             Ok(j) => j,
             Err(_) => return,
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = format!("{}.tmp-{}", path.display(), std::process::id(),);
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+        write_private_json_preserving_newer(path, &json);
     }
 
     fn load_from_file(&mut self, path: &std::path::Path) {
@@ -609,6 +928,11 @@ struct LatencyState {
     /// upstream can be 100% on verification tasks yet 0% on code generation.
     task_successes: Vec<HashMap<String, u32>>,
     task_failures: Vec<HashMap<String, u32>>,
+    /// Upstream IDs and optional disk path for cross-process telemetry.
+    /// Keeping this metadata with the shared state means direct and streaming
+    /// dispatches persist through the same lock without duplicating plumbing.
+    upstream_ids: Vec<String>,
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl LatencyState {
@@ -631,12 +955,28 @@ impl LatencyState {
             failures,
             task_successes,
             task_failures,
+            upstream_ids: Vec::new(),
+            persist_path: None,
         }
+    }
+
+    fn with_persistence(
+        mut self,
+        upstream_ids: Vec<String>,
+        persist_path: Option<std::path::PathBuf>,
+        max_samples: usize,
+    ) -> Self {
+        self.upstream_ids = upstream_ids;
+        self.persist_path = persist_path;
+        if let Some(path) = self.persist_path.clone() {
+            self.load_from_file(&path, max_samples);
+        }
+        self
     }
 
     /// Record a latency sample at `idx`.
     fn record(&mut self, idx: usize, duration_secs: f64, max_samples: usize) {
-        if idx >= self.samples.len() {
+        if idx >= self.samples.len() || max_samples == 0 {
             return;
         }
         let q = &mut self.samples[idx];
@@ -724,6 +1064,166 @@ impl LatencyState {
         let failures = *self.failures.get(idx).unwrap_or(&0);
         successes.saturating_add(failures)
     }
+
+    /// Total dispatches recorded for one task. Unlike the aggregate counter,
+    /// this keeps the router from treating unrelated task history as proof
+    /// that an upstream is reliable for the current request.
+    fn task_dispatches(&self, idx: usize, task: TaskType) -> u32 {
+        let successes = self
+            .task_successes
+            .get(idx)
+            .and_then(|m| m.get(task.key()))
+            .copied()
+            .unwrap_or(0);
+        let failures = self
+            .task_failures
+            .get(idx)
+            .and_then(|m| m.get(task.key()))
+            .copied()
+            .unwrap_or(0);
+        successes.saturating_add(failures)
+    }
+
+    /// Build a disk snapshot while holding only the in-memory state lock.
+    /// The returned JSON is written after the caller releases the mutex.
+    fn snapshot(&self) -> Option<(std::path::PathBuf, String)> {
+        let path = self.persist_path.as_ref()?.clone();
+        let entries: Vec<UpstreamTelemetrySnapshot> = self
+            .upstream_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, upstream)| {
+                let samples = self.samples.get(idx)?.iter().copied().collect::<Vec<_>>();
+                let successes = self.successes.get(idx).copied().unwrap_or(0);
+                let failures = self.failures.get(idx).copied().unwrap_or(0);
+                let task_successes = self.task_successes.get(idx).cloned().unwrap_or_default();
+                let task_failures = self.task_failures.get(idx).cloned().unwrap_or_default();
+                if samples.is_empty()
+                    && successes == 0
+                    && failures == 0
+                    && task_successes.is_empty()
+                    && task_failures.is_empty()
+                {
+                    return None;
+                }
+                Some(UpstreamTelemetrySnapshot {
+                    upstream: upstream.clone(),
+                    samples,
+                    successes,
+                    failures,
+                    task_successes,
+                    task_failures,
+                    saved_at_unix: current_unix_secs(),
+                    saved_at_unix_nanos: current_unix_nanos(),
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&entries).ok()?;
+        Some((path, json))
+    }
+
+    /// Write a previously-built telemetry snapshot without holding the
+    /// provider's in-memory state mutex across filesystem I/O.
+    fn persist_snapshot(snapshot: Option<(std::path::PathBuf, String)>) {
+        let Some((path, json)) = snapshot else {
+            return;
+        };
+        if json != "[]" {
+            write_private_json_if_newer(&path, &json);
+        }
+    }
+
+    fn load_from_file(&mut self, path: &std::path::Path, max_samples: usize) {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(entries) = serde_json::from_str::<Vec<UpstreamTelemetrySnapshot>>(&json) else {
+            return;
+        };
+        let now = current_unix_secs();
+        let file_saved_at = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(now);
+        for mut entry in entries {
+            let saved_at = if entry.saved_at_unix == 0 {
+                file_saved_at
+            } else {
+                entry.saved_at_unix
+            };
+            let age = now.saturating_sub(saved_at);
+            if age > TELEMETRY_MAX_AGE_SECS {
+                continue;
+            }
+            if age > 0 {
+                let decay = 0.5_f64.powf(age as f64 / TELEMETRY_HALF_LIFE_SECS as f64);
+                entry.successes = (entry.successes as f64 * decay).round() as u32;
+                entry.failures = (entry.failures as f64 * decay).round() as u32;
+                for count in entry.task_successes.values_mut() {
+                    *count = (*count as f64 * decay).round() as u32;
+                }
+                for count in entry.task_failures.values_mut() {
+                    *count = (*count as f64 * decay).round() as u32;
+                }
+                if age > TELEMETRY_HALF_LIFE_SECS {
+                    entry.samples.clear();
+                }
+            }
+            if entry.successes == 0
+                && entry.failures == 0
+                && entry.task_successes.values().all(|count| *count == 0)
+                && entry.task_failures.values().all(|count| *count == 0)
+                && entry.samples.is_empty()
+            {
+                continue;
+            }
+            let Some(idx) = self
+                .upstream_ids
+                .iter()
+                .position(|id| id == &entry.upstream)
+            else {
+                continue;
+            };
+            let mut samples = VecDeque::from(entry.samples);
+            while samples.len() > max_samples {
+                samples.pop_front();
+            }
+            self.samples[idx] = samples;
+            self.successes[idx] = entry.successes;
+            self.failures[idx] = entry.failures;
+            self.task_successes[idx] = entry.task_successes;
+            self.task_failures[idx] = entry.task_failures;
+        }
+    }
+}
+
+/// Disk snapshot of one upstream's latency, aggregate success, and per-task
+/// dispatch telemetry. Entries are keyed by upstream ID so catalog ordering
+/// changes do not attach history to the wrong provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpstreamTelemetrySnapshot {
+    #[serde(default)]
+    upstream: String,
+    #[serde(default)]
+    samples: Vec<f64>,
+    #[serde(default)]
+    successes: u32,
+    #[serde(default)]
+    failures: u32,
+    #[serde(default)]
+    task_successes: HashMap<String, u32>,
+    #[serde(default)]
+    task_failures: HashMap<String, u32>,
+    /// Unix timestamp of the snapshot. Zero denotes a legacy file; loading
+    /// then falls back to the file modification time for aging.
+    #[serde(default)]
+    saved_at_unix: u64,
+    /// Nanosecond timestamp used only to reject stale cross-process writes.
+    /// Zero denotes a legacy snapshot without ordering metadata.
+    #[serde(default)]
+    saved_at_unix_nanos: u64,
 }
 
 /// Rate-limit information parsed from provider HTTP response headers.
@@ -1096,14 +1596,35 @@ fn split_cloudflare_key(key: &str) -> Result<(&str, &str), String> {
 /// endpoints honour it where applicable (cloudflare's chat probe is
 /// account-scoped and ignores it). Not for production use.
 pub fn free_upstream_base_url_override(upstream_id: &str) -> Option<String> {
+    // These overrides are intended for local mock servers. Release builds
+    // ignore them unless an operator explicitly opts in, preventing an
+    // inherited environment variable from redirecting API credentials.
+    #[cfg(not(debug_assertions))]
+    if std::env::var_os("CLAWDE_ALLOW_UNSAFE_FREE_BASE_URL").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return None;
+    }
+
     let var = format!(
         "CLAWDE_FREE_BASE_URL_{}",
         upstream_id.to_uppercase().replace('-', "_")
     );
-    std::env::var(&var)
+    let value = std::env::var(&var)
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())?;
+
+    // The override is intended for local mock servers. Never send a bearer
+    // key to a remote endpoint through this development/testing escape hatch.
+    let parsed = url::Url::parse(&value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let is_loopback =
+        host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost");
+    is_loopback.then_some(value)
 }
 
 fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {

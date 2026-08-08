@@ -25,6 +25,7 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 pub mod bun_tls;
 pub mod codex_adapter;
+pub mod compare;
 
 // Provider-agnostic unified types (Phase 1A).
 pub mod provider_error;
@@ -91,6 +92,10 @@ pub use transform::MessageTransformer;
 pub use protocol::{LineStreamDecoder, OpenAiChatDecoder};
 
 // Phase 1C re-exports — provider registry.
+pub use compare::{
+    build_compare_report, format_compare_report, parse_compare_args, CompareFilters, CompareReport,
+    CompareRow,
+};
 pub use registry::ProviderRegistry;
 
 // Phase 1D re-exports — concrete provider adapters.

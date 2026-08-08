@@ -88,14 +88,26 @@ impl FreeProvider {
             None
         };
         let cooldown = Arc::new(Mutex::new(
-            CooldownState::new(n, cb_config).with_persistence(upstream_ids, persist_path),
+            CooldownState::new(n, cb_config).with_persistence(upstream_ids.clone(), persist_path),
         ));
+        let telemetry_path = if persist {
+            Some(
+                clawde_core::config::Settings::config_dir()
+                    .join("telemetry-state")
+                    .join("free.json"),
+            )
+        } else {
+            None
+        };
+        let max_samples = routing.latency.as_ref().map_or(0, |l| l.max_samples);
+        let latencies =
+            LatencyState::new(n).with_persistence(upstream_ids, telemetry_path, max_samples);
         Self {
             id: ProviderId::new(ProviderId::FREE),
             chain,
             routing,
             cooldown,
-            latencies: Arc::new(Mutex::new(LatencyState::new(n))),
+            latencies: Arc::new(Mutex::new(latencies)),
         }
     }
 
@@ -392,8 +404,8 @@ impl FreeProvider {
         if preferred.len() > 1 {
             let lat = self.latencies.lock().unwrap();
             preferred.sort_by(|a, b| {
-                Self::preferred_order_key(&lat, *a)
-                    .partial_cmp(&Self::preferred_order_key(&lat, *b))
+                Self::preferred_order_key(&lat, *a, task)
+                    .partial_cmp(&Self::preferred_order_key(&lat, *b, task))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -412,10 +424,18 @@ impl FreeProvider {
     /// - Rank 1: a couple of samples — rates not yet trustworthy, sort by
     ///   latency alone.
     /// - Rank 2: no history — group tail, keeping preference order.
-    fn preferred_order_key(lat: &LatencyState, idx: usize) -> (u8, f64, f64) {
-        let dispatches = lat.dispatches(idx);
+    fn preferred_order_key(lat: &LatencyState, idx: usize, task: TaskType) -> (u8, f64, f64) {
+        let task_dispatches = lat.task_dispatches(idx, task);
+        let (dispatches, success_rate) = if task_dispatches > 0 {
+            (task_dispatches, lat.task_success_rate(idx, task))
+        } else {
+            // A task with no own history can still use aggregate history as
+            // a conservative prior. Once the task has one dispatch, keep it
+            // isolated so unrelated work cannot outweigh task-specific data.
+            (lat.dispatches(idx), lat.success_rate(idx))
+        };
         let avg = lat.avg_latency(idx);
-        match (dispatches, lat.success_rate(idx)) {
+        match (dispatches, success_rate) {
             (n, Some(rate)) if n >= Self::MIN_SUCCESS_RATE_SAMPLES => (0, -rate, avg),
             (n, _) if n > 0 => (1, 0.0, avg),
             _ => (2, 0.0, avg),
@@ -695,12 +715,16 @@ impl FreeProvider {
         // overall and per-task). One lock: the counters always bump, the
         // latency sample only when latency tracking is enabled.
         let max_samples = self.max_latency_samples();
-        let mut lat = self.latencies.lock().unwrap();
-        lat.record_success(idx);
-        lat.record_task_success(idx, task);
-        if max_samples > 0 {
-            lat.record(idx, elapsed.as_secs_f64(), max_samples);
-        }
+        let snapshot = {
+            let mut lat = self.latencies.lock().unwrap();
+            lat.record_success(idx);
+            lat.record_task_success(idx, task);
+            if max_samples > 0 {
+                lat.record(idx, elapsed.as_secs_f64(), max_samples);
+            }
+            lat.snapshot()
+        };
+        LatencyState::persist_snapshot(snapshot);
     }
 
     /// Record a failed request at `idx`. `task` is the request's classified
@@ -708,10 +732,13 @@ impl FreeProvider {
     fn record_failure(&self, idx: usize, task: TaskType) {
         // Always count the failure for the success-rate views — the circuit
         // breaker below is an optional extra layer.
-        let mut lat = self.latencies.lock().unwrap();
-        lat.record_failure(idx);
-        lat.record_task_failure(idx, task);
-        drop(lat);
+        let snapshot = {
+            let mut lat = self.latencies.lock().unwrap();
+            lat.record_failure(idx);
+            lat.record_task_failure(idx, task);
+            lat.snapshot()
+        };
+        LatencyState::persist_snapshot(snapshot);
         if !self.circuit_breaker_enabled() {
             return;
         }
@@ -869,22 +896,28 @@ impl RetryingFreeStream {
         cd.record_success(idx);
         drop(cd);
         let max_samples = self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
-        let mut lat = self.latencies.lock().unwrap();
-        lat.record_success(idx);
-        lat.record_task_success(idx, self.task);
-        if max_samples > 0 {
-            lat.record(idx, elapsed.as_secs_f64(), max_samples);
-        }
+        let snapshot = {
+            let mut lat = self.latencies.lock().unwrap();
+            lat.record_success(idx);
+            lat.record_task_success(idx, self.task);
+            if max_samples > 0 {
+                lat.record(idx, elapsed.as_secs_f64(), max_samples);
+            }
+            lat.snapshot()
+        };
+        LatencyState::persist_snapshot(snapshot);
     }
 
     fn record_failure(&self, idx: usize) {
         // Always count the failure for the success-rate views (aggregate and
         // per-task) — the circuit breaker below is an optional extra layer.
-        {
+        let snapshot = {
             let mut lat = self.latencies.lock().unwrap();
             lat.record_failure(idx);
             lat.record_task_failure(idx, self.task);
-        }
+            lat.snapshot()
+        };
+        LatencyState::persist_snapshot(snapshot);
         if self
             .routing
             .circuit_breaker
@@ -1968,6 +2001,20 @@ mod tests {
         assert_eq!(free_upstream_base_url_override("groq"), None);
         // The cline var is never set in this process.
         assert_eq!(free_upstream_base_url_override("cline"), None);
+    }
+
+    #[test]
+    fn free_upstream_base_url_override_rejects_remote_and_non_http_urls() {
+        let _remote = crate::test_support::EnvVarGuard::set(
+            "CLAWDE_FREE_BASE_URL_GROQ",
+            "https://example.invalid/v1",
+        );
+        assert_eq!(free_upstream_base_url_override("groq"), None);
+        drop(_remote);
+
+        let _scheme =
+            crate::test_support::EnvVarGuard::set("CLAWDE_FREE_BASE_URL_GROQ", "file:///tmp/mock");
+        assert_eq!(free_upstream_base_url_override("groq"), None);
     }
 
     #[test]
@@ -3939,6 +3986,138 @@ mod tests {
     }
 
     #[test]
+    fn latency_state_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.json");
+        let upstreams = vec!["groq".to_string(), "cerebras".to_string()];
+
+        {
+            let mut lat =
+                LatencyState::new(2).with_persistence(upstreams.clone(), Some(path.clone()), 3);
+            lat.record_success(0);
+            lat.record_success(0);
+            lat.record_failure(0);
+            lat.record_task_success(0, TaskType::CodeGeneration);
+            lat.record_task_success(0, TaskType::CodeGeneration);
+            lat.record_task_failure(0, TaskType::CodeGeneration);
+            lat.record(0, 1.0, 3);
+            lat.record(0, 2.0, 3);
+            LatencyState::persist_snapshot(lat.snapshot());
+            assert!(path.exists(), "telemetry must be written to disk");
+        }
+
+        let lat = LatencyState::new(2).with_persistence(upstreams, Some(path), 3);
+        assert_eq!(lat.success_rate(0), Some(2.0 / 3.0));
+        assert_eq!(
+            lat.task_success_rate(0, TaskType::CodeGeneration),
+            Some(2.0 / 3.0)
+        );
+        assert_eq!(lat.samples[0].len(), 2);
+        assert_eq!(lat.avg_latency(0), 1.5);
+        assert_eq!(lat.success_rate(1), None);
+    }
+
+    #[test]
+    fn latency_telemetry_ages_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.json");
+        let old = current_unix_secs().saturating_sub(TELEMETRY_HALF_LIFE_SECS + 1);
+        let json = serde_json::json!([{
+            "upstream": "groq",
+            "samples": [1.0, 2.0],
+            "successes": 100,
+            "failures": 20,
+            "task_successes": {"code_generation": 80},
+            "task_failures": {"code_generation": 20},
+            "saved_at_unix": old
+        }]);
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let lat = LatencyState::new(1).with_persistence(vec!["groq".to_string()], Some(path), 10);
+        assert!(lat.successes[0] < 100);
+        assert!(lat.failures[0] < 20);
+        assert!(
+            lat.samples[0].is_empty(),
+            "old latency samples should expire"
+        );
+        assert!(lat.task_successes[0]["code_generation"] < 80);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn telemetry_persistence_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("free.json");
+        let mut lat =
+            LatencyState::new(1).with_persistence(vec!["groq".to_string()], Some(path.clone()), 3);
+        lat.record_success(0);
+        LatencyState::persist_snapshot(lat.snapshot());
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn persistence_rejects_stale_snapshot_and_cleans_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.json");
+        let newer_timestamp = current_unix_nanos();
+        let newer = serde_json::json!([{
+            "upstream": "groq",
+            "successes": 2,
+            "saved_at_unix_nanos": newer_timestamp
+        }]);
+        let older = serde_json::json!([{
+            "upstream": "groq",
+            "successes": 1,
+            "saved_at_unix_nanos": newer_timestamp.saturating_sub(1)
+        }]);
+
+        write_private_json_if_newer(&path, &newer.to_string());
+        write_private_json_if_newer(&path, &older.to_string());
+        let newer_but_incomplete = serde_json::json!([{
+            "upstream": "groq",
+            "successes": 1,
+            "saved_at_unix_nanos": newer_timestamp.saturating_add(1)
+        }]);
+        write_private_json_if_newer(&path, &newer_but_incomplete.to_string());
+        let stored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored[0]["successes"], 2);
+
+        let lock = acquire_persistence_file_lock(&path).expect("lock should be available");
+        assert!(lock.path.exists());
+        drop(lock);
+        assert!(!path.with_file_name(".free.json.lock").exists());
+    }
+
+    #[test]
+    fn preferred_order_uses_task_history_over_aggregate_history() {
+        let mut lat = LatencyState::new(2);
+        // Both upstreams have identical aggregate history, but opposite
+        // outcomes for code editing. The task-specific history must win.
+        for _ in 0..3 {
+            lat.record_success(0);
+            lat.record_failure(1);
+            lat.record_task_failure(0, TaskType::CodeEdit);
+            lat.record_task_success(1, TaskType::CodeEdit);
+        }
+
+        let groq = FreeProvider::preferred_order_key(&lat, 0, TaskType::CodeEdit);
+        let cerebras = FreeProvider::preferred_order_key(&lat, 1, TaskType::CodeEdit);
+        assert!(
+            cerebras < groq,
+            "task-successful upstream should rank first: groq={groq:?}, cerebras={cerebras:?}"
+        );
+    }
+
+    #[test]
     fn upstream_5xx_cooldown_persists_across_restart() {
         // The 5xx / circuit-breaker cooldown track must survive a process
         // restart: after a 500, a restart should NOT immediately re-hit the
@@ -3994,6 +4173,7 @@ mod tests {
             consecutive_empties: 0,
             empty_cooldown_until_unix: None,
             cooldown_until_unix: Some(now_unix.saturating_sub(60)),
+            saved_at_unix_nanos: 0,
         }];
         std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
 

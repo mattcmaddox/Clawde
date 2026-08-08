@@ -52,6 +52,51 @@ Commands support aliases — for example `/h`, `/?`, and `/help` all invoke the 
 
 Arguments are passed as a single string after the command name. Most commands that accept arguments are documented with an `argumentHint` shown in the command palette.
 
+### Hierarchical command families
+
+Clawde also supports discoverable nested paths. Type a family prefix and press
+`Tab` to reveal its children; press `Tab` again on a leaf to complete its
+arguments. The command palette and `/help` show the same family/leaf registry.
+
+Examples:
+
+```
+/provider <Tab>                 # connect, health, keys, limits, ...
+/provider connect <Tab>        # argument completion for the provider target
+/model <Tab>                   # list, use, routing, task
+/model routing <Tab>           # auto, sequential, random, latency, task
+/session <Tab>                 # list, resume, rename, fork, ...
+/project <Tab>                 # init, diff, review, verify, memory, ...
+/context <Tab>                 # show, compact, auto-compact, memory
+/system <Tab>                 # status, doctor, version, update, health
+/integrations <Tab>            # mcp, hooks, ide, chrome, plugins, skills
+```
+
+Nested paths are normalized to the existing flat handlers. For example,
+`/provider connect groq` executes as `/connect groq`. Flat commands remain
+supported as compatibility aliases, so existing scripts and workflows do not
+need to change.
+
+### Smart-router comparison
+
+`/compare` shows the current free-mode upstream ranking without making a new
+provider request. It combines task-aware success rates, aggregate success,
+latency, dispatch history, cooldowns, and key-ring health. Monetary cost is
+intentionally not part of free-model routing or this report.
+
+```
+/compare
+/compare coding
+/compare --task reasoning
+/compare --provider groq
+/model compare coding
+/provider compare --provider groq
+```
+
+In the TUI these commands open a sortable table. Use arrow keys (or `j`/`k`
+in Vim mode), `r` to refresh telemetry, and `Esc` to close. A new installation
+may show no rows until it has completed a few free-mode requests.
+
 ---
 
 ## Session & Navigation

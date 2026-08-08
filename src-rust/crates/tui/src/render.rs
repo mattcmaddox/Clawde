@@ -975,6 +975,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         );
     }
 
+    // Smart-router comparison dialog (/compare).
+    if app.compare_dialog.visible {
+        crate::compare_dialog::render_compare_dialog(frame, &app.compare_dialog, size);
+    }
+
     // Task-routing pinning dialog (/routing edit — audit spec §8.6).
     if app.routing_dialog.visible {
         crate::routing_dialog::render_routing_dialog(
@@ -2358,7 +2363,11 @@ fn render_verify_block(
     let area = box_w.saturating_sub(6); // content between "│ " and " │"
 
     // ┌─ Verify · git worktree ──...──┐
-    let title = format!(" Verify · {} ", report.sandbox.label());
+    let title = if report.unavailable {
+        format!(" Verify · {} · unavailable ", report.sandbox.label())
+    } else {
+        format!(" Verify · {} ", report.sandbox.label())
+    };
     let title_fill = box_w.saturating_sub(5 + title.chars().count());
     lines.push(Line::from(vec![
         Span::raw("  "),
@@ -2434,6 +2443,9 @@ fn render_verify_block(
 /// "Auto-fix attempt 1/3", "Verification could not run — commands missing",
 /// ...). Only the colour is derived here, from the per-check results.
 fn verify_headline_color(report: &clawde_query::VerifyReport) -> Color {
+    if report.unavailable {
+        return Color::Yellow;
+    }
     let any_failure = report.results.iter().any(|r| !r.ok && !r.skipped);
     let all_skipped = !report.results.is_empty() && report.results.iter().all(|r| r.skipped);
     if report.results.is_empty() {
@@ -2458,7 +2470,9 @@ fn verify_headline_color(report: &clawde_query::VerifyReport) -> Color {
 /// The attempt counter is shown only for mid-loop auto-fix rounds so a
 /// `✓ verify` or `✗ verify` stays compact.
 fn verify_footer_badge(report: &clawde_query::VerifyReport) -> (String, Color) {
-    let (icon, color) = if report.results.is_empty() {
+    let (icon, color) = if report.unavailable {
+        ("!", Color::Yellow)
+    } else if report.results.is_empty() {
         ("△", Color::DarkGray)
     } else if report.results.iter().all(|r| r.ok || r.skipped) {
         ("✓", Color::Green)
@@ -5194,6 +5208,7 @@ mod stream_cache_tests {
             max_retries: 3,
             headline: "Auto-fix attempt 1/3".to_string(),
             sandbox: clawde_core::config::VerifySandbox::Worktree,
+            unavailable: false,
         };
         app.push_verify_annotation(report);
 
@@ -5820,6 +5835,7 @@ mod task_badge_tooltip_tests {
             max_retries: 3,
             headline: "h".to_string(),
             sandbox: clawde_core::config::VerifySandbox::Direct,
+            unavailable: false,
         }
     }
 
@@ -5846,6 +5862,16 @@ mod task_badge_tooltip_tests {
         assert!(label.starts_with("△"), "label: {label}");
         assert_eq!(color, Color::DarkGray);
     }
+
+    #[test]
+    fn verify_footer_badge_is_unavailable_when_sandbox_cannot_run() {
+        let mut report = verify_report_with(vec![]);
+        report.unavailable = true;
+        let (label, color) = verify_footer_badge(&report);
+        assert!(label.starts_with("! verify"), "label: {label}");
+        assert_eq!(color, Color::Yellow);
+    }
+
     #[test]
     fn verify_footer_badge_shows_attempt_only_for_mid_loop_rounds() {
         let mut report = verify_report_with(vec![(false, false)]);

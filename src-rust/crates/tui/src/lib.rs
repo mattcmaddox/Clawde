@@ -82,6 +82,7 @@ pub mod ask_user_dialog;
 pub mod bridge_state;
 /// Startup confirmation dialog for --dangerously-skip-permissions mode.
 pub mod bypass_permissions_dialog;
+pub mod compare_dialog;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
 /// Modal dialog for entering custom provider URL + API key.
@@ -605,6 +606,29 @@ mod tests {
         assert!(!app.mcp_view.visible);
         assert!(!app.agents_menu.visible);
         assert!(!app.diff_viewer.visible);
+    }
+
+    #[test]
+    fn test_compare_nested_routes_open_shared_dialog() {
+        let mut app = make_app();
+
+        assert!(app.intercept_slash_command_with_args("model", "compare coding"));
+        assert!(app.compare_dialog.visible);
+        assert_eq!(app.compare_dialog.task_filter.as_deref(), Some("coding"));
+
+        assert!(app.intercept_slash_command_with_args("provider", "compare --provider groq"));
+        assert!(app.compare_dialog.visible);
+        assert_eq!(app.compare_dialog.provider_filter.as_deref(), Some("groq"));
+    }
+
+    #[test]
+    fn test_compare_nested_route_requires_exact_subcommand() {
+        let mut app = make_app();
+
+        app.intercept_slash_command_with_args("model", "comparison");
+        assert!(!app.compare_dialog.visible);
+        app.intercept_slash_command_with_args("provider", "comparefoo");
+        assert!(!app.compare_dialog.visible);
     }
 
     #[test]
@@ -2006,6 +2030,7 @@ mod tests {
             max_retries: 3,
             headline: "All checks passed".to_string(),
             sandbox: clawde_core::config::VerifySandbox::Direct,
+            unavailable: false,
         };
         app.handle_query_event(clawde_query::QueryEvent::Verify(report));
         assert_eq!(app.system_annotations.len(), 1);

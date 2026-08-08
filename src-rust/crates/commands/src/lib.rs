@@ -341,6 +341,8 @@ mod ui_settings;
 use ui_settings::*;
 mod routing;
 pub use routing::*;
+mod compare;
+pub use compare::*;
 mod new_move;
 pub use new_move::*;
 
@@ -363,6 +365,7 @@ pub struct HooksCommand;
 pub struct ImportConfigCommand;
 pub struct ThinkingCommand;
 pub struct AutoCompactCommand;
+pub struct TaskCommand;
 // New commands
 // Batch-1 new commands
 // New commands: teleport, btw, ctx-viz, sandbox-toggle
@@ -611,8 +614,13 @@ impl SlashCommand for HelpCommand {
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if !args.is_empty() {
-            // Show help for a specific command
-            if let Some(cmd) = find_command(args) {
+            // Show help for a specific command. Nested paths resolve through
+            // the shared hierarchy and then reuse the target command's help.
+            let nested_target = clawde_core::slash_commands::target_for_path(args);
+            if let Some(cmd) = nested_target
+                .and_then(find_command)
+                .or_else(|| find_command(args))
+            {
                 let aliases = cmd.aliases();
                 let alias_line = if aliases.is_empty() {
                     String::new()
@@ -692,6 +700,31 @@ impl SlashCommand for HelpCommand {
                     output.push_str(&format!("{}\n", entry));
                 }
             }
+        }
+
+        // The hierarchy is shared with TUI completion, help, and the command
+        // palette. Keep `/help` useful in headless mode by listing roots and
+        // leaves here too, while retaining the flat compatibility commands.
+        output.push_str("\nCommand families\n");
+        for (root, description) in clawde_core::slash_commands::hierarchical_roots("") {
+            output.push_str(&format!("  /{:<20} {}\n", root, description));
+        }
+        for route in clawde_core::slash_commands::HIERARCHICAL_COMMANDS {
+            let args = match route.argument_kind() {
+                clawde_core::slash_commands::HierarchicalArgument::None => String::new(),
+                clawde_core::slash_commands::HierarchicalArgument::FreeText => {
+                    " <value>".to_string()
+                }
+                clawde_core::slash_commands::HierarchicalArgument::Enum(values) => {
+                    format!(" [{}]", values.join("|"))
+                }
+            };
+            output.push_str(&format!(
+                "  /{:<20} {} (legacy: /{})\n",
+                format!("{}{}", route.path, args),
+                route.description,
+                route.target
+            ));
         }
 
         // Append user-defined command templates from settings and discovered
@@ -1728,6 +1761,74 @@ impl SlashCommand for AutoCompactCommand {
     }
 }
 
+// ---- /task ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for TaskCommand {
+    fn name(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        "Choose the free-model task lane"
+    }
+
+    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
+        [
+            ("all", "Use the full free-model catalog"),
+            ("coding", "Prefer coding-capable models"),
+            ("reasoning", "Prefer reasoning-capable models"),
+            ("creative", "Prefer creative-capable models"),
+            ("fast", "Prefer fast-response models"),
+            ("multimodal", "Prefer multimodal models"),
+            ("long-context", "Prefer long-context models"),
+        ]
+        .into_iter()
+        .map(|(value, description)| ArgCompletion {
+            value: value.to_string(),
+            description: description.to_string(),
+            available: true,
+        })
+        .collect()
+    }
+
+    fn help(&self) -> &str {
+        "Usage: /task [all|coding|reasoning|creative|fast|multimodal|long-context]"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let task = args.trim().to_ascii_lowercase();
+        let valid = [
+            "all",
+            "coding",
+            "reasoning",
+            "creative",
+            "fast",
+            "multimodal",
+            "long-context",
+        ];
+        if task.is_empty() {
+            return CommandResult::Message(format!(
+                "Current free-model task lane: {}",
+                ctx.config.free_task_sort.as_deref().unwrap_or("all")
+            ));
+        }
+        if !valid.contains(&task.as_str()) {
+            return CommandResult::Error(format!(
+                "Unknown task '{}'. Choose one of: {}",
+                task,
+                valid.join(", ")
+            ));
+        }
+        let mut new_config = ctx.config.clone();
+        new_config.free_task_sort = Some(task.clone());
+        CommandResult::ConfigChangeMessage(
+            new_config,
+            format!("Free-model task lane set to '{}'.", task),
+        )
+    }
+}
+
 // ---- /sources ------------------------------------------------------------
 
 pub struct SourcesCommand;
@@ -1869,6 +1970,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ForkCommand),
         Box::new(ThinkingCommand),
         Box::new(AutoCompactCommand),
+        Box::new(TaskCommand),
         Box::new(UnloadCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
@@ -2026,6 +2128,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(LimitsCommand),
         // Routing strategy for free mode
         Box::new(RoutingCommand),
+        // Smart-router performance comparison
+        Box::new(CompareCommand),
         Box::new(RoutingAlias {
             name: "sr",
             target: "sequential",
@@ -2097,6 +2201,76 @@ pub fn all_command_aliases() -> Vec<(String, String, String)> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Validate the shared hierarchical routes against the executable command
+/// registry. This keeps route metadata from silently pointing at a removed or
+/// misspelled flat command.
+pub fn validate_hierarchical_routes() -> Result<(), Vec<String>> {
+    let mut errors = clawde_core::slash_commands::validate_hierarchy()
+        .err()
+        .unwrap_or_default();
+    for route in clawde_core::slash_commands::HIERARCHICAL_COMMANDS {
+        if find_command(route.target).is_none() {
+            errors.push(format!(
+                "route '{}' targets unknown command '{}'",
+                route.path, route.target
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate the shared flat-command discovery registry against executable
+/// commands and its own metadata invariants.
+///
+/// Prompt completion and the TUI help/palette consume this core-owned table,
+/// while command implementations live here. Keeping this check beside the
+/// executable registry prevents a renamed or removed command from becoming a
+/// dead item in the prompt UI.
+pub fn validate_prompt_commands() -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let mut names = std::collections::HashSet::new();
+
+    for command in clawde_core::slash_commands::PROMPT_COMMANDS {
+        if command.name.trim().is_empty() {
+            errors.push("prompt registry contains an empty command name".to_string());
+        }
+        if command.description.trim().is_empty() {
+            errors.push(format!(
+                "prompt command '{}' has an empty description",
+                command.name
+            ));
+        }
+        if command.category.trim().is_empty() {
+            errors.push(format!(
+                "prompt command '{}' has an empty category",
+                command.name
+            ));
+        }
+        if !names.insert(command.name) {
+            errors.push(format!(
+                "prompt registry contains duplicate command '{}'",
+                command.name
+            ));
+        }
+        if !command.tui_only && find_command(command.name).is_none() {
+            errors.push(format!(
+                "prompt command '{}' is not an executable command or alias",
+                command.name
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Get argument completions for a registered slash command.
@@ -2264,7 +2438,13 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
     if !clawde_tui::input::is_slash_command(input) {
         return None;
     }
-    let (name, args) = clawde_tui::input::parse_slash_command(input);
+    // Resolve a hierarchical path before the existing parser/registry. The
+    // route table is additive: flat commands and their legacy aliases still
+    // take the normal path, while `/provider connect foo` becomes
+    // `/connect foo` for the existing handler.
+    let normalized = clawde_core::slash_commands::normalize_invocation(input);
+    let dispatch_input = normalized.as_deref().unwrap_or(input);
+    let (name, args) = clawde_tui::input::parse_slash_command(dispatch_input);
 
     // First check built-in commands.
     if let Some(cmd) = find_command(name) {
@@ -2440,6 +2620,16 @@ mod tests {
     #[test]
     fn test_all_commands_non_empty() {
         assert!(!all_commands().is_empty());
+    }
+
+    #[test]
+    fn test_hierarchical_routes_target_registered_commands() {
+        validate_hierarchical_routes().unwrap_or_else(|errors| panic!("{errors:#?}"));
+    }
+
+    #[test]
+    fn test_prompt_discovery_entries_are_registered_commands() {
+        validate_prompt_commands().unwrap_or_else(|errors| panic!("{errors:#?}"));
     }
 
     #[test]

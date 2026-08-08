@@ -1563,9 +1563,105 @@ pub(crate) fn compute_slash_suggestions(
     slash_aliases: &[(String, String, String)],
     arg_completions_fn: Option<&ArgCompletionsRef>,
 ) -> Vec<TypeaheadSuggestion> {
-    let mut suggestions = Vec::new();
+    let mut suggestions: Vec<TypeaheadSuggestion> = Vec::new();
 
     if let Some(cmd_prefix) = input.strip_prefix('/') {
+        // Root families are derived from the same table as their leaves.
+        // `/prov<TAB>` therefore discovers `/provider` without another static
+        // command list in the TUI.
+        for (root, description) in clawde_core::slash_commands::hierarchical_roots(input) {
+            // Prefer the existing curated flat entry when the family name is
+            // already a real command (for example `/model` and `/session`).
+            // Only add a synthetic root for new families such as `/provider`.
+            if slash_commands.iter().any(|(name, _)| *name == root) {
+                continue;
+            }
+            let text = format!("/{}", root);
+            if !suggestions.iter().any(|suggestion| suggestion.text == text) {
+                suggestions.push(TypeaheadSuggestion {
+                    text,
+                    description: description.to_string(),
+                    source: TypeaheadSource::SlashCommand,
+                    faded: false,
+                    arg_value: None,
+                });
+            }
+        }
+
+        // Nested routes are backed by the shared core table. Keep them
+        // additive with existing argument completions: `/model r` should show
+        // both `/model routing` and matching model IDs.
+        let mut nested_suggestions = if cmd_prefix.contains(char::is_whitespace) {
+            clawde_core::slash_commands::hierarchical_completions(input)
+                .into_iter()
+                .map(|command| TypeaheadSuggestion {
+                    text: format!("/{}", command.path),
+                    description: format!("{} → /{}", command.description, command.target),
+                    source: TypeaheadSource::SlashCommand,
+                    faded: false,
+                    arg_value: None,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // A complete nested leaf delegates its remaining text to the existing
+        // target command, preserving argument completion for `/provider
+        // connect <TAB>` and similar routes.
+        if let Some((target, root, child, remainder)) = cmd_prefix
+            .split_once(char::is_whitespace)
+            .and_then(|(root, rest)| {
+                let (child, remainder) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let path = format!("{} {}", root, child);
+                clawde_core::slash_commands::target_for_path(&path)
+                    .map(|target| (target, root, child, remainder.trim_start()))
+            })
+        {
+            if let Some(ref completions_fn) = arg_completions_fn {
+                let completions = completions_fn(target, remainder);
+                if !completions.is_empty() {
+                    let nested_prefix = format!("/{root} {child}");
+                    return completions
+                        .into_iter()
+                        .map(|mut completion| {
+                            let flat_prefix = format!("/{target}");
+                            if completion.text == flat_prefix {
+                                completion.text = nested_prefix.clone();
+                            } else if let Some(argument) =
+                                completion.text.strip_prefix(&format!("{flat_prefix} "))
+                            {
+                                completion.text = format!("{nested_prefix} {argument}");
+                            }
+                            completion
+                        })
+                        .collect();
+                }
+            }
+        }
+
+        // Typed route metadata supplies enum values even when the legacy target
+        // has no bespoke completion implementation.
+        if let Some((root, rest)) = cmd_prefix.split_once(char::is_whitespace) {
+            let (child, remainder) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let path = format!("{} {}", root, child);
+            let values =
+                clawde_core::slash_commands::argument_completions(&path, remainder.trim_start());
+            if !values.is_empty() {
+                let prefix = format!("/{} {}", root, child);
+                return values
+                    .into_iter()
+                    .map(|value| TypeaheadSuggestion {
+                        text: format!("{} {}", prefix, value),
+                        description: "Available route option".to_string(),
+                        source: TypeaheadSource::ArgCompletion,
+                        faded: false,
+                        arg_value: Some(value.to_string()),
+                    })
+                    .collect();
+            }
+        }
+
         // Check for "command + space + partial arg": if the prefix contains a
         // space and the part before the first space is a known command or
         // alias, route to argument completions. Aliases are resolved to their
@@ -1584,7 +1680,12 @@ pub(crate) fn compute_slash_suggestions(
                 || slash_aliases.iter().any(|(_, c, _)| c == canonical);
             if is_known {
                 if let Some(ref completions_fn) = arg_completions_fn {
-                    return completions_fn(canonical, partial_arg);
+                    let completions = completions_fn(canonical, partial_arg);
+                    if !nested_suggestions.is_empty() {
+                        nested_suggestions.extend(completions);
+                        return nested_suggestions;
+                    }
+                    return completions;
                 }
             }
         }
@@ -1625,6 +1726,9 @@ pub(crate) fn compute_slash_suggestions(
                     });
                 }
             }
+        }
+        if !nested_suggestions.is_empty() {
+            return nested_suggestions;
         }
     }
 
@@ -4776,6 +4880,61 @@ mod tests {
             .iter()
             .map(|(a, c, d)| (a.to_string(), c.to_string(), d.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn typeahead_nested_root_lists_children() {
+        let suggestions = compute_slash_suggestions(
+            "/provider ",
+            &[("provider", "Provider commands")],
+            &[],
+            None,
+        );
+        assert!(suggestions.iter().any(|s| s.text == "/provider connect"));
+        assert!(suggestions.iter().any(|s| s.text == "/provider health"));
+        assert!(suggestions
+            .iter()
+            .all(|s| matches!(s.source, TypeaheadSource::SlashCommand)));
+    }
+
+    #[test]
+    fn typeahead_nested_leaf_preserves_target_argument_completion() {
+        let completions = |command: &str, _partial: &str| -> Vec<TypeaheadSuggestion> {
+            assert_eq!(command, "connect");
+            vec![TypeaheadSuggestion {
+                text: "/connect groq".into(),
+                description: "Groq provider".into(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("groq".into()),
+            }]
+        };
+        let suggestions = compute_slash_suggestions(
+            "/provider connect ",
+            &[("provider", "Provider commands")],
+            &[],
+            Some(&completions),
+        );
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/provider connect groq");
+    }
+
+    #[test]
+    fn typeahead_nested_child_filters_prefix() {
+        let suggestions =
+            compute_slash_suggestions("/config th", &[("config", "Configuration")], &[], None);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/config theme");
+    }
+
+    #[test]
+    fn typeahead_nested_routes_are_distinct_from_flat_arg_completion() {
+        let suggestions = compute_slash_suggestions("/model r", &[("model", "Model")], &[], None);
+        assert_eq!(suggestions[0].text, "/model routing");
+        assert!(matches!(
+            suggestions[0].source,
+            TypeaheadSource::SlashCommand
+        ));
     }
 
     #[test]

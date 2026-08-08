@@ -1,6 +1,7 @@
 // app.rs — App state struct and main event loop.
 
 use crate::bridge_state::BridgeConnectionState;
+use crate::compare_dialog::CompareDialogState;
 use crate::context_viz::ContextVizState;
 use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::dialogs::McpApprovalDialogState;
@@ -51,139 +52,86 @@ use tracing::debug;
 
 use crate::theme_colors::ColorPalette;
 
-const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("advisor", "Set or unset the server-side advisor model"),
-    ("agent", "List available agents or show agent details"),
-    ("agents", "Browse agent definitions and active agents"),
-    ("new-agent", "Create a new sub-agent in the editor"),
-    ("changes", "Inspect changes from the current session"),
-    ("clear", "Clear the conversation transcript"),
-    ("compact", "Compact the conversation context"),
-    ("config", "Open settings"),
-    ("connect", "Connect an AI provider"),
-    ("context", "Show context window and rate limit usage"),
-    ("copy", "Copy the last assistant response to clipboard"),
-    ("cost", "Show cost breakdown"),
-    ("diff", "Inspect the current git diff"),
-    ("doctor", "Run diagnostics"),
-    ("effort", "Set effort level (low/medium/high/max)"),
-    ("exit", "Quit Clawde"),
-    ("export", "Export conversation"),
-    ("fast", "Toggle fast mode"),
-    ("fork", "Fork session into a new branch"),
-    ("goal", "Set or view the current session goal"),
-    ("heapdump", "Show process memory and diagnostic information"),
-    (
-        "health",
-        "Probe free-mode key health — /health [<upstream>]",
-    ),
-    ("help", "Show help"),
-    (
-        "history",
-        "Show recent sessions for this project and where history lives",
-    ),
-    ("hooks", "Browse configured hooks (read-only)"),
-    (
-        "image",
-        "Switch to a vision-capable model for image processing",
-    ),
-    (
-        "import-config",
-        "Import CLAUDE.md and settings.json from ~/.claude",
-    ),
-    ("init", "Initialize AGENTS.md for this project"),
-    (
-        "insights",
-        "Generate a session analysis report with conversation statistics",
-    ),
-    ("keybindings", "Show keybinding configuration"),
-    ("links", "Open URLs from this session in your browser"),
-    ("login", "Log in to Clawde"),
-    ("logout", "Log out of Clawde"),
-    (
-        "managed-agents",
-        "Configure manager-executor managed agent system",
-    ),
-    ("mcp", "Browse configured MCP servers"),
-    ("memory", "Browse and open AGENTS.md memory files"),
-    ("model", "Change the AI model"),
-    ("models", "Browse free upstream models"),
-    ("task", "Set free-model sort: /task <name> (all/coding/reasoning/creative/fast/multimodal/long-context)"),
-    (
-        "move",
-        "Re-home this session to another worktree of the same project",
-    ),
-    (
-        "new",
-        "Start a fresh session (keeps model, provider & directory)",
-    ),
-    ("output-style", "Show or switch the output style / persona"),
-    ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
-    ("providers", "List available AI providers and their status"),
-    ("caveman", "Caveman persona output style — save big token"),
-    ("rocky", "Rocky persona output style — amaze amaze amaze"),
-    ("normal", "Reset persona / output style to default"),
-    ("quit", "Exit Clawde"),
-    ("refresh", "Clear saved provider auth and model caches"),
-    ("rename", "Rename this session"),
-    ("resume", "Resume a previous session"),
-    ("review", "Review changes (git diff)"),
-    ("rewind", "Rewind to an earlier turn"),
-    ("rustle", "Edit the Rustle mascot animation frames"),
-    ("session", "Browse and manage sessions"),
-    ("settings", "Open settings"),
-    (
-        "share",
-        "Upload the current session as a secret gist and get a shareable URL",
-    ),
-    ("stats", "Open token and cost stats"),
-    ("survey", "Open session feedback survey"),
-    ("theme", "Open the theme picker"),
-    (
-        "ultrareview",
-        "Run an exhaustive multi-dimensional code review",
-    ),
-    (
-        "update",
-        "Check for updates and upgrade to the latest version",
-    ),
-    (
-        "upgrade",
-        "Check for updates and upgrade to the latest version",
-    ),
-    ("vim", "Toggle vim keybindings"),
-    ("voice", "Toggle voice input mode"),
-    (
-        "ollama",
-        "Toggle Ollama connectivity mode (auto / isolated)",
-    ),
-];
+fn prompt_slash_commands() -> &'static [(&'static str, &'static str)] {
+    clawde_core::slash_commands::prompt_command_pairs()
+}
 
 fn help_command_category(name: &str) -> &'static str {
-    match name {
-        "connect" | "model" | "models" | "providers" | "refresh" | "fast" | "effort" | "voice"
-        | "ollama" | "task" => "Model & Provider",
-        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => {
-            "Review & History"
+    clawde_core::slash_commands::prompt_command_category(name)
+}
+
+fn hierarchy_help_entries() -> Vec<HelpEntry> {
+    let mut entries = Vec::new();
+    let mut seen_roots = std::collections::HashSet::new();
+    for (root, description) in clawde_core::slash_commands::hierarchical_roots("") {
+        if seen_roots.insert(root) {
+            entries.push(HelpEntry {
+                name: root.to_string(),
+                aliases: String::new(),
+                description: description.to_string(),
+                category: "Command Families".to_string(),
+            });
         }
-        "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" | "health" => {
-            "Diagnostics"
-        }
-        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
-            "Workspace"
-        }
-        "agent" | "agents" | "new-agent" | "memory" | "plugin" | "survey" | "rustle" => "Tools",
-        "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
-        | "history" | "quit" | "exit" => "Session",
-        _ => "Commands",
     }
+    for route in clawde_core::slash_commands::HIERARCHICAL_COMMANDS {
+        entries.push(HelpEntry {
+            name: route.path.to_string(),
+            aliases: format!("{} (legacy)", route.target),
+            description: route.description.to_string(),
+            category: route.category().to_string(),
+        });
+    }
+    entries
+}
+
+fn command_palette_items() -> Vec<SelectItem> {
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (name, description) in prompt_slash_commands() {
+        if seen.insert((*name).to_string()) {
+            items.push(SelectItem {
+                id: format!("/{}", name),
+                title: format!("/{}", name),
+                description: description.to_string(),
+                category: help_command_category(name).to_string(),
+                badge: None,
+            });
+        }
+    }
+
+    for (root, description) in clawde_core::slash_commands::hierarchical_roots("") {
+        if seen.insert(root.to_string()) {
+            items.push(SelectItem {
+                id: format!("/{}", root),
+                title: format!("/{}", root),
+                description: description.to_string(),
+                category: "Command Families".to_string(),
+                badge: Some("GROUP".to_string()),
+            });
+        }
+    }
+
+    for route in clawde_core::slash_commands::HIERARCHICAL_COMMANDS {
+        if seen.insert(route.path.to_string()) {
+            items.push(SelectItem {
+                id: format!("/{}", route.path),
+                title: format!("/{}", route.path),
+                description: route.description.to_string(),
+                category: route.category().to_string(),
+                badge: Some(format!("/{}", route.target)),
+            });
+        }
+    }
+    items
 }
 
 fn help_overlay_entries(
     slash_aliases: &[(String, String, String)],
     user_entries: &[(String, String, String)],
 ) -> Vec<HelpEntry> {
-    let mut entries: Vec<HelpEntry> = PROMPT_SLASH_COMMANDS
+    let prompt_commands = prompt_slash_commands();
+    let mut entries: Vec<HelpEntry> = prompt_commands
         .iter()
         .map(|(name, description)| HelpEntry {
             name: (*name).to_string(),
@@ -202,16 +150,27 @@ fn help_overlay_entries(
         })
         .collect();
 
+    // Add shared hierarchical routes after flat compatibility commands. The
+    // route table is the source of truth for family/leaf discovery, while the
+    // flat list above remains available for legacy help and aliases.
+    let existing_names: std::collections::HashSet<String> =
+        entries.iter().map(|entry| entry.name.clone()).collect();
+    for entry in hierarchy_help_entries() {
+        if !existing_names.contains(&entry.name) {
+            entries.push(entry);
+        }
+    }
+
     // Append user-defined template commands and discovered skill commands so
     // custom commands are discoverable in the overlay, not just executable.
     // Each entry is `(name, description, category)`; names colliding with a
     // curated built-in are skipped (dispatch resolves built-ins first).
     //
-    // The curated-name set is built from the static `PROMPT_SLASH_COMMANDS`
-    // table (not from `entries`, which we mutate below) so it does not hold a
-    // borrow across the `entries.push` calls.
+    // The curated-name set is built from the shared prompt registry (not from
+    // `entries`, which we mutate below) so it does not hold a borrow across
+    // the `entries.push` calls.
     let curated_names: std::collections::HashSet<&str> =
-        PROMPT_SLASH_COMMANDS.iter().map(|(n, _)| *n).collect();
+        prompt_commands.iter().map(|(n, _)| *n).collect();
     for (name, description, category) in user_entries {
         if curated_names.contains(name.as_str()) {
             continue;
@@ -1532,6 +1491,8 @@ pub struct App {
     pub export_dialog: ExportDialogState,
     /// Context window / rate limit visualization overlay (/context).
     pub context_viz: ContextVizState,
+    /// Smart-router upstream comparison dialog (/compare).
+    pub compare_dialog: CompareDialogState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
     /// Project-defined MCP servers awaiting the user's approval decision.
@@ -2103,6 +2064,7 @@ impl App {
             tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
+            compare_dialog: CompareDialogState::new(),
             mcp_approval: McpApprovalDialogState::new(),
             mcp_pending_project: std::collections::VecDeque::new(),
             mcp_prompting: None,
@@ -2141,19 +2103,7 @@ impl App {
                 import_config_picker_items(),
             ),
             import_config_dialog: ImportConfigDialogState::new(),
-            command_palette: {
-                let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
-                    .iter()
-                    .map(|(name, desc)| SelectItem {
-                        id: format!("/{}", name),
-                        title: format!("/{}", name),
-                        description: desc.to_string(),
-                        category: "Commands".to_string(),
-                        badge: None,
-                    })
-                    .collect();
-                DialogSelectState::new("Command Palette", items)
-            },
+            command_palette: DialogSelectState::new("Command Palette", command_palette_items()),
             home_dir_warning: false,
             output_style: "auto".to_string(),
             pr_number: None,
@@ -3018,7 +2968,34 @@ impl App {
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
-        // /routing edit|pin: open the task-pinning dialog (spec §8.6).
+        // /compare and its nested aliases open the shared comparison dialog.
+        fn nested_compare_args(value: &str) -> Option<&str> {
+            let mut parts = value.splitn(2, char::is_whitespace);
+            match (parts.next(), parts.next()) {
+                (Some("compare"), rest) => Some(rest.unwrap_or_default().trim()),
+                _ => None,
+            }
+        }
+        if cmd == "compare"
+            || (cmd == "model" && nested_compare_args(args).is_some())
+            || (cmd == "provider" && nested_compare_args(args).is_some())
+        {
+            self.close_secondary_views();
+            let compare_args = if cmd == "compare" {
+                args
+            } else {
+                nested_compare_args(args).unwrap_or_default()
+            };
+            match crate::compare_dialog::parse_compare_filters(compare_args) {
+                Ok((task, provider)) => {
+                    self.compare_dialog
+                        .open(self.provider_registry.as_deref(), task, provider);
+                }
+                Err(error) => self.status_message = Some(error),
+            }
+            return true;
+        }
+
         if cmd == "routing" && matches!(args.trim(), "edit" | "pin" | "tasks") {
             // Snapshot the free provider's per-upstream latency averages so
             // the dialog can show the model-performance column (§8.6).
@@ -3730,6 +3707,7 @@ impl App {
         self.tasks_overlay.close();
         self.export_dialog.dismiss();
         self.context_viz.close();
+        self.compare_dialog.close();
         self.connect_dialog.close();
         self.import_config_picker.close();
         self.import_config_dialog.close();
@@ -3795,6 +3773,7 @@ impl App {
             || self.session_branching.visible
             || self.export_dialog.visible
             || self.context_viz.visible
+            || self.compare_dialog.visible
             || self.mcp_approval.visible
             || self.file_injection_dialog.visible
             || self.context_menu_state.is_some()
@@ -4395,7 +4374,7 @@ impl App {
         let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
         let arg_completions = self.arg_completions.as_deref();
         self.prompt_input.update_suggestions(
-            PROMPT_SLASH_COMMANDS,
+            prompt_slash_commands(),
             &self.slash_aliases,
             file_autocomplete_limit,
             file_autocomplete_show_hidden,
@@ -4901,6 +4880,29 @@ impl App {
                         chosen.symbol(),
                         chosen.label()
                     ));
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Smart-router comparison dialog (/compare).
+        if self.compare_dialog.visible {
+            match key.code {
+                KeyCode::Esc => self.compare_dialog.close(),
+                KeyCode::Up => self.compare_dialog.select_prev(),
+                KeyCode::Down => self.compare_dialog.select_next(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.compare_dialog.select_prev()
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.compare_dialog.select_next()
+                }
+                KeyCode::Char('r') => {
+                    let task = self.compare_dialog.task_filter.clone();
+                    let provider = self.compare_dialog.provider_filter.clone();
+                    self.compare_dialog
+                        .open(self.provider_registry.as_deref(), task, provider);
                 }
                 _ => {}
             }
@@ -5972,8 +5974,14 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(selected) = self.command_palette.selected().cloned() {
                         self.command_palette.close();
-                        // Put the command in the input and signal for execution
-                        self.prompt_input.replace_text(selected.id.clone());
+                        // Family entries are navigational: seed the prompt with
+                        // a trailing space so the next typeahead shows leaves.
+                        let command = if selected.badge.as_deref() == Some("GROUP") {
+                            format!("{} ", selected.id)
+                        } else {
+                            selected.id.clone()
+                        };
+                        self.prompt_input.replace_text(command);
                         return true; // signal to submit this as input
                     }
                 }
@@ -10204,7 +10212,16 @@ impl App {
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
-                                let (cmd, args) = crate::input::parse_slash_command(&slash_input);
+                                // Normalize nested command paths before the
+                                // TUI-only interception layer. The command
+                                // crate performs the same normalization for
+                                // non-overlay commands, so both paths share
+                                // one compatibility table.
+                                let dispatch_input =
+                                    clawde_core::slash_commands::normalize_invocation(&slash_input)
+                                        .unwrap_or(slash_input);
+                                let (cmd, args) =
+                                    crate::input::parse_slash_command(&dispatch_input);
                                 if self.intercept_slash_command_with_args(cmd, args) {
                                     self.clear_prompt();
                                     continue;
@@ -11083,6 +11100,18 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_prompt_registry_drives_palette_and_help() {
+        let commands = prompt_slash_commands();
+        assert!(commands.iter().any(|(name, _)| *name == "connect"));
+        assert!(command_palette_items()
+            .iter()
+            .any(|item| item.id == "/connect" && item.category == "Model & Provider"));
+        assert!(help_overlay_entries(&[], &[])
+            .iter()
+            .any(|entry| entry.name == "connect" && entry.category == "Model & Provider"));
+    }
+
+    #[test]
     fn test_help_overlay_entries_include_aliases() {
         // The help overlay surfaces hidden aliases (e.g. /history → /session)
         // so users can discover them; /refresh_help_overlay applies them.
@@ -11749,6 +11778,7 @@ mod tests {
             max_retries: 2,
             headline: "All checks passed".to_string(),
             sandbox: clawde_core::config::VerifySandbox::Direct,
+            unavailable: false,
         });
         app.last_verify_badge_area.set(Some((23, 1, 10)));
         app.last_verify_box_line.set(Some(50));
@@ -11797,6 +11827,7 @@ mod tests {
             max_retries: 2,
             headline: "All checks passed".to_string(),
             sandbox: clawde_core::config::VerifySandbox::Direct,
+            unavailable: false,
         });
         app.last_verify_badge_area.set(Some((23, 1, 10)));
         app.last_verify_box_line.set(Some(50));
