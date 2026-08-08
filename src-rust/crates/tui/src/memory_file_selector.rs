@@ -20,6 +20,7 @@ pub enum MemoryFileType {
     User,
     Project,
     Local,
+    ProjectMemory,
 }
 
 pub struct MemoryFile {
@@ -92,6 +93,29 @@ impl MemoryFileSelectorState {
             local_display,
             MemoryFileType::Local,
         ));
+
+        // Project memory: expose the durable index plus the most recently
+        // updated topic files. Keep the browser bounded so a large memory tree
+        // remains usable while `/memory status` still reports the full count.
+        let memory_dir = clawde_core::memdir::auto_memory_path(project_root);
+        let memory_index = memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
+        self.files.push(memory_file(
+            memory_index,
+            format!("{}/MEMORY.md", memory_dir.display()),
+            MemoryFileType::ProjectMemory,
+        ));
+        for meta in clawde_core::memdir::scan_memory_dir(&memory_dir)
+            .into_iter()
+            .take(12)
+        {
+            self.files.push(MemoryFile {
+                path: meta.path.to_string_lossy().into_owned(),
+                display_path: format!("{}/{}", memory_dir.display(), meta.filename),
+                file_type: MemoryFileType::ProjectMemory,
+                exists: true,
+                modified_secs: Some(meta.modified_secs),
+            });
+        }
 
         self.visible = true;
     }
@@ -199,6 +223,7 @@ pub fn render_memory_file_selector(state: &MemoryFileSelectorState, area: Rect, 
             MemoryFileType::User => "User    ",
             MemoryFileType::Project => "Project ",
             MemoryFileType::Local => "Local   ",
+            MemoryFileType::ProjectMemory => "Memory  ",
         };
 
         let freshness = file
@@ -296,6 +321,30 @@ mod tests {
             .unwrap();
         assert!(!local_entry.exists);
         assert!(local_entry.modified_secs.is_none());
+        assert!(state
+            .files
+            .iter()
+            .any(|file| file.file_type == MemoryFileType::ProjectMemory));
+    }
+
+    #[test]
+    fn open_includes_recent_project_memory_files() {
+        let project = tempfile::tempdir().unwrap();
+        let memory_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(memory_dir.join("architecture.md"), "# Architecture\n").unwrap();
+
+        let mut state = MemoryFileSelectorState::new();
+        state.open(project.path());
+
+        assert!(state.files.iter().any(|file| {
+            file.file_type == MemoryFileType::ProjectMemory && file.path.ends_with("MEMORY.md")
+        }));
+        assert!(state.files.iter().any(|file| {
+            file.file_type == MemoryFileType::ProjectMemory
+                && file.path.ends_with("architecture.md")
+        }));
     }
 
     #[test]
