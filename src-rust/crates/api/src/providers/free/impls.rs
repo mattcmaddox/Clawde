@@ -190,9 +190,15 @@ impl FreeProvider {
         // sequential, random, and latency routes all honor the same settings.
         // Unknown ids are harmless: they simply never match an active chain
         // entry.
+        //
+        // The image-presence check and the token estimate are computed ONCE
+        // here (not per chain entry) so a 14-upstream chain does not scan the
+        // whole message history 14 times.
+        let has_images = request.map(Self::request_has_images).unwrap_or(false);
+        let estimate = request.map(Self::estimate_request_tokens).unwrap_or(0);
         plan.into_iter()
             .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
-            .filter(|(idx, _)| self.entry_fits_request(*idx, request))
+            .filter(|(idx, _)| self.entry_fits_request(*idx, has_images, estimate))
             .collect()
     }
 
@@ -208,6 +214,9 @@ impl FreeProvider {
     /// Capability gate (audit spec §8.4 "capability match"): drop upstreams
     /// whose capabilities cannot serve the request's content before dispatch.
     ///
+    /// `has_images` and `estimate` are precomputed once in [`Self::attempt_plan`]
+    /// so this check stays O(1) per chain entry.
+    ///
     /// - Image-bearing requests skip non-vision upstreams: a text-only
     ///   provider rejects the image with a 400 `InvalidRequest`, which
     ///   [`Self::should_fallback`] deliberately does NOT retry — without this
@@ -220,17 +229,13 @@ impl FreeProvider {
     ///   NOT reserved (the chars/4 estimate under-counts code, and reserving
     ///   full `max_tokens` would over-filter upstreams that usually emit far
     ///   less). This is a "definitely won't fit" gate, not a "might not fit".
-    fn entry_fits_request(&self, idx: usize, request: Option<&ProviderRequest>) -> bool {
-        let Some(request) = request else {
-            return true;
-        };
+    fn entry_fits_request(&self, idx: usize, has_images: bool, estimate: u64) -> bool {
         let Some(entry) = self.chain.get(idx) else {
             return true;
         };
-        if Self::request_has_images(request) && !entry.upstream.vision {
+        if has_images && !entry.upstream.vision {
             return false;
         }
-        let estimate = Self::estimate_request_tokens(request);
         if estimate > 0 && estimate > u64::from(entry.upstream.context_window) {
             return false;
         }
