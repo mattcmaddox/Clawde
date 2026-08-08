@@ -761,6 +761,12 @@ struct RetryingFreeStream {
     current_idx: usize,
     current_model: String,
     pending_attribution: bool,
+    /// Whether the current attempt's success has been credited to the
+    /// success-rate / latency counters (spec §8.6). Set at the completion
+    /// signal (MessageStop) so consumers that drop the stream there still
+    /// count the win; guards against double-crediting when a consumer polls
+    /// the stream through to `None`.
+    success_recorded: bool,
     starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
     /// Parallel probe for first-byte watchdog (§6.5).
     parallel_starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
@@ -801,6 +807,7 @@ impl RetryingFreeStream {
             current_idx: idx,
             current_model: upstream_model,
             pending_attribution: true,
+            success_recorded: false,
             starting: None,
             parallel_starting: None,
             parallel_idx: 0,
@@ -879,6 +886,25 @@ impl RetryingFreeStream {
         self.attempt_text.trim().is_empty()
             && self.attempt_thinking.trim().is_empty()
             && self.attempt_tool_count == 0
+    }
+
+    /// Credit a successful dispatch to the current upstream at the completion
+    /// signal.
+    ///
+    /// Interactive consumers break on `StreamEvent::MessageStop` and drop the
+    /// stream without ever polling to `None`, so the success-rate and latency
+    /// counters (spec §8.6) must be updated when the stop event is observed —
+    /// not only when the stream is drained to its end. `success_recorded`
+    /// guards against double-crediting by consumers that DO poll to the end
+    /// (the `Poll::Ready(None)` branch also credits, see below).
+    fn maybe_record_success(&mut self) {
+        if self.success_recorded || self.is_empty_attempt() {
+            return;
+        }
+        self.success_recorded = true;
+        if let Some(elapsed) = self.attempt_start.map(|s| s.elapsed()) {
+            self.record_success(self.current_idx, elapsed);
+        }
     }
 
     /// Kick off the next plan entry's `create_message_stream`. Returns
@@ -1120,6 +1146,16 @@ impl Stream for RetryingFreeStream {
                         }
                         _ => {}
                     }
+                    // Interactive consumers break on MessageStop and drop the
+                    // stream, so credit the successful dispatch at the
+                    // completion signal rather than only when the stream is
+                    // drained to `None` (which they never reach). Empty
+                    // attempts are NOT credited here — they still flow through
+                    // the empty-completion re-dispatch path when polled to
+                    // `None`, and otherwise remain uncounted.
+                    if matches!(evt, StreamEvent::MessageStop) {
+                        self.maybe_record_success();
+                    }
                     return Poll::Ready(Some(Ok(evt)));
                 }
                 Poll::Ready(Some(Err(err))) => {
@@ -1180,9 +1216,13 @@ impl Stream for RetryingFreeStream {
                         })));
                     }
 
-                    // Non-empty success — record latency.
-                    if let Some(elapsed) = elapsed {
-                        self.record_success(self.current_idx, elapsed);
+                    // Non-empty success — record latency/success, guarded so a
+                    // completion already credited at MessageStop is not
+                    // double-counted by consumers that poll to the end.
+                    if !self.success_recorded {
+                        if let Some(elapsed) = elapsed {
+                            self.record_success(self.current_idx, elapsed);
+                        }
                     }
                     return Poll::Ready(None);
                 }
@@ -2983,6 +3023,86 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_success_credits_success_rate_at_message_stop() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![stream_entry("huggingface", true, Some("hello"))],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                latency: Some(LatencyConfig { max_samples: 10 }),
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        // Consume exactly like the query loop does: stop at MessageStop and
+        // drop the stream WITHOUT draining it to Poll::Ready(None).
+        while let Some(Ok(event)) = stream.next().await {
+            if matches!(event, StreamEvent::MessageStop) {
+                break;
+            }
+        }
+        drop(stream);
+
+        // Regression: the spec §8.6 success-rate counter was only updated in
+        // the Poll::Ready(None) branch, which interactive consumers never
+        // reach (they break on MessageStop) — so streaming wins were silently
+        // never credited. The win must now be recorded at the completion
+        // signal.
+        let rates = provider.upstream_success_rates();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].0, "huggingface");
+        assert_eq!(rates[0].1, Some(1.0));
+
+        // The latency sample rides the same path — it must be recorded too.
+        let lats = provider.upstream_latencies();
+        assert_eq!(lats[0].0, "huggingface");
+        assert!(
+            lats[0].1.is_some(),
+            "latency sample should be recorded for a streaming win"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_stream_does_not_credit_success_at_message_stop() {
+        use futures::StreamExt;
+
+        // A streaming win is only credited when the attempt produced content.
+        // An empty completion (no text, no tools) must NOT bump the success
+        // counter at MessageStop — it stays uncounted so the empty-completion
+        // re-dispatch path remains the authority for empty attempts.
+        let provider = FreeProvider::with_routing(
+            vec![stream_entry("huggingface", true, None)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        while let Some(Ok(event)) = stream.next().await {
+            if matches!(event, StreamEvent::MessageStop) {
+                break;
+            }
+        }
+        drop(stream);
+
+        let rates = provider.upstream_success_rates();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].0, "huggingface");
+        assert_eq!(rates[0].1, None, "empty attempts must not be credited");
     }
 
     #[tokio::test]
