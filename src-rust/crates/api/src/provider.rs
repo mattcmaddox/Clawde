@@ -222,6 +222,16 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Per-upstream capability metadata for the routing dialog's model view
+    /// (spec §8.6): `(upstream_id, vision, context_window_tokens)`. Lets the
+    /// UI explain why the capability gate (spec §8.4) routes image-bearing or
+    /// oversized requests away from some upstreams. The default returns an
+    /// empty vector — only composite providers that multiplex upstreams
+    /// override this.
+    fn upstream_capabilities(&self) -> Vec<(String, bool, u32)> {
+        Vec::new()
+    }
+
     /// Inject an external key exhaustion signal into the provider's key ring
     /// (e.g. from the health poller — spec §6.4).  Returns `true` if the
     /// key was marked exhausted; `false` when this provider has no key ring

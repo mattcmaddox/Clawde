@@ -20,7 +20,7 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
 };
-use clawde_core::types::ContentBlock;
+use clawde_core::types::{ContentBlock, MessageContent};
 use rand::seq::SliceRandom;
 
 use super::*;
@@ -173,7 +173,7 @@ impl FreeProvider {
         route: &Route,
         request: Option<&ProviderRequest>,
     ) -> Vec<(usize, String)> {
-        match self.routing.strategy {
+        let plan = match self.routing.strategy {
             // Auto is the smart default — it routes by task just like the
             // explicit TaskBased strategy (audit spec §8.4).
             RoutingStrategy::Auto | RoutingStrategy::TaskBased => {
@@ -182,7 +182,106 @@ impl FreeProvider {
             RoutingStrategy::RandomFailover => self.attempt_plan_random(route),
             RoutingStrategy::LatencyBased => self.attempt_plan_latency(route),
             RoutingStrategy::Sequential => self.attempt_plan_sequential(route),
+        };
+
+        // Apply the user-configured disabled-upstream list after the strategy
+        // has built its plan, then the per-request capability gate. Keeping
+        // these as one final gate ensures pinned, family, task-preferred,
+        // sequential, random, and latency routes all honor the same settings.
+        // Unknown ids are harmless: they simply never match an active chain
+        // entry.
+        plan.into_iter()
+            .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
+            .filter(|(idx, _)| self.entry_fits_request(*idx, request))
+            .collect()
+    }
+
+    fn is_disabled_upstream(&self, idx: usize) -> bool {
+        self.chain.get(idx).is_some_and(|entry| {
+            self.routing
+                .disabled_upstreams
+                .iter()
+                .any(|id| id == entry.upstream.id)
+        })
+    }
+
+    /// Capability gate (audit spec §8.4 "capability match"): drop upstreams
+    /// whose capabilities cannot serve the request's content before dispatch.
+    ///
+    /// - Image-bearing requests skip non-vision upstreams: a text-only
+    ///   provider rejects the image with a 400 `InvalidRequest`, which
+    ///   [`Self::should_fallback`] deliberately does NOT retry — without this
+    ///   gate the whole request would hard-fail on the first text-only
+    ///   upstream instead of reaching a vision-capable one.
+    /// - Requests whose estimated input-token count exceeds an upstream's
+    ///   documented context window are skipped, so the plan does not burn a
+    ///   guaranteed-overflow round-trip (e.g. Copilot's 16K serving cap).
+    ///   Only the input estimate is checked — output tokens are deliberately
+    ///   NOT reserved (the chars/4 estimate under-counts code, and reserving
+    ///   full `max_tokens` would over-filter upstreams that usually emit far
+    ///   less). This is a "definitely won't fit" gate, not a "might not fit".
+    fn entry_fits_request(&self, idx: usize, request: Option<&ProviderRequest>) -> bool {
+        let Some(request) = request else {
+            return true;
+        };
+        let Some(entry) = self.chain.get(idx) else {
+            return true;
+        };
+        if Self::request_has_images(request) && !entry.upstream.vision {
+            return false;
         }
+        let estimate = Self::estimate_request_tokens(request);
+        if estimate > 0 && estimate > u64::from(entry.upstream.context_window) {
+            return false;
+        }
+        true
+    }
+
+    /// Whether the request carries any image content block. Image-bearing
+    /// requests are routed only to vision-capable upstreams.
+    fn request_has_images(request: &ProviderRequest) -> bool {
+        request.messages.iter().any(|m| match &m.content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            _ => false,
+        })
+    }
+
+    /// Estimated input-token size of the request (heuristic from
+    /// `clawde_core::message_utils::estimate_messages_tokens`, ~4 chars/token).
+    fn estimate_request_tokens(request: &ProviderRequest) -> u64 {
+        clawde_core::message_utils::estimate_messages_tokens(&request.messages)
+    }
+
+    /// When the capability gate filters out every upstream, produce a
+    /// user-actionable reason. The generic "all may be in cooldown" message is
+    /// misleading for image/context-filtered plans — an image request with no
+    /// vision upstream configured is a configuration gap, not a cooldown.
+    fn capability_block_reason(&self, request: &ProviderRequest) -> Option<String> {
+        let available: Vec<usize> = (0..self.chain.len())
+            .filter(|idx| !self.is_disabled_upstream(*idx))
+            .collect();
+        if Self::request_has_images(request)
+            && !available.iter().any(|idx| self.chain[*idx].upstream.vision)
+        {
+            return Some(
+                "no enabled upstream supports image input — add a vision-capable provider via /connect (e.g. google or github-copilot)"
+                    .to_string(),
+            );
+        }
+        let estimate = Self::estimate_request_tokens(request);
+        if estimate > 0
+            && !available
+                .iter()
+                .any(|idx| estimate <= u64::from(self.chain[*idx].upstream.context_window))
+        {
+            return Some(format!(
+                "request is too large (approx {} estimated tokens) for every enabled upstream's context window",
+                estimate
+            ));
+        }
+        None
     }
 
     /// Task-based plan (audit spec Phase 2): order the upstreams by how well
@@ -1165,6 +1264,8 @@ impl LlmProvider for FreeProvider {
                 "all free-mode upstreams exhausted (last error: {})",
                 last_err.as_ref().unwrap()
             )
+        } else if let Some(reason) = self.capability_block_reason(&request) {
+            format!("all free-mode upstreams exhausted: {}", reason)
         } else {
             "all free-mode upstreams exhausted — no upstreams had errors, all may be in cooldown"
                 .to_string()
@@ -1267,10 +1368,17 @@ impl LlmProvider for FreeProvider {
             }
         }
 
+        let err_msg = if let Some(reason) = self.capability_block_reason(&request) {
+            format!("all free-mode upstreams exhausted: {}", reason)
+        } else if let Some(err) = &last_err {
+            format!("all free-mode upstreams exhausted (last error: {})", err)
+        } else {
+            "all free-mode upstreams exhausted".to_string()
+        };
         Err(last_err.unwrap_or_else(|| ProviderError::ServerError {
             provider: self.id.clone(),
             status: None,
-            message: "all free-mode upstreams exhausted".to_string(),
+            message: err_msg,
             is_retryable: false,
         }))
     }
@@ -1308,7 +1416,7 @@ impl LlmProvider for FreeProvider {
             models.push(mk(
                 &format!("{}/{}", entry.upstream.id, model),
                 &label,
-                128_000,
+                entry.upstream.context_window,
             ));
         }
 
@@ -1455,6 +1563,23 @@ impl LlmProvider for FreeProvider {
             .collect()
     }
 
+    fn upstream_capabilities(&self) -> Vec<(String, bool, u32)> {
+        // Per-upstream vision + context-window metadata from the catalog, for
+        // the routing dialog's capability view (spec §8.6). Mirrors the
+        // capability gate in `entry_fits_request` so the UI can explain why
+        // image-bearing or oversized requests skip certain upstreams.
+        self.chain
+            .iter()
+            .map(|entry| {
+                (
+                    entry.upstream.id.to_string(),
+                    entry.upstream.vision,
+                    entry.upstream.context_window,
+                )
+            })
+            .collect()
+    }
+
     fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
         // Both cooldown kinds: "5xx" (server-error / circuit-breaker) and
         // "empty" (empty-completion). Locked once, never across an await.
@@ -1476,14 +1601,18 @@ impl LlmProvider for FreeProvider {
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
-        // tool_calling is true when any chain entry's upstream supports it.
+        // tool_calling / image_input are true when any chain entry's
+        // upstream supports it — an image request only routes to vision
+        // entries (see `entry_fits_request`), so the composite advertises
+        // vision iff at least one configured upstream can serve it.
         let tool_calling = self.chain.iter().any(|entry| entry.upstream.tool_calling);
+        let image_input = self.chain.iter().any(|entry| entry.upstream.vision);
 
         ProviderCapabilities {
             streaming: true,
             tool_calling,
             thinking: false,
-            image_input: false,
+            image_input,
             pdf_input: false,
             audio_input: false,
             video_input: false,
@@ -1534,7 +1663,7 @@ impl LlmProvider for FreeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clawde_core::types::{Message, UsageInfo};
+    use clawde_core::types::{ImageSource, Message, UsageInfo};
     use futures::Stream;
     use std::pin::Pin;
     use std::time::Duration;
@@ -2184,6 +2313,78 @@ mod tests {
     }
 
     #[test]
+    fn disabled_upstreams_are_removed_from_task_plans() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "code_generation".to_string(),
+            vec!["groq".to_string(), "cerebras".to_string()],
+        );
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("huggingface", true),
+                entry("groq", true),
+                entry("cerebras", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                task_preferences: Some(overrides),
+                disabled_upstreams: vec!["groq".to_string(), "does-not-exist".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let req = ProviderRequest {
+            messages: vec![Message::user("write a parser module")],
+            ..dummy_request("free/auto")
+        };
+
+        let plan = provider.attempt_plan(&Route::Auto, Some(&req));
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(order, vec!["cerebras", "huggingface"]);
+        assert!(!order.contains(&"groq"));
+    }
+
+    #[test]
+    fn disabled_upstreams_are_removed_from_pinned_and_sequential_plans() {
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry("groq", true),
+                entry("huggingface", true),
+                entry("cerebras", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                disabled_upstreams: vec!["groq".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+
+        let pinned = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 0,
+                pinned_model: "custom-model".to_string(),
+            },
+            None,
+        );
+        let pinned_ids: Vec<&str> = pinned
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(pinned_ids, vec!["huggingface", "cerebras"]);
+
+        let sequential = provider.attempt_plan(&Route::Auto, None);
+        let sequential_ids: Vec<&str> = sequential
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(sequential_ids, vec!["huggingface", "cerebras"]);
+    }
+
+    #[test]
     fn route_auto_for_free_aliases() {
         let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
         assert!(matches!(provider.resolve_route("free"), Route::Auto));
@@ -2741,6 +2942,350 @@ mod tests {
         let hf_model = catalog_entry("huggingface").unwrap().default_model;
         assert_eq!(attempts.len(), 2, "groq tried before huggingface");
         assert_eq!(resp.model, hf_model);
+    }
+
+    // ---- Capability gate (audit spec §8.4 "capability match") ----------------
+
+    fn image_request(model: &str) -> ProviderRequest {
+        let image = Message::user_blocks(vec![ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: Some("image/png".to_string()),
+                data: Some("aGVsbG8=".to_string()),
+                url: None,
+            },
+        }]);
+        ProviderRequest {
+            messages: vec![image],
+            ..dummy_request(model)
+        }
+    }
+
+    #[test]
+    fn capability_gate_drops_non_vision_upstreams_for_image_request() {
+        // An image request must only route to vision-capable upstreams. The
+        // catalog marks github-copilot (gpt-4o) and google (gemini) as vision;
+        // huggingface (Llama) is text-only and its 400 InvalidRequest would
+        // hard-fail the whole request without this gate.
+        let chain = vec![entry("huggingface", true), entry("google", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let plan = provider.attempt_plan(&Route::Auto, Some(&image_request("free/auto")));
+        let ids: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["google"],
+            "text-only upstreams dropped for images"
+        );
+    }
+
+    #[test]
+    fn capability_gate_drops_small_context_upstreams_for_large_request() {
+        // github-copilot documents a 16K serving context — a request that
+        // estimates above 16K tokens must skip it and go to the 128K upstream
+        // instead of burning a guaranteed-overflow round-trip.
+        let chain = vec![entry("github-copilot", true), entry("huggingface", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        // ~4 chars/token → 80K chars ≈ 20K tokens > copilot's 16_384 cap.
+        let big = ProviderRequest {
+            messages: vec![Message::user("a".repeat(80_000))],
+            ..dummy_request("free/auto")
+        };
+        let plan = provider.attempt_plan(&Route::Auto, Some(&big));
+        let ids: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(ids, vec!["huggingface"], "small-context upstream skipped");
+
+        // A small request keeps both upstreams in the plan (copilot
+        // contributes its primary + fallback rows).
+        let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        let ids: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(ids, vec!["github-copilot", "github-copilot", "huggingface"]);
+    }
+
+    #[test]
+    fn capability_gate_drops_pinned_non_vision_upstream_for_image_request() {
+        // The central gate also applies to pinned routes: a user-pinned
+        // text-only upstream is skipped for an image request so the pin
+        // can't hard-fail the whole request on its 400 InvalidRequest.
+        let chain = vec![entry("huggingface", true), entry("google", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let plan = provider.attempt_plan(
+            &Route::Pinned {
+                start_idx: 0,
+                pinned_model: "meta-llama/Llama-3.3-70B-Instruct".to_string(),
+            },
+            Some(&image_request("free/auto")),
+        );
+        let ids: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["google"],
+            "pinned non-vision upstream dropped for image requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_gate_reports_clear_error_when_request_too_large() {
+        // Oversized request + only a 16K-capped upstream → the plan is
+        // empty and the error must explain the context-window gap instead of
+        // blaming cooldown.
+        let chain = vec![entry("github-copilot", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let big = ProviderRequest {
+            messages: vec![Message::user("a".repeat(80_000))],
+            ..dummy_request("free/auto")
+        };
+        let err = provider.create_message(big).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large"),
+            "expected a context-window error, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("in cooldown"),
+            "must not blame cooldown for a context gap: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_gate_never_dispatches_non_vision_upstream_for_image_request() {
+        // End-to-end: the image request must be served by the first
+        // vision-capable upstream and the text-only stub must never be called
+        // (the gate runs before dispatch, not after a failed round-trip).
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let chain = vec![
+            entry_with_log("huggingface", true, log.clone()),
+            entry_with_log("google", true, log.clone()),
+        ];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let resp = provider
+            .create_message(image_request("free/auto"))
+            .await
+            .expect("vision-capable upstream should serve the image request");
+        let attempts: Vec<String> = log.lock().unwrap().clone();
+        let google_model = catalog_entry("google").unwrap().default_model;
+        assert_eq!(attempts.len(), 1, "only the vision upstream is attempted");
+        assert_eq!(resp.model, google_model);
+    }
+
+    #[tokio::test]
+    async fn capability_gate_reports_clear_error_when_no_vision_upstream() {
+        // Image request + only text-only upstreams → the plan is empty and
+        // the error must explain the capability gap instead of blaming
+        // cooldown (which would be actively misleading).
+        let chain = vec![entry("huggingface", true), entry("nvidia", true)];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let err = provider
+            .create_message(image_request("free/auto"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("image input"),
+            "expected a capability-aware error, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("in cooldown"),
+            "must not blame cooldown for a capability gap: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn upstream_capabilities_reports_catalog_metadata() {
+        // The routing dialog's capability badges (spec §8.6) come from this
+        // snapshot — it must mirror the catalog's vision/context fields that
+        // `entry_fits_request` uses to filter.
+        let chain = vec![entry("google", true), entry("github-copilot", true)];
+        let provider = FreeProvider::new(chain);
+        let upstream_caps = provider.upstream_capabilities();
+        let caps: std::collections::HashMap<&str, (bool, u32)> = upstream_caps
+            .iter()
+            .map(|(id, vision, ctx)| (id.as_str(), (*vision, *ctx)))
+            .collect();
+        assert_eq!(caps.get("google"), Some(&(true, 128_000)));
+        assert_eq!(caps.get("github-copilot"), Some(&(true, 16_384)));
+        // Text-only upstreams are flagged so the dialog can explain why an
+        // image request routes away from them.
+        let chain = vec![entry("huggingface", true)];
+        let provider = FreeProvider::new(chain);
+        let caps = provider.upstream_capabilities();
+        assert_eq!(caps, vec![("huggingface".to_string(), false, 128_000)]);
+    }
+
+    #[test]
+    fn disabled_upstreams_filter_random_latency_family_and_fallback_plans() {
+        let plan_ids = |provider: &FreeProvider, plan: Vec<(usize, String)>| {
+            plan.into_iter()
+                .map(|(idx, model)| (provider.chain[idx].upstream.id, model))
+                .collect::<Vec<_>>()
+        };
+
+        let random_provider = FreeProvider::with_routing(
+            vec![
+                entry("nvidia", true),
+                entry("huggingface", true),
+                entry("groq", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::RandomFailover,
+                disabled_upstreams: vec!["nvidia".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let random_plan = plan_ids(
+            &random_provider,
+            random_provider.attempt_plan(&Route::Auto, None),
+        );
+        assert!(!random_plan.iter().any(|(id, _)| *id == "nvidia"));
+        assert_eq!(random_plan.len(), 2);
+
+        let latency_provider = FreeProvider::with_routing(
+            vec![
+                entry("nvidia", true),
+                entry("huggingface", true),
+                entry("groq", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::LatencyBased,
+                disabled_upstreams: vec!["nvidia".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let latency_plan = plan_ids(
+            &latency_provider,
+            latency_provider.attempt_plan(&Route::Auto, None),
+        );
+        assert!(!latency_plan.iter().any(|(id, _)| *id == "nvidia"));
+        assert_eq!(latency_plan.len(), 2);
+
+        let family_provider = FreeProvider::with_routing(
+            vec![
+                entry("nvidia", true),
+                entry("huggingface", true),
+                entry("groq", true),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                disabled_upstreams: vec!["nvidia".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let family_plan = plan_ids(
+            &family_provider,
+            family_provider.attempt_plan(
+                &Route::Family {
+                    model_family: "llama-3.3-70b",
+                },
+                None,
+            ),
+        );
+        assert!(!family_plan.iter().any(|(id, _)| *id == "nvidia"));
+        assert_eq!(
+            family_plan,
+            vec![
+                (
+                    "huggingface",
+                    "meta-llama/Llama-3.3-70B-Instruct".to_string()
+                ),
+                ("groq", "openai/gpt-oss-120b".to_string())
+            ]
+        );
+
+        // NVIDIA's fallback model must disappear with the disabled upstream,
+        // not leak into a later route attempt.
+        assert!(!family_plan
+            .iter()
+            .any(|(_, model)| model == "meta/llama-3.1-8b-instruct"));
+    }
+
+    #[tokio::test]
+    async fn disabled_task_preference_is_not_dispatched() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let provider = FreeProvider::with_routing(
+            vec![
+                entry_with_log("groq", true, log.clone()),
+                entry_with_log("huggingface", true, log.clone()),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::TaskBased,
+                disabled_upstreams: vec!["groq".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let req = ProviderRequest {
+            messages: vec![Message::user("why does the pool keep exhausting?")],
+            ..dummy_request("free/auto")
+        };
+
+        let response = provider
+            .create_message(req)
+            .await
+            .expect("enabled fallback should handle the request");
+        let attempts: Vec<String> = log.lock().unwrap().clone();
+        let hf_model = catalog_entry("huggingface").unwrap().default_model;
+        assert_eq!(attempts, vec![hf_model.to_string()]);
+        assert_eq!(response.model, hf_model);
     }
 
     // -------------------------------------------------------------------

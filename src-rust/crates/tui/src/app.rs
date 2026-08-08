@@ -3032,7 +3032,18 @@ impl App {
                 })
                 .map(|p| p.upstream_latencies())
                 .unwrap_or_default();
-            self.routing_dialog.open(&self.config, latencies);
+            let capabilities = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_capabilities())
+                .unwrap_or_default();
+            self.routing_dialog
+                .open(&self.config, latencies, capabilities);
             return true;
         }
         // /spec-review [<file>]: open the spec review dialog (audit spec §10)

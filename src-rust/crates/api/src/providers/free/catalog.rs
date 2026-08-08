@@ -28,9 +28,19 @@ pub struct FreeUpstream {
     pub note: &'static str,
     /// Whether the default model supports function/tool calling.
     pub tool_calling: bool,
+    /// Whether the upstream's models accept image input. Image-bearing
+    /// requests skip non-vision upstreams at plan-build time so a text-only
+    /// provider's 400 InvalidRequest can't hard-fail the whole request
+    /// (audit spec §8.4 "capability match").
+    pub vision: bool,
     /// Hard cap on `max_tokens` for this upstream's default model.
     /// When set, requests are silently clamped to this value.
     pub max_tokens_cap: Option<u32>,
+    /// Input context window (tokens) of the upstream's default model.
+    /// Requests whose estimated size exceeds this are skipped at plan-build
+    /// time (audit spec §8.4 "capability match"), and `discover_models()`
+    /// reports it so the picker reflects the real cap.
+    pub context_window: u32,
     /// Secondary model IDs tried right after the primary on the SAME
     /// upstream, before the chain moves to the next provider. Lets a slow or
     /// capacity-starved primary (e.g. NVIDIA's 70B routinely exceeding the
@@ -60,7 +70,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "gpt-4o",
         note: "GPT-4o (16K ctx) — free OAuth via /connect",
         tool_calling: true,
+        vision: true,
         max_tokens_cap: Some(16_384),
+        context_window: 16_384,
         fallback_models: &["gpt-4o-2024-08-06"],
         specialty: "best overall",
         usage: "OAuth · 16K",
@@ -74,7 +86,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "llama-3.3-70b",
         note: "free Inference API — Llama 3.3 70B",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "strong generalist",
         usage: "free API · 8K",
@@ -87,7 +101,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "llama-3.3-70b",
         note: "Llama 3.3 70B — 2 keys",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         specialty: "strong generalist",
         usage: "2 keys · 8K",
         // The free tier's 70B worker is routinely capacity-starved (503
@@ -104,7 +120,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "gpt-oss-120b",
         note: "GPT-OSS 120B (65K ctx) · Gemma 4 31B",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 65_536,
         fallback_models: &[],
         specialty: "large context",
         usage: "65K ctx",
@@ -118,7 +136,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "gemini-2.5-flash",
         note: "Gemini 2.5 Flash",
         tool_calling: true,
+        vision: true,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "multimodal",
         usage: "free tier · 8K",
@@ -131,7 +151,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "qwen3-30b",
         note: "10K neurons/day — key format ACCOUNT_ID:API_TOKEN",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "coding",
         usage: "10K/day · 8K",
@@ -144,12 +166,14 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "gpt-oss-120b",
         note: "GPT-OSS 120B · Llama 3.3 70B — 1K req/day",
         tool_calling: true,
+        vision: false,
         specialty: "large context",
         usage: "1K req/day",
         // The groq() factory's own quirks clamp max_tokens to 512 and total
         // to 8.5K (free-tier TPM budget); leave the catalog cap unset so the
         // provider's authoritative tuning is the only clamp applied.
         max_tokens_cap: None,
+        context_window: 128_000,
         fallback_models: &[],
     },
     FreeUpstream {
@@ -160,7 +184,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "llama-3.3-70b",
         note: "Llama 3.3 70B · DeepSeek V3",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "strong generalist",
         usage: "free tier · 8K",
@@ -174,7 +200,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "deepseek-v4-flash",
         note: "live free-model API — auto-discovers best model at startup (currently deepseek-v4-flash)",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "fast",
         usage: "auto-pick · 8K",
@@ -187,7 +215,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "devstral-small",
         note: "Devstral Small (free) · Large · Codestral",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: None,
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "creative",
         usage: "free · ?K",
@@ -200,7 +230,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "north-mini-code",
         note: "North Mini Code (free) · Command R+",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "coding specialist",
         usage: "free · 8K",
@@ -213,7 +245,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "minimax-m2.5",
         note: "MiniMax M2.5 — 2 keys",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "general purpose",
         usage: "2 keys · 8K",
@@ -226,7 +260,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "glm-4.7",
         note: "GLM-4.7 · GLM-5 · GLM-5.1 — Zhipu AI international",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: Some(8_192),
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "reasoning",
         usage: "free · 8K",
@@ -240,7 +276,9 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         model_family: "openrouter-free",
         note: "19 free-tier models — requires $10 prepaid credits",
         tool_calling: true,
+        vision: false,
         max_tokens_cap: None,
+        context_window: 128_000,
         fallback_models: &[],
         specialty: "variety pack",
         usage: "$10 credits · varies",
