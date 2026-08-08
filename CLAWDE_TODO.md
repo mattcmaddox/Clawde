@@ -75,7 +75,7 @@ All six gaps identified in the auto-compact research have been implemented and t
 ### [commands] /ctx-viz command
 - [x] Context visualization command added
 - [x] 5 tests registered and passing
-- [ ] Hooks from the query loop to populate real-time token data are still needed
+- [x] Query-loop hooks populate authoritative real-time token data at `MessageStart`, usage-bearing `MessageDelta`, and `TurnComplete`; output-only deltas never erase the current context value
 
 ### [commands] /summary command
 - [x] Summary command added

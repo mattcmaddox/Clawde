@@ -2133,6 +2133,40 @@ mod tests {
         ));
         assert_eq!(app.context_used_tokens, 600);
 
+        // A final stream delta may carry authoritative input/cache usage
+        // before TurnComplete arrives; it should refresh the live bar.
+        app.handle_query_event(clawde_query::QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(clawde_core::UsageInfo {
+                    input_tokens: 240,
+                    output_tokens: 12,
+                    cache_creation_input_tokens: 8,
+                    cache_read_input_tokens: 360,
+                }),
+            },
+        ));
+        assert_eq!(app.context_used_tokens, 608);
+
+        // Output-only delta usage must not erase the current context value.
+        app.handle_query_event(clawde_query::QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                usage: Some(clawde_core::UsageInfo {
+                    input_tokens: 0,
+                    output_tokens: 99,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+            },
+        ));
+        assert_eq!(app.context_used_tokens, 608);
+
+        // Real stream order: the message stops, then the query loop emits
+        // TurnComplete with the same authoritative usage.
+        app.handle_query_event(clawde_query::QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageStop,
+        ));
         app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
             turn: 1,
             stop_reason: "end_turn".to_string(),
@@ -2146,9 +2180,7 @@ mod tests {
         });
         assert_eq!(app.context_used_tokens, 520);
 
-        // A completion without usage must not replace authoritative data with
-        // an estimate or zero; the next request will reconcile it at
-        // MessageStart when fresh usage is available.
+        // A completion without usage must preserve the last authoritative value.
         app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
             turn: 2,
             stop_reason: "end_turn".to_string(),

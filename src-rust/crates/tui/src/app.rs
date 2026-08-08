@@ -9635,6 +9635,18 @@ impl App {
                         // for this request, including prompt-cache tokens.
                         self.context_used_tokens = usage.total_input();
                     }
+                    clawde_api::AnthropicStreamEvent::MessageDelta { usage, .. } => {
+                        // Some providers repeat authoritative input/cache usage
+                        // in the final message delta. Anthropic often sends an
+                        // output-only delta, which deserializes to zero input;
+                        // never replace a valid context value with that zero.
+                        if let Some(usage) = usage {
+                            let input_tokens = usage.total_input();
+                            if input_tokens > 0 {
+                                self.context_used_tokens = input_tokens;
+                            }
+                        }
+                    }
                     clawde_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
