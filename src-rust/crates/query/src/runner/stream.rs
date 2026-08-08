@@ -83,7 +83,7 @@ pub(crate) fn map_to_anthropic_event(
                 usage: usage.clone(),
             })
         }
-        StreamEvent::RateLimitHeaders { .. } => None,
+        StreamEvent::ProviderAttribution { .. } | StreamEvent::RateLimitHeaders { .. } => None,
         StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
         StreamEvent::Error {
             error_type,

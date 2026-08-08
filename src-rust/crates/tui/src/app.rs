@@ -9691,6 +9691,7 @@ impl App {
                 if let Some(metrics) = observability {
                     self.stats_dialog.record_provider_activity(
                         &metrics.provider_id,
+                        metrics.upstream_id.as_deref(),
                         &metrics.model,
                         metrics.elapsed_ms,
                         metrics.retries,

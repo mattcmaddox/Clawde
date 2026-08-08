@@ -188,6 +188,7 @@ struct ProviderHealthRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderActivityRow {
     provider_id: String,
+    upstream_id: Option<String>,
     model: String,
     requests: u32,
     total_elapsed_ms: u64,
@@ -284,16 +285,17 @@ impl StatsDialogState {
     pub fn record_provider_activity(
         &mut self,
         provider_id: &str,
+        upstream_id: Option<&str>,
         model: &str,
         elapsed_ms: u64,
         retries: u32,
         fallback_used: bool,
     ) {
-        if let Some(row) = self
-            .provider_activity
-            .iter_mut()
-            .find(|row| row.provider_id == provider_id && row.model == model)
-        {
+        if let Some(row) = self.provider_activity.iter_mut().find(|row| {
+            row.provider_id == provider_id
+                && row.upstream_id.as_deref() == upstream_id
+                && row.model == model
+        }) {
             row.requests = row.requests.saturating_add(1);
             row.total_elapsed_ms = row.total_elapsed_ms.saturating_add(elapsed_ms);
             row.retries = row.retries.saturating_add(retries);
@@ -307,6 +309,7 @@ impl StatsDialogState {
         }
         self.provider_activity.push(ProviderActivityRow {
             provider_id: provider_id.to_string(),
+            upstream_id: upstream_id.map(str::to_string),
             model: model.to_string(),
             requests: 1,
             total_elapsed_ms: elapsed_ms,
@@ -667,8 +670,12 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
         )]));
         for row in state.provider_activity.iter().take(8) {
             let mut detail = format!(
-                "  {}  {} req  avg {}ms",
+                "  {}{}  {} req  avg {}ms",
                 row.provider_id,
+                row.upstream_id
+                    .as_deref()
+                    .map(|upstream| format!("/{}", upstream))
+                    .unwrap_or_default(),
                 row.requests,
                 row.average_elapsed_ms()
             );
@@ -1184,8 +1191,8 @@ mod tests {
     #[test]
     fn provider_activity_aggregates_and_renders() {
         let mut state = free_state();
-        state.record_provider_activity("groq", "llama-3.3", 100, 1, true);
-        state.record_provider_activity("groq", "llama-3.3", 300, 0, false);
+        state.record_provider_activity("free", Some("groq"), "llama-3.3", 100, 1, true);
+        state.record_provider_activity("free", Some("groq"), "llama-3.3", 300, 0, false);
         assert_eq!(state.provider_activity[0].requests, 2);
         assert_eq!(state.provider_activity[0].average_elapsed_ms(), 200);
         assert_eq!(state.provider_activity[0].retries, 1);
@@ -1196,7 +1203,7 @@ mod tests {
         render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
         let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         assert!(content.contains("Session provider activity:"));
-        assert!(content.contains("groq"));
+        assert!(content.contains("free/groq"));
         assert!(content.contains("2 req"));
         assert!(content.contains("avg 200ms"));
         assert!(content.contains("1 retry"));
@@ -1207,7 +1214,7 @@ mod tests {
     fn provider_activity_is_bounded() {
         let mut state = StatsDialogState::new();
         for i in 0..20 {
-            state.record_provider_activity("provider", &format!("model-{i}"), i, 0, false);
+            state.record_provider_activity("provider", None, &format!("model-{i}"), i, 0, false);
         }
         assert_eq!(state.provider_activity.len(), 12);
         assert_eq!(state.provider_activity[0].model, "model-8");

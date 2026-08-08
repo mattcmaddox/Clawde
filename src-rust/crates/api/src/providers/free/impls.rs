@@ -645,6 +645,7 @@ struct RetryingFreeStream {
     current: Option<BoxedProviderStream>,
     current_idx: usize,
     current_model: String,
+    pending_attribution: bool,
     starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
     /// Parallel probe for first-byte watchdog (§6.5).
     parallel_starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
@@ -684,6 +685,7 @@ impl RetryingFreeStream {
             current: Some(stream),
             current_idx: idx,
             current_model: upstream_model,
+            pending_attribution: true,
             starting: None,
             parallel_starting: None,
             parallel_idx: 0,
@@ -828,6 +830,7 @@ impl Stream for RetryingFreeStream {
                     Poll::Ready(Ok(Ok(stream))) => {
                         self.starting = None;
                         self.current = Some(stream);
+                        self.pending_attribution = true;
                     }
                     Poll::Ready(Ok(Err(err))) => {
                         self.starting = None;
@@ -941,6 +944,7 @@ impl Stream for RetryingFreeStream {
                         self.current = Some(stream);
                         self.current_idx = self.parallel_idx;
                         self.current_model = std::mem::take(&mut self.parallel_model);
+                        self.pending_attribution = true;
                         self.reset_attempt();
                     }
                     Poll::Ready(Ok(Err(err))) => {
@@ -954,6 +958,19 @@ impl Stream for RetryingFreeStream {
                     }
                     Poll::Pending => {} // still in-flight
                 }
+            }
+
+            // Announce the currently selected upstream before exposing its
+            // content. This also re-announces after empty-completion and
+            // parallel-probe switches, so the query loop always ends with the
+            // successful upstream's attribution.
+            if self.pending_attribution {
+                self.pending_attribution = false;
+                return Poll::Ready(Some(Ok(StreamEvent::ProviderAttribution {
+                    provider_id: ProviderId::FREE.to_string(),
+                    upstream_id: self.chain[self.current_idx].upstream.id.to_string(),
+                    model: self.current_model.clone(),
+                })));
             }
 
             // Poll the active stream.
@@ -1769,6 +1786,103 @@ mod tests {
         }
     }
 
+    struct StreamStubProvider {
+        id: ProviderId,
+        stream_ok: bool,
+        text: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamStubProvider {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "stream-stub"
+        }
+
+        async fn create_message(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            unimplemented!("attribution tests only use streaming")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<
+            Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
+            ProviderError,
+        > {
+            if !self.stream_ok {
+                return Err(ProviderError::ServerError {
+                    provider: self.id.clone(),
+                    status: Some(503),
+                    message: "stream stub failure".into(),
+                    is_retryable: true,
+                });
+            }
+
+            let mut events = vec![Ok(StreamEvent::MessageStart {
+                id: "stream-stub-message".into(),
+                model: request.model,
+                usage: UsageInfo::default(),
+            })];
+            if let Some(text) = self.text {
+                events.push(Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: text.into(),
+                }));
+            }
+            events.extend([
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ]);
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: SystemPromptStyle::SystemMessage,
+            }
+        }
+    }
+
+    fn stream_entry(id: &'static str, stream_ok: bool, text: Option<&'static str>) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StreamStubProvider {
+                id: ProviderId::new(id),
+                stream_ok,
+                text,
+            }),
+            effective_model: None,
+        }
+    }
+
     fn entry(id: &'static str, ok: bool) -> FreeEntry {
         let upstream = *catalog_entry(id).expect("catalog entry");
         FreeEntry {
@@ -2485,6 +2599,61 @@ mod tests {
                 message: "filtered".into(),
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn free_stream_attribution_tracks_initial_and_empty_retry_upstreams() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_entry("huggingface", true, None),
+                stream_entry("cerebras", true, Some("fallback answer")),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+
+        let mut attributions = Vec::new();
+        while let Some(Ok(event)) = stream.next().await {
+            if let StreamEvent::ProviderAttribution {
+                provider_id,
+                upstream_id,
+                model,
+            } = event
+            {
+                attributions.push((provider_id, upstream_id, model));
+                if attributions.len() == 2 {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            attributions,
+            vec![
+                (
+                    "free".to_string(),
+                    "huggingface".to_string(),
+                    catalog_entry("huggingface")
+                        .unwrap()
+                        .default_model
+                        .to_string(),
+                ),
+                (
+                    "free".to_string(),
+                    "cerebras".to_string(),
+                    catalog_entry("cerebras").unwrap().default_model.to_string(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

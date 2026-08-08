@@ -164,6 +164,16 @@ pub enum StreamEvent {
 
     /// Incremental reasoning / scratchpad delta (alias used by some providers).
     ReasoningDelta { index: usize, reasoning: String },
+    /// Identifies the concrete upstream selected by a composite provider.
+    ///
+    /// This is emitted by FreeProvider before the selected upstream's content
+    /// events. Native providers do not need to emit it.
+    ProviderAttribution {
+        provider_id: String,
+        upstream_id: String,
+        model: String,
+    },
+
     /// Rate-limit usage metadata extracted from response headers.
     /// Sent once per request before any stream content.
     RateLimitHeaders {

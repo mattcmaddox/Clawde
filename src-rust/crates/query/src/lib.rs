@@ -260,6 +260,9 @@ impl QueryConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnObservability {
     pub provider_id: String,
+    /// Concrete upstream for composite providers such as FreeProvider.
+    /// Native providers leave this unset.
+    pub upstream_id: Option<String>,
     pub model: String,
     /// Wall-clock duration for the complete logical completion, including
     /// tool rounds and provider retries/fallbacks.
@@ -1252,6 +1255,8 @@ pub async fn run_query_loop(
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
+                    let mut actual_upstream_id: Option<String> = None;
+                    let mut actual_model = model_id_str.clone();
 
                     use futures::StreamExt as ProviderStreamExt;
                     let provider_stall_timeout = std::time::Duration::from_secs(45);
@@ -1291,6 +1296,14 @@ pub async fn run_query_loop(
 
                                         // Accumulate response data.
                                         match &evt {
+                                            clawde_api::StreamEvent::ProviderAttribution {
+                                                upstream_id,
+                                                model,
+                                                ..
+                                            } => {
+                                                actual_upstream_id = Some(upstream_id.clone());
+                                                actual_model = model.clone();
+                                            }
                                             clawde_api::StreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
                                                 if let Some(ref tx) = event_tx {
                                                     let _ = tx.send(QueryEvent::RateLimitUpdate {
@@ -1590,7 +1603,8 @@ pub async fn run_query_loop(
                             usage: Some(usage.clone()),
                             observability: Some(TurnObservability {
                                 provider_id: provider_id_str.clone(),
-                                model: model_id_str.clone(),
+                                upstream_id: actual_upstream_id.clone(),
+                                model: actual_model.clone(),
                                 elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
                                 retries: request_retries,
                                 fallback_used: fallback_used_for_turn,
@@ -1951,6 +1965,7 @@ pub async fn run_query_loop(
                     usage: Some(usage.clone()),
                     observability: Some(TurnObservability {
                         provider_id: "anthropic".to_string(),
+                        upstream_id: None,
                         model: effective_model.clone(),
                         elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
                         retries: request_retries,
@@ -3342,6 +3357,7 @@ mod tests {
             })
             .expect("completed turns should carry observability");
         assert_eq!(metrics.provider_id, "mockprov");
+        assert_eq!(metrics.upstream_id, None);
         assert_eq!(metrics.model, "mock-model");
         assert_eq!(metrics.retries, 0);
         assert!(!metrics.fallback_used);
