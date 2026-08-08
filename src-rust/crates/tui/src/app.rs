@@ -3298,6 +3298,9 @@ impl App {
             }
             "stats" => {
                 self.stats_dialog.open();
+                if let Some(registry) = self.provider_registry.as_deref() {
+                    self.stats_dialog.refresh_provider_health(registry);
+                }
                 true
             }
             "mcp" => {
@@ -3593,6 +3596,9 @@ impl App {
             }
             "cost" => {
                 self.stats_dialog.open();
+                if let Some(registry) = self.provider_registry.as_deref() {
+                    self.stats_dialog.refresh_provider_health(registry);
+                }
                 true
             }
             "rewind" => {

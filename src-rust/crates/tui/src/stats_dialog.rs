@@ -176,6 +176,15 @@ pub enum StatsTab {
     Models,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderHealthRow {
+    label: String,
+    active_keys: usize,
+    total_keys: usize,
+    retry_secs: Option<u64>,
+    cooldowns: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct StatsDialogState {
     pub visible: bool,
@@ -189,6 +198,9 @@ pub struct StatsDialogState {
     pub current_streak_days: u32,
     /// The longest streak ever recorded.
     pub longest_streak_days: u32,
+    /// Live key-ring health captured when the dialog opens. This is intentionally
+    /// not persisted: it reflects the currently active provider registry.
+    live_provider_health: Vec<ProviderHealthRow>,
 }
 
 impl StatsDialogState {
@@ -202,7 +214,50 @@ impl StatsDialogState {
             model_breakdown: Vec::new(),
             current_streak_days: 0,
             longest_streak_days: 0,
+            live_provider_health: Vec::new(),
         }
+    }
+
+    /// Refresh live key health and cooldowns from the active provider registry.
+    ///
+    /// The registry already owns this state for routing and `/ctx-viz`; taking
+    /// a snapshot here avoids inventing a second persistence pipeline for
+    /// provider telemetry.
+    pub fn refresh_provider_health(&mut self, registry: &clawde_api::ProviderRegistry) {
+        let mut rows = Vec::new();
+        let mut cooldown_counts = HashMap::new();
+
+        for (provider, entries) in registry.upstream_cooldown_summaries() {
+            for (upstream, _kind, _retry) in entries {
+                *cooldown_counts
+                    .entry(format!("{provider}/{upstream}"))
+                    .or_insert(0usize) += 1;
+            }
+        }
+
+        for (provider, active, total, retry) in registry.key_ring_summaries() {
+            rows.push(ProviderHealthRow {
+                cooldowns: cooldown_counts.get(&provider).copied().unwrap_or(0),
+                label: provider,
+                active_keys: active,
+                total_keys: total,
+                retry_secs: retry,
+            });
+        }
+        for (provider, entries) in registry.upstream_key_health_summaries() {
+            for (upstream, active, total, retry) in entries {
+                let label = format!("{provider}/{upstream}");
+                rows.push(ProviderHealthRow {
+                    cooldowns: cooldown_counts.get(&label).copied().unwrap_or(0),
+                    label,
+                    active_keys: active,
+                    total_keys: total,
+                    retry_secs: retry,
+                });
+            }
+        }
+        rows.sort_by(|a, b| a.label.cmp(&b.label));
+        self.live_provider_health = rows;
     }
 
     pub fn open(&mut self) {
@@ -212,6 +267,7 @@ impl StatsDialogState {
         self.current_streak_days = current;
         self.longest_streak_days = longest;
         self.data = Some(stats);
+        self.live_provider_health.clear();
         self.visible = true;
         self.tab = StatsTab::Overview;
         self.scroll = 0;
@@ -546,6 +602,49 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
                 Style::default().fg(Color::Yellow),
             ),
         ]));
+    }
+
+    if !state.live_provider_health.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            "Live key health:",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        for row in state.live_provider_health.iter().take(8) {
+            let color = if row.active_keys == 0 {
+                Color::Red
+            } else if row.active_keys < row.total_keys {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+            let retry = row
+                .retry_secs
+                .map(|secs| format!("  retry {}s", secs))
+                .unwrap_or_default();
+            let cooldowns = if row.cooldowns > 0 {
+                format!(
+                    "  {} cooldown{}",
+                    row.cooldowns,
+                    if row.cooldowns == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(color)),
+                Span::styled(
+                    format!("{:<28}", row.label),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("{}/{} keys", row.active_keys, row.total_keys),
+                    Style::default().fg(color),
+                ),
+                Span::styled(retry, Style::default().fg(Color::Yellow)),
+                Span::styled(cooldowns, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
     }
 
     if !data.by_model.is_empty() {
@@ -988,6 +1087,27 @@ mod tests {
             ..AggregatedStats::default()
         });
         state
+    }
+
+    #[test]
+    fn live_provider_health_renders_key_state_and_cooldown() {
+        let mut state = free_state();
+        state.live_provider_health.push(ProviderHealthRow {
+            label: "free/groq".into(),
+            active_keys: 1,
+            total_keys: 2,
+            retry_secs: Some(30),
+            cooldowns: 1,
+        });
+        let area = Rect::new(0, 0, 110, 24);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Live key health:"));
+        assert!(content.contains("free/groq"));
+        assert!(content.contains("1/2 keys"));
+        assert!(content.contains("retry 30s"));
+        assert!(content.contains("1 cooldown"));
     }
 
     #[test]
