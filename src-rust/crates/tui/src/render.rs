@@ -3946,8 +3946,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
-        // Display cost if it's >= 0.0, so free models show $0.00
-        if app.cost_usd >= 0.0 {
+        // Only show a cost readout when it's nonzero — free models price at $0.00,
+        // so displaying "$0.0000" would be pure noise.
+        if app.cost_usd > 0.0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }

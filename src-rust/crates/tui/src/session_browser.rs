@@ -224,10 +224,11 @@ impl Default for SessionBrowserState {
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-/// Format a cost as a dollar string with 4 decimal places.
+/// Format a cost as a dollar string with 4 decimal places. Free sessions
+/// price at $0.00, so zero renders as an empty cell instead of "$0.0000".
 fn fmt_cost(usd: f64) -> String {
     if usd < 0.0001 {
-        "$0.0000".to_string()
+        String::new()
     } else {
         format!("${:.4}", usd)
     }
@@ -318,7 +319,12 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         //   title: ~40 chars  |  date: ~14 chars  |  msgs: 5  |  cost: 9
         let date_w: usize = 14;
         let msgs_w: usize = 5;
-        let cost_w: usize = 9;
+        // Free sessions price at $0.00 — drop the Cost column entirely when no
+        // visible session has a nonzero cost instead of printing a column of
+        // "$0.0000" cells.
+        let any_cost = filtered.iter().any(|s| s.cost_usd >= 0.0001);
+        let cost_w: usize = if any_cost { 9 } else { 0 };
+        let cost_header = if any_cost { "Cost" } else { "" };
         let fixed = date_w + msgs_w + cost_w + 6; // separators & padding
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
@@ -329,7 +335,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 "Title",
                 "Last Updated",
                 "Msgs",
-                "Cost",
+                cost_header,
                 title_w = title_w,
                 date_w = date_w,
                 msgs_w = msgs_w,
@@ -696,10 +702,12 @@ mod tests {
         }
     }
 
-    // 14. fmt_cost formats correctly.
+    // 14. fmt_cost formats correctly — zero renders as an empty cell so free
+    //     sessions don't fill the table with "$0.0000" readouts.
     #[test]
     fn fmt_cost_formats() {
-        assert_eq!(fmt_cost(0.0), "$0.0000");
+        assert_eq!(fmt_cost(0.0), "");
+        assert_eq!(fmt_cost(0.00005), "");
         assert_eq!(fmt_cost(0.0124), "$0.0124");
         assert_eq!(fmt_cost(1.5), "$1.5000");
     }

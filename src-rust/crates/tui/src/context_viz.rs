@@ -537,15 +537,18 @@ pub fn render_context_viz(
     lines.push(Line::from(""));
 
     // -- Cost --------------------------------------------------------------------
-    lines.push(Line::from(vec![
-        Span::styled(" Session cost:  ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("${:.4}", cost_usd),
-            Style::default()
-                .fg(CLAURST_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    // Free sessions price at $0.00 — hide the readout entirely when zero.
+    if cost_usd > 0.0 {
+        lines.push(Line::from(vec![
+            Span::styled(" Session cost:  ", Style::default().fg(Color::White)),
+            Span::styled(
+                format!("${:.4}", cost_usd),
+                Style::default()
+                    .fg(CLAURST_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 
     // Total wrapped rows (long lines wrap inside the modal), so the scroll
     // offset can be clamped and a scrollbar shown when the body overflows —

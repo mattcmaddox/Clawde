@@ -1912,12 +1912,17 @@ async fn run_headless(
             // Streaming text was already printed; add newline
             println!();
             if verbose {
-                eprintln!(
-                    "\nTokens: {} in / {} out | Cost: ${:.4}",
+                // Cost readout only when nonzero — free models price at $0.00.
+                let mut summary = format!(
+                    "\nTokens: {} in / {} out",
                     cost_tracker.input_tokens(),
                     cost_tracker.output_tokens(),
-                    cost_tracker.total_cost_usd(),
                 );
+                let total_cost = cost_tracker.total_cost_usd();
+                if total_cost > 0.0 {
+                    summary.push_str(&format!(" | Cost: ${:.4}", total_cost));
+                }
+                eprintln!("{}", summary);
             }
             match outcome {
                 QueryOutcome::Error(e) => {
