@@ -670,6 +670,14 @@ impl LatencyState {
         let total = successes + failures;
         (total > 0).then(|| successes as f64 / total as f64)
     }
+
+    /// Total recorded dispatches (successes + failures) for upstream `idx`.
+    /// Used to gate trust in a success rate: a couple of samples are noise.
+    fn dispatches(&self, idx: usize) -> u32 {
+        let successes = *self.successes.get(idx).unwrap_or(&0);
+        let failures = *self.failures.get(idx).unwrap_or(&0);
+        successes.saturating_add(failures)
+    }
 }
 
 /// Rate-limit information parsed from provider HTTP response headers.

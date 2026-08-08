@@ -26,6 +26,12 @@ use rand::seq::SliceRandom;
 use super::*;
 
 impl FreeProvider {
+    /// Minimum dispatch count before an upstream's success rate is trusted
+    /// for Auto-ordering. One or two samples are noise — a single failure
+    /// must not relegate a strong upstream to the tail, nor a single win
+    /// promote a flaky one ahead of a proven provider.
+    const MIN_SUCCESS_RATE_SAMPLES: u32 = 3;
+
     /// Resolve the effective default model for the entry at `idx`.
     /// Uses the auto-detected override when available, otherwise falls
     /// back to the hardcoded `upstream.default_model`.
@@ -355,10 +361,12 @@ impl FreeProvider {
 
         // Task-preferred upstreams first, then every remaining upstream in
         // catalog order — each contributing its primary + fallback models.
-        // Within the preferred group, order by historical average latency
-        // (fastest first, spec §8.4 criterion 2) so a task-appropriate
-        // upstream that has proven slow yields to a faster one. Upstreams
-        // without samples (avg_latency = f64::MAX) sort to the group tail,
+        // Within the preferred group, order by dispatch success rate then
+        // historical average latency (spec §8.4 criterion 2 + success-rate
+        // refinement): a task-appropriate upstream that keeps failing yields
+        // to one that actually succeeds, and among equally reliable upstreams
+        // the faster one leads. Upstreams without enough history sort by
+        // latency alone; upstreams with no history sort to the group tail,
         // keeping their preference order via the stable sort.
         let mut preferred: Vec<usize> = Vec::with_capacity(self.chain_len());
         for pref in &prefs {
@@ -379,11 +387,10 @@ impl FreeProvider {
             }
         }
         if preferred.len() > 1 {
-            let latencies = self.latencies.lock().unwrap();
+            let lat = self.latencies.lock().unwrap();
             preferred.sort_by(|a, b| {
-                latencies
-                    .avg_latency(*a)
-                    .partial_cmp(&latencies.avg_latency(*b))
+                Self::preferred_order_key(&lat, *a)
+                    .partial_cmp(&Self::preferred_order_key(&lat, *b))
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
@@ -391,6 +398,25 @@ impl FreeProvider {
             plan.extend(self.plan_rows_for_entry(idx));
         }
         plan
+    }
+
+    /// Ordering key for the task-preferred group (spec §8.4 criterion 2 +
+    /// success-rate refinement, see [`Self::MIN_SUCCESS_RATE_SAMPLES`]).
+    ///
+    /// - Rank 0: enough dispatch history — sort by success rate descending
+    ///   (negated so ascending sort puts higher rates first), then latency
+    ///   ascending.
+    /// - Rank 1: a couple of samples — rates not yet trustworthy, sort by
+    ///   latency alone.
+    /// - Rank 2: no history — group tail, keeping preference order.
+    fn preferred_order_key(lat: &LatencyState, idx: usize) -> (u8, f64, f64) {
+        let dispatches = lat.dispatches(idx);
+        let avg = lat.avg_latency(idx);
+        match (dispatches, lat.success_rate(idx)) {
+            (n, Some(rate)) if n >= Self::MIN_SUCCESS_RATE_SAMPLES => (0, -rate, avg),
+            (n, _) if n > 0 => (1, 0.0, avg),
+            _ => (2, 0.0, avg),
+        }
     }
 
     /// One chain entry's contribution to the dispatch plan: the effective
@@ -2777,6 +2803,101 @@ mod tests {
         for (_, model) in &plan {
             assert!(!model.is_empty());
         }
+    }
+
+    #[test]
+    fn attempt_plan_auto_prefers_high_success_rate_over_latency() {
+        // CodeGeneration preferences order huggingface (3rd) before groq
+        // (4th). groq is fast (1s avg) but keeps failing (0% at 3+);
+        // huggingface is slow (5s avg) but reliable (100%). The preferred
+        // group must promote the reliable upstream despite its latency.
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        {
+            let mut lat = provider.latencies.lock().unwrap();
+            for _ in 0..3 {
+                lat.record_success(0); // huggingface: 100%
+                lat.record(0, 5.0, 10);
+                lat.record_failure(1); // groq: 0%
+                lat.record(1, 1.0, 10); // fast — but failing
+            }
+        }
+        let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert_eq!(
+            plan[0].0, 0,
+            "huggingface (100%) must lead groq (0%) despite higher latency"
+        );
+        assert_eq!(plan[1].0, 1);
+    }
+
+    #[test]
+    fn attempt_plan_auto_ignores_success_rate_below_min_samples() {
+        // groq has only 2 dispatches (both wins) — below
+        // MIN_SUCCESS_RATE_SAMPLES — so its rate must NOT be trusted to
+        // reorder the group. huggingface (3 dispatches, 100%) keeps its
+        // preference-order lead even though groq is far faster.
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        {
+            let mut lat = provider.latencies.lock().unwrap();
+            for _ in 0..3 {
+                lat.record_success(0);
+                lat.record(0, 5.0, 10);
+            }
+            for _ in 0..2 {
+                lat.record_success(1);
+                lat.record(1, 0.1, 10);
+            }
+        }
+        let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert_eq!(
+            plan[0].0, 0,
+            "small-sample rates must not reorder the group"
+        );
+        assert_eq!(plan[1].0, 1);
+    }
+
+    #[test]
+    fn attempt_plan_auto_breaks_success_rate_ties_by_latency() {
+        // Both upstreams 100% at 3+ dispatches — the faster one leads.
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        {
+            let mut lat = provider.latencies.lock().unwrap();
+            for _ in 0..3 {
+                lat.record_success(0);
+                lat.record(0, 9.0, 10);
+                lat.record_success(1);
+                lat.record(1, 0.8, 10);
+            }
+        }
+        let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert_eq!(plan[0].0, 1, "faster upstream leads when trusted rates tie");
+        assert_eq!(plan[1].0, 0);
+    }
+
+    #[test]
+    fn attempt_plan_auto_keeps_unmeasured_upstreams_at_preferred_tail() {
+        // No dispatch history for either upstream — both are rank 2, so the
+        // stable sort keeps the preference order unchanged (no phantom
+        // reordering from empty counters).
+        let provider = FreeProvider::with_routing(
+            vec![entry("huggingface", true), entry("groq", true)],
+            RoutingConfig::default(),
+            false,
+        );
+        let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
+        assert_eq!(plan[0].0, 0);
+        assert_eq!(plan[1].0, 1);
     }
 
     #[test]
