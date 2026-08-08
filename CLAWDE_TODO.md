@@ -238,6 +238,13 @@ on parse failure, and the default theme is used as fallback.
 
 ---
 
+## 🟡 Free-Mode Routing Decision
+
+- [x] **Deprioritize money-based routing:** Clawde no longer pursues paid support, so dollar cost,
+  billing price, and estimated spend must not drive FreeProvider selection or add configuration
+  complexity. Prioritize capability, key/quota health, cooldowns, latency, reliability, and
+  explicit provider preferences instead.
+
 ## 🟡 Free-Mode Reliability — Empty-Completion Cooldowns — Complete
 
 ### [free] Retry empty completions across upstreams (spec §6.2)

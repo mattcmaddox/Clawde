@@ -334,6 +334,10 @@ pub enum QueryEvent {
     /// writing turn so the TUI can open the Accept/Edit/Reject dialog
     /// instead of only printing a status line.
     SpecForReview(String),
+    /// Project memory was successfully updated by background consolidation or
+    /// session-memory extraction. Carries the updated memory entrypoint so
+    /// interactive clients can surface the existing memory-update notification.
+    MemoryUpdated(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -2013,6 +2017,7 @@ pub async fn run_query_loop(
                         let model_clone = config.model.clone();
                         let messages_clone = messages.clone();
                         let working_dir_clone = tool_ctx.working_dir.clone();
+                        let event_tx_for_memory = event_tx.clone();
 
                         // Build a fresh client using the same API key.  This avoids
                         // requiring an Arc in the existing run_query_loop signature.
@@ -2051,6 +2056,10 @@ pub async fn run_query_loop(
                                                         error = %e,
                                                         "Failed to persist session memories"
                                                     );
+                                                } else if let Some(tx) = event_tx_for_memory {
+                                                    let _ = tx.send(QueryEvent::MemoryUpdated(
+                                                        target.display().to_string(),
+                                                    ));
                                                 }
                                             }
                                             Ok(_) => {} // no memories extracted
@@ -2101,27 +2110,42 @@ pub async fn run_query_loop(
                             let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
                             if let Ok(Some(task)) = dreamer.maybe_trigger().await {
                                 // Run the consolidation subagent in a background Tokio
-                                // task. We use the AgentTool execute path (via
-                                // poll_background_agent / BACKGROUND_AGENTS) to avoid
-                                // re-entering run_query_loop from within the same
-                                // future graph.
+                                // task so the parent query loop stays responsive. The
+                                // nested AgentTool call is synchronous within this task,
+                                // which lets its result determine whether the memory
+                                // update notification is emitted.
                                 let agent_input = serde_json::json!({
                                     "description": "memory consolidation",
                                     "prompt": task.prompt,
                                     "max_turns": 20,
                                     "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
-                                    "run_in_background": true,
+                                    // The outer tokio task already makes this
+                                    // non-blocking for the parent query loop. The
+                                    // nested agent must run synchronously here so
+                                    // MemoryUpdated means consolidation actually
+                                    // finished, not merely that it was scheduled.
+                                    "run_in_background": false,
                                     "isolation": null
                                 });
                                 let ctx_for_dream = tool_ctx.clone();
+                                let event_tx_for_dream = event_tx.clone();
+                                let memory_entrypoint =
+                                    task.memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
                                 tokio::spawn(async move {
                                     let agent = crate::agent_tool::AgentTool;
-                                    let _result = clawde_tools::Tool::execute(
+                                    let result = clawde_tools::Tool::execute(
                                         &agent,
                                         agent_input,
                                         &ctx_for_dream,
                                     )
                                     .await;
+                                    if !result.is_error {
+                                        if let Some(tx) = event_tx_for_dream {
+                                            let _ = tx.send(QueryEvent::MemoryUpdated(
+                                                memory_entrypoint.display().to_string(),
+                                            ));
+                                        }
+                                    }
                                     crate::auto_dream::AutoDream::finish_consolidation(&task).await;
                                 });
                             }

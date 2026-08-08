@@ -582,6 +582,21 @@ Layer 3: GATE POLICY
 
 5. **Gate policies are the least standardized** — each project implements them differently. LiteLLM uses custom classes, OpenRouter uses a `provider` JSON object, Portkey uses nested conditional logic.
 
+### Project Decision: Deprioritize Money-Based Routing
+
+Clawde is focused on free providers and is no longer pursuing paid support. Do not prioritize
+routing by dollar cost, billing price, or estimated spend. Cost metadata may remain useful as
+passive provider metadata for future integrations, but it should not drive FreeProvider
+selection, fallback order, TUI complexity, or user configuration.
+
+Prefer signals that improve the free-tier experience:
+
+- provider capability and request compatibility
+- key health, quota availability, and cooldown state
+- latency and first-byte responsiveness
+- reliability and recent fallback history
+- explicit user/provider preferences
+
 ### Revised: Proposed Architecture (Informed by Industry Research)
 
 ```rust
@@ -608,8 +623,9 @@ enum LoadBalancingStrategy {
     Weighted { upstream_weights: Vec<(&'static str, u8)> },
     /// Fastest historical TTFT/latency
     LatencyBased,
-    /// Lowest cost per token
-    CostBased,
+    /// Deferred: money-based routing is intentionally not a project priority.
+    /// Keep pricing as passive metadata only if an integration needs it.
+    // CostBased is deliberately omitted from the active strategy enum.
     /// Highest remaining quota (rate-limit aware)
     UsageBased,
 }
@@ -642,7 +658,7 @@ enum GatePolicy {
 | **Phase 1** | `capability-filter`, `session-affinity` | Low | High — prevents silent failures, improves consistency |
 | **Phase 2** | `circuit-breaker`, `provider-preferences` | Medium | High — protects against death-spiral retries, gives users control |
 | **Phase 3** | `latency-based`, `hedging` | High | Medium — tail latency reduction, token waste tradeoff |
-| **Phase 4** | `cost-based`, `weighted`, `usage-based`, `content-policy-fallback` | Medium | Low — requires upstream metadata (cost, quotas) not yet tracked |
+| **Phase 4** | `weighted`, `usage-based`, `content-policy-fallback` | Medium | Low — defer until higher-value free-tier signals are complete |
 
 ### Notes from Industry Research
 

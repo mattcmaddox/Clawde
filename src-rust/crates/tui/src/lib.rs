@@ -1976,6 +1976,23 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_memory_updated_shows_notification() {
+        let mut app = make_app();
+        app.handle_query_event(clawde_query::QueryEvent::MemoryUpdated(
+            "/tmp/project/memory/MEMORY.md".to_string(),
+        ));
+        assert!(app.memory_update_notification.visible);
+        assert_eq!(
+            app.memory_update_notification.memory_path,
+            "/tmp/project/memory/MEMORY.md"
+        );
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Project memory updated: ")));
+    }
+
+    #[test]
     fn test_handle_spec_for_review_opens_dialog() {
         let mut app = make_app();
         let dir = std::env::temp_dir().join(format!("clawde-tui-spec-ev-{}", std::process::id()));

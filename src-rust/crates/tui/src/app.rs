@@ -9765,6 +9765,13 @@ impl App {
                     }
                 }
             }
+            QueryEvent::MemoryUpdated(path) => {
+                self.memory_update_notification.show(&path);
+                self.status_message = Some(format!(
+                    "Project memory updated: {}",
+                    crate::memory_update_notification::get_relative_memory_path(&path)
+                ));
+            }
 
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
