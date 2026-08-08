@@ -523,6 +523,13 @@ pub type UpstreamSuccessRateSummaries = Vec<(String, Vec<(String, Option<f64>)>)
 /// [`ProviderRegistry::upstream_latency_summaries`].
 pub type UpstreamLatencySummaries = Vec<(String, Vec<(String, Option<f64>)>)>;
 
+/// Type alias for per-upstream per-task dispatch success-rate summaries
+/// returned by [`ProviderRegistry::upstream_task_success_rate_summaries`].
+/// Mirrors the trait's [`UpstreamTaskSuccessRates`] shape (`Option<f64>` —
+/// `None` before a task's first dispatch); consumers filter to `Some`.
+pub type UpstreamTaskSuccessRateSummaries =
+    Vec<(String, Vec<(String, Vec<(String, Option<f64>)>)>)>;
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
@@ -677,6 +684,24 @@ impl ProviderRegistry {
         let mut summaries = Vec::new();
         for (id, provider) in &self.providers {
             let entries = provider.upstream_latencies();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream per-task dispatch success rates from all
+    /// registered composite providers. Each entry is `(provider_name,
+    /// Vec<(upstream_id, [(task_key, success_rate)])>)` — only tasks with at
+    /// least one recorded dispatch appear, so the /keys health view can show
+    /// the same per-task picture as the routing dialog (spec §8.6). Sorted by
+    /// provider name.
+    pub fn upstream_task_success_rate_summaries(&self) -> UpstreamTaskSuccessRateSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_task_success_rates();
             if !entries.is_empty() {
                 summaries.push((id.to_string(), entries));
             }

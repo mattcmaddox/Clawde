@@ -171,6 +171,42 @@ Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
 `huggingface`, `google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
 `sambanova`, `nvidia`, `cohere`, `mistral`, `cline`).
 
+### Router behaviour (audit spec Phase 2)
+
+Beyond choosing a strategy, the smart router applies a few automatic guards and
+refinements on every request:
+
+- **Capability gating** — image-bearing requests only reach vision-capable
+  upstreams, and requests whose estimated input tokens exceed an upstream's
+  context window are skipped before dispatch. Instead of burning a guaranteed-
+  fail round-trip on a text-only or undersized provider, the chain moves
+  straight to one that can serve the request.
+- **Performance-aware ordering** — within the task-preferred group, upstreams
+  with enough dispatch history are ordered by **success rate, then average
+  latency**. A task-appropriate upstream that keeps failing yields to one that
+  actually succeeds; unmeasured upstreams tail the group in preference order.
+- **Persistent cooldowns** — 5xx / server-error and empty-completion cooldowns
+  are written to `~/.clawde/empty-cooldown-state/free.json` and restored on the
+  next launch, so a flaky upstream is not re-hit after every restart. The
+  cooldown duration for server errors is configurable via
+  `providers.free.options.routing.upstream_5xx_cooldown_secs` (default 45s);
+  set it to `0` to disable.
+
+**Model-performance dashboards (spec §8.6):** the router records dispatch
+success rates (aggregate and per-task) plus average latency per upstream, and
+exposes them in three places:
+
+- `/routing edit` — key-health dots, cooldown tags, capability badges, average
+  latency, and success rate per upstream. The `%` column is task-aware: select
+  a task in the left pane to see each upstream's rate **for that task**
+  (falling back to the aggregate when the task has no dispatches on it).
+- `/stats` — the live key-health table shows each upstream's success rate
+  (green ≥99%, yellow partial, red 0%) and average latency alongside the key
+  dots and cooldown counts.
+- `/keys health` — the *Free Upstream Performance* section lists each
+  upstream's aggregate success rate, average latency, and per-task success
+  rates in CLI form, honoring the same provider/upstream filter.
+
 ---
 
 ## Provider Reference

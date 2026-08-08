@@ -401,6 +401,130 @@ fn format_duration(total_secs: u64) -> String {
     parts.join(" ")
 }
 
+/// Render the free-mode upstream model-performance section (spec §8.6) for
+/// `/keys health`: per-upstream dispatch success rate, average latency, and
+/// per-task success rates (the same data as the /routing edit dashboard, in
+/// CLI form). Respects the same provider/upstream filter as the rest of the
+/// command: `free` or no filter shows every upstream; a specific upstream id
+/// shows only that row.
+fn render_free_upstream_performance(
+    lines: &mut Vec<String>,
+    reg: &clawde_api::ProviderRegistry,
+    provider_filter: Option<&str>,
+) {
+    let success = reg.upstream_success_rate_summaries();
+    let latencies = reg.upstream_latency_summaries();
+    let task_rates = reg.upstream_task_success_rate_summaries(); // Join the three snapshots on (provider, upstream) label. A provider is
+                                                                 // included when ANY of the three has an entry for it; rows are built from
+                                                                 // the union of upstream ids seen. The three sources have different inner
+                                                                 // types, so each is collected separately.
+    let mut upstreams: Vec<(String, String)> = Vec::new();
+    for (provider, entries) in &success {
+        for (upstream, _) in entries {
+            let label = (provider.clone(), upstream.clone());
+            if !upstreams.contains(&label) {
+                upstreams.push(label);
+            }
+        }
+    }
+    for (provider, entries) in &latencies {
+        for (upstream, _) in entries {
+            let label = (provider.clone(), upstream.clone());
+            if !upstreams.contains(&label) {
+                upstreams.push(label);
+            }
+        }
+    }
+    for (provider, entries) in &task_rates {
+        for (upstream, _) in entries {
+            let label = (provider.clone(), upstream.clone());
+            if !upstreams.contains(&label) {
+                upstreams.push(label);
+            }
+        }
+    }
+    if upstreams.is_empty() {
+        return;
+    }
+
+    // The free provider is the only composite that reports per-upstream
+    // performance today; tolerate others generically via the label.
+    let show_section = provider_filter
+        .map(|f| f == "free" || upstreams.iter().any(|(_, u)| u == f))
+        .unwrap_or(true);
+    let upstream_filter = provider_filter.filter(|f| *f != "free");
+    if !show_section {
+        return;
+    }
+
+    let rate_for = |provider: &str, upstream: &str| -> Option<f64> {
+        success
+            .iter()
+            .find(|(p, _)| p == provider)
+            .and_then(|(_, e)| e.iter().find(|(u, _)| u == upstream))
+            .and_then(|(_, r)| *r)
+    };
+    let latency_for = |provider: &str, upstream: &str| -> Option<f64> {
+        latencies
+            .iter()
+            .find(|(p, _)| p == provider)
+            .and_then(|(_, e)| e.iter().find(|(u, _)| u == upstream))
+            .and_then(|(_, l)| *l)
+    };
+    let tasks_for = |provider: &str, upstream: &str| -> Vec<(String, f64)> {
+        task_rates
+            .iter()
+            .find(|(p, _)| p == provider)
+            .and_then(|(_, e)| e.iter().find(|(u, _)| u == upstream))
+            .map(|(_, t)| {
+                t.iter()
+                    .filter_map(|(k, r)| r.map(|rate| (k.clone(), rate)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    lines.push("\nFree Upstream Performance".to_string());
+    lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+    let mut rendered = 0usize;
+    for (provider, upstream) in &upstreams {
+        if upstream_filter.is_some_and(|f| f != upstream.as_str()) {
+            continue;
+        }
+        let rate = rate_for(provider, upstream);
+        let latency = latency_for(provider, upstream);
+        let tasks = tasks_for(provider, upstream);
+        if rate.is_none() && latency.is_none() && tasks.is_empty() {
+            continue;
+        }
+        let rate_str = rate
+            .map(|r| format!("{:.0}%", r * 100.0))
+            .unwrap_or_else(|| "—".to_string());
+        let latency_str = latency
+            .map(|s| format!("{:.1}s", s))
+            .unwrap_or_else(|| "—".to_string());
+        let mut line = format!(
+            "  {} · {}  {} success · {} avg",
+            provider, upstream, rate_str, latency_str
+        );
+        if !tasks.is_empty() {
+            let tasks_str: Vec<String> = tasks
+                .iter()
+                .map(|(k, r)| format!("{} {:.0}%", k, r * 100.0))
+                .collect();
+            line.push_str(&format!("   ({})", tasks_str.join(", ")));
+        }
+        lines.push(line);
+        rendered += 1;
+    }
+    if rendered == 0 {
+        // No upstream has performance data yet — keep the section out rather
+        // than showing an empty box.
+        lines.pop();
+        lines.pop();
+    }
+}
+
 /// Show runtime key health from persisted cooldown state files.
 ///
 /// Reads the `key-ring-state` files written by `KeyRotatingProvider`
@@ -626,6 +750,12 @@ fn cmd_health(
                 }
             }
         }
+
+        // Live free-mode upstream model-performance (spec §8.6): dispatch
+        // success rate, average latency, and per-task success rates, so the
+        // CLI health view matches the /routing edit dashboard. Only visible
+        // when a provider registry is available.
+        render_free_upstream_performance(&mut lines, reg, provider_filter);
     }
 
     if provider_filter.is_none() {
@@ -920,12 +1050,16 @@ pub(crate) mod tests {
     }
 
     /// Minimal `LlmProvider` that reports a fixed set of per-upstream
-    /// empty-completion cooldowns (spec §6.3). The real `CooldownState` is
-    /// private to the api crate, so a stub is the cleanest way to drive the
-    /// registry aggregation + `cmd_health` rendering.
+    /// empty-completion cooldowns (spec §6.3), success rates, latencies and
+    /// per-task success rates (spec §8.6). The real `CooldownState` /
+    /// `LatencyState` are private to the api crate, so a stub is the cleanest
+    /// way to drive the registry aggregation + `cmd_health` rendering.
     struct CooldownStubProvider {
         id: ProviderId,
         cooldowns: Vec<(String, u32, Option<u64>)>,
+        success_rates: Vec<(String, Option<f64>)>,
+        latencies: Vec<(String, Option<f64>)>,
+        task_rates: clawde_api::provider::UpstreamTaskSuccessRates,
     }
 
     #[async_trait]
@@ -987,6 +1121,18 @@ pub(crate) mod tests {
         fn upstream_empty_cooldowns(&self) -> Vec<(String, u32, Option<u64>)> {
             self.cooldowns.clone()
         }
+
+        fn upstream_success_rates(&self) -> Vec<(String, Option<f64>)> {
+            self.success_rates.clone()
+        }
+
+        fn upstream_latencies(&self) -> Vec<(String, Option<f64>)> {
+            self.latencies.clone()
+        }
+
+        fn upstream_task_success_rates(&self) -> clawde_api::provider::UpstreamTaskSuccessRates {
+            self.task_rates.clone()
+        }
     }
 
     /// Seed the auth store (inside the `CLAWDE_HOME` temp dir) with keys so
@@ -1014,6 +1160,21 @@ pub(crate) mod tests {
                 ("groq".to_string(), 0, Some(60)),
                 ("cerebras".to_string(), 2, None),
             ],
+            success_rates: vec![
+                ("groq".to_string(), Some(1.0)),
+                ("cerebras".to_string(), Some(0.5)),
+            ],
+            latencies: vec![
+                ("groq".to_string(), Some(2.1)),
+                ("cerebras".to_string(), Some(9.4)),
+            ],
+            task_rates: vec![(
+                "groq".to_string(),
+                vec![
+                    ("code_generation".to_string(), Some(1.0)),
+                    ("reasoning".to_string(), Some(0.0)),
+                ],
+            )],
         };
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(stub));
@@ -1114,6 +1275,71 @@ pub(crate) mod tests {
         assert!(
             !out.contains("groq"),
             "upstream filter must exclude other upstreams: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn health_performance_section_unfiltered() {
+        let (registry, _home) = test_registry();
+        let out = message_text(cmd_health(None, Some(&registry)));
+
+        assert!(
+            out.contains("Free Upstream Performance"),
+            "unfiltered health must show the performance section: {}",
+            out
+        );
+        assert!(
+            out.contains(
+                "  free · groq  100% success · 2.1s avg   (code_generation 100%, reasoning 0%)"
+            ),
+            "got: {}",
+            out
+        );
+        assert!(
+            out.contains("  free · cerebras  50% success · 9.4s avg"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn health_performance_section_upstream_filter() {
+        let (registry, _home) = test_registry();
+        // `/keys health groq` surfaces the section but only groq's row.
+        let out = message_text(cmd_health(Some("groq"), Some(&registry)));
+
+        assert!(
+            out.contains("Free Upstream Performance"),
+            "upstream filter must show the section: {}",
+            out
+        );
+        assert!(
+            out.contains(
+                "  free · groq  100% success · 2.1s avg   (code_generation 100%, reasoning 0%)"
+            ),
+            "got: {}",
+            out
+        );
+        assert!(
+            !out.contains("cerebras"),
+            "upstream filter must exclude other upstreams: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn health_performance_section_missing_without_registry() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["gsk_test_key_1".into()]);
+        store.save();
+        drop(store);
+
+        let out = message_text(cmd_health(None, None));
+        assert!(
+            !out.contains("Free Upstream Performance"),
+            "section must be absent without a registry: {}",
             out
         );
     }
