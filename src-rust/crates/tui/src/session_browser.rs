@@ -31,6 +31,9 @@ pub enum SessionBrowserMode {
 pub struct SessionEntry {
     pub id: String,
     pub title: String,
+    /// Concatenated user/assistant text used by the browser's full-text search.
+    /// Kept out of rendering so message content does not widen the table.
+    pub searchable_text: String,
     /// Human-readable relative time, e.g. "2 hours ago".
     pub last_updated: String,
     pub message_count: usize,
@@ -46,7 +49,7 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
-    /// Live search/filter query for session titles.
+    /// Live search/filter query for session titles and message content.
     pub search_query: String,
     /// The actual session ID captured when entering rename mode (to avoid
     /// filtered-index mismatch when confirming the rename).
@@ -107,7 +110,9 @@ impl SessionBrowserState {
         let q = self.search_query.to_lowercase();
         self.sessions
             .iter()
-            .filter(|s| s.title.to_lowercase().contains(&q))
+            .filter(|s| {
+                s.title.to_lowercase().contains(&q) || s.searchable_text.to_lowercase().contains(&q)
+            })
             .collect()
     }
 
@@ -123,8 +128,9 @@ impl SessionBrowserState {
 
     /// Move selection up one row, wrapping to the end.
     pub fn select_prev(&mut self) {
-        let count = self.sessions.len();
+        let count = self.filtered_sessions().len();
         if count == 0 {
+            self.selected_idx = 0;
             return;
         }
         if self.selected_idx == 0 {
@@ -136,8 +142,9 @@ impl SessionBrowserState {
 
     /// Move selection down one row, wrapping to the start.
     pub fn select_next(&mut self) {
-        let count = self.sessions.len();
+        let count = self.filtered_sessions().len();
         if count == 0 {
+            self.selected_idx = 0;
             return;
         }
         self.selected_idx = (self.selected_idx + 1) % count;
@@ -524,6 +531,7 @@ mod tests {
             SessionEntry {
                 id: "sess-001".to_string(),
                 title: "Refactor auth module".to_string(),
+                searchable_text: "rotate authentication tokens".to_string(),
                 last_updated: "2 hours ago".to_string(),
                 message_count: 34,
                 cost_usd: 0.0124,
@@ -531,6 +539,7 @@ mod tests {
             SessionEntry {
                 id: "sess-002".to_string(),
                 title: "Write unit tests".to_string(),
+                searchable_text: "coverage report".to_string(),
                 last_updated: "yesterday".to_string(),
                 message_count: 12,
                 cost_usd: 0.0045,
@@ -538,6 +547,7 @@ mod tests {
             SessionEntry {
                 id: "sess-003".to_string(),
                 title: "Debug memory leak".to_string(),
+                searchable_text: "heap profile".to_string(),
                 last_updated: "3 days ago".to_string(),
                 message_count: 57,
                 cost_usd: 0.0289,
@@ -587,7 +597,30 @@ mod tests {
         assert_eq!(s.selected_idx, 2);
     }
 
-    // 5. selected_session() returns correct entry.
+    // 5. Content search matches message text and keeps selection in range.
+    #[test]
+    fn content_search_matches_message_text() {
+        let mut state = SessionBrowserState::new();
+        state.open(sample_sessions());
+        state.push_search_char('t');
+        state.push_search_char('o');
+        state.push_search_char('k');
+        let matches = state.filtered_sessions();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "sess-001");
+        state.select_next();
+        assert_eq!(
+            state.selected_session().map(|session| session.id.as_str()),
+            Some("sess-001")
+        );
+
+        state.search_query = "does-not-exist".to_string();
+        state.select_next();
+        assert!(state.selected_session().is_none());
+        assert_eq!(state.selected_idx, 0);
+    }
+
+    // 6. selected_session() returns correct entry.
     #[test]
     fn selected_session_correct() {
         let mut s = SessionBrowserState::new();

@@ -9909,9 +9909,16 @@ impl App {
                             let last_updated = clawde_core::format_utils::format_relative_time(
                                 s.updated_at.timestamp_millis() as u64,
                             );
+                            let searchable_text = s
+                                .messages
+                                .iter()
+                                .map(Message::get_all_text)
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             crate::session_browser::SessionEntry {
                                 id: s.id,
                                 title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                                searchable_text,
                                 last_updated,
                                 message_count: s.messages.len(),
                                 cost_usd: s.total_cost,

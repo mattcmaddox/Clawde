@@ -1307,6 +1307,7 @@ mod tests {
             SessionEntry {
                 id: "a".to_string(),
                 title: "Alpha".to_string(),
+                searchable_text: String::new(),
                 last_updated: "now".to_string(),
                 message_count: 1,
                 cost_usd: 0.0,
@@ -1314,6 +1315,7 @@ mod tests {
             SessionEntry {
                 id: "b".to_string(),
                 title: "Beta".to_string(),
+                searchable_text: String::new(),
                 last_updated: "now".to_string(),
                 message_count: 2,
                 cost_usd: 0.0,
@@ -1321,6 +1323,7 @@ mod tests {
             SessionEntry {
                 id: "c".to_string(),
                 title: "Gamma".to_string(),
+                searchable_text: String::new(),
                 last_updated: "now".to_string(),
                 message_count: 3,
                 cost_usd: 0.0,
@@ -1364,6 +1367,7 @@ mod tests {
         app.session_browser.open(vec![SessionEntry {
             id: "a".to_string(),
             title: "Alpha".to_string(),
+            searchable_text: String::new(),
             last_updated: "now".to_string(),
             message_count: 1,
             cost_usd: 0.0,
