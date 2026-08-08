@@ -84,7 +84,11 @@ pub(crate) async fn execute_tool(
             warn!(tool = name, "Unknown tool requested");
             let hint = tool_name_hint(name, tools);
             if hint.is_empty() {
-                ToolResult::error(format!("Unknown tool: {}", name))
+                ToolResult::error(format!(
+                    "Unknown tool: {}. This tool is not available in the active tool set. {}",
+                    name,
+                    active_tool_list(tools)
+                ))
             } else {
                 ToolResult::error(format!("Unknown tool: {}. {}", name, hint))
             }
@@ -108,6 +112,26 @@ fn find_tool_for_name<'a>(name: &str, tools: &'a [Box<dyn Tool>]) -> Option<&'a 
         first.map(|tool| tool.as_ref())
     } else {
         None
+    }
+}
+
+/// Build a short recovery hint for an unknown provider-supplied tool name.
+fn active_tool_list(tools: &[Box<dyn Tool>]) -> String {
+    let mut names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    names.sort_unstable();
+    names.truncate(12);
+    if names.is_empty() {
+        "No tools are active for this run.".to_string()
+    } else {
+        format!(
+            "Active tools include: {}{}",
+            names.join(", "),
+            if tools.len() > names.len() {
+                ", …"
+            } else {
+                "."
+            }
+        )
     }
 }
 
@@ -274,6 +298,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_builtin_definition_has_a_dispatch_match() {
+        let tools = clawde_tools::all_tools();
+        let advertised_names: Vec<String> =
+            tools.iter().map(|tool| tool.to_definition().name).collect();
+
+        assert!(advertised_names.iter().any(|name| name == "Bash"));
+        for name in advertised_names {
+            assert!(
+                find_tool_for_name(&name, &tools).is_some(),
+                "advertised tool must be executable: {name}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_accepts_unique_case_insensitive_tool_name() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
@@ -344,7 +383,10 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert_eq!(result.content, "Unknown tool: CompletelyUnknown");
+        assert!(result
+            .content
+            .starts_with("Unknown tool: CompletelyUnknown. This tool is not available"));
+        assert!(result.content.contains("Active tools include: Bash."));
     }
 
     #[tokio::test]

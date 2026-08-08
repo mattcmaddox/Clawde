@@ -988,7 +988,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(turns) = def.max_turns {
                 query_config.max_turns = turns;
             }
-            filter_tools_for_agent(tools, &access)
+            filter_tools_for_agent(tools, &access, mcp_manager_arc.clone())
         } else {
             eprintln!(
                 "Warning: unknown agent '{}'. Run /agent to see available agents.",
@@ -1077,9 +1077,9 @@ async fn connect_mcp_manager_arc(
     Some(mcp_manager)
 }
 
-fn build_tools_with_mcp(
+fn build_tools_with_mcp_vec(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
-) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
+) -> Vec<Box<dyn clawde_tools::Tool>> {
     let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools();
     v.push(Box::new(clawde_query::AgentTool));
 
@@ -1095,7 +1095,13 @@ fn build_tools_with_mcp(
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
-    Arc::new(v)
+    v
+}
+
+fn build_tools_with_mcp(
+    mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
+    Arc::new(build_tools_with_mcp_vec(mcp_manager))
 }
 
 fn model_cache_dir() -> PathBuf {
@@ -1647,21 +1653,25 @@ fn routing_strategy_changed(before: &Config, after: &Config) -> bool {
 fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     access: &str,
+    mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
     use clawde_tools::PermissionLevel as PL;
     match access {
         "read-only" => {
-            // Collect names of tools that are read-only, then rebuild from all_tools
-            // (Box<dyn Tool> is not Clone so we can't directly filter-and-keep).
+            // Collect names first because `Box<dyn Tool>` is not Clone. Rebuild
+            // from the complete runtime registry so MCP wrappers and AgentTool
+            // are preserved when the active mode changes.
             let allowed_names: Vec<String> = tools
                 .iter()
                 .filter(|t| {
-                    matches!(t.permission_level(), PL::ReadOnly | PL::None)
-                        || t.name() == "AskUserQuestion"
+                    (matches!(t.permission_level(), PL::ReadOnly | PL::None)
+                        || t.name() == "AskUserQuestion")
+                        && t.name() != clawde_core::constants::TOOL_NAME_AGENT
                 })
                 .map(|t| t.name().to_string())
                 .collect();
-            let filtered: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager);
+            let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| allowed_names.iter().any(|n| n == t.name()))
                 .collect();
@@ -1669,7 +1679,8 @@ fn filter_tools_for_agent(
         }
         "search-only" => {
             const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
-            let filtered: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager);
+            let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| SEARCH_TOOLS.contains(&t.name()))
                 .collect();
@@ -1677,6 +1688,26 @@ fn filter_tools_for_agent(
         }
         _ => tools, // "full" — allow all tools unchanged
     }
+}
+
+/// Rebuild the active tool slice for a named agent mode without losing MCP
+/// wrappers. Unknown or unset modes retain the complete runtime registry.
+fn tools_for_agent_mode(
+    all_tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
+    mode: Option<&str>,
+    config: &Config,
+    mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
+    let Some(mode) = mode else {
+        return all_tools;
+    };
+
+    let mut all_agents = clawde_core::default_agents();
+    all_agents.extend(config.agents.clone());
+    all_agents
+        .get(mode)
+        .map(|def| filter_tools_for_agent(all_tools.clone(), &def.access, mcp_manager))
+        .unwrap_or(all_tools)
 }
 
 // ---------------------------------------------------------------------------
@@ -2514,9 +2545,10 @@ async fn run_interactive(
         test_provider: None,
     };
 
-    // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn clawde_tools::Tool>>> = Arc::new(clawde_tools::all_tools());
+    // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
+    // agent-mode switching can re-filter without silently dropping tools that
+    // were not part of the bare `clawde_tools::all_tools()` list.
+    let mut all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone());
     let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
@@ -3863,7 +3895,12 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
+                            tools_arc = tools_for_agent_mode(
+                                all_tools_arc.clone(),
+                                Some(mode),
+                                &cmd_ctx.config,
+                                tool_ctx.mcp_manager.clone(),
+                            );
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
@@ -5055,7 +5092,14 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            all_tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            tools_arc = tools_for_agent_mode(
+                all_tools_arc.clone(),
+                app.agent_mode.as_deref(),
+                &cmd_ctx.config,
+                new_mcp_manager.clone(),
+            );
+
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
@@ -5846,6 +5890,27 @@ mod bare_mode_tests {
             registry.all_mcp_servers().is_empty(),
             "no plugin MCP servers"
         );
+    }
+
+    #[test]
+    fn full_runtime_registry_includes_bash() {
+        let tools = build_tools_with_mcp(None);
+        assert!(tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[test]
+    fn restricted_agent_modes_exclude_bash() {
+        let full = build_tools_with_mcp(None);
+        let plan = filter_tools_for_agent(full.clone(), "read-only", None);
+        let explore = filter_tools_for_agent(full, "search-only", None);
+
+        assert!(!plan.iter().any(|tool| tool.name() == "Bash"));
+        assert!(!plan
+            .iter()
+            .any(|tool| tool.name() == clawde_core::constants::TOOL_NAME_AGENT));
+        assert!(!explore.iter().any(|tool| tool.name() == "Bash"));
+        assert!(plan.iter().any(|tool| tool.name() == "Read"));
+        assert!(explore.iter().any(|tool| tool.name() == "Grep"));
     }
 
     #[test]
