@@ -660,16 +660,22 @@ impl FreeProvider {
             let mut cd = self.cooldown.lock().unwrap();
             cd.record_success(idx);
         }
-        // Record latency sample.
+        // Record latency sample + success counter (spec §8.6 success rate).
+        // One lock: the counter always bumps, the sample only when latency
+        // tracking is enabled.
         let max_samples = self.max_latency_samples();
+        let mut lat = self.latencies.lock().unwrap();
+        lat.record_success(idx);
         if max_samples > 0 {
-            let mut lat = self.latencies.lock().unwrap();
             lat.record(idx, elapsed.as_secs_f64(), max_samples);
         }
     }
 
     /// Record a failed request at `idx`.
     fn record_failure(&self, idx: usize) {
+        // Always count the failure for the success-rate view — the circuit
+        // breaker below is an optional extra layer.
+        self.latencies.lock().unwrap().record_failure(idx);
         if !self.circuit_breaker_enabled() {
             return;
         }
@@ -815,15 +821,16 @@ impl RetryingFreeStream {
         cd.record_success(idx);
         drop(cd);
         let max_samples = self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
+        let mut lat = self.latencies.lock().unwrap();
+        lat.record_success(idx);
         if max_samples > 0 {
-            self.latencies
-                .lock()
-                .unwrap()
-                .record(idx, elapsed.as_secs_f64(), max_samples);
+            lat.record(idx, elapsed.as_secs_f64(), max_samples);
         }
     }
 
     fn record_failure(&self, idx: usize) {
+        // Always count the failure for the success-rate view.
+        self.latencies.lock().unwrap().record_failure(idx);
         if self
             .routing
             .circuit_breaker
@@ -1570,6 +1577,19 @@ impl LlmProvider for FreeProvider {
                     if avg >= f64::MAX { None } else { Some(avg) },
                 )
             })
+            .collect()
+    }
+
+    fn upstream_success_rates(&self) -> Vec<(String, Option<f64>)> {
+        // Per-upstream dispatch success rate (0.0–1.0), for the routing
+        // dialog's model-performance view (spec §8.6). `None` when the
+        // upstream has no recorded dispatches. Locked once, never across an
+        // await.
+        let lat = self.latencies.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| (entry.upstream.id.to_string(), lat.success_rate(idx)))
             .collect()
     }
 
@@ -3558,6 +3578,23 @@ mod tests {
             "trait upstream_empty_cooldowns must report cerebras, got {:?}",
             empty
         );
+    }
+
+    #[test]
+    fn latency_state_tracks_success_rate() {
+        let mut lat = LatencyState::new(2);
+        assert_eq!(lat.success_rate(0), None, "no dispatches yet");
+        lat.record_success(0);
+        lat.record_success(0);
+        lat.record_failure(0);
+        assert_eq!(lat.success_rate(0), Some(2.0 / 3.0));
+        assert_eq!(lat.success_rate(1), None, "no dispatches on idx 1");
+        lat.record_failure(1);
+        assert_eq!(lat.success_rate(1), Some(0.0));
+        // Out-of-range idx is a no-op, not a panic.
+        lat.record_success(99);
+        lat.record_failure(99);
+        assert_eq!(lat.success_rate(99), None);
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub struct RoutingDialogState {
     /// Per-upstream average latency in seconds (`None` = no samples yet),
     /// captured at open time for the model-performance view (spec §8.6).
     pub latencies: Vec<(String, Option<f64>)>,
+    /// Per-upstream dispatch success rate 0.0–1.0 (`None` = no dispatches
+    /// yet), captured at open time for the model-performance view (spec
+    /// §8.6).
+    pub success_rates: Vec<(String, Option<f64>)>,
     /// Per-upstream capability metadata `(upstream_id, vision,
     /// context_window)` captured at open time, shown as badges in the
     /// upstream pane so users see why image/large requests skip some
@@ -119,6 +123,7 @@ impl Default for RoutingDialogState {
             overrides: HashMap::new(),
             strategy: "auto".to_string(),
             latencies: Vec::new(),
+            success_rates: Vec::new(),
             capabilities: Vec::new(),
             cooldowns: Vec::new(),
             key_health: Vec::new(),
@@ -134,11 +139,12 @@ impl RoutingDialogState {
     /// Open the dialog, seeding the overrides from the live config's
     /// `providers.free.options.routing.task_preferences` plus the per-upstream
     /// model snapshots for the model-performance view (spec §8.6): latency,
-    /// capability badges, cooldown state, and key-ring health.
+    /// success rate, capability badges, cooldown state, and key-ring health.
     pub fn open(
         &mut self,
         config: &Config,
         latencies: Vec<(String, Option<f64>)>,
+        success_rates: Vec<(String, Option<f64>)>,
         capabilities: Vec<(String, bool, u32)>,
         cooldowns: Vec<(String, String, Option<u64>)>,
         key_health: Vec<(String, usize, usize, Option<u64>)>,
@@ -146,6 +152,7 @@ impl RoutingDialogState {
         self.overrides = parse_task_preferences(config);
         self.strategy = parse_routing_strategy(config);
         self.latencies = latencies;
+        self.success_rates = success_rates;
         self.capabilities = capabilities;
         self.cooldowns = cooldowns;
         self.key_health = key_health;
@@ -162,6 +169,14 @@ impl RoutingDialogState {
             .iter()
             .find(|(id, _)| id == upstream_id)
             .and_then(|(_, avg)| *avg)
+    }
+
+    /// The recorded dispatch success rate for an upstream id, if any.
+    pub fn success_rate_for(&self, upstream_id: &str) -> Option<f64> {
+        self.success_rates
+            .iter()
+            .find(|(id, _)| id == upstream_id)
+            .and_then(|(_, rate)| *rate)
     }
 
     /// The recorded capability metadata `(vision, context_window)` for an
@@ -546,9 +561,14 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
             let label = if kind == "5xx" { "cool" } else { "empty" };
             row.push_str(&format!(" \u{b7}{} {}s", label, secs));
         }
-        // Model-performance column (spec §8.6): average latency when recorded.
+        // Model-performance column (spec §8.6): average latency when recorded,
+        // then dispatch success rate when any dispatch has been recorded.
         match state.latency_for(upstream.id) {
             Some(secs) => row.push_str(&format!("  {:.1}s", secs)),
+            None => row.push_str("  \u{2014}"),
+        }
+        match state.success_rate_for(upstream.id) {
+            Some(rate) => row.push_str(&format!("  {:>3.0}%", rate * 100.0)),
             None => row.push_str("  \u{2014}"),
         }
 
@@ -634,7 +654,14 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        dialog.open(
+            &cfg,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(dialog.visible);
         assert_eq!(dialog.strategy, "task_based");
         assert_eq!(
@@ -649,6 +676,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -679,7 +707,14 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        dialog.open(
+            &cfg,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         dialog.selected_task = 0;
         dialog.reset_task();
         assert!(dialog.task_override(TaskType::CodeGeneration).is_empty());
@@ -694,6 +729,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -719,6 +755,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         let auto = dialog.assignment_summary(TaskType::Verification);
         assert!(auto.starts_with("auto \u{b7} "), "got: {auto}");
@@ -732,6 +769,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -768,6 +806,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.latency_for("groq"), Some(1.25));
         assert_eq!(dialog.latency_for("cerebras"), None);
@@ -776,10 +815,31 @@ mod tests {
     }
 
     #[test]
+    fn open_captures_success_rate_snapshot() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            vec![
+                ("groq".to_string(), Some(0.8)),
+                ("cerebras".to_string(), None),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(dialog.success_rate_for("groq"), Some(0.8));
+        assert_eq!(dialog.success_rate_for("cerebras"), None);
+        // Unknown upstreams (e.g. not configured) are absent.
+        assert_eq!(dialog.success_rate_for("google"), None);
+    }
+
+    #[test]
     fn open_captures_capability_snapshot() {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             vec![
                 ("google".to_string(), true, 128_000),
@@ -799,6 +859,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             vec![
@@ -823,6 +884,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

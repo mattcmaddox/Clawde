@@ -222,6 +222,14 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Per-upstream dispatch success rate (0.0–1.0) for the routing dialog's
+    /// model-performance view (spec §8.6). `None` means no dispatch recorded
+    /// yet. The default returns an empty vector — only composite providers
+    /// that multiplex upstreams override this.
+    fn upstream_success_rates(&self) -> Vec<(String, Option<f64>)> {
+        Vec::new()
+    }
+
     /// Per-upstream capability metadata for the routing dialog's model view
     /// (spec §8.6): `(upstream_id, vision, context_window_tokens)`. Lets the
     /// UI explain why the capability gate (spec §8.4) routes image-bearing or

@@ -3032,6 +3032,16 @@ impl App {
                 })
                 .map(|p| p.upstream_latencies())
                 .unwrap_or_default();
+            let success_rates = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_success_rates())
+                .unwrap_or_default();
             let capabilities = self
                 .provider_registry
                 .as_ref()
@@ -3062,8 +3072,14 @@ impl App {
                 })
                 .map(|p| p.upstream_key_health())
                 .unwrap_or_default();
-            self.routing_dialog
-                .open(&self.config, latencies, capabilities, cooldowns, key_health);
+            self.routing_dialog.open(
+                &self.config,
+                latencies,
+                success_rates,
+                capabilities,
+                cooldowns,
+                key_health,
+            );
             return true;
         }
         // /spec-review [<file>]: open the spec review dialog (audit spec §10)

@@ -594,19 +594,33 @@ impl CooldownState {
     }
 }
 
-/// Per-upstream latency samples for latency-based routing.
+/// Per-upstream performance state: latency samples plus dispatch success /
+/// failure counters for the routing dialog's model-performance view
+/// (spec §8.6).
 struct LatencyState {
     /// Sliding window of request durations (seconds) per upstream index.
     samples: Vec<VecDeque<f64>>,
+    /// Successful dispatches per upstream index.
+    successes: Vec<u32>,
+    /// Failed dispatches per upstream index.
+    failures: Vec<u32>,
 }
 
 impl LatencyState {
     fn new(n: usize) -> Self {
         let mut samples = Vec::with_capacity(n);
+        let mut successes = Vec::with_capacity(n);
+        let mut failures = Vec::with_capacity(n);
         for _ in 0..n {
             samples.push(VecDeque::with_capacity(10));
+            successes.push(0);
+            failures.push(0);
         }
-        Self { samples }
+        Self {
+            samples,
+            successes,
+            failures,
+        }
     }
 
     /// Record a latency sample at `idx`.
@@ -621,6 +635,20 @@ impl LatencyState {
         q.push_back(duration_secs);
     }
 
+    /// Record a successful dispatch at `idx` (success-rate view).
+    fn record_success(&mut self, idx: usize) {
+        if let Some(s) = self.successes.get_mut(idx) {
+            *s = s.saturating_add(1);
+        }
+    }
+
+    /// Record a failed dispatch at `idx` (success-rate view).
+    fn record_failure(&mut self, idx: usize) {
+        if let Some(f) = self.failures.get_mut(idx) {
+            *f = f.saturating_add(1);
+        }
+    }
+
     /// Average latency for upstream `idx`, or `f64::MAX` if no samples.
     fn avg_latency(&self, idx: usize) -> f64 {
         if idx >= self.samples.len() {
@@ -632,6 +660,15 @@ impl LatencyState {
         }
         let sum: f64 = q.iter().sum();
         sum / q.len() as f64
+    }
+
+    /// Dispatch success rate (0.0–1.0) for upstream `idx`, or `None` when
+    /// no dispatch has been recorded yet.
+    fn success_rate(&self, idx: usize) -> Option<f64> {
+        let successes = *self.successes.get(idx)?;
+        let failures = *self.failures.get(idx)?;
+        let total = successes + failures;
+        (total > 0).then(|| successes as f64 / total as f64)
     }
 }
 
