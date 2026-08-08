@@ -176,3 +176,87 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub message_count: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_sessions_matches_titles_and_message_content() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let store =
+            SqliteSessionStore::open(&dir.path().join("sessions.db")).expect("open sqlite store");
+
+        store
+            .save_session("title-match", Some("Authentication refactor"), "model-a")
+            .expect("save title session");
+        store
+            .save_message("title-match", "title-msg", "user", "unrelated text", None)
+            .expect("save title message");
+
+        store
+            .save_session("content-match", Some("Build notes"), "model-b")
+            .expect("save content session");
+        store
+            .save_message(
+                "content-match",
+                "content-msg",
+                "assistant",
+                "The OAuth callback needs a regression test",
+                None,
+            )
+            .expect("save content message");
+
+        let title_results = store
+            .search_sessions("AUTHENTICATION")
+            .expect("title search");
+        assert_eq!(title_results.len(), 1);
+        assert_eq!(title_results[0].id, "title-match");
+        assert_eq!(title_results[0].message_count, 1);
+
+        let content_results = store
+            .search_sessions("oauth callback")
+            .expect("content search");
+        assert_eq!(content_results.len(), 1);
+        assert_eq!(content_results[0].id, "content-match");
+    }
+
+    #[test]
+    fn search_sessions_returns_recent_matches_first_and_empty_for_misses() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let store =
+            SqliteSessionStore::open(&dir.path().join("sessions.db")).expect("open sqlite store");
+
+        for (id, title) in [
+            ("older", "Shared routing work"),
+            ("newer", "Shared routing tests"),
+        ] {
+            store
+                .save_session(id, Some(title), "model")
+                .expect("save session");
+            store
+                .save_message(id, &format!("{id}-message"), "user", "same keyword", None)
+                .expect("save message");
+        }
+        // `save_session` uses second-resolution timestamps; set deterministic
+        // values here so the recency assertion never depends on wall-clock
+        // timing or a sleep in the test suite.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at = CASE id WHEN 'older' THEN '2026-01-01T00:00:00Z' ELSE '2026-01-02T00:00:00Z' END",
+                [],
+            )
+            .expect("set deterministic timestamps");
+
+        let results = store.search_sessions("shared").expect("search matches");
+        assert_eq!(
+            results.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert!(store
+            .search_sessions("does-not-exist")
+            .expect("empty search")
+            .is_empty());
+    }
+}

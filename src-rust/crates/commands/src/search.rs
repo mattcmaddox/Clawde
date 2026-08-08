@@ -77,3 +77,76 @@ impl SlashCommand for SearchCommand {
         CommandResult::Message(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_context() -> CommandContext {
+        CommandContext {
+            config: clawde_core::Config::default(),
+            cost_tracker: clawde_core::CostTracker::new(),
+            messages: Vec::new(),
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "search-test".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn search_command_requires_a_query() {
+        let mut ctx = test_context();
+        let result = SearchCommand.execute("  ", &mut ctx).await;
+        match result {
+            CommandResult::Error(message) => assert!(message.contains("Usage: /search <query>")),
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_command_formats_title_and_content_matches() {
+        let _home = crate::keys::tests::TestHome::new();
+        let db_path = clawde_core::config::Settings::config_dir().join("sessions.db");
+        let store = clawde_core::SqliteSessionStore::open(&db_path).expect("open sqlite store");
+        store
+            .save_session("session-123456789", Some("OAuth migration"), "model-x")
+            .expect("save session");
+        store
+            .save_message(
+                "session-123456789",
+                "message-1",
+                "assistant",
+                "The callback was updated",
+                None,
+            )
+            .expect("save message");
+
+        let mut ctx = test_context();
+        let result = SearchCommand.execute("callback", &mut ctx).await;
+        match result {
+            CommandResult::Message(message) => {
+                assert!(message.contains("Search results for \"callback\": 1 session(s)"));
+                assert!(message.contains("[session-1234] OAuth migration — model-x (1 messages"));
+                assert!(message.contains("/resume <session-id>"));
+            }
+            other => panic!("expected search results, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_command_reports_no_matches() {
+        let _home = crate::keys::tests::TestHome::new();
+        let mut ctx = test_context();
+        let result = SearchCommand.execute("missing-term", &mut ctx).await;
+        assert!(matches!(
+            result,
+            CommandResult::Message(message)
+                if message == "No sessions found matching \"missing-term\"."
+        ));
+    }
+}
