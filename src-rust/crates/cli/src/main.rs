@@ -3819,6 +3819,25 @@ async fn run_interactive(
                     app.handle_key_event(key);
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
+                    // The task-routing dialog (/routing edit) writes pins and
+                    // flips the strategy directly into app.config; rebuild the
+                    // provider registry in place so it applies immediately
+                    // (no /refresh), mirroring the ConfigChangeMessage arm.
+                    if app.take_routing_changed() {
+                        match reload_provider_runtime_state(&cmd_ctx.config).await {
+                            Ok(refreshed) => {
+                                cmd_ctx.provider_registry =
+                                    Some(refreshed.provider_registry.clone());
+                                base_query_config.provider_registry =
+                                    Some(refreshed.provider_registry.clone());
+                                app.provider_registry = Some(refreshed.provider_registry.clone());
+                            }
+                            Err(e) => {
+                                app.status_message =
+                                    Some(format!("Task routing saved but applying it failed: {e}"));
+                            }
+                        }
+                    }
                     if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                         if let Ok(mut manager) = manager.lock() {
                             manager.mode = tool_ctx.config.permission_mode.clone();

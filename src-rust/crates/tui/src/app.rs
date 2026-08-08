@@ -1388,6 +1388,10 @@ pub struct App {
     /// Set by `cycle_agent_mode` so the main loop can update the query config
     /// and tool list to match the newly-selected agent.
     pub agent_mode_changed: bool,
+    /// Set when the task-routing dialog saved pins/strategy directly to the
+    /// live config so the CLI's main loop rebuilds the provider registry in
+    /// place (immediate apply, no /refresh).
+    pub routing_changed: bool,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
@@ -2022,6 +2026,7 @@ impl App {
             previous_model: None,
             agent_mode: None,
             agent_mode_changed: false,
+            routing_changed: false,
             accent_color: ACCENT_BUILD,
             agent_status: Vec::new(),
             history_search: None,
@@ -3794,19 +3799,31 @@ impl App {
             Self::apply_routing_pins(obj, &pins_json, has_pins);
         }
 
+        // Signal the CLI main loop to rebuild the provider registry in place
+        // so the pins/strategy apply immediately (no /refresh). Consumed via
+        // `take_routing_changed` right after the per-key config sync.
+        self.routing_changed = true;
+
         let saved = if has_pins {
             format!(
-                "Task routing saved: {} pinned task(s), strategy \u{2192} task_based. Run /refresh to apply.",
+                "Task routing saved: {} pinned task(s), strategy \u{2192} task_based — applied immediately.",
                 pins.len()
             )
         } else {
-            "Task pins cleared; built-in defaults restored. Run /refresh to apply.".to_string()
+            "Task pins cleared; built-in defaults restored — applied immediately.".to_string()
         };
         if disk_failed {
             format!("{saved} (Warning: settings.json write failed — live config updated.)")
         } else {
             saved
         }
+    }
+
+    /// One-shot flag: `true` if the task-routing dialog saved changes since
+    /// the last call. The CLI consumes this after syncing `app.config` to
+    /// rebuild the provider registry (immediate apply, no /refresh).
+    pub fn take_routing_changed(&mut self) -> bool {
+        std::mem::take(&mut self.routing_changed)
     }
 
     /// Persist `spec_mode: false` to settings.json after a spec is accepted
@@ -10215,6 +10232,22 @@ mod tests {
         let mut app = make_app();
         app.model_picker.visible = true;
         assert!(app.needs_fast_repaint());
+    }
+
+    #[test]
+    fn routing_dialog_save_sets_immediate_apply_flag() {
+        // /routing edit's save writes pins/strategy directly into the live
+        // config; the one-shot flag tells the CLI main loop to rebuild the
+        // provider registry in place so it applies without /refresh.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(!app.take_routing_changed(), "flag must start clear");
+        app.routing_dialog.selected_task = 0; // CodeGeneration
+        app.routing_dialog.toggle_pin("groq");
+        let msg = app.save_routing_dialog();
+        assert!(msg.contains("applied immediately"), "got: {msg}");
+        assert!(app.take_routing_changed(), "save must set the rebuild flag");
+        assert!(!app.take_routing_changed(), "flag is one-shot");
     }
 
     /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
