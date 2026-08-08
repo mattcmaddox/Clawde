@@ -256,7 +256,13 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
     // chain as a local last-resort provider. No API key needed — it uses
     // the already-built Ollama provider from the registry. In Isolated
     // mode Ollama stays out of the free chain entirely.
-    if config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto {
+    //
+    // Only when the chain already has at least one configured upstream:
+    // with zero free keys the chain would otherwise be just [ollama], which
+    // errors `Model not found` on every turn instead of the clearer
+    // "no free upstreams configured" (build_free_provider returns None and
+    // the caller surfaces the no-key message).
+    if !chain.is_empty() && config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto {
         let ollama_provider = crate::providers::ollama();
         chain.push(FreeEntry {
             upstream: crate::providers::FreeUpstream {

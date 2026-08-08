@@ -37,8 +37,10 @@ impl FreeProvider {
         }
     }
 
-    /// Create a new `FreeProvider` with the default [`RoutingConfig`]
-    /// (Auto strategy: task-based routing refined by latency).
+    /// Production flag for cooldown persistence: persists BOTH the 5xx /
+    /// circuit-breaker track and the empty-completion track to disk so a
+    /// restart does not immediately re-hit a cooled-down upstream. The
+    /// `EMPTY` name is historical — see [`Self::with_routing`].
     pub const ENABLE_EMPTY_COOLDOWN_PERSISTENCE: bool = true;
 
     pub fn new(chain: Vec<FreeEntry>) -> Self {
@@ -58,8 +60,11 @@ impl FreeProvider {
     /// Create a new `FreeProvider` with an explicit [`RoutingConfig`].
     ///
     /// When `persist` is `true` (production path — use
-    /// `ENABLE_EMPTY_COOLDOWN_PERSISTENCE`) the empty-cooldown track is
-    /// persisted to `{clawde_home}/empty-cooldown-state/free.json`.
+    /// `ENABLE_EMPTY_COOLDOWN_PERSISTENCE`) both cooldown tracks (5xx /
+    /// circuit-breaker and empty-completion) are persisted to
+    /// `{clawde_home}/empty-cooldown-state/free.json`. The filename is
+    /// retained for backward compatibility with files written before the
+    /// 5xx track was added.
     pub fn with_routing(chain: Vec<FreeEntry>, routing: RoutingConfig, persist: bool) -> Self {
         let n = chain.len();
         let cb_config = routing.circuit_breaker.clone().unwrap_or_default();
@@ -3553,6 +3558,44 @@ mod tests {
             "trait upstream_empty_cooldowns must report cerebras, got {:?}",
             empty
         );
+    }
+
+    #[test]
+    fn upstream_5xx_cooldown_persists_across_restart() {
+        // The 5xx / circuit-breaker cooldown track must survive a process
+        // restart: after a 500, a restart should NOT immediately re-hit the
+        // same upstream (spec §8.4 "cooldown state" must stay effective).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.json");
+
+        // Write: cooldown groq (idx 1) for 45s via the same 5xx path the
+        // dispatcher uses.
+        {
+            let mut cd = CooldownState::new(2, CircuitBreakerConfig::default()).with_persistence(
+                vec!["huggingface".to_string(), "groq".to_string()],
+                Some(path.clone()),
+            );
+            cd.apply_upstream_cooldown(1, 45);
+            assert!(path.exists(), "5xx cooldown must be written to disk");
+        } // Read: a fresh instance (simulating a restart) must restore groq's
+          // cooldown with ~45s remaining.
+        {
+            let cd = CooldownState::new(2, CircuitBreakerConfig::default()).with_persistence(
+                vec!["huggingface".to_string(), "groq".to_string()],
+                Some(path.clone()),
+            );
+            assert!(
+                cd.is_in_cooldown(1),
+                "groq must still be in 5xx cooldown after restart"
+            );
+            assert!(!cd.is_in_cooldown(0), "huggingface stays active");
+            let remaining = cd.cooldown_remaining_secs(1);
+            assert!(
+                matches!(remaining, Some(s) if (1..=45).contains(&s)),
+                "~45s remaining after restart, got {:?}",
+                remaining
+            );
+        }
     }
 
     #[test]

@@ -326,18 +326,27 @@ struct CooldownState {
     empty_cooldown_until: Vec<Option<Instant>>,
     /// Upstream id per index, for persistence keyed by provider id.
     upstream_ids: Vec<String>,
-    /// Optional path for empty-cooldown persistence.
+    /// Optional path for cooldown persistence (empty-completion + 5xx /
+    /// circuit-breaker tracks).
     persist_path: Option<std::path::PathBuf>,
     /// Circuit-breaker configuration.
     config: CircuitBreakerConfig,
 }
 
-/// Disk snapshot of one upstream's empty-completion cooldown track.
+/// Disk snapshot of one upstream's cooldown tracks.
+///
+/// Carries both the empty-completion track (`consecutive_empties` +
+/// `empty_cooldown_until_unix`) and the 5xx / circuit-breaker track
+/// (`cooldown_until_unix`). `cooldown_until_unix` is `#[serde(default)]` so
+/// files written by older builds (empty-completion only) still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EmptyCooldownSnapshot {
+struct UpstreamCooldownSnapshot {
     upstream: String,
     consecutive_empties: u32,
     empty_cooldown_until_unix: Option<u64>,
+    /// 5xx / circuit-breaker cooldown expiry as a unix timestamp.
+    #[serde(default)]
+    cooldown_until_unix: Option<u64>,
 }
 
 impl CooldownState {
@@ -467,6 +476,7 @@ impl CooldownState {
         }
         self.cooldown_until[idx] =
             Some(Instant::now() + std::time::Duration::from_secs(cooldown_secs));
+        self.save();
     }
 
     /// Record a success at `idx` — resets the failure counter and the
@@ -486,7 +496,7 @@ impl CooldownState {
     }
 
     // -------------------------------------------------------------------
-    // Persistence (empty-completion cooldown track only)
+    // Persistence (empty-completion + 5xx/circuit-breaker cooldown tracks)
     // -------------------------------------------------------------------
 
     fn save(&self) {
@@ -497,31 +507,32 @@ impl CooldownState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let entries: Vec<EmptyCooldownSnapshot> = self
+        let to_unix = |until: Option<Instant>| -> Option<u64> {
+            until.and_then(|t| {
+                let remaining = t.duration_since(Instant::now()).as_secs();
+                if remaining == 0 {
+                    return None;
+                }
+                Some(now_unix.saturating_add(remaining))
+            })
+        };
+        let entries: Vec<UpstreamCooldownSnapshot> = self
             .upstream_ids
             .iter()
             .enumerate()
             .filter_map(|(idx, id)| {
                 let count = self.consecutive_empties.get(idx).copied().unwrap_or(0);
-                let until_unix = self
-                    .empty_cooldown_until
-                    .get(idx)
-                    .copied()
-                    .flatten()
-                    .and_then(|t| {
-                        let remaining = t.duration_since(Instant::now()).as_secs();
-                        if remaining == 0 {
-                            return None;
-                        }
-                        Some(now_unix.saturating_add(remaining))
-                    });
-                if count == 0 && until_unix.is_none() {
+                let empty_until_unix =
+                    to_unix(self.empty_cooldown_until.get(idx).copied().flatten());
+                let cooldown_until_unix = to_unix(self.cooldown_until.get(idx).copied().flatten());
+                if count == 0 && empty_until_unix.is_none() && cooldown_until_unix.is_none() {
                     return None;
                 }
-                Some(EmptyCooldownSnapshot {
+                Some(UpstreamCooldownSnapshot {
                     upstream: id.clone(),
                     consecutive_empties: count,
-                    empty_cooldown_until_unix: until_unix,
+                    empty_cooldown_until_unix: empty_until_unix,
+                    cooldown_until_unix,
                 })
             })
             .collect();
@@ -550,7 +561,7 @@ impl CooldownState {
             Ok(j) => j,
             Err(_) => return,
         };
-        let entries: Vec<EmptyCooldownSnapshot> = match serde_json::from_str(&json) {
+        let entries: Vec<UpstreamCooldownSnapshot> = match serde_json::from_str(&json) {
             Ok(e) => e,
             Err(_) => return,
         };
@@ -558,6 +569,12 @@ impl CooldownState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let restore = |until_unix: Option<u64>| -> Option<Instant> {
+            until_unix.and_then(|u| {
+                let remaining = u.saturating_sub(now_unix);
+                (remaining > 0).then(|| Instant::now() + std::time::Duration::from_secs(remaining))
+            })
+        };
         for entry in entries {
             let Some(idx) = self
                 .upstream_ids
@@ -567,12 +584,11 @@ impl CooldownState {
                 continue;
             };
             self.consecutive_empties[idx] = entry.consecutive_empties;
-            if let Some(until_unix) = entry.empty_cooldown_until_unix {
-                let remaining = until_unix.saturating_sub(now_unix);
-                if remaining > 0 {
-                    self.empty_cooldown_until[idx] =
-                        Some(Instant::now() + std::time::Duration::from_secs(remaining));
-                }
+            if let Some(until) = restore(entry.empty_cooldown_until_unix) {
+                self.empty_cooldown_until[idx] = Some(until);
+            }
+            if let Some(until) = restore(entry.cooldown_until_unix) {
+                self.cooldown_until[idx] = Some(until);
             }
         }
     }
