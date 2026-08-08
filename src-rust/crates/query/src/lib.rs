@@ -1902,8 +1902,13 @@ pub async fn run_query_loop(
                         }
                         // Pass a clone so the live conversation survives a failed
                         // compaction; `*messages` is only overwritten on success (#213).
-                        let outcome =
-                            compact::context_collapse(messages.clone(), cp.as_ref(), config).await;
+                        let outcome = compact::context_collapse(
+                            messages.clone(),
+                            cp.as_ref(),
+                            config,
+                            &cancel_token,
+                        )
+                        .await;
                         match apply_compact_result(messages, outcome) {
                             Ok(tokens_freed) => {
                                 info!(tokens_freed, "Context-collapse complete");
@@ -1950,6 +1955,7 @@ pub async fn run_query_loop(
                         &config.model,
                         context_window,
                         &mut compact_state,
+                        &cancel_token,
                     )
                     .await
                     {

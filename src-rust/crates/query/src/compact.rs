@@ -26,6 +26,7 @@ use clawde_core::error::ClaudeError;
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Extract text from all Text content blocks (summariser output is plain text).
@@ -295,24 +296,31 @@ impl Default for MicroCompactConfig {
 
 /// Attempt a micro-compact if the context is above `config.trigger_threshold`.
 ///
-/// Returns `Some(new_messages)` when compaction occurred, `None` otherwise.
+/// Returns `Ok(Some(new_messages))` when compaction occurred, `Ok(None)` when
+/// no compaction was needed or the provider failed, and `Err(Cancelled)` when
+/// the caller interrupted the operation.
 pub async fn micro_compact_if_needed(
     provider: &dyn LlmProvider,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
     config: &MicroCompactConfig,
-) -> Option<Vec<Message>> {
+    cancel: &CancellationToken,
+) -> Result<Option<Vec<Message>>, ClaudeError> {
+    if cancel.is_cancelled() {
+        return Err(ClaudeError::Cancelled);
+    }
+
     let window = context_window_for_model(model);
     let pct_used = input_tokens as f64 / window as f64;
 
     if pct_used < config.trigger_threshold as f64 {
-        return None;
+        return Ok(None);
     }
 
     let total = messages.len();
     if total <= config.keep_recent_messages + 1 {
-        return None;
+        return Ok(None);
     }
 
     let split_at = total.saturating_sub(config.keep_recent_messages);
@@ -326,18 +334,19 @@ pub async fn micro_compact_if_needed(
     );
 
     let target_tokens = config.summary_target_tokens as u32;
-    match summarise_head(provider, messages, split_at, model, target_tokens).await {
+    match summarise_head(provider, messages, split_at, model, target_tokens, cancel).await {
         Ok(new_msgs) => {
             info!(
                 original = total,
                 compacted = new_msgs.len(),
                 "MicroCompact complete"
             );
-            Some(new_msgs)
+            Ok(Some(new_msgs))
         }
+        Err(ClaudeError::Cancelled) => Err(ClaudeError::Cancelled),
         Err(e) => {
             warn!(error = %e, "MicroCompact failed");
-            None
+            Ok(None)
         }
     }
 }
@@ -994,9 +1003,13 @@ async fn summarise_head(
     split_at: usize,
     model: &str,
     max_summary_tokens: u32,
+    cancel: &CancellationToken,
 ) -> Result<Vec<Message>, ClaudeError> {
     if split_at == 0 {
         return Ok(messages.to_vec());
+    }
+    if cancel.is_cancelled() {
+        return Err(ClaudeError::Cancelled);
     }
 
     let head = &messages[..split_at];
@@ -1110,10 +1123,12 @@ async fn summarise_head(
         provider_options: Default::default(),
     };
 
-    let response = provider
-        .create_message(request)
-        .await
-        .map_err(|e| ClaudeError::Api(e.to_string()))?;
+    let response = tokio::select! {
+        response = provider.create_message(request) => {
+            response.map_err(|e| ClaudeError::Api(e.to_string()))?
+        }
+        _ = cancel.cancelled() => return Err(ClaudeError::Cancelled),
+    };
 
     let raw_summary = compact_text_from_blocks(&response.content);
 
@@ -1210,7 +1225,12 @@ pub async fn compact_conversation(
     provider: &dyn LlmProvider,
     messages: &[Message],
     model: &str,
+    cancel: &CancellationToken,
 ) -> Result<Vec<Message>, ClaudeError> {
+    if cancel.is_cancelled() {
+        return Err(ClaudeError::Cancelled);
+    }
+
     let total = messages.len();
 
     // Token-budget keep: summarise everything older than the most recent
@@ -1234,7 +1254,7 @@ pub async fn compact_conversation(
     );
 
     // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(provider, messages, split_at, model, 20_000).await
+    summarise_head(provider, messages, split_at, model, 20_000, cancel).await
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
@@ -1250,10 +1270,14 @@ pub async fn auto_compact_if_needed(
     model: &str,
     context_window: u64,
     state: &mut AutoCompactState,
+    cancel: &CancellationToken,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact_for_window(input_tokens, context_window, state) {
+    if cancel.is_cancelled() || !should_auto_compact_for_window(input_tokens, context_window, state)
+    {
         return None;
     }
+
+    let turns_before_attempt = state.turns_since_last_compact;
 
     // Debounce: don't compact too frequently even when the token count says we
     // should.  When context hovers near the threshold, compacting every turn
@@ -1290,7 +1314,7 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(provider, messages, model).await {
+    match compact_conversation(provider, messages, model, cancel).await {
         Ok(new_msgs) => {
             state.on_success();
             info!(
@@ -1299,6 +1323,13 @@ pub async fn auto_compact_if_needed(
                 "Auto-compact complete"
             );
             Some(new_msgs)
+        }
+        Err(ClaudeError::Cancelled) => {
+            // Cancellation is user control flow, not a failed attempt. Restore
+            // the debounce counter so the state is unchanged by an aborted run.
+            state.turns_since_last_compact = turns_before_attempt;
+            warn!("Auto-compact was cancelled; conversation preserved");
+            None
         }
         Err(e) => {
             warn!(error = %e, "Auto-compact failed");
@@ -1472,8 +1503,8 @@ fn strip_images(messages: Vec<clawde_core::types::Message>) -> Vec<clawde_core::
 /// Feature gate: only call this when
 /// `clawde_core::feature_gates::is_feature_enabled("reactive_compact")` is true.
 ///
-/// The `cancel` token is checked before the API call so the user can abort
-/// a long-running compact.
+/// The `cancel` token is checked before and during the API call so the user
+/// can abort a long-running compact.
 pub async fn reactive_compact(
     messages: Vec<clawde_core::types::Message>,
     provider: &dyn LlmProvider,
@@ -1512,8 +1543,15 @@ pub async fn reactive_compact(
 
     let original_token_estimate = estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
-    let mut new_messages =
-        summarise_head(provider, &stripped, split_at, &config.model, 20_000).await?;
+    let mut new_messages = summarise_head(
+        provider,
+        &stripped,
+        split_at,
+        &config.model,
+        20_000,
+        &cancel,
+    )
+    .await?;
 
     // The summary lives as the first message in new_messages.
     let summary_text = new_messages
@@ -1567,7 +1605,12 @@ pub async fn context_collapse(
     messages: Vec<clawde_core::types::Message>,
     provider: &dyn LlmProvider,
     config: &crate::QueryConfig,
+    cancel: &CancellationToken,
 ) -> Result<CompactResult, clawde_core::error::ClaudeError> {
+    if cancel.is_cancelled() {
+        return Err(clawde_core::error::ClaudeError::Cancelled);
+    }
+
     let total = messages.len();
     if total == 0 {
         return Ok(CompactResult {
@@ -1622,10 +1665,14 @@ pub async fn context_collapse(
         provider_options: Default::default(),
     };
 
-    let response = provider
-        .create_message(request)
-        .await
-        .map_err(|e| clawde_core::error::ClaudeError::Api(e.to_string()))?;
+    let response = tokio::select! {
+        response = provider.create_message(request) => {
+            response.map_err(|e| clawde_core::error::ClaudeError::Api(e.to_string()))?
+        }
+        _ = cancel.cancelled() => {
+            return Err(clawde_core::error::ClaudeError::Cancelled);
+        }
+    };
 
     let summary_text = compact_text_from_blocks(&response.content);
 
@@ -2375,12 +2422,24 @@ mod tests {
     /// disabled or threshold is not met.
     struct GateMockProvider {
         called: std::sync::atomic::AtomicBool,
+        blocking: bool,
+        started: std::sync::Arc<tokio::sync::Notify>,
     }
 
     impl GateMockProvider {
         fn new() -> Self {
             Self {
                 called: std::sync::atomic::AtomicBool::new(false),
+                blocking: false,
+                started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn blocking() -> Self {
+            Self {
+                called: std::sync::atomic::AtomicBool::new(false),
+                blocking: true,
+                started: std::sync::Arc::new(tokio::sync::Notify::new()),
             }
         }
 
@@ -2407,6 +2466,10 @@ mod tests {
         ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
             self.called
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            if self.blocking {
+                self.started.notify_one();
+                std::future::pending().await
+            }
             Err(clawde_api::ProviderError::ServerError {
                 provider: clawde_core::ProviderId::new("mock"),
                 status: Some(500),
@@ -2473,6 +2536,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -2499,6 +2563,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -2538,6 +2603,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -2551,5 +2617,89 @@ mod tests {
             state.consecutive_failures, 1,
             "provider error increments failure count"
         );
+    }
+
+    /// Cancellation must interrupt the provider future itself, not only the
+    /// preflight check before compaction starts.
+    #[tokio::test]
+    async fn in_flight_compaction_cancellation_preserves_control() {
+        let provider = std::sync::Arc::new(GateMockProvider::blocking());
+        let started = provider.started.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let big = filler(20_000);
+        let messages = vec![
+            Message::user(big.clone()),
+            Message::assistant(big.clone()),
+            Message::user(big),
+        ];
+        let task_provider = provider.clone();
+
+        let task = tokio::spawn(async move {
+            compact_conversation(
+                task_provider.as_ref(),
+                &messages,
+                "test-model",
+                &task_cancel,
+            )
+            .await
+        });
+        started.notified().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should interrupt the provider wait")
+            .expect("compaction task should not panic")
+            .expect_err("cancelled compaction must not succeed");
+        assert!(matches!(result, ClaudeError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn cancelled_auto_compact_does_not_open_circuit_breaker() {
+        let provider = std::sync::Arc::new(GateMockProvider::blocking());
+        let started = provider.started.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let big = filler(20_000);
+        let messages = vec![
+            Message::user(big.clone()),
+            Message::assistant(big.clone()),
+            Message::user(big),
+        ];
+        let task_provider = provider.clone();
+
+        let task = tokio::spawn(async move {
+            let mut state = AutoCompactState {
+                turns_since_last_compact: 10,
+                ..Default::default()
+            };
+            let result = auto_compact_if_needed(
+                task_provider.as_ref(),
+                &messages,
+                190_000,
+                "test-model",
+                200_000,
+                &mut state,
+                &task_cancel,
+            )
+            .await;
+            (
+                result,
+                state.consecutive_failures,
+                state.turns_since_last_compact,
+            )
+        });
+        started.notified().await;
+        cancel.cancel();
+
+        let (result, failures, turns_since) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("cancellation should interrupt auto-compact")
+                .expect("auto-compact task should not panic");
+        assert!(result.is_none());
+        assert_eq!(failures, 0, "cancellation is not a provider failure");
+        assert_eq!(turns_since, 10, "cancellation must not consume a turn");
     }
 }
