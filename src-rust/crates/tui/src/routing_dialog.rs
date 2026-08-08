@@ -96,6 +96,14 @@ pub struct RoutingDialogState {
     /// upstream pane so users see why image/large requests skip some
     /// upstreams (spec §8.4 "capability match").
     pub capabilities: Vec<(String, bool, u32)>,
+    /// Per-upstream cooldown state `(upstream_id, kind, retry_secs)` where
+    /// `kind` is `"5xx"` or `"empty"`, captured at open time so the upstream
+    /// pane can show why a provider is currently being skipped.
+    pub cooldowns: Vec<(String, String, Option<u64>)>,
+    /// Per-upstream key-ring health `(upstream_id, active, total, retry)` for
+    /// upstreams wrapped in a KeyRotatingProvider (2+ keys), captured at open
+    /// time for the upstream pane's key-health dots.
+    pub key_health: Vec<(String, usize, usize, Option<u64>)>,
 }
 
 impl Default for RoutingDialogState {
@@ -112,6 +120,8 @@ impl Default for RoutingDialogState {
             strategy: "auto".to_string(),
             latencies: Vec::new(),
             capabilities: Vec::new(),
+            cooldowns: Vec::new(),
+            key_health: Vec::new(),
         }
     }
 }
@@ -122,19 +132,23 @@ impl RoutingDialogState {
     }
 
     /// Open the dialog, seeding the overrides from the live config's
-    /// `providers.free.options.routing.task_preferences`, the per-upstream
-    /// latency snapshot for the model-performance view, and the per-upstream
-    /// capability metadata for the capability badges (spec §8.6).
+    /// `providers.free.options.routing.task_preferences` plus the per-upstream
+    /// model snapshots for the model-performance view (spec §8.6): latency,
+    /// capability badges, cooldown state, and key-ring health.
     pub fn open(
         &mut self,
         config: &Config,
         latencies: Vec<(String, Option<f64>)>,
         capabilities: Vec<(String, bool, u32)>,
+        cooldowns: Vec<(String, String, Option<u64>)>,
+        key_health: Vec<(String, usize, usize, Option<u64>)>,
     ) {
         self.overrides = parse_task_preferences(config);
         self.strategy = parse_routing_strategy(config);
         self.latencies = latencies;
         self.capabilities = capabilities;
+        self.cooldowns = cooldowns;
+        self.key_health = key_health;
         self.selected_task = 0;
         self.pane = RoutingPane::Tasks;
         self.upstream_idx = 0;
@@ -157,6 +171,26 @@ impl RoutingDialogState {
             .iter()
             .find(|(id, _, _)| id == upstream_id)
             .map(|(_, vision, ctx)| (*vision, *ctx))
+    }
+
+    /// The recorded key-ring health `(active, total)` for an upstream id, if
+    /// it has a key ring (2+ keys). `None` when the upstream has no ring.
+    pub fn key_health_for(&self, upstream_id: &str) -> Option<(usize, usize)> {
+        self.key_health
+            .iter()
+            .find(|(id, _, _, _)| id == upstream_id)
+            .map(|(_, active, total, _)| (*active, *total))
+    }
+
+    /// The shortest remaining cooldown `(kind, retry_secs)` for an upstream
+    /// id, if it is currently cooling down (`kind` is `"5xx"` or `"empty"`).
+    /// `None` when the upstream is not in any cooldown.
+    pub fn cooldown_for(&self, upstream_id: &str) -> Option<(String, u64)> {
+        self.cooldowns
+            .iter()
+            .filter(|(id, _, _)| id == upstream_id)
+            .filter_map(|(_, kind, secs)| secs.map(|s| (kind.clone(), s)))
+            .min_by_key(|(_, secs)| *secs)
     }
 
     pub fn close(&mut self) {
@@ -497,6 +531,21 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
                 row.push_str(" \u{b7}vision");
             }
         }
+        // Key-health dots (spec §8.6): only upstreams wrapped in a
+        // KeyRotatingProvider (2+ keys) report a ring — show active/total so
+        // the user sees at a glance how many keys are left.
+        if let Some((active, total)) = state.key_health_for(upstream.id) {
+            if total > 1 {
+                row.push_str(&format!(" \u{b7}{}/{}", active, total));
+            }
+        }
+        // Cooldown tag (spec §8.6): an upstream currently cooling down (5xx
+        // or empty-completion) shows the shortest remaining retry — the same
+        // state the router skips it for at dispatch time.
+        if let Some((kind, secs)) = state.cooldown_for(upstream.id) {
+            let label = if kind == "5xx" { "cool" } else { "empty" };
+            row.push_str(&format!(" \u{b7}{} {}s", label, secs));
+        }
         // Model-performance column (spec §8.6): average latency when recorded.
         match state.latency_for(upstream.id) {
             Some(secs) => row.push_str(&format!("  {:.1}s", secs)),
@@ -585,7 +634,7 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg, Vec::new(), Vec::new());
+        dialog.open(&cfg, Vec::new(), Vec::new(), Vec::new(), Vec::new());
         assert!(dialog.visible);
         assert_eq!(dialog.strategy, "task_based");
         assert_eq!(
@@ -598,7 +647,13 @@ mod tests {
     #[test]
     fn toggle_pin_adds_and_removes() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default(), Vec::new(), Vec::new());
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         dialog.selected_task = 0; // CodeGeneration
         assert!(!dialog.is_pinned("groq"));
         dialog.toggle_pin("groq");
@@ -624,7 +679,7 @@ mod tests {
             "task_based",
         );
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&cfg, Vec::new(), Vec::new());
+        dialog.open(&cfg, Vec::new(), Vec::new(), Vec::new(), Vec::new());
         dialog.selected_task = 0;
         dialog.reset_task();
         assert!(dialog.task_override(TaskType::CodeGeneration).is_empty());
@@ -637,7 +692,13 @@ mod tests {
     #[test]
     fn build_task_preferences_drops_empty_entries() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default(), Vec::new(), Vec::new());
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         dialog.toggle_pin("groq");
         dialog.toggle_pin("groq"); // back to empty
         assert!(dialog.build_task_preferences().is_empty());
@@ -652,7 +713,13 @@ mod tests {
     #[test]
     fn assignment_summary_shows_pins_or_auto_defaults() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default(), Vec::new(), Vec::new());
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         let auto = dialog.assignment_summary(TaskType::Verification);
         assert!(auto.starts_with("auto \u{b7} "), "got: {auto}");
         dialog.toggle_pin("groq");
@@ -663,7 +730,13 @@ mod tests {
     #[test]
     fn navigation_clamps_to_bounds() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default(), Vec::new(), Vec::new());
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         dialog.select_prev();
         assert_eq!(dialog.selected_task, 0);
         for _ in 0..10 {
@@ -693,6 +766,8 @@ mod tests {
                 ("cerebras".to_string(), None),
             ],
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.latency_for("groq"), Some(1.25));
         assert_eq!(dialog.latency_for("cerebras"), None);
@@ -710,6 +785,8 @@ mod tests {
                 ("google".to_string(), true, 128_000),
                 ("huggingface".to_string(), false, 128_000),
             ],
+            Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.capability_for("google"), Some((true, 128_000)));
         assert_eq!(dialog.capability_for("huggingface"), Some((false, 128_000)));
@@ -718,9 +795,39 @@ mod tests {
     }
 
     #[test]
+    fn open_captures_cooldown_and_key_health_snapshots() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                ("groq".to_string(), "5xx".to_string(), Some(45)),
+                ("groq".to_string(), "empty".to_string(), Some(120)),
+                ("cerebras".to_string(), "5xx".to_string(), None),
+            ],
+            vec![("google".to_string(), 2, 3, Some(60))],
+        );
+        // cooldown_for returns the SHORTEST remaining retry across kinds.
+        assert_eq!(dialog.cooldown_for("groq"), Some(("5xx".to_string(), 45)));
+        // A cooldown entry with retry None is treated as not active.
+        assert_eq!(dialog.cooldown_for("cerebras"), None);
+        assert_eq!(dialog.cooldown_for("google"), None);
+        // key_health_for exposes the ring only for key-rotating upstreams.
+        assert_eq!(dialog.key_health_for("google"), Some((2, 3)));
+        assert_eq!(dialog.key_health_for("groq"), None);
+    }
+
+    #[test]
     fn scroll_keeps_cursor_visible() {
         let mut dialog = RoutingDialogState::new();
-        dialog.open(&Config::default(), Vec::new(), Vec::new());
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         dialog.switch_pane();
         dialog.last_upstream_visible.set(5);
         // Navigate past the window — select_next must scroll to keep the

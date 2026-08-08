@@ -3042,8 +3042,28 @@ impl App {
                 })
                 .map(|p| p.upstream_capabilities())
                 .unwrap_or_default();
+            let cooldowns = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_cooldowns())
+                .unwrap_or_default();
+            let key_health = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_key_health())
+                .unwrap_or_default();
             self.routing_dialog
-                .open(&self.config, latencies, capabilities);
+                .open(&self.config, latencies, capabilities, cooldowns, key_health);
             return true;
         }
         // /spec-review [<file>]: open the spec review dialog (audit spec §10)
