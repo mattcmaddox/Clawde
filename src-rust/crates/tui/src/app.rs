@@ -10420,6 +10420,7 @@ mod tests {
     /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
     /// settings writes (e.g. task-sort persistence) never touch the real
     /// `~/.clawde/settings.json`. Mirrors the TestHome helper in commands/keys.rs.
+    /// Serializes on the crate-wide [`crate::TEST_ENV_LOCK`] per AGENTS.md.
     struct TestHome {
         _lock: std::sync::MutexGuard<'static, ()>,
         _tmp: tempfile::TempDir,
@@ -10428,9 +10429,7 @@ mod tests {
 
     impl TestHome {
         fn acquire() -> TestHome {
-            use std::sync::Mutex;
-            static HOME_LOCK: Mutex<()> = Mutex::new(());
-            let _lock = HOME_LOCK
+            let _lock = crate::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var_os("CLAWDE_HOME");

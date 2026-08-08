@@ -5669,10 +5669,9 @@ mod task_badge_tooltip_tests {
     fn tooltip_draws_isolated_from_real_settings() {
         // Guard: App::new restores free_task_sort from settings; point
         // CLAWDE_HOME at a temp dir so a malformed real settings file can
-        // never flake this render test (mirrors app.rs TestHome).
-        use std::sync::Mutex;
-        static HOME_LOCK: Mutex<()> = Mutex::new(());
-        let _lock = HOME_LOCK
+        // never flake this render test (mirrors app.rs TestHome). Serializes
+        // on the crate-wide TEST_ENV_LOCK per AGENTS.md.
+        let _lock = crate::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var_os("CLAWDE_HOME");

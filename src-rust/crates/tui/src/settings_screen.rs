@@ -3115,9 +3115,9 @@ mod tests {
 
     impl MemoryTestHome {
         fn acquire() -> MemoryTestHome {
-            use std::sync::Mutex;
-            static HOME_LOCK: Mutex<()> = Mutex::new(());
-            let _lock = HOME_LOCK
+            // Serialize on the crate-wide TEST_ENV_LOCK per AGENTS.md so
+            // CLAWDE_HOME mutations never race other modules' tests.
+            let _lock = crate::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var_os("CLAWDE_HOME");

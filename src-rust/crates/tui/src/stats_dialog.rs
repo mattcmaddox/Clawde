@@ -176,13 +176,20 @@ pub enum StatsTab {
     Models,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ProviderHealthRow {
     label: String,
     active_keys: usize,
     total_keys: usize,
     retry_secs: Option<u64>,
     cooldowns: usize,
+    /// Dispatch success rate 0.0–1.0 for this upstream (`None` = no
+    /// dispatches yet), captured at open time for the model-performance
+    /// fact-check alongside the key state.
+    success_rate: Option<f64>,
+    /// Sliding-window average dispatch latency in seconds (`None` = no
+    /// samples yet).
+    avg_latency: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,24 +262,79 @@ impl StatsDialogState {
             }
         }
 
+        // Per-upstream model-performance snapshots keyed by `provider/upstream`
+        // label so the key-health rows below can carry the fact-check columns
+        // (does this upstream actually succeed, and how fast?). The registry
+        // already owns this state for /routing edit; the same summary methods
+        // feed both surfaces.
+        let mut success_by_label: HashMap<String, Option<f64>> = HashMap::new();
+        for (provider, entries) in registry.upstream_success_rate_summaries() {
+            for (upstream, rate) in entries {
+                success_by_label.insert(format!("{provider}/{upstream}"), rate);
+            }
+        }
+        let mut latency_by_label: HashMap<String, Option<f64>> = HashMap::new();
+        for (provider, entries) in registry.upstream_latency_summaries() {
+            for (upstream, avg) in entries {
+                latency_by_label.insert(format!("{provider}/{upstream}"), avg);
+            }
+        }
+        let snapshot_for = |label: &str| {
+            (
+                success_by_label.get(label).copied().flatten(),
+                latency_by_label.get(label).copied().flatten(),
+            )
+        };
+
         for (provider, active, total, retry) in registry.key_ring_summaries() {
+            let (success_rate, avg_latency) = snapshot_for(&provider);
             rows.push(ProviderHealthRow {
                 cooldowns: cooldown_counts.get(&provider).copied().unwrap_or(0),
                 label: provider,
                 active_keys: active,
                 total_keys: total,
                 retry_secs: retry,
+                success_rate,
+                avg_latency,
             });
         }
         for (provider, entries) in registry.upstream_key_health_summaries() {
             for (upstream, active, total, retry) in entries {
                 let label = format!("{provider}/{upstream}");
+                let (success_rate, avg_latency) = snapshot_for(&label);
                 rows.push(ProviderHealthRow {
                     cooldowns: cooldown_counts.get(&label).copied().unwrap_or(0),
                     label,
                     active_keys: active,
                     total_keys: total,
                     retry_secs: retry,
+                    success_rate,
+                    avg_latency,
+                });
+            }
+        }
+        // Performance rows for every configured upstream, even those without a
+        // key ring (single-key setups report no rings, so the key-health loop
+        // above would skip them entirely). This is what makes the
+        // model-performance fact-check useful for the common single-key case:
+        // each configured upstream shows its success rate / latency even
+        // though it has no active/total key dots. Rows already added by the
+        // ring loops are not duplicated.
+        for (provider, entries) in registry.upstream_success_rate_summaries() {
+            for (upstream, rate) in entries {
+                let label = format!("{provider}/{upstream}");
+                if rows.iter().any(|r| r.label == label) {
+                    continue;
+                }
+                let avg_latency = latency_by_label.get(&label).copied().flatten();
+                rows.push(ProviderHealthRow {
+                    cooldowns: cooldown_counts.get(&label).copied().unwrap_or(0),
+                    label,
+                    active_keys: 0,
+                    total_keys: 0,
+                    retry_secs: None,
+                    success_rate: rate,
+                    avg_latency,
                 });
             }
         }
@@ -710,7 +772,18 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
             Style::default().fg(Color::DarkGray),
         )]));
         for row in state.live_provider_health.iter().take(8) {
-            let color = if row.active_keys == 0 {
+            // Rows without a key ring (single-key upstreams) carry no
+            // active/total dots — their dot follows the success rate instead,
+            // so a healthy upstream is green rather than a misleading red
+            // (the `active_keys == 0` branch would otherwise fire).
+            let color = if row.total_keys == 0 {
+                match row.success_rate {
+                    Some(r) if r >= 0.99 => Color::Green,
+                    Some(r) if r > 0.0 => Color::Yellow,
+                    Some(_) => Color::Red,
+                    None => Color::DarkGray,
+                }
+            } else if row.active_keys == 0 {
                 Color::Red
             } else if row.active_keys < row.total_keys {
                 Color::Yellow
@@ -730,18 +803,40 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
             } else {
                 String::new()
             };
+            // Model-performance fact-check (spec §8.6): dispatch success rate
+            // and average latency when recorded. Success rates color-code like
+            // the key dots — green all-success, yellow degraded, red failing —
+            // so the row answers "is this upstream actually working?" at a
+            // glance. Em-dashes pad to the same column width as the numeric
+            // rates so rows stay aligned.
+            let (success, success_color) = match row.success_rate {
+                Some(r) if r >= 0.99 => (format!("  {:>3.0}%", r * 100.0), Color::Green),
+                Some(r) if r > 0.0 => (format!("  {:>3.0}%", r * 100.0), Color::Yellow),
+                Some(_) => (format!("  {:>3.0}%", 0.0), Color::Red),
+                None => ("     —".to_string(), Color::DarkGray),
+            };
+            let latency = row
+                .avg_latency
+                .map(|secs| format!("  {:.1}s", secs))
+                .unwrap_or_else(|| "     —".to_string());
+            // Key-health dots only exist for key-ring upstreams (2+ keys);
+            // single-key performance rows render with no keys suffix.
+            let keys = if row.total_keys > 0 {
+                format!("{}/{} keys", row.active_keys, row.total_keys)
+            } else {
+                String::new()
+            };
             lines.push(Line::from(vec![
                 Span::styled("  ● ", Style::default().fg(color)),
                 Span::styled(
                     format!("{:<28}", row.label),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::styled(
-                    format!("{}/{} keys", row.active_keys, row.total_keys),
-                    Style::default().fg(color),
-                ),
+                Span::styled(keys, Style::default().fg(color)),
                 Span::styled(retry, Style::default().fg(Color::Yellow)),
                 Span::styled(cooldowns, Style::default().fg(Color::DarkGray)),
+                Span::styled(success, Style::default().fg(success_color)),
+                Span::styled(latency, Style::default().fg(Color::White)),
             ]));
         }
     }
@@ -1229,6 +1324,8 @@ mod tests {
             total_keys: 2,
             retry_secs: Some(30),
             cooldowns: 1,
+            success_rate: None,
+            avg_latency: None,
         });
         let area = Rect::new(0, 0, 110, 24);
         let mut buf = Buffer::empty(area);
@@ -1239,6 +1336,162 @@ mod tests {
         assert!(content.contains("1/2 keys"));
         assert!(content.contains("retry 30s"));
         assert!(content.contains("1 cooldown"));
+    }
+
+    #[test]
+    fn live_provider_health_renders_success_rate_and_latency() {
+        let mut state = free_state();
+        state.live_provider_health.push(ProviderHealthRow {
+            label: "free/huggingface".into(),
+            active_keys: 0,
+            total_keys: 0,
+            retry_secs: None,
+            cooldowns: 0,
+            success_rate: Some(0.25),
+            avg_latency: Some(9.4),
+        });
+        state.live_provider_health.push(ProviderHealthRow {
+            label: "free/groq".into(),
+            active_keys: 0,
+            total_keys: 0,
+            retry_secs: None,
+            cooldowns: 0,
+            success_rate: Some(1.0),
+            avg_latency: Some(2.1),
+        });
+        let area = Rect::new(0, 0, 110, 24);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("free/huggingface"));
+        assert!(content.contains("25%"));
+        assert!(content.contains("9.4s"));
+        assert!(content.contains("free/groq"));
+        assert!(content.contains("100%"));
+        assert!(content.contains("2.1s"));
+        // Single-key rows (no ring) must NOT render a "0/0 keys" suffix.
+        assert!(!content.contains("0/0 keys"));
+    }
+
+    /// Point CLAWDE_HOME at a throwaway temp dir for the duration of a test so
+    /// `build_free_provider`'s auth-store read never touches the real home.
+    /// Mirrors the TestHome helper in app.rs / commands/keys.rs. Serializes on
+    /// the crate-wide [`crate::TEST_ENV_LOCK`] per AGENTS.md.
+    struct TestHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        prev_clawde_home: Option<std::ffi::OsString>,
+    }
+
+    impl TestHome {
+        fn acquire() -> TestHome {
+            let _lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            TestHome {
+                _lock,
+                _tmp: tmp,
+                prev_clawde_home: prev,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.prev_clawde_home {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    /// Build a config whose free chain is exactly one upstream (mistral) with
+    /// Ollama isolated, so a fresh single-key setup exercises the
+    /// performance-row path (no key rings) without network calls.
+    fn single_upstream_config() -> clawde_core::config::Config {
+        use clawde_core::config::ProviderConfig;
+        let mut options = std::collections::HashMap::new();
+        options.insert(
+            "routing".to_string(),
+            serde_json::json!({
+                "disabled_upstreams": [
+                    "huggingface", "nvidia", "cerebras", "google", "cloudflare",
+                    "groq", "sambanova", "cline", "cohere", "opencode-zen",
+                    "zai", "openrouter"
+                ]
+            }),
+        );
+        let mut provider_configs = std::collections::HashMap::new();
+        provider_configs.insert(
+            "free".to_string(),
+            ProviderConfig {
+                options,
+                ..Default::default()
+            },
+        );
+        provider_configs.insert(
+            "ollama".to_string(),
+            ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        clawde_core::config::Config {
+            provider_configs,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refresh_provider_health_surfaces_performance_rows_without_rings() {
+        // A FreeProvider with a single key per upstream reports no key rings,
+        // so the health rows must come from the success-rate / latency
+        // summaries. Every configured upstream shows a row (with em-dash
+        // metrics until its first dispatch), even though none has a ring.
+        use clawde_api::ProviderRegistry;
+
+        let _home = TestHome::acquire();
+        // Seed a single mistral key into the temp home's auth store (set()
+        // persists to CLAWDE_HOME/auth.json immediately).
+        let mut store = clawde_core::AuthStore::load();
+        store.set(
+            "mistral",
+            clawde_core::StoredCredential::ApiKey {
+                key: "fake-mistral-key-1234567890".to_string(),
+            },
+        );
+
+        let config = single_upstream_config();
+        // registry.rebuild_free is the public path app.rs uses at runtime; it
+        // builds the chain from the seeded auth store and registers it.
+        let mut registry = ProviderRegistry::new();
+        registry.rebuild_free(&config);
+
+        let mut state = free_state();
+        state.refresh_provider_health(&registry);
+        assert!(
+            !state.live_provider_health.is_empty(),
+            "single-key chain must surface performance rows"
+        );
+        for row in &state.live_provider_health {
+            assert_eq!(
+                row.total_keys, 0,
+                "single-key chain reports no key rings, got {} keys for {}",
+                row.total_keys, row.label
+            );
+        }
+        let mistral = state
+            .live_provider_health
+            .iter()
+            .find(|r| r.label == "free/mistral");
+        assert!(mistral.is_some(), "free/mistral row must be present");
+        assert_eq!(mistral.unwrap().success_rate, None);
+        assert_eq!(mistral.unwrap().avg_latency, None);
     }
 
     #[test]

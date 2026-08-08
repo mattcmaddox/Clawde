@@ -39,6 +39,19 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 
 ---
 
+## Smart multi-model routing (Phase 2)
+
+Clawde's Free Mode now routes each request across your configured free upstreams as a smart router (audit spec §8):
+
+- **Task-aware routing** — every request is classified (code generation, code edit, reasoning, planning, search, verification, simple edit, q&a) and the upstreams best suited to the task lead the fallback chain. `/routing` switches strategies (auto / task / sequential / random / latency) and `/routing edit` pins specific upstreams per task.
+- **Capability gating** — image-bearing requests only reach vision-capable upstreams, and oversized requests skip upstreams whose context window can't fit them, instead of burning a guaranteed-fail round-trip.
+- **Performance-aware ordering** — within the task-preferred group, upstreams with enough dispatch history are ordered by success rate then latency, so a task-appropriate upstream that keeps failing yields to one that actually succeeds.
+- **Cooldowns that stick** — 5xx / server-error and empty-completion cooldowns persist across restarts (`~/.clawde/empty-cooldown-state/free.json`), so a flaky upstream isn't re-hit after every relaunch.
+- **Model-performance dashboard** — `/routing edit` shows per-upstream key-health dots, cooldown tags, capability badges, average latency, and dispatch success rate — including per-task success rates when you highlight a task. The `/stats` dialog shows the same success-rate / latency fact-check per upstream.
+- **Health probes in parallel** — upstream key health is probed concurrently on a schedule, and exhausted keys are marked dead for rotation without waiting for the next real request.
+
+---
+
 # Getting Started
 
 ## Quick install (one-liner)

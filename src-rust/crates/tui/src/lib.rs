@@ -17,6 +17,15 @@
 // of scope for this cleanup.
 #![allow(clippy::too_many_arguments)]
 
+/// Crate-wide serialization lock for tests that mutate process-global state
+/// (CLAWDE_HOME, other env vars). AGENTS.md requires every such test to
+/// serialize on a crate-level lock; the `static` lives at the crate root so
+/// submodule tests (app, stats_dialog, settings_screen, render) share ONE
+/// mutex instead of each declaring an independent `HOME_LOCK` that could
+/// race under the parallel test runner.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,

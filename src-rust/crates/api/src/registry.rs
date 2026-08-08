@@ -515,6 +515,14 @@ pub type UpstreamKeyHealthSummaries = Vec<(String, Vec<(String, usize, usize, Op
 /// [`ProviderRegistry::upstream_cooldown_summaries`].
 pub type UpstreamCooldownSummaries = Vec<(String, Vec<(String, String, Option<u64>)>)>;
 
+/// Type alias for per-upstream dispatch success-rate summaries returned by
+/// [`ProviderRegistry::upstream_success_rate_summaries`].
+pub type UpstreamSuccessRateSummaries = Vec<(String, Vec<(String, Option<f64>)>)>;
+
+/// Type alias for per-upstream average-latency summaries returned by
+/// [`ProviderRegistry::upstream_latency_summaries`].
+pub type UpstreamLatencySummaries = Vec<(String, Vec<(String, Option<f64>)>)>;
+
 impl ProviderRegistry {
     /// Create an empty registry with Anthropic as the default provider ID.
     pub fn new() -> Self {
@@ -637,6 +645,38 @@ impl ProviderRegistry {
         let mut summaries = Vec::new();
         for (id, provider) in &self.providers {
             let entries = provider.upstream_cooldowns();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream dispatch success rates from all registered
+    /// composite providers. Each entry is `(provider_name, Vec<(upstream_id,
+    /// success_rate)>)` where `success_rate` is 0.0–1.0 (or `None` before the
+    /// first dispatch). Sorted by provider name.
+    pub fn upstream_success_rate_summaries(&self) -> UpstreamSuccessRateSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_success_rates();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect per-upstream average dispatch latency from all registered
+    /// composite providers. Each entry is `(provider_name, Vec<(upstream_id,
+    /// avg_secs)>)` where `avg_secs` is the sliding-window average (or `None`
+    /// before the first sample). Sorted by provider name.
+    pub fn upstream_latency_summaries(&self) -> UpstreamLatencySummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_latencies();
             if !entries.is_empty() {
                 summaries.push((id.to_string(), entries));
             }
