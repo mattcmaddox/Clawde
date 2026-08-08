@@ -30,7 +30,11 @@ pub struct StatsEntry {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache fields were added after the original stats format; missing values
+    /// in older JSONL records are treated as zero.
+    #[serde(default)]
     pub cache_read_tokens: u64,
+    #[serde(default)]
     pub cache_write_tokens: u64,
     /// Cost in USD cents (f64)
     pub cost_cents: f64,
@@ -42,6 +46,8 @@ pub struct StatsEntry {
 pub struct AggregatedStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_write_tokens: u64,
     pub total_cost_cents: f64,
     pub by_model: HashMap<String, ModelStats>,
     /// (date_str "YYYY-MM-DD", tokens) pairs sorted by date
@@ -91,21 +97,7 @@ pub fn load_stats() -> AggregatedStats {
             continue;
         };
 
-        let total_tokens = entry.input_tokens + entry.output_tokens;
-        agg.total_input_tokens += entry.input_tokens;
-        agg.total_output_tokens += entry.output_tokens;
-        agg.total_cost_cents += entry.cost_cents;
-
-        let model_entry = agg.by_model.entry(entry.model.clone()).or_default();
-        model_entry.input_tokens += entry.input_tokens;
-        model_entry.output_tokens += entry.output_tokens;
-        model_entry.cost_cents += entry.cost_cents;
-        model_entry.turns += 1;
-
-        // Date from timestamp
-        let date = timestamp_to_date(entry.timestamp_ms);
-        *daily.entry(date.clone()).or_insert(0) += total_tokens;
-        *agg.daily_costs.entry(date).or_insert(0.0) += entry.cost_cents;
+        accumulate_entry(&mut agg, &mut daily, &entry);
     }
 
     // Build sorted daily_tokens
@@ -116,6 +108,29 @@ pub fn load_stats() -> AggregatedStats {
     agg.daily_tokens = daily_sorted;
 
     agg
+}
+
+fn accumulate_entry(
+    agg: &mut AggregatedStats,
+    daily: &mut HashMap<String, u64>,
+    entry: &StatsEntry,
+) {
+    let total_tokens = entry.input_tokens + entry.output_tokens;
+    agg.total_input_tokens += entry.input_tokens;
+    agg.total_output_tokens += entry.output_tokens;
+    agg.total_cache_read_tokens += entry.cache_read_tokens;
+    agg.total_cache_write_tokens += entry.cache_write_tokens;
+    agg.total_cost_cents += entry.cost_cents;
+
+    let model_entry = agg.by_model.entry(entry.model.clone()).or_default();
+    model_entry.input_tokens += entry.input_tokens;
+    model_entry.output_tokens += entry.output_tokens;
+    model_entry.cost_cents += entry.cost_cents;
+    model_entry.turns += 1;
+
+    let date = timestamp_to_date(entry.timestamp_ms);
+    *daily.entry(date.clone()).or_insert(0) += total_tokens;
+    *agg.daily_costs.entry(date).or_insert(0.0) += entry.cost_cents;
 }
 
 fn timestamp_to_date(ts_ms: u64) -> String {
@@ -475,6 +490,14 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
         Span::styled("  Output:   ", Style::default().fg(Color::DarkGray)),
         Span::raw(format_tokens(data.total_output_tokens)),
     ]));
+    if let Some(cache_summary) =
+        format_cache_summary(data.total_cache_read_tokens, data.total_cache_write_tokens)
+    {
+        lines.push(Line::from(vec![
+            Span::styled("  Cache:    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(cache_summary),
+        ]));
+    }
     lines.push(Line::default());
     let usage_summary = if data.total_cost_cents > 0.0 {
         clawde_core::format_utils::format_usage_summary(total_tokens, data.total_cost_cents)
@@ -904,6 +927,18 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
 // Formatting helpers
 // ---------------------------------------------------------------------------
 
+fn format_cache_summary(read_tokens: u64, write_tokens: u64) -> Option<String> {
+    if read_tokens == 0 && write_tokens == 0 {
+        None
+    } else {
+        Some(format!(
+            "{} read · {} written",
+            format_tokens(read_tokens),
+            format_tokens(write_tokens)
+        ))
+    }
+}
+
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -1040,6 +1075,57 @@ mod tests {
         render_stats_dialog(&state, area, &mut buf);
         let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         assert!(content.contains("Cost Heatmap"));
+    }
+
+    #[test]
+    fn legacy_stats_entry_without_cache_fields_deserializes() {
+        let entry: StatsEntry = serde_json::from_str(
+            r#"{
+                "timestamp_ms": 1700000000000,
+                "model": "free/model",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cost_cents": 0.0
+            }"#,
+        )
+        .expect("legacy stats records should remain readable");
+        assert_eq!(entry.cache_read_tokens, 0);
+        assert_eq!(entry.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn cache_usage_aggregates_and_renders_only_when_present() {
+        let mut agg = AggregatedStats::default();
+        let mut daily = HashMap::new();
+        accumulate_entry(
+            &mut agg,
+            &mut daily,
+            &StatsEntry {
+                model: "free/model".into(),
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_tokens: 500,
+                cache_write_tokens: 40,
+                timestamp_ms: 1_700_000_000_000,
+                ..StatsEntry::default()
+            },
+        );
+        assert_eq!(agg.total_cache_read_tokens, 500);
+        assert_eq!(agg.total_cache_write_tokens, 40);
+        assert_eq!(
+            format_cache_summary(500, 40).as_deref(),
+            Some("500 read · 40 written")
+        );
+        assert_eq!(format_cache_summary(0, 0), None);
+
+        let mut state = free_state();
+        state.data = Some(agg);
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Cache:"));
+        assert!(content.contains("500 read"));
     }
 
     // ---- model breakdown: add_model_usage ----------------------------------
