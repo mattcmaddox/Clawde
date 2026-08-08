@@ -198,7 +198,17 @@ impl StatsDialogState {
         self.longest_streak_days = longest;
         self.data = Some(stats);
         self.visible = true;
+        self.tab = StatsTab::Overview;
         self.scroll = 0;
+    }
+
+    /// Billing-only views are useful when at least one recorded turn has a
+    /// nonzero cost. Free-model usage still keeps token and model analytics,
+    /// but should not expose empty cost visualizations.
+    fn has_paid_usage(&self) -> bool {
+        self.data
+            .as_ref()
+            .is_some_and(|stats| stats.total_cost_cents > 0.0)
     }
 
     pub fn close(&mut self) {
@@ -206,9 +216,15 @@ impl StatsDialogState {
     }
 
     pub fn next_tab(&mut self) {
-        self.tab = match self.tab {
+        let current = if !self.has_paid_usage() && self.tab == StatsTab::CostHeatmap {
+            StatsTab::DailyTokens
+        } else {
+            self.tab
+        };
+        self.tab = match current {
             StatsTab::Overview => StatsTab::DailyTokens,
-            StatsTab::DailyTokens => StatsTab::CostHeatmap,
+            StatsTab::DailyTokens if self.has_paid_usage() => StatsTab::CostHeatmap,
+            StatsTab::DailyTokens => StatsTab::Models,
             StatsTab::CostHeatmap => StatsTab::Models,
             StatsTab::Models => StatsTab::Overview,
         };
@@ -216,11 +232,17 @@ impl StatsDialogState {
     }
 
     pub fn prev_tab(&mut self) {
-        self.tab = match self.tab {
+        let current = if !self.has_paid_usage() && self.tab == StatsTab::CostHeatmap {
+            StatsTab::DailyTokens
+        } else {
+            self.tab
+        };
+        self.tab = match current {
             StatsTab::Overview => StatsTab::Models,
             StatsTab::DailyTokens => StatsTab::Overview,
             StatsTab::CostHeatmap => StatsTab::DailyTokens,
-            StatsTab::Models => StatsTab::CostHeatmap,
+            StatsTab::Models if self.has_paid_usage() => StatsTab::CostHeatmap,
+            StatsTab::Models => StatsTab::DailyTokens,
         };
         self.scroll = 0;
     }
@@ -374,19 +396,6 @@ pub fn render_stats_dialog(state: &StatsDialogState, area: Rect, buf: &mut Buffe
     let layout = begin_modal_buf(buf, area, 92, 30, 2, 1);
     render_modal_title_buf(buf, layout.header_area, "Cost & stats", "esc");
 
-    let tab_line = Line::from(vec![
-        tab_span("Overview", state.tab == StatsTab::Overview),
-        Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)),
-        tab_span("Daily Tokens", state.tab == StatsTab::DailyTokens),
-        Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)),
-        tab_span("Cost Heatmap", state.tab == StatsTab::CostHeatmap),
-        Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)),
-        tab_span("Models", state.tab == StatsTab::Models),
-    ]);
-    if let Some(tab_area) = modal_header_line_area(layout.header_area, 1) {
-        Paragraph::new(tab_line).render(tab_area, buf);
-    }
-
     let content_area = layout.body_area;
 
     let Some(data) = &state.data else {
@@ -396,7 +405,32 @@ pub fn render_stats_dialog(state: &StatsDialogState, area: Rect, buf: &mut Buffe
         return;
     };
 
-    match state.tab {
+    let cost_tab_available = data.total_cost_cents > 0.0;
+    let active_tab = if !cost_tab_available && state.tab == StatsTab::CostHeatmap {
+        StatsTab::DailyTokens
+    } else {
+        state.tab
+    };
+    let mut tab_spans = vec![
+        tab_span("Overview", active_tab == StatsTab::Overview),
+        Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)),
+        tab_span("Daily Tokens", active_tab == StatsTab::DailyTokens),
+    ];
+    if cost_tab_available {
+        tab_spans.push(Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)));
+        tab_spans.push(tab_span(
+            "Cost Heatmap",
+            active_tab == StatsTab::CostHeatmap,
+        ));
+    }
+    tab_spans.push(Span::styled("  ·  ", Style::default().fg(CLAURST_MUTED)));
+    tab_spans.push(tab_span("Models", active_tab == StatsTab::Models));
+    let tab_line = Line::from(tab_spans);
+    if let Some(tab_area) = modal_header_line_area(layout.header_area, 1) {
+        Paragraph::new(tab_line).render(tab_area, buf);
+    }
+
+    match active_tab {
         StatsTab::Overview => render_overview(data, state, content_area, buf),
         StatsTab::DailyTokens => render_daily_tokens(data, state.range_days, content_area, buf),
         StatsTab::CostHeatmap => render_cost_heatmap(data, content_area, buf),
@@ -442,8 +476,13 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
         Span::raw(format_tokens(data.total_output_tokens)),
     ]));
     lines.push(Line::default());
+    let usage_summary = if data.total_cost_cents > 0.0 {
+        clawde_core::format_utils::format_usage_summary(total_tokens, data.total_cost_cents)
+    } else {
+        format!("{} tokens", format_tokens(total_tokens))
+    };
     lines.push(Line::from(vec![Span::styled(
-        clawde_core::format_utils::format_usage_summary(total_tokens, data.total_cost_cents),
+        usage_summary,
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
@@ -509,10 +548,14 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
                     ),
                     Style::default().fg(Color::White),
                 ),
-                Span::styled(
-                    format!("  ${:.2}", stats.cost_cents / 100.0),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                if data.total_cost_cents > 0.0 {
+                    Span::styled(
+                        format!("  ${:.2}", stats.cost_cents / 100.0),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::raw("")
+                },
             ]));
         }
     }
@@ -624,8 +667,8 @@ fn render_daily_tokens(data: &AggregatedStats, range_days: u32, area: Rect, buf:
 // ---------------------------------------------------------------------------
 
 fn render_cost_heatmap(data: &AggregatedStats, area: Rect, buf: &mut Buffer) {
-    if data.daily_costs.is_empty() {
-        Paragraph::new("No cost data yet.")
+    if data.daily_costs.is_empty() || !data.daily_costs.values().any(|cost| *cost > 0.0) {
+        Paragraph::new("No paid cost data yet.")
             .style(Style::default().fg(Color::DarkGray))
             .render(area, buf);
         return;
@@ -753,17 +796,27 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    let show_cost = state
+        .model_breakdown
+        .iter()
+        .any(|entry| entry.cost_usd > 0.0);
 
     // Table header
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            "{:<42} {:>12} {:>13} {:>10}",
-            "Model", "Input", "Output", "Cost"
-        ),
+    let mut header_spans = vec![Span::styled(
+        format!("{:<42} {:>12} {:>13}", "Model", "Input", "Output"),
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
-    )]));
+    )];
+    if show_cost {
+        header_spans.push(Span::styled(
+            format!(" {:>10}", "Cost"),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(header_spans));
     // Separator
     lines.push(Line::from(vec![Span::styled(
         "\u{2500}".repeat(area.width.saturating_sub(2) as usize),
@@ -786,7 +839,7 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
             entry.model_id.clone()
         };
 
-        lines.push(Line::from(vec![
+        let mut row_spans = vec![
             Span::styled(
                 format!("{:<42} ", model_display),
                 Style::default().fg(Color::Cyan),
@@ -799,11 +852,14 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
                 format!("{:>13} ", format_tokens(entry.output_tokens)),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(
+        ];
+        if show_cost {
+            row_spans.push(Span::styled(
                 format!("{:>9}", format!("${:.4}", entry.cost_usd)),
                 Style::default().fg(Color::Yellow),
-            ),
-        ]));
+            ));
+        }
+        lines.push(Line::from(row_spans));
     }
 
     // Grand total separator + row
@@ -811,7 +867,7 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
         "\u{2500}".repeat(area.width.saturating_sub(2) as usize),
         Style::default().fg(Color::DarkGray),
     )]));
-    lines.push(Line::from(vec![
+    let mut total_spans = vec![
         Span::styled(
             format!("{:<42} ", "TOTAL"),
             Style::default()
@@ -830,13 +886,16 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
+    ];
+    if show_cost {
+        total_spans.push(Span::styled(
             format!("{:>9}", format!("${:.4}", total_cost)),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+        ));
+    }
+    lines.push(Line::from(total_spans));
 
     Paragraph::new(lines).render(area, buf);
 }
@@ -881,6 +940,106 @@ mod tests {
             agg.daily_tokens.push((date.to_string(), 100));
         }
         agg
+    }
+
+    // ---- free-mode cost presentation ---------------------------------------
+
+    fn free_state() -> StatsDialogState {
+        let mut state = make_state_with_models(&[("free/model", 1200, 300, 0.0)]);
+        state.data = Some(AggregatedStats {
+            total_input_tokens: 1200,
+            total_output_tokens: 300,
+            total_cost_cents: 0.0,
+            ..AggregatedStats::default()
+        });
+        state
+    }
+
+    #[test]
+    fn free_usage_skips_cost_heatmap_when_cycling_tabs() {
+        let mut state = free_state();
+        state.tab = StatsTab::Overview;
+        state.next_tab();
+        assert_eq!(state.tab, StatsTab::DailyTokens);
+        state.next_tab();
+        assert_eq!(state.tab, StatsTab::Models);
+        state.prev_tab();
+        assert_eq!(state.tab, StatsTab::DailyTokens);
+
+        state.tab = StatsTab::Models;
+        state.prev_tab();
+        assert_eq!(state.tab, StatsTab::DailyTokens);
+
+        state.tab = StatsTab::CostHeatmap;
+        state.prev_tab();
+        assert_eq!(state.tab, StatsTab::Overview);
+    }
+
+    #[test]
+    fn paid_usage_keeps_cost_heatmap_in_tab_cycle() {
+        let mut state = free_state();
+        state.data.as_mut().unwrap().total_cost_cents = 1.0;
+        state.tab = StatsTab::DailyTokens;
+        state.next_tab();
+        assert_eq!(state.tab, StatsTab::CostHeatmap);
+        state.next_tab();
+        assert_eq!(state.tab, StatsTab::Models);
+        state.prev_tab();
+        assert_eq!(state.tab, StatsTab::CostHeatmap);
+    }
+
+    #[test]
+    fn free_models_render_tokens_without_cost_column() {
+        let state = free_state();
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_models(&state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Model"));
+        assert!(content.contains("Input"));
+        assert!(content.contains("Output"));
+        assert!(!content.contains("Cost"));
+        assert!(!content.contains('$'));
+        assert!(content.contains("1.2K"));
+    }
+
+    #[test]
+    fn free_overview_uses_token_summary_without_cost() {
+        let state = free_state();
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("1.5K tokens"));
+        assert!(!content.contains('$'));
+    }
+
+    #[test]
+    fn free_render_hides_cost_heatmap_tab_and_remaps_stale_selection() {
+        let mut state = free_state();
+        state.visible = true;
+        state.tab = StatsTab::CostHeatmap;
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_stats_dialog(&state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(!content.contains("Cost Heatmap"));
+        assert!(content.contains("Daily Tokens"));
+        assert!(content.contains("No data yet."));
+    }
+
+    #[test]
+    fn paid_render_keeps_cost_heatmap_tab() {
+        let mut state = free_state();
+        state.visible = true;
+        state.data.as_mut().unwrap().total_cost_cents = 1.0;
+        state.model_breakdown[0].cost_usd = 0.01;
+        state.tab = StatsTab::CostHeatmap;
+        let area = Rect::new(0, 0, 100, 40);
+        let mut buf = Buffer::empty(area);
+        render_stats_dialog(&state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Cost Heatmap"));
     }
 
     // ---- model breakdown: add_model_usage ----------------------------------
