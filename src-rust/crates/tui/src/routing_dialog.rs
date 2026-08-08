@@ -58,6 +58,11 @@ const SEL_FG: Color = Color::Rgb(238, 238, 240);
 // State
 // ---------------------------------------------------------------------------
 
+/// Per-upstream per-task dispatch success rates
+/// `(upstream_id, [(task_key, rate)])`, captured at open time for the
+/// model-performance view (spec §8.6).
+pub type TaskSuccessRates = Vec<(String, Vec<(String, Option<f64>)>)>;
+
 /// Which pane the keyboard focus is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPane {
@@ -95,6 +100,12 @@ pub struct RoutingDialogState {
     /// yet), captured at open time for the model-performance view (spec
     /// §8.6).
     pub success_rates: Vec<(String, Option<f64>)>,
+    /// Per-upstream per-task dispatch success rates (see [`TaskSuccessRates`]),
+    /// captured at open time. When a task is selected in the left pane, the
+    /// upstream pane's % column shows each upstream's rate FOR that task
+    /// (falling back to the aggregate `success_rates` when the task has no
+    /// recorded dispatches on that upstream).
+    pub task_success_rates: TaskSuccessRates,
     /// Per-upstream capability metadata `(upstream_id, vision,
     /// context_window)` captured at open time, shown as badges in the
     /// upstream pane so users see why image/large requests skip some
@@ -124,6 +135,7 @@ impl Default for RoutingDialogState {
             strategy: "auto".to_string(),
             latencies: Vec::new(),
             success_rates: Vec::new(),
+            task_success_rates: Vec::new(),
             capabilities: Vec::new(),
             cooldowns: Vec::new(),
             key_health: Vec::new(),
@@ -139,12 +151,14 @@ impl RoutingDialogState {
     /// Open the dialog, seeding the overrides from the live config's
     /// `providers.free.options.routing.task_preferences` plus the per-upstream
     /// model snapshots for the model-performance view (spec §8.6): latency,
-    /// success rate, capability badges, cooldown state, and key-ring health.
+    /// success rate (aggregate + per-task), capability badges, cooldown
+    /// state, and key-ring health.
     pub fn open(
         &mut self,
         config: &Config,
         latencies: Vec<(String, Option<f64>)>,
         success_rates: Vec<(String, Option<f64>)>,
+        task_success_rates: TaskSuccessRates,
         capabilities: Vec<(String, bool, u32)>,
         cooldowns: Vec<(String, String, Option<u64>)>,
         key_health: Vec<(String, usize, usize, Option<u64>)>,
@@ -153,6 +167,7 @@ impl RoutingDialogState {
         self.strategy = parse_routing_strategy(config);
         self.latencies = latencies;
         self.success_rates = success_rates;
+        self.task_success_rates = task_success_rates;
         self.capabilities = capabilities;
         self.cooldowns = cooldowns;
         self.key_health = key_health;
@@ -177,6 +192,20 @@ impl RoutingDialogState {
             .iter()
             .find(|(id, _)| id == upstream_id)
             .and_then(|(_, rate)| *rate)
+    }
+
+    /// The recorded per-task dispatch success rate for an upstream id and
+    /// task key, if that upstream has any dispatch of the task.
+    pub fn task_success_rate_for(&self, upstream_id: &str, task_key: &str) -> Option<f64> {
+        self.task_success_rates
+            .iter()
+            .find(|(id, _)| id == upstream_id)
+            .and_then(|(_, rates)| {
+                rates
+                    .iter()
+                    .find(|(key, _)| key == task_key)
+                    .and_then(|(_, rate)| *rate)
+            })
     }
 
     /// The recorded capability metadata `(vision, context_window)` for an
@@ -562,12 +591,19 @@ fn render_upstreams_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogStat
             row.push_str(&format!(" \u{b7}{} {}s", label, secs));
         }
         // Model-performance column (spec §8.6): average latency when recorded,
-        // then dispatch success rate when any dispatch has been recorded.
+        // then dispatch success rate when any dispatch has been recorded. The
+        // % column is task-aware: since this pane shows the upstreams for the
+        // task selected in the left pane, prefer that task's own success rate
+        // and fall back to the aggregate when the task has no dispatches on
+        // this upstream.
         match state.latency_for(upstream.id) {
             Some(secs) => row.push_str(&format!("  {:.1}s", secs)),
             None => row.push_str("  \u{2014}"),
         }
-        match state.success_rate_for(upstream.id) {
+        let rate = state
+            .task_success_rate_for(upstream.id, task.key())
+            .or_else(|| state.success_rate_for(upstream.id));
+        match rate {
             Some(rate) => row.push_str(&format!("  {:>3.0}%", rate * 100.0)),
             None => row.push_str("  \u{2014}"),
         }
@@ -661,6 +697,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(dialog.visible);
         assert_eq!(dialog.strategy, "task_based");
@@ -676,6 +713,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -714,6 +752,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         dialog.selected_task = 0;
         dialog.reset_task();
@@ -729,6 +768,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -756,6 +796,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         let auto = dialog.assignment_summary(TaskType::Verification);
         assert!(auto.starts_with("auto \u{b7} "), "got: {auto}");
@@ -769,6 +810,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -807,6 +849,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.latency_for("groq"), Some(1.25));
         assert_eq!(dialog.latency_for("cerebras"), None);
@@ -827,6 +870,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(dialog.success_rate_for("groq"), Some(0.8));
         assert_eq!(dialog.success_rate_for("cerebras"), None);
@@ -835,10 +879,53 @@ mod tests {
     }
 
     #[test]
+    fn open_captures_task_success_rate_snapshot() {
+        let mut dialog = RoutingDialogState::new();
+        dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                (
+                    "groq".to_string(),
+                    vec![
+                        ("code_generation".to_string(), Some(0.5)),
+                        ("verification".to_string(), Some(1.0)),
+                    ],
+                ),
+                ("cerebras".to_string(), Vec::new()),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            dialog.task_success_rate_for("groq", "code_generation"),
+            Some(0.5)
+        );
+        assert_eq!(
+            dialog.task_success_rate_for("groq", "verification"),
+            Some(1.0)
+        );
+        // Tasks without recorded dispatches on that upstream are absent.
+        assert_eq!(dialog.task_success_rate_for("groq", "reasoning"), None);
+        // Upstreams without any per-task data, and unknown upstreams, absent.
+        assert_eq!(
+            dialog.task_success_rate_for("cerebras", "code_generation"),
+            None
+        );
+        assert_eq!(
+            dialog.task_success_rate_for("google", "code_generation"),
+            None
+        );
+    }
+
+    #[test]
     fn open_captures_capability_snapshot() {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             vec![
@@ -859,6 +946,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -884,6 +972,7 @@ mod tests {
         let mut dialog = RoutingDialogState::new();
         dialog.open(
             &Config::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

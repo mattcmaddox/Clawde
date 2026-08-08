@@ -604,6 +604,11 @@ struct LatencyState {
     successes: Vec<u32>,
     /// Failed dispatches per upstream index.
     failures: Vec<u32>,
+    /// Per-upstream per-task dispatch counters (task key → count), for the
+    /// routing dialog's per-task model-performance view (spec §8.6): an
+    /// upstream can be 100% on verification tasks yet 0% on code generation.
+    task_successes: Vec<HashMap<String, u32>>,
+    task_failures: Vec<HashMap<String, u32>>,
 }
 
 impl LatencyState {
@@ -611,15 +616,21 @@ impl LatencyState {
         let mut samples = Vec::with_capacity(n);
         let mut successes = Vec::with_capacity(n);
         let mut failures = Vec::with_capacity(n);
+        let mut task_successes = Vec::with_capacity(n);
+        let mut task_failures = Vec::with_capacity(n);
         for _ in 0..n {
             samples.push(VecDeque::with_capacity(10));
             successes.push(0);
             failures.push(0);
+            task_successes.push(HashMap::new());
+            task_failures.push(HashMap::new());
         }
         Self {
             samples,
             successes,
             failures,
+            task_successes,
+            task_failures,
         }
     }
 
@@ -647,6 +658,41 @@ impl LatencyState {
         if let Some(f) = self.failures.get_mut(idx) {
             *f = f.saturating_add(1);
         }
+    }
+
+    /// Record a successful dispatch of `task` at `idx` (per-task view).
+    fn record_task_success(&mut self, idx: usize, task: TaskType) {
+        if let Some(m) = self.task_successes.get_mut(idx) {
+            let e = m.entry(task.key().to_string()).or_insert(0);
+            *e = e.saturating_add(1);
+        }
+    }
+
+    /// Record a failed dispatch of `task` at `idx` (per-task view).
+    fn record_task_failure(&mut self, idx: usize, task: TaskType) {
+        if let Some(m) = self.task_failures.get_mut(idx) {
+            let e = m.entry(task.key().to_string()).or_insert(0);
+            *e = e.saturating_add(1);
+        }
+    }
+
+    /// Per-task dispatch success rate (0.0–1.0) for upstream `idx`, or
+    /// `None` when no dispatch of that task has been recorded.
+    fn task_success_rate(&self, idx: usize, task: TaskType) -> Option<f64> {
+        let successes = self
+            .task_successes
+            .get(idx)
+            .and_then(|m| m.get(task.key()))
+            .copied()
+            .unwrap_or(0);
+        let failures = self
+            .task_failures
+            .get(idx)
+            .and_then(|m| m.get(task.key()))
+            .copied()
+            .unwrap_or(0);
+        let total = successes + failures;
+        (total > 0).then(|| successes as f64 / total as f64)
     }
 
     /// Average latency for upstream `idx`, or `f64::MAX` if no samples.

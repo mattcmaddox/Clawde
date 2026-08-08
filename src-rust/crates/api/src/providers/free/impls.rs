@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use clawde_core::provider_id::ModelId;
 use futures::Stream;
 
-use crate::provider::ModelInfo;
+use crate::provider::{ModelInfo, UpstreamTaskSuccessRates};
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
@@ -680,28 +680,35 @@ impl FreeProvider {
     }
 
     /// Record a successful request at `idx` with the given `elapsed` duration.
-    fn record_success(&self, idx: usize, elapsed: std::time::Duration) {
+    /// `task` is the request's classified [`TaskType`] — the dispatch is also
+    /// credited to the per-task success-rate view (spec §8.6).
+    fn record_success(&self, idx: usize, task: TaskType, elapsed: std::time::Duration) {
         // Reset circuit breaker failure counter for this upstream.
         if self.circuit_breaker_enabled() {
             let mut cd = self.cooldown.lock().unwrap();
             cd.record_success(idx);
         }
-        // Record latency sample + success counter (spec §8.6 success rate).
-        // One lock: the counter always bumps, the sample only when latency
-        // tracking is enabled.
+        // Record latency sample + success counters (spec §8.6 success rate,
+        // overall and per-task). One lock: the counters always bump, the
+        // latency sample only when latency tracking is enabled.
         let max_samples = self.max_latency_samples();
         let mut lat = self.latencies.lock().unwrap();
         lat.record_success(idx);
+        lat.record_task_success(idx, task);
         if max_samples > 0 {
             lat.record(idx, elapsed.as_secs_f64(), max_samples);
         }
     }
 
-    /// Record a failed request at `idx`.
-    fn record_failure(&self, idx: usize) {
-        // Always count the failure for the success-rate view — the circuit
+    /// Record a failed request at `idx`. `task` is the request's classified
+    /// [`TaskType`] — the dispatch is also credited to the per-task view.
+    fn record_failure(&self, idx: usize, task: TaskType) {
+        // Always count the failure for the success-rate views — the circuit
         // breaker below is an optional extra layer.
-        self.latencies.lock().unwrap().record_failure(idx);
+        let mut lat = self.latencies.lock().unwrap();
+        lat.record_failure(idx);
+        lat.record_task_failure(idx, task);
+        drop(lat);
         if !self.circuit_breaker_enabled() {
             return;
         }
@@ -782,6 +789,9 @@ struct RetryingFreeStream {
     latencies: Arc<Mutex<LatencyState>>,
     routing: RoutingConfig,
     request: ProviderRequest,
+    /// Classified task for the request — tags every attempt's success /
+    /// failure counters for the per-task success-rate view (spec §8.6).
+    task: TaskType,
     remaining_plan: VecDeque<(usize, String)>,
     current: Option<BoxedProviderStream>,
     current_idx: usize,
@@ -822,12 +832,14 @@ impl RetryingFreeStream {
         remaining_plan: VecDeque<(usize, String)>,
         is_auto_route: bool,
     ) -> Self {
+        let task = classify_request(&request);
         Self {
             chain,
             cooldown,
             latencies,
             routing,
             request,
+            task,
             remaining_plan,
             current: Some(stream),
             current_idx: idx,
@@ -856,14 +868,20 @@ impl RetryingFreeStream {
         let max_samples = self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
         let mut lat = self.latencies.lock().unwrap();
         lat.record_success(idx);
+        lat.record_task_success(idx, self.task);
         if max_samples > 0 {
             lat.record(idx, elapsed.as_secs_f64(), max_samples);
         }
     }
 
     fn record_failure(&self, idx: usize) {
-        // Always count the failure for the success-rate view.
-        self.latencies.lock().unwrap().record_failure(idx);
+        // Always count the failure for the success-rate views (aggregate and
+        // per-task) — the circuit breaker below is an optional extra layer.
+        {
+            let mut lat = self.latencies.lock().unwrap();
+            lat.record_failure(idx);
+            lat.record_task_failure(idx, self.task);
+        }
         if self
             .routing
             .circuit_breaker
@@ -1288,6 +1306,9 @@ impl LlmProvider for FreeProvider {
         let route = self.resolve_route(&request.model);
         let plan = self.attempt_plan(&route, Some(&request));
         let mut last_err: Option<ProviderError> = None;
+        // The request's task tags every dispatch's success/failure counters
+        // (spec §8.6 per-task success-rate view).
+        let task = classify_request(&request);
 
         for (idx, upstream_model) in plan {
             // Circuit breaker: skip upstreams in cooldown.
@@ -1307,7 +1328,7 @@ impl LlmProvider for FreeProvider {
 
             match result {
                 Ok(Ok(resp)) => {
-                    self.record_success(idx, start.elapsed());
+                    self.record_success(idx, task, start.elapsed());
                     return Ok(resp);
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
@@ -1317,13 +1338,13 @@ impl LlmProvider for FreeProvider {
                         self.routing.upstream_timeout_secs,
                         err,
                     );
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
                     last_err = Some(err);
                     continue;
                 }
                 Ok(Err(err)) => {
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     return Err(err);
                 }
                 Err(_elapsed) => {
@@ -1332,7 +1353,7 @@ impl LlmProvider for FreeProvider {
                         entry.upstream.id,
                         self.routing.upstream_timeout_secs,
                     );
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     last_err = Some(ProviderError::RateLimited {
                         provider: self.id.clone(),
                         retry_after: None,
@@ -1378,6 +1399,9 @@ impl LlmProvider for FreeProvider {
         let route = self.resolve_route(&request.model);
         let plan_vec = self.attempt_plan(&route, Some(&request));
         let mut last_err: Option<ProviderError> = None;
+        // The request's task tags every dispatch's success/failure counters
+        // (spec §8.6 per-task success-rate view).
+        let task = classify_request(&request);
 
         for (pos, (idx, upstream_model)) in plan_vec.into_iter().enumerate() {
             // Circuit breaker: skip upstreams in cooldown.
@@ -1426,13 +1450,13 @@ impl LlmProvider for FreeProvider {
                         self.routing.upstream_timeout_secs,
                         err,
                     );
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
                     last_err = Some(err);
                     continue;
                 }
                 Ok(Err(err)) => {
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     return Err(err);
                 }
                 Err(_elapsed) => {
@@ -1441,7 +1465,7 @@ impl LlmProvider for FreeProvider {
                         entry.upstream.id,
                         self.routing.upstream_timeout_secs,
                     );
-                    self.record_failure(idx);
+                    self.record_failure(idx, task);
                     last_err = Some(ProviderError::RateLimited {
                         provider: self.id.clone(),
                         retry_after: None,
@@ -1656,6 +1680,29 @@ impl LlmProvider for FreeProvider {
             .iter()
             .enumerate()
             .map(|(idx, entry)| (entry.upstream.id.to_string(), lat.success_rate(idx)))
+            .collect()
+    }
+
+    fn upstream_task_success_rates(&self) -> UpstreamTaskSuccessRates {
+        // Per-upstream per-task dispatch success rates (spec §8.6): when the
+        // user highlights a task in the routing dialog, the % column shows
+        // each upstream's rate FOR that task instead of the aggregate. Only
+        // tasks with recorded dispatches are included. Locked once, never
+        // across an await.
+        let lat = self.latencies.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let rates: Vec<(String, Option<f64>)> = TaskType::ALL
+                    .iter()
+                    .filter_map(|t| {
+                        lat.task_success_rate(idx, *t)
+                            .map(|r| (t.key().to_string(), Some(r)))
+                    })
+                    .collect();
+                (entry.upstream.id.to_string(), rates)
+            })
             .collect()
     }
 
@@ -3193,6 +3240,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_success_tags_task_success_rate() {
+        use futures::StreamExt;
+
+        // A generic prompt classifies as CodeGeneration; a streaming win on
+        // it must be credited to the code_generation per-task bucket (spec
+        // §8.6 per-task view).
+        let provider = FreeProvider::with_routing(
+            vec![stream_entry("huggingface", true, Some("hi"))],
+            RoutingConfig::default(),
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+        while let Some(Ok(event)) = stream.next().await {
+            if matches!(event, StreamEvent::MessageStop) {
+                break;
+            }
+        }
+        drop(stream);
+
+        let rates = provider.upstream_task_success_rates();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].0, "huggingface");
+        assert!(
+            rates[0]
+                .1
+                .iter()
+                .any(|(k, r)| k == "code_generation" && *r == Some(1.0)),
+            "code_generation win not credited per-task: {:?}",
+            rates[0].1
+        );
+    }
+
+    #[tokio::test]
     async fn empty_stream_does_not_credit_success_at_message_stop() {
         use futures::StreamExt;
 
@@ -3966,7 +4049,7 @@ mod tests {
     #[test]
     fn circuit_breaker_disabled_by_default() {
         let provider = FreeProvider::new(vec![entry("huggingface", true)]);
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(!provider.is_in_cooldown(0));
     }
 
@@ -3986,9 +4069,9 @@ mod tests {
             false,
         );
         // Even after many failures, no cooldown because max_fails=0
-        provider.record_failure(0);
-        provider.record_failure(0);
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
+        provider.record_failure(0, TaskType::CodeGeneration);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(!provider.is_in_cooldown(0));
     }
 
@@ -4013,11 +4096,11 @@ mod tests {
         assert!(!provider.is_in_cooldown(1));
 
         // First failure — not yet at threshold
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(!provider.is_in_cooldown(0));
 
         // Second failure — now in cooldown
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(provider.is_in_cooldown(0));
 
         // Other upstream unaffected
@@ -4041,15 +4124,15 @@ mod tests {
         );
 
         // One failure, then a success resets the counter
-        provider.record_failure(0);
-        provider.record_success(0, Duration::from_secs(1));
+        provider.record_failure(0, TaskType::CodeGeneration);
+        provider.record_success(0, TaskType::CodeGeneration, Duration::from_secs(1));
 
         // One more failure should NOT trigger cooldown (counter was reset)
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(!provider.is_in_cooldown(0));
 
         // Second failure after reset — now in cooldown
-        provider.record_failure(0);
+        provider.record_failure(0, TaskType::CodeGeneration);
         assert!(provider.is_in_cooldown(0));
     }
 
@@ -4075,7 +4158,7 @@ mod tests {
 
         // Exhaust upstream 0 with 3 failures
         for _ in 0..3 {
-            provider.record_failure(0);
+            provider.record_failure(0, TaskType::CodeGeneration);
         }
         assert!(provider.is_in_cooldown(0));
 
@@ -4102,12 +4185,12 @@ mod tests {
         );
 
         // Record latencies for upstream 0 (fast)
-        provider.record_success(0, Duration::from_millis(100));
-        provider.record_success(0, Duration::from_millis(200));
+        provider.record_success(0, TaskType::CodeGeneration, Duration::from_millis(100));
+        provider.record_success(0, TaskType::CodeGeneration, Duration::from_millis(200));
 
         // Record latencies for upstream 1 (slower)
-        provider.record_success(1, Duration::from_millis(900));
-        provider.record_success(1, Duration::from_millis(1100));
+        provider.record_success(1, TaskType::CodeGeneration, Duration::from_millis(900));
+        provider.record_success(1, TaskType::CodeGeneration, Duration::from_millis(1100));
 
         // Latency-based plan should put faster upstream first
         let plan = provider.attempt_plan(&Route::Auto, None);
@@ -4140,10 +4223,10 @@ mod tests {
         // reorders upstreams, nvidia's 8B fallback row must stay adjacent
         // AFTER its 70B primary (stable sort keeps same-idx rows together
         // in insertion order).
-        provider.record_success(0, Duration::from_millis(800));
-        provider.record_success(1, Duration::from_millis(100));
-        provider.record_success(2, Duration::from_millis(500));
-        provider.record_success(3, Duration::from_millis(300));
+        provider.record_success(0, TaskType::CodeGeneration, Duration::from_millis(800));
+        provider.record_success(1, TaskType::CodeGeneration, Duration::from_millis(100));
+        provider.record_success(2, TaskType::CodeGeneration, Duration::from_millis(500));
+        provider.record_success(3, TaskType::CodeGeneration, Duration::from_millis(300));
 
         let plan = provider.attempt_plan(&Route::Auto, None);
 
@@ -4178,9 +4261,9 @@ mod tests {
         );
 
         // Record latencies: groq is fastest, cerebras is slowest
-        provider.record_success(0, Duration::from_millis(100));
-        provider.record_success(1, Duration::from_millis(2000));
-        provider.record_success(2, Duration::from_millis(500));
+        provider.record_success(0, TaskType::CodeGeneration, Duration::from_millis(100));
+        provider.record_success(1, TaskType::CodeGeneration, Duration::from_millis(2000));
+        provider.record_success(2, TaskType::CodeGeneration, Duration::from_millis(500));
 
         // Pin to cerebras (idx 1) — should be first, then rest sorted by latency
         let plan = provider.attempt_plan(

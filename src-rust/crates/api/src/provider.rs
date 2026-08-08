@@ -74,6 +74,12 @@ impl Default for ModelInfo {
 ///
 /// Implementors are required to be `Send + Sync` so they can be held behind an
 /// `Arc<dyn LlmProvider>` and shared across async tasks.
+/// Per-upstream per-task dispatch success rates (spec §8.6):
+/// `(upstream_id, [(task_key, rate)])` — only tasks with recorded dispatches.
+/// Type-aliased so the trait method, provider overrides, and TUI dialog agree
+/// on one shape without tripping clippy::type_complexity.
+pub type UpstreamTaskSuccessRates = Vec<(String, Vec<(String, Option<f64>)>)>;
+
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Unique machine-readable identifier, e.g. `"anthropic"`, `"openai"`.
@@ -227,6 +233,14 @@ pub trait LlmProvider: Send + Sync {
     /// yet. The default returns an empty vector — only composite providers
     /// that multiplex upstreams override this.
     fn upstream_success_rates(&self) -> Vec<(String, Option<f64>)> {
+        Vec::new()
+    }
+
+    /// Per-upstream per-task dispatch success rates (spec §8.6):
+    /// `(upstream_id, [(task_key, rate)])`, only tasks with recorded
+    /// dispatches. Lets the routing dialog show, for the selected task, each
+    /// upstream's success rate on exactly that task.
+    fn upstream_task_success_rates(&self) -> UpstreamTaskSuccessRates {
         Vec::new()
     }
 

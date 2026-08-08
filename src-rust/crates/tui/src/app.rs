@@ -3042,6 +3042,16 @@ impl App {
                 })
                 .map(|p| p.upstream_success_rates())
                 .unwrap_or_default();
+            let task_success_rates = self
+                .provider_registry
+                .as_ref()
+                .and_then(|reg| {
+                    reg.get(&clawde_core::provider_id::ProviderId::new(
+                        clawde_core::provider_id::ProviderId::FREE,
+                    ))
+                })
+                .map(|p| p.upstream_task_success_rates())
+                .unwrap_or_default();
             let capabilities = self
                 .provider_registry
                 .as_ref()
@@ -3076,6 +3086,7 @@ impl App {
                 &self.config,
                 latencies,
                 success_rates,
+                task_success_rates,
                 capabilities,
                 cooldowns,
                 key_health,
