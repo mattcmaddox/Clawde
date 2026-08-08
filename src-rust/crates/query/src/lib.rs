@@ -251,6 +251,24 @@ impl QueryConfig {
     }
 }
 
+/// Per-request metadata attached to a completed model turn.
+///
+/// This is intentionally session-local telemetry: it is not persisted and does
+/// not change the bridge wire protocol. `provider_id` and `model` identify the
+/// effective provider dispatch (for example, `free`); composite-provider
+/// upstream health remains represented by the live key-health snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnObservability {
+    pub provider_id: String,
+    pub model: String,
+    /// Wall-clock duration for the complete logical completion, including
+    /// tool rounds and provider retries/fallbacks.
+    pub elapsed_ms: u64,
+    /// Number of provider retry/fallback attempts within the completion.
+    pub retries: u32,
+    pub fallback_used: bool,
+}
+
 /// Events emitted by the query loop for the TUI to render.
 #[derive(Debug, Clone)]
 pub enum QueryEvent {
@@ -274,6 +292,7 @@ pub enum QueryEvent {
         turn: u32,
         stop_reason: String,
         usage: Option<UsageInfo>,
+        observability: Option<TurnObservability>,
     },
     /// An informational status message.
     Status(String),
@@ -485,6 +504,13 @@ pub async fn run_query_loop(
     // tool-less summary turn has been dispatched so it can never re-trigger
     // (anti-recursion guard).
     let mut degradation_done = false;
+    // Automatic retries for the current logical completion. This survives
+    // stall/error retries and is reset after a completed turn is emitted.
+    let mut request_retries = 0u32;
+
+    // Measure one complete logical completion, including provider retries and
+    // tool rounds. Reset when a continuation starts a new completion below.
+    let mut observability_started_at = std::time::Instant::now();
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
     let effective_max_turns = config
@@ -672,7 +698,10 @@ pub async fn run_query_loop(
                         turn = 0;
                         max_tokens_recovery_count = 0;
                         retries_left = 2;
+                        request_retries = 0;
+                        used_fallback = false;
                         goal_turn_start = std::time::Instant::now();
+                        observability_started_at = std::time::Instant::now();
                         continue;
                     }
                     crate::continuation::ContinuationDecision::Stop { note } => {
@@ -1323,6 +1352,7 @@ pub async fn run_query_loop(
                     // If the stream stalled (no data for 45s), retry.
                     if provider_stream_stalled && retries_left > 0 {
                         retries_left -= 1;
+                        request_retries += 1;
                         warn!(provider = %provider_id_str, model = %model_id_str, retries_left, "Provider stream stalled — retrying");
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::Status(format!(
@@ -1344,6 +1374,7 @@ pub async fn run_query_loop(
                     if let Some(err) = provider_stream_error {
                         if retries_left > 0 {
                             retries_left -= 1;
+                            request_retries += 1;
                             warn!(
                                 provider = %provider_id_str,
                                 model = %model_id_str,
@@ -1514,7 +1545,7 @@ pub async fn run_query_loop(
                             cost: None,
                             snapshot_patch: None,
                         });
-                        continue; // loop for next turn
+                        continue; // loop for next tool round
                     }
 
                     // End turn — notify TUI and return.
@@ -1551,14 +1582,21 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    let fallback_used_for_turn = used_fallback;
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::TurnComplete {
                             stop_reason: stop_str.clone(),
                             turn,
                             usage: Some(usage.clone()),
+                            observability: Some(TurnObservability {
+                                provider_id: provider_id_str.clone(),
+                                model: model_id_str.clone(),
+                                elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
+                                retries: request_retries,
+                                fallback_used: fallback_used_for_turn,
+                            }),
                         });
                     }
-
                     // Attach snapshot patch covering all file changes this query.
                     if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                         let patch = snap.patch(hash).await;
@@ -1625,6 +1663,7 @@ pub async fn run_query_loop(
                         }
                         effective_model = fb.clone();
                         used_fallback = true;
+                        request_retries += 1;
                         turn -= 1; // don't count this attempt against max_turns
                         continue;
                     }
@@ -1684,6 +1723,7 @@ pub async fn run_query_loop(
 
         if stream_stalled && retries_left > 0 {
             retries_left -= 1;
+            request_retries += 1;
             warn!(model = %effective_model, retries_left, "Stream stalled — retrying request");
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(QueryEvent::Status(format!(
@@ -1909,9 +1949,15 @@ pub async fn run_query_loop(
                     turn,
                     stop_reason: stop.to_string(),
                     usage: Some(usage.clone()),
+                    observability: Some(TurnObservability {
+                        provider_id: "anthropic".to_string(),
+                        model: effective_model.clone(),
+                        elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
+                        retries: request_retries,
+                        fallback_used: used_fallback,
+                    }),
                 });
             }
-
             // Helper closure for firing the Stop hook.
             macro_rules! fire_stop_hook {
                 ($msg:expr) => {{
@@ -3224,6 +3270,81 @@ mod tests {
         .expect("loop must not hang");
 
         (outcome, messages)
+    }
+
+    async fn drive_loop_with_observability(
+        provider: Arc<dyn clawde_api::LlmProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> (QueryOutcome, Vec<QueryEvent>) {
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+        let registry = Arc::new(registry);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "observability-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(registry);
+
+        let cost = clawde_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = vec![Message::user("start")];
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                cost,
+                Some(event_tx),
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        (outcome, events)
+    }
+
+    #[tokio::test]
+    async fn turn_complete_reports_provider_observability() {
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded,
+            always_end_turn: true,
+        });
+        let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        let metrics = events
+            .into_iter()
+            .find_map(|event| match event {
+                QueryEvent::TurnComplete { observability, .. } => observability,
+                _ => None,
+            })
+            .expect("completed turns should carry observability");
+        assert_eq!(metrics.provider_id, "mockprov");
+        assert_eq!(metrics.model, "mock-model");
+        assert_eq!(metrics.retries, 0);
+        assert!(!metrics.fallback_used);
     }
 
     async fn drive_loop_with_mock(

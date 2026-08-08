@@ -2057,6 +2057,7 @@ mod tests {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,
+            observability: None,
         });
         assert!(!app.is_streaming);
         assert!(app.streaming_text.is_empty());
@@ -2073,6 +2074,7 @@ mod tests {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,
+            observability: None,
         });
 
         let blocks = app.messages[0].content_blocks();

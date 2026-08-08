@@ -185,6 +185,22 @@ struct ProviderHealthRow {
     cooldowns: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderActivityRow {
+    provider_id: String,
+    model: String,
+    requests: u32,
+    total_elapsed_ms: u64,
+    retries: u32,
+    fallbacks: u32,
+}
+
+impl ProviderActivityRow {
+    fn average_elapsed_ms(&self) -> u64 {
+        self.total_elapsed_ms / u64::from(self.requests.max(1))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StatsDialogState {
     pub visible: bool,
@@ -201,6 +217,8 @@ pub struct StatsDialogState {
     /// Live key-ring health captured when the dialog opens. This is intentionally
     /// not persisted: it reflects the currently active provider registry.
     live_provider_health: Vec<ProviderHealthRow>,
+    /// Bounded, session-local completion telemetry keyed by provider/model.
+    provider_activity: Vec<ProviderActivityRow>,
 }
 
 impl StatsDialogState {
@@ -215,6 +233,7 @@ impl StatsDialogState {
             current_streak_days: 0,
             longest_streak_days: 0,
             live_provider_health: Vec::new(),
+            provider_activity: Vec::new(),
         }
     }
 
@@ -258,6 +277,42 @@ impl StatsDialogState {
         }
         rows.sort_by(|a, b| a.label.cmp(&b.label));
         self.live_provider_health = rows;
+    }
+
+    /// Record one completed provider request. Keep the list bounded so a long
+    /// interactive session cannot grow the TUI state without limit.
+    pub fn record_provider_activity(
+        &mut self,
+        provider_id: &str,
+        model: &str,
+        elapsed_ms: u64,
+        retries: u32,
+        fallback_used: bool,
+    ) {
+        if let Some(row) = self
+            .provider_activity
+            .iter_mut()
+            .find(|row| row.provider_id == provider_id && row.model == model)
+        {
+            row.requests = row.requests.saturating_add(1);
+            row.total_elapsed_ms = row.total_elapsed_ms.saturating_add(elapsed_ms);
+            row.retries = row.retries.saturating_add(retries);
+            row.fallbacks = row.fallbacks.saturating_add(u32::from(fallback_used));
+            return;
+        }
+
+        const MAX_PROVIDER_ACTIVITY_ROWS: usize = 12;
+        if self.provider_activity.len() >= MAX_PROVIDER_ACTIVITY_ROWS {
+            self.provider_activity.remove(0);
+        }
+        self.provider_activity.push(ProviderActivityRow {
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            requests: 1,
+            total_elapsed_ms: elapsed_ms,
+            retries,
+            fallbacks: u32::from(fallback_used),
+        });
     }
 
     pub fn open(&mut self) {
@@ -602,6 +657,43 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
                 Style::default().fg(Color::Yellow),
             ),
         ]));
+    }
+
+    if !state.provider_activity.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            "Session provider activity:",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        for row in state.provider_activity.iter().take(8) {
+            let mut detail = format!(
+                "  {}  {} req  avg {}ms",
+                row.provider_id,
+                row.requests,
+                row.average_elapsed_ms()
+            );
+            if row.retries > 0 {
+                detail.push_str(&format!(
+                    "  {} retr{}",
+                    row.retries,
+                    if row.retries == 1 { "y" } else { "ies" }
+                ));
+            }
+            if row.fallbacks > 0 {
+                detail.push_str(&format!(
+                    "  {} fallback{}",
+                    row.fallbacks,
+                    if row.fallbacks == 1 { "" } else { "s" }
+                ));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<28}", row.model),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(detail, Style::default().fg(Color::White)),
+            ]));
+        }
     }
 
     if !state.live_provider_health.is_empty() {
@@ -1087,6 +1179,38 @@ mod tests {
             ..AggregatedStats::default()
         });
         state
+    }
+
+    #[test]
+    fn provider_activity_aggregates_and_renders() {
+        let mut state = free_state();
+        state.record_provider_activity("groq", "llama-3.3", 100, 1, true);
+        state.record_provider_activity("groq", "llama-3.3", 300, 0, false);
+        assert_eq!(state.provider_activity[0].requests, 2);
+        assert_eq!(state.provider_activity[0].average_elapsed_ms(), 200);
+        assert_eq!(state.provider_activity[0].retries, 1);
+        assert_eq!(state.provider_activity[0].fallbacks, 1);
+
+        let area = Rect::new(0, 0, 110, 30);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Session provider activity:"));
+        assert!(content.contains("groq"));
+        assert!(content.contains("2 req"));
+        assert!(content.contains("avg 200ms"));
+        assert!(content.contains("1 retry"));
+        assert!(content.contains("1 fallback"));
+    }
+
+    #[test]
+    fn provider_activity_is_bounded() {
+        let mut state = StatsDialogState::new();
+        for i in 0..20 {
+            state.record_provider_activity("provider", &format!("model-{i}"), i, 0, false);
+        }
+        assert_eq!(state.provider_activity.len(), 12);
+        assert_eq!(state.provider_activity[0].model, "model-8");
     }
 
     #[test]

@@ -9685,9 +9685,18 @@ impl App {
                 turn,
                 stop_reason,
                 usage,
-                ..
+                observability,
             } => {
                 debug!(turn, stop_reason, "Turn complete");
+                if let Some(metrics) = observability {
+                    self.stats_dialog.record_provider_activity(
+                        &metrics.provider_id,
+                        &metrics.model,
+                        metrics.elapsed_ms,
+                        metrics.retries,
+                        metrics.fallback_used,
+                    );
+                }
                 self.is_streaming = false;
                 self.spinner_verb = None;
 
