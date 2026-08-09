@@ -123,6 +123,9 @@ pub use types::{
 pub mod dead_code_guard;
 pub mod skill_discovery;
 pub mod spec;
+// Shared hierarchical slash-command metadata. Kept in core so the TUI can
+// discover nested routes without introducing a commands↔TUI dependency cycle.
+pub mod slash_commands;
 pub use cost::CostTracker;
 pub use feature_flags::FeatureFlagManager;
 pub use history::ConversationSession;

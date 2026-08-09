@@ -99,7 +99,6 @@ impl CheckResult {
             .trim()
     }
 }
-
 /// Structured outcome of one verification round, surfaced to the TUI so it
 /// can render the boxed per-check indicator (audit spec §15.1).
 #[derive(Debug, Clone)]
@@ -116,6 +115,9 @@ pub struct VerifyReport {
     pub headline: String,
     /// Sandbox mode the round ran in (`direct` vs `git worktree`).
     pub sandbox: VerifySandbox,
+    /// True when verification could not run because the configured sandbox is
+    /// unavailable. This is distinct from a passing round with skipped checks.
+    pub unavailable: bool,
 }
 
 /// Execute-and-verify continuation policy (audit spec Phase 1).
@@ -146,6 +148,24 @@ impl VerifyPolicy {
         }
     }
 
+    fn unavailable_headline(&self) -> String {
+        format!(
+            "Verification unavailable: sandbox '{}' is not implemented. Set \"verify\": {{\"sandbox\": \"direct\"}} in settings.json.",
+            self.config.sandbox.label()
+        )
+    }
+
+    fn stash_unavailable_report(&self) {
+        *self.last_report.lock().unwrap() = Some(VerifyReport {
+            results: Vec::new(),
+            attempt: 0,
+            max_retries: self.config.max_retries.max(1),
+            headline: self.unavailable_headline(),
+            sandbox: self.config.sandbox,
+            unavailable: true,
+        });
+    }
+
     /// Stash the round's structured report for `verify_report`.
     fn stash_report(
         &self,
@@ -160,6 +180,7 @@ impl VerifyPolicy {
             max_retries,
             headline: headline.into(),
             sandbox: self.config.sandbox,
+            unavailable: false,
         });
     }
 
@@ -174,11 +195,7 @@ impl VerifyPolicy {
         }
         if !self.config.sandbox.is_implemented() {
             return Some(ContinuationDecision::Stop {
-                note: Some(format!(
-                    "Verify sandbox '{}' is not implemented yet — skipped verification. \
-                     Set \"verify\": {{\"sandbox\": \"direct\"}} in settings.json.",
-                    self.config.sandbox.label()
-                )),
+                note: Some(self.unavailable_headline()),
             });
         }
         None
@@ -193,7 +210,11 @@ impl VerifyPolicy {
         results: &[CheckResult],
     ) -> ContinuationDecision {
         if let Some(decision) = self.preflight(ctx) {
-            self.clear_report();
+            if !self.config.sandbox.is_implemented() {
+                self.stash_unavailable_report();
+            } else {
+                self.clear_report();
+            }
             return decision;
         }
         if results.is_empty() {
@@ -350,7 +371,11 @@ impl ContinuationPolicy for VerifyPolicy {
 
     fn decide(&self, ctx: &TurnEndContext<'_>) -> ContinuationDecision {
         if let Some(decision) = self.preflight(ctx) {
-            self.clear_report();
+            if !self.config.sandbox.is_implemented() {
+                self.stash_unavailable_report();
+            } else {
+                self.clear_report();
+            }
             return decision;
         }
         let results = match run_checks(&self.config, &self.working_dir) {
@@ -418,6 +443,7 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
             max_retries: config.max_retries.max(1),
             headline: "No checks configured (verify.auto_test / auto_lint)".to_string(),
             sandbox: config.sandbox,
+            unavailable: false,
         });
     }
     let results = run_checks(config, working_dir)?;
@@ -458,6 +484,7 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
             max_retries,
             headline: "No test or lint commands detected".to_string(),
             sandbox: config.sandbox,
+            unavailable: false,
         });
     }
     let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
@@ -474,6 +501,7 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
         max_retries,
         headline,
         sandbox: config.sandbox,
+        unavailable: false,
     })
 }
 

@@ -648,9 +648,24 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
     ]
 }
 
-/// Find a tool by name (case-sensitive).
+/// Find a tool by name. Exact names win; a unique case-insensitive match
+/// recovers provider/tool-call casing drift without making ambiguous names
+/// executable.
 pub fn find_tool(name: &str) -> Option<Box<dyn Tool>> {
-    all_tools().into_iter().find(|t| t.name() == name)
+    let requested = name.trim();
+    let mut tools = all_tools();
+    if let Some(index) = tools.iter().position(|tool| tool.name() == requested) {
+        return Some(tools.remove(index));
+    }
+    let mut matches = tools
+        .into_iter()
+        .filter(|tool| tool.name().eq_ignore_ascii_case(requested));
+    let first = matches.next();
+    if first.is_some() && matches.next().is_none() {
+        first
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -786,10 +801,15 @@ mod tests {
     }
 
     #[test]
-    fn test_find_tool_case_sensitive() {
-        // Tool names are case-sensitive — "bash" should not match "Bash"
-        assert!(find_tool("bash").is_none());
-        assert!(find_tool("Bash").is_some());
+    fn test_find_tool_accepts_unique_case_insensitive_alias() {
+        assert_eq!(
+            find_tool(" bash ").map(|tool| tool.name().to_string()),
+            Some("Bash".to_string())
+        );
+        assert_eq!(
+            find_tool("read").map(|tool| tool.name().to_string()),
+            Some("Read".to_string())
+        );
     }
 
     #[test]

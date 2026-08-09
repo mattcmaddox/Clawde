@@ -50,12 +50,13 @@ pub(crate) async fn execute_tool(
     tools: &[Box<dyn Tool>],
     ctx: &ToolContext,
 ) -> ToolResult {
-    let tool = find_tool_for_name(name, tools);
+    let requested_name = name.trim();
+    let tool = find_tool_for_name(requested_name, tools);
 
     match tool {
         Some(tool) => {
             debug!(
-                requested_tool = name,
+                requested_tool = requested_name,
                 resolved_tool = tool.name(),
                 "Executing tool"
             );
@@ -72,7 +73,7 @@ pub(crate) async fn execute_tool(
                 if let Err(e) = ctx.check_permission(canonical_name, &description, false) {
                     warn!(
                         tool = canonical_name,
-                        requested_tool = name,
+                        requested_tool = requested_name,
                         "Tool blocked by central permission backstop"
                     );
                     return ToolResult::error(e.to_string());
@@ -81,16 +82,24 @@ pub(crate) async fn execute_tool(
             tool.execute(input.clone(), ctx).await
         }
         None => {
-            warn!(tool = name, "Unknown tool requested");
-            let hint = tool_name_hint(name, tools);
-            if hint.is_empty() {
+            warn!(tool = requested_name, "Unknown or inactive tool requested");
+            let hint = tool_name_hint(requested_name, tools);
+            let registered_elsewhere = clawde_tools::find_tool(requested_name).is_some()
+                || requested_name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT);
+            if registered_elsewhere {
+                ToolResult::error(format!(
+                    "Tool '{}' is registered but not active in this session. {} Enable it in the agent/tool settings or use one of the active tools.",
+                    requested_name,
+                    active_tool_list(tools)
+                ))
+            } else if hint.is_empty() {
                 ToolResult::error(format!(
                     "Unknown tool: {}. This tool is not available in the active tool set. {}",
-                    name,
+                    requested_name,
                     active_tool_list(tools)
                 ))
             } else {
-                ToolResult::error(format!("Unknown tool: {}. {}", name, hint))
+                ToolResult::error(format!("Unknown tool: {}. {}", requested_name, hint))
             }
         }
     }
@@ -100,13 +109,14 @@ pub(crate) async fn execute_tool(
 /// Exact names win; a unique case-insensitive match is accepted as a recovery
 /// path for providers that normalize tool names unexpectedly.
 fn find_tool_for_name<'a>(name: &str, tools: &'a [Box<dyn Tool>]) -> Option<&'a dyn Tool> {
-    if let Some(tool) = tools.iter().find(|tool| tool.name() == name) {
+    let requested = name.trim();
+    if let Some(tool) = tools.iter().find(|tool| tool.name() == requested) {
         return Some(tool.as_ref());
     }
 
     let mut matches = tools
         .iter()
-        .filter(|tool| tool.name().eq_ignore_ascii_case(name));
+        .filter(|tool| tool.name().eq_ignore_ascii_case(requested));
     let first = matches.next();
     if first.is_some() && matches.next().is_none() {
         first.map(|tool| tool.as_ref())
@@ -318,7 +328,7 @@ mod tests {
     async fn dispatch_accepts_unique_case_insensitive_tool_name() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
         let result = execute_tool(
-            "toolsearch",
+            " toolsearch ",
             &serde_json::json!({"query": ""}),
             &tools,
             &test_context(),
@@ -330,6 +340,15 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("Empty query"));
+    }
+
+    #[tokio::test]
+    async fn inactive_registered_tool_explains_how_to_recover() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
+        let result = execute_tool("Bash", &serde_json::json!({}), &tools, &test_context()).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("registered but not active"));
+        assert!(result.content.contains("ToolSearch"));
     }
 
     #[tokio::test]

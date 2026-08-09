@@ -151,6 +151,12 @@ struct AgentInput {
     run_in_background: bool,
 }
 
+fn allowlisted_tool_name(allowed: &[String], tool_name: &str) -> bool {
+    allowed
+        .iter()
+        .any(|requested| requested.trim().eq_ignore_ascii_case(tool_name))
+}
+
 #[async_trait]
 impl Tool for AgentTool {
     fn name(&self) -> &str {
@@ -249,7 +255,7 @@ impl Tool for AgentTool {
         let all = clawde_tools::all_tools();
         let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
             all.into_iter()
-                .filter(|t| allowed.contains(&t.name().to_string()))
+                .filter(|t| allowlisted_tool_name(allowed, t.name()))
                 .collect()
         } else {
             all.into_iter()
@@ -534,6 +540,19 @@ impl Tool for AgentTool {
 // Helper: convert a QueryOutcome into a result string for background agents
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod tests {
+    use super::allowlisted_tool_name;
+
+    #[test]
+    fn allowlist_matches_tool_names_case_insensitively_and_ignores_whitespace() {
+        let allowed = vec![" bash ".to_string(), "Read".to_string()];
+        assert!(allowlisted_tool_name(&allowed, "Bash"));
+        assert!(allowlisted_tool_name(&allowed, "read"));
+        assert!(!allowlisted_tool_name(&allowed, "Write"));
+    }
+}
+
 fn format_outcome(outcome: QueryOutcome) -> String {
     match outcome {
         QueryOutcome::EndTurn { message, .. } => message.get_all_text(),
@@ -612,7 +631,7 @@ pub fn init_team_swarm_runner() {
                 let agent_tools: Vec<Box<dyn clawde_tools::Tool>> = if let Some(ref allowed) = tools
                 {
                     all.into_iter()
-                        .filter(|t| allowed.contains(&t.name().to_string()))
+                        .filter(|t| allowlisted_tool_name(allowed, t.name()))
                         .collect()
                 } else {
                     all.into_iter()

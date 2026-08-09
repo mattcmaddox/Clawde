@@ -84,10 +84,12 @@ impl Tool for FileReadTool {
             return ToolResult::error(format!("File not found: {}", path.display()));
         }
 
-        // Check if it's a directory
+        // Check if it's a directory. Do not prescribe Bash here: the active
+        // session may intentionally omit shell execution (read-only/search-only
+        // agent modes). Point to the available directory-aware tools instead.
         if path.is_dir() {
             return ToolResult::error(format!(
-                "{} is a directory, not a file. Use Bash with `ls` to list directory contents.",
+                "{} is a directory, not a file. Use a directory-aware tool such as Glob or Grep to inspect its contents; shell execution may be unavailable in restricted sessions.",
                 path.display()
             ));
         }
