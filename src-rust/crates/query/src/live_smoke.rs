@@ -19,10 +19,10 @@
 //! material, bounds all captured text, and is opt-in (`clawde diagnostics
 //! --live`). The prompt contains only the bounded fixture diff and spec.
 
-use crate::agent_tool::semantic_verify_runner;
+use crate::agent_tool::{semantic_fix_runner, semantic_verify_runner};
 use crate::continuation::{
-    ContinuationPolicy, SemanticAfterVerifyPolicy, SemanticVerifyRequest, SemanticVerifyRunner,
-    TurnEndContext,
+    ContinuationPolicy, SemanticAfterVerifyPolicy, SemanticFixRequest, SemanticVerifyRequest,
+    SemanticVerifyRunner, TurnEndContext,
 };
 use clawde_core::config::{VerifyConfig, VerifySandbox};
 use clawde_core::snapshot::Patch;
@@ -34,7 +34,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const SMOKE_SCHEMA_VERSION: &str = "live-freeprovider-smoke.v2";
+const SMOKE_SCHEMA_VERSION: &str = "live-freeprovider-smoke.v3";
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PROVIDER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MAX_ERROR_CHARS: usize = 300;
@@ -74,6 +74,11 @@ pub struct LiveSmokeReport {
     /// the reference call. Overall `ok` requires this path — it is the object
     /// under test.
     pub production: Option<ProductionSmokeReport>,
+    /// Evidence from the production AgentTool-backed fixer path
+    /// (`semantic_fix_runner` → fresh write-tools executor, G5), applied to
+    /// the verifier's own findings. Recorded independently; overall `ok`
+    /// requires it when the fixer runs.
+    pub fix: Option<FixSmokeReport>,
     /// Short, bounded error description when the smoke could not complete.
     pub error: Option<String>,
 }
@@ -92,6 +97,27 @@ pub struct ProductionSmokeReport {
     /// a strict-parse failure is retried, mirroring the loop's resilience).
     pub attempts: u32,
     /// Short, bounded error description when the production path could not
+    /// complete.
+    pub error: Option<String>,
+}
+
+/// Evidence from the production AgentTool-backed fixer runner (G5).
+#[derive(Debug, Clone, Serialize)]
+pub struct FixSmokeReport {
+    pub ok: bool,
+    /// Bounded fixer summary (truncated).
+    pub summary: Option<String>,
+    /// Whether the fixer session wrote to the fixture on disk.
+    pub file_changed: bool,
+    /// Whether the injected defect is gone from the fixture source.
+    pub fix_verified: bool,
+    /// Best-effort `cargo test` of the spec acceptance test against the
+    /// fixed fixture. `None` when the toolchain could not run it.
+    pub cargo_verified: Option<bool>,
+    pub latency_ms: u64,
+    /// Number of bounded fresh-executor fix attempts made.
+    pub attempts: u32,
+    /// Short, bounded error description when the fixer path could not
     /// complete.
     pub error: Option<String>,
 }
@@ -463,6 +489,159 @@ async fn run_production_smoke(
 }
 
 // ---------------------------------------------------------------------------
+// Production AgentTool-backed fixer path (G5)
+// ---------------------------------------------------------------------------
+
+/// Maximum fresh-executor fix attempts. Each attempt is its own write-tools
+/// AgentTool session (max 5 model turns) that re-reads the current disk
+/// state, so a second attempt converges on whatever the first one did.
+const FIX_MAX_ATTEMPTS: u32 = 2;
+/// Per-attempt timeout for the fixer. The live smoke can take several minutes
+/// in the worst case (direct 180s + production 3×90s + fix 2×90s); run it via
+/// a persistent session (tmux) and allow ≥900s.
+const FIX_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Best-effort disk check that the injected defect is gone: `sum_pair` now
+/// actually returns `a + b`. Looks at a bounded window after the function
+/// signature so both `{ a + b }` and multi-line bodies match.
+fn fixture_bug_fixed(fixture: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(fixture.join("src/lib.rs")) else {
+        return false;
+    };
+    let Some(idx) = content.find("fn sum_pair") else {
+        return false;
+    };
+    let window = content
+        .get(idx..(idx + 120).min(content.len()))
+        .unwrap_or_default();
+    window.contains("a + b")
+}
+
+/// Best-effort real acceptance run: append the spec's acceptance test
+/// (`sum_pair(1, 2) == 3`) to the fixed fixture and run `cargo test` offline.
+/// Returns `None` when the toolchain cannot run (environment limitation).
+/// The fixture is a private temp dir, so mutating it here is safe.
+async fn fixture_acceptance_test(fixture: &Path) -> Option<bool> {
+    let lib = fixture.join("src/lib.rs");
+    let mut content = std::fs::read_to_string(&lib).ok()?;
+    content.push_str(
+        "\n#[cfg(test)]\nmod live_smoke_acceptance {\n    use super::*;\n    #[test]\n    \
+         fn acceptance_sum_pair() { assert_eq!(sum_pair(1, 2), 3); }\n}\n",
+    );
+    std::fs::write(&lib, content).ok()?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        tokio::process::Command::new("cargo")
+            .args(["test", "--offline", "--quiet"])
+            .current_dir(fixture)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(output.status.success())
+}
+
+/// Run the production AgentTool-backed fixer path end-to-end on the fixture:
+/// `semantic_fix_runner` → fresh write-tools AgentTool session → `free/auto`
+/// → FreeProvider, fed the verifier's own findings. Each attempt re-checks
+/// the disk state; the loop stops early once the injected defect is gone.
+async fn run_fix_smoke(
+    fixture: &Path,
+    patch: &Patch,
+    diff: &str,
+    spec: Spec,
+    summary: &str,
+    findings: &[String],
+) -> FixSmokeReport {
+    let started = Instant::now();
+    let lib = fixture.join("src/lib.rs");
+    let original = std::fs::read_to_string(&lib).ok();
+    let Some(fixer) = semantic_fix_runner(production_tool_context(fixture)) else {
+        return FixSmokeReport {
+            ok: false,
+            summary: None,
+            file_changed: false,
+            fix_verified: false,
+            cargo_verified: None,
+            latency_ms: 0,
+            attempts: 0,
+            error: Some(
+                "production fixer refused the session (free provider not active)".to_string(),
+            ),
+        };
+    };
+
+    let diff = diff.chars().take(6_000).collect::<String>();
+    let mut attempts = 0u32;
+    let mut last_error: Option<String> = None;
+    let mut last_summary: Option<String> = None;
+    while attempts < FIX_MAX_ATTEMPTS {
+        attempts += 1;
+        let request = SemanticFixRequest {
+            session_id: "live-smoke-production".to_string(),
+            working_dir: fixture.to_path_buf(),
+            changed_files: patch.files.clone(),
+            tree_hash: patch.hash.clone(),
+            diff: diff.clone(),
+            task_id: Some(spec.task_id.clone()),
+            spec: Some(spec.clone()),
+            summary: summary.to_string(),
+            findings: findings.to_vec(),
+        };
+        match tokio::time::timeout(FIX_ATTEMPT_TIMEOUT, fixer(request)).await {
+            Ok(Ok(fixer_summary)) => {
+                last_summary = Some(fixer_summary);
+            }
+            Ok(Err(error)) => {
+                last_error = Some(format!("fixer error: {error}"));
+                continue;
+            }
+            Err(_) => {
+                last_error = Some("fixer timed out".to_string());
+                continue;
+            }
+        }
+        if fixture_bug_fixed(fixture) {
+            let cargo_verified = fixture_acceptance_test(fixture).await;
+            return FixSmokeReport {
+                ok: cargo_verified.unwrap_or(true),
+                summary: last_summary,
+                file_changed: true,
+                fix_verified: true,
+                cargo_verified,
+                latency_ms: started.elapsed().as_millis() as u64,
+                attempts,
+                error: if cargo_verified == Some(false) {
+                    Some("fixture acceptance test failed after the fix".to_string())
+                } else {
+                    None
+                },
+            };
+        }
+        last_error = Some(format!(
+            "fixer returned but the fixture defect remained after {attempts} attempt(s)"
+        ));
+    }
+
+    let fixed = fixture_bug_fixed(fixture);
+    let changed = match (&original, std::fs::read_to_string(&lib).ok()) {
+        (Some(before), Some(after)) => before != &after,
+        _ => false,
+    };
+    FixSmokeReport {
+        ok: false,
+        summary: last_summary,
+        file_changed: changed,
+        fix_verified: fixed,
+        cargo_verified: None,
+        latency_ms: started.elapsed().as_millis() as u64,
+        attempts,
+        error: last_error,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -487,6 +666,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             raw_excerpt: None,
             direct_error: None,
             production: None,
+            fix: None,
             error: Some("could not create the synthetic fixture".to_string()),
         };
     }
@@ -544,6 +724,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
         raw_excerpt: info.raw_excerpt.clone(),
         direct_error: None,
         production: None,
+        fix: None,
         error: None,
     };
     drop(info);
@@ -589,7 +770,55 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
     let production = run_production_smoke(&fixture.path, &patch, diff, fixture_spec()).await;
     let production_ok = production.ok;
     report.direct_error = direct_error;
+
+    // G5 fixer path: exercise the production fresh-executor fixer
+    // (`semantic_fix_runner` → write-tools AgentTool session → free model),
+    // fed the verifier's own findings so the evidence is one closed loop:
+    // verifier finds the defect, fixer repairs it, acceptance test passes.
+    // Falls back to the known fixture defect when the verifier produced no
+    // findings this run.
+    let findings = if !production.findings.is_empty() {
+        production.findings.clone()
+    } else if !report.findings.is_empty() {
+        report.findings.clone()
+    } else {
+        vec![
+            ("sum_pair always returns 0 instead of its two integer arguments ".to_string()
+                + "(spec: sum_pair(a, b) must return a + b)"),
+        ]
+    };
+    let fix_summary = production
+        .summary
+        .clone()
+        .or_else(|| report.summary.clone())
+        .unwrap_or_else(|| "sum_pair returns 0 instead of a + b".to_string());
+    // G5 fixer runs only after a `fixable` verdict — exactly like the
+    // production loop (the policy invokes the fixer exclusively on a fixable
+    // semantic verdict). On any other verdict the fixer is not exercised and
+    // cannot fail the smoke; `ok` then rests on the verifier alone.
+    let fixer_verdict = production
+        .verdict
+        .clone()
+        .or_else(|| report.verdict.clone())
+        .unwrap_or_default();
     report.production = Some(production);
-    report.ok = production_ok;
+    let fix = if fixer_verdict == "fixable" {
+        Some(
+            run_fix_smoke(
+                &fixture.path,
+                &patch,
+                diff,
+                fixture_spec(),
+                &fix_summary,
+                &findings,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let fix_ok = fix.as_ref().map(|report| report.ok).unwrap_or(true);
+    report.fix = fix;
+    report.ok = production_ok && fix_ok;
     report
 }

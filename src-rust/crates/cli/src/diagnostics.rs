@@ -97,6 +97,30 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                     println!("    error: {error}");
                 }
             }
+            match &live.fix {
+                Some(fix) => {
+                    println!(
+                        "  production AgentTool fixer (G5): {}",
+                        if fix.ok { "PASS" } else { "FAIL" }
+                    );
+                    println!("    attempts: {}", fix.attempts);
+                    println!("    file changed: {}", fix.file_changed);
+                    println!("    fix verified (disk): {}", fix.fix_verified);
+                    match fix.cargo_verified {
+                        Some(passed) => println!("    acceptance test passes: {passed}"),
+                        None => println!("    acceptance test: not run (toolchain unavailable)"),
+                    }
+                    if let Some(summary) = &fix.summary {
+                        println!("    fixer summary: {summary}");
+                    }
+                    if let Some(error) = &fix.error {
+                        println!("    error: {error}");
+                    }
+                }
+                None => {
+                    println!("  production AgentTool fixer (G5): not run (verdict was not fixable)")
+                }
+            }
             if let Some(direct_error) = &live.direct_error {
                 println!("  direct-path note: {direct_error}");
             }
