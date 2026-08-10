@@ -46,10 +46,11 @@ pub use compact::{
     MicroCompactConfig, TokenWarningState,
 };
 pub use continuation::{
-    parse_semantic_verify_response, semantic_read_only_tool_names, ContinuationDecision,
-    ContinuationMode, ContinuationPolicy, SemanticAfterVerifyPolicy, SemanticVerdict,
-    SemanticVerifyPolicy, SemanticVerifyReport, SemanticVerifyRequest, SemanticVerifyResponse,
-    SemanticVerifyRunner, StopPolicy, TurnEndContext,
+    parse_semantic_verify_response, semantic_fixer_tool_names, semantic_read_only_tool_names,
+    ContinuationDecision, ContinuationMode, ContinuationPolicy, SemanticAfterVerifyPolicy,
+    SemanticFixRequest, SemanticFixRunner, SemanticVerdict, SemanticVerifyPolicy,
+    SemanticVerifyReport, SemanticVerifyRequest, SemanticVerifyResponse, SemanticVerifyRunner,
+    StopPolicy, TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
 pub use diagnostics::{run_native_diagnostics, NativeDiagnosticCheck, NativeDiagnosticsReport};
@@ -192,6 +193,10 @@ pub struct QueryConfig {
     /// `ContinuationMode` so callers can select the mode without embedding a
     /// provider/client dependency in the policy enum.
     pub semantic_verify_runner: Option<crate::continuation::SemanticVerifyRunner>,
+    /// Optional injected fresh-executor fixer (G5). When present, a `fixable`
+    /// semantic verdict spawns a fresh write-tools executor instead of
+    /// replaying the fix request into the same in-context trace.
+    pub semantic_fix_runner: Option<crate::continuation::SemanticFixRunner>,
 }
 
 impl Default for QueryConfig {
@@ -223,6 +228,7 @@ impl Default for QueryConfig {
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
             semantic_verify_runner: None,
+            semantic_fix_runner: None,
         }
     }
 }
@@ -557,10 +563,11 @@ pub async fn run_query_loop(
     // one turn; the goal policy keeps the loop running while an active goal's
     // guards allow; the verify policy runs the project's tests/lints after
     // writing turns. Built once per run.
-    let continuation_policy = config
-        .continuation
-        .clone()
-        .policy_with_runner(&tool_ctx.working_dir, config.semantic_verify_runner.clone());
+    let continuation_policy = config.continuation.clone().policy_with_fixer(
+        &tool_ctx.working_dir,
+        config.semantic_verify_runner.clone(),
+        config.semantic_fix_runner.clone(),
+    );
     // Wall-clock start of the current "continuation turn" (a span from a user /
     // continuation message to the next `end_turn`). Reset on each accepted
     // continuation so goal time/turn accounting matches the old per-dispatch
@@ -2612,6 +2619,7 @@ mod tests {
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
             semantic_verify_runner: None,
+            semantic_fix_runner: None,
         }
     }
 

@@ -404,7 +404,8 @@ async fn run_production_smoke(
     let mut last_error: Option<String> = None;
     while attempts < PRODUCTION_MAX_ATTEMPTS {
         attempts += 1;
-        let policy = SemanticAfterVerifyPolicy::new(verify_config(), fixture, Some(runner.clone()));
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config(), fixture, Some(runner.clone()), None);
         let context = TurnEndContext {
             session_id: "live-smoke",
             total_tokens_used: 0,
@@ -499,7 +500,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
 
     let captured = Arc::new(Mutex::new(LiveCallInfo::default()));
     let runner = make_live_runner(captured.clone());
-    let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner));
+    let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner), None);
 
     let context = TurnEndContext {
         session_id: "live-smoke",

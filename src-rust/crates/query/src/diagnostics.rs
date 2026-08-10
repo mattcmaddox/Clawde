@@ -177,7 +177,7 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
         })
     });
 
-    let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner));
+    let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner), None);
     let context = TurnEndContext {
         session_id: "native-diagnostics",
         total_tokens_used: 0,

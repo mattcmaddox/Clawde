@@ -161,6 +161,42 @@ pub struct SemanticVerifyRequest {
     pub read_only_tools: Vec<String>,
 }
 
+/// Owned request handed to a fresh-executor fix runner (writer-verifier gap
+/// G5). Carries the verifier's verdict context plus the scoped spec/diff so
+/// the executor can act without re-deriving the task from the session trace.
+#[derive(Debug, Clone)]
+pub struct SemanticFixRequest {
+    pub session_id: String,
+    pub working_dir: std::path::PathBuf,
+    pub changed_files: Vec<std::path::PathBuf>,
+    pub tree_hash: String,
+    /// Bounded unified diff for the turn under review.
+    pub diff: String,
+    pub task_id: Option<String>,
+    pub spec: Option<clawde_core::spec::Spec>,
+    /// Verifier summary of the fixable defect.
+    pub summary: String,
+    /// Verifier findings, one concrete defect each.
+    pub findings: Vec<String>,
+}
+
+/// Result type returned by an injected fresh-executor fix runner.
+pub type SemanticFixRunnerResult = Result<String, String>;
+
+/// Async runner seam for a fresh-executor fixer (writer-verifier gap G5).
+///
+/// Unlike the verifier, this runner is expected to EDIT files (write tools)
+/// in a fresh sub-agent session — never the same in-context trace the loop is
+/// replaying. Injected by the caller so the policy stays provider-neutral.
+pub type SemanticFixRunner = std::sync::Arc<
+    dyn Fn(
+            SemanticFixRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = SemanticFixRunnerResult> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Result type returned by an injected semantic verifier runner.
 pub type SemanticVerifyRunnerResult = Result<String, String>;
 
@@ -262,6 +298,25 @@ pub fn semantic_read_only_tool_names() -> Vec<String> {
     .collect()
 }
 
+/// Tools a fresh-executor fixer receives: the read-only verifier set plus the
+/// file-mutating tools needed to apply a fix. No shell/network tools — the
+/// executor repairs files, it does not run commands.
+pub fn semantic_fixer_tool_names() -> Vec<String> {
+    let mut names = semantic_read_only_tool_names();
+    names.extend(
+        [
+            clawde_core::constants::TOOL_NAME_FILE_EDIT,
+            clawde_core::constants::TOOL_NAME_FILE_WRITE,
+            clawde_core::constants::TOOL_NAME_BATCH_EDIT,
+            clawde_core::constants::TOOL_NAME_APPLY_PATCH,
+            clawde_core::constants::TOOL_NAME_NOTEBOOK_EDIT,
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    names
+}
+
 /// Decision returned by a continuation policy at the end of a completed turn.
 #[derive(Debug, Clone)]
 pub enum ContinuationDecision {
@@ -287,6 +342,7 @@ impl ContinuationDecision {
 /// with bounded, explicit feedback; `pass`, `replan`, and `escalate` stop.
 pub struct SemanticVerifyPolicy {
     runner: Option<SemanticVerifyRunner>,
+    fix_runner: Option<SemanticFixRunner>,
     attempts: std::sync::atomic::AtomicU32,
     max_attempts: u32,
     last_report: std::sync::Mutex<Option<SemanticVerifyReport>>,
@@ -295,13 +351,44 @@ pub struct SemanticVerifyPolicy {
 impl SemanticVerifyPolicy {
     pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
-    pub fn new(runner: Option<SemanticVerifyRunner>) -> Self {
+    pub fn new(
+        runner: Option<SemanticVerifyRunner>,
+        fix_runner: Option<SemanticFixRunner>,
+    ) -> Self {
         Self {
             runner,
+            fix_runner,
             attempts: std::sync::atomic::AtomicU32::new(0),
             max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
             last_report: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Maximum fix-and-reverify rounds before escalation.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Clone of the latest verdict report (peek; does not consume).
+    pub fn last_report(&self) -> Option<SemanticVerifyReport> {
+        self.last_report.lock().unwrap().clone()
+    }
+
+    /// Whether a fresh-executor fixer is configured for this policy.
+    pub fn has_fixer(&self) -> bool {
+        self.fix_runner.is_some()
+    }
+
+    /// Invoke the fresh-executor fixer with the given request.
+    ///
+    /// G5: the fixer runs in a fresh sub-agent session with write tools — it
+    /// must never reuse the loop's in-context trace.
+    async fn run_fixer(&self, request: SemanticFixRequest) -> Result<String, String> {
+        let fixer = self
+            .fix_runner
+            .as_ref()
+            .ok_or_else(|| "no fresh-executor fixer configured".to_string())?;
+        fixer(request).await
     }
 
     fn request_from_context(
@@ -437,14 +524,21 @@ impl SemanticAfterVerifyPolicy {
         verify_config: clawde_core::config::VerifyConfig,
         working_dir: &std::path::Path,
         runner: Option<SemanticVerifyRunner>,
+        fix_runner: Option<SemanticFixRunner>,
     ) -> Self {
         Self {
             deterministic: crate::verify::VerifyPolicy::new(
                 verify_config,
                 working_dir.to_path_buf(),
             ),
-            semantic: SemanticVerifyPolicy::new(runner),
+            semantic: SemanticVerifyPolicy::new(runner, fix_runner),
         }
+    }
+
+    /// True when a fresh-executor fixer is wired, i.e. the G5 fix loop is
+    /// available rather than the legacy same-context `Continue`.
+    pub fn has_fixer(&self) -> bool {
+        self.semantic.has_fixer()
     }
 }
 
@@ -463,13 +557,104 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
             if deterministic.is_continue() {
                 return deterministic;
             }
-            match self
+            let deterministic_verdict = self
                 .deterministic
                 .verify_report()
-                .map(|report| report.verdict)
-            {
-                Some(crate::verify::VerifyVerdict::Pass) => self.semantic.decide_async(ctx).await,
-                _ => deterministic,
+                .map(|report| report.verdict);
+            if !matches!(
+                deterministic_verdict,
+                Some(crate::verify::VerifyVerdict::Pass)
+            ) {
+                return deterministic;
+            }
+
+            // Deterministic gate passed → semantic review. G5: a `fixable`
+            // verdict must NOT be replayed into the same in-context trace
+            // (Trap 4). When a fresh-executor fixer is configured, run the
+            // fix-and-reverify loop entirely inside this policy: each round
+            // spawns a fresh write-tools executor with the verdict, then
+            // re-runs the deterministic gate + semantic review on the new
+            // state. Only a terminal decision (pass / escalate / replan /
+            // exhausted) is surfaced to the loop.
+            let mut round: u32 = 0;
+            loop {
+                let decision = self.semantic.decide_async(ctx).await;
+                match decision {
+                    // pass / replan / escalate / runner-error → terminal.
+                    ContinuationDecision::Stop { .. } => return decision,
+                    ContinuationDecision::Continue { message } => {
+                        if !self.semantic.has_fixer() {
+                            // No fresh-executor fixer configured: fall back to
+                            // the legacy same-context Continue (documented
+                            // degraded mode; the loop pushes the fix request
+                            // into the existing trace).
+                            return ContinuationDecision::Continue { message };
+                        }
+                        round += 1;
+                        if round >= self.semantic.max_attempts() {
+                            return ContinuationDecision::Stop {
+                                note: Some(format!(
+                                    "Semantic verification exhausted after {round} fresh-executor \
+                                     fix rounds; the reported issues remain unresolved: {message}"
+                                )),
+                            };
+                        }
+                        // Build the fresh-executor request from the verdict
+                        // report (summary + findings) + scoped context.
+                        let Some(report) = self.semantic.last_report() else {
+                            return ContinuationDecision::Stop {
+                                note: Some(
+                                    "Semantic verification lost its verdict before the fixer \
+                                     could act; stopping."
+                                        .to_string(),
+                                ),
+                            };
+                        };
+                        let Some(patch) = ctx.changed_files else {
+                            return ContinuationDecision::Stop {
+                                note: Some(
+                                    "Semantic verification lost the changed-file scope; stopping."
+                                        .to_string(),
+                                ),
+                            };
+                        };
+                        let fix_request = SemanticFixRequest {
+                            session_id: ctx.session_id.to_string(),
+                            working_dir: ctx.working_dir.to_path_buf(),
+                            changed_files: patch.files.clone(),
+                            tree_hash: patch.hash.clone(),
+                            diff: bound_semantic_diff(
+                                ctx.changed_diff.unwrap_or_default().to_string(),
+                            ),
+                            task_id: ctx.spec.as_ref().map(|spec| spec.task_id.clone()),
+                            spec: ctx.spec.clone(),
+                            summary: report.summary.clone(),
+                            findings: report.findings.clone(),
+                        };
+                        match self.semantic.run_fixer(fix_request).await {
+                            Ok(summary) => {
+                                // Fresh executor applied a fix on disk. Re-run
+                                // the deterministic gate on the new state; if
+                                // it regressed, stop — never silently accept.
+                                let after = self.deterministic.decide(ctx);
+                                if after.is_continue() {
+                                    return ContinuationDecision::Stop {
+                                        note: Some(format!(
+                                            "Fresh-executor fix did not pass the deterministic \
+                                             gate: {summary}"
+                                        )),
+                                    };
+                                }
+                                // Gate green → next round re-reviews semantically.
+                            }
+                            Err(error) => {
+                                return ContinuationDecision::Stop {
+                                    note: Some(format!("Fresh-executor fixer failed: {error}")),
+                                };
+                            }
+                        }
+                    }
+                }
             }
         })
     }
@@ -731,6 +916,18 @@ impl ContinuationMode {
         working_dir: &std::path::Path,
         semantic_runner: Option<SemanticVerifyRunner>,
     ) -> Box<dyn ContinuationPolicy> {
+        self.policy_with_fixer(working_dir, semantic_runner, None)
+    }
+
+    /// Build a policy with both the semantic verifier runner and the
+    /// fresh-executor fixer injected (G5). When `fix_runner` is `None`, a
+    /// `fixable` verdict degrades to the legacy same-context `Continue`.
+    pub fn policy_with_fixer(
+        self,
+        working_dir: &std::path::Path,
+        semantic_runner: Option<SemanticVerifyRunner>,
+        fix_runner: Option<SemanticFixRunner>,
+    ) -> Box<dyn ContinuationPolicy> {
         match self {
             ContinuationMode::Default => Box::new(StopPolicy),
             ContinuationMode::Goal => Box::new(GoalPolicy),
@@ -739,9 +936,14 @@ impl ContinuationMode {
                 working_dir.to_path_buf(),
             )),
             ContinuationMode::SpecMode => Box::new(SpecModePolicy::new()),
-            ContinuationMode::SemanticVerify(verify_config) => Box::new(
-                SemanticAfterVerifyPolicy::new(verify_config, working_dir, semantic_runner),
-            ),
+            ContinuationMode::SemanticVerify(verify_config) => {
+                Box::new(SemanticAfterVerifyPolicy::new(
+                    verify_config,
+                    working_dir,
+                    semantic_runner,
+                    fix_runner,
+                ))
+            }
         }
     }
 }
@@ -862,8 +1064,12 @@ mod tests {
             auto_lint: false,
             ..Default::default()
         };
-        let policy =
-            SemanticAfterVerifyPolicy::new(verify_config, std::path::Path::new("."), Some(runner));
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            std::path::Path::new("."),
+            Some(runner),
+            None,
+        );
         let decision = policy.decide_async(&ctx()).await;
         assert!(!decision.is_continue());
         assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
@@ -892,7 +1098,8 @@ mod tests {
             timeout_secs: 30,
             ..Default::default()
         };
-        let policy = SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner));
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
         let context = TurnEndContext {
             working_dir: project.path(),
             changed_files: Some(&patch),
@@ -932,7 +1139,8 @@ mod tests {
             timeout_secs: 30,
             ..Default::default()
         };
-        let policy = SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner));
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
         let context = TurnEndContext {
             working_dir: project.path(),
             changed_files: Some(&patch),
@@ -1058,9 +1266,12 @@ mod tests {
             files: vec![project.path().join("file.txt")],
         };
         let diff = "x".repeat(SEMANTIC_VERIFY_MAX_DIFF_CHARS + 100);
-        let policy = SemanticVerifyPolicy::new(Some(std::sync::Arc::new(|_| {
-            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"ok"}"#.to_string()) })
-        })));
+        let policy = SemanticVerifyPolicy::new(
+            Some(std::sync::Arc::new(|_| {
+                Box::pin(async { Ok(r#"{"verdict":"pass","summary":"ok"}"#.to_string()) })
+            })),
+            None,
+        );
         let context = TurnEndContext {
             working_dir: project.path(),
             changed_files: Some(&patch),
@@ -1147,7 +1358,7 @@ mod tests {
                 )
             })
         });
-        let policy = SemanticVerifyPolicy::new(Some(runner));
+        let policy = SemanticVerifyPolicy::new(Some(runner), None);
         let context = TurnEndContext {
             session_id: "session-1",
             total_tokens_used: 0,
@@ -1183,7 +1394,7 @@ mod tests {
         let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
             Box::pin(async { Ok(r#"{"verdict":"pass","summary":"ok"}"#.to_string()) })
         });
-        let policy = SemanticVerifyPolicy::new(Some(runner));
+        let policy = SemanticVerifyPolicy::new(Some(runner), None);
         let context = TurnEndContext {
             working_dir: std::path::Path::new("/project"),
             changed_files: Some(&patch),
@@ -1198,12 +1409,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_fixer_routes_fixable_to_fresh_executor_and_reverifies() {
+        if !cargo_available() {
+            return;
+        }
+        let project = tempfile::tempdir().expect("temporary project");
+        write_cargo_semantic_fixture(
+            project.path(),
+            "#[cfg(test)]\nmod tests { #[test] fn passes() {} }\n",
+        );
+        let changed = project.path().join("src/lib.rs");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+
+        // Round 1: fixable. Round 2 (after the fixer): pass.
+        let verifier_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let verifier_calls_clone = verifier_calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            let calls = verifier_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if calls == 0 {
+                    Ok(
+                        r#"{"verdict":"fixable","summary":"missing edge case","findings":["Add coverage"]}"#
+                            .to_string(),
+                    )
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"fixed"}"#.to_string())
+                }
+            })
+        });
+        let fixer_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_calls_clone = fixer_calls.clone();
+        let captured_fix_request = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_fix_clone = captured_fix_request.clone();
+        let fixer: SemanticFixRunner = std::sync::Arc::new(move |request| {
+            fixer_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *captured_fix_clone.lock().unwrap() = Some(request);
+            Box::pin(async { Ok("applied the edge-case fix".to_string()) })
+        });
+
+        let verify_config = clawde_core::config::VerifyConfig {
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+fn edge() {}\n"),
+            ..ctx()
+        };
+
+        let decision = policy.decide_async(&context).await;
+        assert!(matches!(
+            decision,
+            ContinuationDecision::Stop { note: Some(note) } if note.contains("passed")
+        ));
+        assert_eq!(
+            fixer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "fresh executor must run exactly once before the re-review passes"
+        );
+        // The fix request carried the verdict context, not a same-context push.
+        let fix_request = captured_fix_request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("fixer captured request");
+        assert!(fix_request.summary.contains("missing edge case"));
+        assert_eq!(fix_request.findings, vec!["Add coverage"]);
+        assert_eq!(fix_request.working_dir, project.path());
+        assert!(fix_request.diff.contains("fn edge"));
+    }
+
+    #[tokio::test]
+    async fn semantic_fixer_without_fixer_degrades_to_same_context_continue() {
+        if !cargo_available() {
+            return;
+        }
+        let project = tempfile::tempdir().expect("temporary project");
+        write_cargo_semantic_fixture(
+            project.path(),
+            "#[cfg(test)]\nmod tests { #[test] fn passes() {} }\n",
+        );
+        let changed = project.path().join("src/lib.rs");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Ok(r#"{"verdict":"fixable","summary":"needs work","findings":["x"]}"#.to_string())
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        // Deterministic gate passes (fixture tests are green) → the semantic
+        // tier runs. No fixer configured → the legacy same-context Continue is
+        // the documented degraded mode.
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+fn changed() {}\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(decision.is_continue());
+    }
+
+    #[tokio::test]
+    async fn semantic_fixer_error_stops_instead_of_same_context_retry() {
+        if !cargo_available() {
+            return;
+        }
+        let project = tempfile::tempdir().expect("temporary project");
+        write_cargo_semantic_fixture(
+            project.path(),
+            "#[cfg(test)]\nmod tests { #[test] fn passes() {} }\n",
+        );
+        let changed = project.path().join("src/lib.rs");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Ok(r#"{"verdict":"fixable","summary":"broken","findings":["fix it"]}"#.to_string())
+            })
+        });
+        let fixer: SemanticFixRunner = std::sync::Arc::new(|_| {
+            Box::pin(async { Err("fixer could not apply the patch".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+fn changed() {}\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(matches!(
+            decision,
+            ContinuationDecision::Stop { note: Some(note) } if note.contains("fixer failed")
+        ));
+    }
+
+    #[tokio::test]
     async fn semantic_policy_stops_on_missing_runner_or_read_only_turn() {
         let patch = clawde_core::snapshot::Patch {
             hash: "tree".to_string(),
             files: vec![std::path::PathBuf::from("src/lib.rs")],
         };
-        let policy = SemanticVerifyPolicy::new(None);
+        let policy = SemanticVerifyPolicy::new(None, None);
         let context = TurnEndContext {
             turn_made_writes: true,
             changed_files: Some(&patch),

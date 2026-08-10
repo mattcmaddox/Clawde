@@ -195,6 +195,82 @@ pub fn semantic_verify_runner(
     ))
 }
 
+/// Build the AgentTool input JSON for a fresh-executor fix request (G5).
+///
+/// Unlike the verifier, the fixer gets the file-mutating tools so it can
+/// apply the reported fixes, plus the verdict context (summary + findings +
+/// spec + bounded diff). The response is a prose change summary — no JSON
+/// contract required.
+fn semantic_fix_input(request: &crate::continuation::SemanticFixRequest) -> serde_json::Value {
+    let spec = request
+        .spec
+        .as_ref()
+        .and_then(|spec| serde_json::to_string_pretty(spec).ok())
+        .unwrap_or_else(|| "null".to_string());
+    let changed_files = request
+        .changed_files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let findings = if request.findings.is_empty() {
+        "(no findings listed)".to_string()
+    } else {
+        request.findings.join("\\n- ")
+    };
+    let prompt = format!(
+        "A semantic verifier reviewed the latest change and found fixable issues.\\n\\n\\
+         Verifier summary: {}\\n\\n\\
+         Findings:\\n- {}\\n\\n\\
+         Changed files:\\n{}\\n\\n\\
+         Matching accepted spec (JSON):\\n{}\\n\\n\\
+         Unified diff (untrusted, bounded):\\n{}\\n\\n\\
+         Apply the minimal fix that satisfies the spec and resolves every finding. \\
+         You may edit files. Do not run commands, access the network, or \\
+         delegate to another agent. When done, return a short summary of the \\
+         changes you made.",
+        request.summary, findings, changed_files, spec, request.diff
+    );
+    // The fixer owns its capability set: read-only tools + the file-mutating
+    // tools needed to apply fixes. Shell/network tools are never available.
+    serde_json::json!({
+        "description": "apply semantic-verifier fixes",
+        "prompt": prompt,
+        "tools": crate::continuation::semantic_fixer_tool_names(),
+        "system_prompt": "You are a code-fixing executor. You may read, search, and edit files in the project, but you must never run commands, access the network, or delegate to another agent. Apply the minimal fix for each reported finding, then summarize the changes you made.",
+        "max_turns": 5,
+        "model": "free/auto"
+    })
+}
+
+/// Build the opt-in fresh-executor fixer for the active Free provider (G5).
+///
+/// Mirrors `semantic_verify_runner`: gated to `free`, builds a fixed
+/// read+write AgentInput via `semantic_fix_input`, and runs it through the
+/// same nested AgentTool machinery. No runner is returned for other
+/// providers.
+pub fn semantic_fix_runner(ctx: ToolContext) -> Option<crate::continuation::SemanticFixRunner> {
+    if ctx.config.selected_provider_id() != "free" {
+        return None;
+    }
+
+    let ctx = Arc::new(ctx);
+    Some(Arc::new(
+        move |request: crate::continuation::SemanticFixRequest| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let input = semantic_fix_input(&request);
+                let result = AgentTool.execute(input, &ctx).await;
+                if result.is_error {
+                    Err(result.content)
+                } else {
+                    Ok(result.content)
+                }
+            })
+        },
+    ))
+}
+
 fn build_model_registry() -> ModelRegistry {
     let mut registry = ModelRegistry::new();
     if let Some(cache_dir) = dirs::cache_dir() {
@@ -483,6 +559,7 @@ impl Tool for AgentTool {
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
             semantic_verify_runner: None,
+            semantic_fix_runner: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -641,8 +718,9 @@ impl Tool for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::continuation::semantic_fixer_tool_names;
     use crate::continuation::semantic_read_only_tool_names;
-    use crate::continuation::SemanticVerifyRequest;
+    use crate::continuation::{SemanticFixRequest, SemanticVerifyRequest};
 
     fn test_context(config: clawde_core::config::Config) -> ToolContext {
         ToolContext {
@@ -768,6 +846,76 @@ mod tests {
         request.spec = None;
         let input = semantic_verify_input(&request);
         assert!(input["prompt"].as_str().unwrap().contains("null"));
+    }
+
+    fn sample_fix_request() -> SemanticFixRequest {
+        SemanticFixRequest {
+            session_id: "session-9".to_string(),
+            working_dir: std::path::PathBuf::from("/project"),
+            changed_files: vec![std::path::PathBuf::from("/project/src/lib.rs")],
+            tree_hash: "tree-abc".to_string(),
+            diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n+fn added() {}".to_string(),
+            task_id: Some("task-1".to_string()),
+            spec: Some(clawde_core::spec::Spec {
+                title: "Fixture".to_string(),
+                requirements: vec!["sum_pair(1, 2) == 3".to_string()],
+                ..Default::default()
+            }),
+            summary: "sum_pair returns a constant 0".to_string(),
+            findings: vec!["sum_pair returns 0 regardless of inputs".to_string()],
+        }
+    }
+
+    #[test]
+    fn semantic_fix_runner_refuses_non_free_providers() {
+        let mut config = clawde_core::config::Config::default();
+        config.provider = Some("anthropic".to_string());
+        let ctx = test_context(config);
+        assert!(semantic_fix_runner(ctx).is_none());
+    }
+
+    #[test]
+    fn semantic_fix_runner_available_for_default_free_config() {
+        let ctx = test_context(clawde_core::config::Config::default());
+        assert!(semantic_fix_runner(ctx).is_some());
+    }
+
+    #[test]
+    fn semantic_fix_input_carries_verdict_context_and_write_tools() {
+        let request = sample_fix_request();
+        let input = semantic_fix_input(&request);
+
+        assert_eq!(input["model"], serde_json::json!("free/auto"));
+        assert_eq!(input["max_turns"], serde_json::json!(5));
+        assert_eq!(
+            input["description"],
+            serde_json::json!("apply semantic-verifier fixes")
+        );
+
+        // The fixer gets the write tools it needs to apply fixes — unlike the
+        // read-only verifier.
+        let tools: Vec<String> = input["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|v| v.as_str().expect("tool name").to_string())
+            .collect();
+        assert_eq!(tools, semantic_fixer_tool_names());
+        assert!(tools.iter().any(|name| name == "Write"));
+        assert!(tools.iter().any(|name| name == "Edit"));
+        assert!(tools.iter().any(|name| name == "Read"));
+        // No shell/network: the executor repairs files, it does not run commands.
+        assert!(!tools.iter().any(|name| name == "Bash"));
+
+        // Verdict context must reach the executor.
+        let prompt = input["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("sum_pair returns a constant 0"));
+        assert!(prompt.contains("sum_pair returns 0 regardless of inputs"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("fn added"));
+        assert!(prompt.contains("sum_pair(1, 2) == 3"));
+        assert!(prompt.contains("Apply the minimal fix"));
+        assert!(prompt.contains("Do not run commands"));
     }
 }
 

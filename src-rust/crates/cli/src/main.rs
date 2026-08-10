@@ -989,9 +989,14 @@ async fn main() -> anyhow::Result<()> {
     tool_ctx.provider_registry = Some(provider_registry.clone());
     // Semantic verification is explicitly opt-in and only uses the active free
     // provider. The runner itself enforces the read-only AgentTool allowlist.
+    // G5: when enabled, also wire the fresh-executor fixer so a `fixable`
+    // verdict routes to a new write-tools session instead of replaying the fix
+    // request into the same in-context trace.
     if config.semantic_verify == Some(true) {
         query_config.semantic_verify_runner =
             clawde_query::agent_tool::semantic_verify_runner(tool_ctx.clone());
+        query_config.semantic_fix_runner =
+            clawde_query::agent_tool::semantic_fix_runner(tool_ctx.clone());
     }
 
     // Wire in the named agent (--agent flag).
