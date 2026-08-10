@@ -27,11 +27,13 @@ Wants=network-online.target
 
 [Service]
 # -- Path to the clawde binary (update to match your install) ---------------
-# TLS: pass --tls-cert and --tls-key to enable encrypted connections.
-# Omit both lines for plain TCP (e.g. localhost-only).
-ExecStart=/usr/local/bin/clawde acp --listen 0.0.0.0:9876 \
-    --tls-cert /home/user/.clawde/certs/server.crt \
-    --tls-key /home/user/.clawde/certs/server.key
+# This example is localhost-only. For LAN access, use TLS plus an
+# authenticated tunnel/reverse proxy and change the bind address deliberately.
+ExecStart=/usr/local/bin/clawde acp --listen 127.0.0.1:9876
+
+# Use a dedicated profile when this endpoint should run local Ollama instead
+# of inheriting your normal Free Mode credentials:
+# Environment=CLAWDE_HOME=/home/user/.clawde/ollama-acp
 
 # -- User to run as (read your ~/.clawde/auth.json for provider keys) -------
 User=user

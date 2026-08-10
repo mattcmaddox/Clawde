@@ -39,7 +39,7 @@ Clawde runs a multi-turn loop: it streams a response from the model, executes an
 - **Task management** — create, track, and complete tasks
 
 ### 15+ LLM providers
-Anthropic Claude (default), OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ollama, Groq, Mistral, DeepSeek, xAI, Cohere, OpenRouter, Together AI, Perplexity, GitHub Copilot, Cerebras, LM Studio, and LLaMA.cpp.
+Free Mode (`free/auto`) across configured free upstreams by default, plus Anthropic Claude, OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ollama, Groq, Mistral, DeepSeek, xAI, Cohere, OpenRouter, Together AI, Perplexity, GitHub Copilot, Cerebras, LM Studio, and LLaMA.cpp.
 
 ### AMOLED terminal UI
 A ratatui-based TUI with real-time streaming, syntax-highlighted code blocks, diff viewer, permission dialogs, slash command autocomplete, session browser, and a full keybinding system.
@@ -127,8 +127,8 @@ See [Configuration](configuration) for the full reference.
 ## Using a different provider
 
 ```bash
-# Use Ollama with a local model
-clawde --provider ollama --model llama3.2
+# Use Ollama through an explicitly configured remote GPU server
+OLLAMA_HOST=http://gpu-host.example:11434 clawde --provider ollama --model llama3.2
 
 # Use OpenAI
 OPENAI_API_KEY=sk-... clawde --provider openai --model gpt-4o

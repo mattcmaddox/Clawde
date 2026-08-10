@@ -66,6 +66,30 @@ $env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
 [System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY","sk-ant-api03-...","User")
 ```
 
+**Automatic import from environment variables (free mode)**
+
+When a free-mode upstream (Groq, Cerebras, Google, Mistral, etc.) succeeds
+using a key from its environment variable and nothing is stored for it yet,
+Clawde persists that key into `~/.clawde/auth.json` automatically. This keeps
+the TUI and future headless runs consistent — an env-only key that works on
+the command line also shows up in `/keys` and the Connect Free dialog after
+its first successful use. Set `persist_env_keys: false` is not required; the
+import only ever writes a key that was already used successfully.
+
+**Corrupt `auth.json` handling**
+
+If `~/.clawde/auth.json` becomes unreadable or partially corrupt, Clawde does
+not silently drop your keys:
+
+- Both `credentials` and `keys` are optional fields, so a file with only one
+  of them loads normally.
+- Whichever entries still parse are recovered; only the broken ones are
+  dropped, with a reason logged.
+- The original file is backed up as `auth.json.corrupt-<timestamp>` before
+  any overwrite, so recoverable keys are never destroyed.
+- Errors surface in `/keys health` and in the no-key hint instead of a
+  misleading `No API keys configured`.
+
 **Option B: Settings file**
 
 Store the key in `~/.clawde/settings.json`. Ensure the file has restricted
@@ -241,7 +265,8 @@ fi
 ### Slash commands
 
 Inside the interactive REPL the same operations are available as slash
-commands — Anthropic is the default, pass `--codex` to target Codex:
+commands. These account commands target Anthropic unless `--codex` is passed; the
+chat itself defaults to Free Mode (`free/auto`):
 
 ```
 /login                          # OAuth login (Claude.ai)
@@ -510,7 +535,7 @@ providers. Each provider looks for credentials in this order:
       "enabled": true
     },
     "ollama": {
-      "api_base": "http://localhost:11434",
+      "api_base": "http://gpu-host.example:11434",
       "enabled": true
     },
     "openrouter": {
@@ -528,8 +553,8 @@ Switch providers at runtime:
 # Use OpenAI for this session
 clawde --provider openai --model gpt-4o "your prompt"
 
-# Use a local Ollama model (no API key needed)
-clawde --provider ollama --model llama3.2 "your prompt"
+# Use a remote GPU Ollama model (no API key needed)
+OLLAMA_HOST=http://gpu-host.example:11434 clawde --provider ollama --model llama3.2 "your prompt"
 
 # Or via environment variable
 CLAURST_PROVIDER=google clawde "your prompt"
@@ -537,18 +562,17 @@ CLAURST_PROVIDER=google clawde "your prompt"
 
 ---
 
-## Local Models (No API Key)
+## Remote GPU Models (No API Key)
 
-Providers that run locally require no API key:
+Remote model servers such as Ollama require no API key, but Clawde requires an
+explicit non-loopback endpoint and never connects to a local Ollama CPU server.
 
-**Ollama:**
+**Ollama on a remote GPU host:**
 
 ```bash
-# Install Ollama from https://ollama.ai and pull a model
-ollama pull llama3.2
-
-# Run Clawde against it
-clawde --provider ollama --model llama3.2
+# Point Clawde at the remote GPU Ollama server
+OLLAMA_HOST=http://gpu-host.example:11434 \
+  clawde --provider ollama --model llama3.2
 ```
 
 **LM Studio:**

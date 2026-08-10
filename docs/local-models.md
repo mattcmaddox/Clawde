@@ -5,7 +5,7 @@ completions API** (`POST /v1/chat/completions`). That includes:
 
 - **llama.cpp** (`llama-server`) — provider id `llamacpp`
 - **LM Studio** — provider id `lmstudio`
-- **Ollama** (via its `/v1` OpenAI shim) — provider id `ollama`
+- **Ollama** (via its `/v1` OpenAI shim) — provider id `ollama`; Clawde requires a non-loopback remote endpoint by default and never falls back to local CPU Ollama. An explicitly isolated profile may opt into a loopback server.
 - **vLLM**, **text-generation-webui**, **LocalAI**, and anything else that
   exposes `/v1/chat/completions` — use the generic `openai` provider with a
   custom base URL
@@ -58,20 +58,85 @@ Or persist it in `~/.clawde/settings.json`:
 usually reports the GGUF filename. Any non-empty string works if the server
 ignores it.
 
-### Any other OpenAI-compatible server
+### Ollama for local apps and local Clawde
 
-LM Studio and Ollama have dedicated provider ids (`lmstudio`, `ollama`) — see
-[Providers](providers). For everything else, use the generic `openai` provider
-and override the base URL:
+Ollama exposes two useful local interfaces:
+
+- Native Ollama API: `http://127.0.0.1:11434/api`
+- OpenAI-compatible API: `http://127.0.0.1:11434/v1`
+
+SiYuan and other self-hosted privacy apps that support Ollama should use the
+native Ollama base URL, `http://127.0.0.1:11434`. Apps that use an OpenAI SDK
+should use `http://127.0.0.1:11434/v1` and the exact model tag shown by
+`ollama list` (for example `deepseek-coder:latest`). Ollama does not require a
+real API key locally; if an app requires one, use a local placeholder such as
+`ollama-local` and do not reuse a cloud credential.
 
 ```bash
-OPENAI_BASE_URL=http://localhost:8000/v1 \
+# Verify models and the OpenAI-compatible endpoint
+curl http://127.0.0.1:11434/api/tags
+curl http://127.0.0.1:11434/v1/models
+```
+
+Clawde's dedicated `ollama` provider rejects loopback endpoints by default to
+prevent an accidental local-CPU fallback. If you intentionally run Ollama on
+this machine, use an isolated profile with an explicit local opt-in:
+
+```json
+{
+  "provider": "ollama",
+  "providers": {
+    "ollama": {
+      "api_base": "http://127.0.0.1:11434/v1",
+      "options": {
+        "mode": "isolated",
+        "allow_local_host": true
+      }
+    }
+  },
+  "config": {
+    "provider": "ollama",
+    "model": "deepseek-coder:latest"
+  }
+}
+```
+
+`allow_local_host` is accepted only with `mode: "isolated"`; it is ignored in
+normal/automatic mode. The configured local ACP service uses this profile
+independently of your normal Free Mode configuration. Its settings live at
+`~/.clawde/ollama-acp/settings.json`, and its ACP endpoint is
+`127.0.0.1:9876`. This keeps normal `clawde` sessions on Free Mode while
+external ACP-capable apps can use the local Ollama agent.
+
+### Any other OpenAI-compatible server
+
+LM Studio has a dedicated provider id (`lmstudio`) — see [Providers](providers).
+For vLLM, LocalAI, llama.cpp, and other compatible servers, use the generic
+`openai` provider and override the base URL:
+
+```bash
+OPENAI_BASE_URL=http://localhost:8000/v1 \\
   clawde --provider openai --model my-model "..."
 ```
 
-Clawde posts to `{base_url}/v1/chat/completions`, so set the base URL to the
-host root (Clawde appends `/v1`) or to a value already ending in `/v1`
-depending on the provider — match the examples above.
+Clawde posts to `{base_url}/chat/completions`; set the base URL to the provider's
+OpenAI-compatible `/v1` root.
+
+### Local-only network boundary
+
+Leave Ollama bound to `127.0.0.1` when only apps on this machine need access.
+Do not set `OLLAMA_HOST=0.0.0.0:11434` unless you deliberately want LAN access
+and have added authentication and firewall controls; Ollama does not provide
+built-in authentication for a plain local listener.
+
+For a Clawde agent endpoint, ACP is also unauthenticated. Keep it on
+`127.0.0.1` unless you add a protected tunnel or a separately authenticated
+reverse proxy.
+
+Clawde's normal Ollama mode keeps tools and web access available. Its isolated
+/offline mode blocks online tools and other process/network capabilities; the
+local ACP profile above intentionally uses isolated mode so external privacy
+apps cannot send online tool requests through that endpoint.
 
 ---
 

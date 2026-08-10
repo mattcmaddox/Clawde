@@ -3,22 +3,38 @@
 Clawde implements the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) —
 a standardized JSON-RPC 2.0 protocol for communication between AI coding agents and
 editors. In addition to the standard stdio mode (used by editors like Zed, Neovim,
-VS Code), Clawde supports **TCP mode** for LAN access, allowing other machines on
-your network to connect to your Clawde instance and use its providers, keys, and
-MCP tools.
+VS Code), Clawde supports **TCP mode**. The safe default for personal integrations
+is localhost-only access; LAN access is an explicit deployment choice because ACP
+clients can use Clawde's providers, keys, and tools.
 
 ## Modes
 
-### 1. Standalone TCP Server
+### 1. Standalone localhost server
 
-Run a dedicated server process (no TUI):
+Run a dedicated server process (no TUI) for apps on this machine:
 
 ```bash
-clawde acp --listen 0.0.0.0:9876
+clawde acp --listen 127.0.0.1:9876
 ```
 
-This starts the ACP server in TCP mode, accepting connections on port `9876`.
-The process runs headlessly — no interactive TUI is shown.
+This starts the ACP server in TCP mode, accepting local connections on port
+`9876`. The process runs headlessly — no interactive TUI is shown. ACP has no
+application-level authentication, so do not replace `127.0.0.1` with
+`0.0.0.0` unless you add an authenticated, protected transport.
+
+The configured local-Ollama service uses a separate settings profile:
+
+```text
+CLAWDE_HOME=~/.clawde/ollama-acp
+provider: ollama
+model: deepseek-coder:latest
+api_base: http://127.0.0.1:11434/v1
+mode: isolated + allow_local_host: true
+ACP: 127.0.0.1:9876
+```
+
+Your normal `~/.clawde` profile remains independent and continues to default to
+Free Mode.
 
 ### 2. Embedded Server (alongside TUI)
 
@@ -37,9 +53,9 @@ Add to `~/.clawde/settings.json`:
 Now every `clawde` session also serves ACP connections in the background. Tokio
 cancels the server task on shutdown automatically.
 
-## Connecting from LAN Clients
+## Connecting from local apps
 
-Any machine on your network can send JSON-RPC requests to the server using tools
+Any ACP-compatible app on the same machine can send JSON-RPC requests to `127.0.0.1:9876` using tools
 like `socat`, `nc`, or any ACP-compatible client (Zed, VS Code extension, etc.).
 
 **Test the connection:**
@@ -54,10 +70,10 @@ echo '{
     "clientInfo": { "name": "my-client", "version": "1.0" },
     "clientCapabilities": {}
   }
-}' | socat - TCP:192.168.1.100:9876
+}' | socat - TCP:127.0.0.1:9876
 ```
 
-Replace `192.168.1.100` with your server's LAN IP address. A successful response
+A successful response
 looks like:
 
 ```json
@@ -89,7 +105,7 @@ Add to `~/.clawde/settings.json`:
 {
   "acpServer": {
     "enabled": true,
-    "listen": "0.0.0.0:9876",
+    "listen": "127.0.0.1:9876",
     "tlsCertPath": "/path/to/cert.pem",
     "tlsKeyPath": "/path/to/key.pem"
   }
@@ -116,12 +132,14 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
 ## Security Considerations
 
 - **No authentication** — ACP v1 has no token/credential field in its
-  `authenticate` method. Bind to `127.0.0.1` (the default) for local-only access,
-  or use an SSH tunnel / VPN for remote access over untrusted networks.
-- **TLS recommended** — Use `tlsCertPath` / `tlsKeyPath` for encrypted connections
-  when binding to a network-accessible address.
-- **Process-level sharing** — All LAN clients share the same provider registry,
-  API keys, and MCP tools as the host Clawde instance.
+  `authenticate` method. Bind to `127.0.0.1` for local-only access.
+- **LAN access is not the default** — If you intentionally bind to a LAN address,
+  use TLS plus an authenticated tunnel or reverse proxy. TLS alone does not add
+  ACP authorization.
+- **Process-level sharing** — Every connected client shares the ACP process's
+  provider registry, settings profile, API access, and tools. Use a dedicated
+  `CLAWDE_HOME` profile when an external app should use local Ollama rather than
+  your normal Free Mode credentials.
 
 ## ACP Protocol Methods
 

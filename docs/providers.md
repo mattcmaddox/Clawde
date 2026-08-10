@@ -26,7 +26,10 @@ The provider can also be set persistently in `~/.clawde/settings.json`:
 }
 ```
 
-When no provider is specified, Clawde defaults to **Anthropic**.
+When no provider is specified, Clawde defaults to **Free Mode** (`free/auto`),
+which routes every request across your configured free upstreams as a smart
+router (see [Managing routing with `/routing`](#managing-routing-with-routing)).
+Set `"provider": "anthropic"` (or any other provider) to opt out.
 
 ---
 
@@ -192,6 +195,31 @@ refinements on every request:
   `providers.free.options.routing.upstream_5xx_cooldown_secs` (default 45s);
   set it to `0` to disable.
 
+**Individual free upstreams (`groq/…`, `huggingface/…`, …):** selecting a
+free-catalog upstream — `clawde -m groq/llama-3.3-70b-versatile`,
+`/model <upstream>/<model>`, `--provider groq`, or a `provider`/`model` pair in
+settings.json — routes through the router's *pinned* route: the pinned upstream
+is tried first, then the rest of the chain falls through on transient errors.
+Dispatch telemetry, cooldowns and key rotation therefore stay attached to the
+free chain. Non-catalog providers (OpenAI, Ollama, Azure, …) keep direct
+dispatch.
+
+**Headless attribution:** `clawde --print` reports the serving provider on
+stderr (`Model: <model> via <upstream>`) and `--output-format json` results
+carry `provider` / `upstream` / `model` fields, so you can audit which free
+upstream answered (or that a fallback happened).
+
+**Exhaustion errors:** when every upstream in the chain fails, the error names
+the **original** failures rather than only the last upstream's raw error — e.g.
+`all free-mode upstreams exhausted: groq: [groq] Rate limited, …,
+... and 9 more, ollama: [ollama] Model not found: unknown`. Consecutive
+duplicates are collapsed first (a pinned upstream retrying its fallback models
+against the same provider repeats the same failure), then the list is capped
+for readability: the first 5 errors are shown, `… and N more` counts the
+omitted middle entries, and the **last** upstream's error is always appended
+(since the final fallback's failure is usually the most relevant). With 6 or
+fewer failures the full list is shown.
+
 **Model-performance dashboards (spec §8.6):** the router records dispatch
 success rates (aggregate and per-task) plus average latency per upstream, and
 exposes them in three places:
@@ -211,9 +239,11 @@ exposes them in three places:
 
 ## Provider Reference
 
-### Anthropic (default)
+### Anthropic
 
-The default provider. Uses the `/v1/messages` streaming endpoint.
+The provider used when you explicitly select it (e.g. `--provider anthropic` or
+`"provider": "anthropic"`). Not the built-in default — a fresh config starts in
+Free Mode. Uses the `/v1/messages` streaming endpoint.
 
 **Authentication:** `ANTHROPIC_API_KEY` environment variable, or set `api_key` in `settings.json`.
 
@@ -506,9 +536,15 @@ For the OpenAI-compatible protocol, use the custom provider with the correspondi
 
 ### Ollama
 
-Connects to a locally or remotely running Ollama instance. No API key required.
+Connects to an explicitly configured remote Ollama instance, normally a GPU
+server. No API key is required. Clawde does **not** fall back to
+`localhost:11434`: an unconfigured or loopback endpoint is treated as
+unavailable, preventing accidental local CPU inference.
 
-**Base URL:** Reads `OLLAMA_HOST` (defaults to `http://localhost:11434`). Clawde appends `/v1` to construct the OpenAI-compatible endpoint.
+**Base URL:** Reads `providers.ollama.api_base`, then `OLLAMA_HOST`, then
+`providers.ollama.options.default_host`. Clawde appends `/v1` to construct the
+OpenAI-compatible endpoint. Use a DNS name or non-loopback IP for the remote
+GPU host.
 
 **Default model:** `llama3.2`
 
@@ -521,47 +557,23 @@ Connects to a locally or remotely running Ollama instance. No API key required.
   "provider": "ollama",
   "providers": {
     "ollama": {
-      "api_base": "http://localhost:11434"
+      "api_base": "http://devbox:11434"
     }
   }
 }
 ```
 
-Run a model locally first with `ollama pull llama3.2`, then:
+Then run the explicitly configured remote model:
 
 ```
 clawde --provider ollama --model llama3.2 "explain this code"
 ```
 
-**Remote GPU (require explicit host):**
+**Remote GPU default:**
 
-When running Ollama on a remote machine with a GPU (e.g. a LAN server),
-set `require_explicit_host` to prevent accidental fallback to a local CPU
-Ollama instance on `localhost:11434`:
-
-```json
-{
-  "provider": "ollama",
-  "providers": {
-    "ollama": {
-      "api_base": "http://devbox:11434",
-      "options": {
-        "require_explicit_host": true
-      }
-    }
-  }
-}
-```
-
-When `require_explicit_host` is `true` and no `api_base` or `OLLAMA_HOST` is
-configured, the Ollama provider becomes unavailable — Clawde will report it as
-unreachable rather than silently connecting to `localhost` and running on CPU.
-
-**Default host (LAN GPU server):**
-
-For a GPU server shared across machines on a LAN, set `default_host` so that
-every Clawde instance targets the same remote Ollama server without needing to
-set `api_base` on each machine:
+For a GPU server shared across machines on a LAN, `api_base` is the clearest
+configuration. A `default_host` option is also supported when you want every
+Clawde instance to target the same remote endpoint:
 
 ```json
 {
@@ -578,12 +590,26 @@ set `api_base` on each machine:
 
 The host resolution order is:
 1. `providers.ollama.api_base` (explicit override)
-2. `OLLAMA_HOST` env var
-3. `providers.ollama.options.default_host` (new default)
-4. `http://localhost:11434` (built-in fallback)
+2. `OLLAMA_HOST`
+3. `providers.ollama.options.default_host`
+4. no endpoint — Ollama is unavailable
 
-Combine with `require_explicit_host: true` to completely disable the localhost
-fallback and ensure Ollama only runs on the remote GPU server.
+Loopback names and addresses such as `localhost`, `127.0.0.1`, and `0.0.0.0`
+are rejected. The old `require_explicit_host` option is retained for settings
+compatibility but is no longer needed: remote-only fail-closed behavior is now
+the default.
+
+**Tools and offline mode:**
+
+Normal Ollama mode (`ollama:auto`) keeps Clawde's tools enabled, including
+`WebSearch` and `WebFetch`. Toggle `/ollama` to `ollama:offline` / isolated mode
+when the model must not use online tools. In isolated mode Clawde removes
+network-capable tools (web search/fetch, remote triggers, MCP tools) and blocks
+them again at dispatch, including with `--dangerously-skip-permissions`.
+Ollama inference itself remains available through the configured remote GPU
+endpoint. Isolated mode also removes shell/interpreter execution, sub-agents,
+LSP/MCP resources, test/lint commands, and configured formatter subprocesses;
+use an OS/container firewall as defense in depth for a strict air gap.
 
 ---
 

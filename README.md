@@ -136,6 +136,9 @@ clawde
 
 # Or run a one-shot headless query
 clawde -p "explain this codebase"
+
+# Validate your key store (exit 0 = OK, 1 = a store failed to load)
+clawde --check-keys
 ```
 
 ## Devcontainer setup

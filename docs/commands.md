@@ -97,6 +97,37 @@ In the TUI these commands open a sortable table. Use arrow keys (or `j`/`k`
 in Vim mode), `r` to refresh telemetry, and `Esc` to close. A new installation
 may show no rows until it has completed a few free-mode requests.
 
+**Exhaustion errors:** when every upstream in the free chain fails (for
+example a rate-limited Groq key with no other configured upstreams), the
+reported error names the **original** failures instead of only the last
+upstream's raw error — e.g. `all free-mode upstreams exhausted: groq: [groq]
+Rate limited, …, ... and 9 more, ollama: [ollama] Model not found: unknown`.
+Consecutive duplicates are collapsed, the list is capped at the first 5 errors
+(`… and N more` counts the omitted middle entries), and the **last** upstream's
+error is always appended since it is usually the most relevant. With 6 or
+fewer failures the full list is shown. This surfaces in interactive mode, on
+`--print` stderr, and in `--output-format json` `error` events.
+
+`/keys health` (and `/compare` in CLI form) shows a **last fail** note per
+upstream in the *Free Upstream Performance* section, so you can see why an
+upstream's success rate is degraded without triggering a failing request.
+
+`/keys doctor` diagnoses the credential store itself: it reports whether
+`auth.json` loaded cleanly, what was recovered (and dropped) when the file was
+partially corrupt, blank or placeholder-looking key slots that resolvers
+filter out, and any `auth.json.corrupt-<timestamp>` / `settings.json.corrupt-<timestamp>`
+backups waiting to be restored.
+
+On startup the TUI shows an **Invalid Auth Store** dialog (once per launch)
+when `auth.json` or `settings.json` failed to load, with the parse error,
+what was recovered, and how to fix it — dismiss with Enter or Escape.
+
+Headless runs (`-p` / `--print`) print the same once-per-run report to
+stderr so the failure is never invisible, and `clawde --check-keys` runs the
+doctor headlessly for CI and shell scripts: it prints the full report and
+exits `0` when both stores loaded cleanly, `1` when either failed to load
+(placeholder-looking key slots are reported but do not fail the check).
+
 ---
 
 ## Session & Navigation
@@ -1175,7 +1206,9 @@ Codex:
 
 ### /switch
 
-Switch the active account for a provider. Anthropic by default; pass `--codex` for Codex. Run `/accounts` first to see available profile ids.
+Switch the active account for a provider. Account switching targets Anthropic unless
+`--codex` is passed; this does not change the chat provider, which defaults to Free
+Mode (`free/auto`). Run `/accounts` first to see available profile ids.
 
 ```
 /switch work                     — set active Anthropic profile to "work"

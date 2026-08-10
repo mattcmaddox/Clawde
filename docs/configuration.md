@@ -70,9 +70,36 @@ The `config` object holds runtime behaviour options.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `api_key` | string \| null | null | Anthropic API key. Overrides `ANTHROPIC_API_KEY` env var. Prefer the env var in shared environments. |
-| `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
+| `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (`free/auto` in Free Mode; e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
-| `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
+| `provider` | string \| null | `"free"` | Active provider (`free` = Free Mode router across your configured free upstreams). See the [Providers](#providers) section. |
+
+### Ollama remote GPU and offline tool mode
+
+Ollama is remote-only by default. Configure `providers.ollama.api_base`,
+`OLLAMA_HOST`, or `providers.ollama.options.default_host` with a non-loopback
+remote endpoint. Clawde fails closed rather than using `http://localhost:11434`,
+so it cannot silently run inference on the local CPU.
+
+Normal `ollama:auto` mode keeps tools and web search available. Isolated
+`ollama:offline` mode removes network-capable tools and rejects them at dispatch,
+even under bypass permissions, while still allowing inference through the
+configured Ollama endpoint. Isolated mode also removes shell, interpreter,
+sub-agent, LSP, MCP-resource, test/lint, formatter, and other indirect process
+capabilities from the active tool set. A separate OS/container firewall is still
+recommended for defense in depth. The mode is process-wide, so do not run
+conflicting isolated and normal sessions in the same process.
+
+```json
+{
+  "provider": "ollama",
+  "providers": {
+    "ollama": {
+      "api_base": "http://gpu-host.example:11434"
+    }
+  }
+}
+```
 
 ### Permission mode
 
@@ -442,7 +469,7 @@ and `api_base` override the corresponding environment variables.
     "enabled": true
   },
   "ollama": {
-    "api_base": "http://localhost:11434",
+    "api_base": "http://gpu-host.example:11434",
     "enabled": true
   }
 }
@@ -703,7 +730,7 @@ matches. They are defined in the `formatter` map:
       "enabled": true
     },
     "ollama": {
-      "api_base": "http://localhost:11434",
+      "api_base": "http://gpu-host.example:11434",
       "enabled": true
     }
   },

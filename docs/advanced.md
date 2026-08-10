@@ -394,6 +394,20 @@ clawde --print --output-format stream-json "..."
 
 `stream-json` is the format used by the Agent SDK transport. It emits every message event as it arrives, making it suitable for real-time processing pipelines.
 
+### --check-keys
+
+```bash
+clawde --check-keys
+```
+
+Runs the credential-store doctor headlessly — the same report as `/keys doctor` in the TUI. Prints the full report and exits `0` when both `auth.json` and `settings.json` loaded cleanly, `1` when either failed to load (placeholder-looking key slots are reported but do not fail the check). Useful for CI and shell scripts:
+
+```bash
+clawde --check-keys || { echo "credential store is broken"; exit 1; }
+```
+
+Every headless run (`-p` / `--print`) also prints this report to **stderr once per run** whenever a store failed to load, so a corrupt `auth.json` is never silently invisible — the stdout stream stays clean for the model output. In the interactive TUI the same condition shows a one-time *Invalid Auth Store* dialog at startup.
+
 ---
 
 ## Budget control
