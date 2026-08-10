@@ -448,14 +448,7 @@ fn effective_effort_for_turn(
 /// Whether a tool name writes files — drives the verify loop's
 /// `skip_when_no_writes` gating (audit spec Phase 1).
 fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name,
-        clawde_core::constants::TOOL_NAME_FILE_EDIT
-            | clawde_core::constants::TOOL_NAME_FILE_WRITE
-            | clawde_core::constants::TOOL_NAME_BATCH_EDIT
-            | clawde_core::constants::TOOL_NAME_NOTEBOOK_EDIT
-            | clawde_core::constants::TOOL_NAME_APPLY_PATCH
-    )
+    clawde_core::constants::is_file_mutator(name)
 }
 
 /// Resolve the effective output-style persona for a turn.

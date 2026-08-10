@@ -1811,6 +1811,79 @@ fn tools_for_agent_mode(
 // Headless mode: read prompt from arg/stdin, run, print response
 // ---------------------------------------------------------------------------
 
+/// Serialize the public stream-json tool-start event.
+///
+/// Keep this protocol surface pure and bounded so it can be tested without a
+/// live provider and so future changes cannot accidentally expose tool input.
+fn stream_tool_start_event(tool_name: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "tool_start", "tool": tool_name })
+}
+
+/// Serialize the public stream-json tool-end event.
+///
+/// Tool results are intentionally omitted: they may contain source code,
+/// credentials, or command output. The model still receives the full result
+/// internally; external consumers receive completion metadata only.
+fn stream_tool_end_event(tool_name: &str, tool_id: &str, is_error: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_end",
+        "tool": tool_name,
+        "id": tool_id,
+        "is_error": is_error,
+    })
+}
+
+/// Serialize provider attribution without exposing credentials or raw output.
+fn stream_provider_attribution_event(
+    provider_id: &str,
+    upstream_id: Option<&str>,
+    model: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "provider_attribution",
+        "provider_id": provider_id,
+        "upstream_id": upstream_id,
+        "model": model,
+    })
+}
+
+#[cfg(test)]
+mod stream_event_tests {
+    use super::{
+        stream_provider_attribution_event, stream_tool_end_event, stream_tool_start_event,
+    };
+
+    #[test]
+    fn tool_end_is_bounded_metadata_only() {
+        let event = stream_tool_end_event("Write", "tool-1", false);
+        assert_eq!(event["type"], "tool_end");
+        assert_eq!(event["tool"], "Write");
+        assert_eq!(event["id"], "tool-1");
+        assert_eq!(event["is_error"], false);
+        assert!(event.get("result").is_none());
+        assert!(event.get("input").is_none());
+    }
+
+    #[test]
+    fn tool_start_contains_only_public_identity() {
+        let event = stream_tool_start_event("Bash");
+        assert_eq!(event["type"], "tool_start");
+        assert_eq!(event["tool"], "Bash");
+        assert_eq!(event.as_object().map(|object| object.len()), Some(2));
+    }
+
+    #[test]
+    fn provider_attribution_is_stable_and_secret_free() {
+        let event = stream_provider_attribution_event("free", Some("groq"), "openai/gpt-oss-120b");
+        assert_eq!(event["type"], "provider_attribution");
+        assert_eq!(event["provider_id"], "free");
+        assert_eq!(event["upstream_id"], "groq");
+        assert_eq!(event["model"], "openai/gpt-oss-120b");
+        assert!(event.get("api_key").is_none());
+        assert!(event.get("result").is_none());
+    }
+}
+
 async fn run_headless(
     cli: &Cli,
     verbose: bool,
@@ -1974,6 +2047,17 @@ async fn run_headless(
                 observability: Some(obs),
                 ..
             } => {
+                if is_stream_json {
+                    // Preserve composite-provider attribution as a first-class
+                    // machine event. This lets external runners prove which
+                    // free upstream served the trial without exposing secrets.
+                    let ev = stream_provider_attribution_event(
+                        &obs.provider_id,
+                        obs.upstream_id.as_deref(),
+                        &obs.model,
+                    );
+                    println!("{}", ev);
+                }
                 turn_observability = Some(obs.clone());
             }
             QueryEvent::TurnComplete { .. } => {}
@@ -1981,8 +2065,30 @@ async fn run_headless(
                 if !is_json_output {
                     eprintln!("\n[{}...]", tool_name);
                 } else {
-                    let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
+                    let ev = stream_tool_start_event(&tool_name);
                     println!("{}", ev);
+                }
+            }
+            QueryEvent::ToolEnd {
+                tool_name,
+                tool_id,
+                result: _,
+                is_error,
+            } => {
+                if is_stream_json {
+                    // Keep the machine-readable headless stream complete. Do
+                    // not copy raw tool output into this protocol by default:
+                    // Read/Bash results may contain source or secret material.
+                    // The model receives the full result internally; external
+                    // runners only need bounded execution metadata.
+                    let ev = stream_tool_end_event(&tool_name, &tool_id, *is_error);
+                    println!("{}", ev);
+                } else if !is_json_output {
+                    if *is_error {
+                        eprintln!("\n[{} failed]", tool_name);
+                    } else {
+                        eprintln!("\n[{} done]", tool_name);
+                    }
                 }
             }
             QueryEvent::SemanticVerify(report) => {

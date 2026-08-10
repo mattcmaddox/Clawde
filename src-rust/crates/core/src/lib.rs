@@ -3449,6 +3449,20 @@ pub mod constants {
     pub const TOOL_NAME_BATCH_EDIT: &str = "BatchEdit";
     pub const TOOL_NAME_APPLY_PATCH: &str = "ApplyPatch";
 
+    /// Whether a tool mutates files without executing arbitrary commands or
+    /// making network requests. Shared by permission policy and write-turn
+    /// classification so these lists cannot drift.
+    pub fn is_file_mutator(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            TOOL_NAME_FILE_EDIT
+                | TOOL_NAME_FILE_WRITE
+                | TOOL_NAME_BATCH_EDIT
+                | TOOL_NAME_APPLY_PATCH
+                | TOOL_NAME_NOTEBOOK_EDIT
+        )
+    }
+
     // Session ID prefixes
     pub const SESSION_ID_PREFIX_BASH: &str = "b";
     pub const SESSION_ID_PREFIX_AGENT: &str = "a";
@@ -3969,8 +3983,13 @@ pub mod permissions {
                 _ => false,
             };
 
-            // Step 4 — AcceptEdits: only auto-allow Edit; everything else keeps normal checks.
-            if self.mode == PermissionMode::AcceptEdits && tool_name == "Edit" {
+            // Step 4 — AcceptEdits: auto-allow built-in file mutators. `Write`
+            // is required for creating new files; the other names are ordinary
+            // file-edit operations. Shell, network, and other execution tools
+            // still go through the normal permission policy.
+            if self.mode == PermissionMode::AcceptEdits
+                && crate::constants::is_file_mutator(tool_name)
+            {
                 return PermissionDecision::Allow;
             }
 
@@ -4173,7 +4192,12 @@ pub mod permissions {
             match self.mode {
                 PermissionMode::BypassPermissions => PermissionDecision::Allow,
                 PermissionMode::AcceptEdits => {
-                    if request.tool_name == "Edit" || request.is_read_only {
+                    // AcceptEdits is the headless write-capable mode: allow all
+                    // built-in file mutators, not only Edit. Write is required
+                    // for creating new files, while BatchEdit/ApplyPatch and
+                    // NotebookEdit are also ordinary edit operations.
+                    if crate::constants::is_file_mutator(&request.tool_name) || request.is_read_only
+                    {
                         PermissionDecision::Allow
                     } else {
                         PermissionDecision::Deny
@@ -4463,18 +4487,21 @@ pub mod permissions {
         }
 
         #[test]
-        fn accept_edits_only_allows_edit() {
+        fn accept_edits_allows_file_mutators_but_not_shell() {
             let m = mgr(PermissionMode::AcceptEdits);
-            assert_eq!(
-                m.evaluate(
-                    "Edit",
-                    "edit file",
-                    Some("/workspace/src/lib.rs"),
-                    None,
-                    &[]
-                ),
-                PermissionDecision::Allow
-            );
+            for tool in ["Edit", "Write", "BatchEdit", "ApplyPatch", "NotebookEdit"] {
+                assert_eq!(
+                    m.evaluate(
+                        tool,
+                        "mutate file",
+                        Some("/workspace/src/lib.rs"),
+                        None,
+                        &[]
+                    ),
+                    PermissionDecision::Allow,
+                    "AcceptEdits should allow file mutator {tool}"
+                );
+            }
             match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
@@ -6335,16 +6362,19 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_handler_accept_edits_only_allows_edit() {
+    fn test_auto_handler_accept_edits_allows_file_mutators_but_not_shell() {
         let handler = crate::permissions::AutoPermissionHandler {
             mode: crate::config::PermissionMode::AcceptEdits,
         };
+        for tool in ["Edit", "Write", "BatchEdit", "ApplyPatch", "NotebookEdit"] {
+            assert_eq!(
+                handler.check_permission(&make_req(tool, false)),
+                crate::permissions::PermissionDecision::Allow,
+                "AcceptEdits should allow file mutator {tool}"
+            );
+        }
         assert_eq!(
-            handler.check_permission(&make_req("Edit", false)),
-            crate::permissions::PermissionDecision::Allow
-        );
-        assert_eq!(
-            handler.check_permission(&make_req("FileWrite", false)),
+            handler.check_permission(&make_req("Bash", false)),
             crate::permissions::PermissionDecision::Deny
         );
     }
