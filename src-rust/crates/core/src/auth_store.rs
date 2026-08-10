@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Monotonic counter for unique tmp filenames. Two saves racing in the same
+/// process must never share a `.auth.json.clawde-tmp-*` path or one rename
+/// would steal the other's file (ENOENT race).
+static AUTH_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A stored credential for a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -27,11 +32,15 @@ pub enum StoredCredential {
 /// (`keys`). The two maps are independent — a provider can have a single
 /// credential *and* multiple keys, or just one or the other.
 ///
-/// Backward-compatible: old `auth.json` files with only `credentials`
-/// deserialize correctly (the `keys` field defaults to empty), and new files
-/// omit the `keys` field entirely when it is empty.
+/// Backward-compatible both ways: old files with only `credentials` load
+/// (`keys` defaults to empty), and keys-only files load too (`credentials`
+/// defaults to empty). New files omit the `keys` field when it is empty.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AuthStore {
+    /// Single-key credentials. `#[serde(default)]` keeps files that only carry
+    /// a `keys` map loadable — a missing `credentials` field must never make
+    /// the whole store look corrupt (that would hide every stored key).
+    #[serde(default)]
     pub credentials: HashMap<String, StoredCredential>,
     /// Multi-key storage: a provider can have multiple API keys. The system
     /// rotates through these automatically when one is exhausted.
@@ -46,6 +55,26 @@ pub struct AuthStore {
     /// fallback state over the real (possibly recoverable) file.
     #[serde(skip)]
     from_fallback: bool,
+    /// Human-readable reason the last [`Self::load`] could not read a valid
+    /// store (unreadable or corrupt file). `None` when the last load was
+    /// clean. Lets callers (no-key hints, `/keys health`) tell the user the
+    /// store itself failed instead of claiming no keys are configured.
+    #[serde(skip)]
+    pub load_error: Option<String>,
+    /// True when the on-disk file failed to parse. [`Self::save`] then backs
+    /// the original up as `auth.json.corrupt-<timestamp>` before the first
+    /// overwrite, so keys still recoverable from the broken file are never
+    /// silently destroyed.
+    #[serde(skip)]
+    file_corrupt: bool,
+}
+
+/// Result of [`AuthStore::salvage_auth_store`]: the recoverable maps plus a
+/// human-readable reason for every dropped entry.
+struct SalvageResult {
+    credentials: HashMap<String, StoredCredential>,
+    keys: HashMap<String, Vec<String>>,
+    dropped: Vec<String>,
 }
 
 impl AuthStore {
@@ -55,38 +84,112 @@ impl AuthStore {
     }
 
     /// Load the store from disk (returns default if missing or invalid).
+    ///
+    /// A partially corrupt file is not all-or-nothing: whichever `credentials`
+    /// and `keys` entries still parse are recovered, the rest are dropped with
+    /// a recorded reason ([`Self::load_error`]), and the store is marked as a
+    /// fallback so [`Self::save`] cannot clobber the original before backing
+    /// it up.
     pub fn load() -> Self {
         let path = Self::path();
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(s) => match serde_json::from_str(&s) {
-                    Ok(store) => store,
-                    Err(e) => {
-                        tracing::warn!(
-                            "auth store at {} is corrupt ({}); starting with an empty store. \
-                             The corrupt file is left in place until the next save.",
-                            path.display(),
-                            e
-                        );
-                        Self::from_fallback()
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("failed to read auth store at {}: {}", path.display(), e);
-                    Self::from_fallback()
-                }
+        if !path.exists() {
+            return Self::default();
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to read auth store at {}: {}", path.display(), e);
+                return Self::from_fallback(format!("failed to read {}: {}", path.display(), e));
             }
-        } else {
-            Self::default()
+        };
+        match serde_json::from_str::<AuthStore>(&raw) {
+            Ok(store) => store,
+            Err(e) => {
+                let salvaged = Self::salvage_auth_store(&raw);
+                let mut store = Self {
+                    from_fallback: true,
+                    file_corrupt: true,
+                    load_error: None,
+                    credentials: salvaged.credentials,
+                    keys: salvaged.keys,
+                };
+                let dropped = salvaged.dropped;
+                let summary = if dropped.is_empty() {
+                    "no entries could be recovered".to_string()
+                } else {
+                    format!(
+                        "recovered {} credential(s) and {} key slot(s); dropped: {}",
+                        store.credentials.len(),
+                        store.keys.len(),
+                        dropped.join("; ")
+                    )
+                };
+                let msg = format!(
+                    "auth store at {} is corrupt ({}); {}. The corrupt file is backed up \
+                     before the next save; fix or remove it to restore the dropped entries.",
+                    path.display(),
+                    e,
+                    summary
+                );
+                tracing::warn!("{msg}");
+                store.load_error = Some(msg);
+                store
+            }
         }
     }
 
     /// An empty store that marks itself as having failed to load from disk,
-    /// so [`Self::save`] will refuse to clobber the real file.
-    fn from_fallback() -> Self {
+    /// so [`Self::save`] will refuse to clobber the real file. Records why the
+    /// load failed for user-facing diagnostics.
+    fn from_fallback(reason: impl Into<String>) -> Self {
         Self {
             from_fallback: true,
+            load_error: Some(reason.into()),
             ..Self::default()
+        }
+    }
+
+    /// Best-effort recovery of a corrupt auth store: parse the `credentials`
+    /// and `keys` maps independently so one malformed entry cannot hide the
+    /// other keys.
+    fn salvage_auth_store(raw: &str) -> SalvageResult {
+        let mut credentials = HashMap::new();
+        let mut keys = HashMap::new();
+        let mut dropped = Vec::new();
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            dropped.push("file is not valid JSON".to_string());
+            return SalvageResult {
+                credentials,
+                keys,
+                dropped,
+            };
+        };
+
+        if let Some(obj) = value.get("credentials").and_then(|v| v.as_object()) {
+            for (provider, entry) in obj {
+                match serde_json::from_value::<StoredCredential>(entry.clone()) {
+                    Ok(cred) => {
+                        credentials.insert(provider.clone(), cred);
+                    }
+                    Err(e) => dropped.push(format!("credentials[{provider}]: {e}")),
+                }
+            }
+        }
+        if let Some(obj) = value.get("keys").and_then(|v| v.as_object()) {
+            for (provider, entries) in obj {
+                match serde_json::from_value::<Vec<String>>(entries.clone()) {
+                    Ok(list) => {
+                        keys.insert(provider.clone(), list);
+                    }
+                    Err(e) => dropped.push(format!("keys[{provider}]: {e}")),
+                }
+            }
+        }
+        SalvageResult {
+            credentials,
+            keys,
+            dropped,
         }
     }
 
@@ -120,6 +223,34 @@ impl AuthStore {
             );
             return;
         }
+        // One-time backup: when the last load found a corrupt file, preserve
+        // the original (possibly recoverable) content before the first
+        // overwrite. If the file has since been repaired on disk, leave it
+        // alone and discard the stale in-memory state instead.
+        if self.file_corrupt && path.exists() {
+            let still_corrupt = std::fs::read_to_string(&path)
+                .map(|s| serde_json::from_str::<AuthStore>(&s).is_err())
+                .unwrap_or(true);
+            if still_corrupt {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_file_name(format!("auth.json.corrupt-{stamp}"));
+                if std::fs::rename(&path, &backup).is_ok() {
+                    tracing::warn!(
+                        "backed up corrupt auth store to {} before overwriting",
+                        backup.display()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "auth store at {} was repaired on disk; discarding stale in-memory state",
+                    path.display()
+                );
+                return;
+            }
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
             crate::accounts::set_user_only_dir_perms(parent);
@@ -128,7 +259,11 @@ impl AuthStore {
             Ok(j) => j,
             Err(_) => return,
         };
-        let tmp = path.with_file_name(format!(".auth.json.clawde-tmp-{}", std::process::id()));
+        let tmp = path.with_file_name(format!(
+            ".auth.json.clawde-tmp-{}-{}",
+            std::process::id(),
+            AUTH_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         if std::fs::write(&tmp, &json).is_ok() {
             // auth.json holds API keys + OAuth tokens. Lock the temp file to
             // 0o600 *before* the rename so the live credential file is never
@@ -255,32 +390,40 @@ impl AuthStore {
     ///   2. `keys[provider_id][0]` — first key from the multi-key store
     ///   3. Environment variable
     pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
-        // Check stored credentials first
+        // Check stored credentials first. Whitespace-only values are treated
+        // as absent so a blank slot never resolves to an apparently
+        // "configured" key that 401s confusingly.
         if let Some(stored) = self.get(provider_id) {
             match stored {
                 StoredCredential::ApiKey { key } => {
+                    let key = key.trim();
                     if !key.is_empty() {
-                        return Some(key.clone());
+                        return Some(key.to_string());
                     }
                 }
                 StoredCredential::OAuthToken {
                     access, refresh, ..
                 } if provider_id == "github-copilot" => {
+                    let refresh = refresh.trim();
                     if !refresh.is_empty() {
-                        return Some(refresh.clone());
+                        return Some(refresh.to_string());
                     }
+                    let access = access.trim();
                     if !access.is_empty() {
-                        return Some(access.clone());
+                        return Some(access.to_string());
                     }
                 }
                 _ => {}
             }
         }
-        // Check the multi-key store (first key).
-        if let Some(first) = self.keys.get(provider_id).and_then(|k| k.first()) {
-            if !first.is_empty() {
-                return Some(first.clone());
-            }
+        // Multi-key store: first non-empty, whitespace-trimmed key (mirrors
+        // the >=8-char placeholder guard the free resolvers apply).
+        if let Some(first) = self
+            .keys
+            .get(provider_id)
+            .and_then(|k| k.iter().map(|s| s.trim()).find(|k| !k.is_empty()))
+        {
+            return Some(first.to_string());
         }
         // Fall back to environment variable.
         //
@@ -703,5 +846,103 @@ mod tests {
         );
         let on_disk = std::fs::read_to_string(AuthStore::path()).unwrap();
         assert!(on_disk.contains("gsk-real"));
+    }
+
+    #[test]
+    fn keys_only_file_loads_cleanly() {
+        let _home = TestHome::new();
+        // A file with only a `keys` map (no `credentials`) must load as a
+        // healthy store — previously the missing `credentials` field made the
+        // whole file look corrupt and hid every stored key.
+        std::fs::write(
+            AuthStore::path(),
+            r#"{"keys":{"groq":["gsk-abc-12345678"]}}"#,
+        )
+        .unwrap();
+        let store = AuthStore::load();
+        assert_eq!(store.keys_for("groq").map(|k| k.len()), Some(1));
+        assert!(store.credentials.is_empty());
+        assert!(
+            store.load_error.is_none(),
+            "keys-only file must not be treated as corrupt"
+        );
+    }
+
+    #[test]
+    fn partially_corrupt_store_salvages_valid_entries() {
+        let _home = TestHome::new();
+        std::fs::write(
+            AuthStore::path(),
+            r#"{"credentials":{"openai":{"type":"api","key":"sk-ok-12345678"},"broken":{"type":"api"}},"keys":{"groq":["gsk-good-12345678"],"bad":"not-a-list"}}"#,
+        )
+        .unwrap();
+        let store = AuthStore::load();
+        // Valid entries survive the salvage...
+        assert!(matches!(
+            store.get("openai"),
+            Some(StoredCredential::ApiKey { key }) if key == "sk-ok-12345678"
+        ));
+        assert_eq!(store.keys_for("groq").map(|k| k.len()), Some(1));
+        // ...the broken ones are dropped with a recorded reason.
+        assert!(store.get("broken").is_none());
+        assert!(store.keys_for("bad").is_none());
+        let err = store.load_error.as_deref().unwrap_or_default();
+        assert!(err.contains("credentials[broken]"), "err: {err}");
+        assert!(err.contains("keys[bad]"), "err: {err}");
+    }
+
+    #[test]
+    fn save_backs_up_corrupt_file_before_overwrite() {
+        let _home = TestHome::new();
+        let corrupt = r#"{"credentials":{"groq":{"type":"api","key":"gsk-still-recoverable"}}"#;
+        std::fs::write(AuthStore::path(), corrupt).unwrap();
+        let mut store = AuthStore::load();
+        assert!(store.load_error.is_some());
+
+        // The user deliberately adds a key — save proceeds, but the original
+        // (possibly recoverable) content is preserved as a backup first.
+        store.set(
+            "openai",
+            StoredCredential::ApiKey {
+                key: "sk-new-12345678".into(),
+            },
+        );
+        let on_disk = std::fs::read_to_string(AuthStore::path()).unwrap();
+        assert!(on_disk.contains("sk-new-12345678"));
+
+        let backups: Vec<_> = std::fs::read_dir(AuthStore::path().parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "expected exactly one corrupt backup");
+        assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn api_key_for_skips_blank_and_whitespace_slots() {
+        let _home = TestHome::new();
+        // Blank credential + blank ring slots resolve to nothing — never a
+        // phantom key. Unknown providers have no env fallback, so this is
+        // env-independent in tests.
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "mystery-a".into(),
+            StoredCredential::ApiKey { key: "   ".into() },
+        );
+        store.set_keys("mystery-a", vec!["".into(), " \t ".into()]);
+        assert_eq!(store.api_key_for("mystery-a"), None);
+
+        // A whitespace-padded real key is trimmed.
+        let mut store2 = AuthStore::default();
+        store2.set_keys("mystery-b", vec!["secret-key-12345678 ".into()]);
+        assert_eq!(
+            store2.api_key_for("mystery-b").as_deref(),
+            Some("secret-key-12345678")
+        );
     }
 }

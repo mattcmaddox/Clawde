@@ -264,6 +264,16 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Last recorded failure reason per upstream `(upstream_id, reason)`, for
+    /// `/keys health`: explains why an upstream's success rate is degraded
+    /// (e.g. `[groq] Rate limited`) without needing a live failing request.
+    /// `None` means no failure recorded (or the last one was cleared by a
+    /// later success). The default returns an empty vector — only composite
+    /// providers that multiplex upstreams override this.
+    fn upstream_last_failures(&self) -> Vec<(String, Option<String>)> {
+        Vec::new()
+    }
+
     /// Inject an external key exhaustion signal into the provider's key ring
     /// (e.g. from the health poller — spec §6.4).  Returns `true` if the
     /// key was marked exhausted; `false` when this provider has no key ring

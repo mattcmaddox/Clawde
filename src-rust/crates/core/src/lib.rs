@@ -788,7 +788,10 @@ pub mod config {
             "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
             "openai" => Some("https://api.openai.com"),
             "minimax" => Some(crate::constants::MINIMAX_ANTHROPIC_API_BASE),
-            "ollama" => Some("http://localhost:11434"),
+            // Ollama is deliberately fail-closed: an implicit localhost URL
+            // can silently run inference on the local CPU. A remote endpoint
+            // must come from api_base, OLLAMA_HOST, or options.default_host.
+            "ollama" => None,
             "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
             "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
             _ => None,
@@ -1003,12 +1006,12 @@ pub mod config {
     /// Priority:
     /// 1. `api_base` (from either settings location, config wins)
     /// 2. `OLLAMA_HOST` env var
-    /// 3. `options.default_host` (replaces `localhost:11434`)
-    /// 4. `http://localhost:11434` (hardcoded fallback)
+    /// 3. `options.default_host` (which must be a remote endpoint)
     ///
-    /// When `options.require_explicit_host` is `true` and no host is found at
-    /// steps 1 or 2, returns `None` — steps 3 and 4 are skipped so the caller
-    /// can treat Ollama as unavailable.
+    /// There is intentionally no localhost fallback. Loopback and unspecified
+    /// addresses are rejected so an unconfigured Ollama provider cannot
+    /// silently run inference on the local CPU. When no valid remote endpoint
+    /// is configured, the provider is treated as unavailable.
     ///
     /// Ollama options are read from **both** storage locations so a value
     /// saved by either path takes effect:
@@ -1026,40 +1029,66 @@ pub mod config {
 
     /// Shared resolution logic (testable with a constructed `Settings`).
     fn resolve_ollama_host_from(settings: &Settings) -> Option<String> {
-        let require_explicit = ollama_option(settings, "require_explicit_host")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         let explicit_host = ollama_api_base(settings)
-            .filter(|base| !base.trim().is_empty())
+            .or_else(|| std::env::var("OLLAMA_HOST").ok())
             .or_else(|| {
-                std::env::var("OLLAMA_HOST")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
+                ollama_option(settings, "default_host")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
             });
 
-        if let Some(host) = explicit_host {
-            return Some(
-                host.trim_end_matches('/')
-                    .trim_end_matches("/v1")
-                    .to_string(),
-            );
-        }
+        let allow_local_host = ollama_local_host_allowed(settings);
+        explicit_host.and_then(|host| normalize_ollama_host_with_local(&host, allow_local_host))
+    }
 
-        if require_explicit {
-            // require_explicit_host: skip default_host and localhost fallbacks.
+    /// Normalize and validate an Ollama endpoint.
+    ///
+    /// Ollama is remote-GPU-only by default. Hostnames are allowed because a
+    /// remote GPU may be addressed through DNS, but loopback and unspecified IP
+    /// addresses are rejected so an unconfigured provider cannot silently run
+    /// inference on the local CPU. The returned URL is the native Ollama root;
+    /// `/v1` is removed because the OpenAI-compatible provider appends it.
+    pub fn normalize_ollama_host(raw: &str) -> Option<String> {
+        normalize_ollama_host_with_local(raw, false)
+    }
+
+    /// Normalize an Ollama endpoint, optionally allowing an explicitly approved
+    /// loopback target for an isolated local profile. The caller must enforce
+    /// the profile-level opt-in; ordinary automatic/remote resolution uses
+    /// [`normalize_ollama_host`] and remains fail-closed.
+    fn normalize_ollama_host_with_local(raw: &str, allow_local: bool) -> Option<String> {
+        let mut host = raw.trim().trim_end_matches('/').to_string();
+        if host.ends_with("/v1") {
+            host.truncate(host.len().saturating_sub(3));
+            host = host.trim_end_matches('/').to_string();
+        }
+        let parsed = url::Url::parse(&host).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
             return None;
         }
+        let hostname = parsed.host_str()?.to_ascii_lowercase();
+        if !allow_local && matches!(hostname.as_str(), "localhost" | "localhost.localdomain") {
+            return None;
+        }
+        if let Ok(address) = hostname.parse::<std::net::IpAddr>() {
+            if address.is_unspecified() || (!allow_local && address.is_loopback()) {
+                return None;
+            }
+        }
+        Some(host)
+    }
 
-        // Default host — user-configurable, e.g. for a LAN GPU server.
-        // Falls back to localhost when not set.
-        let default_host = ollama_option(settings, "default_host")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-
-        Some(default_host)
+    /// Local Ollama is permitted only for an explicitly isolated profile. A
+    /// bare `allow_local_host` flag in the default/automatic mode is ignored so
+    /// automatic free-mode routing can never fall back to local CPU inference.
+    fn ollama_local_host_allowed(settings: &Settings) -> bool {
+        let isolated = ollama_option(settings, "mode")
+            .and_then(|value| serde_json::from_value::<OllamaMode>(value.clone()).ok())
+            == Some(OllamaMode::Isolated);
+        isolated
+            && ollama_option(settings, "allow_local_host")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
     }
 
     /// Look up one Ollama `options` value from either the embedded config's
@@ -1294,7 +1323,10 @@ pub mod config {
         /// Event hooks: map of event → list of hook commands.
         #[serde(default)]
         pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
-        /// Active provider ID (default: "anthropic")
+        /// Active provider ID (default: "free", the automatic free-mode
+        /// composite which routes across configured upstreams; falls back to
+        /// Anthropic at dispatch time when no free keys exist and an
+        /// Anthropic credential is available).
         #[serde(default)]
         pub provider: Option<String>,
         /// Per-provider configurations
@@ -1679,6 +1711,11 @@ pub mod config {
 
     // ---- Settings --------------------------------------------------------
 
+    /// Monotonic counter for unique settings tmp filenames. Two saves racing
+    /// in the same process must never share a `.settings.json.clawde-tmp-*`
+    /// path or one rename would steal the other's file (ENOENT race).
+    static SETTINGS_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Settings {
         #[serde(default)]
@@ -1724,6 +1761,19 @@ pub mod config {
         /// Active provider ID at the settings level (e.g. "anthropic", "openai").
         #[serde(default)]
         pub provider: Option<String>,
+        /// Set when the settings file failed to parse on the last load; the
+        /// message explains what happened and that the original is backed up
+        /// before any overwrite. Mirrors `AuthStore::load_error` so callers
+        /// (the startup dialog, `/keys doctor`) can tell the user the file
+        /// itself is broken instead of silently running with defaults.
+        #[serde(skip)]
+        pub load_error: Option<String>,
+        /// True when the on-disk file failed to parse. [`Self::save`] then
+        /// backs the original up as `settings.json.corrupt-<timestamp>`
+        /// before the first overwrite, so settings still recoverable from the
+        /// broken file are never silently destroyed.
+        #[serde(skip)]
+        file_corrupt: bool,
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
@@ -1972,19 +2022,14 @@ pub mod config {
         /// The default provider is `"free"` (default model `"free/auto"`), so a fresh
         /// config without explicit model/provider settings routes to the free
         /// composite provider.
+        ///
+        /// An explicit model is always authoritative, including bare IDs. This is
+        /// required for OpenAI-compatible self-hosted endpoints such as Ollama,
+        /// where model names commonly contain no `provider/` prefix (for example
+        /// `deepseek-coder:latest`).
         pub fn effective_model(&self) -> &str {
             if let Some(ref m) = self.model {
-                // An unprefixed bare model (e.g. "claude-opus-4-6") only makes
-                // sense when the active provider is explicitly anthropic. For
-                // any other provider (or unset), a bare model name stored in
-                // settings was likely saved from a different session — defer
-                // to the provider's own default instead of routing a stale name
-                // to the wrong provider.
-                let has_prefix = m.contains('/');
-                let provider_is_anthropic = self.provider.as_deref() == Some("anthropic");
-                if has_prefix || provider_is_anthropic {
-                    return m;
-                }
+                return m;
             }
             match self.provider.as_deref() {
                 Some("openai") => "openai/gpt-4o",
@@ -2204,6 +2249,35 @@ pub mod config {
                 return None;
             }
 
+            if provider_id == "ollama" {
+                let candidate = provider_cfg
+                    .and_then(|provider| provider.api_base.clone())
+                    .filter(|base| !base.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("OLLAMA_HOST")
+                            .ok()
+                            .filter(|base| !base.trim().is_empty())
+                    })
+                    .or_else(|| {
+                        provider_cfg
+                            .and_then(|provider| provider.options.get("default_host"))
+                            .and_then(|value| value.as_str())
+                            .filter(|base| !base.trim().is_empty())
+                            .map(str::to_owned)
+                    });
+                let allow_local_host = provider_cfg
+                    .and_then(|provider| provider.options.get("mode"))
+                    .and_then(|value| serde_json::from_value::<OllamaMode>(value.clone()).ok())
+                    == Some(OllamaMode::Isolated)
+                    && provider_cfg
+                        .and_then(|provider| provider.options.get("allow_local_host"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                return candidate.and_then(|base| {
+                    normalize_ollama_host_with_local(&substitute_env_vars(&base), allow_local_host)
+                });
+            }
+
             provider_cfg
                 .and_then(|provider| provider.api_base.clone())
                 .filter(|base| !base.is_empty())
@@ -2321,47 +2395,148 @@ pub mod config {
         }
 
         /// Load settings from disk, returning defaults when the file is missing.
+        ///
+        /// A corrupt file is never silently swallowed: the failure is logged,
+        /// recorded in [`Self::load_error`], and the file flagged for backup
+        /// before the next overwrite (same pattern as `AuthStore::load`).
         pub async fn load() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
-                let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
-            } else {
-                Ok(Self::default())
+            if !path.exists() {
+                return Ok(Self::default());
+            }
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => Ok(Self::from_parsed(&path, &content)),
+                // Unreadable (e.g. permissions) is not silent: same as a parse
+                // failure, record it so the startup dialog / /keys doctor can
+                // explain instead of running with invisible settings.
+                Err(e) => {
+                    tracing::warn!("failed to read settings store at {}: {}", path.display(), e);
+                    Ok(Self {
+                        load_error: Some(format!("failed to read {}: {}", path.display(), e)),
+                        ..Self::default()
+                    })
+                }
             }
         }
 
         /// Persist settings to disk.
+        ///
+        /// Backs up a file that failed to parse on load before the first
+        /// overwrite, and writes atomically (tmp + rename) so a crash mid-
+        /// write can never corrupt settings.json in the first place.
         pub async fn save(&self) -> anyhow::Result<()> {
             let path = Self::global_settings_path();
+            if !Self::backup_corrupt_if_needed(&path, self.file_corrupt) {
+                return Ok(());
+            }
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             let content = serde_json::to_string_pretty(self)?;
-            tokio::fs::write(&path, content).await?;
+            let tmp = path.with_file_name(format!(
+                ".settings.json.clawde-tmp-{}-{}",
+                std::process::id(),
+                SETTINGS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            tokio::fs::write(&tmp, content).await?;
+            tokio::fs::rename(&tmp, &path).await?;
             Ok(())
         }
 
         /// Synchronous variant used by pre-session commands.
         pub fn load_sync() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
-            } else {
-                Ok(Self::default())
+            if !path.exists() {
+                return Ok(Self::default());
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) => Ok(Self::from_parsed(&path, &content)),
+                // Unreadable (e.g. permissions) is not silent — record it so
+                // the startup dialog / /keys doctor can explain it.
+                Err(e) => {
+                    tracing::warn!("failed to read settings store at {}: {}", path.display(), e);
+                    Ok(Self {
+                        load_error: Some(format!("failed to read {}: {}", path.display(), e)),
+                        ..Self::default()
+                    })
+                }
             }
         }
 
         /// Synchronous variant used by pre-session commands.
         pub fn save_sync(&self) -> anyhow::Result<()> {
             let path = Self::global_settings_path();
+            if !Self::backup_corrupt_if_needed(&path, self.file_corrupt) {
+                return Ok(());
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(&path, content)?;
+            let tmp = path.with_file_name(format!(
+                ".settings.json.clawde-tmp-{}-{}",
+                std::process::id(),
+                SETTINGS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&tmp, content)?;
+            std::fs::rename(&tmp, &path)?;
             Ok(())
+        }
+
+        /// Shared parse path for both load variants. On failure the file is
+        /// flagged for backup (see [`Self::backup_corrupt_if_needed`]) and
+        /// defaults are used, with the failure surfaced via [`Self::load_error`].
+        fn from_parsed(path: &std::path::Path, content: &str) -> Self {
+            match serde_json::from_str::<Settings>(content) {
+                Ok(s) => s,
+                Err(e) => {
+                    let mut s = Self::default();
+                    let msg = format!(
+                        "settings store at {} is corrupt ({}); using defaults. The corrupt \
+                         file is backed up before the next save; fix or remove it to restore \
+                         your settings.",
+                        path.display(),
+                        e
+                    );
+                    tracing::warn!("{msg}");
+                    s.load_error = Some(msg);
+                    s.file_corrupt = true;
+                    s
+                }
+            }
+        }
+
+        /// Before overwriting a file that failed to parse on load, preserve
+        /// the original as `settings.json.corrupt-<timestamp>`. Returns
+        /// `false` when the file was repaired on disk since load — the stale
+        /// in-memory state must not clobber the repair.
+        fn backup_corrupt_if_needed(path: &std::path::Path, file_corrupt: bool) -> bool {
+            if !file_corrupt || !path.exists() {
+                return true;
+            }
+            let still_corrupt = std::fs::read_to_string(path)
+                .map(|s| serde_json::from_str::<Settings>(&s).is_err())
+                .unwrap_or(true);
+            if still_corrupt {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_file_name(format!("settings.json.corrupt-{stamp}"));
+                if std::fs::rename(path, &backup).is_ok() {
+                    tracing::warn!(
+                        "backed up corrupt settings store to {} before overwriting",
+                        backup.display()
+                    );
+                }
+                true
+            } else {
+                tracing::warn!(
+                    "settings store at {} was repaired on disk; discarding stale in-memory state",
+                    path.display()
+                );
+                false
+            }
         }
 
         /// Return the effective `Config`, merging top-level provider settings
@@ -2703,6 +2878,10 @@ pub mod config {
             };
             Self {
                 config: merged_config,
+                // Runtime state comes from the base (global) load; a merged
+                // project settings object must not hide a corrupt-store flag.
+                load_error: base.load_error.clone(),
+                file_corrupt: base.file_corrupt,
                 version: over.version.or(base.version),
                 projects: merge_map(base.projects, over.projects),
                 remote_control_at_startup: over.remote_control_at_startup
@@ -3028,16 +3207,82 @@ pub mod config {
                 .or_default()
                 .options
                 .insert("require_explicit_host".to_string(), serde_json::json!(true));
-            // No explicit host + require_explicit_host → treated as unavailable.
+            // No endpoint is configured, so remote-only resolution fails closed.
             assert_eq!(resolve_ollama_host_from(&settings), None);
         }
 
         #[test]
-        fn resolve_ollama_host_defaults_to_localhost() {
+        fn resolve_ollama_host_defaults_to_unavailable_without_remote_endpoint() {
             let settings = Settings::default();
+            assert_eq!(resolve_ollama_host_from(&settings), None);
+        }
+
+        #[test]
+        fn resolve_ollama_host_rejects_loopback_and_accepts_remote_host() {
+            assert_eq!(normalize_ollama_host("http://localhost:11434"), None);
+            assert_eq!(normalize_ollama_host("http://127.0.0.1:11434"), None);
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/v1"),
+                Some("http://gpu.example.test:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_allows_loopback_only_for_isolated_explicit_profile() {
+            let mut settings = Settings::default();
+            let provider = settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+            provider
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+
             assert_eq!(
                 resolve_ollama_host_from(&settings),
-                Some("http://localhost:11434".to_string())
+                Some("http://127.0.0.1:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_ignores_local_opt_in_in_auto_mode() {
+            let mut settings = Settings::default();
+            let provider = settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+
+            assert_eq!(resolve_ollama_host_from(&settings), None);
+        }
+
+        #[test]
+        fn config_provider_base_matches_isolated_local_ollama_profile() {
+            let mut config = Config::default();
+            let provider = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+            provider
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+
+            assert_eq!(
+                config.resolve_provider_api_base("ollama"),
+                Some("http://127.0.0.1:11434".to_string())
             );
         }
 
@@ -3392,7 +3637,7 @@ pub mod permissions {
             match tool_name {
                 "Bash" | "bash" => Self::Execute,
                 "Write" | "Edit" | "NotebookEdit" => Self::Write,
-                "WebFetch" => Self::Network,
+                "WebFetch" | "WebSearch" | "RemoteTrigger" => Self::Network,
                 _ => Self::Read,
             }
         }
@@ -3652,17 +3897,18 @@ pub mod permissions {
         ) -> PermissionDecision {
             use crate::config::PermissionMode;
 
-            // Step 1 — bypass everything
-            if self.mode == PermissionMode::BypassPermissions {
-                return PermissionDecision::Allow;
-            }
-
-            // Step 1b — network-blocked mode (ollama isolated): deny all
-            // Network-level operations regardless of other rules.
+            // Isolated Ollama mode is a hard network-tool boundary. It must
+            // run before bypass and explicit allow rules; otherwise
+            // --dangerously-skip-permissions would defeat offline mode.
             if crate::config::is_ollama_network_blocked()
                 && PermissionLevel::for_tool(tool_name) == PermissionLevel::Network
             {
                 return PermissionDecision::Deny;
+            }
+
+            // Bypass everything except the isolated-mode network boundary.
+            if self.mode == PermissionMode::BypassPermissions {
+                return PermissionDecision::Allow;
             }
 
             // Steps 2–3 — evaluate explicit rules (deny has priority over
@@ -4097,6 +4343,21 @@ pub mod permissions {
                 m.evaluate("Bash", "rm -rf /", None, None, &[]),
                 PermissionDecision::Allow
             );
+        }
+
+        #[test]
+        fn isolated_mode_denies_network_tools_even_with_bypass() {
+            crate::config::set_ollama_network_blocked(true);
+            let m = mgr(PermissionMode::BypassPermissions);
+            assert_eq!(
+                m.evaluate("WebSearch", "search the web", None, None, &[]),
+                PermissionDecision::Deny
+            );
+            assert_eq!(
+                m.evaluate("WebFetch", "fetch a URL", None, None, &[]),
+                PermissionDecision::Deny
+            );
+            crate::config::set_ollama_network_blocked(false);
         }
 
         #[test]
@@ -5704,6 +5965,36 @@ mod tests {
     }
 
     #[test]
+    fn test_config_effective_model_preserves_bare_openai_compatible_id() {
+        let cfg = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some("deepseek-coder:latest".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "deepseek-coder:latest");
+    }
+
+    #[test]
+    fn test_config_effective_model_preserves_bare_ollama_id() {
+        let cfg = crate::config::Config {
+            provider: Some("ollama".to_string()),
+            model: Some("qwen2.5-coder:14b".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "qwen2.5-coder:14b");
+    }
+
+    #[test]
+    fn test_config_effective_model_preserves_explicit_free_auto() {
+        let cfg = crate::config::Config {
+            provider: Some("free".to_string()),
+            model: Some("free/auto".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "free/auto");
+    }
+
+    #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
         assert_eq!(
@@ -6410,5 +6701,93 @@ mod tests {
 
         // Legacy dir is now renamed to .clawde by auto-migration.
         assert!(!legacy.exists(), ".claurst must not exist after migration");
+    }
+
+    // ---- Settings store robustness (settings.json corrupt handling) ---------
+
+    /// Run a settings-store test with `CLAWDE_HOME` redirected to a temp dir,
+    /// restoring the previous value afterwards — even during unwinding from a
+    /// panic. Serialized via `crate::paths::ENV_LOCK`.
+    fn with_settings_home<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAWDE_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        match result {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[test]
+    fn settings_clean_file_loads_without_error() {
+        with_settings_home(|| {
+            let path = crate::config::Settings::global_settings_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, r#"{"autoCompact": true}"#).unwrap();
+
+            let settings = crate::config::Settings::load_sync().unwrap();
+            assert!(settings.load_error.is_none());
+            assert!(settings.auto_compact);
+        });
+    }
+
+    #[test]
+    fn settings_corrupt_file_records_load_error_and_backs_up() {
+        with_settings_home(|| {
+            let path = crate::config::Settings::global_settings_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{ not valid json ").unwrap();
+
+            let settings = crate::config::Settings::load_sync().unwrap();
+            assert!(
+                settings.load_error.is_some(),
+                "corrupt file must record a load error, not silently default"
+            );
+            // Defaults are used.
+            assert!(settings.providers.is_empty());
+
+            // Saving backs the corrupt file up first and writes valid JSON.
+            settings.save_sync().unwrap();
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert!(on_disk.contains('{'));
+            let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("settings.json.corrupt-")
+                })
+                .collect();
+            assert_eq!(backups.len(), 1, "expected one corrupt backup");
+            assert_eq!(
+                std::fs::read_to_string(backups[0].path()).unwrap(),
+                "{ not valid json "
+            );
+        });
+    }
+
+    #[test]
+    fn settings_partial_file_loads_with_defaults_and_error() {
+        with_settings_home(|| {
+            let path = crate::config::Settings::global_settings_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Valid JSON, but a field with the wrong type (config as a number).
+            std::fs::write(&path, r#"{"config": 42}"#).unwrap();
+
+            let settings = crate::config::Settings::load_sync().unwrap();
+            assert!(
+                settings.load_error.is_some(),
+                "type-mismatched fields must be reported, not silently dropped"
+            );
+        });
     }
 }

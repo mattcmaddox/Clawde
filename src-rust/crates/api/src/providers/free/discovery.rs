@@ -106,7 +106,18 @@ pub fn run_live_discovery(
     {
         return cached;
     }
+    // F2 (audit fix): disk cache — a fresh CLI process should not re-probe
+    // every configured upstream at startup. Successful discoveries persist for
+    // DISCOVERY_CACHE_TTL_SECS; failures are left uncached so a recovering
+    // upstream is re-probed promptly on the next process.
+    if let Some(cached) = super::load_live_discovery_cache(upstream_id) {
+        if let Ok(mut guard) = live_discovery_cache().lock() {
+            guard.insert(upstream_id.to_string(), Some(cached.clone()));
+        }
+        return Some(cached);
+    }
     let result = run_live_discovery_uncached(upstream_id, auth_store);
+    super::save_live_discovery_cache(upstream_id, result.clone());
     if let Ok(mut guard) = live_discovery_cache().lock() {
         guard.insert(upstream_id.to_string(), result.clone());
     }

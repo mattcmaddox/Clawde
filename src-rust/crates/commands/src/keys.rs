@@ -108,6 +108,7 @@ impl SlashCommand for KeysCommand {
            /keys add <p> <key>          — append a key to a provider\n\
            /keys remove <p> <index>     — remove key at 1-based index (see /keys list)\n\
            /keys health [<provider>]    — show runtime key status + cooldowns\n\
+           /keys doctor                 — diagnose the auth store itself\n\
          \n\
          Cloudflare keys are composite ACCOUNT_ID:API_TOKEN credentials (both\n\
          halves joined by a colon) and are shape-validated before saving.\n\
@@ -117,7 +118,8 @@ impl SlashCommand for KeysCommand {
            /keys add groq gsk_key4\n\
            /keys remove groq 1\n\
            /keys list groq\n\
-           /keys health"
+           /keys health\n\
+           /keys doctor"
     }
 
     fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
@@ -145,6 +147,11 @@ impl SlashCommand for KeysCommand {
             ArgCompletion {
                 value: "health".into(),
                 description: "Show runtime key status and cooldown timers".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "doctor".into(),
+                description: "Diagnose the auth store (load errors, salvaged keys, backups)".into(),
                 available: true,
             },
         ];
@@ -188,6 +195,7 @@ impl SlashCommand for KeysCommand {
 
         match subcommand {
             "" => cmd_list(None),
+            "doctor" => cmd_doctor(),
             "health" => {
                 let rest = parts.next().unwrap_or_default().trim();
                 cmd_health(
@@ -414,10 +422,11 @@ fn render_free_upstream_performance(
 ) {
     let success = reg.upstream_success_rate_summaries();
     let latencies = reg.upstream_latency_summaries();
-    let task_rates = reg.upstream_task_success_rate_summaries(); // Join the three snapshots on (provider, upstream) label. A provider is
-                                                                 // included when ANY of the three has an entry for it; rows are built from
-                                                                 // the union of upstream ids seen. The three sources have different inner
-                                                                 // types, so each is collected separately.
+    let task_rates = reg.upstream_task_success_rate_summaries();
+    let failures = reg.upstream_last_failure_summaries(); // Join the snapshots on (provider, upstream) label. A provider is
+                                                          // included when ANY of the sources has an entry for it; rows are built
+                                                          // from the union of upstream ids seen. The sources have different inner
+                                                          // types, so each is collected separately.
     let mut upstreams: Vec<(String, String)> = Vec::new();
     for (provider, entries) in &success {
         for (upstream, _) in entries {
@@ -436,6 +445,14 @@ fn render_free_upstream_performance(
         }
     }
     for (provider, entries) in &task_rates {
+        for (upstream, _) in entries {
+            let label = (provider.clone(), upstream.clone());
+            if !upstreams.contains(&label) {
+                upstreams.push(label);
+            }
+        }
+    }
+    for (provider, entries) in &failures {
         for (upstream, _) in entries {
             let label = (provider.clone(), upstream.clone());
             if !upstreams.contains(&label) {
@@ -483,6 +500,13 @@ fn render_free_upstream_performance(
             })
             .unwrap_or_default()
     };
+    let failure_for = |provider: &str, upstream: &str| -> Option<String> {
+        failures
+            .iter()
+            .find(|(p, _)| p == provider)
+            .and_then(|(_, e)| e.iter().find(|(u, _)| u == upstream))
+            .map(|(_, reason)| reason.clone())
+    };
 
     lines.push("\nFree Upstream Performance".to_string());
     lines.push("━━━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
@@ -494,7 +518,8 @@ fn render_free_upstream_performance(
         let rate = rate_for(provider, upstream);
         let latency = latency_for(provider, upstream);
         let tasks = tasks_for(provider, upstream);
-        if rate.is_none() && latency.is_none() && tasks.is_empty() {
+        let failure = failure_for(provider, upstream);
+        if rate.is_none() && latency.is_none() && tasks.is_empty() && failure.is_none() {
             continue;
         }
         let rate_str = rate
@@ -507,6 +532,9 @@ fn render_free_upstream_performance(
             "  {} · {}  {} success · {} avg",
             provider, upstream, rate_str, latency_str
         );
+        if let Some(reason) = &failure {
+            line.push_str(&format!("   last fail: {}", reason));
+        }
         if !tasks.is_empty() {
             let tasks_str: Vec<String> = tasks
                 .iter()
@@ -537,6 +565,15 @@ fn cmd_health(
     registry: Option<&clawde_api::ProviderRegistry>,
 ) -> CommandResult {
     let store = AuthStore::load();
+    // A corrupt/unreadable store means the user's keys may still be on disk
+    // but invisible — surface that instead of a misleading "no keys".
+    let load_warning = store.load_error.as_ref().map(|err| {
+        format!(
+            "Warning: your auth store at {} failed to load — no keys could be read from it. \
+             Fix or remove the file and retry; the original is backed up before any overwrite.\n{err}",
+            AuthStore::path().display()
+        )
+    });
 
     let mut provider_ids: Vec<String> = store.keys.keys().cloned().collect();
     provider_ids.sort();
@@ -559,25 +596,30 @@ fn cmd_health(
     }
 
     if provider_ids.is_empty() {
-        return if provider_filter.is_some() {
-            CommandResult::Message(format!(
+        let msg = if provider_filter.is_some() {
+            format!(
                 "No keys found for '{}'.\n\
                  Use /keys set {} <key> to configure.",
                 provider_filter.unwrap(),
                 provider_filter.unwrap(),
-            ))
-        } else {
-            CommandResult::Message(
-                "No API keys configured yet.\n\
-                 Use /connect to set up a provider, or /keys set <provider> <key>."
-                    .to_string(),
             )
+        } else {
+            "No API keys configured yet.\n\
+             Use /connect to set up a provider, or /keys set <provider> <key>."
+                .to_string()
         };
+        return CommandResult::Message(match load_warning {
+            Some(w) => format!("{w}\n\n{msg}"),
+            None => msg,
+        });
     }
 
     let mut lines = Vec::new();
     lines.push("Multi-Key Health".to_string());
     lines.push("━━━━━━━━━━━━━━━━━".to_string());
+    if let Some(ref w) = load_warning {
+        lines.push(format!("\n{w}"));
+    }
 
     for pid in &provider_ids {
         let keys = store.keys_for(pid);
@@ -765,6 +807,149 @@ fn cmd_health(
     }
 
     CommandResult::Message(lines.join("\n"))
+}
+
+/// Validate the auth store end-to-end: load status, salvaged/recovered state,
+/// placeholder slots that resolvers would filter, and corrupt-file backups
+/// waiting to be recovered. Complements `/keys health` (which shows per-key
+/// rotation status) by diagnosing the store itself.
+fn cmd_doctor() -> CommandResult {
+    let (report, _) = auth_store_doctor_report();
+    CommandResult::Message(format!(
+        "{report}\n\nTip: /keys health shows per-key rotation status; /keys set <provider> <key> adds keys."
+    ))
+}
+
+/// Headless-friendly doctor report, shared by `/keys doctor`, the
+/// `--check-keys` CLI flag, and the once-per-run headless banner.
+///
+/// Returns the multi-line report plus whether the auth or settings store
+/// failed to load — the exit-code signal for `--check-keys` (placeholder
+/// slots are reported but do not fail the check, since they never resolve).
+pub fn auth_store_doctor_report() -> (String, bool) {
+    let store = AuthStore::load();
+    let path = AuthStore::path();
+    let mut lines = Vec::new();
+    let mut has_problems = false;
+    lines.push("Auth Store Doctor".to_string());
+    lines.push("━━━━━━━━━━━━━━━━━".to_string());
+
+    lines.push(format!("\nStore file: {}", path.display()));
+    if !path.exists() {
+        lines.push("  Not present — keys resolve from environment variables only.".to_string());
+    } else if let Some(ref err) = store.load_error {
+        has_problems = true;
+        lines.push(format!("  LOAD FAILED:\n{err}"));
+        lines.push(
+            "  Recovered entries are already in use. The original file is backed up as\n  \
+             auth.json.corrupt-<timestamp> before any overwrite; fix or remove the file to\n  \
+             restore the dropped entries."
+                .to_string(),
+        );
+    } else {
+        lines.push("  Loaded OK.".to_string());
+    }
+
+    // Credentials + rotation key slots.
+    let mut providers: Vec<&String> = store.credentials.keys().chain(store.keys.keys()).collect();
+    providers.sort();
+    providers.dedup();
+    if providers.is_empty() {
+        lines.push("\nNo stored credentials or rotation keys.".to_string());
+    } else {
+        lines.push(format!("\nStored providers ({}):", providers.len()));
+        for pid in providers {
+            let key_count = store.keys_for(pid).map(|k| k.len()).unwrap_or(0);
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(cred) = store.get(pid) {
+                match cred {
+                    clawde_core::auth_store::StoredCredential::ApiKey { key } => {
+                        if key.trim().is_empty() || key.trim().len() < 8 {
+                            parts.push(
+                                "credential (api) — BLANK/short, treated as absent".to_string(),
+                            );
+                        } else {
+                            parts.push("credential (api)".to_string());
+                        }
+                    }
+                    clawde_core::auth_store::StoredCredential::OAuthToken { .. } => {
+                        parts.push("credential (oauth)".to_string());
+                    }
+                }
+            }
+            if key_count > 0 {
+                parts.push(format!(
+                    "{} rotation key{}",
+                    key_count,
+                    if key_count == 1 { "" } else { "s" }
+                ));
+            }
+            // Slots that resolvers will filter out (whitespace, <8 chars).
+            let (_valid, bad) = partition_placeholder_keys(
+                store.keys_for(pid).map(|k| k.to_vec()).unwrap_or_default(),
+            );
+            if !bad.is_empty() {
+                parts.push(format!(
+                    "{} placeholder/blank slot{} (filtered at use): {}",
+                    bad.len(),
+                    if bad.len() == 1 { "" } else { "s" },
+                    bad.join(", ")
+                ));
+            }
+            lines.push(format!("  {pid} — {}", parts.join(", ")));
+        }
+    }
+
+    // Corrupt-file backups (auth + settings) waiting to be recovered.
+    let backups = find_corrupt_backups("auth.json.corrupt-");
+    let settings_backups = find_corrupt_backups("settings.json.corrupt-");
+    let total = backups.len() + settings_backups.len();
+    if total == 0 {
+        lines.push("\nNo corrupt-file backups.".to_string());
+    } else {
+        lines.push(format!("\nCorrupt-file backups ({}):", total));
+        for b in backups.into_iter().chain(settings_backups) {
+            let meta = std::fs::metadata(&b).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            lines.push(format!("  {} ({} bytes)", b.display(), size));
+        }
+        lines.push(
+            "  Restore a backup by fixing its JSON by hand and moving it back over the\n  \
+             live file."
+                .to_string(),
+        );
+    }
+
+    // Settings store status — a corrupt settings.json is the same class of
+    // trapdoor (settings silently defaulted), so `--check-keys` must flag it.
+    let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();
+    if let Some(ref err) = settings.load_error {
+        has_problems = true;
+        lines.push(format!("\nSettings store (settings.json) FAILED:\n{err}"));
+    } else {
+        lines.push("\nSettings store (settings.json): OK".to_string());
+    }
+
+    (lines.join("\n"), has_problems)
+}
+
+/// List backup files in the auth-store directory matching a prefix (e.g.
+/// `auth.json.corrupt-`), sorted by name (timestamp-suffixed).
+fn find_corrupt_backups(prefix: &str) -> Vec<std::path::PathBuf> {
+    let dir = AuthStore::path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Show key store status.
@@ -1060,6 +1245,7 @@ pub(crate) mod tests {
         success_rates: Vec<(String, Option<f64>)>,
         latencies: Vec<(String, Option<f64>)>,
         task_rates: clawde_api::provider::UpstreamTaskSuccessRates,
+        last_failures: Vec<(String, Option<String>)>,
     }
 
     #[async_trait]
@@ -1133,6 +1319,10 @@ pub(crate) mod tests {
         fn upstream_task_success_rates(&self) -> clawde_api::provider::UpstreamTaskSuccessRates {
             self.task_rates.clone()
         }
+
+        fn upstream_last_failures(&self) -> Vec<(String, Option<String>)> {
+            self.last_failures.clone()
+        }
     }
 
     /// Seed the auth store (inside the `CLAWDE_HOME` temp dir) with keys so
@@ -1175,6 +1365,13 @@ pub(crate) mod tests {
                     ("reasoning".to_string(), Some(0.0)),
                 ],
             )],
+            last_failures: vec![
+                ("groq".to_string(), None),
+                (
+                    "cerebras".to_string(),
+                    Some("cerebras: [cerebras] Server error 500".into()),
+                ),
+            ],
         };
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(stub));
@@ -1300,6 +1497,33 @@ pub(crate) mod tests {
             out.contains("  free · cerebras  50% success · 9.4s avg"),
             "got: {}",
             out
+        );
+    }
+
+    #[test]
+    fn health_performance_section_shows_last_failure_reason() {
+        let (registry, _home) = test_registry();
+        let out = message_text(cmd_health(None, Some(&registry)));
+
+        assert!(
+            out.contains("Free Upstream Performance"),
+            "unfiltered health must show the performance section: {}",
+            out
+        );
+        assert!(
+            out.contains("  free · cerebras  50% success · 9.4s avg   last fail: cerebras: [cerebras] Server error 500"),
+            "last failure reason must be rendered for a degraded upstream: {}",
+            out
+        );
+        // groq has no recorded failure — its row carries no stale reason.
+        let groq_line = out
+            .lines()
+            .find(|l| l.contains("free · groq"))
+            .unwrap_or("");
+        assert!(
+            !groq_line.contains("last fail"),
+            "no stale failure reason for groq: {}",
+            groq_line
         );
     }
 
@@ -1555,5 +1779,126 @@ pub(crate) mod tests {
         assert!(validate_cloudflare_key("tok_12345678").is_err());
         // A short non-hex "account" half must not trip the swap detector.
         assert!(validate_cloudflare_key("abc123def456:tok_12345678").is_ok());
+    }
+
+    #[test]
+    fn doctor_reports_corrupt_store_and_backups() {
+        let _home = TestHome::new();
+        // Partially corrupt store: valid groq credential + broken openai entry.
+        std::fs::write(
+            AuthStore::path(),
+            r#"{"credentials":{"openai":{"type":"api"},"groq":{"type":"api","key":"gsk-still-recoverable"}}}"#,
+        )
+        .unwrap();
+
+        let result = cmd_doctor();
+        let CommandResult::Message(msg) = result else {
+            panic!("expected Message, got: {result:?}")
+        };
+        assert!(msg.contains("Auth Store Doctor"), "msg: {msg}");
+        assert!(msg.contains("LOAD FAILED"), "msg: {msg}");
+        assert!(msg.contains("credentials[openai]"), "msg: {msg}");
+        assert!(msg.contains("groq"), "msg: {msg}");
+
+        // A deliberate save backs the corrupt file up; doctor then lists it.
+        let mut store = AuthStore::load();
+        store.set(
+            "openai",
+            clawde_core::auth_store::StoredCredential::ApiKey {
+                key: "sk-new-12345678".into(),
+            },
+        );
+        let result = cmd_doctor();
+        let CommandResult::Message(msg) = result else {
+            panic!("expected Message, got: {result:?}")
+        };
+        assert!(
+            msg.contains("Corrupt-file backups (1)"),
+            "doctor must list the backup, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn doctor_report_flags_problems_for_corrupt_store() {
+        let _home = TestHome::new();
+        std::fs::write(AuthStore::path(), "{ not valid json ").unwrap();
+        let (report, problems) = auth_store_doctor_report();
+        assert!(problems, "corrupt store must flag problems");
+        assert!(report.contains("LOAD FAILED"), "report: {report}");
+        assert!(report.contains("Settings store"), "report: {report}");
+    }
+
+    #[test]
+    fn doctor_report_clean_store_no_problems() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["gsk-real-key-12345678".into()]);
+        let (report, problems) = auth_store_doctor_report();
+        assert!(
+            !problems,
+            "clean store must not flag problems, got: {report}"
+        );
+        assert!(report.contains("Loaded OK"), "report: {report}");
+        assert!(
+            report.contains("Settings store (settings.json): OK"),
+            "report: {report}"
+        );
+    }
+
+    #[test]
+    fn doctor_report_flags_problems_for_corrupt_settings_store() {
+        let _home = TestHome::new();
+        // Clean auth store + corrupt settings file: the settings branch of
+        // the problems flag must fire.
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["gsk-real-key-12345678".into()]);
+        let settings_path = clawde_core::config::Settings::global_settings_path();
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, "{ not valid json ").unwrap();
+
+        let (report, problems) = auth_store_doctor_report();
+        assert!(problems, "corrupt settings store must flag problems");
+        assert!(
+            report.contains("Settings store (settings.json) FAILED"),
+            "report: {report}"
+        );
+    }
+
+    #[test]
+    fn doctor_report_placeholders_do_not_fail_check() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["k1".into()]);
+        let (report, problems) = auth_store_doctor_report();
+        assert!(!problems, "placeholder slots must not fail the check");
+        assert!(
+            report.contains("placeholder/blank slot"),
+            "report: {report}"
+        );
+    }
+
+    #[test]
+    fn keys_arg_completions_include_doctor() {
+        let completions = crate::get_arg_completions("keys", "d");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["doctor"], "completions: {values:?}");
+    }
+
+    #[test]
+    fn doctor_flags_placeholder_slots() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["gsk-real-key-12345678".into(), "k1".into()]);
+
+        let result = cmd_doctor();
+        let CommandResult::Message(msg) = result else {
+            panic!("expected Message, got: {result:?}")
+        };
+        assert!(msg.contains("placeholder/blank slot"), "msg: {msg}");
+        assert!(msg.contains("k1"), "msg: {msg}");
+        assert!(
+            msg.contains("gsk-real-key-12345678") || msg.contains("rotation key"),
+            "msg: {msg}"
+        );
     }
 }

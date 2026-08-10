@@ -262,8 +262,14 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
     // errors `Model not found` on every turn instead of the clearer
     // "no free upstreams configured" (build_free_provider returns None and
     // the caller surfaces the no-key message).
-    if !chain.is_empty() && config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto {
-        let ollama_provider = crate::providers::ollama();
+    if !chain.is_empty()
+        && config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto
+        && resolve_provider_api_base(config, "ollama").is_some()
+    {
+        let mut ollama_provider = crate::providers::ollama();
+        if let Some(base) = resolve_provider_api_base(config, "ollama") {
+            ollama_provider = ollama_provider.with_base_url(base);
+        }
         chain.push(FreeEntry {
             upstream: crate::providers::FreeUpstream {
                 id: "ollama",
@@ -360,9 +366,8 @@ pub fn provider_from_config(
         }
         "ollama" => {
             let mut provider = providers::ollama();
-            if let Some(base) = api_base {
-                provider = provider.with_base_url(base);
-            }
+            let base = api_base?;
+            provider = provider.with_base_url(base);
             Some(Arc::new(provider))
         }
         "lmstudio" | "lm-studio" => {
@@ -444,7 +449,12 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     // the non-hyphenated aliases ("llamacpp", "lmstudio") used throughout the
     // TUI / connect dialog.
     match provider_id {
-        "ollama" => return Some(Arc::new(p::ollama())),
+        "ollama" => {
+            let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();
+            let config = settings.effective_config();
+            let base = resolve_provider_api_base(&config, "ollama")?;
+            return Some(Arc::new(p::ollama().with_base_url(base)));
+        }
         "lmstudio" | "lm-studio" => return Some(Arc::new(p::lm_studio())),
         // "llama-server" is the binary name for the modern llama.cpp server.
         "llamacpp" | "llama-cpp" | "llama-server" => return Some(Arc::new(p::llama_cpp())),
@@ -534,12 +544,20 @@ pub type UpstreamTaskSuccessRateSummaries =
 /// [`ProviderRegistry::upstream_dispatch_count_summaries`].
 pub type UpstreamDispatchCountSummaries = Vec<(String, Vec<(String, u32)>)>;
 
+/// Type alias for per-upstream last-failure summaries returned by
+/// [`ProviderRegistry::upstream_last_failure_summaries`].
+pub type UpstreamLastFailureSummaries = Vec<(String, Vec<(String, String)>)>;
+
 impl ProviderRegistry {
-    /// Create an empty registry with Anthropic as the default provider ID.
+    /// Create an empty registry whose default provider ID is free mode — the
+    /// product default. Anthropic is paid-only and must be selected explicitly
+    /// (`--provider anthropic`, `provider: "anthropic"`); it is never the
+    /// fallback default. `from_config` re-points the default at the active
+    /// provider when it is registered.
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            default_provider_id: ProviderId::new(ProviderId::ANTHROPIC),
+            default_provider_id: ProviderId::new(ProviderId::FREE),
         }
     }
 
@@ -696,6 +714,25 @@ impl ProviderRegistry {
         summaries
     }
 
+    /// Collect per-upstream last recorded failure reasons from all
+    /// registered providers that report them (the free provider's
+    /// `/keys health` view). Entries with no failure are omitted.
+    pub fn upstream_last_failure_summaries(&self) -> UpstreamLastFailureSummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries: Vec<(String, String)> = provider
+                .upstream_last_failures()
+                .into_iter()
+                .filter_map(|(u, reason)| reason.map(|r| (u, r)))
+                .collect();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
     /// Collect per-upstream per-task dispatch success rates from all
     /// registered composite providers. Each entry is `(provider_name,
     /// Vec<(upstream_id, [(task_key, success_rate)])>)` — only tasks with at
@@ -747,9 +784,10 @@ impl ProviderRegistry {
         results
     }
 
-    /// Convenience: build a registry with just Anthropic registered as the
-    /// default provider.  Takes the same [`ClientConfig`] that
-    /// [`AnthropicClient`] takes.
+    /// Convenience: build a registry with just Anthropic registered.
+    /// The registry's product default remains Free Mode; this helper is for
+    /// callers that explicitly need an Anthropic-only registry. Takes the same
+    /// [`ClientConfig`] that [`AnthropicClient`] takes.
     ///
     /// [`AnthropicClient`]: crate::client::AnthropicClient
     pub fn with_anthropic(config: ClientConfig) -> Self {
@@ -903,7 +941,8 @@ impl ProviderRegistry {
     }
 
     /// Build a registry with **all** providers that have credentials configured
-    /// in the environment.  Anthropic is always the default provider.
+    /// in the environment. The active provider is selected later by
+    /// `from_config`; a fresh config uses Free Mode (`free/auto`).
     ///
     /// This is the recommended constructor for production use.
     pub fn from_environment(anthropic_config: ClientConfig) -> Self {
@@ -974,8 +1013,15 @@ impl ProviderRegistry {
     pub fn with_available_providers(&mut self) -> &mut Self {
         use crate::providers::openai_compat_providers as p;
 
-        // Local providers — always try to register.
-        self.register(Arc::new(p::ollama()));
+        // Ollama is remote-only and fail-closed. Do not register a dummy
+        // localhost provider when no valid remote endpoint is configured.
+        if let Some(base) = clawde_core::config::Settings::load_sync()
+            .ok()
+            .map(|settings| settings.effective_config())
+            .and_then(|config| resolve_provider_api_base(&config, "ollama"))
+        {
+            self.register(Arc::new(p::ollama().with_base_url(base)));
+        }
         self.register(Arc::new(p::lm_studio()));
         self.register(Arc::new(p::llama_cpp()));
 

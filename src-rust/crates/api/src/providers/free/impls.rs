@@ -718,6 +718,7 @@ impl FreeProvider {
         let snapshot = {
             let mut lat = self.latencies.lock().unwrap();
             lat.record_success(idx);
+            lat.clear_failure_reason(idx);
             lat.record_task_success(idx, task);
             if max_samples > 0 {
                 lat.record(idx, elapsed.as_secs_f64(), max_samples);
@@ -725,6 +726,14 @@ impl FreeProvider {
             lat.snapshot()
         };
         LatencyState::persist_snapshot(snapshot);
+    }
+
+    /// Record the reason for a failed dispatch at `idx` so `/keys health` can
+    /// explain a degraded success rate. Called at every failure site with the
+    /// upstream-prefixed reason (e.g. `groq: [groq] Rate limited`).
+    fn record_failure_reason(&self, idx: usize, reason: String) {
+        let mut lat = self.latencies.lock().unwrap();
+        lat.record_failure_reason(idx, reason);
     }
 
     /// Record a failed request at `idx`. `task` is the request's classified
@@ -809,6 +818,33 @@ impl FreeProvider {
 // ---------------------------------------------------------------------------
 
 type BoxedProviderStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
+/// Join per-upstream failure strings into the exhaustion-error message,
+/// capped so a 13-upstream chain cannot produce a wall of text.
+///
+/// Consecutive duplicates are collapsed first (a pinned upstream retrying
+/// its fallback models against the same provider produces the same
+/// `upstream: error` string several times in a row — one mention is
+/// enough). The first occurrence of each run is kept so order is preserved.
+///
+/// With at most [`MAX_LISTED`] entries the full list is shown; beyond that
+/// the first [`MAX_LISTED`] are listed, the count of omitted entries is
+/// noted, and the LAST error is always appended — the final fallback's
+/// failure is usually the most relevant to the user.
+fn join_capped_upstream_errors(errors: &[String]) -> String {
+    const MAX_LISTED: usize = 5;
+    let mut deduped: Vec<&str> = errors.iter().map(String::as_str).collect();
+    deduped.dedup();
+    if deduped.len() <= MAX_LISTED + 1 {
+        return deduped.join(", ");
+    }
+    let omitted = deduped.len() - MAX_LISTED - 1;
+    format!(
+        "{}, ... and {} more, {}",
+        deduped[..MAX_LISTED].join(", "),
+        omitted,
+        deduped[deduped.len() - 1]
+    )
+}
 
 /// Wraps an upstream stream and automatically re-dispatches to the next
 /// plan entry when the current stream produces a completely empty
@@ -861,6 +897,7 @@ impl RetryingFreeStream {
         upstream_model: String,
         remaining_plan: VecDeque<(usize, String)>,
         is_auto_route: bool,
+        upstream_errors: Vec<String>,
     ) -> Self {
         let task = classify_request(&request);
         Self {
@@ -887,7 +924,10 @@ impl RetryingFreeStream {
             attempt_stop_reason: None,
             attempt_start: Some(Instant::now()),
             first_byte_received: false,
-            upstream_errors: Vec::new(),
+            // Seed with failures from the pre-stream dispatch loop so the
+            // exhaustion message reports the WHOLE chain's errors, not just
+            // the ones observed after the first stream started.
+            upstream_errors,
         }
     }
 
@@ -899,6 +939,7 @@ impl RetryingFreeStream {
         let snapshot = {
             let mut lat = self.latencies.lock().unwrap();
             lat.record_success(idx);
+            lat.clear_failure_reason(idx);
             lat.record_task_success(idx, self.task);
             if max_samples > 0 {
                 lat.record(idx, elapsed.as_secs_f64(), max_samples);
@@ -997,8 +1038,12 @@ impl RetryingFreeStream {
             let in_cooldown = cd.is_in_cooldown(idx) || cd.is_in_empty_cooldown(idx);
             if in_cooldown {
                 let uid = self.chain[idx].upstream.id;
-                self.upstream_errors
-                    .push(format!("{}: (skipped — in cooldown)", uid));
+                let reason = format!("{}: (skipped — in cooldown)", uid);
+                self.latencies
+                    .lock()
+                    .unwrap()
+                    .record_failure_reason(idx, reason.clone());
+                self.upstream_errors.push(reason);
                 continue;
             }
             drop(cd);
@@ -1035,8 +1080,12 @@ impl RetryingFreeStream {
         self.record_failure(prev_chain_idx);
         let _cooled = self.record_empty(prev_chain_idx);
         let uid = self.chain[prev_chain_idx].upstream.id;
-        self.upstream_errors
-            .push(format!("{}: switching from empty completion", uid));
+        let reason = format!("{}: switching from empty completion", uid);
+        self.latencies
+            .lock()
+            .unwrap()
+            .record_failure_reason(prev_chain_idx, reason.clone());
+        self.upstream_errors.push(reason);
         self.start_next_plan_entry()
     }
 }
@@ -1060,11 +1109,16 @@ impl Stream for RetryingFreeStream {
                             self.record_failure(self.current_idx);
                             self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                             let uid = self.chain[self.current_idx].upstream.id;
-                            self.upstream_errors.push(format!("{}: {}", uid, err));
+                            let reason = format!("{}: {}", uid, err);
+                            self.latencies
+                                .lock()
+                                .unwrap()
+                                .record_failure_reason(self.current_idx, reason.clone());
+                            self.upstream_errors.push(reason);
                             if !self.start_next_plan_entry() {
                                 let msg = format!(
                                     "all free-mode upstreams exhausted: {}",
-                                    self.upstream_errors.join(", ")
+                                    join_capped_upstream_errors(&self.upstream_errors)
                                 );
                                 return Poll::Ready(Some(Err(ProviderError::ServerError {
                                     provider: ProviderId::new("free"),
@@ -1081,11 +1135,16 @@ impl Stream for RetryingFreeStream {
                         self.starting = None;
                         self.record_failure(self.current_idx);
                         let uid = self.chain[self.current_idx].upstream.id;
-                        self.upstream_errors.push(format!("{}: timeout", uid));
+                        let reason = format!("{}: timeout", uid);
+                        self.latencies
+                            .lock()
+                            .unwrap()
+                            .record_failure_reason(self.current_idx, reason.clone());
+                        self.upstream_errors.push(reason);
                         if !self.start_next_plan_entry() {
                             let msg = format!(
                                 "all free-mode upstreams exhausted: {}",
-                                self.upstream_errors.join(", ")
+                                join_capped_upstream_errors(&self.upstream_errors)
                             );
                             return Poll::Ready(Some(Err(ProviderError::ServerError {
                                 provider: ProviderId::new("free"),
@@ -1120,8 +1179,12 @@ impl Stream for RetryingFreeStream {
                             if in_cooldown {
                                 drop(cd);
                                 let uid = self.chain[idx].upstream.id;
-                                self.upstream_errors
-                                    .push(format!("{}: (skipped — in cooldown)", uid));
+                                let reason = format!("{}: (skipped — in cooldown)", uid);
+                                self.latencies
+                                    .lock()
+                                    .unwrap()
+                                    .record_failure_reason(idx, reason.clone());
+                                self.upstream_errors.push(reason);
                                 continue;
                             }
                             drop(cd);
@@ -1173,10 +1236,20 @@ impl Stream for RetryingFreeStream {
                         self.parallel_starting = None;
                         self.record_failure(self.parallel_idx);
                         self.maybe_cooldown_upstream_for_5xx(self.parallel_idx, &err);
+                        let uid = self.chain[self.parallel_idx].upstream.id;
+                        self.latencies
+                            .lock()
+                            .unwrap()
+                            .record_failure_reason(self.parallel_idx, format!("{}: {}", uid, err));
                     }
                     Poll::Ready(Err(_)) => {
                         self.parallel_starting = None;
                         self.record_failure(self.parallel_idx);
+                        let uid = self.chain[self.parallel_idx].upstream.id;
+                        self.latencies
+                            .lock()
+                            .unwrap()
+                            .record_failure_reason(self.parallel_idx, format!("{}: timeout", uid));
                     }
                     Poll::Pending => {} // still in-flight
                 }
@@ -1243,12 +1316,17 @@ impl Stream for RetryingFreeStream {
                         self.record_failure(self.current_idx);
                         self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                         let uid = self.chain[self.current_idx].upstream.id;
-                        self.upstream_errors.push(format!("{}: {}", uid, err));
+                        let reason = format!("{}: {}", uid, err);
+                        self.latencies
+                            .lock()
+                            .unwrap()
+                            .record_failure_reason(self.current_idx, reason.clone());
+                        self.upstream_errors.push(reason);
                         self.current = None;
                         if !self.start_next_plan_entry() {
                             let msg = format!(
                                 "all free-mode upstreams exhausted: {}",
-                                self.upstream_errors.join(", ")
+                                join_capped_upstream_errors(&self.upstream_errors)
                             );
                             return Poll::Ready(Some(Err(ProviderError::ServerError {
                                 provider: ProviderId::new("free"),
@@ -1286,7 +1364,7 @@ impl Stream for RetryingFreeStream {
                         // All exhausted.
                         let msg = format!(
                             "all free-mode upstreams exhausted: {}",
-                            self.upstream_errors.join(", ")
+                            join_capped_upstream_errors(&self.upstream_errors)
                         );
                         return Poll::Ready(Some(Err(ProviderError::ServerError {
                             provider: ProviderId::new("free"),
@@ -1316,6 +1394,50 @@ impl Stream for RetryingFreeStream {
 // LlmProvider impl
 // ---------------------------------------------------------------------------
 
+/// If an upstream just succeeded using an env-var key (nothing stored for it
+/// yet), persist that key into the auth store so the TUI and future headless
+/// runs see it automatically — env keys otherwise work headlessly but stay
+/// invisible to `/keys` and the Connect Free dialog.
+///
+/// Called on dispatch success (both `create_message` and stream creation).
+/// Stream creation means the upstream accepted the request; a later mid-stream
+/// auth error would persist a bad key, but the free fallback chain handles bad
+/// keys anyway, so the eager persist is acceptable. Once persisted, later
+/// calls early-return after one small store read, so cost is bounded to the
+/// first success per upstream.
+///
+/// No-op once the upstream has any stored ring keys or a stored credential
+/// (mirroring the opencode-zen ↔ opencode-go slot alias used by the
+/// resolvers). Also no-ops for non-env providers (e.g. ollama) and
+/// sub-8-char placeholders. Best-effort: failures only log. On a corrupt
+/// store the first save also triggers the `auth.json.corrupt-<ts>` backup, so
+/// this doubles as an automatic heal of an unreadable store.
+fn persist_env_key_if_unstored(upstream_id: &str) {
+    let mut store = clawde_core::AuthStore::load();
+    if store.keys_for(upstream_id).is_some_and(|k| !k.is_empty()) {
+        return;
+    }
+    // opencode-zen shares the opencode-go slots (see resolve_free_upstream_keys).
+    if upstream_id == "opencode-zen" && store.keys_for("opencode-go").is_some_and(|k| !k.is_empty())
+    {
+        return;
+    }
+    if store.get(upstream_id).is_some() {
+        return;
+    }
+    let Some(key) = store.api_key_for(upstream_id) else {
+        return;
+    };
+    if key.trim().len() < 8 {
+        return;
+    }
+    store.set_keys(upstream_id, vec![key]);
+    tracing::info!(
+        upstream = %upstream_id,
+        "persisted env-var key into the auth store (auto-import on first successful use)"
+    );
+}
+
 #[async_trait]
 impl LlmProvider for FreeProvider {
     fn id(&self) -> &ProviderId {
@@ -1341,7 +1463,11 @@ impl LlmProvider for FreeProvider {
 
         let route = self.resolve_route(&request.model);
         let plan = self.attempt_plan(&route, Some(&request));
-        let mut last_err: Option<ProviderError> = None;
+        // Every failed upstream is recorded with its upstream id so the
+        // exhaustion error surfaces the ORIGINAL failures (e.g. a groq rate
+        // limit) rather than only the last upstream's raw error — matching
+        // the streaming path's `RetryingFreeStream::upstream_errors`.
+        let mut upstream_errors: Vec<String> = Vec::new();
         // The request's task tags every dispatch's success/failure counters
         // (spec §8.6 per-task success-rate view).
         let task = classify_request(&request);
@@ -1350,6 +1476,9 @@ impl LlmProvider for FreeProvider {
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
+                let uid = self.chain[idx].upstream.id.to_string();
+                self.record_failure_reason(idx, format!("{}: (skipped — in cooldown)", uid));
+                upstream_errors.push(format!("{}: (skipped — in cooldown)", uid));
                 continue;
             }
 
@@ -1365,6 +1494,7 @@ impl LlmProvider for FreeProvider {
             match result {
                 Ok(Ok(resp)) => {
                     self.record_success(idx, task, start.elapsed());
+                    persist_env_key_if_unstored(entry.upstream.id);
                     return Ok(resp);
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
@@ -1375,8 +1505,9 @@ impl LlmProvider for FreeProvider {
                         err,
                     );
                     self.record_failure(idx, task);
+                    self.record_failure_reason(idx, format!("{}: {}", entry.upstream.id, err));
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
-                    last_err = Some(err);
+                    upstream_errors.push(format!("{}: {}", entry.upstream.id, err));
                     continue;
                 }
                 Ok(Err(err)) => {
@@ -1390,19 +1521,21 @@ impl LlmProvider for FreeProvider {
                         self.routing.upstream_timeout_secs,
                     );
                     self.record_failure(idx, task);
-                    last_err = Some(ProviderError::RateLimited {
-                        provider: self.id.clone(),
-                        retry_after: None,
-                    });
+                    let reason = format!(
+                        "{}: timed out after {}s",
+                        entry.upstream.id, self.routing.upstream_timeout_secs
+                    );
+                    self.record_failure_reason(idx, reason.clone());
+                    upstream_errors.push(reason);
                     continue;
                 }
             }
         }
 
-        let err_msg = if last_err.is_some() {
+        let err_msg = if !upstream_errors.is_empty() {
             format!(
-                "all free-mode upstreams exhausted (last error: {})",
-                last_err.as_ref().unwrap()
+                "all free-mode upstreams exhausted: {}",
+                join_capped_upstream_errors(&upstream_errors)
             )
         } else if let Some(reason) = self.capability_block_reason(&request) {
             format!("all free-mode upstreams exhausted: {}", reason)
@@ -1410,12 +1543,12 @@ impl LlmProvider for FreeProvider {
             "all free-mode upstreams exhausted — no upstreams had errors, all may be in cooldown"
                 .to_string()
         };
-        Err(last_err.unwrap_or_else(|| ProviderError::ServerError {
+        Err(ProviderError::ServerError {
             provider: self.id.clone(),
             status: None,
             message: err_msg,
             is_retryable: false,
-        }))
+        })
     }
 
     async fn create_message_stream(
@@ -1434,7 +1567,11 @@ impl LlmProvider for FreeProvider {
 
         let route = self.resolve_route(&request.model);
         let plan_vec = self.attempt_plan(&route, Some(&request));
-        let mut last_err: Option<ProviderError> = None;
+        // Every failed upstream is recorded with its upstream id so the
+        // exhaustion error surfaces the ORIGINAL failures (e.g. a groq rate
+        // limit) rather than only the last upstream's raw error — matching
+        // the streaming path's `RetryingFreeStream::upstream_errors`.
+        let mut upstream_errors: Vec<String> = Vec::new();
         // The request's task tags every dispatch's success/failure counters
         // (spec §8.6 per-task success-rate view).
         let task = classify_request(&request);
@@ -1443,6 +1580,9 @@ impl LlmProvider for FreeProvider {
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
+                let uid = self.chain[idx].upstream.id.to_string();
+                self.record_failure_reason(idx, format!("{}: (skipped — in cooldown)", uid));
+                upstream_errors.push(format!("{}: (skipped — in cooldown)", uid));
                 continue;
             }
 
@@ -1458,6 +1598,7 @@ impl LlmProvider for FreeProvider {
 
             match result {
                 Ok(Ok(stream)) => {
+                    persist_env_key_if_unstored(entry.upstream.id);
                     // Wrap in RetryingFreeStream for empty-completion re-dispatch.
                     // Rebuild plan to get remaining entries by position.
                     let remaining: VecDeque<_> = self
@@ -1477,6 +1618,7 @@ impl LlmProvider for FreeProvider {
                         upstream_model,
                         remaining,
                         is_auto,
+                        upstream_errors,
                     )));
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
@@ -1487,8 +1629,9 @@ impl LlmProvider for FreeProvider {
                         err,
                     );
                     self.record_failure(idx, task);
+                    self.record_failure_reason(idx, format!("{}: {}", entry.upstream.id, err));
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
-                    last_err = Some(err);
+                    upstream_errors.push(format!("{}: {}", entry.upstream.id, err));
                     continue;
                 }
                 Ok(Err(err)) => {
@@ -1502,28 +1645,33 @@ impl LlmProvider for FreeProvider {
                         self.routing.upstream_timeout_secs,
                     );
                     self.record_failure(idx, task);
-                    last_err = Some(ProviderError::RateLimited {
-                        provider: self.id.clone(),
-                        retry_after: None,
-                    });
+                    let reason = format!(
+                        "{}: timed out after {}s",
+                        entry.upstream.id, self.routing.upstream_timeout_secs
+                    );
+                    self.record_failure_reason(idx, reason.clone());
+                    upstream_errors.push(reason);
                     continue;
                 }
             }
         }
 
-        let err_msg = if let Some(reason) = self.capability_block_reason(&request) {
+        let err_msg = if !upstream_errors.is_empty() {
+            format!(
+                "all free-mode upstreams exhausted: {}",
+                join_capped_upstream_errors(&upstream_errors)
+            )
+        } else if let Some(reason) = self.capability_block_reason(&request) {
             format!("all free-mode upstreams exhausted: {}", reason)
-        } else if let Some(err) = &last_err {
-            format!("all free-mode upstreams exhausted (last error: {})", err)
         } else {
             "all free-mode upstreams exhausted".to_string()
         };
-        Err(last_err.unwrap_or_else(|| ProviderError::ServerError {
+        Err(ProviderError::ServerError {
             provider: self.id.clone(),
             status: None,
             message: err_msg,
             is_retryable: false,
-        }))
+        })
     }
 
     fn routing_strategy_name(&self) -> Option<&'static str> {
@@ -1716,6 +1864,23 @@ impl LlmProvider for FreeProvider {
             .iter()
             .enumerate()
             .map(|(idx, entry)| (entry.upstream.id.to_string(), lat.success_rate(idx)))
+            .collect()
+    }
+
+    fn upstream_last_failures(&self) -> Vec<(String, Option<String>)> {
+        // Last recorded failure reason per upstream, for `/keys health`
+        // (e.g. `groq: [groq] Rate limited`). Locked once, never across an
+        // await.
+        let lat = self.latencies.lock().unwrap();
+        let reasons = lat.last_failure_reasons();
+        self.chain
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let reason = reasons.get(idx).cloned().flatten();
+                (entry.upstream.id.to_string(), reason)
+            })
+            .filter(|(_, reason)| reason.is_some())
             .collect()
     }
 
@@ -2059,16 +2224,14 @@ mod tests {
             .create_message(dummy_request("free/auto"))
             .await
             .unwrap_err();
+        // The single-upstream chain exhausts into the aggregate ServerError,
+        // whose message preserves the ORIGINAL 500 from the mock upstream.
+        let text = err.to_string();
         assert!(
-            matches!(
-                &err,
-                ProviderError::ServerError {
-                    status: Some(500),
-                    ..
-                }
-            ),
-            "mock 500 should surface as a server error, got {:?}",
-            err
+            text.contains("all free-mode upstreams exhausted")
+                && text.contains("groq")
+                && text.contains("Server error 500"),
+            "mock 500 should surface in the exhaustion error, got: {text}"
         );
 
         let cooldowns = provider.upstream_cooldowns();
@@ -2120,6 +2283,10 @@ mod tests {
         /// When set, records the `request.model` of every `create_message`
         /// call so tests can assert dispatch ORDER through the plan.
         attempt_log: Option<Arc<Mutex<Vec<String>>>>,
+        /// When `ok` is false, the error `create_message` returns carries
+        /// this message — lets tests distinguish upstream failures (e.g.
+        /// "rate limited" vs "model not found") in the exhaustion error.
+        fail_msg: Option<&'static str>,
     }
 
     #[async_trait]
@@ -2154,6 +2321,13 @@ mod tests {
                     stop_reason: StopReason::EndTurn,
                     usage: UsageInfo::default(),
                 })
+            } else if let Some(msg) = self.fail_msg {
+                Err(ProviderError::ServerError {
+                    provider: self.id.clone(),
+                    status: None,
+                    message: msg.to_string(),
+                    is_retryable: true,
+                })
             } else {
                 Err(ProviderError::RateLimited {
                     provider: self.id.clone(),
@@ -2172,7 +2346,7 @@ mod tests {
             Err(ProviderError::ServerError {
                 provider: self.id.clone(),
                 status: None,
-                message: "stub".into(),
+                message: self.fail_msg.unwrap_or("stub").to_string(),
                 is_retryable: false,
             })
         }
@@ -2328,6 +2502,26 @@ mod tests {
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: None,
+                fail_msg: None,
+            }),
+            effective_model: None,
+        }
+    }
+
+    /// Entry whose `create_message` fails with a distinguishable message,
+    /// so exhaustion-error tests can assert WHICH upstream errors surface.
+    fn failing_entry(id: &'static str, fail_msg: &'static str) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok: false,
+                seen_max_tokens: None,
+                ring_status: None,
+                exhaustion: None,
+                attempt_log: None,
+                fail_msg: Some(fail_msg),
             }),
             effective_model: None,
         }
@@ -2344,6 +2538,7 @@ mod tests {
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: Some(log),
+                fail_msg: None,
             }),
             effective_model: None,
         }
@@ -2364,6 +2559,7 @@ mod tests {
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: None,
+                fail_msg: None,
             }),
             effective_model: None,
         }
@@ -2380,6 +2576,7 @@ mod tests {
                 ring_status: None,
                 exhaustion: Some(recorder),
                 attempt_log: None,
+                fail_msg: None,
             }),
             effective_model: None,
         }
@@ -2396,6 +2593,7 @@ mod tests {
                 ring_status: Some(ring),
                 exhaustion: None,
                 attempt_log: None,
+                fail_msg: None,
             }),
             effective_model: None,
         }
@@ -3200,6 +3398,137 @@ mod tests {
                 message: "filtered".into(),
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_error_surfaces_all_upstream_failures_non_stream() {
+        // Both upstreams fail with DISTINCT errors; the exhausted error must
+        // name every original failure, not just the last upstream's raw error
+        // (regression: `[ollama] Model not found: unknown` swallowed the groq
+        // rate limit that caused the chain to exhaust).
+        let provider = FreeProvider::with_routing(
+            vec![
+                failing_entry("groq", "rate limited"),
+                failing_entry("openrouter", "Model not found: unknown"),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let err = provider
+            .create_message(dummy_request("free/auto"))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("all free-mode upstreams exhausted"),
+            "got: {text}"
+        );
+        // The ORIGINAL failures are preserved, with their upstream ids.
+        assert!(text.contains("groq"), "got: {text}");
+        assert!(text.contains("openrouter"), "got: {text}");
+        assert!(text.contains("rate limited"), "got: {text}");
+        assert!(text.contains("Model not found: unknown"), "got: {text}");
+        // The exhausted error is a ServerError carrying the joined message.
+        match err {
+            ProviderError::ServerError { message, .. } => {
+                assert!(message.contains("groq"), "got: {message}");
+                assert!(message.contains("openrouter"), "got: {message}");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_capped_upstream_errors_lists_all_below_cap() {
+        // 6 or fewer errors are shown in full — no ellipsis, no tail append.
+        let errors: Vec<String> = (0..6).map(|i| format!("upstream{i}")).collect();
+        assert_eq!(join_capped_upstream_errors(&errors), errors.join(", "));
+    }
+
+    #[test]
+    fn join_capped_upstream_errors_truncates_middle_preserving_last() {
+        // 7+ errors: first 5 listed, omitted count noted, LAST error always
+        // preserved (the final fallback's failure is the most relevant).
+        let errors: Vec<String> = (0..8).map(|i| format!("upstream{i}")).collect();
+        let joined = join_capped_upstream_errors(&errors);
+        assert!(joined.contains("upstream0"), "got: {joined}");
+        assert!(joined.contains("upstream4"), "got: {joined}");
+        assert!(!joined.contains("upstream5"), "got: {joined}");
+        assert!(!joined.contains("upstream6"), "got: {joined}");
+        assert!(joined.contains("... and 2 more"), "got: {joined}");
+        assert!(joined.ends_with("upstream7"), "got: {joined}");
+        // Short enough that even a 13-upstream chain stays readable.
+        assert!(
+            joined.len() < 120,
+            "got {}-char message: {joined}",
+            joined.len()
+        );
+    }
+
+    #[test]
+    fn join_capped_upstream_errors_collapses_consecutive_duplicates() {
+        // A pinned upstream retrying its fallback models can record the same
+        // `upstream: error` string several times in a row — dedup collapses
+        // the run (first occurrence kept, order preserved) before capping.
+        let errors: Vec<String> = vec![
+            "groq: Rate limited".into(),
+            "groq: Rate limited".into(),
+            "groq: Rate limited".into(),
+            "cerebras: [cerebras] Server error 500".into(),
+            "ollama: [ollama] Model not found: unknown".into(),
+        ];
+        let joined = join_capped_upstream_errors(&errors);
+        assert_eq!(
+            joined,
+            "groq: Rate limited, cerebras: [cerebras] Server error 500, ollama: [ollama] Model not found: unknown"
+        );
+
+        // Non-consecutive repeats are kept (they describe different attempts).
+        let spaced: Vec<String> = vec![
+            "groq: Rate limited".into(),
+            "cerebras: [cerebras] Server error 500".into(),
+            "groq: Rate limited".into(),
+        ];
+        let joined_spaced = join_capped_upstream_errors(&spaced);
+        assert_eq!(joined_spaced, spaced.join(", "));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_error_surfaces_all_upstream_failures_stream() {
+        // Streaming path: the first upstream fails before producing a stream,
+        // the second fails after. The final exhausted error must include both.
+        let provider = FreeProvider::with_routing(
+            vec![
+                failing_entry("huggingface", "quota exceeded"),
+                failing_entry("cerebras", "Model not found: unknown"),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let err = match provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected exhaustion error, got Ok"),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("all free-mode upstreams exhausted"),
+            "got: {text}"
+        );
+        assert!(text.contains("huggingface"), "got: {text}");
+        assert!(text.contains("cerebras"), "got: {text}");
+        assert!(text.contains("quota exceeded"), "got: {text}");
+        assert!(text.contains("Model not found: unknown"), "got: {text}");
     }
 
     #[tokio::test]
@@ -5008,4 +5337,24 @@ fn resolvers_agree_on_synthetic_fixture_store() {
         3,
         "no credentials stored for opencode-zen"
     );
+}
+
+#[test]
+fn first_successful_dispatch_persists_env_key() {
+    let _home = crate::test_support::TestHome::new();
+    let _env = crate::test_support::EnvVarGuard::set("GROQ_API_KEY", "gsk-env-1234567890");
+
+    let store = clawde_core::AuthStore::load();
+    assert!(store.keys_for("groq").is_none(), "fixture starts unstored");
+
+    persist_env_key_if_unstored("groq");
+
+    let store = clawde_core::AuthStore::load();
+    assert_eq!(store.keys_for("groq").map(|k| k.len()), Some(1));
+    assert_eq!(store.keys_for("groq").unwrap()[0], "gsk-env-1234567890");
+
+    // Second call is a no-op (already stored) — does not duplicate.
+    persist_env_key_if_unstored("groq");
+    let store = clawde_core::AuthStore::load();
+    assert_eq!(store.keys_for("groq").map(|k| k.len()), Some(1));
 }

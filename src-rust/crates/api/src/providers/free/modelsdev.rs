@@ -29,112 +29,128 @@ static AUTO_DETECTED_DEFAULTS: OnceLock<HashMap<String, String>> = OnceLock::new
 /// only happens once per process lifetime.
 pub fn fetch_best_free_models_from_modelsdev() -> &'static HashMap<String, String> {
     AUTO_DETECTED_DEFAULTS.get_or_init(|| {
-        // reqwest::blocking::Client creates an internal tokio runtime. Dropping
-        // that runtime inside an existing tokio runtime context (e.g. under
-        // #[tokio::main]) panics. Run the entire HTTP fetch on a plain OS thread
-        // so the internal runtime is created and dropped outside any async context.
-        std::thread::spawn(|| {
-            let url = "https://models.dev/api.json";
-            let Ok(response) = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .and_then(|client| client.get(url).send())
-            else {
-                tracing::warn!("fetch_best_free_models_from_modelsdev: HTTP request failed");
-                return HashMap::new();
+        // F2 (audit fix): prefer the persisted cache so a fresh CLI process does
+        // not block on a network fetch at startup. The cache is refreshed below
+        // and re-fetched on a later process once it goes stale.
+        if let Some(cached) = super::load_modelsdev_defaults_cache() {
+            tracing::debug!(
+                "models.dev auto-detection loaded from cache ({} upstreams)",
+                cached.len()
+            );
+            return cached;
+        }
+        let result = fetch_modelsdev_defaults_blocking();
+        super::save_modelsdev_defaults_cache(&result);
+        result
+    })
+}
+
+/// The blocking models.dev fetch — runs on a plain OS thread so the internal
+/// reqwest runtime is created and dropped outside any async context (dropping
+/// it inside an existing tokio runtime context, e.g. under `#[tokio::main]`,
+/// would panic).
+fn fetch_modelsdev_defaults_blocking() -> HashMap<String, String> {
+    std::thread::spawn(|| {
+        let url = "https://models.dev/api.json";
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| client.get(url).send())
+        else {
+            tracing::warn!("fetch_best_free_models_from_modelsdev: HTTP request failed");
+            return HashMap::new();
+        };
+
+        let Ok(data) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_best_free_models_from_modelsdev: failed to parse JSON");
+            return HashMap::new();
+        };
+
+        let mut result = HashMap::new();
+
+        for upstream in FREE_CATALOG {
+            let Some(provider) = data.get(upstream.id) else {
+                continue;
+            };
+            let Some(models) = provider.get("models") else {
+                continue;
+            };
+            let Some(models_obj) = models.as_object() else {
+                continue;
             };
 
-            let Ok(data) = response.json::<serde_json::Value>() else {
-                tracing::warn!("fetch_best_free_models_from_modelsdev: failed to parse JSON");
-                return HashMap::new();
-            };
+            let mut candidates: Vec<(&str, u64)> = Vec::new();
 
-            let mut result = HashMap::new();
-
-            for upstream in FREE_CATALOG {
-                let Some(provider) = data.get(upstream.id) else {
+            for (model_id, model_info) in models_obj {
+                // Must be free
+                let cost = model_info.get("cost").and_then(|c| c.as_object());
+                let cost_in = cost
+                    .and_then(|c| c.get("input"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                let cost_out = cost
+                    .and_then(|c| c.get("output"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                if cost_in != 0.0 || cost_out != 0.0 {
                     continue;
-                };
-                let Some(models) = provider.get("models") else {
-                    continue;
-                };
-                let Some(models_obj) = models.as_object() else {
-                    continue;
-                };
-
-                let mut candidates: Vec<(&str, u64)> = Vec::new();
-
-                for (model_id, model_info) in models_obj {
-                    // Must be free
-                    let cost = model_info.get("cost").and_then(|c| c.as_object());
-                    let cost_in = cost
-                        .and_then(|c| c.get("input"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0);
-                    let cost_out = cost
-                        .and_then(|c| c.get("output"))
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1.0);
-                    if cost_in != 0.0 || cost_out != 0.0 {
-                        continue;
-                    }
-
-                    // Must support tool calling (matching Cline's filtering)
-                    let tool_call = model_info
-                        .get("tool_call")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if !tool_call {
-                        continue;
-                    }
-
-                    // Must not be deprecated
-                    let status = model_info
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if status == "deprecated" || status == "legacy" {
-                        continue;
-                    }
-
-                    // Context window for ranking
-                    let limit = model_info.get("limit").and_then(|l| l.as_object());
-                    let context = limit
-                        .and_then(|l| l.get("context"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-
-                    candidates.push((model_id, context));
                 }
 
-                // Sort by context window descending, pick the best
-                candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                // Must support tool calling (matching Cline's filtering)
+                let tool_call = model_info
+                    .get("tool_call")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !tool_call {
+                    continue;
+                }
 
-                if let Some((model_id, _ctx)) = candidates.first() {
-                    let prev = result.insert(upstream.id.to_string(), (*model_id).to_string());
-                    if prev.is_none() {
-                        tracing::info!(
-                            "Auto-detected free model for {}: {} ({} context)",
-                            upstream.id,
-                            model_id,
-                            _ctx,
-                        );
-                    }
+                // Must not be deprecated
+                let status = model_info
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if status == "deprecated" || status == "legacy" {
+                    continue;
+                }
+
+                // Context window for ranking
+                let limit = model_info.get("limit").and_then(|l| l.as_object());
+                let context = limit
+                    .and_then(|l| l.get("context"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                candidates.push((model_id, context));
+            }
+
+            // Sort by context window descending, pick the best
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            if let Some((model_id, _ctx)) = candidates.first() {
+                let prev = result.insert(upstream.id.to_string(), (*model_id).to_string());
+                if prev.is_none() {
+                    tracing::info!(
+                        "Auto-detected free model for {}: {} ({} context)",
+                        upstream.id,
+                        model_id,
+                        _ctx,
+                    );
                 }
             }
+        }
 
-            if result.is_empty() {
-                tracing::warn!("fetch_best_free_models_from_modelsdev: no free models found");
-            } else {
-                tracing::info!("Auto-detected free models for {} upstreams", result.len(),);
-            }
+        if result.is_empty() {
+            tracing::warn!("fetch_best_free_models_from_modelsdev: no free models found");
+        } else {
+            tracing::info!("Auto-detected free models for {} upstreams", result.len(),);
+        }
 
-            result
-        })
-        .join()
-        .unwrap_or_else(|_| {
-            tracing::warn!("fetch_best_free_models_from_modelsdev: thread panicked");
-            HashMap::new()
-        })
+        result
+    })
+    .join()
+    .unwrap_or_else(|_| {
+        tracing::warn!("fetch_best_free_models_from_modelsdev: thread panicked");
+        HashMap::new()
     })
 }

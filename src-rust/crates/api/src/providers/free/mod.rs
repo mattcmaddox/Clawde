@@ -61,6 +61,30 @@ mod task_classifier;
 pub use modelsdev::fetch_best_free_models_from_modelsdev;
 pub use task_classifier::{classify_request, task_preference_ids, TaskType};
 
+/// Select the first configured vision-capable free upstream in catalog order.
+///
+/// The returned `provider/model` pin is still routed through the composite
+/// FreeProvider by the query layer, so transient failures can fall through to
+/// another configured vision upstream. This is used by the TUI image mode;
+/// the synthetic `free/auto` entry is intentionally absent from the static
+/// model registry and cannot be selected via `best_vision_model_for_provider`.
+pub fn first_configured_vision_model(auth_store: &clawde_core::AuthStore) -> Option<String> {
+    let effective_models = take_free_model_defaults();
+    FREE_CATALOG.iter().find_map(|upstream| {
+        if !upstream.vision
+            || crate::providers::free::first_free_upstream_key(auth_store, upstream.id).is_none()
+        {
+            return None;
+        }
+        let model = effective_models
+            .iter()
+            .find(|(id, _, _)| id == upstream.id)
+            .map(|(_, _, model)| model.as_str())
+            .unwrap_or(upstream.default_model);
+        Some(format!("{}/{}", upstream.id, model))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // FreeProvider
 // ---------------------------------------------------------------------------
@@ -437,9 +461,29 @@ fn merge_telemetry_snapshot(path: &std::path::Path, incoming: &str) -> Option<St
         {
             existing_entry.samples = incoming_entry.samples;
         }
+        // The incoming snapshot is the fresher write — its failure reason (if
+        // any) reflects the most recent dispatch. A None never overwrites a
+        // recorded reason; a Some always does.
+        if incoming_entry.last_failure_reason.is_some() {
+            existing_entry.last_failure_reason = incoming_entry.last_failure_reason;
+        }
     }
 
     serde_json::to_string_pretty(&existing_entries).ok()
+}
+
+/// Cap a persisted failure reason so a verbose upstream error (some providers
+/// return multi-sentence messages) cannot bloat `telemetry-state/free.json`,
+/// which is rewritten on every dispatch. Truncated reasons keep the upstream
+/// prefix and error kind — the tail details are rarely diagnostic.
+fn cap_failure_reason(reason: String) -> String {
+    const MAX_REASON_CHARS: usize = 160;
+    if reason.len() <= MAX_REASON_CHARS {
+        return reason;
+    }
+    let mut truncated: String = reason.chars().take(MAX_REASON_CHARS).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn remove_snapshot_if_unchanged(path: &std::path::Path) {
@@ -546,6 +590,123 @@ fn set_private_dir_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn set_private_dir_permissions(_path: &std::path::Path) {}
+
+// ---------------------------------------------------------------------------
+// Free-mode discovery caches (audit fix F2)
+//
+// Best-free-model auto-detection (models.dev) and live per-upstream discovery
+// used to re-run blocking HTTP fetches on every CLI startup — up to 5s for
+// models.dev plus 5s per configured discovery-capable upstream, each process.
+// These helpers persist the derived results under `{clawde_home}/free-state/`
+// so a fresh process starts from disk instead of the network. The in-process
+// `AUTO_DETECTED_DEFAULTS` / `LIVE_DISCOVERY_CACHE` caches remain the fast path
+// within a process; the disk cache covers the first call of a new process.
+// ---------------------------------------------------------------------------
+
+/// How long a persisted discovery result is trusted before a refetch. Both the
+/// models.dev catalog and the per-upstream model lists are slow-moving.
+const DISCOVERY_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn free_state_dir() -> std::path::PathBuf {
+    clawde_core::config::Settings::config_dir().join("free-state")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelsDevDefaultsCache {
+    #[serde(default)]
+    saved_at_unix: u64,
+    #[serde(default)]
+    defaults: HashMap<String, String>,
+}
+
+/// Load the persisted models.dev auto-detection defaults when fresh.
+fn load_modelsdev_defaults_cache() -> Option<HashMap<String, String>> {
+    let path = free_state_dir().join("modelsdev-defaults.json");
+    let json = std::fs::read_to_string(path).ok()?;
+    let cached: ModelsDevDefaultsCache = serde_json::from_str(&json).ok()?;
+    let now = current_unix_secs();
+    if cached.saved_at_unix == 0
+        || now.saturating_sub(cached.saved_at_unix) > DISCOVERY_CACHE_TTL_SECS
+    {
+        return None;
+    }
+    (!cached.defaults.is_empty()).then_some(cached.defaults)
+}
+
+/// Persist models.dev auto-detection defaults (best-effort, cross-process
+/// safe via the shared file-lock / atomic-write machinery).
+fn save_modelsdev_defaults_cache(defaults: &HashMap<String, String>) {
+    if defaults.is_empty() {
+        return;
+    }
+    let cache = ModelsDevDefaultsCache {
+        saved_at_unix: current_unix_secs(),
+        defaults: defaults.clone(),
+    };
+    let json = match serde_json::to_string_pretty(&cache) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    write_private_json_locked(
+        &free_state_dir().join("modelsdev-defaults.json"),
+        Some(&json),
+        false,
+        false,
+    );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveDiscoveryCache {
+    #[serde(default)]
+    saved_at_unix: u64,
+    /// upstream id → discovered model id (successful discoveries only).
+    #[serde(default)]
+    models: HashMap<String, String>,
+}
+
+/// Load a persisted live-discovery result for `upstream_id` when fresh.
+fn load_live_discovery_cache(upstream_id: &str) -> Option<String> {
+    let path = free_state_dir().join("live-discovery.json");
+    let json = std::fs::read_to_string(path).ok()?;
+    let cached: LiveDiscoveryCache = serde_json::from_str(&json).ok()?;
+    let now = current_unix_secs();
+    if cached.saved_at_unix == 0
+        || now.saturating_sub(cached.saved_at_unix) > DISCOVERY_CACHE_TTL_SECS
+    {
+        return None;
+    }
+    cached
+        .models
+        .get(upstream_id)
+        .cloned()
+        .filter(|m| !m.is_empty())
+}
+
+/// Persist a live-discovery result. Only successful discoveries are written so
+/// a temporarily-down upstream is re-probed on the next process (recovery stays
+/// prompt). Merges with the on-disk map so concurrent processes each add their
+/// own upstreams without clobbering the others.
+fn save_live_discovery_cache(upstream_id: &str, model: Option<String>) {
+    let Some(model) = model else { return };
+    if model.is_empty() {
+        return;
+    }
+    let path = free_state_dir().join("live-discovery.json");
+    let mut cache = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<LiveDiscoveryCache>(&json).ok())
+        .unwrap_or(LiveDiscoveryCache {
+            saved_at_unix: current_unix_secs(),
+            models: HashMap::new(),
+        });
+    cache.models.insert(upstream_id.to_string(), model);
+    cache.saved_at_unix = current_unix_secs();
+    let json = match serde_json::to_string_pretty(&cache) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    write_private_json_locked(&path, Some(&json), false, false);
+}
 
 /// Routing configuration for a [`FreeProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -928,6 +1089,11 @@ struct LatencyState {
     /// upstream can be 100% on verification tasks yet 0% on code generation.
     task_successes: Vec<HashMap<String, u32>>,
     task_failures: Vec<HashMap<String, u32>>,
+    /// Last recorded failure reason per upstream (e.g. `[groq] Rate limited`)
+    /// so `/keys health` can explain WHY an upstream's success rate is down
+    /// without needing a live failing request. `None` before the first
+    /// failure. Cleared by a successful dispatch.
+    last_failure_reasons: Vec<Option<String>>,
     /// Upstream IDs and optional disk path for cross-process telemetry.
     /// Keeping this metadata with the shared state means direct and streaming
     /// dispatches persist through the same lock without duplicating plumbing.
@@ -942,12 +1108,14 @@ impl LatencyState {
         let mut failures = Vec::with_capacity(n);
         let mut task_successes = Vec::with_capacity(n);
         let mut task_failures = Vec::with_capacity(n);
+        let mut last_failure_reasons = Vec::with_capacity(n);
         for _ in 0..n {
             samples.push(VecDeque::with_capacity(10));
             successes.push(0);
             failures.push(0);
             task_successes.push(HashMap::new());
             task_failures.push(HashMap::new());
+            last_failure_reasons.push(None);
         }
         Self {
             samples,
@@ -955,6 +1123,7 @@ impl LatencyState {
             failures,
             task_successes,
             task_failures,
+            last_failure_reasons,
             upstream_ids: Vec::new(),
             persist_path: None,
         }
@@ -998,6 +1167,27 @@ impl LatencyState {
         if let Some(f) = self.failures.get_mut(idx) {
             *f = f.saturating_add(1);
         }
+    }
+
+    /// Record the reason for the failure at `idx` (e.g. `[groq] Rate
+    /// limited`) so `/keys health` can explain a degraded success rate.
+    fn record_failure_reason(&mut self, idx: usize, reason: String) {
+        if let Some(slot) = self.last_failure_reasons.get_mut(idx) {
+            *slot = Some(cap_failure_reason(reason));
+        }
+    }
+
+    /// Clear the recorded failure reason at `idx` — a later success means the
+    /// upstream recovered, and showing a stale failure would mislead.
+    fn clear_failure_reason(&mut self, idx: usize) {
+        if let Some(slot) = self.last_failure_reasons.get_mut(idx) {
+            *slot = None;
+        }
+    }
+
+    /// Last recorded failure reason per upstream, or `None`.
+    fn last_failure_reasons(&self) -> Vec<Option<String>> {
+        self.last_failure_reasons.clone()
     }
 
     /// Record a successful dispatch of `task` at `idx` (per-task view).
@@ -1098,11 +1288,13 @@ impl LatencyState {
                 let failures = self.failures.get(idx).copied().unwrap_or(0);
                 let task_successes = self.task_successes.get(idx).cloned().unwrap_or_default();
                 let task_failures = self.task_failures.get(idx).cloned().unwrap_or_default();
+                let last_failure_reason = self.last_failure_reasons.get(idx).cloned().flatten();
                 if samples.is_empty()
                     && successes == 0
                     && failures == 0
                     && task_successes.is_empty()
                     && task_failures.is_empty()
+                    && last_failure_reason.is_none()
                 {
                     return None;
                 }
@@ -1113,6 +1305,7 @@ impl LatencyState {
                     failures,
                     task_successes,
                     task_failures,
+                    last_failure_reason,
                     saved_at_unix: current_unix_secs(),
                     saved_at_unix_nanos: current_unix_nanos(),
                 })
@@ -1169,6 +1362,10 @@ impl LatencyState {
                 }
                 if age > TELEMETRY_HALF_LIFE_SECS {
                     entry.samples.clear();
+                    // The counters that motivated a failure reason have decayed
+                    // to noise — drop the reason too so /keys health does not
+                    // show a stale failure after the window passes.
+                    entry.last_failure_reason = None;
                 }
             }
             if entry.successes == 0
@@ -1176,6 +1373,7 @@ impl LatencyState {
                 && entry.task_successes.values().all(|count| *count == 0)
                 && entry.task_failures.values().all(|count| *count == 0)
                 && entry.samples.is_empty()
+                && entry.last_failure_reason.is_none()
             {
                 continue;
             }
@@ -1195,6 +1393,7 @@ impl LatencyState {
             self.failures[idx] = entry.failures;
             self.task_successes[idx] = entry.task_successes;
             self.task_failures[idx] = entry.task_failures;
+            self.last_failure_reasons[idx] = entry.last_failure_reason;
         }
     }
 }
@@ -1216,6 +1415,11 @@ struct UpstreamTelemetrySnapshot {
     task_successes: HashMap<String, u32>,
     #[serde(default)]
     task_failures: HashMap<String, u32>,
+    /// Last recorded failure reason (e.g. `groq: [groq] Rate limited`).
+    /// `None` for healthy upstreams. `#[serde(default)]` so telemetry files
+    /// written by older builds still parse.
+    #[serde(default)]
+    last_failure_reason: Option<String>,
     /// Unix timestamp of the snapshot. Zero denotes a legacy file; loading
     /// then falls back to the file modification time for aging.
     #[serde(default)]
@@ -1819,3 +2023,142 @@ enum Route {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::test_support::TestHome;
+    use clawde_core::AuthStore;
+
+    #[test]
+    fn first_configured_vision_model_uses_catalog_order() {
+        let _home = TestHome::new();
+        let mut auth = AuthStore::default();
+        auth.set_keys("google", vec!["google-test-key-12345678".to_string()]);
+        auth.set_keys(
+            "github-copilot",
+            vec!["github-test-key-12345678".to_string()],
+        );
+
+        // GitHub Copilot precedes Google in FREE_CATALOG, so it wins when both
+        // vision-capable upstreams are configured.
+        assert_eq!(
+            first_configured_vision_model(&auth).as_deref(),
+            Some("github-copilot/gpt-4o-2024-11-20")
+        );
+    }
+
+    #[test]
+    fn first_configured_vision_model_skips_non_vision_upstreams() {
+        let _home = TestHome::new();
+        let mut auth = AuthStore::default();
+        auth.set_keys("groq", vec!["groq-test-key-12345678".to_string()]);
+        assert_eq!(first_configured_vision_model(&auth), None);
+    }
+
+    /// Verbose upstream error messages are capped before persistence so
+    /// `telemetry-state/free.json` cannot grow unbounded across dispatches.
+    #[test]
+    fn failure_reason_is_capped_before_persist() {
+        let _home = TestHome::new();
+        let path = clawde_core::config::Settings::config_dir()
+            .join("telemetry-state")
+            .join("free.json");
+        let mut state =
+            LatencyState::new(1).with_persistence(vec!["groq".to_string()], Some(path.clone()), 10);
+        let long = "groq: [groq] Rate limited: ".to_string() + &"x".repeat(300);
+        state.record_failure_reason(0, long);
+        LatencyState::persist_snapshot(state.snapshot());
+
+        let disk = std::fs::read_to_string(&path).unwrap();
+        let entries: Vec<UpstreamTelemetrySnapshot> = serde_json::from_str(&disk).unwrap();
+        let reason = entries[0].last_failure_reason.as_deref().unwrap();
+        assert!(reason.ends_with('…'), "reason must be truncated: {reason}");
+        assert!(
+            reason.chars().count() <= 161,
+            "capped reason must stay under the limit: {} chars",
+            reason.chars().count()
+        );
+        // The upstream prefix survives the cap.
+        assert!(
+            reason.starts_with("groq: [groq] Rate limited"),
+            "got: {reason}"
+        );
+    }
+
+    /// The per-upstream last failure reason persists to the telemetry file and
+    /// survives a restart (a fresh `LatencyState` restores it), so `/keys
+    /// health` explains a degraded success rate even after the process exits.
+    #[test]
+    fn last_failure_reason_persists_and_restores() {
+        let _home = TestHome::new();
+        let path = clawde_core::config::Settings::config_dir()
+            .join("telemetry-state")
+            .join("free.json");
+        let mut state =
+            LatencyState::new(1).with_persistence(vec!["groq".to_string()], Some(path.clone()), 10);
+        state.record_failure_reason(0, "groq: [groq] Rate limited".to_string());
+        LatencyState::persist_snapshot(state.snapshot());
+        assert!(path.exists(), "telemetry file must be written");
+
+        // A fresh state (restart) restores the reason.
+        let restored =
+            LatencyState::new(1).with_persistence(vec!["groq".to_string()], Some(path), 10);
+        assert_eq!(
+            restored.last_failure_reasons(),
+            vec![Some("groq: [groq] Rate limited".to_string())]
+        );
+    }
+
+    /// F2 (audit fix): persisted models.dev defaults round-trip through the
+    /// `{clawde_home}/free-state/` cache.
+    #[test]
+    fn modelsdev_defaults_cache_round_trips() {
+        let _home = TestHome::new();
+        let mut defaults = HashMap::new();
+        defaults.insert("groq".to_string(), "llama-3.3-70b-versatile".to_string());
+        defaults.insert("cerebras".to_string(), "gpt-oss-120b".to_string());
+        save_modelsdev_defaults_cache(&defaults);
+        assert_eq!(load_modelsdev_defaults_cache(), Some(defaults));
+    }
+
+    /// F2: a cache older than the TTL is ignored so a fresh process re-fetches
+    /// instead of trusting stale model lists.
+    #[test]
+    fn modelsdev_defaults_cache_stale_is_ignored() {
+        let _home = TestHome::new();
+        let mut defaults = HashMap::new();
+        defaults.insert("groq".to_string(), "llama-3.3-70b-versatile".to_string());
+        let stale = ModelsDevDefaultsCache {
+            saved_at_unix: current_unix_secs().saturating_sub(DISCOVERY_CACHE_TTL_SECS + 1),
+            defaults,
+        };
+        let dir = free_state_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("modelsdev-defaults.json"),
+            serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_modelsdev_defaults_cache(), None);
+    }
+
+    /// F2: live-discovery results persist only on success — a failed probe is
+    /// left uncached so a recovering upstream is re-probed on the next process.
+    #[test]
+    fn live_discovery_cache_persists_only_successes() {
+        let _home = TestHome::new();
+        assert_eq!(load_live_discovery_cache("groq"), None);
+        save_live_discovery_cache("groq", None);
+        assert_eq!(
+            load_live_discovery_cache("groq"),
+            None,
+            "failed discovery must not be persisted"
+        );
+        save_live_discovery_cache("groq", Some("llama-3.3-70b-versatile".to_string()));
+        assert_eq!(
+            load_live_discovery_cache("groq"),
+            Some("llama-3.3-70b-versatile".to_string())
+        );
+    }
+}

@@ -91,8 +91,8 @@ pub struct ProviderQuirks {
     /// When set, `discover_models()` uses Ollama's native `/api/tags` endpoint
     /// (and optionally `/api/show` for per-model metadata) instead of the
     /// OpenAI-compatible `/v1/models` endpoint.  The value is the Ollama host
-    /// root (e.g. `"http://localhost:11434"`) so the native API can be called
-    /// independently of the `/v1` base URL used for chat completions.
+    /// root (e.g. `"http://gpu-host.example:11434"`) so the native API can be
+    /// called independently of the `/v1` base URL used for chat completions.
     pub ollama_native_host: Option<String>,
 
     /// Estimated bytes-per-token ratio for prompt truncation.
@@ -1361,14 +1361,14 @@ mod tests {
 
     #[test]
     fn with_base_url_retargets_ollama_native_host() {
-        // Mirror the ollama() factory default: both the /v1 base URL and the
-        // native host point at localhost initially.
-        let provider = OpenAiCompatProvider::new("ollama", "Ollama", "http://localhost:11434/v1")
-            .with_quirks(ProviderQuirks {
-                no_api_key_required: true,
-                ollama_native_host: Some("http://localhost:11434".to_string()),
-                ..Default::default()
-            });
+        // Use a remote test endpoint for Ollama's /v1 base URL and native host.
+        let provider =
+            OpenAiCompatProvider::new("ollama", "Ollama", "http://gpu-host.example:11434/v1")
+                .with_quirks(ProviderQuirks {
+                    no_api_key_required: true,
+                    ollama_native_host: Some("http://gpu-host.example:11434".to_string()),
+                    ..Default::default()
+                });
 
         // Overriding the base URL with a configured remote api_base (as the
         // registry does for `providers.ollama.api_base`) must also retarget the

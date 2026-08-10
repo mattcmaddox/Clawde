@@ -60,17 +60,15 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
 // Local / self-hosted providers (no API key required)
 // ---------------------------------------------------------------------------
 
-/// Ollama — local or remote inference server.
-/// Resolves the host from `providers.ollama.api_base` in settings first, then
-/// the `OLLAMA_HOST` env var, then defaults to `http://localhost:11434`.  Both
-/// the OpenAI-compatible `/v1` base URL and the native API host (used for
-/// health checks and model discovery) are derived from the same resolved host
-/// so a configured remote server is honored everywhere.
+/// Ollama — explicitly configured remote GPU inference server.
+/// Resolves the host from settings or `OLLAMA_HOST`; there is no localhost
+/// fallback. Both the OpenAI-compatible `/v1` base URL and the native API host
+/// (used for health checks and model discovery) are derived from the same
+/// resolved host so a configured remote server is honored everywhere.
 ///
-/// When `providers.ollama.options.require_explicit_host` is `true` and no
-/// explicit host is configured (neither settings nor `OLLAMA_HOST`), the
-/// provider will be unavailable — the `localhost:11434` fallback is skipped
-/// to prevent accidental CPU inference.
+/// When no valid remote host is configured, the provider points at an
+/// unroutable address and its native host is `None`, so it cannot silently run
+/// inference on a local CPU.
 pub fn ollama() -> OpenAiCompatProvider {
     let native_host = clawde_core::config::resolve_ollama_host();
     let base_url = native_host
@@ -137,7 +135,7 @@ pub fn custom_openai() -> OpenAiCompatProvider {
         .get("custom-openai")
         .and_then(|config| config.api_base.as_deref())
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or("http://localhost:11434/v1");
+        .unwrap_or("http://127.0.0.1:1/v1");
 
     custom_openai_with_url(base_url)
 }
