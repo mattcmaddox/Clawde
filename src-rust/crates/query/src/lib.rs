@@ -290,6 +290,27 @@ pub struct TurnObservability {
     pub fallback_used: bool,
 }
 
+/// F1 (free-mode audit fix): decide whether a `provider/model` dispatch to a
+/// free-catalog upstream (e.g. `groq/llama-3.3-70b-versatile`) should route
+/// through the composite free provider's *pinned* route instead of a standalone
+/// upstream client.
+///
+/// Returns `true` when the provider is a free-catalog upstream (not the free
+/// composite itself) AND it has a configured key in the auth store — so a pin
+/// never silently falls through to the router's auto plan when the upstream is
+/// not actually part of the free chain (the direct path then surfaces the
+/// clearer no-credentials error instead).
+fn free_catalog_pin_redirect(provider_id: &str, auth_store: &clawde_core::AuthStore) -> bool {
+    if provider_id == "free"
+        || !clawde_api::providers::free::FREE_CATALOG
+            .iter()
+            .any(|u| u.id == provider_id)
+    {
+        return false;
+    }
+    clawde_api::providers::free::first_free_upstream_key(auth_store, provider_id).is_some()
+}
+
 /// Events emitted by the query loop for the TUI to render.
 #[derive(Debug, Clone)]
 pub enum QueryEvent {
@@ -398,6 +419,8 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
 // Spinner verbs are imported from clawde_core::spinner
+
+const FREE_NO_CREDENTIALS_HINT: &str = "Free mode has no configured upstream keys. Configure the default free router with `clawde -p \"/keys set <upstream> <key>\"` (for example, `/keys set groq gsk_...`), or set GROQ_API_KEY, GOOGLE_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, or another free-upstream key. Use `clawde --check-keys` to validate the store.";
 
 /// Resolve the effective effort level for a turn.
 ///
@@ -527,9 +550,7 @@ pub async fn run_query_loop(
         agent.model.clone().unwrap_or_else(|| config.model.clone())
     } else {
         config.model.clone()
-    };
-
-    // If managed-agent mode is active, override the model to the manager model.
+    }; // If managed-agent mode is active, override the model to the manager model.
     if let Some(ref ma_config) = config.managed_agents {
         if ma_config.enabled && !ma_config.manager_model.is_empty() {
             effective_model = ma_config.manager_model.clone();
@@ -1046,9 +1067,10 @@ pub async fn run_query_loop(
         //   1. Explicit "provider/model" format in the model string
         //   2. config.provider setting (from --provider flag or settings.json)
         //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
+        //   4. Default to free mode ("free") — never anthropic, which is a
+        //      paid-only provider and must be chosen explicitly.
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx
+            let (mut provider_id_str, mut model_id_str) = if let Some(p) = tool_ctx
                 .config
                 .provider
                 .as_deref()
@@ -1133,9 +1155,9 @@ pub async fn run_query_loop(
                     (p.to_string(), m.to_string())
                 } else {
                     // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider =
-                        tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    // to auto-detection below. Anthropic is never the implicit
+                    // fallback — the default is free mode.
+                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("free");
                     (fallback_provider.to_string(), effective_model.clone())
                 }
             } else {
@@ -1166,11 +1188,30 @@ pub async fn run_query_loop(
                         ("anthropic".to_string(), effective_model.clone())
                     }
                 } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    // Fall back to config.provider; unset resolves to free mode
+                    // ("free") — never anthropic (paid-only, explicit choice).
+                    let p = tool_ctx.config.provider.as_deref().unwrap_or("free");
                     (p.to_string(), effective_model.clone())
                 }
             };
+
+            // F1 (free-mode audit fix): an individual free-catalog upstream
+            // selected as `provider/model` — `clawde -m groq/llama-3.3-70b-versatile`,
+            // `/model groq/...`, `--provider groq`, or settings.json — routes
+            // through the composite free provider's *pinned* route instead of a
+            // standalone upstream client. `Route::Pinned` restores the documented
+            // "pin first, then fall through the rest of the chain on transient
+            // errors" behaviour and keeps dispatch telemetry, 5xx/empty-completion
+            // cooldowns and key-ring rotation attached to the free chain. Non-catalog
+            // providers (openai, ollama, azure, ...) keep direct dispatch.
+            //
+            // Redirect only when the pinned upstream actually has a configured key
+            // — otherwise direct dispatch surfaces the clearer no-credentials error
+            // instead of silently routing the pin to the free router's auto plan.
+            if free_catalog_pin_redirect(&provider_id_str, &clawde_core::AuthStore::load()) {
+                model_id_str = format!("{provider_id_str}/{model_id_str}");
+                provider_id_str = "free".to_string();
+            }
 
             // Dispatch through the provider path for non-Anthropic providers,
             // AND for Anthropic when the pre-built client has no API key
@@ -1210,6 +1251,17 @@ pub async fn run_query_loop(
                 };
 
                 let mut provider = runtime_provider.or(registry_provider);
+
+                // The composite free provider is normally pre-registered at
+                // startup (and preserved so its in-memory cooldown / key-ring
+                // state survives between requests). When it is absent — a pinned
+                // free-catalog model on a process whose active provider is
+                // something else — build it on demand so the pin still routes
+                // through the chain (its cooldown/telemetry state loads from the
+                // persisted free-state files).
+                if provider.is_none() && provider_id_str == "free" {
+                    provider = clawde_api::registry::provider_from_config(&tool_ctx.config, "free");
+                }
 
                 // Rebuild providers using the unified base resolver so overrides
                 // from settings/env/defaults are applied consistently.
@@ -1737,16 +1789,29 @@ pub async fn run_query_loop(
                     // Non-Anthropic provider detected but no API key / credentials
                     // available.  Return a clear error instead of silently falling
                     // through to the Anthropic client.
-                    let hint = match provider_id_str.as_str() {
-                        "google" => "Set GOOGLE_API_KEY or run `clawde auth login --provider google`.",
-                        "openai" => "Set OPENAI_API_KEY or run `clawde auth login --provider openai`.",
-                        "groq" => "Set GROQ_API_KEY.",
-                        "mistral" => "Set MISTRAL_API_KEY.",
-                        "deepseek" => "Set DEEPSEEK_API_KEY.",
-                        "xai" => "Set XAI_API_KEY.",
-                        "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.",
-                        "cohere" => "Set COHERE_API_KEY.",
-                        _ => "Set the appropriate API key environment variable or use `clawde auth login`.",
+                    // When the store itself failed to load, the user's keys may
+                    // still be in the file — never claim "no keys configured"
+                    // when the real problem is an unreadable/corrupt store.
+                    let hint = if let Some(err) = clawde_core::AuthStore::load().load_error {
+                        format!(
+                            "Your auth store at {} failed to load — no keys could be read \
+                             from it ({err}). Fix or remove the file and retry; the original \
+                             is backed up before any overwrite.",
+                            clawde_core::AuthStore::path().display()
+                        )
+                    } else {
+                        match provider_id_str.as_str() {
+                            "google" => "Set GOOGLE_API_KEY or run `clawde auth login --provider google`.".to_string(),
+                            "openai" => "Set OPENAI_API_KEY or run `clawde auth login --provider openai`.".to_string(),
+                            "groq" => "Set GROQ_API_KEY.".to_string(),
+                            "mistral" => "Set MISTRAL_API_KEY.".to_string(),
+                            "deepseek" => "Set DEEPSEEK_API_KEY.".to_string(),
+                            "xai" => "Set XAI_API_KEY.".to_string(),
+                            "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.".to_string(),
+                            "cohere" => "Set COHERE_API_KEY.".to_string(),
+                            "free" => FREE_NO_CREDENTIALS_HINT.to_string(),
+                            _ => "Set the appropriate API key environment variable or use `clawde auth login`.".to_string(),
+                        }
                     };
                     error!(
                         provider = %provider_id_str,
@@ -1950,7 +2015,9 @@ pub async fn run_query_loop(
         // no usable entry. All threshold logic below keys off this. (#216)
         let context_window = compact::resolve_context_window(
             config.model_registry.as_deref(),
-            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+            // The effective provider — free mode by default, never implicitly
+            // anthropic (paid-only, explicit choice).
+            tool_ctx.config.selected_provider_id(),
             &config.model,
         );
 
@@ -2580,6 +2647,20 @@ impl StreamHandler for ChannelStreamHandler {
 mod tests {
     use super::*;
     use clawde_api::SystemPrompt;
+    use std::sync::Mutex as StdMutex;
+
+    // Tests that touch process-global env vars (e.g. the free-upstream API-key
+    // fallbacks read by `first_free_upstream_key`) must serialize on this
+    // guard — the same pattern as `crates/core/src/paths.rs::ENV_LOCK` — so
+    // they don't race under `cargo test --workspace`'s parallel runner.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn free_no_credentials_hint_is_headless_actionable() {
+        assert!(FREE_NO_CREDENTIALS_HINT.contains("clawde -p \"/keys set <upstream> <key>\""));
+        assert!(FREE_NO_CREDENTIALS_HINT.contains("GROQ_API_KEY"));
+        assert!(FREE_NO_CREDENTIALS_HINT.contains("--check-keys"));
+    }
 
     #[test]
     fn test_no_unreferenced_pub_functions_in_workspace() {
@@ -3243,8 +3324,6 @@ mod tests {
 
     // ---- Issue #230 (MI-3): in-loop continuation + max-steps degradation -----
 
-    use std::sync::Mutex as StdMutex;
-
     /// A provider double that records, per request, whether the tool set was
     /// empty (i.e. tools were disabled — the max-steps degradation turn) and
     /// replays a scripted response. Drives `run_query_loop` end-to-end.
@@ -3781,6 +3860,48 @@ mod tests {
         );
     }
 
+    // ---- F1: free-catalog pin redirect (audit fix) -------------------------
+
+    #[test]
+    fn free_catalog_pin_redirect_routes_keyed_upstreams() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // `first_free_upstream_key` falls back to env vars, so the negative
+        // assertions below must not be contaminated by a developer's exported
+        // `GROQ_API_KEY` / `HF_TOKEN`.
+        let saved_groq = std::env::var("GROQ_API_KEY").ok();
+        let saved_hf = std::env::var("HF_TOKEN").ok();
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("HF_TOKEN");
+
+        let mut store = clawde_core::AuthStore::default();
+        store.set(
+            "groq",
+            clawde_core::StoredCredential::ApiKey {
+                key: "test-groq-key-1234567890".to_string(),
+            },
+        );
+        // A free-catalog upstream with a configured key redirects to the free
+        // composite's pinned route.
+        assert!(free_catalog_pin_redirect("groq", &store));
+        // The composite itself is never a redirect target.
+        assert!(!free_catalog_pin_redirect("free", &store));
+        // Non-catalog providers keep direct dispatch.
+        assert!(!free_catalog_pin_redirect("openai", &store));
+        // A free-catalog upstream WITHOUT a key does not redirect — the direct
+        // path surfaces the clearer no-credentials error instead of silently
+        // routing the pin to the router's auto plan.
+        let empty = clawde_core::AuthStore::default();
+        assert!(!free_catalog_pin_redirect("groq", &empty));
+        assert!(!free_catalog_pin_redirect("huggingface", &empty));
+
+        if let Some(v) = saved_groq {
+            std::env::set_var("GROQ_API_KEY", v);
+        }
+        if let Some(v) = saved_hf {
+            std::env::set_var("HF_TOKEN", v);
+        }
+    }
+
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
     /// turn — the default `StopPolicy` never continues the loop.
     #[tokio::test]
@@ -4160,18 +4281,22 @@ mod tests {
         ctx.permission_handler = Arc::new(AllowAllHandler);
         ctx.non_interactive = true;
 
-        let mut verify = clawde_core::config::VerifyConfig::default();
-        verify.enabled = true;
-        verify.auto_test = true;
-        verify.auto_lint = false;
-        verify.timeout_secs = 30;
-        let mut config = QueryConfig::default();
-        config.model = "mock-model".to_string();
-        config.max_turns = 3;
-        config.provider_registry = Some(Arc::new(registry));
-        config.continuation = crate::continuation::ContinuationMode::SemanticVerify(verify);
-        config.semantic_verify_runner = Some(verifier);
-        config.semantic_fix_runner = Some(fixer);
+        let verify = clawde_core::config::VerifyConfig {
+            enabled: true,
+            auto_test: true,
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 3,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::SemanticVerify(verify),
+            semantic_verify_runner: Some(verifier),
+            semantic_fix_runner: Some(fixer),
+            ..Default::default()
+        };
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut messages = vec![Message::user("write a generated fixture file")];

@@ -30,6 +30,12 @@ impl Tool for LspTool {
         PermissionLevel::ReadOnly
     }
 
+    fn network_capable(&self) -> bool {
+        // Configured language servers may be external processes or remote
+        // endpoints, so isolated mode must not start or query them.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",

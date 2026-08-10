@@ -79,12 +79,21 @@ impl Tool for McpToolWrapper {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // An MCP server may make arbitrary network calls, regardless of whether
+        // its advertised tool looks read-only.
+        true
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         self.tool_def.input_schema.clone()
     }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let desc = format!("Run MCP tool {}", self.tool_def.name);
+        if let Err(e) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
+            return ToolResult::error(e.to_string());
+        }
         if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
             return ToolResult::error(e.to_string());
         }
@@ -271,7 +280,8 @@ struct Cli {
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,
 
-    /// LLM provider to use (default: anthropic). Examples: openai, google, ollama
+    /// LLM provider to use (default: free — free-mode auto routing across your
+    /// configured upstreams). Examples: free, openai, google, ollama
     #[arg(long, env = "CLAWDE_PROVIDER")]
     provider: Option<String>,
 
@@ -286,6 +296,11 @@ struct Cli {
     /// List all available models from the bundled registry and exit
     #[arg(long = "list-models", action = clap::ArgAction::SetTrue)]
     list_models: bool,
+
+    /// Validate the credential + settings stores and exit (0 = OK, 1 = a
+    /// store failed to load). For CI and shell scripts.
+    #[arg(long = "check-keys", action = clap::ArgAction::SetTrue)]
+    check_keys: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -410,6 +425,17 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: `clawde accounts` — list all stored accounts across providers.
     if raw_args.get(1).map(|s| s.as_str()) == Some("accounts") {
         handle_accounts_command(&raw_args[2..]);
+        return Ok(());
+    }
+
+    // Fast-path: `clawde --check-keys` — validate the credential + settings
+    // stores headlessly and exit non-zero when either failed to load.
+    if raw_args.iter().any(|a| a == "--check-keys") {
+        let (report, problems) = clawde_commands::auth_store_doctor_report();
+        println!("{report}");
+        if problems {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -666,17 +692,22 @@ async fn main() -> anyhow::Result<()> {
         config.provider = Some(p.clone());
     }
     if let Some(base) = &cli.api_base {
-        // Store in the provider's config entry
-        let provider_id = config
-            .provider
-            .clone()
-            .unwrap_or_else(|| "anthropic".to_string());
+        // Store in the effective provider's config entry (the active provider —
+        // free mode by default, never implicitly anthropic).
+        let provider_id = config.selected_provider_id().to_string();
         config
             .provider_configs
             .entry(provider_id)
             .or_default()
             .api_base = Some(base.clone());
     }
+
+    // Sync the mode before constructing providers or tools. In isolated mode
+    // this removes network-capable tools immediately and also makes the global
+    // dispatcher backstop effective for headless CLI runs.
+    clawde_core::set_ollama_network_blocked(
+        config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated,
+    );
 
     // --list-models fast path: print all models and exit
     if cli.list_models {
@@ -716,6 +747,17 @@ async fn main() -> anyhow::Result<()> {
     // Determine mode early (needed for auth error handling and permission handler selection).
     let is_headless = cli.print || cli.prompt.is_some();
 
+    // Once-per-run headless banner: a corrupt auth/settings store would
+    // otherwise only surface as repeated WARN lines or a failing request. The
+    // TUI shows a startup dialog instead; here the report goes to stderr so
+    // the stdout stream stays clean for the model output.
+    if is_headless {
+        let (report, problems) = clawde_commands::auth_store_doctor_report();
+        if problems {
+            eprintln!("\n{report}\n");
+        }
+    }
+
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
     // If no Anthropic credentials are found, check whether any other provider is
@@ -728,14 +770,19 @@ async fn main() -> anyhow::Result<()> {
             Some(auth) => auth,
             None => {
                 if is_headless {
+                    // Free mode first — it is the default and the cheapest path
+                    // to a working setup. Anthropic is paid-only and listed last.
                     anyhow::bail!(
                         "No API key found. Options:\n\
-                         - Set ANTHROPIC_API_KEY for Anthropic\n\
-                         - Set OPENAI_API_KEY for OpenAI\n\
-                         - Set GOOGLE_API_KEY for Google Gemini\n\
+                         - Configure free mode (the default): `clawde -p \"/keys set <upstream> <key>\"` \
+                         (e.g. /keys set groq gsk_...) — free tiers from Groq, Cerebras, \
+                         Google, Mistral and more\n\
                          - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
+                         - Set GOOGLE_API_KEY for Google Gemini\n\
+                         - Set OPENAI_API_KEY for OpenAI\n\
                          - Run `clawde --provider ollama` for local models (no key needed)\n\
-                         - Run `clawde auth login` for Anthropic OAuth"
+                         - Set ANTHROPIC_API_KEY for Anthropic (paid)\n\
+                         - Run `clawde auth login` for Anthropic OAuth (paid)"
                     );
                 } else {
                     (String::new(), false)
@@ -762,9 +809,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Build provider registry: auto-registers all env-configured providers
     // AND providers with keys stored in ~/.clawde/auth.json (from /connect).
-    // Anthropic is always the default; additional providers (OpenAI, Google,
-    // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
-    // their respective environment variables or auth store entries are found.
+    // Free Mode (`free/auto`) is the default; additional providers (including
+    // Anthropic, OpenAI, Google, Bedrock, Azure, Copilot, Cohere, and local
+    // providers) are registered when their credentials are found.
     let provider_registry = clawde_api::ProviderRegistry::from_config(&config, client_config);
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
@@ -840,7 +887,13 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    let mcp_manager_arc = if config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated {
+        // Isolated mode must not launch HTTP or stdio MCP servers at startup;
+        // they are arbitrary network/process capabilities, not merely tools.
+        None
+    } else {
+        connect_mcp_manager_arc(&mcp_decision.allowed).await
+    };
 
     let pending_permissions = Arc::new(ParkingMutex::new(
         clawde_tools::PendingPermissionStore::default(),
@@ -1104,19 +1157,28 @@ async fn connect_mcp_manager_arc(
 fn build_tools_with_mcp_vec(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
 ) -> Vec<Box<dyn clawde_tools::Tool>> {
-    let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools();
+    let network_blocked = clawde_core::is_ollama_network_blocked();
+    let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
+        .into_iter()
+        .filter(|tool| !network_blocked || !tool.network_capable())
+        .collect();
     v.push(Box::new(clawde_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
+        if !network_blocked {
+            for (server_name, tool_def) in manager_arc.all_tool_definitions() {
+                let wrapper = McpToolWrapper {
+                    tool_def,
+                    server_name,
+                    manager: manager_arc.clone(),
+                };
+                v.push(Box::new(wrapper));
+            }
         }
-        debug!(total_tools = v.len(), "MCP tools registered");
+        debug!(
+            total_tools = v.len(),
+            network_blocked, "MCP tools registered"
+        );
     }
 
     v
@@ -1680,6 +1742,7 @@ fn filter_tools_for_agent(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
     use clawde_tools::PermissionLevel as PL;
+    let network_blocked = clawde_core::is_ollama_network_blocked();
     match access {
         "read-only" => {
             // Collect names first because `Box<dyn Tool>` is not Clone. Rebuild
@@ -1687,6 +1750,7 @@ fn filter_tools_for_agent(
             // are preserved when the active mode changes.
             let allowed_names: Vec<String> = tools
                 .iter()
+                .filter(|t| !network_blocked || !t.network_capable())
                 .filter(|t| {
                     (matches!(t.permission_level(), PL::ReadOnly | PL::None)
                         || t.name() == "AskUserQuestion")
@@ -1707,10 +1771,19 @@ fn filter_tools_for_agent(
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| SEARCH_TOOLS.contains(&t.name()))
+                .filter(|t| !network_blocked || !t.network_capable())
                 .collect();
             Arc::new(filtered)
         }
-        _ => tools, // "full" — allow all tools unchanged
+        _ => {
+            if network_blocked {
+                // Rebuild from the same runtime registry because the Arc holds
+                // boxed trait objects that cannot be moved out by value.
+                Arc::new(build_tools_with_mcp_vec(mcp_manager))
+            } else {
+                tools
+            }
+        } // "full" — allow all tools unchanged
     }
 }
 
@@ -1869,6 +1942,9 @@ async fn run_headless(
     let mut full_text = String::new();
     let mut semantic_report: Option<clawde_query::SemanticVerifyReport> = None;
     let mut status_messages: Vec<String> = Vec::new();
+    // F3 (audit fix): capture which provider/upstream/model actually served the
+    // last turn so headless output can report it.
+    let mut turn_observability: Option<clawde_query::TurnObservability> = None;
 
     while let Some(event) = event_rx.recv().await {
         match &event {
@@ -1876,6 +1952,14 @@ async fn run_headless(
                 delta: clawde_api::streaming::ContentDelta::TextDelta { text },
                 ..
             }) => {
+                // F4 (audit fix): free-mode empty-completion retry placeholders
+                // ("(no response from <upstream>/<model> …)") are status, not
+                // content — keep them out of the answer on stdout / JSON.
+                // Interactive TUI and transcript behaviour are unchanged.
+                if text.starts_with("(no response from ") {
+                    status_messages.push(text.clone());
+                    continue;
+                }
                 full_text.push_str(text);
                 if !is_json_output {
                     print!("{}", text);
@@ -1886,6 +1970,13 @@ async fn run_headless(
                     println!("{}", chunk);
                 }
             }
+            QueryEvent::TurnComplete {
+                observability: Some(obs),
+                ..
+            } => {
+                turn_observability = Some(obs.clone());
+            }
+            QueryEvent::TurnComplete { .. } => {}
             QueryEvent::ToolStart { tool_name, .. } => {
                 if !is_json_output {
                     eprintln!("\n[{}...]", tool_name);
@@ -1964,6 +2055,9 @@ async fn run_headless(
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
                     },
                     "cost_usd": cost_tracker.total_cost_usd(),
+                    "provider": turn_observability.as_ref().map(|o| o.provider_id.clone()),
+                    "upstream": turn_observability.as_ref().and_then(|o| o.upstream_id.clone()),
+                    "model": turn_observability.as_ref().map(|o| o.model.clone()),
                     "semantic_verify": semantic_report,
                     "status": status_messages,
                 });
@@ -2001,6 +2095,16 @@ async fn run_headless(
         CliOutputFormat::Text => {
             // Streaming text was already printed; add newline
             println!();
+            // F3 (audit fix): report which provider/upstream/model actually
+            // served the request — free/auto users could not tell which
+            // upstream answered (or that a fallback happened).
+            if let Some(obs) = &turn_observability {
+                let served = match &obs.upstream_id {
+                    Some(up) => format!("{} via {}", obs.model, up),
+                    None => obs.model.clone(),
+                };
+                eprintln!("Model: {served}");
+            }
             if verbose {
                 // Cost readout only when nonzero — free models price at $0.00.
                 let mut summary = format!(
@@ -3917,8 +4021,21 @@ async fn run_interactive(
                         continue;
                     }
 
+                    let previous_ollama_mode = app.ollama_mode;
                     app.handle_key_event(key);
                     cmd_ctx.config = app.config.clone();
+                    if app.ollama_mode != previous_ollama_mode {
+                        // `/ollama` changes the active capability boundary. Rebuild
+                        // both the full registry and the current agent-filtered
+                        // slice so tools disappear/return immediately.
+                        all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone());
+                        tools_arc = tools_for_agent_mode(
+                            all_tools_arc.clone(),
+                            app.agent_mode.as_deref(),
+                            &cmd_ctx.config,
+                            tool_ctx.mcp_manager.clone(),
+                        );
+                    }
                     tool_ctx.config = app.config.clone();
                     // The task-routing dialog (/routing edit) writes pins and
                     // flips the strategy directly into app.config; rebuild the

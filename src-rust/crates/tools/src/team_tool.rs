@@ -219,6 +219,11 @@ impl Tool for TeamCreateTool {
         PermissionLevel::Write
     }
 
+    fn network_capable(&self) -> bool {
+        // Team members may run network-capable tools and call remote models.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -498,6 +503,11 @@ impl Tool for TeamDeleteTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Write
+    }
+
+    fn network_capable(&self) -> bool {
+        // Team members may run network-capable tools and call remote models.
+        true
     }
 
     fn input_schema(&self) -> Value {

@@ -39,6 +39,9 @@ pub enum InvalidConfigKind {
     #[default]
     Settings,
     ClaudeMd,
+    /// The credential store (`auth.json`) failed to load — keys may be
+    /// present but invisible.
+    AuthStore,
     Generic,
 }
 
@@ -64,6 +67,20 @@ impl InvalidConfigDialogState {
         Self {
             visible: true,
             kind: InvalidConfigKind::ClaudeMd,
+            error_message: error.to_string(),
+            scroll: 0,
+            last_rect: Cell::new(Rect::default()),
+        }
+    }
+
+    /// Show the dialog with an auth-store load error. Shown once at startup
+    /// when `~/.clawde/auth.json` is unreadable or corrupt, so the user never
+    /// sees a misleading "no keys configured" while their keys sit in a file
+    /// that failed to parse.
+    pub fn show_auth_store_error(error: &str) -> Self {
+        Self {
+            visible: true,
+            kind: InvalidConfigKind::AuthStore,
             error_message: error.to_string(),
             scroll: 0,
             last_rect: Cell::new(Rect::default()),
@@ -110,6 +127,7 @@ pub fn render_invalid_config_dialog(
     let title = match state.kind {
         InvalidConfigKind::Settings => " Invalid Settings ",
         InvalidConfigKind::ClaudeMd => " Invalid AGENTS.md ",
+        InvalidConfigKind::AuthStore => " Invalid Auth Store ",
         InvalidConfigKind::Generic => " Configuration Error ",
     };
 
@@ -131,6 +149,7 @@ pub fn render_invalid_config_dialog(
     let subtitle = match state.kind {
         InvalidConfigKind::Settings => "~/.clawde/settings.json could not be parsed.",
         InvalidConfigKind::ClaudeMd => "AGENTS.md could not be parsed.",
+        InvalidConfigKind::AuthStore => "The credential store (auth.json) could not be parsed.",
         InvalidConfigKind::Generic => "A configuration file could not be parsed.",
     };
     lines.push(Line::from(vec![Span::styled(
@@ -169,6 +188,13 @@ pub fn render_invalid_config_dialog(
             "  1. Open the AGENTS.md file shown above in a text editor.",
             "  2. Fix the syntax error.",
             "  3. Restart Clawde.",
+        ],
+        InvalidConfigKind::AuthStore => vec![
+            "  1. Fix or remove the auth.json file shown above.",
+            "  2. Whichever keys still parsed are already in use.",
+            "  3. The original file is backed up as auth.json.corrupt-<timestamp>",
+            "     before any overwrite, so recoverable keys are never lost.",
+            "  4. Run /keys doctor for a full health report.",
         ],
         InvalidConfigKind::Generic => vec![
             "  1. Fix the configuration file shown above.",
@@ -226,6 +252,37 @@ mod tests {
         assert!(state.visible);
         assert_eq!(state.kind, InvalidConfigKind::Settings);
         assert!(state.error_message.contains("unexpected token"));
+    }
+
+    #[test]
+    fn invalid_config_dialog_show_auth_store_error() {
+        let state = InvalidConfigDialogState::show_auth_store_error("auth store is corrupt");
+        assert!(state.visible);
+        assert_eq!(state.kind, InvalidConfigKind::AuthStore);
+        assert!(state.error_message.contains("auth store is corrupt"));
+    }
+
+    #[test]
+    fn invalid_config_dialog_renders_auth_store_kind() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let state = InvalidConfigDialogState::show_auth_store_error("recovered 1 credential(s)");
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_invalid_config_dialog(frame, &state, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(content.contains("Invalid Auth Store"), "content: {content}");
+        assert!(content.contains("recovered 1 credential(s)"));
+        assert!(content.contains("/keys doctor"));
     }
 
     #[test]

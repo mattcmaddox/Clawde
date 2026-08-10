@@ -284,6 +284,10 @@ impl Tool for WebFetchTool {
         PermissionLevel::ReadOnly
     }
 
+    fn network_capable(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

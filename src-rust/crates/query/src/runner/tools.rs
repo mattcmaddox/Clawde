@@ -101,6 +101,10 @@ fn plan_gate_error(
 }
 
 /// Execute a single tool invocation.
+///
+/// Test-only convenience wrapper (the query loop dispatches through
+/// `execute_tool_for_task` with a task classification).
+#[cfg(test)]
 pub(crate) async fn execute_tool(
     name: &str,
     input: &Value,
@@ -130,6 +134,17 @@ pub(crate) async fn execute_tool_for_task(
             if let Some(blocked) = plan_gate_error(tool.name(), ctx, active_task_id) {
                 warn!(tool = tool.name(), "Tool blocked by plan-artifact gate");
                 return blocked;
+            }
+
+            // Isolated Ollama mode is a hard boundary for outbound tools. Keep
+            // this before the permission handler so bypass/allow rules cannot
+            // turn an offline session back into an online one.
+            if clawde_core::is_ollama_network_blocked() && tool.network_capable() {
+                warn!(tool = tool.name(), "Tool blocked by isolated Ollama mode");
+                return ToolResult::error(format!(
+                    "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
+                    tool.name()
+                ));
             }
 
             // Central permission backstop (issue #210): if a tool does not gate

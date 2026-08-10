@@ -287,6 +287,12 @@ impl Tool for CronCreateTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // A scheduled agent can execute later, outside the current offline
+        // boundary, so isolated mode must not create one.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

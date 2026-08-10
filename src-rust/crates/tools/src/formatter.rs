@@ -5,6 +5,11 @@ use crate::ToolContext;
 /// Try to format a file using any configured formatter.
 /// Returns silently if no formatter is configured or the formatter fails.
 pub async fn try_format_file(path: &str, ctx: &ToolContext) {
+    // Formatters are user-configured subprocesses and may invoke package
+    // managers or network clients. Never run them in isolated/offline mode.
+    if clawde_core::is_ollama_network_blocked() {
+        return;
+    }
     let formatters = &ctx.config.formatter;
     if formatters.is_empty() {
         return;

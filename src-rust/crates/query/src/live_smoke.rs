@@ -374,9 +374,11 @@ const PRODUCTION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// `set_provider_default("free")` equivalent). The runner refuses any
 /// other provider.
 fn production_tool_context(fixture: &Path) -> clawde_tools::ToolContext {
-    let mut config = clawde_core::config::Config::default();
-    config.provider = Some("free".to_string());
-    config.model = Some("free/auto".to_string());
+    let config = clawde_core::config::Config {
+        provider: Some("free".to_string()),
+        model: Some("free/auto".to_string()),
+        ..Default::default()
+    };
     clawde_tools::ToolContext {
         working_dir: fixture.to_path_buf(),
         permission_mode: clawde_core::config::PermissionMode::Default,
@@ -708,27 +710,30 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
         verdict.to_string()
     });
     let semantic = policy.semantic_report();
-    let info = captured.lock().expect("live smoke info lock");
 
-    let mut report = LiveSmokeReport {
-        schema_version: SMOKE_SCHEMA_VERSION,
-        ok: false,
-        deterministic_verdict,
-        verdict: None,
-        summary: None,
-        findings: Vec::new(),
-        model: info.model.clone(),
-        routing_strategy: info.routing_strategy.clone(),
-        latency_ms,
-        prompt_chars: info.prompt_chars,
-        response_chars: info.response_chars,
-        raw_excerpt: info.raw_excerpt.clone(),
-        direct_error: None,
-        production: None,
-        fix: None,
-        error: None,
+    // Scope the captured lock so the guard is dropped before any `.await`
+    // below (clippy::await_holding_lock).
+    let mut report = {
+        let info = captured.lock().expect("live smoke info lock");
+        LiveSmokeReport {
+            schema_version: SMOKE_SCHEMA_VERSION,
+            ok: false,
+            deterministic_verdict,
+            verdict: None,
+            summary: None,
+            findings: Vec::new(),
+            model: info.model.clone(),
+            routing_strategy: info.routing_strategy.clone(),
+            latency_ms,
+            prompt_chars: info.prompt_chars,
+            response_chars: info.response_chars,
+            raw_excerpt: info.raw_excerpt.clone(),
+            direct_error: None,
+            production: None,
+            fix: None,
+            error: None,
+        }
     };
-    drop(info);
 
     if let Err(elapsed) = outcome {
         report.error = Some(format!("live smoke timed out after {elapsed:?}"));

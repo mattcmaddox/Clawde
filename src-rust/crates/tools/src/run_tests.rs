@@ -178,6 +178,12 @@ impl Tool for RunTestsTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // Explicit test commands can install dependencies or call arbitrary
+        // network clients; keep strict isolated mode fail-closed.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

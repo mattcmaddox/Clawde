@@ -76,6 +76,12 @@ impl Tool for EnterWorktreeTool {
         PermissionLevel::Write
     }
 
+    fn network_capable(&self) -> bool {
+        // post_create_command is arbitrary shell code and may reach the
+        // network, even though the worktree operation itself is local.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -333,6 +339,12 @@ impl Tool for ExitWorktreeTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::Write
+    }
+
+    fn network_capable(&self) -> bool {
+        // post_create_command is arbitrary shell code and may reach the
+        // network, even though the worktree operation itself is local.
+        true
     }
 
     fn input_schema(&self) -> Value {

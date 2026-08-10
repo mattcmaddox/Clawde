@@ -689,6 +689,12 @@ impl Tool for PtyBashTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // A shell can invoke curl, package managers, or arbitrary network
+        // clients, so isolated mode must remove it from the active tool set.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

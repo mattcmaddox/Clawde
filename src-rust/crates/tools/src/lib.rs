@@ -379,6 +379,7 @@ impl ToolContext {
         &self,
         request: PermissionRequest,
     ) -> Result<(), clawde_core::error::ClaudeError> {
+        self.ensure_network_allowed(&request.tool_name)?;
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
@@ -423,6 +424,38 @@ impl ToolContext {
                 request.tool_name
             ))),
         }
+    }
+
+    /// Reject a network-capable tool when Ollama is in isolated mode.
+    ///
+    /// This is intentionally separate from the permission handler: bypass mode
+    /// can skip ordinary permission decisions, but it must not re-enable online
+    /// tools in an isolated session.
+    pub fn ensure_network_allowed(
+        &self,
+        tool_name: &str,
+    ) -> Result<(), clawde_core::error::ClaudeError> {
+        self.ensure_network_allowed_for_tool(tool_name, known_network_capability(tool_name))
+    }
+
+    /// Enforce the isolated-mode boundary using the tool's capability metadata.
+    ///
+    /// The dispatcher calls this with `Tool::network_capable()`. Self-gating
+    /// tools must call it with `true` when they can execute arbitrary code or
+    /// otherwise reach the network, so bypass permissions cannot turn an
+    /// isolated session back online.
+    pub fn ensure_network_allowed_for_tool(
+        &self,
+        tool_name: &str,
+        network_capable: bool,
+    ) -> Result<(), clawde_core::error::ClaudeError> {
+        if clawde_core::is_ollama_network_blocked() && network_capable {
+            return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
+                "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
+                tool_name
+            )));
+        }
+        Ok(())
     }
 
     /// Check permissions for a tool invocation.
@@ -531,6 +564,30 @@ impl ToolContext {
     }
 }
 
+/// Conservative fallback for direct permission paths that only have a tool
+/// name rather than a `Tool` trait object. The dispatcher always uses the
+/// capability-aware method above; dynamic MCP wrappers pass `true` explicitly.
+fn known_network_capability(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "WebSearch"
+            | "WebFetch"
+            | "RemoteTrigger"
+            | "Bash"
+            | "PowerShell"
+            | "REPL"
+            | "LSP"
+            | "ListMcpResources"
+            | "ReadMcpResource"
+            | "Agent"
+            | "TeamCreate"
+            | "RunTests"
+            | "RunLints"
+            | "EnterWorktree"
+            | "CronCreate"
+    )
+}
+
 /// The trait every tool must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -542,6 +599,16 @@ pub trait Tool: Send + Sync {
 
     /// The permission level the tool requires.
     fn permission_level(&self) -> PermissionLevel;
+
+    /// Whether this tool can make an outbound network request.
+    ///
+    /// Isolated Ollama mode removes these tools from the active tool set and
+    /// the query dispatcher rejects them as a second, bypass-resistant
+    /// backstop. Keep this capability metadata conservative: a false negative
+    /// would expose an online side effect to offline mode.
+    fn network_capable(&self) -> bool {
+        false
+    }
 
     /// Whether this tool performs its own permission gating inside `execute()`.
     ///
@@ -756,6 +823,36 @@ mod tests {
                 names.insert(tool.name().to_string()),
                 "Duplicate tool name: {}",
                 tool.name()
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_mode_marks_indirect_network_capabilities() {
+        let names: std::collections::HashSet<String> = all_tools()
+            .into_iter()
+            .filter(|tool| tool.network_capable())
+            .map(|tool| tool.name().to_string())
+            .collect();
+        for name in [
+            "Bash",
+            "PowerShell",
+            "REPL",
+            "WebSearch",
+            "WebFetch",
+            "RemoteTrigger",
+            "LSP",
+            "ListMcpResources",
+            "ReadMcpResource",
+            "RunTests",
+            "RunLints",
+            "EnterWorktree",
+            "CronCreate",
+            "TeamCreate",
+        ] {
+            assert!(
+                names.contains(name),
+                "missing network capability for {name}"
             );
         }
     }

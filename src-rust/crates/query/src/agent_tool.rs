@@ -107,10 +107,14 @@ pub fn build_agent_tools(
     allowed: Option<&[String]>,
     exclude_agent_tool: bool,
 ) -> Vec<Box<dyn Tool>> {
+    let network_blocked = clawde_core::is_ollama_network_blocked();
     clawde_tools::all_tools()
         .into_iter()
         .filter(|tool| {
             if exclude_agent_tool && tool.name() == clawde_core::constants::TOOL_NAME_AGENT {
+                return false;
+            }
+            if network_blocked && tool.network_capable() {
                 return false;
             }
             allowed.is_none_or(|allowed| allowlisted_tool_name(allowed, tool.name()))
@@ -148,6 +152,7 @@ fn bounded_semantic_turns(turns: u32, default: u32) -> u32 {
     }
 }
 
+#[cfg(test)]
 fn semantic_verify_input_for_config(
     request: &crate::continuation::SemanticVerifyRequest,
     config: &clawde_core::config::Config,
@@ -243,6 +248,7 @@ pub fn semantic_verify_runner(
 /// apply the reported fixes, plus the verdict context (summary + findings +
 /// spec + bounded diff). The response is a prose change summary — no JSON
 /// contract required.
+#[cfg(test)]
 fn semantic_fix_input_for_config(
     request: &crate::continuation::SemanticFixRequest,
     config: &clawde_core::config::Config,
@@ -423,6 +429,12 @@ impl Tool for AgentTool {
         PermissionLevel::None
     }
 
+    fn network_capable(&self) -> bool {
+        // A sub-agent can otherwise reconstruct a full tool set and reach
+        // providers or network-capable tools outside the parent call.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -470,6 +482,12 @@ impl Tool for AgentTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        // AgentTool can be called directly by semantic runners and other
+        // internal paths, so do not rely solely on the outer dispatcher.
+        if let Err(e) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
+            return ToolResult::error(e.to_string());
+        }
+
         let params: AgentInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -647,10 +665,7 @@ impl Tool for AgentTool {
             let _ = clawde_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
-            let agent_tools_bg: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
-                .into_iter()
-                .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
-                .collect();
+            let agent_tools_bg = build_agent_tools(None, true);
 
             let client_bg = client.clone();
             let ctx_bg = ctx.clone();
@@ -781,6 +796,143 @@ impl Tool for AgentTool {
 // Helper: convert a QueryOutcome into a result string for background agents
 // ---------------------------------------------------------------------------
 
+fn format_outcome(outcome: QueryOutcome) -> String {
+    match outcome {
+        QueryOutcome::EndTurn { message, .. } => message.get_all_text(),
+        QueryOutcome::MaxTokens {
+            partial_message, ..
+        } => format!(
+            "{}\n\n[Note: Agent hit max_tokens limit]",
+            partial_message.get_all_text()
+        ),
+        QueryOutcome::Cancelled => "[Agent was cancelled]".to_string(),
+        QueryOutcome::Error(e) => format!("[Agent error: {}]", e),
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => format!(
+            "[Agent stopped: budget ${:.4} exceeded (limit ${:.4})]",
+            cost_usd, limit_usd
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Team swarm runner injection
+// ---------------------------------------------------------------------------
+//
+// Called once at process startup (e.g. from main.rs) to inject a real agent
+// runner into cc-tools so that TeamCreateTool can spawn sub-agents via
+// run_query_loop without creating a circular crate dependency.
+
+/// Register the cc-query-backed agent runner with cc-tools.
+///
+/// After this call, `TeamCreateTool` will actually invoke `run_query_loop` for
+/// each agent instead of returning stub output.
+///
+/// # Panics
+/// Panics if the runner was already registered.
+pub fn init_team_swarm_runner() {
+    let runner: clawde_tools::AgentRunFn = Arc::new(
+        |description: String,
+         prompt: String,
+         tools: Option<Vec<String>>,
+         system: Option<String>,
+         max_turns: Option<u32>,
+         ctx: Arc<clawde_tools::ToolContext>| {
+            // We must return a Pin<Box<dyn Future<...> + Send>>.
+            Box::pin(async move {
+                let anthropic_key = ctx.config.resolve_anthropic_api_key().unwrap_or_default();
+                let anthropic_base = ctx.config.resolve_anthropic_api_base();
+                let client =
+                    match clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+                        api_key: anthropic_key.clone(),
+                        api_base: anthropic_base,
+                        ..Default::default()
+                    }) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            return format!(
+                                "[Agent '{}' failed to create client: {}]",
+                                description, e
+                            )
+                        }
+                    };
+
+                let provider_registry = ProviderRegistry::from_config(
+                    &ctx.config,
+                    clawde_api::client::ClientConfig {
+                        api_key: anthropic_key,
+                        api_base: ctx.config.resolve_anthropic_api_base(),
+                        ..Default::default()
+                    },
+                );
+                let model_registry = Arc::new(build_model_registry());
+
+                // Build the tool list, filtering to the allowlist if provided.
+                let agent_tools = build_agent_tools(tools.as_deref(), true);
+
+                let model = resolve_subagent_model(
+                    &AgentInput {
+                        description: description.clone(),
+                        prompt: prompt.clone(),
+                        tools: tools.clone(),
+                        system_prompt: system.clone(),
+                        max_turns,
+                        model: None,
+                        isolation: None,
+                        run_in_background: false,
+                    },
+                    &ctx,
+                );
+
+                let system_prompt = system.unwrap_or_else(|| {
+                    "You are a specialized AI agent helping with a specific sub-task. \
+                     Complete the task thoroughly and return your findings."
+                        .to_string()
+                });
+
+                let query_config = crate::QueryConfig {
+                    model,
+                    max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
+                    max_turns: max_turns.unwrap_or(10),
+                    system_prompt: Some(system_prompt),
+                    working_directory: Some(ctx.working_dir.display().to_string()),
+                    output_style: ctx.config.effective_output_style(),
+                    output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    provider_registry: Some(Arc::new(provider_registry)),
+                    model_registry: Some(model_registry),
+                    // Progressive tool disclosure (issue #233): only emit
+                    // per-tool guidance for tools this team sub-agent has.
+                    enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+                    ..Default::default()
+                };
+
+                // Child of the parent's token so a parent cancel propagates into
+                // this team sub-agent as well (issue #218).
+                let cancel = ctx.cancel_token.child_token();
+                let mut messages = vec![clawde_core::types::Message::user(prompt)];
+                let outcome = crate::run_query_loop(
+                    client.as_ref(),
+                    &mut messages,
+                    &agent_tools,
+                    &ctx,
+                    &query_config,
+                    ctx.cost_tracker.clone(),
+                    None,
+                    cancel,
+                    None,
+                )
+                .await;
+
+                format_outcome(outcome)
+            }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
+        },
+    );
+
+    clawde_tools::register_agent_runner(runner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,8 +995,10 @@ mod tests {
 
     #[test]
     fn semantic_verify_runner_refuses_non_free_providers() {
-        let mut config = clawde_core::config::Config::default();
-        config.provider = Some("anthropic".to_string());
+        let config = clawde_core::config::Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
         let ctx = test_context(config);
         assert!(
             semantic_verify_runner(ctx).is_none(),
@@ -986,8 +1140,10 @@ mod tests {
 
     #[test]
     fn semantic_fix_runner_refuses_non_free_providers() {
-        let mut config = clawde_core::config::Config::default();
-        config.provider = Some("anthropic".to_string());
+        let config = clawde_core::config::Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
         let ctx = test_context(config);
         assert!(semantic_fix_runner(ctx).is_none());
     }
@@ -1035,141 +1191,4 @@ mod tests {
         assert!(prompt.contains("Apply the minimal fix"));
         assert!(prompt.contains("Do not run commands"));
     }
-}
-
-fn format_outcome(outcome: QueryOutcome) -> String {
-    match outcome {
-        QueryOutcome::EndTurn { message, .. } => message.get_all_text(),
-        QueryOutcome::MaxTokens {
-            partial_message, ..
-        } => format!(
-            "{}\n\n[Note: Agent hit max_tokens limit]",
-            partial_message.get_all_text()
-        ),
-        QueryOutcome::Cancelled => "[Agent was cancelled]".to_string(),
-        QueryOutcome::Error(e) => format!("[Agent error: {}]", e),
-        QueryOutcome::BudgetExceeded {
-            cost_usd,
-            limit_usd,
-        } => format!(
-            "[Agent stopped: budget ${:.4} exceeded (limit ${:.4})]",
-            cost_usd, limit_usd
-        ),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Team swarm runner injection
-// ---------------------------------------------------------------------------
-//
-// Called once at process startup (e.g. from main.rs) to inject a real agent
-// runner into cc-tools so that TeamCreateTool can spawn sub-agents via
-// run_query_loop without creating a circular crate dependency.
-
-/// Register the cc-query-backed agent runner with cc-tools.
-///
-/// After this call, `TeamCreateTool` will actually invoke `run_query_loop` for
-/// each agent instead of returning stub output.
-///
-/// # Panics
-/// Panics if the runner was already registered.
-pub fn init_team_swarm_runner() {
-    let runner: clawde_tools::AgentRunFn = Arc::new(
-        |description: String,
-         prompt: String,
-         tools: Option<Vec<String>>,
-         system: Option<String>,
-         max_turns: Option<u32>,
-         ctx: Arc<clawde_tools::ToolContext>| {
-            // We must return a Pin<Box<dyn Future<...> + Send>>.
-            Box::pin(async move {
-                let anthropic_key = ctx.config.resolve_anthropic_api_key().unwrap_or_default();
-                let anthropic_base = ctx.config.resolve_anthropic_api_base();
-                let client =
-                    match clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
-                        api_key: anthropic_key.clone(),
-                        api_base: anthropic_base,
-                        ..Default::default()
-                    }) {
-                        Ok(c) => Arc::new(c),
-                        Err(e) => {
-                            return format!(
-                                "[Agent '{}' failed to create client: {}]",
-                                description, e
-                            )
-                        }
-                    };
-
-                let provider_registry = ProviderRegistry::from_config(
-                    &ctx.config,
-                    clawde_api::client::ClientConfig {
-                        api_key: anthropic_key,
-                        api_base: ctx.config.resolve_anthropic_api_base(),
-                        ..Default::default()
-                    },
-                );
-                let model_registry = Arc::new(build_model_registry());
-
-                // Build the tool list, filtering to the allowlist if provided.
-                let agent_tools = build_agent_tools(tools.as_deref(), true);
-
-                let model = resolve_subagent_model(
-                    &AgentInput {
-                        description: description.clone(),
-                        prompt: prompt.clone(),
-                        tools: tools.clone(),
-                        system_prompt: system.clone(),
-                        max_turns,
-                        model: None,
-                        isolation: None,
-                        run_in_background: false,
-                    },
-                    &ctx,
-                );
-
-                let system_prompt = system.unwrap_or_else(|| {
-                    "You are a specialized AI agent helping with a specific sub-task. \
-                     Complete the task thoroughly and return your findings."
-                        .to_string()
-                });
-
-                let query_config = crate::QueryConfig {
-                    model,
-                    max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
-                    max_turns: max_turns.unwrap_or(10),
-                    system_prompt: Some(system_prompt),
-                    working_directory: Some(ctx.working_dir.display().to_string()),
-                    output_style: ctx.config.effective_output_style(),
-                    output_style_prompt: ctx.config.resolve_output_style_prompt(),
-                    provider_registry: Some(Arc::new(provider_registry)),
-                    model_registry: Some(model_registry),
-                    // Progressive tool disclosure (issue #233): only emit
-                    // per-tool guidance for tools this team sub-agent has.
-                    enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
-                    ..Default::default()
-                };
-
-                // Child of the parent's token so a parent cancel propagates into
-                // this team sub-agent as well (issue #218).
-                let cancel = ctx.cancel_token.child_token();
-                let mut messages = vec![clawde_core::types::Message::user(prompt)];
-                let outcome = crate::run_query_loop(
-                    client.as_ref(),
-                    &mut messages,
-                    &agent_tools,
-                    &ctx,
-                    &query_config,
-                    ctx.cost_tracker.clone(),
-                    None,
-                    cancel,
-                    None,
-                )
-                .await;
-
-                format_outcome(outcome)
-            }) as Pin<Box<dyn std::future::Future<Output = String> + Send>>
-        },
-    );
-
-    clawde_tools::register_agent_runner(runner);
 }

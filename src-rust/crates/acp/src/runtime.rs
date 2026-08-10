@@ -37,6 +37,9 @@ impl AgentRuntime {
     pub async fn build(working_dir: PathBuf) -> anyhow::Result<Self> {
         let settings = Settings::load_sync().unwrap_or_default();
         let mut config = settings.effective_config();
+        clawde_core::set_ollama_network_blocked(
+            config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated,
+        );
         // Plan mode requires interactive UI — fall back to Default so the
         // ACP permission bridge can route decisions to the client.
         if config.permission_mode == clawde_core::PermissionMode::Plan {
@@ -83,7 +86,11 @@ impl AgentRuntime {
         // attached here — the wrapper type lives in the CLI crate today and
         // adding it would create a circular dep. Built-in tools (Bash, Read,
         // Edit, Glob, Grep, WebFetch, …) cover the common ACP-editor flows.
-        let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools();
+        let network_blocked = clawde_core::is_ollama_network_blocked();
+        let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
+            .into_iter()
+            .filter(|tool| !network_blocked || !tool.network_capable())
+            .collect();
         tools.push(Box::new(clawde_query::AgentTool));
         let tools = Arc::new(tools);
 

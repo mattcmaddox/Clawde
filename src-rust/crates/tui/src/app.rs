@@ -1936,6 +1936,42 @@ fn matches_capability_groups(
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
+        // Startup banner (once per launch, not per load): surface a corrupt
+        // auth store or settings file immediately instead of silently running
+        // with invisible keys / defaulted settings. The dialog is dismissed
+        // with Enter/Escape.
+        let auth_store = clawde_core::AuthStore::load();
+        let invalid_config_dialog = {
+            let mut errors: Vec<(crate::invalid_config_dialog::InvalidConfigKind, String)> =
+                Vec::new();
+            if let Some(err) = &auth_store.load_error {
+                errors.push((
+                    crate::invalid_config_dialog::InvalidConfigKind::AuthStore,
+                    err.clone(),
+                ));
+            }
+            if let Ok(settings) = clawde_core::config::Settings::load_sync() {
+                if let Some(err) = settings.load_error {
+                    errors.push((
+                        crate::invalid_config_dialog::InvalidConfigKind::Settings,
+                        err,
+                    ));
+                }
+            }
+            let mut state = crate::invalid_config_dialog::InvalidConfigDialogState::new();
+            if !errors.is_empty() {
+                let (kind, first) = errors.remove(0);
+                let mut msg = first;
+                for (_, e) in errors {
+                    msg.push_str("\n\n");
+                    msg.push_str(&e);
+                }
+                state.visible = true;
+                state.kind = kind;
+                state.error_message = msg;
+            }
+            state
+        };
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         // Restore the last-used free-model task sort from settings (e.g.
         // "coding") so the /models picker opens pre-sorted on next launch.
@@ -2052,7 +2088,7 @@ impl App {
             overage_upsell: crate::overage_upsell::OverageCreditUpsellState::new(),
             voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState::new(),
             desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState::new(),
-            invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState::new(),
+            invalid_config_dialog,
             memory_update_notification:
                 crate::memory_update_notification::MemoryUpdateNotificationState::new(),
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
@@ -2096,7 +2132,7 @@ impl App {
             // Load recent activity once, lazily, on the first run-loop iteration.
             recent_sessions_pending: true,
             recent_sessions_rx: None,
-            auth_store: clawde_core::AuthStore::load(),
+            auth_store,
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
@@ -2796,10 +2832,29 @@ impl App {
         if next == "image" && current != "image" {
             // Entering image mode: save current model for later restore.
             self.previous_model = Some(self.model_name.clone());
-            // Switch to the best vision model for this provider.
-            if let Some(vis) = self.model_registry.best_vision_model_for_provider(
-                self.config.provider.as_deref().unwrap_or("anthropic"),
-            ) {
+            // Free is a composite provider, so its synthetic `free/auto`
+            // entry is not present in the static model registry. Select a
+            // configured vision-capable catalog pin when possible; the query
+            // layer redirects that pin back through FreeProvider, preserving
+            // its vision gate and fallback chain. If the registry already has
+            // an aggregate vision-capable FreeProvider, keep `free/auto` so it
+            // can choose the best configured vision upstream at request time.
+            let selected_vision_model = if self.config.selected_provider_id() == "free" {
+                clawde_api::providers::free::first_configured_vision_model(&self.auth_store)
+                    .or_else(|| {
+                        self.provider_registry
+                            .as_deref()
+                            .and_then(|registry| {
+                                registry.get(&clawde_core::ProviderId::new("free"))
+                            })
+                            .filter(|provider| provider.capabilities().image_input)
+                            .map(|_| "free/auto".to_string())
+                    })
+            } else {
+                self.model_registry
+                    .best_vision_model_for_provider(self.config.selected_provider_id())
+            };
+            if let Some(vis) = selected_vision_model {
                 let display = vis
                     .strip_prefix(&format!(
                         "{}/",
@@ -2852,7 +2907,8 @@ impl App {
 
     /// Update the context window size from the model registry for the current model.
     pub fn refresh_context_window_size(&mut self) {
-        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+        // The effective provider (free mode by default — never anthropic).
+        let provider = self.config.selected_provider_id();
         let model_id = self
             .model_name
             .strip_prefix(&format!("{}/", provider))
@@ -3560,7 +3616,7 @@ impl App {
                 // visually instead of cycling/typing it (issues #149 / #268). The
                 // selectable ladder is model-adaptive: it comes from
                 // `supported_efforts` for the current provider + model.
-                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                let provider = self.config.selected_provider_id();
                 let model_id = self
                     .model_name
                     .strip_prefix(&format!("{}/", provider))
@@ -10441,6 +10497,23 @@ mod tests {
     }
 
     #[test]
+    fn image_mode_selects_configured_free_vision_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.auth_store
+            .set_keys("google", vec!["google-test-key-12345678".to_string()]);
+
+        // build → plan → image. The configured Google key is the first
+        // available vision-capable free upstream in this fixture.
+        app.cycle_agent_mode();
+        app.cycle_agent_mode();
+
+        assert_eq!(app.agent_mode.as_deref(), Some("image"));
+        assert_eq!(app.config.model.as_deref(), Some("google/gemini-2.5-flash"));
+        assert_eq!(app.config.provider.as_deref(), Some("google"));
+    }
+
+    #[test]
     fn idle_app_does_not_need_fast_repaint() {
         assert!(!make_app().needs_fast_repaint());
     }
@@ -10529,11 +10602,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("clawde-accept-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("specs")).unwrap();
         let path = dir.join("specs/task.json");
+        // A spec carrying generation task/session metadata, exactly as `/spec`
+        // produces — the durable approval gate (write_approval_for_session)
+        // refuses specs without matching task/session metadata.
         std::fs::write(
             &path,
-            r#"{"title":"Task Spec","requirements":["do it"],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+            r#"{"task_id":"clawde-accept-test","task":"Do it","session_id":"clawde-accept-session","title":"Task Spec","requirements":["do it"],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
         )
         .unwrap();
+        // Mirror the real CLI wiring (main.rs calls set_session_id at startup)
+        // so the approval can be persisted and the implementation queued.
+        app.spec_review.set_session_id("clawde-accept-session");
         app.spec_review.open(path).unwrap();
         assert!(app.spec_review.visible);
 
@@ -11163,13 +11242,15 @@ mod tests {
     #[test]
     fn test_help_overlay_entries_omit_aliases_when_unseeded() {
         // Before the CLI seeds slash_aliases, the overlay is built with an
-        // empty alias table (no panic, empty aliases on every entry).
+        // empty user alias table (no panic). The only non-empty aliases are
+        // the static "(legacy)" target hints that hierarchical route entries
+        // carry by design — no user-seeded alias may leak in.
         let app = make_app();
         assert!(app
             .help_overlay
             .commands
             .iter()
-            .all(|e| e.aliases.is_empty()));
+            .all(|e| { e.aliases.is_empty() || e.aliases.ends_with("(legacy)") }));
     }
 
     #[test]

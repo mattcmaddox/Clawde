@@ -58,6 +58,12 @@ impl Tool for RunLintsTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // Explicit lint commands can install dependencies or make arbitrary
+        // outbound requests.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

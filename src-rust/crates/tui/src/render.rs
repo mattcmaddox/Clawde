@@ -3339,7 +3339,10 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     // their exhaustion through their own error paths, and free-catalog
     // upstream status is noise on non-free providers (e.g. ollama).
     if let Some(ref registry) = app.provider_registry {
-        let active_provider = app.config.provider.as_deref().unwrap_or("anthropic");
+        // The effective provider — free mode is the default, so a fresh config
+        // (provider unset) must still be treated as free here, otherwise the
+        // exhausted-key indicator would never render.
+        let active_provider = app.config.selected_provider_id();
         let summaries = registry.key_ring_summaries();
         let has_exhausted = summaries
             .iter()

@@ -44,6 +44,12 @@ impl Tool for ListMcpResourcesTool {
         PermissionLevel::ReadOnly
     }
 
+    fn network_capable(&self) -> bool {
+        // MCP resources may be backed by remote servers or arbitrary external
+        // processes, even when the resource is presented as read-only.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -131,6 +137,12 @@ impl Tool for ReadMcpResourceTool {
 
     fn permission_level(&self) -> PermissionLevel {
         PermissionLevel::ReadOnly
+    }
+
+    fn network_capable(&self) -> bool {
+        // MCP resources may be backed by remote servers or arbitrary external
+        // processes, even when the resource is presented as read-only.
+        true
     }
 
     fn input_schema(&self) -> Value {

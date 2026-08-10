@@ -36,6 +36,10 @@ impl Tool for RemoteTriggerTool {
         PermissionLevel::None
     }
 
+    fn network_capable(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -59,6 +63,9 @@ impl Tool for RemoteTriggerTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        if let Err(error) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
+            return ToolResult::error(error.to_string());
+        }
         let params: RemoteTriggerInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {e}")),

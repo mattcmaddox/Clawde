@@ -145,10 +145,8 @@ async fn rejects_unknown_argument() {
 
 #[test]
 fn effective_config_merges_top_level_auto_compact() {
-    let mut settings = Settings {
-        auto_compact: true,
-        ..Default::default()
-    };
+    let mut settings = Settings::default();
+    settings.auto_compact = true;
     // Config-level auto_compact stays at its default (false).
     settings.config.auto_compact = false;
 
@@ -506,10 +504,8 @@ fn footer_state_healthy_off_below_70_with_auto_compact_off() {
 fn footer_state_derivation_matches_config_roundtrip() {
     // Verify the config roundtrip: config.auto_compact flows to the
     // auto_compact_enabled boolean that drives derive_footer_state.
-    let settings = Settings {
-        auto_compact: true,
-        ..Default::default()
-    };
+    let mut settings = Settings::default();
+    settings.auto_compact = true;
     let config = settings.effective_config();
     assert!(config.auto_compact);
 
@@ -520,10 +516,8 @@ fn footer_state_derivation_matches_config_roundtrip() {
     );
 
     // After toggling off, footer should be HealthyOff (gray).
-    let settings = Settings {
-        auto_compact: false,
-        ..Default::default()
-    };
+    let mut settings = Settings::default();
+    settings.auto_compact = false;
     let config = settings.effective_config();
     assert!(!config.auto_compact);
     assert_eq!(

@@ -97,6 +97,11 @@ impl Tool for PowerShellTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // PowerShell can invoke arbitrary HTTP clients and remote commands.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

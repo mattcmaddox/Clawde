@@ -188,9 +188,10 @@ pub struct SettingsScreen {
     pub ollama_keep_alive: String,
     /// Ollama: max output tokens (human label from OLLAMA_PREDICT_PRESETS).
     pub ollama_num_predict: String,
-    /// Ollama: require an explicit host (no localhost fallback).
+    /// Ollama: require an explicit remote host (loopback is always rejected).
+    /// Kept for settings-file compatibility; remote-only resolution is always enforced.
     pub ollama_require_explicit_host: bool,
-    /// Ollama: default host URL when no api_base or OLLAMA_HOST is set.
+    /// Ollama: explicitly configured remote host URL. Empty means unavailable.
     pub ollama_default_host: String,
     /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
     pub permission_mode: String,
@@ -261,8 +262,8 @@ impl SettingsScreen {
             ollama_num_ctx: "12K".to_string(),
             ollama_keep_alive: "forever".to_string(),
             ollama_num_predict: "2K".to_string(),
-            ollama_require_explicit_host: false,
-            ollama_default_host: "http://localhost:11434".to_string(),
+            ollama_require_explicit_host: true,
+            ollama_default_host: String::new(),
             permission_mode: "default".to_string(),
             verify_sandbox: "direct".to_string(),
             verify_container_image: String::new(),
@@ -430,11 +431,10 @@ impl SettingsScreen {
             .unwrap_or_else(|| "2K".to_string());
         self.ollama_require_explicit_host = ollama_opts
             .and_then(|o| o.get("require_explicit_host").and_then(|v| v.as_bool()))
-            .unwrap_or(false);
+            .unwrap_or(true);
         self.ollama_default_host = ollama_opts
             .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .unwrap_or("http://localhost:11434")
+            .unwrap_or_default()
             .to_string();
 
         // Read keybinding preset from keybindings.json
@@ -812,11 +812,7 @@ impl SettingsScreen {
                     } else {
                         self.health_warning.clear();
                     }
-                    self.ollama_default_host = if trimmed.is_empty() {
-                        "http://localhost:11434".to_string()
-                    } else {
-                        trimmed.to_string()
-                    };
+                    self.ollama_default_host = trimmed.to_string();
                     if trimmed.is_empty() {
                         config
                             .provider_configs
@@ -1670,20 +1666,20 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     ));
     entries.push(make_entry(
         "ollama_require_explicit_host",
-        "Ollama: Require explicit host",
-        "When on, Ollama only connects if api_base or OLLAMA_HOST is explicitly set — never falls back to localhost. Use this when Ollama runs on a remote GPU machine.",
+        "Ollama: Require remote host",
+        "Remote-only compatibility setting. Loopback endpoints are always rejected; set api_base, OLLAMA_HOST, or this screen's remote default host.",
         SECTION_OLLAMA,
-        "false".to_string(),
+        "true".to_string(),
         SettingEffect::Immediate,
         SettingKind::Bool,
         bool_v(screen.ollama_require_explicit_host),
     ));
     entries.push(make_entry(
         "ollama_default_host",
-        "Ollama: Default host",
-        "Host URL used when no api_base or OLLAMA_HOST is set. Set this to point at a LAN GPU server so Ollama always targets the same machine across devices (e.g. http://devbox:11434).",
+        "Ollama: Remote host",
+        "Optional remote GPU endpoint used when api_base and OLLAMA_HOST are unset. Leave empty to disable Ollama; localhost and loopback addresses are rejected.",
         SECTION_OLLAMA,
-        "http://localhost:11434".to_string(),
+        String::new(),
         SettingEffect::NextSession,
         SettingKind::Text,
         screen.ollama_default_host.clone(),

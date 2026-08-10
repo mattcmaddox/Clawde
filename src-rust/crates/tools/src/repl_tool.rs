@@ -221,6 +221,12 @@ impl Tool for ReplTool {
         PermissionLevel::Execute
     }
 
+    fn network_capable(&self) -> bool {
+        // Persistent bash/Python/Node interpreters can open sockets or spawn
+        // network clients, so isolated mode must remove REPL entirely.
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
