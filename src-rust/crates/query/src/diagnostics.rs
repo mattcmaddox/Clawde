@@ -20,6 +20,27 @@ use std::sync::{Arc, Mutex};
 
 const DIAGNOSTICS_SCHEMA_VERSION: &str = "native-diagnostics.v1";
 
+/// Redacted operational evidence for the semantic pipeline.
+///
+/// This deliberately reports only bounded policy state and outcome metadata:
+/// provider family, clamped limits, gate/runner/fixer reachability, terminal
+/// verdict, and elapsed time. It never contains credentials, project paths, or
+/// raw model output.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeSemanticEvidence {
+    pub mode: &'static str,
+    pub configured_provider_family: &'static str,
+    pub verifier_max_turns: u32,
+    pub fixer_max_turns: u32,
+    pub max_attempts: u32,
+    pub deterministic_gate_passed: bool,
+    pub verifier_reached: bool,
+    pub fixer_configured: bool,
+    pub fixer_ran: bool,
+    pub terminal_verdict: Option<String>,
+    pub elapsed_ms: u64,
+}
+
 /// One redacted diagnostic assertion.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeDiagnosticCheck {
@@ -41,6 +62,7 @@ pub struct NativeDiagnosticsReport {
     pub checks: Vec<NativeDiagnosticCheck>,
     pub semantic_verdict: Option<String>,
     pub read_only_tools: Vec<String>,
+    pub semantic: NativeSemanticEvidence,
 }
 
 impl NativeDiagnosticsReport {
@@ -48,6 +70,7 @@ impl NativeDiagnosticsReport {
         checks: Vec<NativeDiagnosticCheck>,
         semantic_verdict: Option<String>,
         project_mutated: bool,
+        semantic: NativeSemanticEvidence,
     ) -> Self {
         Self {
             schema_version: DIAGNOSTICS_SCHEMA_VERSION,
@@ -57,6 +80,7 @@ impl NativeDiagnosticsReport {
             checks,
             semantic_verdict,
             read_only_tools: semantic_verifier_tool_names(),
+            semantic,
         }
     }
 }
@@ -138,6 +162,36 @@ fn verify_config() -> VerifyConfig {
     }
 }
 
+fn semantic_evidence(
+    config: &VerifyConfig,
+    deterministic_gate_passed: bool,
+    verifier_reached: bool,
+    fixer_configured: bool,
+    fixer_ran: bool,
+    terminal_verdict: Option<String>,
+    started_at: std::time::Instant,
+) -> NativeSemanticEvidence {
+    NativeSemanticEvidence {
+        mode: "native-fake-runner",
+        configured_provider_family: "free",
+        verifier_max_turns: config
+            .semantic_max_turns
+            .clamp(1, clawde_core::config::MAX_SEMANTIC_TURNS),
+        fixer_max_turns: config
+            .semantic_fix_max_turns
+            .clamp(1, clawde_core::config::MAX_SEMANTIC_TURNS),
+        max_attempts: config
+            .semantic_max_attempts
+            .clamp(1, clawde_core::config::MAX_SEMANTIC_ATTEMPTS),
+        deterministic_gate_passed,
+        verifier_reached,
+        fixer_configured,
+        fixer_ran,
+        terminal_verdict,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    }
+}
+
 /// Run the native semantic pipeline diagnostics.
 ///
 /// The only subprocess is `cargo test --workspace` inside the synthetic
@@ -145,6 +199,8 @@ fn verify_config() -> VerifyConfig {
 /// The semantic verifier is an injected fake that returns a fixed `pass`
 /// response and records the request metadata for boundary assertions.
 pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
+    let started_at = std::time::Instant::now();
+    let config = verify_config();
     let fixture = FixtureGuard::new();
     let mut checks = Vec::new();
     let mut semantic_verdict = None;
@@ -157,7 +213,12 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
                 "could not create synthetic fixture",
             ));
             let _ = error;
-            return NativeDiagnosticsReport::from_checks(checks, None, false);
+            return NativeDiagnosticsReport::from_checks(
+                checks,
+                None,
+                false,
+                semantic_evidence(&config, false, false, false, false, None, started_at),
+            );
         }
     };
 
@@ -178,7 +239,7 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
         })
     });
 
-    let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner), None);
+    let policy = SemanticAfterVerifyPolicy::new(config.clone(), &fixture.path, Some(runner), None);
     let context = TurnEndContext {
         session_id: "native-diagnostics",
         total_tokens_used: 0,
@@ -320,8 +381,16 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
         },
     ));
 
-    let report = NativeDiagnosticsReport::from_checks(checks, semantic_verdict, project_mutated);
-    report
+    let evidence = semantic_evidence(
+        &config,
+        deterministic_passed,
+        runner_called,
+        false,
+        false,
+        semantic_verdict.clone(),
+        started_at,
+    );
+    NativeDiagnosticsReport::from_checks(checks, semantic_verdict, project_mutated, evidence)
 }
 
 #[cfg(test)]
@@ -335,6 +404,14 @@ mod tests {
         assert!(!report.live_provider_calls);
         assert!(!report.project_mutated);
         assert_eq!(report.semantic_verdict.as_deref(), Some("pass"));
+        assert_eq!(report.semantic.mode, "native-fake-runner");
+        assert_eq!(report.semantic.configured_provider_family, "free");
+        assert_eq!(report.semantic.verifier_max_turns, 3);
+        assert_eq!(report.semantic.fixer_max_turns, 5);
+        assert_eq!(report.semantic.max_attempts, 3);
+        assert!(report.semantic.deterministic_gate_passed);
+        assert!(report.semantic.verifier_reached);
+        assert!(!report.semantic.fixer_ran);
         assert!(
             report.checks.iter().all(|check| check.ok),
             "checks: {:?}",

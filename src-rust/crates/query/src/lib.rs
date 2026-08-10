@@ -3256,6 +3256,10 @@ mod tests {
         /// emit a `tool_use` while tools are present and end the turn once
         /// they're gone (so the degradation turn ends the loop).
         always_end_turn: bool,
+        /// Optional one-shot write request used by whole-loop integration tests.
+        write_path: Option<String>,
+        write_content: Option<String>,
+        write_emitted: Arc<AtomicBool>,
     }
 
     #[async_trait::async_trait]
@@ -3297,9 +3301,49 @@ mod tests {
                 .push(tools_empty);
 
             let msg_id = uuid::Uuid::new_v4().to_string();
-            let emit_tool_use = !self.always_end_turn && !tools_empty;
+            let write_tool_use = !tools_empty
+                && self
+                    .write_path
+                    .as_ref()
+                    .is_some_and(|_| !self.write_emitted.swap(true, AtomicOrdering::SeqCst));
+            let emit_tool_use = !self.always_end_turn && !tools_empty && self.write_path.is_none();
 
-            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if emit_tool_use {
+            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if write_tool_use {
+                let tool_id = uuid::Uuid::new_v4().to_string();
+                let input = serde_json::json!({
+                    "file_path": self.write_path.as_deref().unwrap_or_default(),
+                    "content": self.write_content.as_deref().unwrap_or_default(),
+                });
+                vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: tool_id,
+                            name: clawde_core::constants::TOOL_NAME_FILE_WRITE.to_string(),
+                            input,
+                            thought_signature: None,
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta {
+                        index: 0,
+                        partial_json: serde_json::json!({
+                            "file_path": self.write_path.as_deref().unwrap_or_default(),
+                            "content": self.write_content.as_deref().unwrap_or_default(),
+                        })
+                        .to_string(),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ]
+            } else if emit_tool_use {
                 let tool_id = uuid::Uuid::new_v4().to_string();
                 vec![
                     Ok(StreamEvent::MessageStart {
@@ -3497,6 +3541,9 @@ mod tests {
             id: clawde_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded,
             always_end_turn: true,
+            write_path: None,
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
         });
         let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
 
@@ -3526,6 +3573,9 @@ mod tests {
             id: clawde_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
             always_end_turn,
+            write_path: None,
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
         });
         let (outcome, messages) =
             drive_loop_with_provider(provider, tools, max_turns, continuation).await;
@@ -4009,5 +4059,198 @@ mod tests {
         let msgs = vec![Message::user("rocky, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.unwrap().contains("Project Hail Mary"));
+    }
+
+    struct AllowAllHandler;
+
+    impl clawde_core::permissions::PermissionHandler for AllowAllHandler {
+        fn check_permission(
+            &self,
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
+        }
+
+        fn request_permission(
+            &self,
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Allow
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_verification_runs_through_the_real_query_loop() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::create_dir_all(fixture.path().join("src")).expect("fixture src");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"query_loop_semantic_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest");
+        let source = "pub fn value() -> u32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value_is_one() { assert_eq!(crate::value(), 1); }\n}\n";
+        std::fs::write(fixture.path().join("src/lib.rs"), source).expect("fixture source");
+
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let changed_path = fixture.path().join("src/generated.rs");
+        // Keep the fixture declaration crate-private so the workspace's
+        // source-scanning dead-code guard does not mistake this test string for
+        // a live public function declaration.
+        let changed_content = "pub(crate) fn generated_value() -> u32 { 2 }\n";
+        let recorded_requests = Arc::new(StdMutex::new(Vec::<SemanticVerifyRequest>::new()));
+        let verifier_requests = recorded_requests.clone();
+        let verifier_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let verifier_call_count = verifier_calls.clone();
+        let verifier: SemanticVerifyRunner = Arc::new(move |request| {
+            verifier_requests.lock().unwrap().push(request);
+            let call = verifier_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    Ok(r#"{"verdict":"fixable","summary":"fixture needs semantic review","findings":["review the generated value"]}"#.to_string())
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"fixture is semantically acceptable","findings":[]}"#.to_string())
+                }
+            })
+        });
+        let fixer_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_call_count = fixer_calls.clone();
+        let fixer_requests = Arc::new(StdMutex::new(Vec::<SemanticFixRequest>::new()));
+        let fixer_requests_for_runner = fixer_requests.clone();
+        let fixer: SemanticFixRunner = Arc::new(move |request| {
+            fixer_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            fixer_requests_for_runner.lock().unwrap().push(request);
+            Box::pin(async { Ok("fresh fixer completed".to_string()) })
+        });
+
+        let recorded_tools = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded_tools,
+            always_end_turn: false,
+            write_path: Some(changed_path.to_string_lossy().into_owned()),
+            write_content: Some(changed_content.to_string()),
+            write_emitted: Arc::new(AtomicBool::new(false)),
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = "semantic-loop-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.permission_handler = Arc::new(AllowAllHandler);
+        ctx.non_interactive = true;
+
+        let mut verify = clawde_core::config::VerifyConfig::default();
+        verify.enabled = true;
+        verify.auto_test = true;
+        verify.auto_lint = false;
+        verify.timeout_secs = 30;
+        let mut config = QueryConfig::default();
+        config.model = "mock-model".to_string();
+        config.max_turns = 3;
+        config.provider_registry = Some(Arc::new(registry));
+        config.continuation = crate::continuation::ContinuationMode::SemanticVerify(verify);
+        config.semantic_verify_runner = Some(verifier);
+        config.semantic_fix_runner = Some(fixer);
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("write a generated fixture file")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[Box::new(clawde_tools::FileWriteTool)],
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("whole-loop semantic run must not hang");
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&changed_path).unwrap(),
+            changed_content
+        );
+        assert_eq!(
+            fixer_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "fixer calls={}, verifier calls={}, requests={}",
+            fixer_calls.load(AtomicOrdering::SeqCst),
+            verifier_calls.load(AtomicOrdering::SeqCst),
+            recorded_requests.lock().unwrap().len()
+        );
+        assert_eq!(verifier_calls.load(AtomicOrdering::SeqCst), 2);
+
+        let mut saw_deterministic_pass = false;
+        let mut saw_semantic_pass = false;
+        let mut event_order = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                QueryEvent::Verify(report) if report.verdict == VerifyVerdict::Pass => {
+                    saw_deterministic_pass = true;
+                    event_order.push("deterministic-pass");
+                }
+                QueryEvent::SemanticVerify(report) if report.verdict == SemanticVerdict::Pass => {
+                    saw_semantic_pass = true;
+                    event_order.push("semantic-pass");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_deterministic_pass, "deterministic gate event missing");
+        assert!(
+            saw_semantic_pass,
+            "terminal semantic reverify pass event missing"
+        );
+        assert_eq!(
+            event_order,
+            vec!["deterministic-pass", "semantic-pass"],
+            "the public event stream must report the deterministic gate before terminal semantic acceptance"
+        );
+
+        let requests = recorded_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].changed_files.as_slice(),
+            [changed_path.as_path()]
+        );
+        assert!(!requests[0].diff.trim().is_empty());
+        assert_eq!(requests[0].read_only_tools, semantic_read_only_tool_names());
+        let fix_requests = fixer_requests.lock().unwrap();
+        assert_eq!(fix_requests.len(), 1);
+        assert_eq!(
+            fix_requests[0].changed_files.as_slice(),
+            [changed_path.as_path()]
+        );
+        assert!(fix_requests[0]
+            .summary
+            .contains("fixture needs semantic review"));
+        assert_eq!(fix_requests[0].findings, vec!["review the generated value"]);
     }
 }
