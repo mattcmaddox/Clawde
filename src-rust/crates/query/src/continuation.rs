@@ -355,11 +355,20 @@ impl SemanticVerifyPolicy {
         runner: Option<SemanticVerifyRunner>,
         fix_runner: Option<SemanticFixRunner>,
     ) -> Self {
+        Self::with_max_attempts(runner, fix_runner, Self::DEFAULT_MAX_ATTEMPTS)
+    }
+
+    /// Build a policy with a caller-configured, bounded fix/reverify limit.
+    pub fn with_max_attempts(
+        runner: Option<SemanticVerifyRunner>,
+        fix_runner: Option<SemanticFixRunner>,
+        max_attempts: u32,
+    ) -> Self {
         Self {
             runner,
             fix_runner,
             attempts: std::sync::atomic::AtomicU32::new(0),
-            max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
+            max_attempts: max_attempts.clamp(1, clawde_core::config::MAX_SEMANTIC_ATTEMPTS),
             last_report: std::sync::Mutex::new(None),
         }
     }
@@ -528,10 +537,14 @@ impl SemanticAfterVerifyPolicy {
     ) -> Self {
         Self {
             deterministic: crate::verify::VerifyPolicy::new(
-                verify_config,
+                verify_config.clone(),
                 working_dir.to_path_buf(),
             ),
-            semantic: SemanticVerifyPolicy::new(runner, fix_runner),
+            semantic: SemanticVerifyPolicy::with_max_attempts(
+                runner,
+                fix_runner,
+                verify_config.semantic_max_attempts,
+            ),
         }
     }
 

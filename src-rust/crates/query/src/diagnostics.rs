@@ -134,6 +134,7 @@ fn verify_config() -> VerifyConfig {
         skip_when_no_writes: true,
         timeout_secs: 120,
         container_image: None,
+        ..Default::default()
     }
 }
 

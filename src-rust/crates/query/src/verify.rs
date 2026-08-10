@@ -775,6 +775,7 @@ mod tests {
             skip_when_no_writes: true,
             timeout_secs: 30,
             container_image: None,
+            ..Default::default()
         }
     }
 

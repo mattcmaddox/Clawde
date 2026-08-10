@@ -1580,12 +1580,49 @@ pub mod config {
         /// (`rust:latest`, `node:latest`, `python:latest`, `golang:latest`,
         /// `eclipse-temurin:latest`, `gcc:latest`).
         pub container_image: Option<String>,
+        /// FreeProvider model used by the semantic verifier and fixer. The
+        /// production adapters accept only `free/...` routes and fall back to
+        /// `free/auto` for invalid or non-free values.
+        #[serde(default = "default_semantic_model")]
+        pub semantic_model: String,
+        /// Maximum AgentTool turns for one read-only semantic review.
+        #[serde(default = "default_semantic_max_turns")]
+        pub semantic_max_turns: u32,
+        /// Maximum AgentTool turns for one fresh-executor fix session.
+        #[serde(default = "default_semantic_fix_max_turns")]
+        pub semantic_fix_max_turns: u32,
+        /// Maximum semantic fix-and-reverify rounds in the continuation policy.
+        #[serde(default = "default_semantic_max_attempts")]
+        pub semantic_max_attempts: u32,
+    }
+
+    pub const DEFAULT_SEMANTIC_MODEL: &str = "free/auto";
+    pub const DEFAULT_SEMANTIC_MAX_TURNS: u32 = 3;
+    pub const DEFAULT_SEMANTIC_FIX_MAX_TURNS: u32 = 5;
+    pub const DEFAULT_SEMANTIC_MAX_ATTEMPTS: u32 = 3;
+    pub const MAX_SEMANTIC_TURNS: u32 = 10;
+    pub const MAX_SEMANTIC_ATTEMPTS: u32 = 5;
+
+    fn default_semantic_model() -> String {
+        DEFAULT_SEMANTIC_MODEL.to_string()
+    }
+
+    fn default_semantic_max_turns() -> u32 {
+        DEFAULT_SEMANTIC_MAX_TURNS
+    }
+
+    fn default_semantic_fix_max_turns() -> u32 {
+        DEFAULT_SEMANTIC_FIX_MAX_TURNS
+    }
+
+    fn default_semantic_max_attempts() -> u32 {
+        DEFAULT_SEMANTIC_MAX_ATTEMPTS
     }
 
     impl Default for VerifyConfig {
         /// Zero-config sensible defaults: verification on, 3 auto-fix attempts,
         /// direct sandbox, tests + lints, read-only turns skipped, 180s
-        /// per-command timeout.
+        /// per-command timeout, and bounded free-model semantic review values.
         fn default() -> Self {
             Self {
                 enabled: true,
@@ -1596,6 +1633,10 @@ pub mod config {
                 skip_when_no_writes: true,
                 timeout_secs: 180,
                 container_image: None,
+                semantic_model: DEFAULT_SEMANTIC_MODEL.to_string(),
+                semantic_max_turns: DEFAULT_SEMANTIC_MAX_TURNS,
+                semantic_fix_max_turns: DEFAULT_SEMANTIC_FIX_MAX_TURNS,
+                semantic_max_attempts: DEFAULT_SEMANTIC_MAX_ATTEMPTS,
             }
         }
     }

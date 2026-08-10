@@ -128,8 +128,44 @@ pub fn build_semantic_verifier_tools() -> Vec<Box<dyn Tool>> {
 /// Extracted from `semantic_verify_runner` so the request→input mapping (the
 /// read-only allowlist, the fixed `free/auto` model, the one-shot turn budget,
 /// and the JSON-only prompt contract) is testable without a live model call.
+fn semantic_model(config: &clawde_core::config::Config) -> String {
+    let configured = config.verify.semantic_model.trim();
+    let is_free_route = configured
+        .strip_prefix("free/")
+        .is_some_and(|model| !model.trim().is_empty());
+    if is_free_route {
+        configured.to_string()
+    } else {
+        "free/auto".to_string()
+    }
+}
+
+fn bounded_semantic_turns(turns: u32, default: u32) -> u32 {
+    if turns == 0 {
+        default
+    } else {
+        turns.clamp(1, clawde_core::config::MAX_SEMANTIC_TURNS)
+    }
+}
+
+fn semantic_verify_input_for_config(
+    request: &crate::continuation::SemanticVerifyRequest,
+    config: &clawde_core::config::Config,
+) -> serde_json::Value {
+    semantic_verify_input(
+        request,
+        &semantic_model(config),
+        bounded_semantic_turns(
+            config.verify.semantic_max_turns,
+            clawde_core::config::DEFAULT_SEMANTIC_MAX_TURNS,
+        ),
+    )
+}
+
 fn semantic_verify_input(
     request: &crate::continuation::SemanticVerifyRequest,
+    model: &str,
+    max_turns: u32,
 ) -> serde_json::Value {
     let spec = request
         .spec
@@ -160,8 +196,8 @@ fn semantic_verify_input(
         "prompt": prompt,
         "tools": semantic_verifier_tool_names(),
         "system_prompt": "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict.",
-        "max_turns": 3,
-        "model": "free/auto"
+        "max_turns": max_turns,
+        "model": model
     })
 }
 
@@ -178,12 +214,18 @@ pub fn semantic_verify_runner(
         return None;
     }
 
+    let model = semantic_model(&ctx.config);
+    let max_turns = bounded_semantic_turns(
+        ctx.config.verify.semantic_max_turns,
+        clawde_core::config::DEFAULT_SEMANTIC_MAX_TURNS,
+    );
     let ctx = Arc::new(ctx);
     Some(Arc::new(
         move |request: crate::continuation::SemanticVerifyRequest| {
             let ctx = ctx.clone();
+            let model = model.clone();
             Box::pin(async move {
-                let input = semantic_verify_input(&request);
+                let input = semantic_verify_input(&request, &model, max_turns);
                 let result = AgentTool.execute(input, &ctx).await;
                 if result.is_error {
                     Err(result.content)
@@ -201,7 +243,25 @@ pub fn semantic_verify_runner(
 /// apply the reported fixes, plus the verdict context (summary + findings +
 /// spec + bounded diff). The response is a prose change summary — no JSON
 /// contract required.
-fn semantic_fix_input(request: &crate::continuation::SemanticFixRequest) -> serde_json::Value {
+fn semantic_fix_input_for_config(
+    request: &crate::continuation::SemanticFixRequest,
+    config: &clawde_core::config::Config,
+) -> serde_json::Value {
+    semantic_fix_input(
+        request,
+        &semantic_model(config),
+        bounded_semantic_turns(
+            config.verify.semantic_fix_max_turns,
+            clawde_core::config::DEFAULT_SEMANTIC_FIX_MAX_TURNS,
+        ),
+    )
+}
+
+fn semantic_fix_input(
+    request: &crate::continuation::SemanticFixRequest,
+    model: &str,
+    max_turns: u32,
+) -> serde_json::Value {
     let spec = request
         .spec
         .as_ref()
@@ -238,8 +298,8 @@ fn semantic_fix_input(request: &crate::continuation::SemanticFixRequest) -> serd
         "prompt": prompt,
         "tools": crate::continuation::semantic_fixer_tool_names(),
         "system_prompt": "You are a code-fixing executor. You may read, search, and edit files in the project, but you must never run commands, access the network, or delegate to another agent. Apply the minimal fix for each reported finding, then summarize the changes you made.",
-        "max_turns": 5,
-        "model": "free/auto"
+        "max_turns": max_turns,
+        "model": model
     })
 }
 
@@ -254,12 +314,18 @@ pub fn semantic_fix_runner(ctx: ToolContext) -> Option<crate::continuation::Sema
         return None;
     }
 
+    let model = semantic_model(&ctx.config);
+    let max_turns = bounded_semantic_turns(
+        ctx.config.verify.semantic_fix_max_turns,
+        clawde_core::config::DEFAULT_SEMANTIC_FIX_MAX_TURNS,
+    );
     let ctx = Arc::new(ctx);
     Some(Arc::new(
         move |request: crate::continuation::SemanticFixRequest| {
             let ctx = ctx.clone();
+            let model = model.clone();
             Box::pin(async move {
-                let input = semantic_fix_input(&request);
+                let input = semantic_fix_input(&request, &model, max_turns);
                 let result = AgentTool.execute(input, &ctx).await;
                 if result.is_error {
                     Err(result.content)
@@ -797,9 +863,61 @@ mod tests {
     }
 
     #[test]
+    fn semantic_config_defaults_are_bounded_and_free() {
+        let config = clawde_core::config::VerifyConfig::default();
+        assert_eq!(config.semantic_model, "free/auto");
+        assert_eq!(config.semantic_max_turns, 3);
+        assert_eq!(config.semantic_fix_max_turns, 5);
+        assert_eq!(config.semantic_max_attempts, 3);
+        assert!(config.semantic_max_turns <= clawde_core::config::MAX_SEMANTIC_TURNS);
+        assert!(config.semantic_fix_max_turns <= clawde_core::config::MAX_SEMANTIC_TURNS);
+        assert!(config.semantic_max_attempts <= clawde_core::config::MAX_SEMANTIC_ATTEMPTS);
+    }
+
+    #[test]
+    fn semantic_config_override_round_trips_and_invalid_model_falls_back() {
+        let mut config = clawde_core::config::Config::default();
+        config.verify.semantic_model = "anthropic/secret-model".to_string();
+        config.verify.semantic_max_turns = 99;
+        config.verify.semantic_fix_max_turns = 0;
+        let serialized = serde_json::to_value(&config.verify).expect("serialize verify config");
+        let decoded: clawde_core::config::VerifyConfig =
+            serde_json::from_value(serialized).expect("deserialize verify config");
+        assert_eq!(decoded.semantic_model, "anthropic/secret-model");
+        assert_eq!(decoded.semantic_max_turns, 99);
+        assert_eq!(semantic_model(&config), "free/auto");
+        assert_eq!(bounded_semantic_turns(decoded.semantic_max_turns, 3), 10);
+        assert_eq!(bounded_semantic_turns(decoded.semantic_fix_max_turns, 5), 5);
+        assert_eq!(bounded_semantic_turns(decoded.semantic_max_attempts, 3), 3);
+    }
+
+    #[test]
+    fn semantic_config_values_reach_verifier_and_fixer_inputs() {
+        let mut config = clawde_core::config::Config::default();
+        config.verify.semantic_model = "free/openai/gpt-oss-120b".to_string();
+        config.verify.semantic_max_turns = 7;
+        config.verify.semantic_fix_max_turns = 8;
+        let verify_input = semantic_verify_input_for_config(&sample_request(), &config);
+        let fix_input = semantic_fix_input_for_config(&sample_fix_request(), &config);
+        assert_eq!(verify_input["model"], "free/openai/gpt-oss-120b");
+        assert_eq!(verify_input["max_turns"], 7);
+        assert_eq!(fix_input["model"], "free/openai/gpt-oss-120b");
+        assert_eq!(fix_input["max_turns"], 8);
+    }
+
+    #[test]
+    fn semantic_config_accepts_explicit_free_model_route_and_rejects_empty_suffix() {
+        let mut config = clawde_core::config::Config::default();
+        config.verify.semantic_model = "free/openai/gpt-oss-120b".to_string();
+        assert_eq!(semantic_model(&config), "free/openai/gpt-oss-120b");
+        config.verify.semantic_model = "free/".to_string();
+        assert_eq!(semantic_model(&config), "free/auto");
+    }
+
+    #[test]
     fn semantic_verify_input_carries_read_only_allowlist_and_json_contract() {
         let request = sample_request();
-        let input = semantic_verify_input(&request);
+        let input = semantic_verify_input(&request, "free/auto", 3);
 
         // Fixed routing + budget: the verifier is a one-shot free-model agent.
         assert_eq!(input["model"], serde_json::json!("free/auto"));
@@ -844,7 +962,7 @@ mod tests {
     fn semantic_verify_input_survives_missing_spec() {
         let mut request = sample_request();
         request.spec = None;
-        let input = semantic_verify_input(&request);
+        let input = semantic_verify_input(&request, "free/auto", 3);
         assert!(input["prompt"].as_str().unwrap().contains("null"));
     }
 
@@ -883,7 +1001,7 @@ mod tests {
     #[test]
     fn semantic_fix_input_carries_verdict_context_and_write_tools() {
         let request = sample_fix_request();
-        let input = semantic_fix_input(&request);
+        let input = semantic_fix_input(&request, "free/auto", 5);
 
         assert_eq!(input["model"], serde_json::json!("free/auto"));
         assert_eq!(input["max_turns"], serde_json::json!(5));
