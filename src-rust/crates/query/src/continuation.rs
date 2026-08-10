@@ -1125,6 +1125,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_mode_suppresses_verifier_and_fixer_when_gate_fails() {
+        if !cargo_available() {
+            return;
+        }
+        let project = tempfile::tempdir().expect("temporary project");
+        write_cargo_semantic_fixture(project.path(), "#[test]\nfn fails() { assert!(false); }\n");
+        let changed = project.path().join("src/lib.rs");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let verifier_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let verifier_calls_clone = verifier_calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            verifier_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                Ok(r#"{\"verdict\":\"pass\",\"summary\":\"must not run\"}"#.to_string())
+            })
+        });
+        let fixer_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_calls_clone = fixer_calls.clone();
+        let fixer: SemanticFixRunner = std::sync::Arc::new(move |_| {
+            fixer_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("must not run".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+assert!(false);"),
+            ..ctx()
+        };
+
+        let decision = policy.decide_async(&context).await;
+        assert!(matches!(decision, ContinuationDecision::Continue { .. }));
+        assert_eq!(
+            verifier_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a failed deterministic gate must suppress semantic review"
+        );
+        assert_eq!(
+            fixer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a failed deterministic gate must suppress the fresh fixer too"
+        );
+    }
+
+    #[tokio::test]
     async fn semantic_mode_runs_after_deterministic_pass() {
         if !cargo_available() {
             return;
