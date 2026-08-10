@@ -142,6 +142,8 @@ pub struct SpecReviewState {
     /// Raw JSON of the spec currently on screen, captured at `open` time so
     /// `mark_accepted` records exactly what the user approved.
     last_opened_raw: Option<String>,
+    /// Session that owns this review. Used to persist a session-bound approval.
+    session_id: Option<String>,
 }
 
 impl Default for SpecReviewState {
@@ -160,6 +162,7 @@ impl Default for SpecReviewState {
             last_reviewed: std::collections::HashMap::new(),
             accepted: std::collections::HashMap::new(),
             last_opened_raw: None,
+            session_id: None,
         }
     }
 }
@@ -167,6 +170,11 @@ impl Default for SpecReviewState {
 impl SpecReviewState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind future approvals to the active conversation session.
+    pub fn set_session_id(&mut self, session_id: impl Into<String>) {
+        self.session_id = Some(session_id.into());
     }
 
     /// Open the dialog for a spec JSON file. Returns `Err(message)` when the
@@ -298,12 +306,20 @@ impl SpecReviewState {
     }
 
     /// Record the spec currently on screen as the accepted version, so any
-    /// later re-open diffs against what was approved (§10.2). No-op when the
-    /// dialog holds no spec.
-    pub fn mark_accepted(&mut self) {
-        if let (Some(path), Some(raw)) = (self.path.clone(), self.last_opened_raw.clone()) {
-            self.accepted.insert(path, raw);
-        }
+    /// later re-open diffs against what was approved (§10.2), and persist the
+    /// approval for the active session. Returns false when the durable gate
+    /// could not be established; the in-memory diff baseline is still updated.
+    pub fn mark_accepted(&mut self) -> bool {
+        let (Some(path), Some(raw)) = (self.path.clone(), self.last_opened_raw.clone()) else {
+            return false;
+        };
+        self.accepted.insert(path.clone(), raw);
+        self.session_id
+            .as_deref()
+            .map(|session_id| {
+                clawde_core::spec::Spec::write_approval_for_session(&path, session_id).is_ok()
+            })
+            .unwrap_or(false)
     }
 
     /// The accepted-spec implementation message queued when the user presses
@@ -319,9 +335,10 @@ impl SpecReviewState {
             .collect::<Vec<_>>()
             .join("\n");
         let mut msg = format!(
-            "The spec \"{}\" (saved at {}) has been ACCEPTED. Implement it:\n\n{}",
+            "The spec \"{}\" (saved at {}) has been ACCEPTED. {} Implement it:\n\n{}",
             spec.title,
             path.display(),
+            spec.accepted_task_marker(),
             spec.to_json()
         );
         if !criteria.is_empty() {
@@ -742,6 +759,9 @@ mod tests {
 
     fn sample_spec() -> Spec {
         Spec {
+            task_id: "tui-spec-review-test".to_string(),
+            task: "Add rate limiting".to_string(),
+            session_id: Some("tui-spec-review-session".to_string()),
             title: "Rate-Limiting Middleware".to_string(),
             requirements: vec!["Per-IP rate limiting".to_string()],
             files_to_touch: vec![clawde_core::spec::FilePlan {
@@ -909,6 +929,7 @@ mod tests {
         dialog.open(path).unwrap();
         let msg = dialog.accept_message().expect("accept message");
         assert!(msg.contains("ACCEPTED"));
+        assert!(msg.contains("clawde-spec-task:"));
         assert!(msg.contains("Rate-Limiting Middleware"));
         assert!(msg.contains("Requests under limit pass through"));
         let _ = std::fs::remove_dir_all(&dir);

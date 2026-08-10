@@ -1385,6 +1385,11 @@ pub mod config {
         /// Execute-and-verify loop configuration (audit spec Phase 1).
         #[serde(default)]
         pub verify: VerifyConfig,
+        /// Opt-in read-only semantic verification after writing turns. This is
+        /// separate from the deterministic test/lint verifier and remains off
+        /// by default until a semantic runner is explicitly injected.
+        #[serde(default, rename = "semanticVerify", alias = "semantic_verify")]
+        pub semantic_verify: Option<bool>,
         /// Project-memory injection settings (audit spec §18.3 token budget).
         #[serde(default)]
         pub memory: MemoryConfig,
@@ -2644,6 +2649,7 @@ pub mod config {
                 // Override wins for this scalar struct (project settings take
                 // precedence over global).
                 verify: over.config.verify,
+                semantic_verify: over.config.semantic_verify.or(base.config.semantic_verify),
                 spec_mode: over.config.spec_mode || base.config.spec_mode,
                 memory: MemoryConfig {
                     max_tokens: over

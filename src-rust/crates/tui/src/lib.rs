@@ -2018,6 +2018,7 @@ mod tests {
         let mut app = make_app();
         app.messages.push(Message::assistant("wrote the fix"));
         let report = clawde_query::VerifyReport {
+            verdict: clawde_query::VerifyVerdict::Pass,
             results: vec![clawde_query::CheckResult {
                 label: "test: cargo test --workspace".to_string(),
                 ok: true,

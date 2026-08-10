@@ -30,6 +30,12 @@ pub(crate) fn merge_openai_compatible_options(body: &mut Value, provider_options
     };
 
     for (key, value) in options_obj {
+        // FreeProvider routing metadata is internal to Clawde. It can be
+        // carried in provider_options while a request is assembled, but must
+        // never be sent as a top-level OpenAI-compatible API parameter.
+        if key == "routing" {
+            continue;
+        }
         match key.as_str() {
             "reasoningEffort" => body["reasoning_effort"] = value.clone(),
             "textVerbosity" => body["verbosity"] = value.clone(),
@@ -75,6 +81,11 @@ pub(crate) fn merge_google_options(body: &mut Value, provider_options: &Value) {
     let mut root_entries: Vec<(String, Value)> = Vec::new();
 
     for (key, value) in options_obj {
+        // FreeProvider routing metadata is internal to Clawde and is not a
+        // valid Google GenerateContent field.
+        if key == "routing" {
+            continue;
+        }
         if GENERATION_CONFIG_KEYS.contains(&key.as_str()) {
             generation_config_obj.insert(key.clone(), value.clone());
         } else {
@@ -135,6 +146,36 @@ mod tests {
         assert_eq!(body["reasoning_effort"], json!("high"));
         assert_eq!(body["verbosity"], json!("low"));
         assert_eq!(body["store"], json!(false));
+    }
+
+    #[test]
+    fn merge_openai_compatible_drops_internal_routing_metadata() {
+        let mut body = json!({});
+        merge_openai_compatible_options(
+            &mut body,
+            &json!({
+                "routing": {"strategy": "auto"},
+                "temperature": 0.2,
+            }),
+        );
+
+        assert!(!body.as_object().unwrap().contains_key("routing"));
+        assert_eq!(body["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn merge_google_drops_internal_routing_metadata() {
+        let mut body = json!({});
+        merge_google_options(
+            &mut body,
+            &json!({
+                "routing": {"disabled_upstreams": ["groq"]},
+                "temperature": 0.2,
+            }),
+        );
+
+        assert!(!body.as_object().unwrap().contains_key("routing"));
+        assert_eq!(body["generationConfig"]["temperature"], json!(0.2));
     }
 
     #[test]

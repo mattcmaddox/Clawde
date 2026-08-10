@@ -136,6 +136,17 @@ impl SlashCommand for GoalCommand {
                     }
                     _ => {}
                 }
+                // Re-baseline goal-scoped token accounting so tokens spent
+                // while the goal was paused are never attributed to it (G7),
+                // and clear the no-progress streak: a pause breaks the
+                // "consecutive turns" the guard counts.
+                if let Err(e) = store.rebaseline_tokens(session_id, ctx.cost_tracker.total_tokens())
+                {
+                    return CommandResult::Error(format!("Failed to resume goal: {}", e));
+                }
+                if let Err(e) = store.set_low_progress_streak(session_id, 0) {
+                    return CommandResult::Error(format!("Failed to resume goal: {}", e));
+                }
                 if let Err(e) = store.set_status(session_id, clawde_core::GoalStatus::Active) {
                     return CommandResult::Error(format!("Failed to resume goal: {}", e));
                 }
@@ -209,7 +220,11 @@ impl SlashCommand for GoalCommand {
             None => return CommandResult::Error("Could not open goal store.".to_string()),
         };
 
-        match store.set_goal(session_id, objective, token_budget) {
+        // Seed the goal-scoped accounting baseline with the session's current
+        // cumulative usage so pre-goal tokens never count toward the goal's
+        // soft budget (G7).
+        let session_tokens_at_start = ctx.cost_tracker.total_tokens();
+        match store.set_goal(session_id, objective, token_budget, session_tokens_at_start) {
             Err(clawde_core::GoalError::ObjectiveTooLong { len, max }) => CommandResult::Error(
                 format!("Objective too long ({} chars). Max {} chars.", len, max),
             ),

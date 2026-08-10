@@ -21,7 +21,9 @@ pub mod context_analyzer;
 pub mod continuation;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod diagnostics;
 pub mod goal_loop;
+pub mod live_smoke;
 pub mod managed_orchestrator;
 pub mod sanitize;
 pub mod session_memory;
@@ -44,13 +46,18 @@ pub use compact::{
     MicroCompactConfig, TokenWarningState,
 };
 pub use continuation::{
-    ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
+    parse_semantic_verify_response, semantic_read_only_tool_names, ContinuationDecision,
+    ContinuationMode, ContinuationPolicy, SemanticAfterVerifyPolicy, SemanticVerdict,
+    SemanticVerifyPolicy, SemanticVerifyReport, SemanticVerifyRequest, SemanticVerifyResponse,
+    SemanticVerifyRunner, StopPolicy, TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
+pub use diagnostics::{run_native_diagnostics, NativeDiagnosticCheck, NativeDiagnosticsReport};
 pub use goal_loop::{
     check_and_continue_goal, decide_goal_continuation, mark_goal_complete, GoalContinuation,
     StopReason,
 };
+pub use live_smoke::{run_live_semantic_smoke, LiveSmokeReport};
 pub use runner::*;
 pub use sanitize::sanitize_history;
 pub use session_memory::{
@@ -59,7 +66,7 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
-pub use verify::{CheckResult, VerifyPolicy, VerifyReport};
+pub use verify::{CheckResult, VerifyPolicy, VerifyReport, VerifyVerdict};
 
 use clawde_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, LlmProvider,
@@ -181,6 +188,10 @@ pub struct QueryConfig {
     /// goal's guards allow, injecting the goal continuation message as the next
     /// user turn — instead of the CLI REPL re-dispatching a fresh turn.
     pub continuation: crate::continuation::ContinuationMode,
+    /// Optional injected runner for the opt-in semantic verifier. Kept out of
+    /// `ContinuationMode` so callers can select the mode without embedding a
+    /// provider/client dependency in the policy enum.
+    pub semantic_verify_runner: Option<crate::continuation::SemanticVerifyRunner>,
 }
 
 impl Default for QueryConfig {
@@ -211,6 +222,7 @@ impl Default for QueryConfig {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            semantic_verify_runner: None,
         }
     }
 }
@@ -328,6 +340,10 @@ pub enum QueryEvent {
     /// the project's checks, so the TUI can render the boxed per-check
     /// indicator instead of a plain status line.
     Verify(crate::verify::VerifyReport),
+    /// Structured result of an opt-in semantic verifier round. This is
+    /// intentionally separate from deterministic `Verify`, so clients never
+    /// mistake a model opinion for executable test evidence.
+    SemanticVerify(crate::continuation::SemanticVerifyReport),
     /// A spec was generated this turn and should be surfaced for review
     /// (spec-driven development, audit spec §10.2). Carries the path to the
     /// spec JSON. Emitted by the spec-mode continuation policy after a
@@ -479,6 +495,16 @@ pub async fn run_query_loop(
     let mut loop_ctx = tool_ctx.clone();
     loop_ctx.cancel_token = cancel_token.clone();
     let tool_ctx = &loop_ctx;
+    // Capture the accepted implementation task once. Tool results are user
+    // messages too, so re-reading the latest user message at each dispatch
+    // would lose this marker after the first tool round.
+    let mut active_task_id = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .and_then(|message| {
+            clawde_core::spec::Spec::task_id_from_accepted_message(&message.get_all_text())
+        });
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
@@ -531,7 +557,10 @@ pub async fn run_query_loop(
     // one turn; the goal policy keeps the loop running while an active goal's
     // guards allow; the verify policy runs the project's tests/lints after
     // writing turns. Built once per run.
-    let continuation_policy = config.continuation.clone().policy(&tool_ctx.working_dir);
+    let continuation_policy = config
+        .continuation
+        .clone()
+        .policy_with_runner(&tool_ctx.working_dir, config.semantic_verify_runner.clone());
     // Wall-clock start of the current "continuation turn" (a span from a user /
     // continuation message to the next `end_turn`). Reset on each accepted
     // continuation so goal time/turn accounting matches the old per-dispatch
@@ -539,21 +568,35 @@ pub async fn run_query_loop(
     let mut goal_turn_start = std::time::Instant::now();
 
     // Shadow-git snapshot: capture the worktree state before any tools run so we
-    // can produce a per-turn file-change patch when the turn ends.
+    // can produce a per-turn file-change patch when the turn ends. Semantic
+    // verification needs this context even when auto-commits are disabled; the
+    // snapshot is only used for bounded change detection and does not commit or
+    // modify the user's worktree.
+    let snapshot_needed = tool_ctx.config.auto_commits == Some(true)
+        || matches!(
+            config.continuation,
+            crate::continuation::ContinuationMode::SemanticVerify(_)
+        );
     let shadow_snap: Option<std::sync::Arc<clawde_core::snapshot::ShadowSnapshot>> =
-        if tool_ctx.config.auto_commits == Some(true) {
+        if snapshot_needed {
             clawde_core::snapshot::get_or_create(&tool_ctx.working_dir)
         } else {
             None
         };
-    // Pre-capture tree hash; refreshed at the start of each turn's tool phase.
-    let initial_snapshot: Option<String> = if let Some(ref s) = shadow_snap {
+    // Baseline for the current continuation turn; refreshed before every
+    // accepted continuation so a later read-only/fix turn is not attributed to
+    // an earlier write.
+    let mut turn_snapshot: Option<String> = if let Some(ref s) = shadow_snap {
         s.track().await
     } else {
         None
-    }; // Resolve a provider for auto-compact API calls (Gap 2: generic provider support).
-       // Uses the existing provider_registry if available, otherwise builds a fresh
-       // registry from config so compaction works with both Anthropic and non-Anthropic providers.
+    };
+    // Bounded unified diff for the current continuation turn. It is captured
+    // alongside the patch metadata and only consumed by semantic verification.
+    let mut turn_diff: Option<String> = None;
+    // Resolve a provider for auto-compact API calls (Gap 2: generic provider support).
+    // Uses the existing provider_registry if available, otherwise builds a fresh
+    // registry from config so compaction works with both Anthropic and non-Anthropic providers.
     let compact_provider: Option<Arc<dyn LlmProvider>> = {
         let pid = tool_ctx.config.selected_provider_id();
         // Try the existing provider_registry first.
@@ -655,6 +698,16 @@ pub async fn run_query_loop(
                     turn_elapsed_secs: goal_turn_start.elapsed().as_secs(),
                     working_dir: &tool_ctx.working_dir,
                     turn_made_writes: wrote_files,
+                    turn_output_tokens: $usage.output_tokens,
+                    changed_files: $assistant_msg.snapshot_patch.as_ref(),
+                    changed_diff: turn_diff.as_deref(),
+                    spec: active_task_id.as_deref().and_then(|task_id| {
+                        crate::continuation::matching_spec(
+                            &tool_ctx.working_dir,
+                            task_id,
+                            &tool_ctx.session_id,
+                        )
+                    }),
                 };
                 // Announce a slow round up front so the TUI can show a
                 // spinner instead of a silent wait during the checks.
@@ -663,7 +716,7 @@ pub async fn run_query_loop(
                         let _ = tx.send(QueryEvent::VerifyStarted);
                     }
                 }
-                let decision = continuation_policy.decide(&turn_ctx);
+                let decision = continuation_policy.decide_async(&turn_ctx).await;
                 // Structured verify report (audit spec Phase 1 §15.1): forward
                 // the round's per-check results to the TUI so it renders the
                 // boxed Verify indicator. Emitted for both Continue and Stop
@@ -672,6 +725,11 @@ pub async fn run_query_loop(
                 if let Some(report) = continuation_policy.verify_report() {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Verify(report));
+                    }
+                }
+                if let Some(report) = continuation_policy.semantic_report() {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::SemanticVerify(report));
                     }
                 }
                 // Spec-driven development (audit spec §10.2): when the
@@ -699,7 +757,21 @@ pub async fn run_query_loop(
                             };
                             let _ = tx.send(QueryEvent::Status(status));
                         }
+                        if active_task_id.is_none() {
+                            active_task_id =
+                                clawde_core::spec::Spec::task_id_from_accepted_message(&message);
+                        }
                         messages.push(Message::user(message));
+                        // A continuation starts a fresh verification scope:
+                        // writes from the previous turn must not leak into the
+                        // next turn's semantic context or write guard.
+                        wrote_files = false;
+                        turn_diff = None;
+                        turn_snapshot = if let Some(ref snap) = shadow_snap {
+                            snap.track().await
+                        } else {
+                            None
+                        };
                         // Fresh per-continuation-turn budget, mirroring the old
                         // one-loop-per-goal-turn design.
                         turn = 0;
@@ -737,6 +809,9 @@ pub async fn run_query_loop(
         if let Some(queue) = pending_messages.as_deref_mut() {
             for text in queue.drain(..) {
                 debug!("Injecting pending message: {}", &text);
+                if active_task_id.is_none() {
+                    active_task_id = clawde_core::spec::Spec::task_id_from_accepted_message(&text);
+                }
                 messages.push(Message::user(text));
             }
         }
@@ -990,6 +1065,10 @@ pub async fn run_query_loop(
                 let known_providers = [
                     // Native (non-OpenAI-compat) providers
                     "anthropic",
+                    // Composite free provider: `free/auto` must dispatch through
+                    // the registry's FreeProvider even when `config.provider` is
+                    // unset (default/headless), never fall through to anthropic.
+                    "free",
                     "openai",
                     "google",
                     "azure",
@@ -1552,7 +1631,14 @@ pub async fn run_query_loop(
                                     tool_name
                                 ))
                             } else {
-                                execute_tool(&tool_name, &tool_input, tools, tool_ctx).await
+                                execute_tool_for_task(
+                                    &tool_name,
+                                    &tool_input,
+                                    tools,
+                                    tool_ctx,
+                                    active_task_id.as_deref(),
+                                )
+                                .await
                             };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -1631,9 +1717,10 @@ pub async fn run_query_loop(
                         });
                     }
                     // Attach snapshot patch covering all file changes this query.
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
                         let patch = snap.patch(hash).await;
                         if !patch.files.is_empty() {
+                            turn_diff = Some(snap.diff(hash).await);
                             assistant_msg.snapshot_patch = Some(patch);
                         }
                     }
@@ -2174,9 +2261,10 @@ pub async fn run_query_loop(
                     }
 
                     // Attach snapshot patch covering all file changes this query.
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
                         let patch = snap.patch(hash).await;
                         if !patch.files.is_empty() {
+                            turn_diff = Some(snap.diff(hash).await);
                             assistant_msg.snapshot_patch = Some(patch);
                         }
                     }
@@ -2327,9 +2415,11 @@ pub async fn run_query_loop(
                     // Blocked tools yield a ready future with the pre-computed error result.
                     // Non-blocked tools execute concurrently via join_all.
                     // Each async block owns its cloned name/input so there are no lifetime issues.
+                    let exec_task_id = active_task_id.clone();
                     let exec_futures: Vec<_> = prepared
                         .iter()
                         .map(|p| {
+                            let task_id = exec_task_id.clone();
                             if p.blocked_result.is_some() {
                                 let r = p.blocked_result.clone().unwrap();
                                 futures::future::Either::Left(async move { r })
@@ -2337,7 +2427,14 @@ pub async fn run_query_loop(
                                 let name = p.name.clone();
                                 let input = p.input.clone();
                                 futures::future::Either::Right(async move {
-                                    execute_tool(&name, &input, tools, tool_ctx).await
+                                    execute_tool_for_task(
+                                        &name,
+                                        &input,
+                                        tools,
+                                        tool_ctx,
+                                        task_id.as_deref(),
+                                    )
+                                    .await
                                 })
                             }
                         })
@@ -2421,7 +2518,7 @@ pub async fn run_query_loop(
                         &tool_ctx.config,
                         tool_ctx.working_dir.clone(),
                     );
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
                         let patch = snap.patch(hash).await;
                         if !patch.files.is_empty() {
                             assistant_msg.snapshot_patch = Some(patch);
@@ -2440,7 +2537,7 @@ pub async fn run_query_loop(
                         &tool_ctx.config,
                         tool_ctx.working_dir.clone(),
                     );
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
+                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
                         let patch = snap.patch(hash).await;
                         if !patch.files.is_empty() {
                             assistant_msg.snapshot_patch = Some(patch);
@@ -2514,6 +2611,7 @@ mod tests {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            semantic_verify_runner: None,
         }
     }
 
@@ -3703,8 +3801,8 @@ mod tests {
             clawde_core::GoalStore::open(std::path::Path::new(":memory:")).expect("open store");
 
         // Active goal, guards allow → continue with the goal continuation message.
-        store.set_goal("live", "ship the feature", None).unwrap();
-        match decide_goal_continuation(&store, "live", 0, 1) {
+        store.set_goal("live", "ship the feature", None, 0).unwrap();
+        match decide_goal_continuation(&store, "live", 0, 1, 0, false) {
             GoalContinuation::Continue { message } => {
                 assert!(
                     message.contains("Goal continuation"),
@@ -3717,9 +3815,11 @@ mod tests {
         // The turn was recorded in the store.
         assert_eq!(store.get_goal("live").unwrap().turns_used, 1);
 
-        // Soft token budget tripped → budget-limited (paused) outcome.
-        store.set_goal("budget", "big task", Some(100)).unwrap();
-        match decide_goal_continuation(&store, "budget", 500, 1) {
+        // Soft token budget tripped → budget-limited (paused) outcome. The
+        // goal-scoped counter is fed the session delta (500 past baseline 0),
+        // which exceeds the 100-token budget.
+        store.set_goal("budget", "big task", Some(100), 0).unwrap();
+        match decide_goal_continuation(&store, "budget", 500, 1, 0, false) {
             GoalContinuation::Stop {
                 reason: StopReason::BudgetLimited,
             } => {}
@@ -3732,11 +3832,11 @@ mod tests {
         );
 
         // Runaway guard tripped → paused outcome (same as the cross-turn design).
-        store.set_goal("runaway", "endless", None).unwrap();
+        store.set_goal("runaway", "endless", None, 0).unwrap();
         for _ in 0..clawde_core::MAX_GOAL_TURNS {
             store.record_turn("runaway", 0).unwrap();
         }
-        match decide_goal_continuation(&store, "runaway", 0, 1) {
+        match decide_goal_continuation(&store, "runaway", 0, 1, 0, false) {
             GoalContinuation::Stop {
                 reason: StopReason::RunawayGuard { turns_used },
             } => {

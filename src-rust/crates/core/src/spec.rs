@@ -6,6 +6,13 @@
 // tests as the verification criteria (§10.4).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+/// Filename of the repository-scoped approval record for the currently
+/// accepted spec. It lives under `specs/` and is intentionally not itself a
+/// parseable `Spec`.
+const APPROVAL_FILENAME: &str = ".approved.json";
 
 /// What the spec plans to do to a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +61,16 @@ pub struct AcceptanceTest {
 /// in the TUI before implementation begins.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Spec {
+    /// Stable identity for this generated task/spec pair.
+    #[serde(default)]
+    pub task_id: String,
+    /// The original task description supplied to `/spec`.
+    #[serde(default)]
+    pub task: String,
+    /// Session that generated this spec. Older hand-written specs omit it and
+    /// therefore cannot pass the strict approval gate until regenerated.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// Short task title, e.g. "Rate-Limiting Middleware".
     pub title: String,
     /// Ordered functional requirements, plain language.
@@ -68,7 +85,127 @@ pub struct Spec {
     pub edge_cases: Vec<String>,
 }
 
+/// Persisted approval for exactly one spec version in exactly one session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SpecApproval {
+    spec_path: String,
+    task_id: String,
+    session_id: String,
+    content_hash: String,
+}
+
 impl Spec {
+    /// Marker embedded in the accepted implementation message. The query loop
+    /// uses it to keep the approved task identity attached to that run.
+    pub fn accepted_task_marker(&self) -> String {
+        format!("[clawde-spec-task:{}]", self.task_id)
+    }
+
+    /// Extract an accepted task ID from the latest user message.
+    pub fn task_id_from_accepted_message(message: &str) -> Option<String> {
+        let prefix = "[clawde-spec-task:";
+        let start = message.rfind(prefix)? + prefix.len();
+        let end = message[start..].find(']')?;
+        let task_id = &message[start..start + end];
+        (!task_id.trim().is_empty()
+            && task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .then(|| task_id.to_string())
+    }
+
+    /// SHA-256 fingerprint of the exact JSON bytes under review.
+    pub fn content_hash(raw: &str) -> String {
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    }
+
+    /// Path to the repository-scoped approval record.
+    pub fn approval_path(dir: &Path) -> PathBuf {
+        dir.join("specs").join(APPROVAL_FILENAME)
+    }
+
+    /// Remove the current approval, if present. `/spec` calls this after a new
+    /// artifact is successfully generated so a prior task cannot authorize it.
+    pub fn clear_approval(dir: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(Self::approval_path(dir)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record explicit user acceptance for the exact on-disk spec version.
+    pub fn write_approval_for_session(path: &Path, session_id: &str) -> std::io::Result<()> {
+        if session_id.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot approve a spec without a session ID",
+            ));
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let spec = Self::parse_json(&raw)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+        if spec.task_id.trim().is_empty() || spec.session_id.as_deref() != Some(session_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "spec is missing generation task/session metadata",
+            ));
+        }
+        let dir = path.parent().and_then(Path::parent).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "spec is not under specs/")
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "spec has no filename")
+        })?;
+        let approval = SpecApproval {
+            spec_path: file_name.to_string_lossy().into_owned(),
+            task_id: spec.task_id,
+            session_id: session_id.to_string(),
+            content_hash: Self::content_hash(&raw),
+        };
+        let approval_path = Self::approval_path(dir);
+        if let Some(parent) = approval_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec_pretty(&approval).map_err(std::io::Error::other)?;
+        std::fs::write(approval_path, bytes)
+    }
+
+    /// Load the explicitly accepted spec for `session_id`, validating the
+    /// approval record, task identity, generation session, and exact content.
+    pub fn approved_in(dir: &Path, session_id: &str) -> Option<(PathBuf, Spec)> {
+        if session_id.trim().is_empty() {
+            return None;
+        }
+        let approval_path = Self::approval_path(dir);
+        let raw_approval = std::fs::read_to_string(approval_path).ok()?;
+        let approval: SpecApproval = serde_json::from_str(&raw_approval).ok()?;
+        let specs_dir = dir.join("specs");
+        let spec_name = Path::new(&approval.spec_path).file_name()?.to_str()?;
+        if approval.session_id != session_id
+            || spec_name != approval.spec_path
+            || spec_name == APPROVAL_FILENAME
+            || spec_name.contains('\\')
+        {
+            return None;
+        }
+        let path = specs_dir.join(spec_name);
+        let canonical_specs_dir = specs_dir.canonicalize().ok()?;
+        let canonical_path = path.canonicalize().ok()?;
+        if !canonical_path.starts_with(&canonical_specs_dir) {
+            return None;
+        }
+        let raw_spec = std::fs::read_to_string(&canonical_path).ok()?;
+        let spec = Self::parse_json(&raw_spec).ok()?;
+        if spec.task_id != approval.task_id
+            || spec.session_id.as_deref() != Some(session_id)
+            || Self::content_hash(&raw_spec) != approval.content_hash
+        {
+            return None;
+        }
+        Some((canonical_path, spec))
+    }
+
     /// Serialize to pretty-printed JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
@@ -101,7 +238,9 @@ impl Spec {
         let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if path.file_name().and_then(|n| n.to_str()) == Some(APPROVAL_FILENAME)
+                || path.extension().and_then(|e| e.to_str()) != Some("json")
+            {
                 continue;
             }
             if let Ok(metadata) = entry.metadata() {
@@ -185,6 +324,9 @@ mod tests {
 
     fn sample_spec() -> Spec {
         Spec {
+            task_id: "task-rate-limit".to_string(),
+            task: "Add rate limiting".to_string(),
+            session_id: Some("spec-test-session".to_string()),
             title: "Rate-Limiting Middleware".to_string(),
             requirements: vec![
                 "Per-IP rate limiting with configurable window".to_string(),
@@ -332,6 +474,42 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Spec::latest_in(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn approval_requires_matching_session_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("specs/task.json");
+        let spec = sample_spec();
+        spec.write_to(&path).unwrap();
+
+        assert!(Spec::approved_in(dir.path(), "spec-test-session").is_none());
+        Spec::write_approval_for_session(&path, "spec-test-session").unwrap();
+        assert_eq!(
+            Spec::approved_in(dir.path(), "spec-test-session")
+                .unwrap()
+                .1,
+            spec
+        );
+        assert!(Spec::approved_in(dir.path(), "other-session").is_none());
+
+        std::fs::write(
+            &path,
+            spec.to_json().replace("Add rate limiting", "Changed task"),
+        )
+        .unwrap();
+        assert!(Spec::approved_in(dir.path(), "spec-test-session").is_none());
+    }
+
+    #[test]
+    fn clear_approval_removes_previous_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("specs/task.json");
+        sample_spec().write_to(&path).unwrap();
+        Spec::write_approval_for_session(&path, "spec-test-session").unwrap();
+        assert!(Spec::approval_path(dir.path()).exists());
+        Spec::clear_approval(dir.path()).unwrap();
+        assert!(!Spec::approval_path(dir.path()).exists());
     }
 
     #[test]

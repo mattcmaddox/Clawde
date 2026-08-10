@@ -186,7 +186,7 @@ impl SlashCommand for SpecCommand {
         // ------------------------------------------------------------------
         // 3. Parse, persist, and present the spec
         // ------------------------------------------------------------------
-        let spec = match clawde_core::spec::Spec::parse_json(&spec_json) {
+        let mut spec = match clawde_core::spec::Spec::parse_json(&spec_json) {
             Ok(spec) => spec,
             Err(e) => {
                 return CommandResult::Error(format!(
@@ -195,6 +195,12 @@ impl SlashCommand for SpecCommand {
                 ));
             }
         };
+
+        // Bind this artifact to the exact task and session that generated it.
+        // The model owns the plan content; the command owns provenance.
+        spec.task = task.to_string();
+        spec.task_id = uuid::Uuid::new_v4().to_string();
+        spec.session_id = Some(ctx.session_id.clone());
 
         let specs_dir = repo_root.join("specs");
         let slug = slugify(&spec.title);
@@ -213,6 +219,12 @@ impl SlashCommand for SpecCommand {
         if let Err(e) = spec.write_to(&path) {
             return CommandResult::Error(format!(
                 "Spec generated but could not be written to {}: {e}",
+                path.display()
+            ));
+        }
+        if let Err(e) = clawde_core::spec::Spec::clear_approval(&repo_root) {
+            return CommandResult::Error(format!(
+                "Spec generated at {}, but the previous approval could not be cleared: {e}",
                 path.display()
             ));
         }

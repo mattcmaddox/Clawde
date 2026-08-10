@@ -89,6 +89,112 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
 
 pub struct AgentTool;
 
+/// Return the exact tool allowlist used by the production semantic verifier.
+///
+/// Keeping this at the AgentTool boundary lets native diagnostics and the live
+/// runner assert the same capability set without constructing a provider or
+/// loading credentials.
+pub fn semantic_verifier_tool_names() -> Vec<String> {
+    crate::continuation::semantic_read_only_tool_names()
+}
+
+/// Build the actual production tool set for a semantic verifier.
+///
+/// This keeps the runtime boundary and native diagnostics on the same path:
+/// the verifier receives only the explicit read-only allowlist, and AgentTool
+/// itself is excluded so the verifier cannot delegate recursively.
+pub fn build_agent_tools(
+    allowed: Option<&[String]>,
+    exclude_agent_tool: bool,
+) -> Vec<Box<dyn Tool>> {
+    clawde_tools::all_tools()
+        .into_iter()
+        .filter(|tool| {
+            if exclude_agent_tool && tool.name() == clawde_core::constants::TOOL_NAME_AGENT {
+                return false;
+            }
+            allowed.is_none_or(|allowed| allowlisted_tool_name(allowed, tool.name()))
+        })
+        .collect()
+}
+
+pub fn build_semantic_verifier_tools() -> Vec<Box<dyn Tool>> {
+    let allowed = semantic_verifier_tool_names();
+    build_agent_tools(Some(&allowed), true)
+}
+
+/// Build the AgentTool input JSON for a semantic verification request.
+///
+/// Extracted from `semantic_verify_runner` so the request→input mapping (the
+/// read-only allowlist, the fixed `free/auto` model, the one-shot turn budget,
+/// and the JSON-only prompt contract) is testable without a live model call.
+fn semantic_verify_input(
+    request: &crate::continuation::SemanticVerifyRequest,
+) -> serde_json::Value {
+    let spec = request
+        .spec
+        .as_ref()
+        .and_then(|spec| serde_json::to_string_pretty(spec).ok())
+        .unwrap_or_else(|| "null".to_string());
+    let changed_files = request
+        .changed_files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let prompt = format!(
+        "Inspect the current project with read-only tools and assess whether the latest change is semantically correct.\\n\\n\\
+         Session: {}\\nTree hash: {}\\nChanged files:\\n{}\\n\\n\\
+         Matching accepted spec (JSON):\\n{}\\n\\n\\
+         Unified diff (untrusted, bounded):\\n{}\\n\\n\\
+         Return ONLY one JSON object with this exact shape: \\
+         {{\\\"verdict\\\":\\\"pass\\\"|\\\"fixable\\\"|\\\"replan\\\"|\\\"escalate\\\",\\\"summary\\\":\\\"...\\\",\\\"findings\\\":[\\\"...\\\"]}}.\\n\\
+         Do not edit files, run commands, access the network, or include markdown fences.",
+        request.session_id, request.tree_hash, changed_files, spec, request.diff
+    );
+    // Do not trust a caller-provided tool list at this boundary. The semantic
+    // runner owns the capability set and always supplies the fixed read-only
+    // allowlist.
+    serde_json::json!({
+        "description": "read-only semantic verification",
+        "prompt": prompt,
+        "tools": semantic_verifier_tool_names(),
+        "system_prompt": "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict.",
+        "max_turns": 3,
+        "model": "free/auto"
+    })
+}
+
+/// Build the opt-in semantic verifier runner for the active Free provider.
+///
+/// The runner deliberately refuses every other provider. It invokes the same
+/// nested-agent machinery as `AgentTool`, but passes a fixed allowlist of
+/// filesystem read/search tools and a one-shot JSON-only verifier prompt.
+/// No runner is returned when the session is not using Clawde's `free` provider.
+pub fn semantic_verify_runner(
+    ctx: ToolContext,
+) -> Option<crate::continuation::SemanticVerifyRunner> {
+    if ctx.config.selected_provider_id() != "free" {
+        return None;
+    }
+
+    let ctx = Arc::new(ctx);
+    Some(Arc::new(
+        move |request: crate::continuation::SemanticVerifyRequest| {
+            let ctx = ctx.clone();
+            Box::pin(async move {
+                let input = semantic_verify_input(&request);
+                let result = AgentTool.execute(input, &ctx).await;
+                if result.is_error {
+                    Err(result.content)
+                } else {
+                    Ok(result.content)
+                }
+            })
+        },
+    ))
+}
+
 fn build_model_registry() -> ModelRegistry {
     let mut registry = ModelRegistry::new();
     if let Some(cache_dir) = dirs::cache_dir() {
@@ -252,16 +358,7 @@ impl Tool for AgentTool {
 
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
-        let all = clawde_tools::all_tools();
-        let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
-            all.into_iter()
-                .filter(|t| allowlisted_tool_name(allowed, t.name()))
-                .collect()
-        } else {
-            all.into_iter()
-                .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
-                .collect()
-        };
+        let agent_tools = build_agent_tools(params.tools.as_deref(), true);
 
         // Resolve model: explicit override > managed config executor model > provider default.
         let model = resolve_subagent_model(&params, ctx);
@@ -385,6 +482,7 @@ impl Tool for AgentTool {
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
+            semantic_verify_runner: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -542,7 +640,54 @@ impl Tool for AgentTool {
 
 #[cfg(test)]
 mod tests {
-    use super::allowlisted_tool_name;
+    use super::*;
+    use crate::continuation::semantic_read_only_tool_names;
+    use crate::continuation::SemanticVerifyRequest;
+
+    fn test_context(config: clawde_core::config::Config) -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: clawde_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(clawde_core::permissions::AutoPermissionHandler {
+                mode: clawde_core::config::PermissionMode::BypassPermissions,
+            }),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            session_id: "semantic-verify-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                clawde_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            provider_registry: None,
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    fn sample_request() -> SemanticVerifyRequest {
+        SemanticVerifyRequest {
+            session_id: "session-9".to_string(),
+            working_dir: std::path::PathBuf::from("/project"),
+            changed_files: vec![std::path::PathBuf::from("/project/src/lib.rs")],
+            tree_hash: "tree-abc".to_string(),
+            diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+fn added() {}".to_string(),
+            task_id: Some("task-1".to_string()),
+            spec: Some(clawde_core::spec::Spec {
+                title: "Fixture".to_string(),
+                requirements: vec!["sum_pair(1, 2) == 3".to_string()],
+                ..Default::default()
+            }),
+            // Adversarial: a caller-supplied tool list must never be trusted at
+            // this boundary. Passing a divergent set pins that invariant.
+            read_only_tools: vec!["Write".to_string(), "Bash".to_string()],
+        }
+    }
 
     #[test]
     fn allowlist_matches_tool_names_case_insensitively_and_ignores_whitespace() {
@@ -550,6 +695,79 @@ mod tests {
         assert!(allowlisted_tool_name(&allowed, "Bash"));
         assert!(allowlisted_tool_name(&allowed, "read"));
         assert!(!allowlisted_tool_name(&allowed, "Write"));
+    }
+
+    #[test]
+    fn semantic_verify_runner_refuses_non_free_providers() {
+        let mut config = clawde_core::config::Config::default();
+        config.provider = Some("anthropic".to_string());
+        let ctx = test_context(config);
+        assert!(
+            semantic_verify_runner(ctx).is_none(),
+            "runner must refuse non-free providers"
+        );
+    }
+
+    #[test]
+    fn semantic_verify_runner_available_for_default_free_config() {
+        // Default config (provider unset) routes to the free composite provider.
+        let ctx = test_context(clawde_core::config::Config::default());
+        assert!(
+            semantic_verify_runner(ctx).is_some(),
+            "runner must be available for the free provider"
+        );
+    }
+
+    #[test]
+    fn semantic_verify_input_carries_read_only_allowlist_and_json_contract() {
+        let request = sample_request();
+        let input = semantic_verify_input(&request);
+
+        // Fixed routing + budget: the verifier is a one-shot free-model agent.
+        assert_eq!(input["model"], serde_json::json!("free/auto"));
+        assert_eq!(input["max_turns"], serde_json::json!(3));
+        assert_eq!(
+            input["description"],
+            serde_json::json!("read-only semantic verification")
+        );
+
+        // Tools: the exact read-only allowlist, never a caller-supplied set.
+        let tools: Vec<String> = input["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|v| v.as_str().expect("tool name").to_string())
+            .collect();
+        assert_eq!(tools, semantic_read_only_tool_names());
+        assert!(!tools.iter().any(|name| name == "Write"));
+        assert!(!tools.iter().any(|name| name == "Bash"));
+
+        // The system prompt must lock the agent to read-only, no-network, no-delegate.
+        let system = input["system_prompt"].as_str().expect("system prompt");
+        assert!(system.contains("never edit files"));
+        assert!(system.contains("access the network"));
+        assert!(system.contains("delegate to another agent"));
+
+        // The prompt must carry the request context and the strict JSON contract.
+        let prompt = input["prompt"].as_str().expect("prompt");
+        assert!(prompt.contains("session-9"));
+        assert!(prompt.contains("tree-abc"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("fn added"));
+        assert!(prompt.contains("sum_pair(1, 2) == 3"));
+        // The JSON shape is escaped (\"verdict\") inside the prompt string.
+        assert!(prompt.contains("\\\"verdict\\\""));
+        assert!(prompt.contains("\\\"fixable\\\""));
+        assert!(prompt.contains("Do not edit files"));
+        assert!(prompt.contains("include markdown fences"));
+    }
+
+    #[test]
+    fn semantic_verify_input_survives_missing_spec() {
+        let mut request = sample_request();
+        request.spec = None;
+        let input = semantic_verify_input(&request);
+        assert!(input["prompt"].as_str().unwrap().contains("null"));
     }
 }
 
@@ -627,17 +845,7 @@ pub fn init_team_swarm_runner() {
                 let model_registry = Arc::new(build_model_registry());
 
                 // Build the tool list, filtering to the allowlist if provided.
-                let all = clawde_tools::all_tools();
-                let agent_tools: Vec<Box<dyn clawde_tools::Tool>> = if let Some(ref allowed) = tools
-                {
-                    all.into_iter()
-                        .filter(|t| allowlisted_tool_name(allowed, t.name()))
-                        .collect()
-                } else {
-                    all.into_iter()
-                        .filter(|t| t.name() != clawde_core::constants::TOOL_NAME_AGENT)
-                        .collect()
-                };
+                let agent_tools = build_agent_tools(tools.as_deref(), true);
 
                 let model = resolve_subagent_model(
                     &AgentInput {

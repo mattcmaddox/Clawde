@@ -13,6 +13,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod codex_oauth_flow;
+mod diagnostics;
 mod oauth_flow;
 mod upgrade;
 
@@ -410,6 +411,12 @@ async fn main() -> anyhow::Result<()> {
     if raw_args.get(1).map(|s| s.as_str()) == Some("accounts") {
         handle_accounts_command(&raw_args[2..]);
         return Ok(());
+    }
+
+    // Fast-path: `clawde diagnostics [--json]` — run the bounded, native
+    // semantic-pipeline harness without loading settings, credentials, or providers.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("diagnostics") {
+        return diagnostics::run(&raw_args[2..]).await;
     }
 
     // Fast-path: `clawde upgrade [--version <v>] [--force]` — self-update.
@@ -980,6 +987,12 @@ async fn main() -> anyhow::Result<()> {
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
     tool_ctx.provider_registry = Some(provider_registry.clone());
+    // Semantic verification is explicitly opt-in and only uses the active free
+    // provider. The runner itself enforces the read-only AgentTool allowlist.
+    if config.semantic_verify == Some(true) {
+        query_config.semantic_verify_runner =
+            clawde_query::agent_tool::semantic_verify_runner(tool_ctx.clone());
+    }
 
     // Wire in the named agent (--agent flag).
     // Merge built-in default agents with user-defined agents (user wins on collision).
@@ -1849,6 +1862,8 @@ async fn run_headless(
 
     // Drain events and print streaming text
     let mut full_text = String::new();
+    let mut semantic_report: Option<clawde_query::SemanticVerifyReport> = None;
+    let mut status_messages: Vec<String> = Vec::new();
 
     while let Some(event) = event_rx.recv().await {
         match &event {
@@ -1872,6 +1887,37 @@ async fn run_headless(
                 } else {
                     let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
                     println!("{}", ev);
+                }
+            }
+            QueryEvent::SemanticVerify(report) => {
+                semantic_report = Some(report.clone());
+                if is_stream_json {
+                    let ev = serde_json::json!({
+                        "type": "semantic_verify",
+                        "report": report,
+                    });
+                    println!("{}", ev);
+                } else if !is_json_output {
+                    eprintln!(
+                        "\n[semantic verification: {}] {}",
+                        report.verdict.as_str(),
+                        report.summary
+                    );
+                    for finding in &report.findings {
+                        eprintln!("  - {}", finding);
+                    }
+                }
+            }
+            QueryEvent::Status(msg) => {
+                status_messages.push(msg.clone());
+                if is_stream_json {
+                    let ev = serde_json::json!({ "type": "status", "status": msg });
+                    println!("{}", ev);
+                } else if is_json_output {
+                    let ev = serde_json::json!({ "type": "status", "status": msg });
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!("\n[status] {}", msg);
                 }
             }
             QueryEvent::Error(msg) => {
@@ -1913,6 +1959,8 @@ async fn run_headless(
                         "cache_read_input_tokens": usage.cache_read_input_tokens,
                     },
                     "cost_usd": cost_tracker.total_cost_usd(),
+                    "semantic_verify": semantic_report,
+                    "status": status_messages,
                 });
                 println!("{}", out);
             }
@@ -2093,8 +2141,8 @@ async fn sync_transcript_to_disk(
 /// Derive the in-loop continuation mode from the live config.
 ///
 /// Precedence (highest first): goal autonomy, spec-driven development
-/// (review gate before implementation), execute-and-verify, then plain
-/// stop-after-one-turn. Re-derived per submit — not just once at startup —
+/// (review gate before implementation), opt-in semantic verification,
+/// execute-and-verify, then plain stop-after-one-turn. Re-derived per submit — not just once at startup —
 /// so mid-session config changes (e.g. Accept in `/spec-review` disabling
 /// spec mode) take effect on the very next turn.
 fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::ContinuationMode {
@@ -2103,6 +2151,9 @@ fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::Conti
     }
     if config.spec_mode {
         return clawde_query::ContinuationMode::SpecMode;
+    }
+    if config.semantic_verify == Some(true) {
+        return clawde_query::ContinuationMode::SemanticVerify(config.verify.clone());
     }
     if config.verify.enabled {
         return clawde_query::ContinuationMode::Verify(config.verify.clone());
@@ -2226,6 +2277,8 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.session_id = session.id.clone();
+    app.spec_review.set_session_id(session.id.clone());
 
     // Start the embedded ACP TCP server if enabled in settings.
     let _acp_cancel = clawde_acp::start_embedded_acp_server(&settings.acp_server);
@@ -3979,6 +4032,8 @@ async fn run_interactive(
                         tool_ctx.config.model = Some(session.model.clone());
                         app.model_name = session.model.clone();
                         tool_ctx.session_id = session.id.clone();
+                        app.session_id = session.id.clone();
+                        app.spec_review.set_session_id(session.id.clone());
                         tool_ctx.file_history = Arc::new(ParkingMutex::new(
                             clawde_core::file_history::FileHistory::new(),
                         ));

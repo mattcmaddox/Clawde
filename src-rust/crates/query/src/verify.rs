@@ -99,10 +99,27 @@ impl CheckResult {
             .trim()
     }
 }
+/// Machine-actionable outcome of a verification round.
+///
+/// This is deliberately independent of any future semantic/model verifier:
+/// low-level checks can already distinguish a passing round, a failure that
+/// may be fixed within the bounded loop, and a result that needs escalation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyVerdict {
+    /// Every executed check passed.
+    Pass,
+    /// At least one check failed and the bounded auto-fix loop may continue.
+    Fixable,
+    /// Verification could not establish correctness or the retry budget ended.
+    Escalate,
+}
+
 /// Structured outcome of one verification round, surfaced to the TUI so it
 /// can render the boxed per-check indicator (audit spec §15.1).
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
+    /// Machine-actionable classification of this round.
+    pub verdict: VerifyVerdict,
     /// Per-check results in execution order (tests first, then lints).
     pub results: Vec<CheckResult>,
     /// Which auto-fix attempt this round was (1-based). 0 when no round ran
@@ -157,6 +174,7 @@ impl VerifyPolicy {
 
     fn stash_unavailable_report(&self) {
         *self.last_report.lock().unwrap() = Some(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
             results: Vec::new(),
             attempt: 0,
             max_retries: self.config.max_retries.max(1),
@@ -172,9 +190,11 @@ impl VerifyPolicy {
         results: &[CheckResult],
         attempt: u32,
         max_retries: u32,
+        verdict: VerifyVerdict,
         headline: impl Into<String>,
     ) {
         *self.last_report.lock().unwrap() = Some(VerifyReport {
+            verdict,
             results: results.to_vec(),
             attempt,
             max_retries,
@@ -222,6 +242,7 @@ impl VerifyPolicy {
                 results,
                 0,
                 self.config.max_retries.max(1),
+                VerifyVerdict::Escalate,
                 "No test or lint commands detected",
             );
             return ContinuationDecision::Stop {
@@ -246,6 +267,7 @@ impl VerifyPolicy {
                 results,
                 0,
                 self.config.max_retries.max(1),
+                VerifyVerdict::Escalate,
                 "Verification could not run — commands missing",
             );
             return ContinuationDecision::Stop {
@@ -274,9 +296,20 @@ impl VerifyPolicy {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.stash_report(results, attempt, max_retries, "All checks passed");
+            let incomplete = !skipped.is_empty();
+            let verdict = if incomplete {
+                VerifyVerdict::Escalate
+            } else {
+                VerifyVerdict::Pass
+            };
+            let headline = if incomplete {
+                "Verification incomplete — checks skipped"
+            } else {
+                "All checks passed"
+            };
+            self.stash_report(results, attempt, max_retries, verdict, headline);
             return ContinuationDecision::Stop {
-                note: Some(format!("All checks passed:\n{}", summary)),
+                note: Some(format!("{}:\n{}", headline, summary)),
             };
         }
 
@@ -328,6 +361,7 @@ impl VerifyPolicy {
                 results,
                 attempt,
                 max_retries,
+                VerifyVerdict::Fixable,
                 format!("Auto-fix attempt {attempt}/{max_retries}"),
             );
             return ContinuationDecision::Continue {
@@ -344,6 +378,7 @@ impl VerifyPolicy {
             results,
             attempt,
             max_retries,
+            VerifyVerdict::Escalate,
             format!("Auto-fix exhausted ({max_retries} attempts)"),
         );
         ContinuationDecision::Stop {
@@ -438,6 +473,7 @@ pub fn apply_verify_subset(config: &mut VerifyConfig, args: &str) -> Result<(), 
 pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<VerifyReport, String> {
     if !config.auto_test && !config.auto_lint {
         return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
             results: Vec::new(),
             attempt: 0,
             max_retries: config.max_retries.max(1),
@@ -479,6 +515,7 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
     let max_retries = config.max_retries.max(1);
     if results.is_empty() {
         return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
             results,
             attempt: 0,
             max_retries,
@@ -488,14 +525,24 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
         });
     }
     let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
+    let skipped = results.iter().any(|r| r.skipped);
     let headline = if results.iter().all(|r| r.skipped) {
         "Verification could not run — commands missing".to_string()
+    } else if failures.is_empty() && skipped {
+        "Verification incomplete — checks skipped".to_string()
     } else if failures.is_empty() {
         "All checks passed".to_string()
     } else {
         format!("{} check(s) failed", failures.len())
     };
     Ok(VerifyReport {
+        verdict: if !failures.is_empty() {
+            VerifyVerdict::Fixable
+        } else if skipped {
+            VerifyVerdict::Escalate
+        } else {
+            VerifyVerdict::Pass
+        },
         results,
         attempt: 1,
         max_retries,
@@ -707,6 +754,10 @@ mod tests {
             turn_elapsed_secs: 0,
             working_dir: std::path::Path::new("."),
             turn_made_writes: true,
+            turn_output_tokens: 0,
+            changed_files: None,
+            changed_diff: None,
+            spec: None,
         }
     }
 
@@ -842,6 +893,7 @@ mod tests {
 
         // max_retries=2 allows two auto-fix attempts (verification rounds 1, 2).
         let first = p.decide_with_results(&ctx(), &[failing_check()]);
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Fixable);
         match &first {
             ContinuationDecision::Continue { message } => {
                 assert!(message.contains("2 tests failed"));
@@ -859,6 +911,7 @@ mod tests {
         }
 
         let third = p.decide_with_results(&ctx(), &[failing_check()]);
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Escalate);
         match &third {
             ContinuationDecision::Stop { note } => {
                 let note = note.as_deref().expect("exhaustion note must be present");
@@ -924,6 +977,10 @@ mod tests {
             turn_elapsed_secs: 0,
             working_dir: dir.path(),
             turn_made_writes: true,
+            turn_output_tokens: 0,
+            changed_files: None,
+            changed_diff: None,
+            spec: None,
         };
         let p = VerifyPolicy::new(default_config(), dir.path().to_path_buf());
         let decision = p.decide_with_results(&ctx, &[failing_check()]);
@@ -958,6 +1015,23 @@ mod tests {
             }
             _ => panic!("real failure must continue, got: {decision:?}"),
         }
+    }
+
+    #[test]
+    fn mixed_pass_and_skipped_escalates_incomplete_verification() {
+        let skipped =
+            CheckResult::skipped("lint: ruff check .", "Failed to spawn 'ruff': No such file");
+        let p = policy(default_config());
+        let decision = p.decide_with_results(&ctx(), &[passing_check(), skipped]);
+        match &decision {
+            ContinuationDecision::Stop { note } => {
+                let note = note.as_deref().unwrap_or_default();
+                assert!(note.contains("Verification incomplete"), "note: {note}");
+                assert!(note.contains("SKIPPED"), "note: {note}");
+            }
+            _ => panic!("incomplete verification must stop, got: {decision:?}"),
+        }
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Escalate);
     }
 
     #[test]
@@ -1005,6 +1079,7 @@ mod tests {
 
         // A passing round must stop with a note (no auto-fix needed).
         let passed = p.decide_with_results(&ctx(), &[passing_check()]);
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Pass);
         match &passed {
             ContinuationDecision::Stop { note } => {
                 assert!(note.as_deref().unwrap_or("").contains("All checks passed"))
@@ -1151,6 +1226,7 @@ mod tests {
         // Passing crate → "All checks passed".
         write_cargo_crate(dir.path(), "#[cfg(test)]\nmod t { #[test] fn ok() {} }\n");
         let report = run_verify_round(&default_config(), dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Pass);
         assert_eq!(report.headline, "All checks passed");
         assert!(report.results.iter().all(|r| r.ok));
         assert_eq!(report.attempt, 1);
@@ -1161,6 +1237,7 @@ mod tests {
         let report = run_verify_round(&default_config(), dir.path()).unwrap();
         // Both the test and lint checks fail on a broken crate; assert the
         // headline shape and that at least one real failure was flagged.
+        assert_eq!(report.verdict, VerifyVerdict::Fixable);
         assert!(
             report.headline.ends_with("check(s) failed"),
             "headline: {}",

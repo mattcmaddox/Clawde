@@ -5186,6 +5186,7 @@ mod stream_cache_tests {
 
         // Mixed round: one passing check, one failing check.
         let report = clawde_query::VerifyReport {
+            verdict: clawde_query::VerifyVerdict::Fixable,
             results: vec![
                 clawde_query::CheckResult {
                     label: "test: cargo test --workspace".to_string(),
@@ -5820,6 +5821,13 @@ mod task_badge_tooltip_tests {
         // (ok, skipped) pairs -> CheckResult (constructors are pub(crate) in
         // query, so build the struct directly here).
         clawde_query::VerifyReport {
+            verdict: if results.iter().all(|(ok, skipped)| *ok && !*skipped) {
+                clawde_query::VerifyVerdict::Pass
+            } else if results.iter().any(|(ok, skipped)| !*ok && !*skipped) {
+                clawde_query::VerifyVerdict::Fixable
+            } else {
+                clawde_query::VerifyVerdict::Escalate
+            },
             results: results
                 .into_iter()
                 .map(|(ok, skipped)| clawde_query::CheckResult {

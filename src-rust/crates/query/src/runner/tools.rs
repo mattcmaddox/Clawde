@@ -43,12 +43,79 @@ pub(crate) fn synthesize_permission_description(name: &str, input: &Value) -> St
     }
 }
 
+/// Return whether a built-in file-mutator tool requires a structured spec when
+/// spec-driven mode is enabled. Shell and interpreter tools are intentionally
+/// outside this first slice because their arbitrary commands cannot be safely
+/// classified here without duplicating the shell policy.
+fn requires_plan_artifact(name: &str) -> bool {
+    matches!(
+        name,
+        clawde_core::constants::TOOL_NAME_FILE_EDIT
+            | clawde_core::constants::TOOL_NAME_FILE_WRITE
+            | clawde_core::constants::TOOL_NAME_BATCH_EDIT
+            | clawde_core::constants::TOOL_NAME_NOTEBOOK_EDIT
+            | clawde_core::constants::TOOL_NAME_APPLY_PATCH
+    )
+}
+
+/// Return a plan-gate error when spec-driven mode is enabled without a valid
+/// structured spec in the current repository. This is intentionally checked
+/// at the shared dispatcher rather than inside each file-mutator tool so every
+/// covered mutator follows the same policy without duplicating tool semantics.
+/// The spec review flow persists approval for the exact generated artifact and
+/// active session. A stale, edited, unreviewed, or differently-generated spec
+/// therefore cannot authorize this write.
+fn plan_gate_error(
+    name: &str,
+    ctx: &ToolContext,
+    active_task_id: Option<&str>,
+) -> Option<ToolResult> {
+    if !requires_plan_artifact(name) {
+        return None;
+    }
+    // Normal sessions remain unchanged. An accepted implementation turn is
+    // enforced even after the UI turns spec_mode off, because its task marker
+    // explicitly carries the approval contract into the queued turn.
+    if !ctx.config.spec_mode && active_task_id.is_none() {
+        return None;
+    }
+
+    let project_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
+        .unwrap_or_else(|| ctx.working_dir.clone());
+    let approved = clawde_core::spec::Spec::approved_in(&project_root, &ctx.session_id);
+    let Some((_, approved_spec)) = approved else {
+        return Some(ToolResult::error(format!(
+            "Plan approval required before '{}': spec-driven mode is enabled, but no current task-bound spec has been accepted for session '{}' in {}/specs/. Run /spec <task>, then accept it with /spec-review before making file changes.",
+            name,
+            ctx.session_id,
+            project_root.display()
+        )));
+    };
+    if active_task_id != Some(approved_spec.task_id.as_str()) {
+        return Some(ToolResult::error(format!(
+            "Plan approval required before '{}': the accepted spec is bound to task '{}', not the current task. Generate and review a new /spec for this task.",
+            name, approved_spec.task_id
+        )));
+    }
+    None
+}
+
 /// Execute a single tool invocation.
 pub(crate) async fn execute_tool(
     name: &str,
     input: &Value,
     tools: &[Box<dyn Tool>],
     ctx: &ToolContext,
+) -> ToolResult {
+    execute_tool_for_task(name, input, tools, ctx, None).await
+}
+
+pub(crate) async fn execute_tool_for_task(
+    name: &str,
+    input: &Value,
+    tools: &[Box<dyn Tool>],
+    ctx: &ToolContext,
+    active_task_id: Option<&str>,
 ) -> ToolResult {
     let requested_name = name.trim();
     let tool = find_tool_for_name(requested_name, tools);
@@ -60,6 +127,11 @@ pub(crate) async fn execute_tool(
                 resolved_tool = tool.name(),
                 "Executing tool"
             );
+            if let Some(blocked) = plan_gate_error(tool.name(), ctx, active_task_id) {
+                warn!(tool = tool.name(), "Tool blocked by plan-artifact gate");
+                return blocked;
+            }
+
             // Central permission backstop (issue #210): if a tool does not gate
             // itself (`self_gates() == false`) and requires a gated permission
             // level, prompt here BEFORE executing. On denial, return a blocked
@@ -243,6 +315,24 @@ mod tests {
         seen_tool: Arc<parking_lot::Mutex<Option<String>>>,
     }
 
+    struct DenyingPermissionHandler;
+
+    impl clawde_core::permissions::PermissionHandler for DenyingPermissionHandler {
+        fn check_permission(
+            &self,
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Deny
+        }
+
+        fn request_permission(
+            &self,
+            _request: &clawde_core::permissions::PermissionRequest,
+        ) -> clawde_core::permissions::PermissionDecision {
+            clawde_core::permissions::PermissionDecision::Deny
+        }
+    }
+
     impl clawde_core::permissions::PermissionHandler for RecordingPermissionHandler {
         fn check_permission(
             &self,
@@ -288,7 +378,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             permission_mode: clawde_core::config::PermissionMode::Default,
             permission_handler: Arc::new(clawde_core::permissions::AutoPermissionHandler {
-                mode: clawde_core::config::PermissionMode::Default,
+                mode: clawde_core::config::PermissionMode::BypassPermissions,
             }),
             cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: "tool-dispatch-test".to_string(),
@@ -322,6 +412,256 @@ mod tests {
                 "advertised tool must be executable: {name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn plan_gate_blocks_write_without_spec() {
+        let mut ctx = test_context();
+        ctx.config.spec_mode = true;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let result =
+            execute_tool_for_task("Edit", &serde_json::json!({}), &tools, &ctx, None).await;
+
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("Plan approval required before 'Edit'"));
+        assert!(result.content.contains("/spec <task>"));
+        assert!(result.content.contains("/spec-review"));
+    }
+
+    #[tokio::test]
+    async fn plan_gate_covers_all_concrete_file_mutators() {
+        let dir = tempfile::tempdir().unwrap();
+        let edit_path = dir.path().join("edit.txt");
+        let batch_path = dir.path().join("batch.txt");
+        let notebook_path = dir.path().join("notebook.ipynb");
+        std::fs::write(&edit_path, "old\n").unwrap();
+        std::fs::write(&batch_path, "old\n").unwrap();
+        std::fs::write(
+            &notebook_path,
+            serde_json::json!({
+                "cells": [{
+                    "cell_type": "code",
+                    "id": "c1",
+                    "metadata": {},
+                    "source": ["old\\n"],
+                    "outputs": [],
+                    "execution_count": null
+                }],
+                "metadata": {},
+                "nbformat": 4,
+                "nbformat_minor": 5
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let inputs = vec![
+            (
+                clawde_core::constants::TOOL_NAME_FILE_EDIT,
+                serde_json::json!({
+                    "file_path": edit_path,
+                    "old_string": "old",
+                    "new_string": "new"
+                }),
+            ),
+            (
+                clawde_core::constants::TOOL_NAME_FILE_WRITE,
+                serde_json::json!({"file_path": dir.path().join("write.txt"), "content": "new"}),
+            ),
+            (
+                clawde_core::constants::TOOL_NAME_BATCH_EDIT,
+                serde_json::json!({"edits": [{
+                    "file_path": batch_path,
+                    "old_string": "old",
+                    "new_string": "new"
+                }]}),
+            ),
+            (
+                clawde_core::constants::TOOL_NAME_NOTEBOOK_EDIT,
+                serde_json::json!({
+                    "notebook_path": notebook_path,
+                    "cell_id": "cell-0",
+                    "new_source": "new",
+                    "edit_mode": "replace"
+                }),
+            ),
+            (
+                clawde_core::constants::TOOL_NAME_APPLY_PATCH,
+                serde_json::json!({
+                    "patch": r#"--- a/patch.txt
++++ b/patch.txt
+@@ -0,0 +1,1 @@
++new
+"#
+                }),
+            ),
+        ];
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(clawde_tools::FileEditTool),
+            Box::new(clawde_tools::FileWriteTool),
+            Box::new(clawde_tools::BatchEditTool),
+            Box::new(clawde_tools::NotebookEditTool),
+            Box::new(clawde_tools::ApplyPatchTool),
+        ];
+
+        let mut no_spec_ctx = test_context();
+        no_spec_ctx.working_dir = dir.path().to_path_buf();
+        no_spec_ctx.config.spec_mode = true;
+        for (name, input) in &inputs {
+            let result = execute_tool_for_task(name, input, &tools, &no_spec_ctx, None).await;
+            assert!(result.is_error, "{name} must be blocked without a spec");
+            assert!(
+                result.content.contains("Plan approval required"),
+                "{name} returned: {}",
+                result.content
+            );
+        }
+
+        let mut valid_spec_ctx = no_spec_ctx.clone();
+        valid_spec_ctx.permission_handler = Arc::new(DenyingPermissionHandler);
+        let accepted_spec_path = dir.path().join("specs/concrete-mutators.json");
+        clawde_core::spec::Spec {
+            task_id: "concrete-mutators-task".to_string(),
+            task: "Exercise concrete mutators".to_string(),
+            session_id: Some("tool-dispatch-test".to_string()),
+            title: "Concrete mutator plan".to_string(),
+            ..Default::default()
+        }
+        .write_to(&accepted_spec_path)
+        .unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(
+            &accepted_spec_path,
+            "tool-dispatch-test",
+        )
+        .unwrap();
+        for (name, input) in &inputs {
+            let result = execute_tool_for_task(
+                name,
+                input,
+                &tools,
+                &valid_spec_ctx,
+                Some("concrete-mutators-task"),
+            )
+            .await;
+            assert!(
+                result.is_error,
+                "{name} must still reach normal permissions"
+            );
+            assert!(
+                result.content.contains("Permission denied"),
+                "{name} bypassed normal permissions: {}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_gate_allows_write_with_valid_spec_and_preserves_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.spec_mode = true;
+        let spec_path = dir.path().join("specs/test-plan.json");
+        clawde_core::spec::Spec {
+            task_id: "test-plan-task".to_string(),
+            task: "Test plan".to_string(),
+            session_id: Some("tool-dispatch-test".to_string()),
+            title: "Test plan".to_string(),
+            ..Default::default()
+        }
+        .write_to(&spec_path)
+        .unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, "tool-dispatch-test")
+            .unwrap();
+        let seen_tool = Arc::new(parking_lot::Mutex::new(None));
+        ctx.permission_handler = Arc::new(RecordingPermissionHandler {
+            seen_tool: seen_tool.clone(),
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let result = execute_tool_for_task(
+            "Edit",
+            &serde_json::json!({}),
+            &tools,
+            &ctx,
+            Some("test-plan-task"),
+        )
+        .await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "named tool executed");
+        assert_eq!(seen_tool.lock().as_deref(), Some("Edit"));
+    }
+
+    #[tokio::test]
+    async fn plan_gate_rejects_unreviewed_and_stale_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: "task-one".to_string(),
+            task: "Task one".to_string(),
+            session_id: Some("tool-dispatch-test".to_string()),
+            title: "Task one".to_string(),
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).unwrap();
+        let mut ctx = test_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.spec_mode = true;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let unreviewed = execute_tool("Edit", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(unreviewed.content.contains("Plan approval required"));
+
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, &ctx.session_id).unwrap();
+        let approved = execute_tool_for_task(
+            "Edit",
+            &serde_json::json!({}),
+            &tools,
+            &ctx,
+            Some("task-one"),
+        )
+        .await;
+        assert!(!approved.is_error);
+
+        std::fs::write(
+            &spec_path,
+            spec.to_json().replace("Task one", "Task one changed"),
+        )
+        .unwrap();
+        let stale = execute_tool("Edit", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(stale.content.contains("Plan approval required"));
+
+        let mut wrong_session = ctx.clone();
+        wrong_session.session_id = "different-session".to_string();
+        let unrelated = execute_tool("Edit", &serde_json::json!({}), &tools, &wrong_session).await;
+        assert!(unrelated.content.contains("Plan approval required"));
+    }
+
+    #[tokio::test]
+    async fn plan_gate_is_disabled_by_default() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let result = execute_tool("Edit", &serde_json::json!({}), &tools, &test_context()).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "named tool executed");
+    }
+
+    #[tokio::test]
+    async fn plan_gate_does_not_block_read_tools() {
+        let mut ctx = test_context();
+        ctx.config.spec_mode = true;
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(NamedTool("Read", PermissionLevel::ReadOnly))];
+
+        let result = execute_tool("Read", &serde_json::json!({}), &tools, &ctx).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "named tool executed");
     }
 
     #[tokio::test]

@@ -1526,6 +1526,8 @@ pub struct App {
     pub routing_dialog: crate::routing_dialog::RoutingDialogState,
     /// Spec review dialog (/spec-review <file> — audit spec §10 Accept/Edit/Reject).
     pub spec_review: crate::spec_review::SpecReviewState,
+    /// Session identity used to bind spec-review approvals to the active run.
+    pub session_id: String,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
@@ -2184,6 +2186,7 @@ impl App {
             recent_activity_start_row: Cell::new(0),
             recent_activity_hovered_idx: Cell::new(None),
             clicked_recent_session_id: None,
+            session_id: String::new(),
             last_mouse_pos: Cell::new(None),
             task_badge_rect: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
@@ -4986,6 +4989,17 @@ impl App {
                     match self.spec_review.selected_action {
                         ACTION_ACCEPT => {
                             if let Some(msg) = self.spec_review.accept_message() {
+                                // Persist the approval before queueing the
+                                // implementation turn. A failed durable gate
+                                // must not disturb an already-pending queue.
+                                let approval_persisted = self.spec_review.mark_accepted();
+                                if !approval_persisted {
+                                    self.status_message = Some(
+                                        "Spec acceptance could not be persisted for this session; implementation was not queued.".to_string(),
+                                    );
+                                    self.spec_review.close();
+                                    return false;
+                                }
                                 // Queue the implementation turn: it auto-submits
                                 // once the current turn finishes (issue #149).
                                 self.queued_messages.push_back(msg);
@@ -4993,7 +5007,6 @@ impl App {
                                 // The accepted version becomes the diff baseline
                                 // (§10.2): a later re-open shows what changed
                                 // since approval, not just since the last look.
-                                self.spec_review.mark_accepted();
                                 // Accepting exits spec mode (§10.2): the review
                                 // gate has served its purpose, and the queued
                                 // implementation turn must not stop again to
@@ -9884,6 +9897,22 @@ impl App {
                 self.push_verify_annotation(report);
             }
 
+            QueryEvent::SemanticVerify(report) => {
+                self.is_verifying = false;
+                let findings = if report.findings.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nFindings:\n- {}", report.findings.join("\n- "))
+                };
+                self.push_system_message(
+                    format!(
+                        "Semantic verification {:?}: {}{}",
+                        report.verdict, report.summary, findings
+                    ),
+                    SystemMessageStyle::Info,
+                );
+            }
+
             QueryEvent::SpecForReview(path) => {
                 // Spec mode: the agent just produced a spec — auto-open the
                 // Accept/Edit/Reject dialog for it (§10.2).
@@ -11766,6 +11795,7 @@ mod tests {
         // the box's first line sits at line 50 of the transcript, which has
         // scrolled 40 lines up (max_scroll 100).
         app.verify = Some(clawde_query::VerifyReport {
+            verdict: clawde_query::VerifyVerdict::Pass,
             results: vec![clawde_query::CheckResult {
                 label: "test: npm test".to_string(),
                 ok: true,
@@ -11822,6 +11852,7 @@ mod tests {
 
         let mut app = make_app();
         app.verify = Some(clawde_query::VerifyReport {
+            verdict: clawde_query::VerifyVerdict::Pass,
             results: Vec::new(),
             attempt: 1,
             max_retries: 2,

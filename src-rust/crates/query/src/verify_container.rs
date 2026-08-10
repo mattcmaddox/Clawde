@@ -393,6 +393,10 @@ mod tests {
                 turn_elapsed_secs: 0,
                 working_dir: dir.path(),
                 turn_made_writes: true,
+                turn_output_tokens: 0,
+                changed_files: None,
+                changed_diff: None,
+                spec: None,
             },
         );
 
