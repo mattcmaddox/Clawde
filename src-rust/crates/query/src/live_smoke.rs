@@ -37,9 +37,7 @@ use std::time::Instant;
 const SMOKE_SCHEMA_VERSION: &str = "live-freeprovider-smoke.v3";
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PROVIDER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-const MAX_ERROR_CHARS: usize = 300;
 const MAX_SUMMARY_CHARS: usize = 1_000;
-const MAX_RAW_EXCERPT_CHARS: usize = 400;
 
 /// Redacted, bounded evidence from one live semantic smoke run.
 #[derive(Debug, Clone, Serialize)]
@@ -61,9 +59,7 @@ pub struct LiveSmokeReport {
     pub latency_ms: u64,
     pub prompt_chars: usize,
     pub response_chars: usize,
-    /// Bounded raw response excerpt, kept for diagnosing strict-parse
-    /// failures (never contains secrets — only the fixture-derived model
-    /// reply, truncated).
+    /// Reserved for schema compatibility; raw model output is never serialized.
     pub raw_excerpt: Option<String>,
     /// Short, bounded description of a direct-path failure (kept for
     /// diagnosis even when the production adapter proves the tier).
@@ -130,8 +126,8 @@ struct LiveCallInfo {
     latency_ms: u64,
     prompt_chars: usize,
     response_chars: usize,
-    /// Bounded raw response excerpt for diagnosing strict-parse failures.
-    raw_excerpt: Option<String>,
+    /// Bounded runner/provider failure; kept separate from parser failures.
+    error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +285,36 @@ fn response_text(response: &clawde_api::provider_types::ProviderResponse) -> Str
         .collect::<String>()
 }
 
+fn error_category(error: impl std::fmt::Display) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("rate limit") || message.contains("rate-limit") || message.contains("429") {
+        "rate_limited"
+    } else if message.contains("unauthorized")
+        || message.contains("forbidden")
+        || message.contains("authentication")
+        || message.contains("invalid key")
+    {
+        "authentication_error"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "timeout"
+    } else if message.contains("empty completion") {
+        "empty_completion"
+    } else if message.contains("malformed")
+        || message.contains("strict parser")
+        || message.contains("no verdict")
+    {
+        "strict_parse_failure"
+    } else if message.contains("provider") || message.contains("upstream") {
+        "provider_error"
+    } else {
+        "runner_error"
+    }
+}
+
+fn record_live_error(captured: &Arc<Mutex<LiveCallInfo>>, error: impl std::fmt::Display) {
+    captured.lock().expect("live smoke info lock").error = Some(error_category(error).to_string());
+}
+
 // ---------------------------------------------------------------------------
 // Live runner
 // ---------------------------------------------------------------------------
@@ -300,16 +326,25 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
     Arc::new(move |request: SemanticVerifyRequest| {
         let captured = captured.clone();
         Box::pin(async move {
-            let provider = clawde_api::registry::runtime_provider_for("free").ok_or_else(|| {
-                "no free provider configured: no usable free-model keys found in the auth store"
-                    .to_string()
-            })?;
+            let prompt = verifier_prompt(&request);
+            {
+                let mut info = captured.lock().expect("live smoke info lock");
+                info.prompt_chars = prompt.chars().count();
+            }
+
+            let provider = match clawde_api::registry::runtime_provider_for("free") {
+                Some(provider) => provider,
+                None => {
+                    let error =
+                        "no free provider configured: no usable free-model keys found in the auth store";
+                    record_live_error(&captured, error);
+                    return Err(error.to_string());
+                }
+            };
             {
                 let mut info = captured.lock().expect("live smoke info lock");
                 info.routing_strategy = provider.routing_strategy_name().map(str::to_string);
             }
-
-            let prompt = verifier_prompt(&request);
             let provider_request = clawde_api::provider_types::ProviderRequest {
                 model: "free/auto".to_string(),
                 messages: vec![Message::user(prompt.clone())],
@@ -325,13 +360,24 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
             };
 
             let started = Instant::now();
-            let response = tokio::time::timeout(
+            let response = match tokio::time::timeout(
                 PROVIDER_CALL_TIMEOUT,
                 provider.create_message(provider_request),
             )
             .await
-            .map_err(|_| "free-provider smoke call timed out".to_string())?
-            .map_err(|error| format!("free-provider error: {error}"))?;
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    let message = format!("free-provider error: {error}");
+                    record_live_error(&captured, &message);
+                    return Err(message);
+                }
+                Err(_) => {
+                    let message = "free-provider smoke call timed out";
+                    record_live_error(&captured, message);
+                    return Err(message.to_string());
+                }
+            };
             let latency_ms = started.elapsed().as_millis() as u64;
 
             let text = response_text(&response);
@@ -339,18 +385,17 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
             {
                 let mut info = captured.lock().expect("live smoke info lock");
                 info.latency_ms = latency_ms;
-                info.prompt_chars = prompt.chars().count();
                 info.response_chars = response_chars;
                 info.model = if response.model.is_empty() {
                     None
                 } else {
                     Some(response.model)
                 };
-                info.raw_excerpt =
-                    Some(text.chars().take(MAX_RAW_EXCERPT_CHARS).collect::<String>());
             }
             if text.trim().is_empty() {
-                return Err("free provider returned an empty completion".to_string());
+                let error = "free provider returned an empty completion";
+                record_live_error(&captured, error);
+                return Err(error.to_string());
             }
             Ok(text)
         })
@@ -423,9 +468,7 @@ async fn run_production_smoke(
             findings: Vec::new(),
             latency_ms: 0,
             attempts: 0,
-            error: Some(
-                "production runner refused the session (free provider not active)".to_string(),
-            ),
+            error: Some("runner_unavailable".to_string()),
         };
     };
 
@@ -446,13 +489,24 @@ async fn run_production_smoke(
             changed_diff: Some(diff),
             spec: Some(spec.clone()),
         };
-        match tokio::time::timeout(PRODUCTION_ATTEMPT_TIMEOUT, policy.decide_async(&context)).await
-        {
-            Ok(_) => {}
-            Err(_) => {
-                last_error = Some("production path timed out".to_string());
-                break;
-            }
+        let decision =
+            match tokio::time::timeout(PRODUCTION_ATTEMPT_TIMEOUT, policy.decide_async(&context))
+                .await
+            {
+                Ok(decision) => decision,
+                Err(_) => {
+                    last_error = Some("timeout".to_string());
+                    break;
+                }
+            };
+        // Deterministic verification remains authoritative: never accept a
+        // semantic report, retry, or route to a fixer when its gate did not pass.
+        if !matches!(
+            policy.verify_report().map(|r| r.verdict),
+            Some(crate::verify::VerifyVerdict::Pass)
+        ) {
+            last_error = Some("deterministic_gate_failed".to_string());
+            break;
         }
         if let Some(report_data) = policy.semantic_report() {
             let summary = report_data.summary.trim();
@@ -466,18 +520,14 @@ async fn run_production_smoke(
                 error: None,
             };
         }
-        // Distinguish a deterministic-gate failure from a strict-parse failure
-        // so the retry loop (and the error) blame the right stage.
-        if !matches!(
-            policy.verify_report().map(|r| r.verdict),
-            Some(crate::verify::VerifyVerdict::Pass)
-        ) {
-            last_error = Some("deterministic gate did not pass in the production path".to_string());
-            break;
+        // Only after a confirmed deterministic pass do we preserve the
+        // policy's bounded stop note, distinguishing runner/provider failure
+        // from a malformed or empty verifier response.
+        if let crate::continuation::ContinuationDecision::Stop { note: Some(note) } = decision {
+            last_error = Some(error_category(note).to_string());
+        } else {
+            last_error = Some("strict_parse_failure".to_string());
         }
-        last_error = Some(
-            "strict parser rejected the production verifier response (no verdict)".to_string(),
-        );
     }
 
     ProductionSmokeReport {
@@ -569,9 +619,7 @@ async fn run_fix_smoke(
             cargo_verified: None,
             latency_ms: 0,
             attempts: 0,
-            error: Some(
-                "production fixer refused the session (free provider not active)".to_string(),
-            ),
+            error: Some("runner_unavailable".to_string()),
         };
     };
 
@@ -594,10 +642,10 @@ async fn run_fix_smoke(
         };
         match tokio::time::timeout(FIX_ATTEMPT_TIMEOUT, fixer(request)).await {
             Ok(Ok(fixer_summary)) => {
-                last_summary = Some(fixer_summary);
+                last_summary = Some(fixer_summary.chars().take(MAX_SUMMARY_CHARS).collect());
             }
             Ok(Err(error)) => {
-                last_error = Some(format!("fixer error: {error}"));
+                last_error = Some(error_category(format!("fixer error: {error}")).to_string());
                 continue;
             }
             Err(_) => {
@@ -616,15 +664,13 @@ async fn run_fix_smoke(
                 latency_ms: started.elapsed().as_millis() as u64,
                 attempts,
                 error: if cargo_verified == Some(false) {
-                    Some("fixture acceptance test failed after the fix".to_string())
+                    Some("acceptance_failed".to_string())
                 } else {
                     None
                 },
             };
         }
-        last_error = Some(format!(
-            "fixer returned but the fixture defect remained after {attempts} attempt(s)"
-        ));
+        last_error = Some("fix_not_verified".to_string());
     }
 
     let fixed = fixture_bug_fixed(fixture);
@@ -670,7 +716,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             direct_error: None,
             production: None,
             fix: None,
-            error: Some("could not create the synthetic fixture".to_string()),
+            error: Some("fixture_setup_failed".to_string()),
         };
     }
 
@@ -727,24 +773,21 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             latency_ms,
             prompt_chars: info.prompt_chars,
             response_chars: info.response_chars,
-            raw_excerpt: info.raw_excerpt.clone(),
-            direct_error: None,
+            raw_excerpt: None,
+            direct_error: info.error.clone(),
             production: None,
             fix: None,
             error: None,
         }
     };
 
-    if let Err(elapsed) = outcome {
-        report.error = Some(format!("live smoke timed out after {elapsed:?}"));
+    if outcome.is_err() {
+        report.error = Some("timeout".to_string());
         return report;
     }
 
     if report.deterministic_verdict.as_deref() != Some("pass") {
-        report.error = Some(
-            "deterministic gate did not pass — semantic tier was (correctly) not reached"
-                .to_string(),
-        );
+        report.error = Some("deterministic_gate_failed".to_string());
         return report;
     }
 
@@ -757,14 +800,9 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             report.findings = report_data.findings.clone();
         }
         None => {
-            let mut detail = "semantic tier produced no parseable verdict (strict JSON parser \
-                               rejected the model response)"
-                .to_string();
-            if let Some(excerpt) = &report.raw_excerpt {
-                let bounded = excerpt.chars().take(MAX_ERROR_CHARS).collect::<String>();
-                detail.push_str(&format!(" — raw response: {bounded}"));
+            if report.direct_error.is_none() {
+                direct_error = Some("strict_parse_failure".to_string());
             }
-            direct_error = Some(detail);
         }
     }
 
@@ -775,7 +813,9 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
     // `direct_error` for diagnosis.
     let production = run_production_smoke(&fixture.path, &patch, diff, fixture_spec()).await;
     let production_ok = production.ok;
-    report.direct_error = direct_error;
+    if direct_error.is_some() {
+        report.direct_error = direct_error;
+    }
 
     // G5 fixer path: exercise the production fresh-executor fixer
     // (`semantic_fix_runner` → write-tools AgentTool session → free model),
@@ -827,4 +867,40 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
     report.fix = fix;
     report.ok = production_ok && fix_ok;
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_category;
+
+    #[test]
+    fn error_categories_are_stable_and_do_not_include_dynamic_details() {
+        assert_eq!(
+            error_category("free-provider error: HTTP 429 with key=secret"),
+            "rate_limited"
+        );
+        assert_eq!(
+            error_category("free provider returned an empty completion"),
+            "empty_completion"
+        );
+        assert_eq!(
+            error_category("Semantic verification stopped: malformed JSON"),
+            "strict_parse_failure"
+        );
+        assert_eq!(
+            error_category("nested provider failure with raw tool output"),
+            "provider_error"
+        );
+        assert_eq!(
+            error_category("unexpected internal condition"),
+            "runner_error"
+        );
+    }
+
+    #[test]
+    fn authentication_classification_does_not_echo_the_error() {
+        let category = error_category("unauthorized: api_key=do-not-record");
+        assert_eq!(category, "authentication_error");
+        assert!(!category.contains("do-not-record"));
+    }
 }
