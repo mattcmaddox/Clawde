@@ -796,6 +796,84 @@ impl Default for RoutingConfig {
     }
 }
 
+/// Adaptive concurrency controller (based on Netflix gradient-based approach).
+/// Tracks latency gradient to dynamically adjust concurrency limits.
+struct AdaptiveConcurrency {
+    /// Current concurrency limit per provider
+    limits: HashMap<String, u32>,
+    /// No-load latency baseline (seconds)
+    baseline_latency: HashMap<String, f64>,
+    /// Sliding window of recent latencies
+    latency_window: HashMap<String, VecDeque<f64>>,
+    /// Window size in milliseconds
+    window_size_ms: u64,
+    /// Gradient threshold below which to reduce concurrency
+    gradient_threshold: f64,
+}
+
+impl AdaptiveConcurrency {
+    fn new(window_size_ms: u64, gradient_threshold: f64) -> Self {
+        Self {
+            limits: HashMap::new(),
+            baseline_latency: HashMap::new(),
+            latency_window: HashMap::new(),
+            window_size_ms,
+            gradient_threshold,
+        }
+    }
+
+    /// Record a latency observation and update concurrency limit.
+    fn record_latency(&mut self, provider_id: &str, latency_secs: f64) {
+        // Update sliding window
+        let window = self
+            .latency_window
+            .entry(provider_id.to_string())
+            .or_insert_with(VecDeque::new);
+        window.push_back(latency_secs);
+
+        // Keep only recent observations (based on time window)
+        // For simplicity, keep last 100 observations
+        while window.len() > 100 {
+            window.pop_front();
+        }
+
+        // Update baseline if not set
+        if !self.baseline_latency.contains_key(provider_id) {
+            self.baseline_latency
+                .insert(provider_id.to_string(), latency_secs);
+        }
+
+        // Calculate gradient
+        let baseline = self
+            .baseline_latency
+            .get(provider_id)
+            .copied()
+            .unwrap_or(100.0);
+        let gradient = baseline / latency_secs;
+
+        // Update limit based on Netflix formula
+        let current_limit = self.limits.get(provider_id).copied().unwrap_or(10);
+        let queue_size = (current_limit as f64).sqrt() as u32;
+        let new_limit = ((current_limit as f64 * gradient) as u32 + queue_size)
+            .max(1)
+            .min(100); // Cap at 100 concurrent requests
+
+        self.limits.insert(provider_id.to_string(), new_limit);
+    }
+
+    /// Check if we can accept a request to this provider.
+    fn can_accept_request(&self, provider_id: &str) -> bool {
+        let limit = self.limits.get(provider_id).copied().unwrap_or(10);
+        // For now, always allow - actual tracking would need request counting
+        true
+    }
+
+    /// Get the current concurrency limit for a provider.
+    fn get_limit(&self, provider_id: &str) -> u32 {
+        self.limits.get(provider_id).copied().unwrap_or(10)
+    }
+}
+
 /// Per-upstream failure history and cooldown for the circuit breaker.
 struct CooldownState {
     /// Sliding window of failure timestamps per upstream index.
