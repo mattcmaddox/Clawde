@@ -955,12 +955,18 @@ impl CooldownState {
         just_cooled
     }
 
-    fn apply_upstream_cooldown(&mut self, idx: usize, cooldown_secs: u64) {
-        if cooldown_secs == 0 || idx >= self.cooldown_until.len() {
+    fn apply_upstream_cooldown(&mut self, idx: usize, base_cooldown_secs: u64) {
+        if base_cooldown_secs == 0 || idx >= self.cooldown_until.len() {
             return;
         }
-        self.cooldown_until[idx] =
-            Some(Instant::now() + std::time::Duration::from_secs(cooldown_secs));
+        // Calculate failure count for exponential backoff
+        let failure_count = self.failures.get(idx).map_or(0, |f| f.len() as u32);
+        // Get max cooldown from profile or use a reasonable default
+        let max_cooldown = base_cooldown_secs.saturating_mul(5).min(600);
+        // Apply exponential backoff with jitter
+        let cooldown =
+            calculate_exponential_backoff(base_cooldown_secs, failure_count, max_cooldown);
+        self.cooldown_until[idx] = Some(Instant::now() + std::time::Duration::from_secs(cooldown));
         self.save();
     }
 
@@ -2283,4 +2289,22 @@ impl ProviderProfiles {
     pub fn profile_for(&self, provider_id: &str) -> &ProviderCooldownProfile {
         self.profiles.get(provider_id).unwrap_or(&self.defaults)
     }
+}
+
+/// Calculate exponential backoff with jitter.
+///
+/// # Arguments
+/// * `base_secs` - Base cooldown in seconds
+/// * `failure_count` - Number of consecutive failures
+/// * `max_secs` - Maximum cooldown in seconds
+///
+/// # Returns
+/// Cooldown duration with exponential backoff and ±20% jitter
+fn calculate_exponential_backoff(base_secs: u64, failure_count: u32, max_secs: u64) -> u64 {
+    let exponential = base_secs.saturating_mul(2u64.saturating_pow(failure_count.min(5)));
+    let capped = exponential.min(max_secs);
+    // Add ±20% jitter to prevent thundering herd
+    let jitter_range = capped as f64 * 0.2;
+    let jitter = (rand::random::<f64>() * jitter_range * 2.0) - jitter_range;
+    ((capped as f64 + jitter).max(1.0)) as u64
 }
