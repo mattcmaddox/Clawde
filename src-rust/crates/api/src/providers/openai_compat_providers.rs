@@ -171,14 +171,15 @@ pub fn groq() -> OpenAiCompatProvider {
             overflow_patterns: vec!["reduce the length of the messages".to_string()],
             include_usage_in_stream: true,
             max_tokens_cap: Some(512),
-            // Groq's free tier limits to 12,000 TPM. The Clawde system prompt
-            // is extremely code-dense (AGENTS.md rules + tool definitions +
-            // JSON examples), tokenizing at ~1.07 bytes/token on Llama BPE.
-            // Set max_total_tokens to 8,500 so the truncation budget of
-            // (8,500-512)*1.3 = 10,384 bytes produces at most ~9,705 prompt
-            // tokens (10,384/1.07) + 512 output = ~10,217 total — well under
-            // the 12,000 limit with 1,783 tokens of headroom.
-            max_total_tokens: Some(8_500),
+            // Groq's observed free-tier limit is 8,000 TPM (measured in
+            // live trials: `Limit 8000, Requested 18016`), not 12,000. The
+            // truncation budget must also reserve the serialised tools array,
+            // which Groq counts against the request token total. Set
+            // max_total_tokens to 6,500 so the prompt budget of
+            // (6,500-512)*1.3 = 7,784 bytes minus tools leaves the system
+            // prompt truncated to a total that fits under 8,000 tokens with
+            // headroom for tool definitions.
+            max_total_tokens: Some(6_500),
             bytes_per_token: 1.3,
             ..Default::default()
         })
@@ -701,6 +702,13 @@ mod tests {
             (p.quirks.bytes_per_token - 1.3).abs() < f64::EPSILON,
             "expected Groq bytes_per_token=1.3, got {}",
             p.quirks.bytes_per_token
+        );
+        // Tuned for the observed 8,000 TPM free tier (not 12,000), with the
+        // tools array reserved out of the prompt budget (see openai_compat.rs).
+        assert_eq!(
+            p.quirks.max_total_tokens,
+            Some(6_500),
+            "expected Groq max_total_tokens=6500 for the 8k TPM tier"
         );
     }
 

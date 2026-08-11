@@ -330,18 +330,33 @@ impl OpenAiCompatProvider {
             let ratio = self.quirks.bytes_per_token;
             let budget_bytes = (budget_prompt_tokens as f64 * ratio) as usize;
 
+            // The tools array is a separate request-body field and its JSON
+            // bytes count against the provider's token budget too (Groq's TPM
+            // limit is enforced on the whole request). Reserve it out of the
+            // prompt budget so truncation accounts for the full request size.
+            let tools_bytes: usize = if request.tools.is_empty() {
+                0
+            } else {
+                OpenAiProvider::to_openai_tools_pub(&request.tools)
+                    .iter()
+                    .map(|tool| tool.to_string().len())
+                    .sum()
+            };
+            let prompt_budget_bytes = budget_bytes.saturating_sub(tools_bytes);
+
             // Estimate current total byte size of all serialised messages.
             // Using serde_json's Display (compact JSON) for accuracy.
             let current_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
 
-            if current_bytes > budget_bytes {
+            if current_bytes > prompt_budget_bytes {
                 tracing::debug!(
                     current_bytes,
-                    budget_bytes,
+                    prompt_budget_bytes,
+                    tools_bytes,
                     total_limit,
                     max_tokens,
                     ratio,
-                    "max_total_tokens: system prompt exceeds budget, truncating"
+                    "max_total_tokens: request exceeds budget, truncating system prompt"
                 );
                 // Pre-compute the byte size of non-system messages so we don't
                 // need to borrow `messages` again while holding a mutable ref.
@@ -349,12 +364,18 @@ impl OpenAiCompatProvider {
                     messages.iter().skip(1).map(|m| m.to_string().len()).sum();
 
                 // Truncate the first (system) message content to fit the budget.
+                // Even when multi-turn history dominates the budget, always
+                // shrink the system prompt down to its floor (14 bytes) instead
+                // of skipping truncation: the system prompt is the largest
+                // single removable block, and leaving it untouched guarantees
+                // the request stays over budget.
                 if let Some(system_msg) = messages.first_mut() {
                     if system_msg.get("role").and_then(|r| r.as_str()) == Some("system") {
                         if let Some(content_val) = system_msg.get_mut("content") {
                             if let Some(content) = content_val.as_str() {
                                 let content_bytes = content.len();
-                                let sys_budget = budget_bytes.saturating_sub(non_system_bytes);
+                                let sys_budget =
+                                    prompt_budget_bytes.saturating_sub(non_system_bytes);
                                 // Reserve ~50 bytes for the truncation suffix.
                                 let max_content_bytes = sys_budget.saturating_sub(50);
                                 if content_bytes > max_content_bytes && max_content_bytes >= 14 {
@@ -1462,6 +1483,74 @@ mod tests {
             total_bytes <= budget_bytes + 100,
             "total bytes {} exceeds budget {} + 100 slack",
             total_bytes,
+            budget_bytes
+        );
+    }
+
+    #[test]
+    fn max_total_tokens_reserves_tools_array_bytes() {
+        // The tools array is a separate request-body field that Groq counts
+        // against its TPM limit. Truncation must reserve those bytes out of
+        // the prompt budget so the system prompt is shrunk enough for the
+        // full request (messages + tools) to fit.
+        let provider = OpenAiCompatProvider::new("groq", "Groq", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                max_total_tokens: Some(6_500),
+                max_tokens_cap: Some(512),
+                bytes_per_token: 1.3,
+                ..Default::default()
+            });
+
+        use clawde_core::types::{Message, MessageContent, Role, ToolDefinition};
+        // A system prompt that alone would fit the raw budget but not the
+        // budget minus a ~2KB tools array.
+        let system = "x".repeat(6_000);
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("write the file".to_string()),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: Some(SystemPrompt::Text(system)),
+            tools: vec![ToolDefinition {
+                name: "Bash".to_string(),
+                description: "run a command".repeat(200),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "cmd".repeat(200)},
+                    },
+                    "required": ["command"],
+                }),
+            }],
+            max_tokens: 1_000,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+        let system_content = messages[0]["content"].as_str().unwrap_or("");
+        assert!(
+            system_content.contains("[truncated to fit provider token limit]"),
+            "expected system prompt to be truncated when tools are present"
+        );
+        // The truncated system prompt plus the tools array must fit the total
+        // budget with the usual slack.
+        let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools_bytes: usize = tools.iter().map(|t| t.to_string().len()).sum();
+        let messages_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
+        let budget_bytes = ((6_500 - 512) as f64 * 1.3) as usize;
+        assert!(
+            messages_bytes + tools_bytes <= budget_bytes + 200,
+            "messages+tools {} exceeds budget {} + slack",
+            messages_bytes + tools_bytes,
             budget_bytes
         );
     }
