@@ -521,29 +521,58 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
         .collect()
 }
 
+/// Successful Cline model discovery cached by credential fingerprint.
+static CLINE_LIVE_MODELS: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Vec<String>)>>> =
+    std::sync::OnceLock::new();
+
+/// Clear the Cline model-list cache after authentication or credential changes.
+pub(crate) fn refresh_cline_model_cache() {
+    if let Ok(mut guard) = CLINE_LIVE_MODELS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *guard = None;
+    }
+}
+
 /// Cline model list — live discovery from Cline's recommended-models API.
 ///
 /// Cline (cline.bot) is a proxy requiring models in `provider/model` format
 /// (e.g. `deepseek/deepseek-v4-flash`). Since Cline is not in the models.dev
 /// catalog, this function fetches the current free model list from Cline's
-/// API (cached once per process lifetime) and enriches each entry with
-/// capability tags and context-window info from the bundled registry.
+/// API and enriches each entry with capability tags and context-window info
+/// from the bundled registry.
 ///
 /// Falls back to the catalog default (`deepseek/deepseek-v4-flash`) when the
 /// API is unreachable or no Cline key is configured.
 fn cline_provider_models() -> Vec<ModelEntry> {
     let reg = picker_registry();
+    let auth_store = clawde_core::AuthStore::load();
+    let key = auth_store.api_key_for("cline").filter(|k| k.len() >= 8);
 
-    // Live discovery: fetch all current free models from Cline's API.
-    // Cached in a OnceLock so the network call only happens once per
-    // process lifetime.
-    static LIVE_MODELS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
-    let discovered = LIVE_MODELS.get_or_init(|| {
-        let auth_store = clawde_core::AuthStore::load();
-        auth_store
-            .api_key_for("cline")
-            .filter(|k| k.len() >= 8)
-            .and_then(|key| clawde_api::providers::fetch_cline_free_models(&key))
+    // Cache successful discovery per credential fingerprint. Do not cache a
+    // missing-key or failed request: the picker may be opened before auth and
+    // must be able to discover models after `/connect cline` stores a key.
+    let cache = CLINE_LIVE_MODELS.get_or_init(|| std::sync::Mutex::new(None));
+    let discovered = key.and_then(|key| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+
+        if let Ok(guard) = cache.lock() {
+            if let Some((cached_fingerprint, models)) = guard.as_ref() {
+                if *cached_fingerprint == fingerprint {
+                    return Some(models.clone());
+                }
+            }
+        }
+
+        let models = clawde_api::providers::fetch_cline_free_models(&key)?;
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((fingerprint, models.clone()));
+        }
+        Some(models)
     });
 
     match discovered {

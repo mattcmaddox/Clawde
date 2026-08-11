@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::{fetch_best_free_models_from_modelsdev, resolve_free_upstream_keys};
+use crate::providers::openai_compat_providers::CLINE_SDK_CLIENT_TYPE;
 
 // ---------------------------------------------------------------------------
 // Live free-model discovery (per-provider API endpoints)
@@ -91,14 +92,14 @@ fn live_discovery_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
 /// Returns the discovered model ID, or `None` if discovery is not configured
 /// or the fetch fails.
 ///
-/// Results (including failures) are cached per upstream id after the first
-/// fetch, so runtime rebuilds of the free chain don't re-run blocking
-/// network calls on the UI thread.
+/// Successful results are cached per upstream id after the first fetch, so
+/// runtime rebuilds of the free chain don't re-run blocking network calls on
+/// the UI thread. Failed results are deliberately retried on later calls.
 pub fn run_live_discovery(
     upstream_id: &str,
     auth_store: &clawde_core::AuthStore,
 ) -> Option<String> {
-    // Fast path: previously discovered (or previously failed) result.
+    // Fast path: previously successful result.
     if let Some(cached) = live_discovery_cache()
         .lock()
         .ok()
@@ -117,9 +118,13 @@ pub fn run_live_discovery(
         return Some(cached);
     }
     let result = run_live_discovery_uncached(upstream_id, auth_store);
-    super::save_live_discovery_cache(upstream_id, result.clone());
-    if let Ok(mut guard) = live_discovery_cache().lock() {
-        guard.insert(upstream_id.to_string(), result.clone());
+    // Cache only successful discovery. A transient outage, missing key, or
+    // pre-authentication probe must not permanently mask a later recovery.
+    if let Some(model) = result.as_ref() {
+        super::save_live_discovery_cache(upstream_id, Some(model.clone()));
+        if let Ok(mut guard) = live_discovery_cache().lock() {
+            guard.insert(upstream_id.to_string(), Some(model.clone()));
+        }
     }
     result
 }
@@ -171,11 +176,20 @@ fn first_upstream_key(auth_store: &clawde_core::AuthStore, upstream_id: &str) ->
 ///
 /// Returns `None` on transport failure, non-2xx status, or unparseable JSON,
 /// logging a warning labelled with `context`.
+fn request_headers(headers: &[(&str, &str)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
+}
+
 fn blocking_get_json(
     url: String,
     auth_bearer: Option<String>,
+    headers: &[(&str, &str)],
     context: String,
 ) -> Option<serde_json::Value> {
+    let headers = request_headers(headers);
     std::thread::spawn(move || {
         let Ok(response) = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -184,6 +198,9 @@ fn blocking_get_json(
                 let mut request = client.get(&url);
                 if let Some(key) = auth_bearer {
                     request = request.header("Authorization", format!("Bearer {}", key));
+                }
+                for (name, value) in &headers {
+                    request = request.header(name.as_str(), value.as_str());
                 }
                 request.send()
             })
@@ -222,6 +239,7 @@ pub fn fetch_cline_free_model(cline_api_key: &str) -> Option<String> {
     let data = blocking_get_json(
         "https://api.cline.bot/api/v1/ai/cline/recommended-models".to_string(),
         Some(cline_api_key.to_string()),
+        &[("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)],
         "fetch_cline_free_model".to_string(),
     )?;
 
@@ -250,6 +268,7 @@ pub fn fetch_cline_free_models(cline_api_key: &str) -> Option<Vec<String>> {
     let data = blocking_get_json(
         "https://api.cline.bot/api/v1/ai/cline/recommended-models".to_string(),
         Some(cline_api_key.to_string()),
+        &[("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)],
         "fetch_cline_free_models".to_string(),
     )?;
 
@@ -273,6 +292,22 @@ pub fn fetch_cline_free_models(cline_api_key: &str) -> Option<Vec<String>> {
     Some(ids)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cline_discovery_headers_include_sdk_client_type() {
+        assert_eq!(
+            request_headers(&[("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)]),
+            vec![(
+                "X-CLIENT-TYPE".to_string(),
+                CLINE_SDK_CLIENT_TYPE.to_string()
+            )]
+        );
+    }
+}
+
 /// Fetch OpenRouter's current free models from their models API.
 ///
 /// OpenRouter's API at `https://openrouter.ai/api/v1/models` returns
@@ -292,6 +327,7 @@ pub fn fetch_openrouter_free_model(openrouter_api_key: &str) -> Option<String> {
     let payload = blocking_get_json(
         "https://openrouter.ai/api/v1/models".to_string(),
         Some(openrouter_api_key.to_string()),
+        &[],
         "fetch_openrouter_free_model".to_string(),
     )?;
 
@@ -384,6 +420,7 @@ pub fn fetch_openai_compat_model_list(
     let payload = blocking_get_json(
         models_url,
         Some(api_key.to_string()),
+        &[],
         format!("fetch_openai_compat_model_list({})", upstream_id),
     )?;
 
@@ -458,6 +495,7 @@ pub fn fetch_gemini_models(api_key: &str) -> Option<String> {
             api_key
         ),
         None, // Gemini uses query-parameter auth (?key=), not a Bearer header
+        &[],
         "fetch_gemini_models".to_string(),
     )?;
 

@@ -179,6 +179,19 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Return whether an exact custom header is configured.
+    ///
+    /// This is crate-visible so provider factories can regression-test their
+    /// protocol-specific headers without exposing the internal header store.
+    #[cfg(test)]
+    pub(crate) fn has_header(&self, name: &str, value: &str) -> bool {
+        self.extra_headers
+            .iter()
+            .any(|(configured_name, configured_value)| {
+                configured_name == name && configured_value == value
+            })
+    }
+
     /// Apply provider-specific quirks.
     pub fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
         self.quirks = quirks;

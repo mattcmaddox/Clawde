@@ -2606,6 +2606,9 @@ impl App {
     ) {
         let picker_title = provider_name.clone();
         self.fast_mode = false;
+        if provider_id == "cline" {
+            crate::model_picker::refresh_cline_model_cache();
+        }
         self.set_provider_default(provider_id.clone());
         self.persist_provider_and_model();
         self.has_credentials = true;

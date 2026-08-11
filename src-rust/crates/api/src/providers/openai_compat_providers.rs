@@ -11,6 +11,9 @@ use clawde_core::provider_id::ProviderId;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
+/// Client discriminator required by Cline's restricted FREE model route.
+pub const CLINE_SDK_CLIENT_TYPE: &str = "cline-sdk";
+
 pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
     match provider_id {
         "ollama" => Some(ollama()),
@@ -672,6 +675,10 @@ pub fn cline() -> OpenAiCompatProvider {
     let key = std::env::var("CLINE_API_KEY").unwrap_or_default();
     OpenAiCompatProvider::new(ProviderId::CLINE, "Cline", "https://api.cline.bot/api/v1")
         .with_api_key(key)
+        // Cline's restricted FREE catalog requires requests to identify the
+        // official SDK client. This is the discriminator emitted by Cline's
+        // own CLI/SDK; without it some advertised models return HTTP 403.
+        .with_header("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)
         .with_quirks(ProviderQuirks {
             include_usage_in_stream: true,
             ..Default::default()
@@ -721,6 +728,15 @@ mod tests {
             p.quirks.max_total_tokens,
             Some(7_500),
             "expected Groq max_total_tokens=7500 for the 8k TPM tier"
+        );
+    }
+
+    #[test]
+    fn cline_factory_sets_sdk_client_header() {
+        let provider = cline();
+        assert!(
+            provider.has_header("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE),
+            "Cline requests must identify the cline-sdk client"
         );
     }
 
