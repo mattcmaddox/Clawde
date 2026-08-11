@@ -1868,7 +1868,11 @@ pub(crate) mod tests {
     fn doctor_report_placeholders_do_not_fail_check() {
         let _home = TestHome::new();
         let mut store = AuthStore::load();
-        store.set_keys("groq", vec!["k1".into()]);
+        // Seed malformed legacy state directly: canonical setters reject
+        // placeholders, while doctor must still diagnose an already-existing
+        // hand-edited/legacy file.
+        store.keys.insert("groq".into(), vec!["k1".into()]);
+        store.save();
         let (report, problems) = auth_store_doctor_report();
         assert!(!problems, "placeholder slots must not fail the check");
         assert!(
@@ -1888,7 +1892,13 @@ pub(crate) mod tests {
     fn doctor_flags_placeholder_slots() {
         let _home = TestHome::new();
         let mut store = AuthStore::load();
-        store.set_keys("groq", vec!["gsk-real-key-12345678".into(), "k1".into()]);
+        // Seed one valid and one malformed legacy slot directly so doctor can
+        // report the malformed slot without weakening canonical writes.
+        store.keys.insert(
+            "groq".into(),
+            vec!["gsk-real-key-12345678".into(), "k1".into()],
+        );
+        store.save();
 
         let result = cmd_doctor();
         let CommandResult::Message(msg) = result else {

@@ -1,10 +1,12 @@
-//! Live FreeProvider semantic-verifier smoke test.
+//! Live semantic-verifier smoke test for Free Mode or an explicitly configured
+//! remote Ollama GPU endpoint.
 //!
 //! The native diagnostics harness ([`crate::diagnostics`]) proves the semantic
 //! pipeline offline with an injected fake runner. This module exercises the
-//! REAL end-to-end path with a live free model through Clawde's normal provider
-//! stack (`runtime_provider_for("free")` → `FreeProvider`), which loads the
-//! user's stored keys from the auth store exactly as the query loop does.
+//! REAL end-to-end path with the active supported provider through Clawde's
+//! normal provider stack. Free Mode uses `free/auto` and stored free-model
+//! keys; an explicitly selected Ollama profile must resolve to a non-loopback
+//! endpoint on the remote GPU host. This smoke never uses a local Ollama daemon.
 //!
 //! The scenario is deliberately adversarial for the semantic tier: a synthetic
 //! fixture whose deterministic checks genuinely PASS (cargo test is green) but
@@ -34,7 +36,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const SMOKE_SCHEMA_VERSION: &str = "live-freeprovider-smoke.v3";
+const SMOKE_SCHEMA_VERSION: &str = "live-semantic-provider-smoke.v4";
 const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const PROVIDER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MAX_SUMMARY_CHARS: usize = 1_000;
@@ -54,7 +56,10 @@ pub struct LiveSmokeReport {
     pub findings: Vec<String>,
     /// Model that actually answered, as reported by the provider.
     pub model: Option<String>,
-    /// FreeProvider routing strategy in effect (e.g. Auto).
+    /// Provider route used by the smoke (free/auto or explicit remote
+    /// ollama/model).
+    pub provider: Option<String>,
+    /// Composite-provider routing strategy, when the provider exposes one.
     pub routing_strategy: Option<String>,
     pub latency_ms: u64,
     pub prompt_chars: usize,
@@ -71,7 +76,7 @@ pub struct LiveSmokeReport {
     /// under test.
     pub production: Option<ProductionSmokeReport>,
     /// Evidence from the production AgentTool-backed fixer path
-    /// (`semantic_fix_runner` → fresh write-tools executor, G5), applied to
+    /// (`semantic_fix_runner` → fresh patch-author executor, G5), applied to
     /// the verifier's own findings. Recorded independently; overall `ok`
     /// requires it when the fixer runs.
     pub fix: Option<FixSmokeReport>,
@@ -274,6 +279,14 @@ fn verifier_prompt(request: &SemanticVerifyRequest) -> String {
     )
 }
 
+fn provider_request_model(provider_id: &str, model: &str) -> String {
+    if provider_id == "ollama" {
+        model.strip_prefix("ollama/").unwrap_or(model).to_string()
+    } else {
+        model.to_string()
+    }
+}
+
 fn response_text(response: &clawde_api::provider_types::ProviderResponse) -> String {
     response
         .content
@@ -287,7 +300,27 @@ fn response_text(response: &clawde_api::provider_types::ProviderResponse) -> Str
 
 fn error_category(error: impl std::fmt::Display) -> &'static str {
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("rate limit") || message.contains("rate-limit") || message.contains("429") {
+    if message.contains("provider_chain_exhausted")
+        || message.contains("all free-mode upstreams exhausted")
+        || message.contains("free-mode upstreams exhausted")
+    {
+        "provider_chain_exhausted"
+    } else if message.contains("network_boundary_blocked")
+        || (message.contains("offline mode")
+            && message.contains("network-capable tools are disabled"))
+    {
+        "network_boundary_blocked"
+    } else if message.contains("provider_unavailable")
+        || message.contains("no api key for provider")
+        || message.contains("no credentials found")
+        || message.contains("provider unavailable")
+        || message.contains("provider not found")
+    {
+        "provider_unavailable"
+    } else if message.contains("rate limit")
+        || message.contains("rate-limit")
+        || message.contains("429")
+    {
         "rate_limited"
     } else if message.contains("unauthorized")
         || message.contains("forbidden")
@@ -299,9 +332,26 @@ fn error_category(error: impl std::fmt::Display) -> &'static str {
         "timeout"
     } else if message.contains("empty completion") {
         "empty_completion"
+    } else if message.contains("model not found") || message.contains("modelnotfound") {
+        "model_not_found"
+    } else if message.contains("invalid request") || message.contains("invalidrequest") {
+        "invalid_request"
+    } else if message.contains("context overflow") || message.contains("contextoverflow") {
+        "context_overflow"
+    } else if message.contains("server error") || message.contains("servererror") {
+        "server_error"
+    } else if message.contains("stream error") || message.contains("streamerror") {
+        "stream_error"
+    } else if message.contains("no choices") || message.contains("no message in choice") {
+        "response_parse_error"
+    } else if message.contains("failed to parse response") {
+        "response_parse_error"
     } else if message.contains("malformed")
         || message.contains("strict parser")
         || message.contains("no verdict")
+        || message.contains("semantic patch")
+        || message.contains("unified diff")
+        || message.contains("semantic hunk")
     {
         "strict_parse_failure"
     } else if message.contains("provider") || message.contains("upstream") {
@@ -319,12 +369,20 @@ fn record_live_error(captured: &Arc<Mutex<LiveCallInfo>>, error: impl std::fmt::
 // Live runner
 // ---------------------------------------------------------------------------
 
-/// Build the live runner: calls the composite FreeProvider exactly like the
-/// query loop does, with the user's stored free-model keys, and returns the
-/// raw model text for the strict verdict parser.
-fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner {
+/// Build the live runner: calls the active provider exactly like the query
+/// loop does, with Free Mode's stored keys or an explicitly configured remote
+/// Ollama endpoint, and returns raw model text for the strict verdict parser.
+fn make_live_runner(
+    captured: Arc<Mutex<LiveCallInfo>>,
+    config: clawde_core::config::Config,
+    provider_id: String,
+    model: String,
+) -> SemanticVerifyRunner {
     Arc::new(move |request: SemanticVerifyRequest| {
         let captured = captured.clone();
+        let config = config.clone();
+        let provider_id = provider_id.clone();
+        let model = model.clone();
         Box::pin(async move {
             let prompt = verifier_prompt(&request);
             {
@@ -332,11 +390,10 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
                 info.prompt_chars = prompt.chars().count();
             }
 
-            let provider = match clawde_api::registry::runtime_provider_for("free") {
+            let provider = match clawde_api::registry::provider_from_config(&config, &provider_id) {
                 Some(provider) => provider,
                 None => {
-                    let error =
-                        "no free provider configured: no usable free-model keys found in the auth store";
+                    let error = "configured semantic provider is unavailable";
                     record_live_error(&captured, error);
                     return Err(error.to_string());
                 }
@@ -346,7 +403,7 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
                 info.routing_strategy = provider.routing_strategy_name().map(str::to_string);
             }
             let provider_request = clawde_api::provider_types::ProviderRequest {
-                model: "free/auto".to_string(),
+                model: provider_request_model(&provider_id, &model),
                 messages: vec![Message::user(prompt.clone())],
                 system_prompt: None,
                 tools: Vec::new(),
@@ -368,12 +425,12 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
             {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
-                    let message = format!("free-provider error: {error}");
+                    let message = format!("semantic provider error: {error}");
                     record_live_error(&captured, &message);
                     return Err(message);
                 }
                 Err(_) => {
-                    let message = "free-provider smoke call timed out";
+                    let message = "semantic provider smoke call timed out";
                     record_live_error(&captured, message);
                     return Err(message.to_string());
                 }
@@ -393,7 +450,7 @@ fn make_live_runner(captured: Arc<Mutex<LiveCallInfo>>) -> SemanticVerifyRunner 
                 };
             }
             if text.trim().is_empty() {
-                let error = "free provider returned an empty completion";
+                let error = "semantic provider returned an empty completion";
                 record_live_error(&captured, error);
                 return Err(error.to_string());
             }
@@ -414,16 +471,12 @@ const PRODUCTION_MAX_ATTEMPTS: u32 = 3;
 /// timeout (900s) so worst case (direct 180s + 3×120s) stays bounded.
 const PRODUCTION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Build a `ToolContext` pinned to the smoke fixture with the free provider
-/// selected, exactly as the CLI does for a free-mode session (`main.rs`
-/// `set_provider_default("free")` equivalent). The runner refuses any
-/// other provider.
-fn production_tool_context(fixture: &Path) -> clawde_tools::ToolContext {
-    let config = clawde_core::config::Config {
-        provider: Some("free".to_string()),
-        model: Some("free/auto".to_string()),
-        ..Default::default()
-    };
+/// Build a `ToolContext` pinned to the smoke fixture with the active supported
+/// provider selected, exactly as the CLI does for a normal session.
+fn production_tool_context(
+    fixture: &Path,
+    config: clawde_core::config::Config,
+) -> clawde_tools::ToolContext {
     clawde_tools::ToolContext {
         working_dir: fixture.to_path_buf(),
         permission_mode: clawde_core::config::PermissionMode::Default,
@@ -458,9 +511,11 @@ async fn run_production_smoke(
     patch: &Patch,
     diff: &str,
     spec: Spec,
+    config: clawde_core::config::Config,
 ) -> ProductionSmokeReport {
     let started = Instant::now();
-    let Some(runner) = semantic_verify_runner(production_tool_context(fixture)) else {
+    let Some(runner) = semantic_verify_runner(production_tool_context(fixture, config.clone()))
+    else {
         return ProductionSmokeReport {
             ok: false,
             verdict: None,
@@ -545,7 +600,7 @@ async fn run_production_smoke(
 // Production AgentTool-backed fixer path (G5)
 // ---------------------------------------------------------------------------
 
-/// Maximum fresh-executor fix attempts. Each attempt is its own write-tools
+/// Maximum fresh-executor fix attempts. Each attempt is its own patch-author
 /// AgentTool session (max 5 model turns) that re-reads the current disk
 /// state, so a second attempt converges on whatever the first one did.
 const FIX_MAX_ATTEMPTS: u32 = 2;
@@ -596,7 +651,7 @@ async fn fixture_acceptance_test(fixture: &Path) -> Option<bool> {
 }
 
 /// Run the production AgentTool-backed fixer path end-to-end on the fixture:
-/// `semantic_fix_runner` → fresh write-tools AgentTool session → `free/auto`
+/// `semantic_fix_runner` → fresh patch-author AgentTool session → `free/auto`
 /// → FreeProvider, fed the verifier's own findings. Each attempt re-checks
 /// the disk state; the loop stops early once the injected defect is gone.
 async fn run_fix_smoke(
@@ -606,11 +661,12 @@ async fn run_fix_smoke(
     spec: Spec,
     summary: &str,
     findings: &[String],
+    config: clawde_core::config::Config,
 ) -> FixSmokeReport {
     let started = Instant::now();
     let lib = fixture.join("src/lib.rs");
     let original = std::fs::read_to_string(&lib).ok();
-    let Some(fixer) = semantic_fix_runner(production_tool_context(fixture)) else {
+    let Some(fixer) = semantic_fix_runner(production_tool_context(fixture, config)) else {
         return FixSmokeReport {
             ok: false,
             summary: None,
@@ -639,6 +695,7 @@ async fn run_fix_smoke(
             spec: Some(spec.clone()),
             summary: summary.to_string(),
             findings: findings.to_vec(),
+            feedback: None,
         };
         match tokio::time::timeout(FIX_ATTEMPT_TIMEOUT, fixer(request)).await {
             Ok(Ok(fixer_summary)) => {
@@ -694,9 +751,53 @@ async fn run_fix_smoke(
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run one live FreeProvider semantic-verification smoke and return bounded
-/// evidence. Never touches the user's project.
+/// Run one live semantic-verification smoke using the active configuration.
+/// Never touches the user's project.
 pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
+    let config = clawde_core::config::Settings::load_sync()
+        .unwrap_or_default()
+        .effective_config();
+    run_live_semantic_smoke_with_config(config).await
+}
+
+/// Run one live semantic-verification smoke with an explicit effective config.
+///
+/// This is used by diagnostics after loading the same settings the CLI would
+/// use. Ollama is accepted here only when its resolved endpoint is remote;
+/// loopback configurations fail closed before any model request.
+pub async fn run_live_semantic_smoke_with_config(
+    config: clawde_core::config::Config,
+) -> LiveSmokeReport {
+    // Network-tool filtering is derived from this effective config at each
+    // nested AgentTool construction; do not mutate the process-global Ollama
+    // mode from this reusable library API.
+    if config.selected_provider_id() == "ollama"
+        && config
+            .resolve_provider_api_base("ollama")
+            .and_then(|base| clawde_core::config::normalize_ollama_host(&base))
+            .is_none()
+    {
+        return LiveSmokeReport {
+            schema_version: SMOKE_SCHEMA_VERSION,
+            ok: false,
+            deterministic_verdict: None,
+            verdict: None,
+            summary: None,
+            findings: Vec::new(),
+            model: None,
+            provider: Some("ollama".to_string()),
+            routing_strategy: None,
+            latency_ms: 0,
+            prompt_chars: 0,
+            response_chars: 0,
+            raw_excerpt: None,
+            direct_error: None,
+            production: None,
+            fix: None,
+            error: Some("remote_ollama_endpoint_required".to_string()),
+        };
+    }
+
     let fixture = FixtureGuard::new();
     if let Err(error) = write_fixture(&fixture.path) {
         let _ = error;
@@ -708,6 +809,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             summary: None,
             findings: Vec::new(),
             model: None,
+            provider: None,
             routing_strategy: None,
             latency_ms: 0,
             prompt_chars: 0,
@@ -727,8 +829,10 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
     };
     let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,14 @@\n+/// Returns the sum of two integers.\n+pub(crate) fn sum_pair(a: i32, b: i32) -> i32 { 0 }\n+// ...";
 
+    let provider_id = config.selected_provider_id().to_string();
+    let model = crate::agent_tool::semantic_model(&config);
     let captured = Arc::new(Mutex::new(LiveCallInfo::default()));
-    let runner = make_live_runner(captured.clone());
+    let runner = make_live_runner(captured.clone(), config.clone(), provider_id, model);
     let policy = SemanticAfterVerifyPolicy::new(verify_config(), &fixture.path, Some(runner), None);
 
     let context = TurnEndContext {
@@ -769,6 +873,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
             summary: None,
             findings: Vec::new(),
             model: info.model.clone(),
+            provider: Some(config.selected_provider_id().to_string()),
             routing_strategy: info.routing_strategy.clone(),
             latency_ms,
             prompt_chars: info.prompt_chars,
@@ -807,18 +912,19 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
     }
 
     // Production adapter path: the same `semantic_verify_runner` the live loop
-    // wires, exercised end-to-end with real free-model keys. The production
-    // adapter is the object under test, so overall `ok` requires it; the
-    // direct path is reference evidence and its failure is preserved in
-    // `direct_error` for diagnosis.
-    let production = run_production_smoke(&fixture.path, &patch, diff, fixture_spec()).await;
+    // wires, exercised end-to-end with the selected Free Mode route or remote
+    // Ollama GPU endpoint. The production adapter is the object under test, so
+    // overall `ok` requires it; the direct path is reference evidence and its
+    // failure is preserved in `direct_error` for diagnosis.
+    let production =
+        run_production_smoke(&fixture.path, &patch, diff, fixture_spec(), config.clone()).await;
     let production_ok = production.ok;
     if direct_error.is_some() {
         report.direct_error = direct_error;
     }
 
     // G5 fixer path: exercise the production fresh-executor fixer
-    // (`semantic_fix_runner` → write-tools AgentTool session → free model),
+    // (`semantic_fix_runner` → patch-author AgentTool session → free model),
     // fed the verifier's own findings so the evidence is one closed loop:
     // verifier finds the defect, fixer repairs it, acceptance test passes.
     // Falls back to the known fixture defect when the verifier produced no
@@ -857,6 +963,7 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
                 fixture_spec(),
                 &fix_summary,
                 &findings,
+                config,
             )
             .await,
         )
@@ -871,7 +978,16 @@ pub async fn run_live_semantic_smoke() -> LiveSmokeReport {
 
 #[cfg(test)]
 mod tests {
-    use super::error_category;
+    use super::{error_category, provider_request_model};
+
+    #[test]
+    fn direct_ollama_requests_use_bare_model_tags() {
+        assert_eq!(
+            provider_request_model("ollama", "ollama/deepseek-coder:latest"),
+            "deepseek-coder:latest"
+        );
+        assert_eq!(provider_request_model("free", "free/auto"), "free/auto");
+    }
 
     #[test]
     fn error_categories_are_stable_and_do_not_include_dynamic_details() {
@@ -888,8 +1004,44 @@ mod tests {
             "strict_parse_failure"
         );
         assert_eq!(
+            error_category("semantic patch response was not strict JSON"),
+            "strict_parse_failure"
+        );
+        assert_eq!(
+            error_category("semantic patch hunk has an invalid start line"),
+            "strict_parse_failure"
+        );
+        assert_eq!(
+            error_category("Semantic verification could not run safely: provider_chain_exhausted"),
+            "provider_chain_exhausted"
+        );
+        assert_eq!(
+            error_category("Semantic verification could not run safely: provider_unavailable"),
+            "provider_unavailable"
+        );
+        assert_eq!(
+            error_category("Sub-agent error: No API key for provider 'free'"),
+            "provider_unavailable"
+        );
+        assert_eq!(
+            error_category("Semantic verification could not run safely: network_boundary_blocked"),
+            "network_boundary_blocked"
+        );
+        assert_eq!(
             error_category("nested provider failure with raw tool output"),
             "provider_error"
+        );
+        assert_eq!(
+            error_category("[ollama] Model not found: qwen"),
+            "model_not_found"
+        );
+        assert_eq!(
+            error_category("[ollama] Invalid request: unsupported option"),
+            "invalid_request"
+        );
+        assert_eq!(
+            error_category("[ollama] Error: No choices in response"),
+            "response_parse_error"
         );
         assert_eq!(
             error_category("unexpected internal condition"),
@@ -902,5 +1054,15 @@ mod tests {
         let category = error_category("unauthorized: api_key=do-not-record");
         assert_eq!(category, "authentication_error");
         assert!(!category.contains("do-not-record"));
+    }
+
+    #[test]
+    fn exhausted_free_chain_is_classified_without_upstream_details() {
+        let category = error_category(
+            "all free-mode upstreams exhausted: groq: unauthorized key=secret, nvidia: timeout",
+        );
+        assert_eq!(category, "provider_chain_exhausted");
+        assert!(!category.contains("groq"));
+        assert!(!category.contains("secret"));
     }
 }

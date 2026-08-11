@@ -1417,6 +1417,13 @@ fn persist_env_key_if_unstored(upstream_id: &str) {
     if store.keys_for(upstream_id).is_some_and(|k| !k.is_empty()) {
         return;
     }
+    // A legacy single free credential is migrated into the same canonical
+    // rotation map before env import is considered. Never create a second
+    // destination for a free key.
+    if store.migrate_free_credential_to_keys(upstream_id) {
+        store.save();
+        return;
+    }
     // opencode-zen shares the opencode-go slots (see resolve_free_upstream_keys).
     if upstream_id == "opencode-zen" && store.keys_for("opencode-go").is_some_and(|k| !k.is_empty())
     {
@@ -1431,7 +1438,7 @@ fn persist_env_key_if_unstored(upstream_id: &str) {
     if key.trim().len() < 8 {
         return;
     }
-    store.set_keys(upstream_id, vec![key]);
+    store.set_free_key(upstream_id, key);
     tracing::info!(
         upstream = %upstream_id,
         "persisted env-var key into the auth store (auto-import on first successful use)"
@@ -5161,7 +5168,7 @@ fn all_stored_free_upstream_keys_dedups_and_merges() {
 }
 
 #[test]
-fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
+fn first_free_upstream_key_prefers_valid_ring_key_then_env_or_copilot_oauth() {
     // One TestHome guard for the whole test body; each scenario builds a
     // fresh in-memory store. Creating a second TestHome while the first
     // guard is still alive would re-lock the non-reentrant CLAWDE_HOME_LOCK
@@ -5188,7 +5195,9 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
         "valid ring key must win over the credential"
     );
 
-    // No valid ring keys -> credential.
+    // Legacy credentials are not a dispatch fallback. The free provider
+    // migrates them explicitly before building its chain, so an un-migrated
+    // in-memory credential cannot create a second source of truth.
     let mut store = clawde_core::AuthStore::default();
     store.credentials.insert(
         "openrouter".to_string(),
@@ -5201,8 +5210,8 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
         .insert("openrouter".to_string(), vec!["short".into()]);
     assert_eq!(
         first_free_upstream_key(&store, "openrouter").as_deref(),
-        Some("or-credential-key-0123456789"),
-        "credential used when no valid ring key exists"
+        None,
+        "legacy credential must not bypass canonical keys storage"
     );
 
     // No credential, no keys -> env var fallback (guarded so it only
@@ -5213,6 +5222,22 @@ fn first_free_upstream_key_prefers_valid_ring_key_then_credential_then_env() {
     } else {
         assert_eq!(first_free_upstream_key(&store, "openrouter"), None);
     }
+
+    // GitHub Copilot's OAuth credential is the intentional exception to the
+    // API-key-only free dispatch rule.
+    let mut copilot = clawde_core::AuthStore::default();
+    copilot.credentials.insert(
+        "github-copilot".into(),
+        clawde_core::StoredCredential::OAuthToken {
+            access: "copilot-access".into(),
+            refresh: "copilot-refresh".into(),
+            expires: 0,
+        },
+    );
+    assert_eq!(
+        first_free_upstream_key(&copilot, "github-copilot").as_deref(),
+        Some("copilot-refresh")
+    );
 }
 
 #[test]
@@ -5246,7 +5271,10 @@ fn first_free_upstream_key_trims_and_drops_placeholders() {
         Some("gsk-very-long-real-key-0001")
     );
 
-    // Short keys alone -> None.
+    // Short keys alone -> None. Isolate the test from a developer's
+    // exported GROQ_API_KEY so the assertion checks the key-store boundary,
+    // not ambient process configuration.
+    let _env = crate::test_support::EnvVarGuard::set("GROQ_API_KEY", "");
     let mut store = clawde_core::AuthStore::default();
     store.keys.insert("groq".to_string(), vec!["short".into()]);
     assert_eq!(first_free_upstream_key(&store, "groq"), None);

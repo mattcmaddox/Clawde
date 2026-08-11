@@ -106,7 +106,11 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
 /// Returns `None` only if *no* catalog entry has a configured key — a single
 /// key is enough to run, and more is better.
 pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<dyn LlmProvider>> {
-    let auth_store = clawde_core::AuthStore::load();
+    let mut auth_store = clawde_core::AuthStore::load();
+    // Free-catalog API keys have exactly one canonical destination:
+    // auth.json.keys. Migrate legacy single credentials before resolving the
+    // chain; cooldown/key-ring state is never a credential source.
+    auth_store.migrate_legacy_free_credentials();
     let mut chain: Vec<FreeEntry> = Vec::new();
 
     // Parse optional routing config from `settings.json` → `providers.free.options.routing`.
@@ -1275,6 +1279,17 @@ mod tests {
                 key: "fake-mistral-key-1234567890".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn core_free_predicate_matches_catalog_ids() {
+        for upstream in FREE_CATALOG {
+            assert!(
+                clawde_core::AuthStore::is_free_upstream(upstream.id),
+                "catalog upstream '{}' must use canonical free-key storage",
+                upstream.id
+            );
+        }
     }
 
     #[test]

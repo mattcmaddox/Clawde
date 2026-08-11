@@ -4,6 +4,7 @@
 // solely on environment variables.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -11,6 +12,59 @@ use std::path::PathBuf;
 /// process must never share a `.auth.json.clawde-tmp-*` path or one rename
 /// would steal the other's file (ENOENT race).
 static AUTH_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Short-lived inter-process lock for the compare-and-rename portion of an
+/// auth-store save. The hash check alone is not enough: two writers can both
+/// observe the same bytes and then race their final renames.
+struct AuthFileLock {
+    path: PathBuf,
+}
+
+impl AuthFileLock {
+    fn acquire(auth_path: &PathBuf) -> Option<Self> {
+        let path = auth_path.with_file_name("auth.json.lock");
+        let parent = path.parent()?;
+        let _ = std::fs::create_dir_all(parent);
+        for _ in 0..200 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    // The lock contains only an owner PID. Keep it private and
+                    // flush it before publishing the guard to other writers.
+                    crate::accounts::set_user_only_perms(&path);
+                    use std::io::Write;
+                    if file
+                        .write_all(std::process::id().to_string().as_bytes())
+                        .and_then(|_| file.sync_all())
+                        .is_err()
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        return None;
+                    }
+                    return Some(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Fail closed after the bounded wait. Never delete an
+                    // old lock by timestamp: a slow live writer must not be
+                    // robbed by a second writer. A future explicit recovery
+                    // command can remove an abandoned lock after inspection.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for AuthFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 /// A stored credential for a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +121,12 @@ pub struct AuthStore {
     /// silently destroyed.
     #[serde(skip)]
     file_corrupt: bool,
+    /// SHA-256 of the file contents observed by the last successful load.
+    /// Saves compare this with the current file before replacing it, so a
+    /// stale long-lived TUI instance cannot erase keys written by another
+    /// process or session.
+    #[serde(skip)]
+    loaded_file_hash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Result of [`AuthStore::salvage_auth_store`]: the recoverable maps plus a
@@ -78,6 +138,177 @@ struct SalvageResult {
 }
 
 impl AuthStore {
+    /// Return whether a provider is part of Clawde's composite free catalog.
+    /// Kept in core so every credential-writing surface can enforce the same
+    /// destination without depending on the API crate. `opencode-go` is the
+    /// compatibility alias for the shared OpenCode Zen/Go key slot; it is not
+    /// a separate catalog entry.
+    pub fn is_free_upstream(provider_id: &str) -> bool {
+        matches!(
+            provider_id,
+            "github-copilot"
+                | "cline"
+                | "openrouter"
+                | "huggingface"
+                | "cerebras"
+                | "nvidia"
+                | "groq"
+                | "google"
+                | "cloudflare"
+                | "mistral"
+                | "cohere"
+                | "opencode-zen"
+                | "opencode-go"
+                | "zai"
+                | "sambanova"
+        )
+    }
+
+    /// Normalize a free-provider key pool. Free resolver entries reject
+    /// values shorter than eight characters, so the canonical store must use
+    /// the same boundary and must never retain placeholder slots.
+    fn clean_free_keys(keys: impl IntoIterator<Item = String>) -> Vec<String> {
+        keys.into_iter()
+            .map(|key| key.trim().to_string())
+            .filter(|key| key.len() >= 8)
+            .fold(Vec::new(), |mut out, key| {
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+                out
+            })
+    }
+
+    /// Move a legacy single API credential for a free upstream into the
+    /// canonical multi-key store. The operation is idempotent and does not
+    /// import environment variables or cooldown-state keys.
+    ///
+    /// Returns true when the in-memory store changed. Callers can persist once
+    /// after applying several migrations.
+    pub fn migrate_free_credential_to_keys(&mut self, provider_id: &str) -> bool {
+        if !Self::is_free_upstream(provider_id) {
+            return false;
+        }
+        let legacy = match self.credentials.get(provider_id).cloned() {
+            Some(StoredCredential::ApiKey { key }) => Some(key),
+            _ => None,
+        };
+        let Some(legacy) = legacy else {
+            return false;
+        };
+
+        let mut keys = Self::clean_free_keys(self.keys.remove(provider_id).unwrap_or_default());
+        let legacy = legacy.trim().to_string();
+        if legacy.len() >= 8 && !keys.contains(&legacy) {
+            keys.insert(0, legacy);
+        }
+        if keys.is_empty() {
+            self.keys.remove(provider_id);
+        } else {
+            self.keys.insert(provider_id.to_string(), keys);
+        }
+        // Even an invalid/empty legacy API credential is removed from the
+        // credentials map: free API credentials have one canonical home.
+        self.credentials.remove(provider_id);
+        true
+    }
+
+    /// Migrate every legacy free-provider API credential into `keys`, normalize
+    /// existing free key pools, and persist the canonical result once. OAuth
+    /// and non-free credentials stay in `credentials` untouched.
+    pub fn migrate_legacy_free_credentials(&mut self) -> bool {
+        let providers: Vec<String> = self.credentials.keys().cloned().collect();
+        let mut changed = false;
+        for provider in providers {
+            changed |= self.migrate_free_credential_to_keys(&provider);
+        }
+
+        let free_key_providers: Vec<String> = self
+            .keys
+            .keys()
+            .filter(|provider| Self::is_free_upstream(provider))
+            .cloned()
+            .collect();
+        for provider in free_key_providers {
+            let old = self.keys.remove(&provider).unwrap_or_default();
+            let clean = Self::clean_free_keys(old.clone());
+            if clean != old {
+                changed = true;
+            }
+            if clean.is_empty() {
+                // Removing the empty entry is canonical and avoids a false
+                // "configured" signal in dialogs and diagnostics.
+                continue;
+            }
+            self.keys.insert(provider, clean);
+        }
+
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
+    /// Canonical free-provider key write. Free catalog keys always land in the
+    /// multi-key rotation map; non-free providers retain the legacy `set`
+    /// credential path. Duplicate keys are ignored.
+    pub fn set_free_key(&mut self, provider_id: &str, key: String) -> bool {
+        if !Self::is_free_upstream(provider_id) {
+            return false;
+        }
+        // Migrate/remove any legacy credential before validating the new
+        // input, so even an invalid replacement cannot leave a second free
+        // credential destination behind. Normalize the existing pool first as
+        // well, so a rejected replacement cannot preserve malformed slots.
+        let mut changed = self.migrate_free_credential_to_keys(provider_id);
+        let old = self.keys.remove(provider_id).unwrap_or_default();
+        let mut keys = Self::clean_free_keys(old.clone());
+        changed |= keys != old;
+        let key = key.trim().to_string();
+        if key.len() >= 8 && !keys.contains(&key) {
+            keys.push(key);
+            changed = true;
+        }
+        if keys.is_empty() {
+            self.keys.remove(provider_id);
+        } else {
+            self.keys.insert(provider_id.to_string(), keys);
+        }
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
+    /// Canonical replacement of a free provider's full rotation pool.
+    pub fn set_free_keys(&mut self, provider_id: &str, keys: Vec<String>) -> bool {
+        if !Self::is_free_upstream(provider_id) {
+            return false;
+        }
+        let clean = Self::clean_free_keys(keys);
+        let old = self.keys.remove(provider_id).unwrap_or_default();
+        let removed_legacy = matches!(
+            self.credentials.get(provider_id),
+            Some(StoredCredential::ApiKey { .. })
+        ) && self.credentials.remove(provider_id).is_some();
+        let changed = old != clean || removed_legacy;
+        if clean.is_empty() {
+            self.keys.remove(provider_id);
+        } else {
+            self.keys.insert(provider_id.to_string(), clean);
+        }
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
+    /// Fingerprint the exact serialized bytes on disk. This is an optimistic
+    /// concurrency token, not a credential-derived identifier exposed to users.
+    fn file_hash(raw: &str) -> String {
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    }
+
     /// Path to the auth store file.
     pub fn path() -> PathBuf {
         crate::config::Settings::config_dir().join("auth.json")
@@ -102,8 +333,15 @@ impl AuthStore {
                 return Self::from_fallback(format!("failed to read {}: {}", path.display(), e));
             }
         };
+        let observed_hash = Self::file_hash(&raw);
         match serde_json::from_str::<AuthStore>(&raw) {
-            Ok(store) => store,
+            Ok(store) => {
+                *store.loaded_file_hash.lock().unwrap() = Some(observed_hash);
+                // Do not mutate or persist during load. Callers that construct
+                // the free provider invoke the explicit migration method before
+                // building the chain, so loading remains side-effect free.
+                store
+            }
             Err(e) => {
                 let salvaged = Self::salvage_auth_store(&raw);
                 let mut store = Self {
@@ -112,6 +350,9 @@ impl AuthStore {
                     load_error: None,
                     credentials: salvaged.credentials,
                     keys: salvaged.keys,
+                    loaded_file_hash: std::sync::Arc::new(std::sync::Mutex::new(Some(
+                        observed_hash,
+                    ))),
                 };
                 let dropped = salvaged.dropped;
                 let summary = if dropped.is_empty() {
@@ -223,6 +464,38 @@ impl AuthStore {
             );
             return;
         }
+
+        // Serialize the compare-and-rename sequence across Clawde processes.
+        // The guard is held until after the final rename below.
+        let Some(_file_lock) = AuthFileLock::acquire(&path) else {
+            tracing::warn!(
+                "refusing to save auth store at {}; another writer holds the lock",
+                path.display()
+            );
+            return;
+        };
+
+        // Optimistic concurrency guard. A long-lived caller may have loaded
+        // auth.json before another process (or another Clawde session) saved
+        // newer keys. Never replace a changed file with that stale snapshot.
+        let current_exists = path.exists();
+        let current_hash = std::fs::read_to_string(&path)
+            .ok()
+            .map(|raw| Self::file_hash(&raw));
+        let expected_hash = self.loaded_file_hash.lock().unwrap().clone();
+        let changed = match (expected_hash.as_ref(), current_hash.as_ref()) {
+            (None, None) => current_exists,
+            (Some(expected), Some(current)) => expected != current,
+            _ => true,
+        };
+        if changed {
+            tracing::warn!(
+                "refusing to overwrite changed auth store at {}; reload before saving",
+                path.display()
+            );
+            return;
+        }
+
         // One-time backup: when the last load found a corrupt file, preserve
         // the original (possibly recoverable) content before the first
         // overwrite. If the file has since been repaired on disk, leave it
@@ -271,12 +544,26 @@ impl AuthStore {
             crate::accounts::set_user_only_perms(&tmp);
             if std::fs::rename(&tmp, &path).is_err() {
                 let _ = std::fs::remove_file(&tmp);
+            } else {
+                *self.loaded_file_hash.lock().unwrap() = Some(Self::file_hash(&json));
             }
         }
     }
 
     /// Store a credential for the given provider (persists immediately).
     pub fn set(&mut self, provider_id: &str, cred: StoredCredential) {
+        if Self::is_free_upstream(provider_id) {
+            if let StoredCredential::ApiKey { key } = cred {
+                self.set_free_key(provider_id, key);
+            } else {
+                // Free catalog OAuth credentials (currently only the
+                // GitHub-Copilot flow) remain in the credential map; only API
+                // keys are canonicalized into rotation slots.
+                self.credentials.insert(provider_id.to_string(), cred);
+                self.save();
+            }
+            return;
+        }
         self.credentials.insert(provider_id.to_string(), cred);
         self.save();
     }
@@ -286,10 +573,32 @@ impl AuthStore {
         self.credentials.get(provider_id)
     }
 
-    /// Remove the credential for a provider (persists immediately).
+    /// Remove all credentials and canonical key slots for a provider
+    /// (persists immediately). For free providers this is the destructive
+    /// logout/remove operation; callers that only need to discard a legacy
+    /// single credential should use [`Self::remove_credential`].
     pub fn remove(&mut self, provider_id: &str) {
         self.credentials.remove(provider_id);
+        if Self::is_free_upstream(provider_id) {
+            self.keys.remove(provider_id);
+        }
         self.save();
+    }
+
+    /// Remove only a legacy API-key credential while preserving any canonical
+    /// multi-key pool and OAuth credentials. This is used when a rotation pool
+    /// has just been written and the old API entry must be discarded without
+    /// deleting keys or an unrelated OAuth token.
+    pub fn remove_credential(&mut self, provider_id: &str) -> bool {
+        let remove = matches!(
+            self.credentials.get(provider_id),
+            Some(StoredCredential::ApiKey { .. })
+        );
+        let removed = remove && self.credentials.remove(provider_id).is_some();
+        if removed {
+            self.save();
+        }
+        removed
     }
 
     // -----------------------------------------------------------------------
@@ -301,6 +610,10 @@ impl AuthStore {
     /// Empty keys in the input are stripped. If the resulting list is empty the
     /// provider's key entry is removed entirely.
     pub fn set_keys(&mut self, provider_id: &str, keys: Vec<String>) {
+        if Self::is_free_upstream(provider_id) {
+            self.set_free_keys(provider_id, keys);
+            return;
+        }
         let clean: Vec<String> = keys.into_iter().filter(|k| !k.is_empty()).collect();
         if clean.is_empty() {
             self.keys.remove(provider_id);
@@ -313,6 +626,10 @@ impl AuthStore {
     /// Append a single key to the provider's key list (persists immediately).
     /// Silently ignores empty keys.
     pub fn add_key(&mut self, provider_id: &str, key: String) {
+        if Self::is_free_upstream(provider_id) {
+            self.set_free_key(provider_id, key);
+            return;
+        }
         if key.is_empty() {
             return;
         }
@@ -395,7 +712,7 @@ impl AuthStore {
         // "configured" key that 401s confusingly.
         if let Some(stored) = self.get(provider_id) {
             match stored {
-                StoredCredential::ApiKey { key } => {
+                StoredCredential::ApiKey { key } if !Self::is_free_upstream(provider_id) => {
                     let key = key.trim();
                     if !key.is_empty() {
                         return Some(key.to_string());
@@ -563,13 +880,13 @@ mod tests {
     fn api_key_for_regular_provider_uses_stored_key() {
         let mut store = AuthStore::default();
         store.credentials.insert(
-            "openrouter".to_string(),
+            "openai".to_string(),
             StoredCredential::ApiKey {
-                key: "or-key".to_string(),
+                key: "openai-key".to_string(),
             },
         );
 
-        assert_eq!(store.api_key_for("openrouter").as_deref(), Some("or-key"));
+        assert_eq!(store.api_key_for("openai").as_deref(), Some("openai-key"));
     }
 
     // -----------------------------------------------------------------------
@@ -587,17 +904,17 @@ mod tests {
     fn set_keys_stores_and_overwrites() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
+        store.set_keys("firecrawl", vec!["k1".into(), "k2".into(), "k3".into()]);
 
-        let keys = store.keys_for("groq").expect("should have keys");
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys.len(), 3);
         assert_eq!(keys[0], "k1");
         assert_eq!(keys[1], "k2");
         assert_eq!(keys[2], "k3");
 
         // Overwrite
-        store.set_keys("groq", vec!["k4".into()]);
-        let keys = store.keys_for("groq").expect("should have keys");
+        store.set_keys("firecrawl", vec!["k4".into()]);
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], "k4");
     }
@@ -606,9 +923,9 @@ mod tests {
     fn set_keys_strips_empty() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.set_keys("groq", vec!["k1".into(), "".into(), "k2".into()]);
+        store.set_keys("firecrawl", vec!["k1".into(), "".into(), "k2".into()]);
 
-        let keys = store.keys_for("groq").expect("should have keys");
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "k1");
         assert_eq!(keys[1], "k2");
@@ -618,19 +935,21 @@ mod tests {
     fn set_keys_all_empty_removes_entry() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.keys.insert("groq".to_string(), vec!["k1".into()]);
-        store.set_keys("groq", vec!["".into(), "".into()]);
-        assert!(store.keys_for("groq").is_none());
+        store
+            .keys
+            .insert("firecrawl".to_string(), vec!["k1".into()]);
+        store.set_keys("firecrawl", vec!["".into(), "".into()]);
+        assert!(store.keys_for("firecrawl").is_none());
     }
 
     #[test]
     fn add_key_appends() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.add_key("groq", "k1".into());
-        store.add_key("groq", "k2".into());
+        store.add_key("firecrawl", "k1".into());
+        store.add_key("firecrawl", "k2".into());
 
-        let keys = store.keys_for("groq").expect("should have keys");
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "k1");
         assert_eq!(keys[1], "k2");
@@ -640,8 +959,8 @@ mod tests {
     fn add_key_ignores_empty() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.add_key("groq", "".into());
-        assert!(store.keys_for("groq").is_none());
+        store.add_key("firecrawl", "".into());
+        assert!(store.keys_for("firecrawl").is_none());
     }
 
     #[test]
@@ -695,23 +1014,23 @@ mod tests {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
         store.credentials.insert(
-            "groq".into(),
+            "firecrawl".into(),
             crate::auth_store::StoredCredential::ApiKey {
                 key: "anchor".into(),
             },
         );
-        store.set_keys("groq", vec!["a".into(), "b".into()]);
+        store.set_keys("firecrawl", vec!["a".into(), "b".into()]);
 
-        let prior = store.keys_for("groq").unwrap_or(&[]).to_vec();
-        let existing_key = match store.get("groq").cloned() {
+        let prior = store.keys_for("firecrawl").unwrap_or(&[]).to_vec();
+        let existing_key = match store.get("firecrawl").cloned() {
             Some(crate::auth_store::StoredCredential::ApiKey { key }) => key,
             _ => String::new(),
         };
         let merged = AuthStore::merge_keys_for_rotation(&existing_key, &prior, "typed");
-        store.set_keys("groq", merged);
-        store.remove("groq");
+        store.set_keys("firecrawl", merged);
+        store.remove_credential("firecrawl");
 
-        let keys = store.keys_for("groq").expect("should have keys");
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys, &["anchor", "a", "b", "typed"]);
     }
 
@@ -719,10 +1038,10 @@ mod tests {
     fn remove_key_removes_at_index() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.set_keys("groq", vec!["k1".into(), "k2".into(), "k3".into()]);
+        store.set_keys("firecrawl", vec!["k1".into(), "k2".into(), "k3".into()]);
 
-        assert!(store.remove_key("groq", 1));
-        let keys = store.keys_for("groq").expect("should have keys");
+        assert!(store.remove_key("firecrawl", 1));
+        let keys = store.keys_for("firecrawl").expect("should have keys");
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "k1");
         assert_eq!(keys[1], "k3");
@@ -732,18 +1051,187 @@ mod tests {
     fn remove_key_out_of_bounds_returns_false() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.set_keys("groq", vec!["k1".into()]);
-        assert!(!store.remove_key("groq", 5));
-        assert!(store.keys_for("groq").is_some());
+        store.set_keys("firecrawl", vec!["k1".into()]);
+        assert!(!store.remove_key("firecrawl", 5));
+        assert!(store.keys_for("firecrawl").is_some());
     }
 
     #[test]
     fn remove_key_last_removes_entry() {
         let _home = TestHome::new();
         let mut store = AuthStore::default();
-        store.set_keys("groq", vec!["k1".into()]);
-        assert!(store.remove_key("groq", 0));
+        store.set_keys("firecrawl", vec!["k1".into()]);
+        assert!(store.remove_key("firecrawl", 0));
+        assert!(store.keys_for("firecrawl").is_none());
+    }
+
+    #[test]
+    fn api_key_for_free_provider_ignores_legacy_credential_and_uses_keys() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "groq".into(),
+            StoredCredential::ApiKey {
+                key: "legacy-groq-key".into(),
+            },
+        );
+        store
+            .keys
+            .insert("groq".into(), vec!["canonical-groq-key".into()]);
+
+        assert_eq!(
+            store.api_key_for("groq").as_deref(),
+            Some("canonical-groq-key"),
+            "free API credentials must never bypass auth.json.keys"
+        );
+    }
+
+    #[test]
+    fn free_api_credentials_are_canonicalized_into_keys() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-free-12345678".into(),
+            },
+        );
+        assert!(store.credentials.get("groq").is_none());
+        assert_eq!(store.keys_for("groq").map(|keys| keys.len()), Some(1));
+
+        // Repeated writes are idempotent and do not create duplicate slots.
+        store.set_free_key("groq", "gsk-free-12345678".into());
+        assert_eq!(store.keys_for("groq").unwrap().len(), 1);
+
+        let reloaded = AuthStore::load();
+        assert!(reloaded.credentials.get("groq").is_none());
+        assert_eq!(reloaded.keys_for("groq").map(|keys| keys.len()), Some(1));
+    }
+
+    #[test]
+    fn legacy_free_credentials_migrate_without_touching_non_free_credentials() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "nvidia".into(),
+            StoredCredential::ApiKey {
+                key: "nv-legacy-12345678".into(),
+            },
+        );
+        store.credentials.insert(
+            "openai".into(),
+            StoredCredential::ApiKey {
+                key: "sk-openai-12345678".into(),
+            },
+        );
+        assert!(store.migrate_legacy_free_credentials());
+        assert!(store.credentials.get("nvidia").is_none());
+        assert!(store.credentials.get("openai").is_some());
+        assert_eq!(store.keys_for("nvidia").map(|keys| keys.len()), Some(1));
+    }
+
+    #[test]
+    fn free_key_replacement_deduplicates_and_filters_placeholders() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        assert!(store.set_free_keys(
+            "google",
+            vec![
+                "short".into(),
+                "google-key-12345678".into(),
+                "google-key-12345678 ".into()
+            ]
+        ));
+        assert_eq!(
+            store.keys_for("google").unwrap(),
+            &["google-key-12345678".to_string()]
+        );
+    }
+
+    #[test]
+    fn invalid_legacy_free_credentials_are_removed_without_creating_slots() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "groq".into(),
+            StoredCredential::ApiKey {
+                key: "short".into(),
+            },
+        );
+
+        assert!(store.migrate_legacy_free_credentials());
+        assert!(store.credentials.get("groq").is_none());
         assert!(store.keys_for("groq").is_none());
+    }
+
+    #[test]
+    fn invalid_free_write_normalizes_existing_pool() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.keys.insert(
+            "groq".into(),
+            vec!["short".into(), "gsk-valid-12345678".into()],
+        );
+
+        assert!(store.set_free_key("groq", "bad".into()));
+        assert_eq!(
+            store.keys_for("groq").unwrap(),
+            &["gsk-valid-12345678".to_string()]
+        );
+    }
+
+    #[test]
+    fn free_key_writes_preserve_github_copilot_oauth() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            "github-copilot".into(),
+            StoredCredential::OAuthToken {
+                access: "access-token".into(),
+                refresh: "refresh-token".into(),
+                expires: 0,
+            },
+        );
+
+        assert!(store.set_free_keys("github-copilot", vec!["copilot-key-12345678".into()]));
+        assert!(matches!(
+            store.credentials.get("github-copilot"),
+            Some(StoredCredential::OAuthToken { .. })
+        ));
+        assert_eq!(
+            store.keys_for("github-copilot").map(|keys| keys.len()),
+            Some(1)
+        );
+
+        assert!(!store.remove_credential("github-copilot"));
+        assert!(matches!(
+            store.credentials.get("github-copilot"),
+            Some(StoredCredential::OAuthToken { .. })
+        ));
+    }
+
+    #[test]
+    fn remove_clears_free_keys_but_preserves_non_free_key_pools() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set_free_key("groq", "gsk-free-12345678".into());
+        store.set_keys("firecrawl", vec!["fire-key-12345678".into()]);
+
+        store.remove("groq");
+        store.remove("firecrawl");
+
+        assert!(store.keys_for("groq").is_none());
+        assert!(
+            store.keys_for("firecrawl").is_some(),
+            "non-free remove must retain the independent multi-key pool"
+        );
+    }
+
+    #[test]
+    fn non_free_set_keys_keeps_legacy_multi_key_behavior() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set_keys("firecrawl", vec!["fire-key-12345678".into()]);
+        assert_eq!(store.keys_for("firecrawl").map(|keys| keys.len()), Some(1));
     }
 
     #[test]
@@ -793,13 +1281,13 @@ mod tests {
                 key: "sk-ant".into(),
             },
         );
-        store.set_keys("groq", vec!["gsk-1".into(), "gsk-2".into()]);
+        store.set_keys("firecrawl", vec!["gsk-1".into(), "gsk-2".into()]);
 
         let json = serde_json::to_string_pretty(&store).unwrap();
         let restored: AuthStore = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.credentials.len(), 1);
-        assert_eq!(restored.keys_for("groq").map(|k| k.len()), Some(2));
-        assert_eq!(restored.keys_for("groq").unwrap()[0], "gsk-1");
+        assert_eq!(restored.keys_for("firecrawl").map(|k| k.len()), Some(2));
+        assert_eq!(restored.keys_for("firecrawl").unwrap()[0], "gsk-1");
     }
 
     #[test]
@@ -889,6 +1377,74 @@ mod tests {
         let err = store.load_error.as_deref().unwrap_or_default();
         assert!(err.contains("credentials[broken]"), "err: {err}");
         assert!(err.contains("keys[bad]"), "err: {err}");
+    }
+
+    #[test]
+    fn missing_store_can_be_created_by_default_save() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set_keys("groq", vec!["gsk-new-12345678".into()]);
+        assert_eq!(
+            AuthStore::load().keys_for("groq").map(|keys| keys.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn save_fails_closed_when_another_writer_holds_lock() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::default();
+        store.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-existing-12345678".into(),
+            },
+        );
+        let lock_path = AuthStore::path().with_file_name("auth.json.lock");
+        std::fs::write(&lock_path, "owner").unwrap();
+
+        store.set_keys("nvidia", vec!["nv-blocked-12345678".into()]);
+        let on_disk = AuthStore::load();
+        assert!(on_disk.keys_for("nvidia").is_none());
+        assert_eq!(
+            on_disk
+                .keys_for("groq")
+                .map(|keys| keys.first().map(String::as_str)),
+            Some(Some("gsk-existing-12345678"))
+        );
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn stale_store_cannot_clobber_newer_keys() {
+        let _home = TestHome::new();
+        let mut initial = AuthStore::default();
+        initial.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-initial-12345678".into(),
+            },
+        );
+
+        let mut stale = AuthStore::load();
+        let mut fresh = AuthStore::load();
+        fresh.set_keys("nvidia", vec!["nv-initial-12345678".into()]);
+
+        // The stale writer must not erase the newer provider/key pool.
+        stale.set(
+            "groq",
+            StoredCredential::ApiKey {
+                key: "gsk-stale-12345678".into(),
+            },
+        );
+        let on_disk = AuthStore::load();
+        assert_eq!(on_disk.keys_for("nvidia").map(|keys| keys.len()), Some(1));
+        assert_eq!(
+            on_disk
+                .keys_for("groq")
+                .map(|keys| keys.first().map(String::as_str)),
+            Some(Some("gsk-initial-12345678"))
+        );
     }
 
     #[test]

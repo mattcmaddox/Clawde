@@ -5345,7 +5345,10 @@ impl App {
                                     &api_key,
                                 );
                                 self.auth_store.set_keys(&provider_id, merged);
-                                self.auth_store.remove(&provider_id);
+                                // Discard only the legacy single credential;
+                                // removing the provider would also delete the
+                                // freshly-created canonical rotation pool.
+                                self.auth_store.remove_credential(&provider_id);
                                 self.push_notification(
                                     NotificationKind::Success,
                                     format!(

@@ -1612,9 +1612,9 @@ pub mod config {
         /// (`rust:latest`, `node:latest`, `python:latest`, `golang:latest`,
         /// `eclipse-temurin:latest`, `gcc:latest`).
         pub container_image: Option<String>,
-        /// FreeProvider model used by the semantic verifier and fixer. The
-        /// production adapters accept only `free/...` routes and fall back to
-        /// `free/auto` for invalid or non-free values.
+        /// Provider/model route used by the semantic verifier and fixer. The
+        /// production adapters accept `free/...` routes or explicitly selected
+        /// isolated `ollama/...` routes; invalid routes fall back safely.
         #[serde(default = "default_semantic_model")]
         pub semantic_model: String,
         /// Maximum AgentTool turns for one read-only semantic review.
@@ -1626,12 +1626,16 @@ pub mod config {
         /// Maximum semantic fix-and-reverify rounds in the continuation policy.
         #[serde(default = "default_semantic_max_attempts")]
         pub semantic_max_attempts: u32,
+        /// Maximum fresh patch-author retries for one fixable verdict.
+        #[serde(default = "default_semantic_fix_max_attempts")]
+        pub semantic_fix_max_attempts: u32,
     }
 
     pub const DEFAULT_SEMANTIC_MODEL: &str = "free/auto";
     pub const DEFAULT_SEMANTIC_MAX_TURNS: u32 = 3;
     pub const DEFAULT_SEMANTIC_FIX_MAX_TURNS: u32 = 5;
     pub const DEFAULT_SEMANTIC_MAX_ATTEMPTS: u32 = 3;
+    pub const DEFAULT_SEMANTIC_FIX_MAX_ATTEMPTS: u32 = 3;
     pub const MAX_SEMANTIC_TURNS: u32 = 10;
     pub const MAX_SEMANTIC_ATTEMPTS: u32 = 5;
 
@@ -1649,6 +1653,10 @@ pub mod config {
 
     fn default_semantic_max_attempts() -> u32 {
         DEFAULT_SEMANTIC_MAX_ATTEMPTS
+    }
+
+    fn default_semantic_fix_max_attempts() -> u32 {
+        DEFAULT_SEMANTIC_FIX_MAX_ATTEMPTS
     }
 
     impl Default for VerifyConfig {
@@ -1669,6 +1677,7 @@ pub mod config {
                 semantic_max_turns: DEFAULT_SEMANTIC_MAX_TURNS,
                 semantic_fix_max_turns: DEFAULT_SEMANTIC_FIX_MAX_TURNS,
                 semantic_max_attempts: DEFAULT_SEMANTIC_MAX_ATTEMPTS,
+                semantic_fix_max_attempts: DEFAULT_SEMANTIC_FIX_MAX_ATTEMPTS,
             }
         }
     }

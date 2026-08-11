@@ -91,7 +91,7 @@ impl AgentRuntime {
             .into_iter()
             .filter(|tool| !network_blocked || !tool.network_capable())
             .collect();
-        tools.push(Box::new(clawde_query::AgentTool));
+        tools.push(Box::new(clawde_query::AgentTool::default()));
         let tools = Arc::new(tools);
 
         let mut query_config = QueryConfig::from_config(&config);

@@ -46,11 +46,11 @@ pub use compact::{
     MicroCompactConfig, TokenWarningState,
 };
 pub use continuation::{
-    parse_semantic_verify_response, semantic_fixer_tool_names, semantic_read_only_tool_names,
-    ContinuationDecision, ContinuationMode, ContinuationPolicy, SemanticAfterVerifyPolicy,
-    SemanticFixRequest, SemanticFixRunner, SemanticVerdict, SemanticVerifyPolicy,
-    SemanticVerifyReport, SemanticVerifyRequest, SemanticVerifyResponse, SemanticVerifyRunner,
-    StopPolicy, TurnEndContext,
+    parse_semantic_verify_response, semantic_read_only_tool_names, ContinuationDecision,
+    ContinuationMode, ContinuationPolicy, SemanticAfterVerifyPolicy, SemanticFixRequest,
+    SemanticFixRunner, SemanticVerdict, SemanticVerifyPolicy, SemanticVerifyReport,
+    SemanticVerifyRequest, SemanticVerifyResponse, SemanticVerifyRunner, StopPolicy,
+    TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
 pub use diagnostics::{run_native_diagnostics, NativeDiagnosticCheck, NativeDiagnosticsReport};
@@ -58,7 +58,9 @@ pub use goal_loop::{
     check_and_continue_goal, decide_goal_continuation, mark_goal_complete, GoalContinuation,
     StopReason,
 };
-pub use live_smoke::{run_live_semantic_smoke, LiveSmokeReport};
+pub use live_smoke::{
+    run_live_semantic_smoke, run_live_semantic_smoke_with_config, LiveSmokeReport,
+};
 pub use runner::*;
 pub use sanitize::sanitize_history;
 pub use session_memory::{
@@ -194,7 +196,7 @@ pub struct QueryConfig {
     /// provider/client dependency in the policy enum.
     pub semantic_verify_runner: Option<crate::continuation::SemanticVerifyRunner>,
     /// Optional injected fresh-executor fixer (G5). When present, a `fixable`
-    /// semantic verdict spawns a fresh write-tools executor instead of
+    /// semantic verdict spawns a fresh patch-author executor instead of
     /// replaying the fix request into the same in-context trace.
     pub semantic_fix_runner: Option<crate::continuation::SemanticFixRunner>,
 }
@@ -309,6 +311,18 @@ fn free_catalog_pin_redirect(provider_id: &str, auth_store: &clawde_core::AuthSt
         return false;
     }
     clawde_api::providers::free::first_free_upstream_key(auth_store, provider_id).is_some()
+}
+
+/// Convert a canonical Clawde model ID into the upstream model ID expected by
+/// the selected provider. Provider-qualified IDs are useful for routing, but
+/// OpenAI-compatible Ollama endpoints expect the native tag without the
+/// `ollama/` namespace prefix (for example `qwen2.5-coder:7b`).
+fn provider_request_model(provider_id: &str, model: &str) -> String {
+    if provider_id == "ollama" {
+        model.strip_prefix("ollama/").unwrap_or(model).to_string()
+    } else {
+        model.to_string()
+    }
 }
 
 /// Events emitted by the query loop for the TUI to render.
@@ -597,6 +611,7 @@ pub async fn run_query_loop(
         || matches!(
             config.continuation,
             crate::continuation::ContinuationMode::SemanticVerify(_)
+                | crate::continuation::ContinuationMode::GoalSemanticVerify(_)
         );
     let shadow_snap: Option<std::sync::Arc<clawde_core::snapshot::ShadowSnapshot>> =
         if snapshot_needed {
@@ -770,6 +785,7 @@ pub async fn run_query_loop(
                             let status = if matches!(
                                 config.continuation,
                                 crate::continuation::ContinuationMode::Goal
+                                    | crate::continuation::ContinuationMode::GoalSemanticVerify(_)
                             ) {
                                 "Goal: continuing autonomously… (use /goal pause to stop)".to_string()
                             } else {
@@ -969,6 +985,7 @@ pub async fn run_query_loop(
             if matches!(
                 config.continuation,
                 crate::continuation::ContinuationMode::Goal
+                    | crate::continuation::ContinuationMode::GoalSemanticVerify(_)
             ) {
                 if let Some(goal) = clawde_core::GoalStore::open_default()
                     .and_then(|s| s.get_active_goal(&tool_ctx.session_id))
@@ -1350,7 +1367,7 @@ pub async fn run_query_loop(
                         .collect();
 
                     let provider_request = clawde_api::ProviderRequest {
-                        model: model_id_str.to_owned(),
+                        model: provider_request_model(&provider_id_str, &model_id_str),
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
                         tools: provider_tools,
@@ -2307,7 +2324,7 @@ pub async fn run_query_loop(
                                 let memory_entrypoint =
                                     task.memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
                                 tokio::spawn(async move {
-                                    let agent = crate::agent_tool::AgentTool;
+                                    let agent = crate::agent_tool::AgentTool::default();
                                     let result = clawde_tools::Tool::execute(
                                         &agent,
                                         agent_input,
@@ -3854,6 +3871,23 @@ mod tests {
     }
 
     // ---- F1: free-catalog pin redirect (audit fix) -------------------------
+
+    #[test]
+    fn ollama_provider_requests_use_bare_model_tags() {
+        assert_eq!(
+            provider_request_model("ollama", "ollama/qwen2.5-coder:7b"),
+            "qwen2.5-coder:7b"
+        );
+        assert_eq!(
+            provider_request_model("ollama", "qwen2.5-coder:7b"),
+            "qwen2.5-coder:7b"
+        );
+        assert_eq!(provider_request_model("free", "free/auto"), "free/auto");
+        assert_eq!(
+            provider_request_model("openai", "openai/gpt-5-mini"),
+            "openai/gpt-5-mini"
+        );
+    }
 
     #[test]
     fn free_catalog_pin_redirect_routes_keyed_upstreams() {

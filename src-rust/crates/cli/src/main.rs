@@ -1043,7 +1043,7 @@ async fn main() -> anyhow::Result<()> {
     // Semantic verification is explicitly opt-in and only uses the active free
     // provider. The runner itself enforces the read-only AgentTool allowlist.
     // G5: when enabled, also wire the fresh-executor fixer so a `fixable`
-    // verdict routes to a new write-tools session instead of replaying the fix
+    // verdict routes to a new patch-author session instead of replaying the fix
     // request into the same in-context trace.
     if config.semantic_verify == Some(true) {
         query_config.semantic_verify_runner =
@@ -1162,7 +1162,7 @@ fn build_tools_with_mcp_vec(
         .into_iter()
         .filter(|tool| !network_blocked || !tool.network_capable())
         .collect();
-    v.push(Box::new(clawde_query::AgentTool));
+    v.push(Box::new(clawde_query::AgentTool::default()));
 
     if let Some(ref manager_arc) = mcp_manager {
         if !network_blocked {
@@ -2355,17 +2355,21 @@ async fn sync_transcript_to_disk(
 
 /// Derive the in-loop continuation mode from the live config.
 ///
-/// Precedence (highest first): goal autonomy, spec-driven development
-/// (review gate before implementation), opt-in semantic verification,
-/// execute-and-verify, then plain stop-after-one-turn. Re-derived per submit — not just once at startup —
+/// Precedence (highest first): spec-driven development (review gate before
+/// implementation), goal autonomy with semantic acceptance when enabled,
+/// standalone semantic verification, execute-and-verify, then plain
+/// stop-after-one-turn. Re-derived per submit — not just once at startup —
 /// so mid-session config changes (e.g. Accept in `/spec-review` disabling
 /// spec mode) take effect on the very next turn.
 fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::ContinuationMode {
-    if clawde_core::goals_enabled() {
-        return clawde_query::ContinuationMode::Goal;
-    }
     if config.spec_mode {
         return clawde_query::ContinuationMode::SpecMode;
+    }
+    if clawde_core::goals_enabled() {
+        if config.semantic_verify == Some(true) {
+            return clawde_query::ContinuationMode::GoalSemanticVerify(config.verify.clone());
+        }
+        return clawde_query::ContinuationMode::Goal;
     }
     if config.semantic_verify == Some(true) {
         return clawde_query::ContinuationMode::SemanticVerify(config.verify.clone());

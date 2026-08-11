@@ -1468,25 +1468,22 @@ pub fn resolve_free_upstream_keys(
     auth_store: &clawde_core::AuthStore,
     upstream_id: &str,
 ) -> Option<Vec<String>> {
-    let raw: Vec<String> = if upstream_id == "opencode-zen" {
+    let raw = if upstream_id == "opencode-zen" {
         auth_store
             .keys_for("opencode-zen")
             .or_else(|| auth_store.keys_for("opencode-go"))
             .map(|k| k.to_vec())
     } else {
         auth_store.keys_for(upstream_id).map(|k| k.to_vec())
-    }?;
+    };
 
     let filtered: Vec<String> = raw
+        .unwrap_or_default()
         .into_iter()
         .map(|k| k.trim().to_string())
         .filter(|k| k.len() >= 8)
         .collect();
-    if filtered.is_empty() {
-        None
-    } else {
-        Some(filtered)
-    }
+    (!filtered.is_empty()).then_some(filtered)
 }
 
 /// All stored keys for a free-catalog upstream, including single-key / OAuth
@@ -1512,7 +1509,19 @@ pub fn all_stored_free_upstream_keys(
         vec![upstream_id]
     };
     for slot in slots {
-        if let Some(key) = auth_store.api_key_for(slot) {
+        // This helper is display/migration-oriented, not a dispatch resolver:
+        // surface a legacy API credential so `/connect` and diagnostics can
+        // show it while the production chain still requires `keys`.
+        if let Some(clawde_core::StoredCredential::ApiKey { key }) =
+            auth_store.credentials.get(slot)
+        {
+            let key = key.trim();
+            if !key.is_empty() {
+                push(key.to_string());
+            }
+        } else if let Some(key) = auth_store.api_key_for(slot) {
+            // Preserve OAuth-backed display credentials such as Copilot while
+            // keeping free API credentials out of api_key_for's dispatch path.
             push(key);
         }
         if let Some(keys) = auth_store.keys_for(slot) {
@@ -1531,8 +1540,8 @@ pub fn all_stored_free_upstream_keys(
 /// placeholder sitting in slot 0 does not shadow a valid key in slot 1, since
 /// the ring resolver would have used it and the poller probes those exact
 /// slots. Only when there are no usable rotation keys does it fall back to
-/// the stored credential (incl. OAuth, e.g. github-copilot) or the provider's
-/// env var.
+/// GitHub Copilot's OAuth credential or the provider's environment variable;
+/// free API credentials must first be migrated into the canonical `keys` map.
 ///
 /// OpenCode Zen shares the OpenCode Go slots. `build_free_provider` uses
 /// this for the non-rotating single-key path.
@@ -1545,12 +1554,36 @@ pub fn first_free_upstream_key(
     {
         return Some(first);
     }
+    // Free API dispatch is keys-only. Legacy API credentials are intentionally
+    // not a fallback here; the free chain builder migrates them explicitly
+    // before resolving. GitHub Copilot is the deliberate OAuth exception:
+    // its refresh/access token remains in `credentials` and is not an API-key
+    // rotation slot. Environment keys remain a supported last resort until
+    // successful dispatch auto-imports them into `auth.json.keys`.
+    if upstream_id == "github-copilot" {
+        return auth_store.api_key_for(upstream_id);
+    }
     let key = if upstream_id == "opencode-zen" {
         auth_store
-            .api_key_for("opencode-zen")
-            .or_else(|| auth_store.api_key_for("opencode-go"))
+            .keys_for("opencode-zen")
+            .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
+            .cloned()
+            .or_else(|| {
+                auth_store
+                    .keys_for("opencode-go")
+                    .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
+                    .cloned()
+            })
+            .or_else(|| std::env::var("OPENCODE_API_KEY").ok())
     } else {
-        auth_store.api_key_for(upstream_id)
+        auth_store
+            .keys_for(upstream_id)
+            .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
+            .cloned()
+            .or_else(|| {
+                clawde_core::config::primary_api_key_env_var_for_provider(upstream_id)
+                    .and_then(|env| std::env::var(env).ok())
+            })
     }?;
     let key = key.trim().to_string();
     (key.len() >= 8).then_some(key)

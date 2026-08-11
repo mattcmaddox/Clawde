@@ -800,7 +800,11 @@ impl FreeModeDialogState {
         let credential_removals: Vec<&'static str> = self
             .fields
             .iter()
-            .filter(|f| !f.from_env && f.enabled)
+            .filter(|f| {
+                f.enabled
+                    && !f.from_env
+                    && (!f.collapsed || !f.keys.is_empty() || !f.pending.is_empty())
+            })
             .map(|f| f.upstream.id)
             .collect();
         (writes, credential_removals)
@@ -822,10 +826,27 @@ impl FreeModeDialogState {
         let count: usize = writes.iter().map(|(_, ks)| ks.len()).sum();
         let mut auth_store = clawde_core::AuthStore::load();
         for provider_id in removals {
-            auth_store.credentials.remove(provider_id);
+            // The dialog owns free-provider key pools. Remove only a stale
+            // legacy single credential; `AuthStore::remove` intentionally
+            // deletes the canonical pool too.
+            auth_store.remove_credential(provider_id);
         }
-        for (provider_id, keys) in writes {
-            auth_store.set_keys(provider_id, keys);
+        // Apply every enabled row, including empty rows, so deleting the last
+        // visible key removes its canonical auth.json.keys entry. The public
+        // `writes` result remains non-empty-only for callers that use it as a
+        // summary of configured values.
+        for field in self.fields.iter().filter(|f| {
+            f.enabled
+                && !f.from_env
+                && (!f.collapsed || !f.keys.is_empty() || !f.pending.is_empty())
+        }) {
+            let keys: Vec<String> = field
+                .keys
+                .iter()
+                .filter(|k| !k.trim().is_empty())
+                .map(|k| k.trim().to_string())
+                .collect();
+            auth_store.set_keys(field.upstream.id, keys);
         }
         auth_store.save();
         count

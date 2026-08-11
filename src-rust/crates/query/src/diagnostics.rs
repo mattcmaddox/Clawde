@@ -33,6 +33,7 @@ pub struct NativeSemanticEvidence {
     pub verifier_max_turns: u32,
     pub fixer_max_turns: u32,
     pub max_attempts: u32,
+    pub fixer_max_attempts: u32,
     pub deterministic_gate_passed: bool,
     pub verifier_reached: bool,
     pub fixer_configured: bool,
@@ -182,6 +183,9 @@ fn semantic_evidence(
             .clamp(1, clawde_core::config::MAX_SEMANTIC_TURNS),
         max_attempts: config
             .semantic_max_attempts
+            .clamp(1, clawde_core::config::MAX_SEMANTIC_ATTEMPTS),
+        fixer_max_attempts: config
+            .semantic_fix_max_attempts
             .clamp(1, clawde_core::config::MAX_SEMANTIC_ATTEMPTS),
         deterministic_gate_passed,
         verifier_reached,
@@ -409,6 +413,7 @@ mod tests {
         assert_eq!(report.semantic.verifier_max_turns, 3);
         assert_eq!(report.semantic.fixer_max_turns, 5);
         assert_eq!(report.semantic.max_attempts, 3);
+        assert_eq!(report.semantic.fixer_max_attempts, 3);
         assert!(report.semantic.deterministic_gate_passed);
         assert!(report.semantic.verifier_reached);
         assert!(!report.semantic.fixer_ran);

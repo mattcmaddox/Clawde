@@ -551,6 +551,37 @@ impl OpenAiCompatProvider {
         })?;
 
         if !(200..300).contains(&(status as usize)) {
+            if status == 404 {
+                if let Some(retry) = self
+                    .retry_ollama_if_model_advertised(&request.model, &url, &body, None)
+                    .await
+                {
+                    let retry_response = retry?;
+                    let retry_status = retry_response.status().as_u16();
+                    let retry_text =
+                        retry_response
+                            .text()
+                            .await
+                            .map_err(|error| ProviderError::Other {
+                                provider: self.id.clone(),
+                                message: format!("Failed to read Ollama retry response: {error}"),
+                                status: Some(retry_status),
+                                body: None,
+                            })?;
+                    if !(200..300).contains(&(retry_status as usize)) {
+                        return Err(self.map_http_error(retry_status, &retry_text));
+                    }
+                    let retry_json: Value = serde_json::from_str(&retry_text).map_err(|error| {
+                        ProviderError::Other {
+                            provider: self.id.clone(),
+                            message: format!("Failed to parse Ollama retry response JSON: {error}"),
+                            status: Some(retry_status),
+                            body: None,
+                        }
+                    })?;
+                    return OpenAiProvider::parse_non_streaming_response_pub(&retry_json, &self.id);
+                }
+            }
             // Small local Ollama models (1B–3B) often don't support tool
             // calling. When that's the 400 reason, retry without tools.
             if status == 400 && text.contains("does not support tools") && !tools.is_empty() {
@@ -587,6 +618,65 @@ impl OpenAiCompatProvider {
         })?;
 
         OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
+    }
+
+    /// Retry one transient Ollama 404 when the remote daemon still advertises
+    /// the requested model. Ollama can briefly return 404 while a model is
+    /// being loaded or its OpenAI-compatible route is settling; treating that
+    /// first response as permanent makes the live semantic smoke flaky.
+    ///
+    /// This is deliberately restricted to providers with an Ollama native host
+    /// and requires an exact `/api/tags` model match. Other providers and a
+    /// genuinely absent model remain fail-fast.
+    async fn retry_ollama_if_model_advertised(
+        &self,
+        model: &str,
+        url: &str,
+        body: &serde_json::Value,
+        accept_header: Option<&str>,
+    ) -> Option<Result<reqwest::Response, ProviderError>> {
+        let host = self.quirks.ollama_native_host.as_deref()?;
+        // Keep this recovery path remote-only even when an explicitly isolated
+        // local profile has populated `ollama_native_host`. The normal provider
+        // resolver already rejects loopback by default; this independent gate
+        // prevents a future caller from bypassing that boundary here. Use the
+        // normalized value too, so a configured `/v1` suffix never leaks into
+        // the native `/api/tags` route.
+        let tags_url = ollama_tags_url(host)?;
+        let tags_response = self.http_client.get(&tags_url).send().await.ok()?;
+        if !tags_response.status().is_success() {
+            return None;
+        }
+        let tags: Value = tags_response.json().await.ok()?;
+        let advertised = ollama_tags_advertise_model(&tags, model);
+        if !advertised {
+            return None;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let mut builder = self
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/json");
+        if let Some(accept) = accept_header {
+            builder = builder.header("Accept", accept);
+        }
+        builder = self.apply_auth(builder);
+        builder = self.apply_extra_headers(builder);
+        Some(
+            builder
+                .json(body)
+                .send()
+                .await
+                .map_err(|error| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!(
+                        "HTTP request failed (retry after transient Ollama 404): {error}"
+                    ),
+                    status: None,
+                    body: None,
+                }),
+        )
     }
 
     /// Retry the request without tools when the model doesn't support them.
@@ -683,6 +773,25 @@ impl OpenAiCompatProvider {
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
             let text = resp.text().await.unwrap_or_default();
+            if status == 404 {
+                if let Some(retry) = self
+                    .retry_ollama_if_model_advertised(
+                        &request.model,
+                        &url,
+                        &body,
+                        Some("text/event-stream"),
+                    )
+                    .await
+                {
+                    let retry_response = retry?;
+                    let retry_status = retry_response.status().as_u16();
+                    if (200..300).contains(&(retry_status as usize)) {
+                        return Ok(retry_response);
+                    }
+                    let retry_text = retry_response.text().await.unwrap_or_default();
+                    return Err(self.map_http_error(retry_status, &retry_text));
+                }
+            }
             // Small local Ollama models (1B–3B) often don't support tool
             // calling. When that's the 400 reason, retry without tools so
             // the user can still chat with these models.
@@ -945,6 +1054,26 @@ impl OpenAiCompatProvider {
             (None, None) => format!("{} ({})", pretty_base, tag),
         }
     }
+}
+
+/// Build Ollama's native tags URL only for a validated remote host.
+fn ollama_tags_url(host: &str) -> Option<String> {
+    let normalized = clawde_core::config::normalize_ollama_host(host)?;
+    Some(format!("{}/api/tags", normalized.trim_end_matches('/')))
+}
+
+/// Return whether Ollama's native tags response contains an exact model name.
+///
+/// Ollama tags may include related names such as `model:latest`; substring or
+/// prefix matching would incorrectly authorize a retry for a different model.
+fn ollama_tags_advertise_model(tags: &Value, model: &str) -> bool {
+    tags.get("models")
+        .and_then(Value::as_array)
+        .is_some_and(|models| {
+            models
+                .iter()
+                .any(|entry| entry.get("name").and_then(Value::as_str) == Some(model))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,6 +1486,34 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn ollama_tags_match_only_the_exact_model_name() {
+        let tags = json!({
+            "models": [
+                {"name": "qwen2.5-coder:7b"},
+                {"name": "qwen2.5-coder:7b-instruct"},
+            ]
+        });
+
+        assert!(ollama_tags_advertise_model(&tags, "qwen2.5-coder:7b"));
+        assert!(ollama_tags_advertise_model(
+            &tags,
+            "qwen2.5-coder:7b-instruct"
+        ));
+        assert!(!ollama_tags_advertise_model(&tags, "qwen2.5-coder"));
+        assert!(!ollama_tags_advertise_model(&tags, "qwen2.5-coder:latest"));
+    }
+
+    #[test]
+    fn ollama_retry_host_requires_remote_normalization() {
+        assert_eq!(
+            ollama_tags_url("http://192.0.2.10:11434/v1").as_deref(),
+            Some("http://192.0.2.10:11434/api/tags"),
+        );
+        assert!(ollama_tags_url("http://localhost:11434").is_none());
+        assert!(ollama_tags_url("http://127.0.0.1:11434").is_none());
     }
 
     #[test]

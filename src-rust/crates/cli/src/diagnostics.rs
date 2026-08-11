@@ -4,10 +4,10 @@
 //! credentials, providers, MCP, or the normal query loop are initialized; it
 //! exercises only Clawde's deterministic semantic-pipeline harness.
 //!
-//! `clawde diagnostics --live` additionally runs the live FreeProvider
-//! semantic smoke: a real free model reviews a synthetic fixture through the
-//! production provider stack, using the user's stored free-model keys. This is
-//! the acceptance evidence the native harness intentionally cannot produce.
+//! `clawde diagnostics --live` additionally runs the live semantic smoke using
+//! the active effective provider: FreeProvider by default, or an explicitly
+//! configured isolated local Ollama model. This is the acceptance evidence the
+//! native harness intentionally cannot produce.
 
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let json = args.iter().any(|arg| arg == "--json");
@@ -26,7 +26,13 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
 
     let native = clawde_query::run_native_diagnostics().await;
     let live_report = if live {
-        Some(clawde_query::run_live_semantic_smoke().await)
+        let config = clawde_core::config::Settings::load_sync()
+            .unwrap_or_default()
+            .effective_config();
+        clawde_core::set_ollama_network_blocked(
+            config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated,
+        );
+        Some(clawde_query::run_live_semantic_smoke_with_config(config).await)
     } else {
         None
     };
@@ -57,7 +63,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         }
         if let Some(live) = &live_report {
             println!(
-                "Clawde live FreeProvider smoke: {}",
+                "Clawde live semantic smoke: {}",
                 if live.ok { "PASS" } else { "FAIL" }
             );
             println!(
