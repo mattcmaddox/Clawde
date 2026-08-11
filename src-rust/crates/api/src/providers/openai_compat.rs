@@ -352,23 +352,27 @@ impl OpenAiCompatProvider {
             let current_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
 
             if current_bytes > prompt_budget_bytes {
-                let system_bytes: usize = messages
-                    .first()
-                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-                    .map(|m| m.to_string().len())
-                    .unwrap_or(0);
-                tracing::debug!(
-                    current_bytes,
-                    system_bytes,
-                    non_system_bytes = current_bytes.saturating_sub(system_bytes),
-                    prompt_budget_bytes,
-                    tools_bytes,
-                    budget_bytes,
-                    total_limit,
-                    max_tokens,
-                    ratio,
-                    "max_total_tokens: request exceeds budget, truncating system prompt"
-                );
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    // Only serialize for the debug log; the truncation path
+                    // below re-computes sizes for the actual budget math.
+                    let system_bytes: usize = messages
+                        .first()
+                        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                        .map(|m| m.to_string().len())
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        current_bytes,
+                        system_bytes,
+                        non_system_bytes = current_bytes.saturating_sub(system_bytes),
+                        prompt_budget_bytes,
+                        tools_bytes,
+                        budget_bytes,
+                        total_limit,
+                        max_tokens,
+                        ratio,
+                        "max_total_tokens: request exceeds budget, truncating system prompt"
+                    );
+                }
                 // Pre-compute the byte size of non-system messages so we don't
                 // need to borrow `messages` again while holding a mutable ref.
                 let non_system_bytes: usize =
@@ -1520,9 +1524,11 @@ mod tests {
 
         use clawde_core::types::{Message, MessageContent, Role, ToolDefinition};
         // A system prompt that alone would fit the raw budget but not the
-        // budget minus a ~2KB tools array. Budget = (7500-512)*4.5 ~= 31.4KB,
-        // so a 32KB prompt overflows only once the tools bytes are reserved.
-        let system = "x".repeat(32_000);
+        // budget minus the tools array. Raw budget = (7500-512)*4.5 ~= 31.4KB;
+        // with ~5.3KB of tools the reserved prompt budget is ~26KB. A 28KB
+        // prompt overflows only once the tools bytes are reserved, isolating
+        // the tools-reservation behavior.
+        let system = "x".repeat(28_000);
         let request = ProviderRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
