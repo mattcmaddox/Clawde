@@ -113,6 +113,27 @@ impl FreeProvider {
         }
     }
 
+    /// Calculate adaptive timeout based on latency history.
+    /// Uses p95 latency * 2, bounded between 10s and 120s.
+    fn adaptive_timeout(&self, idx: usize) -> std::time::Duration {
+        let lat = self.latencies.lock().unwrap();
+        let p95 = lat.percentile_latency(idx, 0.95);
+        let avg = lat.avg_latency(idx);
+
+        let timeout_secs = if p95 < f64::MAX {
+            // Use 2× p95 latency, bounded between 10s and 120s
+            (p95 * 2.0).clamp(10.0, 120.0)
+        } else if avg < f64::MAX {
+            // Use 3× average latency
+            (avg * 3.0).clamp(15.0, 90.0)
+        } else {
+            // No history: use configured timeout
+            self.routing.upstream_timeout_secs as f64
+        };
+
+        std::time::Duration::from_secs_f64(timeout_secs)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chain.is_empty()
     }
@@ -891,6 +912,23 @@ struct RetryingFreeStream {
 }
 
 impl RetryingFreeStream {
+    /// Calculate adaptive timeout based on latency history.
+    fn adaptive_timeout(&self, idx: usize) -> std::time::Duration {
+        let lat = self.latencies.lock().unwrap();
+        let p95 = lat.percentile_latency(idx, 0.95);
+        let avg = lat.avg_latency(idx);
+
+        let timeout_secs = if p95 < f64::MAX {
+            (p95 * 2.0).clamp(10.0, 120.0)
+        } else if avg < f64::MAX {
+            (avg * 3.0).clamp(15.0, 90.0)
+        } else {
+            self.routing.upstream_timeout_secs as f64
+        };
+
+        std::time::Duration::from_secs_f64(timeout_secs)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         chain: Vec<FreeEntry>,
@@ -1076,7 +1114,7 @@ impl RetryingFreeStream {
             let mut req = self.request.clone();
             req.model = model.clone();
             clamp_max_tokens_for(&mut req, entry);
-            let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+            let timeout = self.adaptive_timeout(idx);
             let provider = entry.provider.clone();
 
             self.current_idx = idx;
@@ -1217,8 +1255,7 @@ impl Stream for RetryingFreeStream {
                             let mut req = self.request.clone();
                             req.model = model.clone();
                             clamp_max_tokens_for(&mut req, entry);
-                            let timeout =
-                                std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+                            let timeout = self.adaptive_timeout(idx);
                             let provider = entry.provider.clone();
                             self.parallel_idx = idx;
                             self.parallel_model = model;
@@ -1519,7 +1556,7 @@ impl LlmProvider for FreeProvider {
             self.clamp_max_tokens(&mut req, idx);
 
             let start = Instant::now();
-            let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+            let timeout = self.adaptive_timeout(idx);
             let result = tokio::time::timeout(timeout, entry.provider.create_message(req)).await;
 
             match result {
@@ -1623,7 +1660,7 @@ impl LlmProvider for FreeProvider {
             self.clamp_max_tokens(&mut req, idx);
 
             let _start = Instant::now();
-            let timeout = std::time::Duration::from_secs(self.routing.upstream_timeout_secs);
+            let timeout = self.adaptive_timeout(idx);
             let result =
                 tokio::time::timeout(timeout, entry.provider.create_message_stream(req)).await;
 

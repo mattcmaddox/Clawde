@@ -1244,6 +1244,21 @@ impl LatencyState {
         sum / q.len() as f64
     }
 
+    /// Calculate percentile latency for upstream `idx`.
+    fn percentile_latency(&self, idx: usize, percentile: f64) -> f64 {
+        if idx >= self.samples.len() {
+            return f64::MAX;
+        }
+        let q = &self.samples[idx];
+        if q.is_empty() {
+            return f64::MAX;
+        }
+        let mut sorted: Vec<f64> = q.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((sorted.len() as f64) * percentile).min((sorted.len() - 1) as f64) as usize;
+        sorted[idx]
+    }
+
     /// Dispatch success rate (0.0–1.0) for upstream `idx`, or `None` when
     /// no dispatch has been recorded yet.
     fn success_rate(&self, idx: usize) -> Option<f64> {
