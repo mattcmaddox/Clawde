@@ -1497,7 +1497,7 @@ mod tests {
             .with_quirks(ProviderQuirks {
                 max_total_tokens: Some(6_500),
                 max_tokens_cap: Some(512),
-                bytes_per_token: 1.3,
+                bytes_per_token: 0.85,
                 ..Default::default()
             });
 
@@ -1546,7 +1546,7 @@ mod tests {
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
         let tools_bytes: usize = tools.iter().map(|t| t.to_string().len()).sum();
         let messages_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
-        let budget_bytes = ((6_500 - 512) as f64 * 1.3) as usize;
+        let budget_bytes = ((6_500 - 512) as f64 * 0.85) as usize;
         assert!(
             messages_bytes + tools_bytes <= budget_bytes + 200,
             "messages+tools {} exceeds budget {} + slack",

@@ -174,13 +174,18 @@ pub fn groq() -> OpenAiCompatProvider {
             // Groq's observed free-tier limit is 8,000 TPM (measured in
             // live trials: `Limit 8000, Requested 18016`), not 12,000. The
             // truncation budget must also reserve the serialised tools array,
-            // which Groq counts against the request token total. Set
-            // max_total_tokens to 6,500 so the prompt budget of
-            // (6,500-512)*1.3 = 7,784 bytes minus tools leaves the system
-            // prompt truncated to a total that fits under 8,000 tokens with
-            // headroom for tool definitions.
+            // which Groq counts against the request token total.
+            //
+            // bytes_per_token must match the real density of the serialised
+            // request. A live trial with max_total_tokens=6,500 (assumed
+            // 1.3 bytes/token) produced a 10,214-token request — 1.57x the
+            // assumed budget, i.e. the effective density is ~0.83 bytes/token.
+            // Using 1.3 made the byte budget too generous and under-shrunk the
+            // system prompt. With 0.85, max_total_tokens=6,500 yields
+            // (6,500-512)*0.85 = 5,090 prompt bytes ~= 6,150 real tokens,
+            // comfortably under 8,000 with headroom for per-minute repeats.
             max_total_tokens: Some(6_500),
-            bytes_per_token: 1.3,
+            bytes_per_token: 0.85,
             ..Default::default()
         })
 }
@@ -699,8 +704,8 @@ mod tests {
         // Verify bytes_per_token is set to 1.3 (code-heavy ratio, tuned for
         // ~1.3 bytes/token density of the Clawde system prompt on Llama BPE).
         assert!(
-            (p.quirks.bytes_per_token - 1.3).abs() < f64::EPSILON,
-            "expected Groq bytes_per_token=1.3, got {}",
+            (p.quirks.bytes_per_token - 0.85).abs() < f64::EPSILON,
+            "expected Groq bytes_per_token=0.85, got {}",
             p.quirks.bytes_per_token
         );
         // Tuned for the observed 8,000 TPM free tier (not 12,000), with the
