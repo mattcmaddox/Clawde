@@ -874,6 +874,88 @@ impl AdaptiveConcurrency {
     }
 }
 
+/// Memory-efficient stream manager (based on vLLM PagedAttention concepts).
+/// Tracks active streams and enforces memory budgets.
+struct StreamManager {
+    /// Active streams with memory tracking
+    active_streams: HashMap<usize, StreamState>,
+    /// Memory budget per stream (estimated tokens)
+    memory_budget: u32,
+    /// Maximum concurrent streams
+    max_concurrent: u32,
+    /// Next stream ID
+    next_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StreamState {
+    /// Tokens received so far
+    tokens_received: u64,
+    /// Memory used (estimated)
+    memory_used: usize,
+    /// Whether stream is being cancelled
+    cancelling: bool,
+    /// Provider index
+    provider_idx: usize,
+}
+
+impl StreamManager {
+    fn new(max_concurrent: u32, memory_budget: u32) -> Self {
+        Self {
+            active_streams: HashMap::new(),
+            memory_budget,
+            max_concurrent,
+            next_id: 0,
+        }
+    }
+
+    /// Check if we can start a new stream.
+    fn can_start_stream(&self) -> bool {
+        self.active_streams.len() < self.max_concurrent as usize
+    }
+
+    /// Register a new stream and return its ID.
+    fn register_stream(&mut self, provider_idx: usize) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.active_streams.insert(
+            id,
+            StreamState {
+                tokens_received: 0,
+                memory_used: 0,
+                cancelling: false,
+                provider_idx,
+            },
+        );
+        id
+    }
+
+    /// Update stream token count.
+    fn update_stream(&mut self, stream_id: usize, tokens: u64) {
+        if let Some(state) = self.active_streams.get_mut(&stream_id) {
+            state.tokens_received += tokens;
+            state.memory_used += tokens as usize * 4; // Estimate 4 bytes per token
+        }
+    }
+
+    /// Cancel a stream.
+    fn cancel_stream(&mut self, stream_id: usize) {
+        if let Some(state) = self.active_streams.get_mut(&stream_id) {
+            state.cancelling = true;
+        }
+    }
+
+    /// Remove a completed stream.
+    fn remove_stream(&mut self, stream_id: usize) {
+        self.active_streams.remove(&stream_id);
+    }
+
+    /// Get total memory usage.
+    fn total_memory_used(&self) -> usize {
+        self.active_streams.values().map(|s| s.memory_used).sum()
+    }
+}
+
 /// Per-upstream failure history and cooldown for the circuit breaker.
 struct CooldownState {
     /// Sliding window of failure timestamps per upstream index.
