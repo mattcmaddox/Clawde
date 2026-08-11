@@ -103,7 +103,8 @@ pub struct ProviderQuirks {
     /// Set to `true` for providers that reject OpenAI-style content arrays
     /// and require `message.content` to be a plain string (e.g. Cloudflare
     /// Workers AI).  When `true`, any content array (built from multi-block
-    /// user messages) is flattened to the concatenated text parts.
+    /// user messages) is flattened to the text parts joined with newlines,
+    /// and `content: null` on assistant tool-call turns is replaced with `""`.
     pub string_content_only: bool,
 }
 
@@ -302,11 +303,13 @@ impl OpenAiCompatProvider {
             Self::ensure_content_not_null(&mut messages);
         }
 
-        // Providers that reject content arrays (Cloudflare Workers AI) get
-        // every content value flattened to a plain string. This must run before
-        // truncation so the byte estimate sees the final wire format.
+        // Providers that require string content (Cloudflare Workers AI) get
+        // every content value flattened to a plain string and `content: null`
+        // replaced with `""`. Both transformations must run before truncation
+        // so the byte estimate sees the final wire format.
         if self.quirks.string_content_only {
             Self::flatten_content_to_string(&mut messages);
+            Self::ensure_content_not_null(&mut messages);
         }
 
         // Max-total-tokens truncation: when `max_total_tokens` is set, estimate
@@ -1511,6 +1514,49 @@ mod tests {
             content
         );
         assert_eq!(content.as_str().unwrap(), "part one\npart two");
+    }
+
+    #[test]
+    fn string_content_only_fixes_assistant_null_content() {
+        // Cloudflare also rejects `content: null` on assistant tool-call
+        // turns (`'string' not in 'null'`); the quirk must rewrite it to "".
+        let provider = OpenAiCompatProvider::new("cloudflare", "Cloudflare", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                string_content_only: true,
+                ..Default::default()
+            });
+
+        use clawde_core::types::{Message, MessageContent, Role};
+
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![]),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+        assert_eq!(messages.len(), 1);
+        let content = &messages[0]["content"];
+        assert!(
+            content.is_string(),
+            "expected content to be a string (not null), got: {}",
+            content
+        );
+        assert_eq!(content.as_str().unwrap(), "");
     }
 
     #[test]
