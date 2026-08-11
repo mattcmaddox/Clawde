@@ -99,6 +99,12 @@ pub struct ProviderQuirks {
     /// Default is `4.0` (typical for English prose). Code-heavy content
     /// like system prompts / tool definitions tokenizes at ~1.5 bytes/token.
     pub bytes_per_token: f64,
+
+    /// Set to `true` for providers that reject OpenAI-style content arrays
+    /// and require `message.content` to be a plain string (e.g. Cloudflare
+    /// Workers AI).  When `true`, any content array (built from multi-block
+    /// user messages) is flattened to the concatenated text parts.
+    pub string_content_only: bool,
 }
 
 impl Default for ProviderQuirks {
@@ -117,6 +123,7 @@ impl Default for ProviderQuirks {
             no_api_key_required: false,
             ollama_native_host: None,
             bytes_per_token: 4.0, // prose-safe default; code-heavy providers override lower
+            string_content_only: false,
         }
     }
 }
@@ -295,6 +302,13 @@ impl OpenAiCompatProvider {
             Self::ensure_content_not_null(&mut messages);
         }
 
+        // Providers that reject content arrays (Cloudflare Workers AI) get
+        // every content value flattened to a plain string. This must run before
+        // truncation so the byte estimate sees the final wire format.
+        if self.quirks.string_content_only {
+            Self::flatten_content_to_string(&mut messages);
+        }
+
         // Max-total-tokens truncation: when `max_total_tokens` is set, estimate
         // the total token count (prompt + max_tokens) using a simple byte heuristic
         // and truncate the system message to fit within the budget.
@@ -439,6 +453,38 @@ impl OpenAiCompatProvider {
                 }
                 reasoning_idx += 1;
             }
+        }
+    }
+
+    /// Flatten OpenAI-style content arrays into plain string content.
+    ///
+    /// Some providers (Cloudflare Workers AI) reject `message.content` when
+    /// it is an array of `{type, text}` parts and require a plain string.
+    /// Text parts are joined with newlines; non-text parts (images, etc.)
+    /// are dropped since these providers do not support them anyway.
+    fn flatten_content_to_string(messages: &mut [Value]) {
+        for msg in messages.iter_mut() {
+            let Some(obj) = msg.as_object_mut() else {
+                continue;
+            };
+            let Some(content) = obj.get_mut("content") else {
+                continue;
+            };
+            let Some(parts) = content.as_array() else {
+                continue;
+            };
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        part.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            *content = Value::String(text);
         }
     }
 
@@ -1414,6 +1460,95 @@ mod tests {
             "total bytes {} exceeds budget {} + 100 slack",
             total_bytes,
             budget_bytes
+        );
+    }
+
+    #[test]
+    fn string_content_only_flattens_user_content_arrays() {
+        // Cloudflare Workers AI rejects content arrays; the quirk must
+        // flatten multi-block user messages to a plain string.
+        let provider = OpenAiCompatProvider::new("cloudflare", "Cloudflare", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                string_content_only: true,
+                ..Default::default()
+            });
+
+        use clawde_core::types::{ContentBlock, Message, Role};
+
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: clawde_core::types::MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "part one".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "part two".to_string(),
+                    },
+                ]),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+        assert_eq!(messages.len(), 1, "expected exactly one user message");
+        let content = &messages[0]["content"];
+        assert!(
+            content.is_string(),
+            "expected content to be a plain string, got: {}",
+            content
+        );
+        assert_eq!(content.as_str().unwrap(), "part one\npart two");
+    }
+
+    #[test]
+    fn without_string_content_only_keeps_content_arrays() {
+        // Default behaviour: multi-block user messages stay as content arrays
+        // (correct for OpenAI, Groq, etc.).
+        let provider = OpenAiCompatProvider::new("groq", "Groq", "https://example.com");
+
+        use clawde_core::types::{ContentBlock, Message, Role};
+
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: clawde_core::types::MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: "part one".to_string(),
+                }]),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+        let content = &messages[0]["content"];
+        assert!(
+            content.is_array(),
+            "expected content to stay an array without the quirk, got: {}",
+            content
         );
     }
 

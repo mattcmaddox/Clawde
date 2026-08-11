@@ -645,6 +645,9 @@ fn cloudflare_with_parts(account_id: &str, api_token: &str) -> OpenAiCompatProvi
     .with_quirks(ProviderQuirks {
         include_usage_in_stream: true,
         max_tokens_cap: Some(8_192),
+        // Workers AI rejects OpenAI-style content arrays in multi-turn
+        // conversations (`/messages/0/content` must be a string).
+        string_content_only: true,
         ..Default::default()
     })
 }
@@ -699,6 +702,18 @@ mod tests {
             "expected Groq bytes_per_token=1.3, got {}",
             p.quirks.bytes_per_token
         );
+    }
+
+    #[test]
+    fn cloudflare_sets_string_content_only() {
+        // Cloudflare Workers AI rejects OpenAI-style content arrays in
+        // multi-turn conversations; the factory must opt in to flattening.
+        let p = cloudflare_with_key("test-account:test-token");
+        assert!(
+            p.quirks.string_content_only,
+            "expected cloudflare to flatten content arrays"
+        );
+        assert_eq!(p.quirks.max_tokens_cap, Some(8_192));
     }
 
     #[test]
