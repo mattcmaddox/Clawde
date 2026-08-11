@@ -172,20 +172,26 @@ pub fn groq() -> OpenAiCompatProvider {
             include_usage_in_stream: true,
             max_tokens_cap: Some(512),
             // Groq's observed free-tier limit is 8,000 TPM (measured in
-            // live trials: `Limit 8000, Requested 18016`), not 12,000. The
+            // live trials: `Limit 8000, Requested 10211`), not 12,000. The
             // truncation budget must also reserve the serialised tools array,
             // which Groq counts against the request token total.
             //
             // bytes_per_token must match the real density of the serialised
-            // request. A live trial with max_total_tokens=6,500 (assumed
-            // 1.3 bytes/token) produced a 10,214-token request — 1.57x the
-            // assumed budget, i.e. the effective density is ~0.83 bytes/token.
-            // Using 1.3 made the byte budget too generous and under-shrunk the
-            // system prompt. With 0.85, max_total_tokens=6,500 yields
-            // (6,500-512)*0.85 = 5,090 prompt bytes ~= 6,150 real tokens,
-            // comfortably under 8,000 with headroom for per-minute repeats.
-            max_total_tokens: Some(6_500),
-            bytes_per_token: 0.85,
+            // request. Debug-instrumented live trial: 46,218 bytes (26,321
+            // message bytes + 19,897 tools bytes) was reported as 10,211
+            // tokens by Groq, i.e. ~4.53 bytes/token. Earlier guesses (1.3,
+            // then 0.85) were wrong in the unsafe direction: the tools array
+            // alone exceeded the whole byte budget, which zeroed the prompt
+            // budget and made truncation skip entirely.
+            //
+            // With bytes_per_token=4.5 and max_total_tokens=7,500 (headroom
+            // under the 8,000 TPM cap), the prompt budget is
+            // (7,500-512)*4.5 = 31,446 bytes; after reserving ~19,900 bytes
+            // of tools, ~11,500 bytes remain for the system prompt, which
+            // truncates the ~26KB Clawde prompt to fit. Resulting request
+            // ~= 7,000 prompt tokens + 512 output, safely under 8,000.
+            max_total_tokens: Some(7_500),
+            bytes_per_token: 4.5,
             ..Default::default()
         })
 }
@@ -701,19 +707,20 @@ mod tests {
             Some(512),
             "expected Groq max_tokens_cap=512"
         );
-        // Verify bytes_per_token is set to 1.3 (code-heavy ratio, tuned for
-        // ~1.3 bytes/token density of the Clawde system prompt on Llama BPE).
+        // Verify bytes_per_token matches the measured density of the
+        // serialised request. Live trial: 46,218 bytes -> 10,211 tokens
+        // (~4.53 bytes/token); 4.5 is slightly conservative (safe direction).
         assert!(
-            (p.quirks.bytes_per_token - 0.85).abs() < f64::EPSILON,
-            "expected Groq bytes_per_token=0.85, got {}",
+            (p.quirks.bytes_per_token - 4.5).abs() < f64::EPSILON,
+            "expected Groq bytes_per_token=4.5, got {}",
             p.quirks.bytes_per_token
         );
         // Tuned for the observed 8,000 TPM free tier (not 12,000), with the
         // tools array reserved out of the prompt budget (see openai_compat.rs).
         assert_eq!(
             p.quirks.max_total_tokens,
-            Some(6_500),
-            "expected Groq max_total_tokens=6500 for the 8k TPM tier"
+            Some(7_500),
+            "expected Groq max_total_tokens=7500 for the 8k TPM tier"
         );
     }
 

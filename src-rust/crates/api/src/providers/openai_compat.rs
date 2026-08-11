@@ -389,7 +389,13 @@ impl OpenAiCompatProvider {
                                     prompt_budget_bytes.saturating_sub(non_system_bytes);
                                 // Reserve ~50 bytes for the truncation suffix.
                                 let max_content_bytes = sys_budget.saturating_sub(50);
-                                if content_bytes > max_content_bytes && max_content_bytes >= 14 {
+                                // Truncate whenever the system prompt exceeds the
+                                // budget. There is no minimum-budget skip: when
+                                // tools+history consume the whole budget
+                                // (max_content_bytes = 0), still shrink to the
+                                // 14-byte floor rather than sending the request
+                                // untruncated (which guaranteed the TPM error).
+                                if content_bytes > max_content_bytes {
                                     // Need to truncate. Keep at least 14 bytes.
                                     let keep_bytes =
                                         std::cmp::max(max_content_bytes, 14).min(content_bytes);
@@ -1506,16 +1512,17 @@ mod tests {
         // full request (messages + tools) to fit.
         let provider = OpenAiCompatProvider::new("groq", "Groq", "https://example.com")
             .with_quirks(ProviderQuirks {
-                max_total_tokens: Some(6_500),
+                max_total_tokens: Some(7_500),
                 max_tokens_cap: Some(512),
-                bytes_per_token: 0.85,
+                bytes_per_token: 4.5,
                 ..Default::default()
             });
 
         use clawde_core::types::{Message, MessageContent, Role, ToolDefinition};
         // A system prompt that alone would fit the raw budget but not the
-        // budget minus a ~2KB tools array.
-        let system = "x".repeat(6_000);
+        // budget minus a ~2KB tools array. Budget = (7500-512)*4.5 ~= 31.4KB,
+        // so a 32KB prompt overflows only once the tools bytes are reserved.
+        let system = "x".repeat(32_000);
         let request = ProviderRequest {
             model: "test-model".to_string(),
             messages: vec![Message {
@@ -1557,12 +1564,95 @@ mod tests {
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
         let tools_bytes: usize = tools.iter().map(|t| t.to_string().len()).sum();
         let messages_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
-        let budget_bytes = ((6_500 - 512) as f64 * 0.85) as usize;
+        let budget_bytes = ((7_500 - 512) as f64 * 4.5) as usize;
         assert!(
             messages_bytes + tools_bytes <= budget_bytes + 200,
             "messages+tools {} exceeds budget {} + slack",
             messages_bytes + tools_bytes,
             budget_bytes
+        );
+    }
+
+    #[test]
+    fn max_total_tokens_truncates_when_tools_consume_budget() {
+        // Regression test for the guard bug: when the tools array alone
+        // exceeds the byte budget, the old `max_content_bytes >= 14` guard
+        // silently skipped truncation, so the request went out untruncated
+        // and Groq rejected it (observed: `Limit 8000, Requested 10211` with
+        // tools_bytes=19897 > budget). Truncation must still run and shrink
+        // the system prompt down to its 14-byte floor.
+        let provider = OpenAiCompatProvider::new("groq", "Groq", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                max_total_tokens: Some(7_500),
+                max_tokens_cap: Some(512),
+                bytes_per_token: 4.5,
+                ..Default::default()
+            });
+
+        use clawde_core::types::{Message, MessageContent, Role, ToolDefinition};
+        // A large system prompt plus a tools array whose serialised bytes
+        // exceed the whole prompt budget (~31.4KB), so `prompt_budget_bytes`
+        // saturates to zero — the old `max_content_bytes >= 14` guard skipped
+        // truncation entirely in this case (observed in live trials:
+        // `Limit 8000, Requested 10211` with tools_bytes=19897 > budget).
+        let system = "system-instruction-".repeat(2_000); // ~39KB
+        let tool_schema = json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "long description ".repeat(2_000),
+                }
+            },
+            "required": ["command"],
+        });
+        let request = ProviderRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("do the thing".to_string()),
+                uuid: None,
+                cost: None,
+                snapshot_patch: None,
+            }],
+            system_prompt: Some(SystemPrompt::Text(system)),
+            tools: vec![ToolDefinition {
+                name: "Bash".to_string(),
+                description: "run a command".repeat(2_000),
+                input_schema: tool_schema,
+            }],
+            max_tokens: 1_000,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        // Sanity-check the fixture really overflows: tools bytes must exceed
+        // the budget so the truncation runs under the guard-fix path.
+        let tools_json = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools_bytes: usize = tools_json.iter().map(|t| t.to_string().len()).sum();
+        let budget_bytes = ((7_500 - 512) as f64 * 4.5) as usize;
+        assert!(
+            tools_bytes > budget_bytes,
+            "fixture tools {} bytes must exceed budget {} for guard regression",
+            tools_bytes,
+            budget_bytes
+        );
+
+        let messages = provider.build_messages(&request);
+        let system_content = messages[0]["content"].as_str().unwrap_or("");
+        assert!(
+            system_content.contains("[truncated to fit provider token limit]"),
+            "expected system prompt to be truncated even when tools consume the budget"
+        );
+        // The truncated system prompt must be at its floor, not left intact.
+        assert!(
+            system_content.len() < 2_000,
+            "expected system prompt shrunk to floor, got {} bytes",
+            system_content.len()
         );
     }
 
