@@ -134,6 +134,55 @@ impl FreeProvider {
         std::time::Duration::from_secs_f64(timeout_secs)
     }
 
+    /// Select a backup provider using Power of Two Choices (P2C).
+    /// Based on Cloudflare research: reduces peak connections by 30%.
+    fn select_backup_provider(&self, exclude_idx: usize) -> usize {
+        let available: Vec<usize> = (0..self.chain.len())
+            .filter(|&i| i != exclude_idx && !self.is_in_cooldown(i))
+            .collect();
+
+        if available.is_empty() {
+            return exclude_idx; // Fallback to primary
+        }
+
+        // Power of Two Choices: sample 2, pick healthier one
+        if available.len() == 1 {
+            return available[0];
+        }
+
+        let sample_size = 2.min(available.len());
+        let mut rng = rand::thread_rng();
+        let samples: Vec<usize> = available
+            .choose_multiple(&mut rng, sample_size)
+            .copied()
+            .collect();
+
+        // Pick the one with better success rate
+        samples
+            .iter()
+            .max_by_key(|&&idx| {
+                let success_rate = self
+                    .latencies
+                    .lock()
+                    .unwrap()
+                    .success_rate(idx)
+                    .unwrap_or(0.5);
+                (success_rate * 1000.0) as u64 // Convert to integer for comparison
+            })
+            .copied()
+            .unwrap_or(samples[0])
+    }
+
+    /// Check if hedging is enabled in the configuration.
+    fn is_hedging_enabled(&self) -> bool {
+        self.profiles.parallel.hedging.enabled && self.chain.len() >= 2
+    }
+
+    /// Get hedging delay in milliseconds.
+    fn hedge_delay_ms(&self) -> u64 {
+        self.profiles.parallel.hedging.delay_ms
+    }
+
     pub fn is_empty(&self) -> bool {
         self.chain.is_empty()
     }
