@@ -276,6 +276,7 @@ pub use plugin::*;
 mod doctor;
 pub use doctor::*;
 mod health;
+mod status;
 pub use health::*;
 mod accounts;
 pub use accounts::*;
@@ -1947,6 +1948,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(UsageCommand),
         Box::new(DoctorCommand),
         Box::new(HealthCommand),
+        Box::new(StatusCommand),
         Box::new(LoginCommand),
         Box::new(LogoutCommand),
         Box::new(AccountsCommand),
