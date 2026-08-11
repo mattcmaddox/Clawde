@@ -136,6 +136,7 @@ impl FreeProvider {
 
     /// Select a backup provider using Power of Two Choices (P2C).
     /// Based on Cloudflare research: reduces peak connections by 30%.
+    #[allow(dead_code)]
     fn select_backup_provider(&self, exclude_idx: usize) -> usize {
         let available: Vec<usize> = (0..self.chain.len())
             .filter(|&i| i != exclude_idx && !self.is_in_cooldown(i))
@@ -174,11 +175,13 @@ impl FreeProvider {
     }
 
     /// Check if hedging is enabled in the configuration.
+    #[allow(dead_code)]
     fn is_hedging_enabled(&self) -> bool {
         self.profiles.parallel.hedging.enabled && self.chain.len() >= 2
     }
 
     /// Get hedging delay in milliseconds.
+    #[allow(dead_code)]
     fn hedge_delay_ms(&self) -> u64 {
         self.profiles.parallel.hedging.delay_ms
     }
@@ -945,6 +948,7 @@ struct HedgeState {
     /// Index of the hedge provider
     hedge_provider_idx: usize,
     /// Model used for hedge request
+    #[allow(dead_code)]
     hedge_model: String,
 }
 

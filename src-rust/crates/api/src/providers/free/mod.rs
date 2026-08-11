@@ -798,6 +798,8 @@ impl Default for RoutingConfig {
 
 /// Adaptive concurrency controller (based on Netflix gradient-based approach).
 /// Tracks latency gradient to dynamically adjust concurrency limits.
+/// Infrastructure ready for future integration.
+#[allow(dead_code)]
 struct AdaptiveConcurrency {
     /// Current concurrency limit per provider
     limits: HashMap<String, u32>,
@@ -811,6 +813,7 @@ struct AdaptiveConcurrency {
     gradient_threshold: f64,
 }
 
+#[allow(dead_code)]
 impl AdaptiveConcurrency {
     fn new(window_size_ms: u64, gradient_threshold: f64) -> Self {
         Self {
@@ -862,8 +865,7 @@ impl AdaptiveConcurrency {
     }
 
     /// Check if we can accept a request to this provider.
-    fn can_accept_request(&self, provider_id: &str) -> bool {
-        let limit = self.limits.get(provider_id).copied().unwrap_or(10);
+    fn can_accept_request(&self, _provider_id: &str) -> bool {
         // For now, always allow - actual tracking would need request counting
         true
     }
@@ -876,6 +878,8 @@ impl AdaptiveConcurrency {
 
 /// Memory-efficient stream manager (based on vLLM PagedAttention concepts).
 /// Tracks active streams and enforces memory budgets.
+/// Infrastructure ready for future integration.
+#[allow(dead_code)]
 struct StreamManager {
     /// Active streams with memory tracking
     active_streams: HashMap<usize, StreamState>,
@@ -888,6 +892,7 @@ struct StreamManager {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct StreamState {
     /// Tokens received so far
     tokens_received: u64,
@@ -899,6 +904,7 @@ struct StreamState {
     provider_idx: usize,
 }
 
+#[allow(dead_code)]
 impl StreamManager {
     fn new(max_concurrent: u32, memory_budget: u32) -> Self {
         Self {
