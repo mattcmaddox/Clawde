@@ -5386,3 +5386,54 @@ fn first_successful_dispatch_persists_env_key() {
     let store = clawde_core::AuthStore::load();
     assert_eq!(store.keys_for("groq").map(|k| k.len()), Some(1));
 }
+
+#[test]
+/// Bidirectional catalog drift test: every provider in FREE_CATALOG
+fn free_catalog_and_core_predicate_agree_bidirectionally() {
+    // All providers recognized by core's is_free_upstream, excluding the
+    // intentional alias opencode-go (shared key slot with opencode-zen).
+    let core_free = [
+        "github-copilot",
+        "cline",
+        "openrouter",
+        "huggingface",
+        "cerebras",
+        "nvidia",
+        "groq",
+        "google",
+        "cloudflare",
+        "mistral",
+        "cohere",
+        "opencode-zen",
+        // opencode-go omitted: intentional alias, not a catalog entry
+        "zai",
+        "sambanova",
+    ];
+
+    // Every core-recognized provider must be in FREE_CATALOG.
+    for id in &core_free {
+        assert!(
+            FREE_CATALOG.iter().any(|e| e.id == *id),
+            "core is_free_upstream recognizes '{id}' but FREE_CATALOG has no entry"
+        );
+    }
+
+    // Every FREE_CATALOG entry must be recognized by core.
+    for entry in FREE_CATALOG.iter() {
+        assert!(
+            clawde_core::AuthStore::is_free_upstream(entry.id),
+            "FREE_CATALOG has '{}' but core is_free_upstream does not recognize it",
+            entry.id
+        );
+    }
+
+    // The intentional alias must be recognized but must NOT be a catalog entry.
+    assert!(
+        clawde_core::AuthStore::is_free_upstream("opencode-go"),
+        "opencode-go must be recognized as free upstream"
+    );
+    assert!(
+        !FREE_CATALOG.iter().any(|e| e.id == "opencode-go"),
+        "opencode-go must NOT be a separate catalog entry (alias for opencode-zen)"
+    );
+}
