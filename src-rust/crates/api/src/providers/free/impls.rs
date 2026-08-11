@@ -62,6 +62,7 @@ impl FreeProvider {
                 n,
                 CircuitBreakerConfig::default(),
             ))),
+            profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(LatencyState::new(n))),
         }
     }
@@ -107,6 +108,7 @@ impl FreeProvider {
             chain,
             routing,
             cooldown,
+            profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(latencies)),
         }
     }
@@ -798,7 +800,10 @@ impl FreeProvider {
         if !is_upstream_server_error(err) {
             return;
         }
-        let secs = self.routing.upstream_5xx_cooldown_secs;
+        // Use provider-specific profile if available
+        let provider_id = self.chain[idx].upstream.id;
+        let profile = self.profiles.profile_for(provider_id);
+        let secs = profile.server_error_cooldown_secs;
         if secs == 0 {
             return;
         }
@@ -854,6 +859,7 @@ struct RetryingFreeStream {
     cooldown: Arc<Mutex<CooldownState>>,
     latencies: Arc<Mutex<LatencyState>>,
     routing: RoutingConfig,
+    profiles: Arc<ProviderProfiles>,
     request: ProviderRequest,
     /// Classified task for the request — tags every attempt's success /
     /// failure counters for the per-task success-rate view (spec §8.6).
@@ -891,6 +897,7 @@ impl RetryingFreeStream {
         cooldown: Arc<Mutex<CooldownState>>,
         latencies: Arc<Mutex<LatencyState>>,
         routing: RoutingConfig,
+        profiles: Arc<ProviderProfiles>,
         request: ProviderRequest,
         stream: BoxedProviderStream,
         idx: usize,
@@ -905,6 +912,7 @@ impl RetryingFreeStream {
             cooldown,
             latencies,
             routing,
+            profiles,
             request,
             task,
             remaining_plan,
@@ -985,7 +993,10 @@ impl RetryingFreeStream {
         if !is_upstream_server_error(err) {
             return;
         }
-        let secs = self.routing.upstream_5xx_cooldown_secs;
+        // Use provider-specific profile if available
+        let provider_id = self.chain[idx].upstream.id;
+        let profile = self.profiles.profile_for(provider_id);
+        let secs = profile.server_error_cooldown_secs;
         if secs == 0 {
             return;
         }
@@ -1619,6 +1630,7 @@ impl LlmProvider for FreeProvider {
                         self.cooldown.clone(),
                         self.latencies.clone(),
                         self.routing.clone(),
+                        self.profiles.clone(),
                         request,
                         stream,
                         idx,

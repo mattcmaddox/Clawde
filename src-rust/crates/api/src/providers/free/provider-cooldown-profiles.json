@@ -1,0 +1,117 @@
+{
+  "$schema": "Provider cooldown profiles for free providers",
+  "$doc": "Research-based cooldown values. Providers that return Retry-After headers can have shorter base cooldowns.",
+  "profiles": {
+    "groq": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": true,
+      "notes": "RPM: 30-60, TPM: 6K-30K. Resets quickly. Returns x-ratelimit-reset-tokens header."
+    },
+    "nvidia": {
+      "rate_limit_cooldown_secs": 90,
+      "server_error_cooldown_secs": 60,
+      "max_cooldown_secs": 600,
+      "respects_retry_after": false,
+      "notes": "RPM: ~40. Often missing Retry-After. Be conservative."
+    },
+    "cerebras": {
+      "rate_limit_cooldown_secs": 120,
+      "server_error_cooldown_secs": 60,
+      "max_cooldown_secs": 600,
+      "respects_retry_after": true,
+      "notes": "RPM: 5 (very strict). TPM: 30K. Returns x-ratelimit-reset headers."
+    },
+    "sambanova": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": true,
+      "notes": "Free tier: 20 RPM, 200K TPD. Returns rate limit headers."
+    },
+    "zai": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": false,
+      "notes": "Zhipu AI GLM. Conservative estimate pending research."
+    },
+    "mistral": {
+      "rate_limit_cooldown_secs": 90,
+      "server_error_cooldown_secs": 60,
+      "max_cooldown_secs": 600,
+      "respects_retry_after": true,
+      "notes": "Free tier very restricted. ~1 RPS. Returns Retry-After."
+    },
+    "google": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": true,
+      "notes": "RPM: 5-15, TPM: 250K. Model-specific. Returns RESOURCE_EXHAUSTED."
+    },
+    "cohere": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": false,
+      "notes": "Conservative estimate. Research pending."
+    },
+    "cloudflare": {
+      "rate_limit_cooldown_secs": 30,
+      "server_error_cooldown_secs": 15,
+      "max_cooldown_secs": 180,
+      "respects_retry_after": true,
+      "notes": "High RPM (150-720). 10K neurons/day. Returns error codes 3036/3040."
+    },
+    "huggingface": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": true,
+      "notes": "Cold-start 503s common (10-30s). Returns RateLimit headers."
+    },
+    "openrouter": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": true,
+      "notes": "Free tier: 50-1000 requests/day. Returns X-RateLimit headers."
+    },
+    "cline": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": false,
+      "notes": "Conservative estimate."
+    },
+    "opencode-zen": {
+      "rate_limit_cooldown_secs": 60,
+      "server_error_cooldown_secs": 30,
+      "max_cooldown_secs": 300,
+      "respects_retry_after": false,
+      "notes": "Conservative estimate."
+    },
+    "github-copilot": {
+      "rate_limit_cooldown_secs": 120,
+      "server_error_cooldown_secs": 60,
+      "max_cooldown_secs": 600,
+      "respects_retry_after": false,
+      "notes": "OAuth-based. Different rate limit structure."
+    }
+  },
+  "defaults": {
+    "rate_limit_cooldown_secs": 120,
+    "server_error_cooldown_secs": 60,
+    "max_cooldown_secs": 600,
+    "respects_retry_after": false
+  },
+  "parallel": {
+    "enabled": true,
+    "first_n": 2,
+    "max_tokens_for_parallel": 50000,
+    "require_all_healthy": true,
+    "notes": "Try first 2 providers in parallel for timeout scenarios. Disable for large prompts."
+  }
+}

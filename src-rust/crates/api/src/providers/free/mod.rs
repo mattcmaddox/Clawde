@@ -2031,6 +2031,8 @@ pub struct FreeProvider {
     /// Circuit-breaker state (per-upstream cooldown).
     cooldown: Arc<Mutex<CooldownState>>,
     /// Latency tracking state (per-upstream sliding window).
+    /// Provider-specific cooldown profiles (research-based).
+    profiles: Arc<ProviderProfiles>,
     latencies: Arc<Mutex<LatencyState>>,
 }
 
@@ -2193,5 +2195,92 @@ mod cache_tests {
             load_live_discovery_cache("groq"),
             Some("llama-3.3-70b-versatile".to_string())
         );
+    }
+}
+
+/// Provider-specific cooldown profile based on research.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCooldownProfile {
+    /// Base cooldown for rate limit errors (seconds)
+    pub rate_limit_cooldown_secs: u64,
+    /// Cooldown for server errors (seconds)
+    pub server_error_cooldown_secs: u64,
+    /// Maximum cooldown with exponential backoff (seconds)
+    pub max_cooldown_secs: u64,
+    /// Whether this provider returns Retry-After headers
+    pub respects_retry_after: bool,
+    /// Optional notes about this provider's limits
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl Default for ProviderCooldownProfile {
+    fn default() -> Self {
+        Self {
+            rate_limit_cooldown_secs: 120,
+            server_error_cooldown_secs: 60,
+            max_cooldown_secs: 600,
+            respects_retry_after: false,
+            notes: None,
+        }
+    }
+}
+
+/// Parallel attempt configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelConfig {
+    /// Whether to try multiple providers in parallel for timeouts
+    pub enabled: bool,
+    /// Number of providers to try in parallel (recommended: 2)
+    pub first_n: u32,
+    /// Maximum prompt tokens to enable parallelism (avoid memory issues)
+    pub max_tokens_for_parallel: u32,
+    /// Only parallelize if all N providers have no cooldown
+    pub require_all_healthy: bool,
+}
+
+impl Default for ParallelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            first_n: 2,
+            max_tokens_for_parallel: 50_000,
+            require_all_healthy: true,
+        }
+    }
+}
+
+/// All provider cooldown profiles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfiles {
+    /// Per-provider cooldown profiles
+    pub profiles: HashMap<String, ProviderCooldownProfile>,
+    /// Default profile for unknown providers
+    pub defaults: ProviderCooldownProfile,
+    /// Parallel attempt configuration
+    pub parallel: ParallelConfig,
+}
+
+impl Default for ProviderProfiles {
+    fn default() -> Self {
+        Self {
+            profiles: HashMap::new(),
+            defaults: ProviderCooldownProfile::default(),
+            parallel: ParallelConfig::default(),
+        }
+    }
+}
+
+impl ProviderProfiles {
+    /// Load profiles from the embedded JSON or fallback to defaults.
+    pub fn load() -> Self {
+        // Try to load from embedded JSON first
+        let json_str = include_str!("provider-cooldown-profiles.json");
+        serde_json::from_str(json_str).unwrap_or_default()
+    }
+
+    /// Get the cooldown profile for a specific provider.
+    pub fn profile_for(&self, provider_id: &str) -> &ProviderCooldownProfile {
+        self.profiles.get(provider_id).unwrap_or(&self.defaults)
     }
 }
