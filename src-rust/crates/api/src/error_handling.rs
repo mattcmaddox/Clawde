@@ -388,3 +388,35 @@ mod tests {
         assert!(d10 <= cfg.max_delay + Duration::from_millis(1));
     }
 }
+
+/// Extract Retry-After header from a reqwest response.
+/// Must be called BEFORE consuming the response with `.text().await`.
+pub fn extract_retry_after(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Parse error response with optional Retry-After header.
+pub fn parse_error_response_with_retry(
+    status: u16,
+    body: &str,
+    provider: &ProviderId,
+    retry_after: Option<u64>,
+) -> ProviderError {
+    let mut error = parse_error_response(status, body, provider);
+
+    // If we have a retry_after value and this is a RateLimited error, use it
+    if let ProviderError::RateLimited {
+        retry_after: ref mut ra,
+        ..
+    } = &mut error
+    {
+        if retry_after.is_some() {
+            *ra = retry_after;
+        }
+    }
+
+    error
+}

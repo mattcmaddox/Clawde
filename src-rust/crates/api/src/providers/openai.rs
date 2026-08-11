@@ -392,6 +392,8 @@ impl OpenAiProvider {
             })?;
 
         let status = resp.status().as_u16();
+        // Extract Retry-After header before consuming the response
+        let retry_after = crate::error_handling::extract_retry_after(&resp);
         let text = resp.text().await.map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
             message: format!("Failed to read response body: {}", e),
@@ -400,7 +402,12 @@ impl OpenAiProvider {
         })?;
 
         if !(200..300).contains(&(status as usize)) {
-            return Err(self.map_http_error(status, &text));
+            return Err(crate::error_handling::parse_error_response_with_retry(
+                status,
+                &text,
+                &self.id,
+                retry_after,
+            ));
         }
 
         let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
@@ -601,9 +608,16 @@ impl OpenAiProvider {
             })?;
 
         let status = resp.status().as_u16();
+        // Extract Retry-After header before consuming the response
+        let retry_after = crate::error_handling::extract_retry_after(&resp);
         if !(200..300).contains(&(status as usize)) {
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text));
+            return Err(crate::error_handling::parse_error_response_with_retry(
+                status,
+                &text,
+                &self.id,
+                retry_after,
+            ));
         }
 
         Ok(resp)

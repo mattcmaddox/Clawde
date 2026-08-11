@@ -996,7 +996,20 @@ impl RetryingFreeStream {
         // Use provider-specific profile if available
         let provider_id = self.chain[idx].upstream.id;
         let profile = self.profiles.profile_for(provider_id);
-        let secs = profile.server_error_cooldown_secs;
+
+        // Check if we have a retry_after value from the error
+        let retry_after_secs = match err {
+            ProviderError::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        };
+
+        // Use retry_after if provider respects it, otherwise use profile default
+        let secs = if profile.respects_retry_after && retry_after_secs.is_some() {
+            retry_after_secs.unwrap()
+        } else {
+            profile.server_error_cooldown_secs
+        };
+
         if secs == 0 {
             return;
         }
@@ -4496,8 +4509,8 @@ mod tests {
             assert!(!cd.is_in_cooldown(0), "huggingface stays active");
             let remaining = cd.cooldown_remaining_secs(1);
             assert!(
-                matches!(remaining, Some(s) if (1..=45).contains(&s)),
-                "~45s remaining after restart, got {:?}",
+                matches!(remaining, Some(s) if (1..=60).contains(&s)),
+                "~45s remaining after restart (with jitter), got {:?}",
                 remaining
             );
         }
