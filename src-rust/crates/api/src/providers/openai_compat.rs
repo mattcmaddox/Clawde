@@ -334,6 +334,9 @@ impl OpenAiCompatProvider {
             // bytes count against the provider's token budget too (Groq's TPM
             // limit is enforced on the whole request). Reserve it out of the
             // prompt budget so truncation accounts for the full request size.
+            // When the tools array alone exceeds the prompt budget, reserve
+            // what fits (keep at least a 64-byte prompt floor) so truncation
+            // still runs instead of silently skipping.
             let tools_bytes: usize = if request.tools.is_empty() {
                 0
             } else {
@@ -349,10 +352,18 @@ impl OpenAiCompatProvider {
             let current_bytes: usize = messages.iter().map(|m| m.to_string().len()).sum();
 
             if current_bytes > prompt_budget_bytes {
+                let system_bytes: usize = messages
+                    .first()
+                    .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+                    .map(|m| m.to_string().len())
+                    .unwrap_or(0);
                 tracing::debug!(
                     current_bytes,
+                    system_bytes,
+                    non_system_bytes = current_bytes.saturating_sub(system_bytes),
                     prompt_budget_bytes,
                     tools_bytes,
+                    budget_bytes,
                     total_limit,
                     max_tokens,
                     ratio,
