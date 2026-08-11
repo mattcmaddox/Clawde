@@ -875,6 +875,23 @@ fn join_capped_upstream_errors(errors: &[String]) -> String {
 /// Wraps an upstream stream and automatically re-dispatches to the next
 /// plan entry when the current stream produces a completely empty
 /// completion (HTTP 200 + zero text + zero tool calls + `end_turn`).
+/// State for hedged requests (based on Google's "The Tail at Scale" paper)
+#[derive(Default)]
+struct HedgeState {
+    /// Whether a hedge request is in flight
+    hedge_in_flight: bool,
+    /// The hedge request's abort handle
+    hedge_abort: Option<tokio::task::JoinHandle<()>>,
+    /// The hedge request's response channel
+    hedge_response: Option<tokio::sync::oneshot::Receiver<Result<ProviderResponse, ProviderError>>>,
+    /// Timestamp when hedge was initiated
+    hedge_started: Option<Instant>,
+    /// Index of the hedge provider
+    hedge_provider_idx: usize,
+    /// Model used for hedge request
+    hedge_model: String,
+}
+
 struct RetryingFreeStream {
     chain: Vec<FreeEntry>,
     cooldown: Arc<Mutex<CooldownState>>,
@@ -909,6 +926,8 @@ struct RetryingFreeStream {
     attempt_start: Option<Instant>,
     first_byte_received: bool,
     upstream_errors: Vec<String>,
+    /// Hedged request state
+    hedge_state: HedgeState,
 }
 
 impl RetryingFreeStream {
@@ -974,6 +993,7 @@ impl RetryingFreeStream {
             // exhaustion message reports the WHOLE chain's errors, not just
             // the ones observed after the first stream started.
             upstream_errors,
+            hedge_state: HedgeState::default(),
         }
     }
 
