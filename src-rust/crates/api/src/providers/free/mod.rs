@@ -2252,21 +2252,173 @@ impl Default for ProviderCooldownProfile {
 pub struct ParallelConfig {
     /// Whether to try multiple providers in parallel for timeouts
     pub enabled: bool,
-    /// Number of providers to try in parallel (recommended: 2)
-    pub first_n: u32,
-    /// Maximum prompt tokens to enable parallelism (avoid memory issues)
-    pub max_tokens_for_parallel: u32,
-    /// Only parallelize if all N providers have no cooldown
-    pub require_all_healthy: bool,
+    /// Strategy: "hedged", "sequential", or "parallel"
+    #[serde(default = "default_parallel_strategy")]
+    pub strategy: String,
+    /// Hedging configuration
+    #[serde(default)]
+    pub hedging: HedgeConfig,
+    /// Power of Two Choices selection configuration
+    #[serde(default)]
+    pub p2c_selection: P2CConfig,
+    /// Adaptive concurrency configuration
+    #[serde(default)]
+    pub adaptive_concurrency: AdaptiveConcurrencyConfig,
+    /// Memory budget configuration
+    #[serde(default)]
+    pub memory_budget: MemoryBudgetConfig,
+}
+
+fn default_parallel_strategy() -> String {
+    "hedged".to_string()
 }
 
 impl Default for ParallelConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            first_n: 2,
-            max_tokens_for_parallel: 50_000,
-            require_all_healthy: true,
+            strategy: "hedged".to_string(),
+            hedging: HedgeConfig::default(),
+            p2c_selection: P2CConfig::default(),
+            adaptive_concurrency: AdaptiveConcurrencyConfig::default(),
+            memory_budget: MemoryBudgetConfig::default(),
+        }
+    }
+}
+
+/// Hedged request configuration (based on Google's "The Tail at Scale" paper)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HedgeConfig {
+    /// Whether hedging is enabled
+    pub enabled: bool,
+    /// Delay before sending hedge request (milliseconds)
+    #[serde(default = "default_hedge_delay")]
+    pub delay_ms: u64,
+    /// Maximum number of concurrent hedge requests
+    #[serde(default = "default_max_hedges")]
+    pub max_hedges: u32,
+    /// Whether to cancel losing requests on first valid response
+    #[serde(default = "default_cancel_on_first_valid")]
+    pub cancel_on_first_valid: bool,
+    /// Research notes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+fn default_hedge_delay() -> u64 {
+    100
+}
+
+fn default_max_hedges() -> u32 {
+    1
+}
+
+fn default_cancel_on_first_valid() -> bool {
+    true
+}
+
+impl Default for HedgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_ms: 100,
+            max_hedges: 1,
+            cancel_on_first_valid: true,
+            notes: None,
+        }
+    }
+}
+
+/// Power of Two Choices selection configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2CConfig {
+    /// Whether P2C selection is enabled
+    pub enabled: bool,
+    /// Number of providers to sample (typically 2)
+    #[serde(default = "default_p2c_sample")]
+    pub sample_count: usize,
+    /// Research notes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+fn default_p2c_sample() -> usize {
+    2
+}
+
+impl Default for P2CConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_count: 2,
+            notes: None,
+        }
+    }
+}
+
+/// Adaptive concurrency configuration (based on Netflix gradient-based approach)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveConcurrencyConfig {
+    /// Whether adaptive concurrency is enabled
+    pub enabled: bool,
+    /// Gradient threshold below which to reduce concurrency
+    #[serde(default = "default_gradient_threshold")]
+    pub gradient_threshold: f64,
+    /// Window size for latency measurement (milliseconds)
+    #[serde(default = "default_window_size")]
+    pub window_size_ms: u64,
+    /// Research notes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+fn default_gradient_threshold() -> f64 {
+    0.8
+}
+
+fn default_window_size() -> u64 {
+    1000
+}
+
+impl Default for AdaptiveConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gradient_threshold: 0.8,
+            window_size_ms: 1000,
+            notes: None,
+        }
+    }
+}
+
+/// Memory budget configuration (based on vLLM PagedAttention concepts)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBudgetConfig {
+    /// Maximum concurrent streams
+    #[serde(default = "default_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+    /// Maximum tokens per stream
+    #[serde(default = "default_max_tokens_per_stream")]
+    pub max_tokens_per_stream: u32,
+    /// Research notes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+fn default_max_concurrent_streams() -> u32 {
+    10
+}
+
+fn default_max_tokens_per_stream() -> u32 {
+    100_000
+}
+
+impl Default for MemoryBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: 10,
+            max_tokens_per_stream: 100_000,
+            notes: None,
         }
     }
 }

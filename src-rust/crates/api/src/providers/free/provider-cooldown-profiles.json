@@ -109,9 +109,29 @@
   },
   "parallel": {
     "enabled": true,
-    "first_n": 2,
-    "max_tokens_for_parallel": 50000,
-    "require_all_healthy": true,
-    "notes": "Try first 2 providers in parallel for timeout scenarios. Disable for large prompts."
+    "strategy": "hedged",
+    "hedging": {
+      "enabled": true,
+      "delay_ms": 100,
+      "max_hedges": 1,
+      "cancel_on_first_valid": true,
+      "notes": "Based on Google's 'The Tail at Scale' paper. 100ms delay optimal for most scenarios."
+    },
+    "p2c_selection": {
+      "enabled": true,
+      "sample_count": 2,
+      "notes": "Power of Two Choices: reduces peak connections by 30% (Cloudflare research)."
+    },
+    "adaptive_concurrency": {
+      "enabled": false,
+      "gradient_threshold": 0.8,
+      "window_size_ms": 1000,
+      "notes": "Netflix gradient-based approach. Disabled by default for stability."
+    },
+    "memory_budget": {
+      "max_concurrent_streams": 10,
+      "max_tokens_per_stream": 100000,
+      "notes": "Based on vLLM PagedAttention concepts."
+    }
   }
 }
