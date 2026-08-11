@@ -314,6 +314,46 @@ impl AuthStore {
         crate::config::Settings::config_dir().join("auth.json")
     }
 
+    /// Read the current OpenCode CLI API key without modifying either auth
+    /// store. OpenCode writes a flat map at `~/.local/share/opencode/auth.json`
+    /// with records such as `{ "type": "api", "key": "..." }` keyed by the
+    /// provider ID. The current Zen ID is `opencode`; the two Clawde IDs are
+    /// accepted as compatibility aliases because OpenCode has changed naming
+    /// across releases.
+    ///
+    /// This deliberately does not accept the generic `{ "providers": ...,
+    /// "apiKey": ... }` shape: importing arbitrary provider entries could send
+    /// an OpenAI or Anthropic key to Zen by mistake. File and parse failures are
+    /// silent and fail closed; credential values are never logged.
+    pub fn opencode_cli_api_key() -> Option<String> {
+        let path = dirs::data_local_dir()?.join("opencode").join("auth.json");
+        let raw = std::fs::read_to_string(path).ok()?;
+        Self::parse_opencode_cli_api_key(&raw)
+    }
+
+    fn parse_opencode_cli_api_key(raw: &str) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        for provider_id in ["opencode", "opencode-zen", "opencode-go"] {
+            let Some(record) = value
+                .get(provider_id)
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            if record.get("type").and_then(serde_json::Value::as_str) != Some("api") {
+                continue;
+            }
+            let Some(key) = record.get("key").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let key = key.trim();
+            if key.len() >= 8 {
+                return Some(key.to_string());
+            }
+        }
+        None
+    }
+
     /// Load the store from disk (returns default if missing or invalid).
     ///
     /// A partially corrupt file is not all-or-nothing: whichever `credentials`
@@ -805,11 +845,15 @@ impl AuthStore {
             "ollama" | "lm-studio" | "llama-cpp" => "", // No API key required
             _ => return None,
         };
-        if env_var.is_empty() {
-            None
-        } else {
-            std::env::var(env_var).ok().filter(|k| !k.is_empty())
+        if !env_var.is_empty() {
+            if let Some(key) = std::env::var(env_var).ok().filter(|k| !k.trim().is_empty()) {
+                return Some(key.trim().to_string());
+            }
         }
+        if matches!(provider_id, "opencode-zen" | "opencode-go") {
+            return Self::opencode_cli_api_key();
+        }
+        None
     }
 }
 
@@ -874,6 +918,27 @@ mod tests {
             store.api_key_for("github-copilot").as_deref(),
             Some("refresh-token")
         );
+    }
+
+    #[test]
+    fn opencode_cli_parser_accepts_current_flat_api_schema() {
+        let raw = r#"{
+            "opencode": {"type": "api", "key": "zen-key-12345678"},
+            "openai": {"type": "api", "key": "openai-key-12345678"}
+        }"#;
+        assert_eq!(
+            AuthStore::parse_opencode_cli_api_key(raw).as_deref(),
+            Some("zen-key-12345678")
+        );
+    }
+
+    #[test]
+    fn opencode_cli_parser_rejects_generic_provider_shape_and_non_api_records() {
+        let generic = r#"{"providers":{"opencode":{"apiKey":"zen-key-12345678"}}}"#;
+        assert_eq!(AuthStore::parse_opencode_cli_api_key(generic), None);
+
+        let oauth = r#"{"opencode":{"type":"oauth","access":"token-12345678"}}"#;
+        assert_eq!(AuthStore::parse_opencode_cli_api_key(oauth), None);
     }
 
     #[test]

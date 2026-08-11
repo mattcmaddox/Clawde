@@ -99,7 +99,7 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
     // Check for structured error codes returned by some providers.
     if let Some(ref j) = json {
         if let Some(code) = extract_error_code(j) {
-            match code.as_str() {
+            match code.to_ascii_lowercase().as_str() {
                 "context_length_exceeded" | "context_window_exceeded" => {
                     return ProviderError::ContextOverflow {
                         provider: provider.clone(),
@@ -107,7 +107,17 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
                         max_tokens: None,
                     };
                 }
-                "insufficient_quota" | "billing_not_active" => {
+                // OpenCode Zen uses `error.type = "CreditsError"` when the
+                // account has no usable Zen credits. This is a quota/credits
+                // condition, not an invalid bearer token and not a 429 rate
+                // limit. Recognize the provider's spelling before falling
+                // through to the HTTP-status classifier below.
+                "creditserror"
+                | "credits_error"
+                | "insufficient_credits"
+                | "insufficient_credit"
+                | "insufficient_quota"
+                | "billing_not_active" => {
                     return ProviderError::QuotaExceeded {
                         provider: provider.clone(),
                         message,
@@ -321,6 +331,17 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(429, "rate limited", &pid);
         assert!(matches!(err, ProviderError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn test_parse_opencode_credits_error_as_quota() {
+        let pid = ProviderId::new("opencode-zen");
+        let err = parse_error_response(401, r#"{"error":{"type":"CreditsError"}}"#, &pid);
+        assert!(
+            matches!(&err, ProviderError::QuotaExceeded { provider, .. } if *provider == pid),
+            "OpenCode CreditsError must not become AuthFailed or RateLimited: {:?}",
+            err
+        );
     }
 
     // ---- Flat {"error": "string"} format (Cline, some gateways) -----

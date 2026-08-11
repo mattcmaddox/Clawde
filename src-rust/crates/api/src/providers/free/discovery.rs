@@ -41,6 +41,13 @@ pub enum FreeModelDiscovery {
     /// actually live), or the first model from the endpoint if no
     /// match is found.
     OpenAiModelList {
+        /// The base URL of the OpenAI-compatible API.
+        base_url: &'static str,
+    },
+    /// Fetch OpenCode Zen's public model list and select a model whose ID
+    /// explicitly ends in `-free`. The endpoint contains paid and free models;
+    /// the suffix is the authoritative free-tier marker.
+    OpenCodeZenFreeModels {
         /// The base URL of the OpenAI-compatible API, e.g.
         /// `"https://api.groq.com/openai/v1"`.
         base_url: &'static str,
@@ -70,6 +77,9 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
             base_url: "https://api.groq.com/openai/v1",
         },
         "google" => FreeModelDiscovery::GeminiModels,
+        "opencode-zen" => FreeModelDiscovery::OpenCodeZenFreeModels {
+            base_url: "https://opencode.ai/zen/v1",
+        },
         // cloudflare: /ai/v1/models does not support GET (405) — the
         // hardcoded default_model is authoritative.
         "cloudflare" => FreeModelDiscovery::None,
@@ -146,6 +156,11 @@ fn run_live_discovery_uncached(
         FreeModelDiscovery::OpenAiModelList { base_url } => {
             let key = first_upstream_key(auth_store, upstream_id)?;
             fetch_openai_compat_model_list(&key, base_url, upstream_id)
+        }
+        FreeModelDiscovery::OpenCodeZenFreeModels { base_url } => {
+            // `/models` is public and must remain discoverable even when the
+            // stored Zen credential is stale or currently creditless.
+            fetch_opencode_zen_free_model(base_url)
         }
         FreeModelDiscovery::GeminiModels => {
             let key = first_upstream_key(auth_store, "google")?;
@@ -306,6 +321,39 @@ mod tests {
             )]
         );
     }
+
+    #[test]
+    fn opencode_discovery_ignores_paid_models() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "minimax-m2.5"},
+                {"id": "deepseek-v4-flash-free"},
+                {"id": "big-pickle"},
+                {"id": "mimo-v2.5-free"}
+            ]
+        });
+        assert_eq!(
+            select_opencode_zen_free_models(&payload),
+            Some(vec![
+                "deepseek-v4-flash-free".to_string(),
+                "mimo-v2.5-free".to_string()
+            ])
+        );
+        assert_eq!(
+            select_opencode_zen_free_models(&payload)
+                .and_then(|models| models.into_iter().next())
+                .as_deref(),
+            Some("deepseek-v4-flash-free")
+        );
+    }
+
+    #[test]
+    fn opencode_discovery_returns_none_without_free_models() {
+        let payload = serde_json::json!({
+            "data": [{"id": "minimax-m2.5"}, {"id": "big-pickle"}]
+        });
+        assert_eq!(select_opencode_zen_free_models(&payload), None);
+    }
 }
 
 /// Fetch OpenRouter's current free models from their models API.
@@ -403,6 +451,52 @@ pub fn fetch_openrouter_free_model(openrouter_api_key: &str) -> Option<String> {
         tracing::warn!("fetch_openrouter_free_model: no free tool-capable models found");
         None
     }
+}
+
+/// Fetch OpenCode Zen's current free model list.
+///
+/// Zen exposes paid and free models from the same public `/models` endpoint.
+/// Only IDs ending in `-free` are eligible; do not fall back to the first
+/// arbitrary model because that could turn Free mode into a paid request.
+pub fn fetch_opencode_zen_free_model(base_url: &str) -> Option<String> {
+    fetch_opencode_zen_free_models(base_url)?.into_iter().next()
+}
+
+/// Fetch all current OpenCode Zen free model IDs.
+///
+/// The endpoint contains both paid and free models. Only IDs ending in
+/// `-free` are returned, so this remains safe as the public catalog changes.
+pub fn fetch_opencode_zen_free_models(base_url: &str) -> Option<Vec<String>> {
+    let models_url = format!("{}/models", base_url.trim_end_matches('/'));
+    let payload = blocking_get_json(
+        models_url,
+        None,
+        &[],
+        "fetch_opencode_zen_free_models".to_string(),
+    )?;
+    select_opencode_zen_free_models(&payload)
+}
+
+/// Select all explicitly free models from a Zen `/models` payload.
+/// Kept separate from HTTP so the paid-model exclusion is regression-tested
+/// without a network dependency.
+fn select_opencode_zen_free_models(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let models = payload.get("data").and_then(|v| v.as_array())?;
+    let free_models: Vec<String> = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+        .filter(|id| id.ends_with("-free"))
+        .map(str::to_owned)
+        .collect();
+    if free_models.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        "OpenCode Zen free models: {} (first: {})",
+        free_models.len(),
+        free_models[0],
+    );
+    Some(free_models)
 }
 
 /// Fetch model list from a standard OpenAI-compatible `/v1/models` endpoint.

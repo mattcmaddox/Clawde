@@ -228,13 +228,15 @@ impl KeyRotatingProvider {
     /// Get the next available key, build a provider, and call `try_provider`.
     /// On exhaustible errors, marks the key and loops. On non-exhaustible
     /// errors, returns immediately. When all keys are exhausted, returns
-    /// `RateLimited` with the earliest retry time.
+    /// the last exhaustible provider error, preserving quota/credits and auth
+    /// failures instead of masking them as a synthetic rate limit.
     async fn try_with_rotation<F, Fut, T>(&self, try_provider: F) -> Result<T, ProviderError>
     where
         F: Fn(Arc<dyn LlmProvider>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ProviderError>>,
     {
         let mut retry_count: u32 = 0;
+        let mut last_exhaustible_error: Option<ProviderError> = None;
 
         loop {
             // Get the next available key (lock scope ends before any .await).
@@ -275,6 +277,23 @@ impl KeyRotatingProvider {
                         continue;
                     }
 
+                    if let Some(last_error) = last_exhaustible_error.take() {
+                        // Do not turn a pool of rejected/creditless keys into
+                        // a misleading synthetic rate limit. The caller needs
+                        // the actual terminal class to decide whether to
+                        // reauthenticate, add credits, or wait for a quota
+                        // reset. Genuine RateLimited errors retain the
+                        // earliest cooldown hint below.
+                        match last_error {
+                            ProviderError::RateLimited { .. } => {
+                                return Err(ProviderError::RateLimited {
+                                    provider: self.provider_id.clone(),
+                                    retry_after: Some(retry_secs),
+                                });
+                            }
+                            other => return Err(other),
+                        }
+                    }
                     return Err(ProviderError::RateLimited {
                         provider: self.provider_id.clone(),
                         retry_after: Some(retry_secs),
@@ -288,6 +307,7 @@ impl KeyRotatingProvider {
                     let Some(signal) = classify_exhaust(&err) else {
                         return Err(err);
                     };
+                    last_exhaustible_error = Some(err.clone());
 
                     // Mark the active key as exhausted (brief lock).
                     {
@@ -709,10 +729,10 @@ mod tests {
         let result = provider.create_message(dummy_request()).await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            ProviderError::RateLimited { retry_after, .. } => {
-                assert!(retry_after.is_some(), "should have retry_after");
+            ProviderError::QuotaExceeded { message, .. } => {
+                assert_eq!(message, "out of quota");
             }
-            other => panic!("expected RateLimited, got {:?}", other),
+            other => panic!("expected QuotaExceeded, got {:?}", other),
         }
     }
 

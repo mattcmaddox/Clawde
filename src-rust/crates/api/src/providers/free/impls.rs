@@ -217,7 +217,19 @@ impl FreeProvider {
             .strip_prefix("free/family/")
             .or_else(|| normalized.strip_prefix("family/"))
         {
-            if let Some(entry) = FREE_CATALOG.iter().find(|entry| entry.model_family == rest) {
+            // Backward-compatible alias for the historical OpenCode Zen
+            // MiniMax family. The Zen free pool is now dynamic, so the alias
+            // resolves to the current catalog family rather than pinning a
+            // paid/stale model ID.
+            let family = if rest == "minimax-m2.5" {
+                "opencode-zen-free"
+            } else {
+                rest
+            };
+            if let Some(entry) = FREE_CATALOG
+                .iter()
+                .find(|entry| entry.model_family == family)
+            {
                 return Route::Family {
                     model_family: entry.model_family,
                 };
@@ -1750,6 +1762,17 @@ fn persist_env_key_if_unstored(upstream_id: &str) {
         return;
     }
     if store.get(upstream_id).is_some() {
+        return;
+    }
+    // A key read from OpenCode's own auth.json is intentionally read-only
+    // here. Only the existing environment-variable import path may copy a
+    // credential into Clawde's canonical key ring.
+    if upstream_id == "opencode-zen"
+        && std::env::var("OPENCODE_API_KEY")
+            .ok()
+            .is_none_or(|key| key.trim().is_empty())
+        && clawde_core::AuthStore::opencode_cli_api_key().is_some()
+    {
         return;
     }
     let Some(key) = store.api_key_for(upstream_id) else {

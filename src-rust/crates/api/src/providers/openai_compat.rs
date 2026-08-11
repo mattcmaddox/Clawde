@@ -63,9 +63,10 @@ pub struct ProviderQuirks {
     pub reasoning_field: Option<String>,
 
     /// Whether this provider requires reasoning_content to be echoed back on
-    /// subsequent turns in multi-turn conversations.  DeepSeek V4 is currently
-    /// the only provider with this requirement; most providers ignore this field.
-    /// When false, reasoning is not included in outbound messages to save tokens.
+    /// subsequent turns in multi-turn conversations.  DeepSeek V4 and OpenCode
+    /// Zen's thinking-mode free models are currently the providers with this
+    /// requirement; most providers ignore this field. When false, reasoning is
+    /// not included in outbound messages to save tokens.
     pub requires_reasoning_roundtrip: bool,
 
     /// Hard cap on `max_tokens` sent to this provider.  When the request
@@ -443,8 +444,15 @@ impl OpenAiCompatProvider {
     /// text into assistant messages that contain tool calls.
     ///
     /// DeepSeek's thinking mode requires `reasoning_content` to be sent back
-    /// on turns where tool calls occurred. Turns without tool calls omit it —
-    /// the API ignores it anyway and skipping saves tokens.
+    /// on turns where tool calls occurred. MiniMax Console (the strict backend
+    /// behind OpenCode Zen's gateway) additionally requires the field on
+    /// **every** assistant tool-call turn once the conversation is in thinking
+    /// mode — even turns where the model emitted no reasoning. Flash-class
+    /// thinking models skip thinking on some turns, so a strict 1:1 pairing
+    /// leaves those turns without `reasoning_content` and the strict backend
+    /// rejects the whole request. The fix: turns with their own captured
+    /// reasoning use it; turns without one carry forward the most recent
+    /// reasoning so the field is always present.
     fn inject_reasoning_for_tool_turns(
         json_messages: &mut [Value],
         original_messages: &[clawde_core::types::Message],
@@ -452,48 +460,56 @@ impl OpenAiCompatProvider {
     ) {
         use clawde_core::types::{MessageContent, Role};
 
-        // Collect reasoning texts from assistant messages that have both
-        // Thinking blocks and ToolUse blocks, preserving order.
-        let reasoning_texts: Vec<String> = original_messages
-            .iter()
-            .filter_map(|msg| {
-                if msg.role != Role::Assistant {
-                    return None;
-                }
-                let blocks = match &msg.content {
-                    MessageContent::Blocks(b) => b,
-                    _ => return None,
-                };
-                let has_tool_use = blocks
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-                if !has_tool_use {
-                    return None;
-                }
-                let thinking: Vec<&str> = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if thinking.is_empty() {
-                    None
-                } else {
-                    Some(thinking.join(""))
-                }
-            })
-            .collect();
+        // Build one reasoning record per original assistant tool-call turn, in
+        // order. A turn uses its own captured thinking when present; otherwise
+        // it carries forward the most recent reasoning (flash-class thinking
+        // models skip thinking on some turns, and MiniMax Console's strict
+        // backend still demands the field once the conversation is in thinking
+        // mode). Turns before any reasoning has been emitted stay `None` — the
+        // API cannot demand reasoning it never saw.
+        let mut per_turn: Vec<Option<String>> = Vec::new();
+        let mut last_reasoning: Option<&str> = None;
+        for msg in original_messages {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            let blocks = match &msg.content {
+                MessageContent::Blocks(b) => b,
+                _ => continue,
+            };
+            if !blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            {
+                continue;
+            }
+            let thinking: Vec<&str> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !thinking.is_empty() {
+                last_reasoning = Some(thinking[0]);
+                per_turn.push(Some(thinking.join("")));
+            } else if let Some(last) = last_reasoning {
+                per_turn.push(Some(last.to_string()));
+            } else {
+                per_turn.push(None);
+            }
+        }
 
-        if reasoning_texts.is_empty() {
+        if per_turn.iter().all(Option::is_none) {
             return;
         }
 
-        // Inject into JSON messages: for each assistant message that carries
-        // tool_calls, add the reasoning field from the collected texts.
-        let mut reasoning_idx = 0;
+        // Inject into JSON messages: the i-th assistant tool-call message
+        // corresponds to the i-th original tool-call turn, so consume the
+        // per-turn records in order.
+        let mut turn_idx = 0;
         for msg in json_messages.iter_mut() {
-            if reasoning_idx >= reasoning_texts.len() {
+            if turn_idx >= per_turn.len() {
                 break;
             }
             let is_assistant = msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
@@ -502,15 +518,15 @@ impl OpenAiCompatProvider {
                 .and_then(|tc| tc.as_array())
                 .map(|a| !a.is_empty())
                 .unwrap_or(false);
-            if is_assistant && has_tool_calls {
-                if let Some(obj) = msg.as_object_mut() {
-                    obj.insert(
-                        field.to_string(),
-                        Value::String(reasoning_texts[reasoning_idx].clone()),
-                    );
-                }
-                reasoning_idx += 1;
+            if !(is_assistant && has_tool_calls) {
+                continue;
             }
+            if let Some(reasoning) = per_turn[turn_idx].as_ref() {
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.insert(field.to_string(), Value::String(reasoning.clone()));
+                }
+            }
+            turn_idx += 1;
         }
     }
 
@@ -1467,6 +1483,109 @@ mod tests {
     use super::*;
     use crate::provider_types::SystemPrompt;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_roundtrip_injects_reasoning_content_on_tool_calls() {
+        use clawde_core::types::{ContentBlock, Message, MessageContent, Role};
+        use serde_json::json; // DeepSeek V4 / OpenCode Zen thinking models reject multi-turn tool-call
+                              // requests that drop the previous turn's reasoning_content. The quirks
+                              // must inject it back onto every assistant tool-call message.
+        let provider = OpenAiCompatProvider::new(
+            ProviderId::OPENCODE_ZEN,
+            "OpenCode Zen",
+            "http://example.test/v1",
+        )
+        .with_quirks(ProviderQuirks {
+            reasoning_field: Some("reasoning_content".to_string()),
+            requires_reasoning_roundtrip: true,
+            ..Default::default()
+        });
+
+        let assistant_turn = |thinking: Option<&str>, id: &str| Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(
+                thinking
+                    .map(|t| ContentBlock::Thinking {
+                        thinking: t.to_string(),
+                        signature: String::new(),
+                    })
+                    .into_iter()
+                    .chain(std::iter::once(ContentBlock::ToolUse {
+                        id: id.to_string(),
+                        name: "Write".to_string(),
+                        input: json!({ "path": "/tmp/a.txt" }),
+                        thought_signature: None,
+                    }))
+                    .collect(),
+            ),
+            uuid: None,
+            cost: None,
+            snapshot_patch: None,
+        };
+
+        let request = ProviderRequest {
+            model: "opencode-zen/deepseek-v4-flash-free".to_string(),
+            messages: vec![
+                Message::user("write the file"),
+                // Turn 1: thinking + tool call.
+                assistant_turn(Some("first I plan"), "call_1"),
+                // Turn 2: tool call WITHOUT thinking — flash models skip
+                // thinking on some turns; the roundtrip must carry forward
+                // the most recent reasoning so the strict backend sees the
+                // field on every tool-call turn.
+                assistant_turn(None, "call_2"),
+                // Turn 3: thinking + tool call again.
+                assistant_turn(Some("third I check"), "call_3"),
+            ],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 200,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            thinking: None,
+            stop_sequences: vec![],
+            provider_options: Default::default(),
+        };
+
+        let messages = provider.build_messages(&request);
+        let assistants: Vec<&serde_json::Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .collect();
+        assert_eq!(
+            assistants.len(),
+            3,
+            "expected three assistant tool-call turns"
+        );
+        fn reasoning_of(m: &serde_json::Value) -> Option<&str> {
+            m.get("reasoning_content").and_then(|v| v.as_str())
+        }
+        assert_eq!(
+            reasoning_of(assistants[0]),
+            Some("first I plan"),
+            "turn with own reasoning keeps it"
+        );
+        assert_eq!(
+            reasoning_of(assistants[1]),
+            Some("first I plan"),
+            "turn without reasoning carries forward the most recent text"
+        );
+        assert_eq!(
+            reasoning_of(assistants[2]),
+            Some("third I check"),
+            "later turn with own reasoning replaces the carried text"
+        );
+        // The same quirk must also replace content:null with an empty string,
+        // which thinking-mode APIs reject.
+        for assistant in assistants {
+            assert_eq!(
+                assistant.get("content").and_then(|v| v.as_str()),
+                Some(""),
+                "content:null must be normalized to empty string"
+            );
+        }
+    }
 
     #[test]
     fn max_total_tokens_truncates_large_system_prompt() {

@@ -241,9 +241,11 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "opencode-zen",
         title: "OpenCode Zen",
         key_url: "opencode.ai/auth",
-        default_model: "minimax-m2.5-free",
-        model_family: "minimax-m2.5",
-        note: "MiniMax M2.5 — 2 keys",
+        // Zen's free pool is dynamic. This is only the offline fallback;
+        // live discovery selects the current `*-free` model from `/models`.
+        default_model: "deepseek-v4-flash-free",
+        model_family: "opencode-zen-free",
+        note: "dynamic Zen free pool — current `*-free` model via /models",
         tool_calling: true,
         vision: false,
         max_tokens_cap: Some(8_192),

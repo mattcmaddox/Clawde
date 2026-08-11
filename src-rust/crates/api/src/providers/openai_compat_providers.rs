@@ -536,9 +536,12 @@ pub fn opencode_go() -> OpenAiCompatProvider {
 }
 
 /// OpenCode Zen — pay-as-you-go metered endpoint hosted by opencode.ai.
-/// Exposes the free pool (Big Pickle, MiniMax M2.5 Free, Ring 2.6 1T Free,
-/// Nemotron 3 Super Free) alongside paid models.  Same `OPENCODE_API_KEY` as
-/// OpenCode Go.
+/// Exposes the free pool (DeepSeek V4 Flash, MiniMax M2.5 Free, Nemotron,
+/// etc.) alongside paid models.  Same `OPENCODE_API_KEY` as OpenCode Go.
+///
+/// Several Zen free models run thinking mode and reject multi-turn tool-call
+/// requests that drop the previous turn's `reasoning_content`, so the provider
+/// opts into the reasoning roundtrip exactly like DeepSeek V4.
 pub fn opencode_zen() -> OpenAiCompatProvider {
     let key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
     OpenAiCompatProvider::new(
@@ -549,6 +552,8 @@ pub fn opencode_zen() -> OpenAiCompatProvider {
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         include_usage_in_stream: true,
+        reasoning_field: Some("reasoning_content".to_string()),
+        requires_reasoning_roundtrip: true,
         ..Default::default()
     })
 }
@@ -728,6 +733,22 @@ mod tests {
             p.quirks.max_total_tokens,
             Some(7_500),
             "expected Groq max_total_tokens=7500 for the 8k TPM tier"
+        );
+    }
+
+    #[test]
+    fn opencode_zen_sets_reasoning_roundtrip() {
+        // Zen free models (DeepSeek V4 Flash, MiniMax M2.5 Free) run thinking
+        // mode; multi-turn tool-call requests must echo reasoning_content back.
+        let p = opencode_zen();
+        assert_eq!(
+            p.quirks.reasoning_field.as_deref(),
+            Some("reasoning_content"),
+            "expected opencode-zen to echo reasoning_content"
+        );
+        assert!(
+            p.quirks.requires_reasoning_roundtrip,
+            "expected opencode-zen to require the reasoning roundtrip"
         );
     }
 

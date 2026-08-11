@@ -48,8 +48,8 @@ pub use catalog::{
 };
 pub use discovery::{
     discovery_for, fetch_cline_free_model, fetch_cline_free_models, fetch_gemini_models,
-    fetch_openai_compat_model_list, fetch_openrouter_free_model, run_live_discovery,
-    FreeModelDiscovery,
+    fetch_openai_compat_model_list, fetch_opencode_zen_free_model, fetch_opencode_zen_free_models,
+    fetch_openrouter_free_model, run_live_discovery, FreeModelDiscovery,
 };
 
 // Further sub-modules: inherent impl + streaming + trait impl (mutually
@@ -1655,22 +1655,41 @@ pub fn resolve_free_upstream_keys(
     auth_store: &clawde_core::AuthStore,
     upstream_id: &str,
 ) -> Option<Vec<String>> {
-    let raw = if upstream_id == "opencode-zen" {
-        auth_store
-            .keys_for("opencode-zen")
-            .or_else(|| auth_store.keys_for("opencode-go"))
-            .map(|k| k.to_vec())
-    } else {
-        auth_store.keys_for(upstream_id).map(|k| k.to_vec())
+    let clean = |keys: Option<&[String]>| {
+        keys.unwrap_or_default()
+            .iter()
+            .map(|key| key.trim().to_string())
+            .filter(|key| key.len() >= 8)
+            .collect::<Vec<_>>()
     };
-
-    let filtered: Vec<String> = raw
-        .unwrap_or_default()
-        .into_iter()
-        .map(|k| k.trim().to_string())
-        .filter(|k| k.len() >= 8)
-        .collect();
-    (!filtered.is_empty()).then_some(filtered)
+    // Zen and Go intentionally share one ring: prefer the canonical Zen slot,
+    // but fall back to the Go alias when the Zen slot is absent or invalid.
+    let filtered = if upstream_id == "opencode-zen" {
+        let zen = clean(auth_store.keys_for("opencode-zen"));
+        if zen.is_empty() {
+            clean(auth_store.keys_for("opencode-go"))
+        } else {
+            zen
+        }
+    } else {
+        clean(auth_store.keys_for(upstream_id))
+    };
+    if !filtered.is_empty() {
+        return Some(filtered);
+    }
+    if upstream_id == "opencode-zen" {
+        if let Some(key) = std::env::var("OPENCODE_API_KEY")
+            .ok()
+            .map(|key| key.trim().to_string())
+            .filter(|key| key.len() >= 8)
+        {
+            return Some(vec![key]);
+        }
+        if let Some(key) = clawde_core::AuthStore::opencode_cli_api_key() {
+            return Some(vec![key]);
+        }
+    }
+    None
 }
 
 /// All stored keys for a free-catalog upstream, including single-key / OAuth
@@ -1750,7 +1769,7 @@ pub fn first_free_upstream_key(
     if upstream_id == "github-copilot" {
         return auth_store.api_key_for(upstream_id);
     }
-    let key = if upstream_id == "opencode-zen" {
+    let key = if matches!(upstream_id, "opencode-zen" | "opencode-go") {
         auth_store
             .keys_for("opencode-zen")
             .and_then(|keys| keys.iter().find(|key| key.trim().len() >= 8))
@@ -1762,6 +1781,7 @@ pub fn first_free_upstream_key(
                     .cloned()
             })
             .or_else(|| std::env::var("OPENCODE_API_KEY").ok())
+            .or_else(|| clawde_core::AuthStore::opencode_cli_api_key())
     } else {
         auth_store
             .keys_for(upstream_id)
