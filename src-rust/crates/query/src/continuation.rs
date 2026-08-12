@@ -576,6 +576,15 @@ impl SemanticVerifyPolicy {
         self.max_fix_attempts
     }
 
+    /// Reset the fix-and-reverify round budget for a new turn.
+    ///
+    /// The `attempts` counter bounds rounds within one verification session;
+    /// a new turn starts a fresh session, so a prior exhaustion must not
+    /// poison the next review.
+    pub fn reset_attempts(&self) {
+        self.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Clone of the latest verdict report (peek; does not consume).
     pub fn last_report(&self) -> Option<SemanticVerifyReport> {
         self.last_report.lock().unwrap().clone()
@@ -965,6 +974,7 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
             // exits early due to a failed or unavailable deterministic gate.
             self.semantic.last_report.lock().unwrap().take();
             *self.semantic_note.lock().unwrap() = None;
+            self.semantic.reset_attempts();
             let deterministic = self.deterministic.decide(ctx);
             if deterministic.is_continue() {
                 return deterministic;
@@ -1636,6 +1646,66 @@ mod tests {
             review_calls.load(std::sync::atomic::Ordering::Relaxed),
             2,
             "the fix loop must re-verify after the fixer runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_fix_loop_resets_attempt_budget_between_turns() {
+        // A turn that exhausts the fix-and-reverify budget must not poison the
+        // next turn: each turn is a fresh verification session. Without the
+        // per-turn reset, the second turn's first `fixable` verdict would
+        // immediately decline as "exhausted" and never reach the fixer.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Ok(r#"{"verdict":"fixable","summary":"still wrong","findings":["x"]}"#.to_string())
+            })
+        });
+        let fixer_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_calls_clone = fixer_calls.clone();
+        let fixer: SemanticFixRunner = std::sync::Arc::new(move |_| {
+            fixer_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("patched".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            semantic_fix_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        // First turn: the fix loop re-verifies `fixable` every round until the
+        // semantic attempt budget (default 3) is exhausted.
+        let _ = policy.decide_async(&context).await;
+        let first_fixer_calls = fixer_calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            first_fixer_calls, 3,
+            "the first turn must exhaust three fix rounds"
+        );
+        // Second turn: the budget must be reset, so the fixer runs again
+        // instead of immediately declining as "exhausted".
+        let _ = policy.decide_async(&context).await;
+        assert_eq!(
+            fixer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            first_fixer_calls + 3,
+            "the second turn must start a fresh fix budget"
         );
     }
 
