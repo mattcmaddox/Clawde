@@ -134,6 +134,37 @@ pub struct SemanticVerifyResponse {
     pub findings: Vec<String>,
 }
 
+/// Tolerant wire envelope accepted from a semantic verifier runner.
+///
+/// Some free models wrap their verdict in a Claude-style `{"message": …}`
+/// assistant-message field. The `message` field is accepted and ignored, but
+/// `verdict` and `summary` remain strictly required and every other unknown
+/// field is still rejected, so an ambiguous response can never authorize
+/// continuation. A response that places the verdict *inside* `message` (rather
+/// than alongside it) still fails closed: the top-level `verdict` is absent.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticVerifyEnvelope {
+    verdict: SemanticVerdict,
+    summary: String,
+    #[serde(default)]
+    findings: Vec<String>,
+    /// Tolerated and ignored; the field is never read after deserialization.
+    #[serde(default)]
+    #[allow(dead_code)]
+    message: Option<serde_json::Value>,
+}
+
+impl From<SemanticVerifyEnvelope> for SemanticVerifyResponse {
+    fn from(envelope: SemanticVerifyEnvelope) -> Self {
+        Self {
+            verdict: envelope.verdict,
+            summary: envelope.summary,
+            findings: envelope.findings,
+        }
+    }
+}
+
 /// Machine-visible semantic-verification outcome emitted to clients.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SemanticVerifyReport {
@@ -358,16 +389,18 @@ fn extract_json_object(input: &str) -> Option<&str> {
 }
 
 /// Parse a semantic verifier response. Responses must contain a bounded JSON
-/// object with exactly `verdict`, `summary`, and optional `findings`.
+/// object with `verdict`, `summary`, and optional `findings`.
 ///
-/// Free-tier models frequently wrap their JSON in markdown fences or prose, or
-/// return empty output. To avoid silently skipping verification on those
-/// models, the parser first tries a strict whole-string parse and then falls
-/// back to extracting the first balanced JSON object (skipping fences and
-/// prose). The extracted object goes through the same strict validation
-/// (`deny_unknown_fields`, non-empty bounded summary, bounded findings), so an
-/// ambiguous response can never authorize continuation: anything that is not a
-/// strictly valid verdict object is rejected.
+/// Free-tier models frequently wrap their JSON in markdown fences or prose,
+/// return empty output, or add a Claude-style `{"message": …}` field. To avoid
+/// silently skipping verification on those models, the parser first tries a
+/// strict whole-string parse and then falls back to extracting the first
+/// balanced JSON object (skipping fences and prose). The extracted object is
+/// parsed through a tolerant envelope that accepts (and ignores) a top-level
+/// `message` field. The envelope still enforces `deny_unknown_fields`, a
+/// required non-empty bounded summary, and bounded findings, so an ambiguous
+/// response can never authorize continuation: anything that is not a strictly
+/// valid verdict object is rejected.
 pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyResponse, String> {
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -381,8 +414,8 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
     }
 
     // Fast path: a bare JSON object with no surrounding prose or fences.
-    let parsed = match serde_json::from_str::<SemanticVerifyResponse>(trimmed) {
-        Ok(parsed) => parsed,
+    let parsed = match serde_json::from_str::<SemanticVerifyEnvelope>(trimmed) {
+        Ok(envelope) => SemanticVerifyResponse::from(envelope),
         Err(strict_error) => {
             // Tolerant path: skip fences/prose and re-parse the first balanced
             // object. Any failure here remains fail-closed.
@@ -391,8 +424,9 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
                     "semantic verifier returned malformed JSON (no JSON object found): {strict_error}"
                 )
             })?;
-            serde_json::from_str::<SemanticVerifyResponse>(candidate)
-                .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?
+            let envelope = serde_json::from_str::<SemanticVerifyEnvelope>(candidate)
+                .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?;
+            SemanticVerifyResponse::from(envelope)
         }
     };
     if parsed.summary.trim().is_empty() {
@@ -2071,6 +2105,36 @@ mod tests {
         // Unknown fields still fail closed even inside a fence.
         assert!(parse_semantic_verify_response(
             "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"extra\":true}\n```"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn semantic_response_parser_tolerates_message_envelope() {
+        // A Claude-style `{"message": …}` field alongside the verdict is
+        // accepted and ignored.
+        let with_message = parse_semantic_verify_response(
+            r#"{"message":"looks good","verdict":"pass","summary":"all good","findings":[]}"#,
+        )
+        .expect("message envelope accepted");
+        assert_eq!(with_message.verdict, SemanticVerdict::Pass);
+        assert_eq!(with_message.summary, "all good");
+
+        // A non-string `message` value is tolerated too (it is ignored).
+        let nested = parse_semantic_verify_response(
+            r#"{"message":{"role":"assistant"},"verdict":"pass","summary":"ok"}"#,
+        )
+        .expect("object message tolerated");
+        assert_eq!(nested.verdict, SemanticVerdict::Pass);
+
+        // A `message` field alone (no verdict) still fails closed.
+        assert!(
+            parse_semantic_verify_response(r#"{"message":"The change looks correct"}"#).is_err()
+        );
+
+        // Other unknown fields are still rejected alongside `message`.
+        assert!(parse_semantic_verify_response(
+            r#"{"message":"x","verdict":"pass","summary":"ok","extra":true}"#
         )
         .is_err());
     }
