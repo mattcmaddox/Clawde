@@ -349,11 +349,21 @@ mod tests {
 
     #[test]
     fn render_shows_freshness_and_new_file_state() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("AGENTS.md"), "memory\n").unwrap();
+        // The project row renders as `› Project <path> · updated today` and the
+        // dialog is a fixed 70 columns. A long project path (e.g. an overridden
+        // TMPDIR) pushes the freshness suffix past the clip point and the
+        // assertion becomes environment-dependent, so use a short, fixed path.
+        let base: std::path::PathBuf = if cfg!(unix) {
+            "/tmp/clawde-memsel-test".into()
+        } else {
+            std::env::temp_dir().join("clawde-memsel-test")
+        };
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("AGENTS.md"), "memory\n").unwrap();
 
         let mut state = MemoryFileSelectorState::new();
-        state.open(project.path());
+        state.open(&base);
         let area = Rect {
             x: 0,
             y: 0,
@@ -371,5 +381,6 @@ mod tests {
 
         assert!(rendered.contains("updated today"));
         assert!(rendered.contains(" · new"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

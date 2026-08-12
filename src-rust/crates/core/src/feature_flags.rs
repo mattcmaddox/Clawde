@@ -234,11 +234,27 @@ mod tests {
 
     #[test]
     fn test_cache_path() {
+        // config_dir() honors a CLAWDE_HOME override verbatim, and other test
+        // modules mutate the process-global env var concurrently — so pin an
+        // explicit home whose path contains "clawde" to make this deterministic
+        // instead of inheriting whatever a parallel test left behind.
+        let _lock = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAWDE_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("clawde-test-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CLAWDE_HOME", &home);
+
         let path = FeatureFlagManager::get_cache_path();
-        // "claurst" (not ".claurst"): the config dir is legacy ~/.claurst on
-        // existing installs but XDG ~/.config/claurst on fresh ones (#207).
         assert!(path.to_string_lossy().contains("clawde"));
         assert!(path.to_string_lossy().contains("feature_flags.json"));
+
+        match prev {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
     }
 
     #[test]

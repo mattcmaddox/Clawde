@@ -225,6 +225,9 @@ pub struct StatsDialogState {
     /// Live key-ring health captured when the dialog opens. This is intentionally
     /// not persisted: it reflects the currently active provider registry.
     live_provider_health: Vec<ProviderHealthRow>,
+    /// Per-upstream live model probe picks (`upstream → last-picked model`)
+    /// from the free discovery cache, refreshed when the dialog opens.
+    live_probe_picks: Vec<(String, String)>,
     /// Bounded, session-local completion telemetry keyed by provider/model.
     provider_activity: Vec<ProviderActivityRow>,
 }
@@ -241,6 +244,7 @@ impl StatsDialogState {
             current_streak_days: 0,
             longest_streak_days: 0,
             live_provider_health: Vec::new(),
+            live_probe_picks: Vec::new(),
             provider_activity: Vec::new(),
         }
     }
@@ -313,6 +317,17 @@ impl StatsDialogState {
                 });
             }
         }
+        // Live model probe picks: what the free-discovery poller last selected
+        // per upstream (from the persisted live-discovery cache), so the stats
+        // view shows the effective model without leaving the session.
+        self.live_probe_picks = clawde_api::providers::free::live_discovery_snapshot()
+            .map(|(probes, _saved_at)| {
+                let mut picks: Vec<(String, String)> = probes.into_iter().collect();
+                picks.sort();
+                picks
+            })
+            .unwrap_or_default();
+
         // Performance rows for every configured upstream, even those without a
         // key ring (single-key setups report no rings, so the key-health loop
         // above would skip them entirely). This is what makes the
@@ -388,6 +403,7 @@ impl StatsDialogState {
         self.longest_streak_days = longest;
         self.data = Some(stats);
         self.live_provider_health.clear();
+        self.live_probe_picks.clear();
         self.visible = true;
         self.tab = StatsTab::Overview;
         self.scroll = 0;
@@ -837,6 +853,24 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
                 Span::styled(cooldowns, Style::default().fg(Color::DarkGray)),
                 Span::styled(success, Style::default().fg(success_color)),
                 Span::styled(latency, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    if !state.live_probe_picks.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![Span::styled(
+            "Live model probes:",
+            Style::default().fg(Color::DarkGray),
+        )]));
+        for (upstream, model) in state.live_probe_picks.iter().take(8) {
+            lines.push(Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:<28}", upstream),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(model, Style::default().fg(Color::White)),
             ]));
         }
     }
@@ -1336,6 +1370,27 @@ mod tests {
         assert!(content.contains("1/2 keys"));
         assert!(content.contains("retry 30s"));
         assert!(content.contains("1 cooldown"));
+    }
+
+    #[test]
+    fn live_probe_picks_render_upstream_and_model() {
+        let mut state = free_state();
+        state.live_probe_picks = vec![
+            (
+                "cloudflare".to_string(),
+                "@cf/qwen/qwen3-30b-a3b-fp8".to_string(),
+            ),
+            ("groq".to_string(), "openai/gpt-oss-120b".to_string()),
+        ];
+        let area = Rect::new(0, 0, 110, 24);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("Live model probes:"));
+        assert!(content.contains("cloudflare"));
+        assert!(content.contains("@cf/qwen/qwen3-30b-a3b-fp8"));
+        assert!(content.contains("groq"));
+        assert!(content.contains("openai/gpt-oss-120b"));
     }
 
     #[test]
