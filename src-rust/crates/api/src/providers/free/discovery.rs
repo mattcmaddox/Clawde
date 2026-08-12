@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::{fetch_best_free_models_from_modelsdev, resolve_free_upstream_keys};
-use crate::providers::openai_compat_providers::CLINE_SDK_CLIENT_TYPE;
+use crate::providers::openai_compat_providers::{cloudflare_parts, CLINE_SDK_CLIENT_TYPE};
 
 // ---------------------------------------------------------------------------
 // Live free-model discovery (per-provider API endpoints)
@@ -57,6 +57,17 @@ pub enum FreeModelDiscovery {
     /// array with `name` fields like `"models/gemini-2.5-flash"`.
     /// Strips the `models/` prefix to get the model ID.
     GeminiModels,
+    /// Fetch from Cloudflare's account-scoped models API
+    /// (`/accounts/{ACCOUNT_ID}/ai/models/search`). Cloudflare's
+    /// OpenAI-compatible `/models` route does not support GET (405), and the
+    /// account-scoped endpoint additionally reflects which models this
+    /// account can actually serve — picking up new models without waiting
+    /// for a models.dev refresh.
+    CloudflareModels,
+    /// Fetch from Cohere's `/v1/models` endpoint. Cohere's response uses a
+    /// top-level `models` array with the model ID in `name` (not OpenAI's
+    /// `data` shape).
+    CohereModels,
 }
 
 /// Map each FREE_CATALOG upstream to its live discovery method.
@@ -80,9 +91,23 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         "opencode-zen" => FreeModelDiscovery::OpenCodeZenFreeModels {
             base_url: "https://opencode.ai/zen/v1",
         },
-        // cloudflare: /ai/v1/models does not support GET (405) — the
-        // hardcoded default_model is authoritative.
-        "cloudflare" => FreeModelDiscovery::None,
+        "mistral" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api.mistral.ai/v1",
+        },
+        "sambanova" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api.sambanova.ai/v1",
+        },
+        "zai" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api.z.ai/api/coding/paas/v4",
+        },
+        // cloudflare: /ai/v1/models does not support GET (405), so probe the
+        // account-scoped models/search API instead — it reflects per-account
+        // availability and sees new models without a models.dev refresh.
+        "cloudflare" => FreeModelDiscovery::CloudflareModels,
+        "cohere" => FreeModelDiscovery::CohereModels,
+        // github-copilot intentionally stays on the catch-all None here: the
+        // CopilotProvider fetches its own /models list internally (with a
+        // hardcoded fallback), so it needs no separate discovery probe.
         _ => FreeModelDiscovery::None,
     }
 }
@@ -165,6 +190,14 @@ fn run_live_discovery_uncached(
         FreeModelDiscovery::GeminiModels => {
             let key = first_upstream_key(auth_store, "google")?;
             fetch_gemini_models(&key)
+        }
+        FreeModelDiscovery::CloudflareModels => {
+            let key = first_upstream_key(auth_store, "cloudflare")?;
+            fetch_cloudflare_available_model(&key)
+        }
+        FreeModelDiscovery::CohereModels => {
+            let key = first_upstream_key(auth_store, "cohere")?;
+            fetch_cohere_model_list(&key)
         }
         FreeModelDiscovery::None => None,
     }
@@ -354,6 +387,88 @@ mod tests {
         });
         assert_eq!(select_opencode_zen_free_models(&payload), None);
     }
+
+    #[test]
+    fn cloudflare_discovery_extracts_cf_models_and_prefers_text_generation() {
+        let payload = serde_json::json!({
+            "success": true,
+            "result": [
+                {"name": "@cf/baai/bge-m3", "task": {"name": "Text Embeddings"}},
+                {"name": "@cf/qwen/qwen3-30b-a3b-fp8", "task": {"name": "Text Generation"}},
+                {"name": "@cf/openai/gpt-oss-120b", "task": {"name": "Text Generation"}},
+                {"name": "not-a-cf-model", "task": {"name": "Text Generation"}}
+            ]
+        });
+        assert_eq!(
+            collect_cloudflare_available_models(&payload),
+            vec![
+                "@cf/qwen/qwen3-30b-a3b-fp8",
+                "@cf/openai/gpt-oss-120b",
+                "@cf/baai/bge-m3",
+            ]
+        );
+    }
+
+    #[test]
+    fn cloudflare_discovery_returns_empty_for_invalid_payload() {
+        assert!(collect_cloudflare_available_models(&serde_json::json!({})).is_empty());
+        assert!(
+            collect_cloudflare_available_models(&serde_json::json!({ "result": "nope" }))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cohere_discovery_extracts_model_names() {
+        let payload = serde_json::json!({
+            "models": [
+                {"name": "north-mini-code-1-0"},
+                {"name": "command-r-plus", "context_length": 128000}
+            ]
+        });
+        assert_eq!(
+            collect_cohere_model_ids(&payload),
+            vec!["north-mini-code-1-0", "command-r-plus"]
+        );
+        assert!(collect_cohere_model_ids(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn select_available_model_prefers_modelsdev_pick() {
+        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
+        let auto = HashMap::from([(
+            "cloudflare".to_string(),
+            "@cf/qwen/qwen3-30b-a3b-fp8".to_string(),
+        )]);
+        assert_eq!(
+            select_available_model("cloudflare", &available, &auto).as_deref(),
+            Some("@cf/qwen/qwen3-30b-a3b-fp8")
+        );
+    }
+
+    #[test]
+    fn select_available_model_prefers_catalog_default_when_modelsdev_pick_absent() {
+        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
+        let auto = HashMap::from([("cloudflare".to_string(), "some-other-model".to_string())]);
+        // models.dev pick is not on the live list → catalog default wins.
+        assert_eq!(
+            select_available_model("cloudflare", &available, &auto).as_deref(),
+            Some("@cf/qwen/qwen3-30b-a3b-fp8")
+        );
+    }
+
+    #[test]
+    fn select_available_model_falls_back_to_first() {
+        let available: Vec<&str> = vec!["m1", "m2"];
+        assert_eq!(
+            select_available_model("cloudflare", &available, &HashMap::new()).as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            select_available_model("cloudflare", &[], &HashMap::new()),
+            None
+        );
+    }
 }
 
 /// Fetch OpenRouter's current free models from their models API.
@@ -537,8 +652,26 @@ pub fn fetch_openai_compat_model_list(
         return None;
     }
 
-    // Try to find the models.dev-recommended free model in the available list.
-    let auto_detected = fetch_best_free_models_from_modelsdev();
+    select_available_model(
+        upstream_id,
+        &available,
+        fetch_best_free_models_from_modelsdev(),
+    )
+}
+
+/// Shared selection rule for live model lists: prefer the models.dev
+/// auto-detected pick when the live list confirms it is actually available,
+/// then the catalog's `default_model`, then the first available ID.
+///
+/// Kept pure (no network) so every discovery path — OpenAI-compat, Cohere,
+/// Cloudflare — uses one unit-testable precedence.
+fn select_available_model(
+    upstream_id: &str,
+    available: &[&str],
+    auto_detected: &HashMap<String, String>,
+) -> Option<String> {
+    // Prefer the models.dev-recommended free model when the live list
+    // confirms it is actually available.
     if let Some(recommended) = auto_detected.get(upstream_id) {
         if available.contains(&recommended.as_str()) {
             tracing::info!(
@@ -549,7 +682,6 @@ pub fn fetch_openai_compat_model_list(
             return Some(recommended.clone());
         }
     }
-
     // Fallback: prefer the catalog's default_model when it's available.
     if let Some(entry) = crate::providers::free::catalog_entry(upstream_id) {
         if available.contains(&entry.default_model) {
@@ -561,9 +693,8 @@ pub fn fetch_openai_compat_model_list(
             return Some(entry.default_model.to_string());
         }
     }
-
     // Last resort: return the first available model.
-    let first = available[0].to_string();
+    let first = available.first()?.to_string();
     tracing::info!(
         "{} live model list returned first model: {} ({} available)",
         upstream_id,
@@ -571,6 +702,143 @@ pub fn fetch_openai_compat_model_list(
         available.len(),
     );
     Some(first)
+}
+
+/// Fetch the best Cloudflare Workers AI model available to this account.
+///
+/// Cloudflare's OpenAI-compatible `/ai/v1/models` route does not support GET
+/// (405), so this probes the account-scoped catalog instead:
+/// `GET /accounts/{ACCOUNT_ID}/ai/models/search` authenticated with the
+/// composite `ACCOUNT_ID:API_TOKEN` credential. The response's `result[].name`
+/// carries the request-time model IDs (`@cf/qwen/qwen3-30b-a3b-fp8`). Because
+/// the endpoint is account-scoped, it also catches models that models.dev
+/// marks free but this account cannot actually serve.
+///
+/// Returns `None` (→ catalog default) when the account ID is unknown, the
+/// request fails, or the account exposes no `@cf/` models.
+pub fn fetch_cloudflare_available_model(cloudflare_key: &str) -> Option<String> {
+    // Composite `ACCOUNT_ID:API_TOKEN` key; fall back to the dedicated env
+    // vars when the key has no separator (mirrors `cloudflare_with_key`).
+    let (account, token) = match cloudflare_parts(cloudflare_key) {
+        Some((a, t)) => (a.to_string(), t.to_string()),
+        None => {
+            let account = std::env::var("CLOUDFLARE_ACCOUNT_ID").unwrap_or_default();
+            if account.is_empty() {
+                // Unlike cloudflare_with_key (which builds a provider with an
+                // empty account and fails only at request time), fail fast
+                // here: discovery is optional and the catalog default applies.
+                tracing::warn!(
+                    "fetch_cloudflare_available_model: key is not ACCOUNT_ID:API_TOKEN and \
+                     CLOUDFLARE_ACCOUNT_ID is unset"
+                );
+                return None;
+            }
+            (account, cloudflare_key.to_string())
+        }
+    };
+
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/ai/models/search?per_page=100",
+        account
+    );
+    let payload = blocking_get_json(
+        url,
+        Some(token),
+        &[],
+        "fetch_cloudflare_available_model".to_string(),
+    )?;
+    let available = collect_cloudflare_available_models(&payload);
+    if available.is_empty() {
+        tracing::warn!("fetch_cloudflare_available_model: no @cf/ models in response");
+        return None;
+    }
+    select_available_model(
+        "cloudflare",
+        &available,
+        fetch_best_free_models_from_modelsdev(),
+    )
+}
+
+/// Extract available Cloudflare model IDs from an `/ai/models/search` payload.
+///
+/// The search response lists models as objects whose `name` carries the
+/// request-time model ID (`@cf/...`) and whose `task.name` distinguishes
+/// text-generation LLMs from embeddings/classifiers. Text-generation models
+/// are returned first so the first-available fallback prefers an LLM.
+fn collect_cloudflare_available_models(payload: &serde_json::Value) -> Vec<&str> {
+    let Some(models) = payload.get("result").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let is_text_generation = |model: &serde_json::Value| {
+        model
+            .get("task")
+            .and_then(|t| t.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|name| name.eq_ignore_ascii_case("Text Generation"))
+            .unwrap_or(false)
+    };
+    let mut text_generation: Vec<&str> = Vec::new();
+    let mut other: Vec<&str> = Vec::new();
+    for model in models {
+        let Some(id) = model.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if !id.starts_with("@cf/") {
+            continue;
+        }
+        if is_text_generation(model) {
+            text_generation.push(id);
+        } else {
+            other.push(id);
+        }
+    }
+    text_generation.extend(other);
+    text_generation
+}
+
+/// Fetch Cohere's current model list from their models API.
+///
+/// Cohere's API at `https://api.cohere.com/v1/models` returns a top-level
+/// `models` array (not OpenAI's `data` shape), with each entry's model ID in
+/// `name`. Selection mirrors the OpenAI-compat path: models.dev pick →
+/// catalog default → first available.
+pub fn fetch_cohere_model_list(api_key: &str) -> Option<String> {
+    let payload = blocking_get_json(
+        "https://api.cohere.com/v1/models".to_string(),
+        Some(api_key.to_string()),
+        &[],
+        "fetch_cohere_model_list".to_string(),
+    )?;
+    let mut available = collect_cohere_model_ids(&payload);
+    if available.is_empty() {
+        tracing::warn!("fetch_cohere_model_list: no models in response");
+        return None;
+    }
+    // Cohere's list mixes free and paid models in one response. Keep catalog-
+    // family models (e.g. `north-mini-code`) first so the first-available
+    // fallback prefers the free coding family when the models.dev pick and
+    // catalog default are both absent.
+    if let Some(family) = crate::providers::free::catalog_entry("cohere").map(|e| e.model_family) {
+        available.sort_by_key(|id| !id.starts_with(family));
+    }
+    select_available_model(
+        "cohere",
+        &available,
+        fetch_best_free_models_from_modelsdev(),
+    )
+}
+
+/// Extract model IDs from a Cohere `/v1/models` payload (`models[].name`).
+fn collect_cohere_model_ids(payload: &serde_json::Value) -> Vec<&str> {
+    payload
+        .get("models")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fetch Google Gemini's current available models from their models API.
