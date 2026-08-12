@@ -123,6 +123,16 @@ fn live_discovery_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     LIVE_DISCOVERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Clear the in-process live-discovery cache so the next chain build re-probes
+/// every configured upstream (used by `clawde --refresh-models`).
+pub(crate) fn clear_live_discovery_cache() {
+    if let Some(cache) = LIVE_DISCOVERY_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.clear();
+        }
+    }
+}
+
 /// Run live discovery for the first entry whose ID matches `upstream_id`.
 /// Returns the discovered model ID, or `None` if discovery is not configured
 /// or the fetch fails.

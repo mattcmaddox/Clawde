@@ -708,6 +708,33 @@ fn save_live_discovery_cache(upstream_id: &str, model: Option<String>) {
     write_private_json_locked(&path, Some(&json), false, false);
 }
 
+/// Force the free chain's live discovery to re-probe on the next build.
+///
+/// Clears the in-process per-upstream discovery cache and expires the
+/// persisted `live-discovery.json` / `modelsdev-defaults.json` caches so the
+/// next chain build re-runs every upstream probe instead of serving results
+/// inside the 24-hour cache window. The lossless models.dev registry snapshot
+/// is intentionally untouched — `clawde models --refresh` covers that layer.
+/// Exposed for `clawde --refresh-models`.
+///
+/// Note: the in-process models.dev defaults (`AUTO_DETECTED_DEFAULTS` OnceLock
+/// in modelsdev.rs) are only reset by a fresh process, so deleting
+/// `modelsdev-defaults.json` only takes effect for a new process. Callers that
+/// have already fetched models.dev defaults in-process should rely on the next
+/// process (or call before the first fetch, as the CLI does).
+pub fn force_refresh_discovery_caches() {
+    discovery::clear_live_discovery_cache();
+    for name in ["live-discovery.json", "modelsdev-defaults.json"] {
+        let path = free_state_dir().join(name);
+        if path.exists() {
+            match std::fs::remove_file(&path) {
+                Ok(_) => tracing::info!("force-refreshed free discovery cache: {name}"),
+                Err(err) => tracing::warn!("failed to remove {}: {err}", path.display()),
+            }
+        }
+    }
+}
+
 /// Routing configuration for a [`FreeProvider`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
@@ -2326,6 +2353,34 @@ mod cache_tests {
             reason.starts_with("groq: [groq] Rate limited"),
             "got: {reason}"
         );
+    }
+
+    /// `--refresh-models` semantics: force_refresh_discovery_caches() expires
+    /// both persisted free-chain discovery caches (24h TTL) so the next chain
+    /// build re-probes every configured upstream.
+    #[test]
+    fn force_refresh_discovery_caches_expires_persisted_caches() {
+        let _home = TestHome::new();
+        let state_dir = free_state_dir();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // Seed both cache files with future-fresh timestamps.
+        std::fs::write(
+            state_dir.join("live-discovery.json"),
+            r#"{"saved_at_unix": 9999999999, "models": {"cloudflare": "@cf/qwen/qwen3-30b-a3b-fp8"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            state_dir.join("modelsdev-defaults.json"),
+            r#"{"saved_at_unix": 9999999999, "defaults": {"groq": "gpt-oss-120b"}}"#,
+        )
+        .unwrap();
+        assert!(state_dir.join("live-discovery.json").exists());
+        assert!(state_dir.join("modelsdev-defaults.json").exists());
+
+        force_refresh_discovery_caches();
+
+        assert!(!state_dir.join("live-discovery.json").exists());
+        assert!(!state_dir.join("modelsdev-defaults.json").exists());
     }
 
     /// The per-upstream last failure reason persists to the telemetry file and

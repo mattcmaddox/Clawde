@@ -301,6 +301,11 @@ struct Cli {
     /// store failed to load). For CI and shell scripts.
     #[arg(long = "check-keys", action = clap::ArgAction::SetTrue)]
     check_keys: bool,
+
+    /// Expire the free-mode live-discovery caches so every configured upstream
+    /// is re-probed on this run (bypasses the 24-hour discovery cache).
+    #[arg(long = "refresh-models", action = clap::ArgAction::SetTrue)]
+    refresh_models: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -712,6 +717,14 @@ async fn main() -> anyhow::Result<()> {
     // --list-models fast path: print all models and exit
     if cli.list_models {
         return run_models_command(&[]).await;
+    }
+
+    // --refresh-models: expire the free-chain live-discovery caches so the
+    // provider build re-probes each configured upstream on this run instead of
+    // serving the 24-hour cached model picks. The lossless models.dev registry
+    // snapshot is untouched (`clawde models --refresh` covers that layer).
+    if cli.refresh_models {
+        clawde_api::providers::free::force_refresh_discovery_caches();
     }
 
     // --dump-system-prompt fast path
