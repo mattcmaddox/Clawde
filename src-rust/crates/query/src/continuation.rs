@@ -601,6 +601,10 @@ impl SemanticVerifyPolicy {
 pub struct SemanticAfterVerifyPolicy {
     deterministic: crate::verify::VerifyPolicy,
     semantic: SemanticVerifyPolicy,
+    /// Deferred gate policy: when true, a turn whose deterministic gate found
+    /// no test/lint commands still runs the read-only semantic verifier as a
+    /// bounded review signal. The verdict cannot authorize acceptance.
+    semantic_only_when_no_lowlevel_tests: bool,
 }
 
 impl SemanticAfterVerifyPolicy {
@@ -610,6 +614,8 @@ impl SemanticAfterVerifyPolicy {
         runner: Option<SemanticVerifyRunner>,
         fix_runner: Option<SemanticFixRunner>,
     ) -> Self {
+        let semantic_only_when_no_lowlevel_tests =
+            verify_config.semantic_only_when_no_lowlevel_tests;
         Self {
             deterministic: crate::verify::VerifyPolicy::new(
                 verify_config.clone(),
@@ -621,6 +627,7 @@ impl SemanticAfterVerifyPolicy {
                 verify_config.semantic_max_attempts,
                 verify_config.semantic_fix_max_attempts,
             ),
+            semantic_only_when_no_lowlevel_tests,
         }
     }
 
@@ -727,14 +734,30 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
             if deterministic.is_continue() {
                 return deterministic;
             }
-            let deterministic_verdict = self
-                .deterministic
-                .verify_report()
-                .map(|report| report.verdict);
+            let report = self.deterministic.verify_report();
+            let deterministic_verdict = report.as_ref().map(|report| report.verdict);
+            let no_checks_detected = matches!(
+                deterministic_verdict,
+                Some(crate::verify::VerifyVerdict::Escalate)
+            ) && report
+                .as_ref()
+                .is_some_and(|report| report.results.is_empty() && !report.unavailable);
             if !matches!(
                 deterministic_verdict,
                 Some(crate::verify::VerifyVerdict::Pass)
             ) {
+                // Deferred gate policy (`semantic_only_when_no_lowlevel_tests`):
+                // when no deterministic test/lint commands were detected, the
+                // read-only semantic verifier may still run as a bounded
+                // review signal. Its verdict cannot authorize acceptance or
+                // automatic completion — a model verdict is not an executable
+                // grader — so the deterministic Stop is preserved and the
+                // report is surfaced as evidence only (never a synthetic
+                // pass). Other Escalate cases (checks failed, commands
+                // missing, sandbox unavailable) stay fail-closed.
+                if self.semantic_only_when_no_lowlevel_tests && no_checks_detected {
+                    let _ = self.semantic.decide_async(ctx).await;
+                }
                 return deterministic;
             }
 
@@ -1267,6 +1290,170 @@ mod tests {
         );
         let decision = policy.decide_async(&ctx()).await;
         assert!(!decision.is_continue());
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_runs_when_no_checks_detected_and_flag_enabled() {
+        // A plain directory with no project manifest detects no test/lint
+        // commands, reproducing the deferred `semantic_only_when_no_lowlevel_tests`
+        // gate case (deterministic Escalate, empty results).
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            called_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        // The model verdict cannot authorize acceptance: the turn still stops
+        // on the deterministic Escalate, never a synthetic pass or Continue.
+        assert!(!decision.is_continue());
+        assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+        // The read-only review signal is surfaced via the semantic report.
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_fixable_never_authorizes_continuation() {
+        // The load-bearing fail-closed guarantee: a `fixable` verdict must not
+        // continue the loop or invoke the fixer in the no-gate review-signal
+        // path. Only the report surfaces.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Ok(r#"{"verdict":"fixable","summary":"needs work","findings":["x"]}"#.to_string())
+            })
+        });
+        let fixer_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_calls_clone = fixer_calls.clone();
+        let fixer: SemanticFixRunner = std::sync::Arc::new(move |_| {
+            fixer_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("must not run".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            fixer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the no-gate review signal must never invoke the fixer"
+        );
+        let report = policy.semantic_report().expect("fixable signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Fixable);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_skipped_when_flag_disabled() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            called_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"must not run"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(policy.semantic_report().is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_still_closed_on_deterministic_failure() {
+        if !cargo_available() {
+            return;
+        }
+        let project = tempfile::tempdir().expect("temporary project");
+        write_cargo_semantic_fixture(project.path(), "#[test]\nfn fails() { assert!(false); }\n");
+        let changed = project.path().join("src/lib.rs");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = called.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            called_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"must not run"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            auto_lint: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n+assert!(false);\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        // A failing executable check routes to the deterministic auto-fix path
+        // (Continue), never the semantic verifier, even with the gate open.
+        assert!(decision.is_continue());
         assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
     }
 

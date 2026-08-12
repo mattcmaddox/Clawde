@@ -1629,6 +1629,18 @@ pub mod config {
         /// Maximum fresh patch-author retries for one fixable verdict.
         #[serde(default = "default_semantic_fix_max_attempts")]
         pub semantic_fix_max_attempts: u32,
+        /// Open the read-only semantic review tier when no deterministic
+        /// test/lint commands are detected (fail-closed by default). When
+        /// true, a turn whose deterministic gate reports "No test or lint
+        /// commands detected" still runs the read-only semantic verifier as a
+        /// bounded review signal. The semantic verdict cannot authorize
+        /// acceptance or automatic completion — the turn remains a
+        /// deterministic `Stop` and the report is surfaced as evidence only,
+        /// never as a synthetic pass. See the deferred
+        /// `semantic_only_when_no_lowlevel_tests` gate policy in
+        /// `blueprint/writer-verifier-gap.md`.
+        #[serde(default)]
+        pub semantic_only_when_no_lowlevel_tests: bool,
     }
 
     pub const DEFAULT_SEMANTIC_MODEL: &str = "free/auto";
@@ -1678,6 +1690,7 @@ pub mod config {
                 semantic_fix_max_turns: DEFAULT_SEMANTIC_FIX_MAX_TURNS,
                 semantic_max_attempts: DEFAULT_SEMANTIC_MAX_ATTEMPTS,
                 semantic_fix_max_attempts: DEFAULT_SEMANTIC_FIX_MAX_ATTEMPTS,
+                semantic_only_when_no_lowlevel_tests: false,
             }
         }
     }
@@ -5820,6 +5833,24 @@ mod tests {
     fn test_hooks_config_default() {
         let cfg = crate::config::Config::default();
         assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn verify_config_semantic_only_when_no_lowlevel_tests_roundtrip() {
+        let default = crate::config::VerifyConfig::default();
+        assert!(
+            !default.semantic_only_when_no_lowlevel_tests,
+            "the no-lowlevel-tests gate must stay fail-closed by default"
+        );
+        let parsed: crate::config::VerifyConfig =
+            serde_json::from_str(r#"{"semantic_only_when_no_lowlevel_tests": true}"#)
+                .expect("parse verify config");
+        assert!(parsed.semantic_only_when_no_lowlevel_tests);
+        let json = serde_json::to_string(&parsed).expect("serialize verify config");
+        assert!(
+            json.contains("semantic_only_when_no_lowlevel_tests"),
+            "round-trip must preserve the gate key: {json}"
+        );
     }
 
     /// The bypass-permissions acceptance and always-allow bash prefixes must
