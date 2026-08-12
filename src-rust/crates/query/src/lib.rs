@@ -790,6 +790,15 @@ pub async fn run_query_loop(
                         let _ = tx.send(QueryEvent::SemanticVerify(report));
                     }
                 }
+                // Surface a declined gate-open review signal (skip / runner
+                // error / parse failure) as a status event rather than
+                // discarding it, so the external harness can prove *why* the
+                // semantic verifier did not fire on a gate-eligible turn.
+                if let Some(note) = continuation_policy.semantic_note() {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(note));
+                    }
+                }
                 // Spec-driven development (audit spec §10.2): when the
                 // spec-mode policy decided the stop because a spec was
                 // generated, forward its path so the TUI can auto-open the

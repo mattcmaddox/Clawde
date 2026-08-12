@@ -665,6 +665,10 @@ pub struct SemanticAfterVerifyPolicy {
     /// no test/lint commands still runs the read-only semantic verifier as a
     /// bounded review signal. The verdict cannot authorize acceptance.
     semantic_only_when_no_lowlevel_tests: bool,
+    /// Reason the gate-open review signal declined this turn (skip / runner
+    /// error / parse failure). Captured so the discarded decision stays
+    /// observable as a status event; `None` while no decline is pending.
+    semantic_note: std::sync::Mutex<Option<String>>,
 }
 
 impl SemanticAfterVerifyPolicy {
@@ -688,6 +692,7 @@ impl SemanticAfterVerifyPolicy {
                 verify_config.semantic_fix_max_attempts,
             ),
             semantic_only_when_no_lowlevel_tests,
+            semantic_note: std::sync::Mutex::new(None),
         }
     }
 
@@ -770,6 +775,10 @@ impl ContinuationPolicy for GoalSemanticVerifyPolicy {
         self.semantic.semantic_report()
     }
 
+    fn semantic_note(&self) -> Option<String> {
+        self.semantic.semantic_note()
+    }
+
     fn will_run_checks(&self, ctx: &TurnEndContext<'_>) -> bool {
         self.semantic.will_run_checks(ctx)
     }
@@ -790,6 +799,7 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
             // semantic pass must never authorize the goal after this round
             // exits early due to a failed or unavailable deterministic gate.
             self.semantic.last_report.lock().unwrap().take();
+            *self.semantic_note.lock().unwrap() = None;
             let deterministic = self.deterministic.decide(ctx);
             if deterministic.is_continue() {
                 return deterministic;
@@ -816,7 +826,17 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
                 // pass). Other Escalate cases (checks failed, commands
                 // missing, sandbox unavailable) stay fail-closed.
                 if self.semantic_only_when_no_lowlevel_tests && no_checks_detected {
-                    let _ = self.semantic.decide_async(ctx).await;
+                    let decision = self.semantic.decide_async(ctx).await;
+                    // The review signal is evidence-only, so its decision is
+                    // discarded — but a decline (skip / runner error / parse
+                    // failure) must stay observable. Capture the stop note when
+                    // the verifier produced no report; a real verdict already
+                    // surfaces through `semantic_report`.
+                    if let ContinuationDecision::Stop { note: Some(note) } = decision {
+                        if self.semantic.last_report().is_none() {
+                            *self.semantic_note.lock().unwrap() = Some(note);
+                        }
+                    }
                 }
                 return deterministic;
             }
@@ -928,6 +948,10 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
         self.semantic.semantic_report()
     }
 
+    fn semantic_note(&self) -> Option<String> {
+        self.semantic_note.lock().unwrap().take()
+    }
+
     fn will_run_checks(&self, ctx: &TurnEndContext<'_>) -> bool {
         self.deterministic.will_run_checks(ctx)
     }
@@ -1022,6 +1046,15 @@ pub trait ContinuationPolicy: Send + Sync {
 
     /// Structured result of the most recent semantic verifier round.
     fn semantic_report(&self) -> Option<SemanticVerifyReport> {
+        None
+    }
+
+    /// Reason the read-only semantic verifier declined to produce a verdict
+    /// for the most recent turn (skipped / runner error / parse failure),
+    /// surfaced as a status event so a gate-open review signal that silently
+    /// declined stays observable. Default: `None` — only the execute-and-
+    /// verify policies override this.
+    fn semantic_note(&self) -> Option<String> {
         None
     }
 
@@ -1443,6 +1476,112 @@ mod tests {
         );
         let report = policy.semantic_report().expect("fixable signal surfaced");
         assert_eq!(report.verdict, SemanticVerdict::Fixable);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_surfaces_decline_reason() {
+        // A free model returning prose with no JSON object → parse failure.
+        // The gate-open review signal is evidence-only, but the decline reason
+        // must still be observable instead of silently discarded.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async { Ok("sorry, I cannot produce JSON right now".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert!(policy.semantic_report().is_none());
+        let note = policy.semantic_note().expect("decline reason surfaced");
+        assert!(note.contains("malformed JSON"), "note was: {note}");
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_surfaces_skip_reason() {
+        // No scoped diff at all → request_from_context declines with a skip
+        // note, which must also be surfaced.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"must not run"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: None,
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        let note = policy.semantic_note().expect("skip reason surfaced");
+        assert!(
+            note.contains("no non-empty scoped diff"),
+            "note was: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_clears_note_on_success() {
+        // A successful verdict must not leave a stale decline note behind.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert!(policy.semantic_report().is_some());
+        assert!(
+            policy.semantic_note().is_none(),
+            "a successful verdict must not leave a decline note"
+        );
     }
 
     #[tokio::test]
