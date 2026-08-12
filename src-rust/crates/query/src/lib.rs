@@ -503,6 +503,28 @@ fn effective_output_style_for_turn(
     (config.output_style, config.output_style_prompt.clone())
 }
 
+/// Materialize the bounded turn-change context from the shadow snapshot.
+///
+/// Returns the unified diff (`String`) and the patch metadata together, or
+/// `(None, None)` when there is no snapshot baseline or no files changed.
+/// The two are always produced as a pair so that a writing turn which carries
+/// `snapshot_patch` also carries a non-empty scoped diff for the semantic
+/// verifier (G6): the verifier's `request_from_context` declines a turn with
+/// no diff, so materializing the patch alone would silently skip verification.
+async fn materialize_turn_changes(
+    shadow_snap: &Option<Arc<clawde_core::snapshot::ShadowSnapshot>>,
+    turn_snapshot: &Option<String>,
+) -> (Option<String>, Option<clawde_core::snapshot::Patch>) {
+    let (Some(snap), Some(hash)) = (shadow_snap.as_ref(), turn_snapshot.as_ref()) else {
+        return (None, None);
+    };
+    let patch = snap.patch(hash).await;
+    if patch.files.is_empty() {
+        return (None, None);
+    }
+    (Some(snap.diff(hash).await), Some(patch))
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1785,13 +1807,14 @@ pub async fn run_query_loop(
                             }),
                         });
                     }
-                    // Attach snapshot patch covering all file changes this query.
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
-                        let patch = snap.patch(hash).await;
-                        if !patch.files.is_empty() {
-                            turn_diff = Some(snap.diff(hash).await);
-                            assistant_msg.snapshot_patch = Some(patch);
-                        }
+                    // Attach snapshot patch + bounded diff covering all file
+                    // changes this query (G6: materialized together so every
+                    // writing turn carries a scoped diff for the verifier).
+                    let (turn_change_diff, turn_change_patch) =
+                        materialize_turn_changes(&shadow_snap, &turn_snapshot).await;
+                    if let Some(patch) = turn_change_patch {
+                        turn_diff = turn_change_diff;
+                        assistant_msg.snapshot_patch = Some(patch);
                     }
 
                     continue_or_end!(assistant_msg, usage);
@@ -2344,13 +2367,14 @@ pub async fn run_query_loop(
                         }
                     }
 
-                    // Attach snapshot patch covering all file changes this query.
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
-                        let patch = snap.patch(hash).await;
-                        if !patch.files.is_empty() {
-                            turn_diff = Some(snap.diff(hash).await);
-                            assistant_msg.snapshot_patch = Some(patch);
-                        }
+                    // Attach snapshot patch + bounded diff covering all file
+                    // changes this query (G6: materialized together so every
+                    // writing turn carries a scoped diff for the verifier).
+                    let (turn_change_diff, turn_change_patch) =
+                        materialize_turn_changes(&shadow_snap, &turn_snapshot).await;
+                    if let Some(patch) = turn_change_patch {
+                        turn_diff = turn_change_diff;
+                        assistant_msg.snapshot_patch = Some(patch);
                     }
 
                     continue_or_end!(assistant_msg, usage);
@@ -2602,11 +2626,11 @@ pub async fn run_query_loop(
                         &tool_ctx.config,
                         tool_ctx.working_dir.clone(),
                     );
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
-                        let patch = snap.patch(hash).await;
-                        if !patch.files.is_empty() {
-                            assistant_msg.snapshot_patch = Some(patch);
-                        }
+                    let (turn_change_diff, turn_change_patch) =
+                        materialize_turn_changes(&shadow_snap, &turn_snapshot).await;
+                    if let Some(patch) = turn_change_patch {
+                        turn_diff = turn_change_diff;
+                        assistant_msg.snapshot_patch = Some(patch);
                     }
                     continue_or_end!(assistant_msg, usage);
                 }
@@ -2621,11 +2645,11 @@ pub async fn run_query_loop(
                         &tool_ctx.config,
                         tool_ctx.working_dir.clone(),
                     );
-                    if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &turn_snapshot) {
-                        let patch = snap.patch(hash).await;
-                        if !patch.files.is_empty() {
-                            assistant_msg.snapshot_patch = Some(patch);
-                        }
+                    let (turn_change_diff, turn_change_patch) =
+                        materialize_turn_changes(&shadow_snap, &turn_snapshot).await;
+                    if let Some(patch) = turn_change_patch {
+                        turn_diff = turn_change_diff;
+                        assistant_msg.snapshot_patch = Some(patch);
                     }
                     continue_or_end!(assistant_msg, usage);
                 }
@@ -3649,6 +3673,68 @@ mod tests {
         assert_eq!(metrics.model, "mock-model");
         assert_eq!(metrics.retries, 0);
         assert!(!metrics.fallback_used);
+    }
+
+    /// G6: `materialize_turn_changes` returns the diff and the patch together,
+    /// so a writing turn carries a non-empty scoped diff for the semantic
+    /// verifier. The verifier declines turns without a diff, so a patch-only
+    /// materialization (the pre-fix `stop_sequence`/`other` behaviour) would
+    /// silently skip verification.
+    #[tokio::test]
+    async fn materialize_turn_changes_pairs_diff_with_patch() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::create_dir_all(fixture.path().join("src")).expect("fixture src");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            "pub fn value() -> u32 { 1 }\n",
+        )
+        .expect("fixture source");
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let data_root = tempfile::tempdir().expect("snapshot data root");
+        let snap =
+            clawde_core::snapshot::ShadowSnapshot::for_session_in(fixture.path(), data_root.path())
+                .expect("hermetic shadow snapshot");
+        let snap = Arc::new(snap);
+        let baseline = snap.track().await.expect("baseline tree hash");
+
+        // No changes yet: both must come back empty (nothing to verify).
+        let (diff, patch) =
+            materialize_turn_changes(&Some(snap.clone()), &Some(baseline.clone())).await;
+        assert!(diff.is_none(), "no change → no diff");
+        assert!(patch.is_none(), "no change → no patch");
+
+        std::fs::write(
+            fixture.path().join("src/generated.rs"),
+            "pub fn g() -> u32 { 2 }\n",
+        )
+        .expect("generated source");
+
+        let (diff, patch) = materialize_turn_changes(&Some(snap.clone()), &Some(baseline)).await;
+        let patch = patch.expect("writing turn must produce patch metadata");
+        assert!(!patch.files.is_empty(), "patch must list the changed file");
+        let diff = diff.expect("writing turn must produce a scoped diff");
+        assert!(
+            diff.contains("generated.rs"),
+            "diff must name the changed file: {diff}"
+        );
+        assert!(
+            diff.contains("pub fn g()"),
+            "diff must include the added content: {diff}"
+        );
     }
 
     async fn drive_loop_with_mock(
