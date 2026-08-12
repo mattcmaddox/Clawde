@@ -728,6 +728,10 @@ pub struct SemanticAfterVerifyPolicy {
     /// no test/lint commands still runs the read-only semantic verifier as a
     /// bounded review signal. The verdict cannot authorize acceptance.
     semantic_only_when_no_lowlevel_tests: bool,
+    /// When the no-checks review signal fires, route a `fixable` verdict to
+    /// the bounded G5 fresh-executor fixer and re-verify. The deterministic
+    /// `Stop` remains authoritative (fail-closed).
+    semantic_fix_when_no_lowlevel_tests: bool,
     /// Reason the gate-open review signal declined this turn (skip / runner
     /// error / parse failure). Captured so the discarded decision stays
     /// observable as a status event; `None` while no decline is pending.
@@ -743,6 +747,7 @@ impl SemanticAfterVerifyPolicy {
     ) -> Self {
         let semantic_only_when_no_lowlevel_tests =
             verify_config.semantic_only_when_no_lowlevel_tests;
+        let semantic_fix_when_no_lowlevel_tests = verify_config.semantic_fix_when_no_lowlevel_tests;
         Self {
             deterministic: crate::verify::VerifyPolicy::new(
                 verify_config.clone(),
@@ -755,6 +760,7 @@ impl SemanticAfterVerifyPolicy {
                 verify_config.semantic_fix_max_attempts,
             ),
             semantic_only_when_no_lowlevel_tests,
+            semantic_fix_when_no_lowlevel_tests,
             semantic_note: std::sync::Mutex::new(None),
         }
     }
@@ -763,6 +769,102 @@ impl SemanticAfterVerifyPolicy {
     /// available rather than the legacy same-context `Continue`.
     pub fn has_fixer(&self) -> bool {
         self.semantic.has_fixer()
+    }
+
+    /// Run the semantic review + fresh-executor fix loop to a terminal decision.
+    ///
+    /// Shared by the deterministic-pass path and the actionable no-checks
+    /// review-signal path. Each `fixable` verdict spawns a bounded
+    /// fresh-executor patch author, then re-runs the deterministic gate and
+    /// semantic review on the new state. Only a terminal decision (pass /
+    /// replan / escalate / exhausted) is returned; the caller decides whether
+    /// that decision can authorize continuation.
+    async fn semantic_fix_loop<'a>(&'a self, ctx: &'a TurnEndContext<'a>) -> ContinuationDecision {
+        loop {
+            let decision = self.semantic.decide_async(ctx).await;
+            match decision {
+                // pass / replan / escalate / runner-error → terminal.
+                ContinuationDecision::Stop { .. } => return decision,
+                ContinuationDecision::Continue { message } => {
+                    if !self.semantic.has_fixer() {
+                        // No fresh-executor fixer configured: fall back to the
+                        // legacy same-context Continue (the loop pushes the
+                        // fix request into the existing trace).
+                        return ContinuationDecision::Continue { message };
+                    }
+                    // Build the fresh-executor request from the verdict report
+                    // (summary + findings) + scoped context. The semantic
+                    // policy's own attempt counter bounds the number of
+                    // fix-and-reverify rounds; the local counter below
+                    // independently bounds retries within this one verdict.
+                    let Some(report) = self.semantic.last_report() else {
+                        return ContinuationDecision::Stop {
+                            note: Some(
+                                "Semantic verification lost its verdict before the fixer \
+                                 could act; stopping."
+                                    .to_string(),
+                            ),
+                        };
+                    };
+                    let Some(patch) = ctx.changed_files else {
+                        return ContinuationDecision::Stop {
+                            note: Some(
+                                "Semantic verification lost the changed-file scope; stopping."
+                                    .to_string(),
+                            ),
+                        };
+                    };
+                    let fix_request = SemanticFixRequest {
+                        session_id: ctx.session_id.to_string(),
+                        working_dir: ctx.working_dir.to_path_buf(),
+                        changed_files: patch.files.clone(),
+                        tree_hash: patch.hash.clone(),
+                        diff: bound_semantic_diff(ctx.changed_diff.unwrap_or_default().to_string()),
+                        task_id: ctx.spec.as_ref().map(|spec| spec.task_id.clone()),
+                        spec: ctx.spec.clone(),
+                        summary: report.summary.clone(),
+                        findings: report.findings.clone(),
+                        feedback: None,
+                    };
+                    let mut feedback = None;
+                    let mut fix_attempts = 0;
+                    loop {
+                        fix_attempts += 1;
+                        let mut attempt = fix_request.clone();
+                        attempt.feedback = feedback.clone();
+                        match self.semantic.run_fixer(attempt).await {
+                            Ok(summary) => {
+                                // Fresh executor applied a fix on disk. Re-run
+                                // the deterministic gate on the new state; if
+                                // it regressed, stop — never silently accept.
+                                let after = self.deterministic.decide(ctx);
+                                if after.is_continue() {
+                                    return ContinuationDecision::Stop {
+                                        note: Some(format!(
+                                            "Fresh-executor fix did not pass the deterministic \
+                                             gate: {summary}"
+                                        )),
+                                    };
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                feedback = Some(bounded_fix_feedback(&error));
+                                if fix_attempts >= self.semantic.max_fix_attempts() {
+                                    return ContinuationDecision::Stop {
+                                        note: Some(format!(
+                                            "Fresh-executor fixer exhausted after {} bounded attempts: {}",
+                                            self.semantic.max_fix_attempts(),
+                                            bounded_fix_feedback(&error)
+                                        )),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn last_semantic_verdict(&self) -> Option<SemanticVerdict> {
@@ -889,15 +991,30 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
                 // pass). Other Escalate cases (checks failed, commands
                 // missing, sandbox unavailable) stay fail-closed.
                 if self.semantic_only_when_no_lowlevel_tests && no_checks_detected {
-                    let decision = self.semantic.decide_async(ctx).await;
-                    // The review signal is evidence-only, so its decision is
-                    // discarded — but a decline (skip / runner error / parse
-                    // failure) must stay observable. Capture the stop note when
-                    // the verifier produced no report; a real verdict already
-                    // surfaces through `semantic_report`.
-                    if let ContinuationDecision::Stop { note: Some(note) } = decision {
-                        if self.semantic.last_report().is_none() {
-                            *self.semantic_note.lock().unwrap() = Some(note);
+                    if self.semantic_fix_when_no_lowlevel_tests && self.semantic.has_fixer() {
+                        // Actionable review signal: run the review + fresh-executor
+                        // fix loop so a `fixable` verdict can change the on-disk
+                        // result. Acceptance stays deterministic-only: the loop's
+                        // terminal decision is discarded and the deterministic
+                        // `Stop` below stays authoritative. A decline (skip /
+                        // runner error / parse failure) is still captured.
+                        let fixed = self.semantic_fix_loop(ctx).await;
+                        if let ContinuationDecision::Stop { note: Some(note) } = fixed {
+                            if self.semantic.last_report().is_none() {
+                                *self.semantic_note.lock().unwrap() = Some(note);
+                            }
+                        }
+                    } else {
+                        // Read-only evidence: a single review whose verdict is
+                        // surfaced as a report but never authorizes acceptance.
+                        // A decline must stay observable instead of being
+                        // silently discarded; a real verdict already surfaces
+                        // through `semantic_report`.
+                        let decision = self.semantic.decide_async(ctx).await;
+                        if let ContinuationDecision::Stop { note: Some(note) } = decision {
+                            if self.semantic.last_report().is_none() {
+                                *self.semantic_note.lock().unwrap() = Some(note);
+                            }
                         }
                     }
                 }
@@ -906,100 +1023,10 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
 
             // Deterministic gate passed → semantic review. G5: a `fixable`
             // verdict must NOT be replayed into the same in-context trace
-            // (Trap 4). When a fresh-executor fixer is configured, run the
-            // fix-and-reverify loop entirely inside this policy: each round
-            // spawns a fresh patch-author executor with the verdict, then
-            // re-runs the deterministic gate + semantic review on the new
-            // state. Only a terminal decision (pass / escalate / replan /
-            // exhausted) is surfaced to the loop.
-            loop {
-                let decision = self.semantic.decide_async(ctx).await;
-                match decision {
-                    // pass / replan / escalate / runner-error → terminal.
-                    ContinuationDecision::Stop { .. } => return decision,
-                    ContinuationDecision::Continue { message } => {
-                        if !self.semantic.has_fixer() {
-                            // No fresh-executor fixer configured: fall back to
-                            // the legacy same-context Continue (documented
-                            // degraded mode; the loop pushes the fix request
-                            // into the existing trace).
-                            return ContinuationDecision::Continue { message };
-                        }
-                        // Build the fresh-executor request from the verdict
-                        // report (summary + findings) + scoped context. The
-                        // semantic policy's own attempt counter bounds the
-                        // number of fix-and-reverify rounds; this local counter
-                        // independently bounds retries within this one verdict.
-                        let Some(report) = self.semantic.last_report() else {
-                            return ContinuationDecision::Stop {
-                                note: Some(
-                                    "Semantic verification lost its verdict before the fixer \
-                                     could act; stopping."
-                                        .to_string(),
-                                ),
-                            };
-                        };
-                        let Some(patch) = ctx.changed_files else {
-                            return ContinuationDecision::Stop {
-                                note: Some(
-                                    "Semantic verification lost the changed-file scope; stopping."
-                                        .to_string(),
-                                ),
-                            };
-                        };
-                        let fix_request = SemanticFixRequest {
-                            session_id: ctx.session_id.to_string(),
-                            working_dir: ctx.working_dir.to_path_buf(),
-                            changed_files: patch.files.clone(),
-                            tree_hash: patch.hash.clone(),
-                            diff: bound_semantic_diff(
-                                ctx.changed_diff.unwrap_or_default().to_string(),
-                            ),
-                            task_id: ctx.spec.as_ref().map(|spec| spec.task_id.clone()),
-                            spec: ctx.spec.clone(),
-                            summary: report.summary.clone(),
-                            findings: report.findings.clone(),
-                            feedback: None,
-                        };
-                        let mut feedback = None;
-                        let mut fix_attempts = 0;
-                        loop {
-                            fix_attempts += 1;
-                            let mut attempt = fix_request.clone();
-                            attempt.feedback = feedback.clone();
-                            match self.semantic.run_fixer(attempt).await {
-                                Ok(summary) => {
-                                    // Fresh executor applied a fix on disk. Re-run
-                                    // the deterministic gate on the new state; if
-                                    // it regressed, stop — never silently accept.
-                                    let after = self.deterministic.decide(ctx);
-                                    if after.is_continue() {
-                                        return ContinuationDecision::Stop {
-                                            note: Some(format!(
-                                                "Fresh-executor fix did not pass the deterministic \
-                                                 gate: {summary}"
-                                            )),
-                                        };
-                                    }
-                                    break;
-                                }
-                                Err(error) => {
-                                    feedback = Some(bounded_fix_feedback(&error));
-                                    if fix_attempts >= self.semantic.max_fix_attempts() {
-                                        return ContinuationDecision::Stop {
-                                            note: Some(format!(
-                                                "Fresh-executor fixer exhausted after {} bounded attempts: {}",
-                                                self.semantic.max_fix_attempts(),
-                                                bounded_fix_feedback(&error)
-                                            )),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // (Trap 4). The fix-and-reverify loop spawns a fresh patch-author
+            // executor per round and re-runs the deterministic gate + semantic
+            // review on the new state; only a terminal decision is surfaced.
+            self.semantic_fix_loop(ctx).await
         })
     }
 
@@ -1539,6 +1566,77 @@ mod tests {
         );
         let report = policy.semantic_report().expect("fixable signal surfaced");
         assert_eq!(report.verdict, SemanticVerdict::Fixable);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_signal_fixable_runs_fixer_when_flag_enabled() {
+        // With `semantic_fix_when_no_lowlevel_tests`, a `fixable` review-signal
+        // verdict routes to the bounded fresh-executor fixer. Acceptance stays
+        // deterministic-only: the turn still stops on the deterministic
+        // Escalate even after the fixer runs and the re-review passes.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        // First review returns `fixable`; after the fixer runs, the re-review
+        // returns `pass` so the fix loop reaches a terminal decision.
+        let review_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let review_calls_clone = review_calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            let n = review_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(
+                        r#"{"verdict":"fixable","summary":"needs work","findings":["x"]}"#
+                            .to_string(),
+                    )
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"fixed"}"#.to_string())
+                }
+            })
+        });
+        let fixer_calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fixer_calls_clone = fixer_calls.clone();
+        let fixer: SemanticFixRunner = std::sync::Arc::new(move |_| {
+            fixer_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("patched".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            semantic_fix_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fixer),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(
+            !decision.is_continue(),
+            "the deterministic Stop stays authoritative after the actionable fix"
+        );
+        assert_eq!(
+            fixer_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a fixable review-signal verdict must route to the fixer exactly once"
+        );
+        assert_eq!(
+            review_calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the fix loop must re-verify after the fixer runs"
+        );
     }
 
     #[tokio::test]

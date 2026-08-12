@@ -1641,6 +1641,15 @@ pub mod config {
         /// `blueprint/writer-verifier-gap.md`.
         #[serde(default)]
         pub semantic_only_when_no_lowlevel_tests: bool,
+        /// When combined with `semantic_only_when_no_lowlevel_tests`, make the
+        /// no-checks review signal actionable: a `fixable` verdict routes to
+        /// the bounded G5 fresh-executor fixer and re-verifies, so the review
+        /// can change the on-disk result. Acceptance stays deterministic-only
+        /// — the turn still ends in the deterministic `Stop`, so a model
+        /// verdict can never authorize completion. Off by default: the
+        /// no-checks review signal is read-only unless this is also set.
+        #[serde(default)]
+        pub semantic_fix_when_no_lowlevel_tests: bool,
     }
 
     pub const DEFAULT_SEMANTIC_MODEL: &str = "free/auto";
@@ -1691,6 +1700,7 @@ pub mod config {
                 semantic_max_attempts: DEFAULT_SEMANTIC_MAX_ATTEMPTS,
                 semantic_fix_max_attempts: DEFAULT_SEMANTIC_FIX_MAX_ATTEMPTS,
                 semantic_only_when_no_lowlevel_tests: false,
+                semantic_fix_when_no_lowlevel_tests: false,
             }
         }
     }
@@ -5850,6 +5860,24 @@ mod tests {
         assert!(
             json.contains("semantic_only_when_no_lowlevel_tests"),
             "round-trip must preserve the gate key: {json}"
+        );
+    }
+
+    #[test]
+    fn verify_config_semantic_fix_when_no_lowlevel_tests_roundtrip() {
+        let default = crate::config::VerifyConfig::default();
+        assert!(
+            !default.semantic_fix_when_no_lowlevel_tests,
+            "the actionable no-lowlevel-tests fixer must stay read-only by default"
+        );
+        let parsed: crate::config::VerifyConfig =
+            serde_json::from_str(r#"{"semantic_fix_when_no_lowlevel_tests": true}"#)
+                .expect("parse verify config");
+        assert!(parsed.semantic_fix_when_no_lowlevel_tests);
+        let json = serde_json::to_string(&parsed).expect("serialize verify config");
+        assert!(
+            json.contains("semantic_fix_when_no_lowlevel_tests"),
+            "round-trip must preserve the fix gate key: {json}"
         );
     }
 
