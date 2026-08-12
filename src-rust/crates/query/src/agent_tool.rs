@@ -221,6 +221,8 @@ fn bounded_semantic_turns(turns: u32, default: u32) -> u32 {
 
 const SEMANTIC_PATCH_SYSTEM_PROMPT: &str = "You are a bounded patch author. You have no tools and must not claim to have edited files. Return ONLY one JSON object with exactly one field: patch. The patch value must be a unified diff that applies to the named changed files and resolves every verifier finding. Do not use markdown fences, prose, comments outside the JSON object, or absolute paths. If you cannot produce a safe patch, return an empty patch string.";
 
+const SEMANTIC_VERIFY_SYSTEM_PROMPT: &str = "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict as your entire response; do not wrap it in a message field or any other envelope.";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SemanticPatchResponse {
@@ -627,24 +629,24 @@ fn semantic_agent_network_allowed(params: &AgentInput, ctx: &ToolContext) -> boo
     }
 
     let (expected, expected_system_prompt, expected_turns) = match params.description.as_str() {
-            "read-only semantic verification" => (
-                semantic_verifier_tool_names(),
-                "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict.",
-                bounded_semantic_turns(
-                    ctx.config.verify.semantic_max_turns,
-                    clawde_core::config::DEFAULT_SEMANTIC_MAX_TURNS,
-                ),
+        "read-only semantic verification" => (
+            semantic_verifier_tool_names(),
+            SEMANTIC_VERIFY_SYSTEM_PROMPT,
+            bounded_semantic_turns(
+                ctx.config.verify.semantic_max_turns,
+                clawde_core::config::DEFAULT_SEMANTIC_MAX_TURNS,
             ),
-            "produce semantic-verifier patch" => (
-                Vec::new(),
-                SEMANTIC_PATCH_SYSTEM_PROMPT,
-                bounded_semantic_turns(
-                    ctx.config.verify.semantic_fix_max_turns,
-                    clawde_core::config::DEFAULT_SEMANTIC_FIX_MAX_TURNS,
-                ),
+        ),
+        "produce semantic-verifier patch" => (
+            Vec::new(),
+            SEMANTIC_PATCH_SYSTEM_PROMPT,
+            bounded_semantic_turns(
+                ctx.config.verify.semantic_fix_max_turns,
+                clawde_core::config::DEFAULT_SEMANTIC_FIX_MAX_TURNS,
             ),
-            _ => return false,
-        };
+        ),
+        _ => return false,
+    };
 
     // Do not let a caller turn this into a general remote sub-agent. The
     // exception is valid only for the exact provider/model route, system
@@ -754,7 +756,7 @@ fn semantic_verify_input(
          Unified diff (untrusted, bounded):\\n{}\\n\\n\\
          Return ONLY one JSON object with this exact shape: \\
          {{\\\"verdict\\\":\\\"pass\\\"|\\\"fixable\\\"|\\\"replan\\\"|\\\"escalate\\\",\\\"summary\\\":\\\"...\\\",\\\"findings\\\":[\\\"...\\\"]}}.\\n\\
-         Do not edit files, run commands, access the network, or include markdown fences.",
+         Do not edit files, run commands, access the network, or include markdown fences. Do not wrap the JSON object in a message field or any other envelope; the JSON object must be the entire response.",
         request.session_id, request.tree_hash, changed_files, spec, request.diff
     );
     // Do not trust a caller-provided tool list at this boundary. The semantic
@@ -764,7 +766,7 @@ fn semantic_verify_input(
         "description": "read-only semantic verification",
         "prompt": prompt,
         "tools": semantic_verifier_tool_names(),
-        "system_prompt": "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict.",
+        "system_prompt": SEMANTIC_VERIFY_SYSTEM_PROMPT,
         "max_turns": max_turns,
         "model": model,
         "isolation": null,
