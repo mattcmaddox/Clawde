@@ -3662,6 +3662,17 @@ impl App {
                 }
                 true
             }
+            "refresh-models" => {
+                // Expire the live-discovery caches (in-process + disk) and
+                // rebuild the free chain so every configured upstream is
+                // re-probed right now — no restart, no 6h/24h cache wait.
+                clawde_api::providers::free::force_refresh_discovery_caches();
+                self.refresh_free_provider();
+                self.status_message = Some(
+                    "Live model discovery refreshed — re-probing configured upstreams.".to_string(),
+                );
+                true
+            }
             "ollama" => {
                 use clawde_core::OllamaMode;
                 let next = match self.ollama_mode {

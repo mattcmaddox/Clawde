@@ -83,6 +83,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "normal", description: "Reset persona / output style to default", category: "Commands", tui_only: false },
     PromptCommand { name: "quit", description: "Exit Clawde", category: "Session", tui_only: false },
     PromptCommand { name: "refresh", description: "Clear saved provider auth and model caches", category: "Model & Provider", tui_only: false },
+    PromptCommand { name: "refresh-models", description: "Re-probe every configured free upstream's live model list (bypasses the discovery cache)", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "rename", description: "Rename this session", category: "Session", tui_only: false },
     PromptCommand { name: "resume", description: "Resume a previous session", category: "Session", tui_only: false },
     PromptCommand { name: "review", description: "Review changes (git diff)", category: "Review & History", tui_only: false },
@@ -620,6 +621,15 @@ mod tests {
         assert!(prompt_command_pairs()
             .iter()
             .any(|(name, _)| *name == "help"));
+        // --refresh-models TUI twin: the slash command must appear in the
+        // typeahead registry under the provider category.
+        assert!(PROMPT_COMMANDS
+            .iter()
+            .any(|command| command.name == "refresh-models"));
+        assert_eq!(
+            prompt_command_category("refresh-models"),
+            "Model & Provider"
+        );
     }
 
     #[test]

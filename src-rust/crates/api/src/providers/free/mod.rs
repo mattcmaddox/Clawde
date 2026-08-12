@@ -605,7 +605,14 @@ fn set_private_dir_permissions(_path: &std::path::Path) {}
 
 /// How long a persisted discovery result is trusted before a refetch. Both the
 /// models.dev catalog and the per-upstream model lists are slow-moving.
-const DISCOVERY_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+// 6h: the per-upstream probes (OpenAI-compat /models, cloudflare account
+// search, cline, openrouter, zen, gemini) are cheap single GETs, so a shorter
+// TTL keeps new models visible sooner without meaningful cost. The 24h window
+// previously made a stale pick stick for a full day.
+const DISCOVERY_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+// The models.dev api.json fetch is a much heavier payload than the per-upstream
+// probes, so its persisted defaults keep a longer (24h) freshness window.
+const MODELSDEV_DEFAULTS_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn free_state_dir() -> std::path::PathBuf {
     clawde_core::config::Settings::config_dir().join("free-state")
@@ -626,7 +633,7 @@ fn load_modelsdev_defaults_cache() -> Option<HashMap<String, String>> {
     let cached: ModelsDevDefaultsCache = serde_json::from_str(&json).ok()?;
     let now = current_unix_secs();
     if cached.saved_at_unix == 0
-        || now.saturating_sub(cached.saved_at_unix) > DISCOVERY_CACHE_TTL_SECS
+        || now.saturating_sub(cached.saved_at_unix) > MODELSDEV_DEFAULTS_TTL_SECS
     {
         return None;
     }
@@ -706,6 +713,17 @@ fn save_live_discovery_cache(upstream_id: &str, model: Option<String>) {
         Err(_) => return,
     };
     write_private_json_locked(&path, Some(&json), false, false);
+}
+
+/// Snapshot of the persisted live-discovery cache: the per-upstream probe
+/// results last written (`upstream id → model id`) plus the `saved_at_unix`
+/// timestamp. `None` when no cache file exists yet. Exposed for
+/// `clawde models --verbose`.
+pub fn live_discovery_snapshot() -> Option<(std::collections::HashMap<String, String>, u64)> {
+    let path = free_state_dir().join("live-discovery.json");
+    let json = std::fs::read_to_string(path).ok()?;
+    let cached: LiveDiscoveryCache = serde_json::from_str(&json).ok()?;
+    Some((cached.models, cached.saved_at_unix))
 }
 
 /// Force the free chain's live discovery to re-probe on the next build.
@@ -2427,7 +2445,7 @@ mod cache_tests {
         let mut defaults = HashMap::new();
         defaults.insert("groq".to_string(), "llama-3.3-70b-versatile".to_string());
         let stale = ModelsDevDefaultsCache {
-            saved_at_unix: current_unix_secs().saturating_sub(DISCOVERY_CACHE_TTL_SECS + 1),
+            saved_at_unix: current_unix_secs().saturating_sub(MODELSDEV_DEFAULTS_TTL_SECS + 1),
             defaults,
         };
         let dir = free_state_dir();

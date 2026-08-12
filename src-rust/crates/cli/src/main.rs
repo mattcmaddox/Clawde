@@ -1453,6 +1453,33 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    // Verbose: show what the FreeProvider's live model poller last picked per
+    // upstream (the persisted live-discovery cache), so operators can see the
+    // effective model without reading free-state/live-discovery.json.
+    if verbose {
+        if let Some((probes, saved_at)) = clawde_api::providers::free::live_discovery_snapshot() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let age_secs = now.saturating_sub(saved_at);
+            println!();
+            println!(
+                "Live free-discovery probes (cached {:.0}h {:.0}m ago; `clawde --refresh-models` to re-probe):",
+                age_secs / 3600,
+                (age_secs % 3600) / 60,
+            );
+            let mut sorted: Vec<(&String, &String)> = probes.iter().collect();
+            sorted.sort();
+            if sorted.is_empty() {
+                println!("  (none cached — configured keys will populate on first run)");
+            }
+            for (upstream, model) in sorted {
+                println!("  {} → {}", upstream, model);
+            }
+        }
+    }
+
     if provider_filter.is_none() {
         eprintln!(
             "\n{} models across {} providers.  Use `clawde models <provider>` to filter.",
