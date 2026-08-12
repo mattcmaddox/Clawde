@@ -320,12 +320,59 @@ fn classify_semantic_runner_error(error: &str) -> &'static str {
     }
 }
 
-/// Parse a semantic verifier response. Responses must be a bounded JSON object
-/// with exactly `verdict`, `summary`, and optional `findings`; prose or fenced
-/// JSON is rejected so an ambiguous model response can never authorize
-/// continuation.
+/// Extract the first balanced JSON object from a string, respecting string
+/// literals so braces inside quoted values do not terminate the scan early.
+fn extract_json_object(input: &str) -> Option<&str> {
+    let start = input.find('{')?;
+    let bytes = input.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&input[start..=offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Parse a semantic verifier response. Responses must contain a bounded JSON
+/// object with exactly `verdict`, `summary`, and optional `findings`.
+///
+/// Free-tier models frequently wrap their JSON in markdown fences or prose, or
+/// return empty output. To avoid silently skipping verification on those
+/// models, the parser first tries a strict whole-string parse and then falls
+/// back to extracting the first balanced JSON object (skipping fences and
+/// prose). The extracted object goes through the same strict validation
+/// (`deny_unknown_fields`, non-empty bounded summary, bounded findings), so an
+/// ambiguous response can never authorize continuation: anything that is not a
+/// strictly valid verdict object is rejected.
 pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyResponse, String> {
     let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return Err("semantic verifier returned an empty response".to_string());
+    }
     if trimmed.len() > SEMANTIC_VERIFY_MAX_RESPONSE_BYTES {
         return Err(format!(
             "semantic verifier response exceeds the {}-byte limit",
@@ -333,8 +380,21 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
         ));
     }
 
-    let parsed: SemanticVerifyResponse = serde_json::from_str(trimmed)
-        .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?;
+    // Fast path: a bare JSON object with no surrounding prose or fences.
+    let parsed = match serde_json::from_str::<SemanticVerifyResponse>(trimmed) {
+        Ok(parsed) => parsed,
+        Err(strict_error) => {
+            // Tolerant path: skip fences/prose and re-parse the first balanced
+            // object. Any failure here remains fail-closed.
+            let candidate = extract_json_object(trimmed).ok_or_else(|| {
+                format!(
+                    "semantic verifier returned malformed JSON (no JSON object found): {strict_error}"
+                )
+            })?;
+            serde_json::from_str::<SemanticVerifyResponse>(candidate)
+                .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?
+        }
+    };
     if parsed.summary.trim().is_empty() {
         return Err("semantic verifier returned an empty summary".to_string());
     }
@@ -1821,7 +1881,7 @@ mod tests {
         assert!(parse_semantic_verify_response(
             "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\"}\n```"
         )
-        .is_err());
+        .is_ok());
         assert!(parse_semantic_verify_response(r#"{"verdict":"pass","summary":""}"#).is_err());
         assert!(parse_semantic_verify_response(&format!(
             r#"{{"verdict":"pass","summary":"{}"}}"#,
@@ -1832,6 +1892,48 @@ mod tests {
             r#"{"verdict":"replan","summary":"new approach needed"}"#
         )
         .is_ok());
+    }
+
+    #[test]
+    fn semantic_response_parser_tolerates_fences_and_prose() {
+        // Markdown-fenced JSON is accepted.
+        let fenced = parse_semantic_verify_response(
+            "```json\n{\"verdict\":\"pass\",\"summary\":\"looks good\",\"findings\":[]}\n```",
+        )
+        .expect("fenced JSON");
+        assert_eq!(fenced.verdict, SemanticVerdict::Pass);
+
+        // Prose wrapping a JSON object is accepted.
+        let prose = parse_semantic_verify_response(
+            "Here is my assessment:\n\n{\"verdict\":\"fixable\",\"summary\":\"handle the edge case\",\"findings\":[\"Add a guard\"]}\n\nHope that helps!",
+        )
+        .expect("prose-wrapped JSON");
+        assert_eq!(prose.verdict, SemanticVerdict::Fixable);
+        assert_eq!(prose.findings, vec!["Add a guard"]);
+
+        // Braces and escaped quotes inside the summary string must not break
+        // the balance scan.
+        let braced = parse_semantic_verify_response(
+            r#"prefix {"verdict":"pass","summary":"use a {map} with \"keys\"","findings":[]} suffix"#,
+        )
+        .expect("braces in summary");
+        assert_eq!(braced.summary, "use a {map} with \"keys\"");
+
+        // Truncated / unbalanced JSON still fails closed.
+        assert!(parse_semantic_verify_response(r#"{"verdict":"pass","summary":"ok""#).is_err());
+
+        // Empty output fails closed.
+        assert!(parse_semantic_verify_response("").is_err());
+        assert!(parse_semantic_verify_response("   ").is_err());
+
+        // Prose with no JSON object at all still fails closed.
+        assert!(parse_semantic_verify_response("just some prose, no object").is_err());
+
+        // Unknown fields still fail closed even inside a fence.
+        assert!(parse_semantic_verify_response(
+            "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"extra\":true}\n```"
+        )
+        .is_err());
     }
 
     #[tokio::test]
