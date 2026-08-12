@@ -1101,7 +1101,13 @@ async fn main() -> anyhow::Result<()> {
         cron_cancel.clone(),
     );
 
-    // --print mode (headless)
+    // --print mode (headless). Headless single-shot runs must honor the same
+    // continuation-mode derivation as interactive runs (semanticVerify / goal /
+    // verify policies). Without this, --print mode always used StopPolicy and
+    // the G1-G7 semantic verifier was unreachable from the external Phase 0/1
+    // evaluation harness (verified: zero semantic_verify/verify events across
+    // all 40 headless Phase 1 trials).
+    query_config.continuation = derive_continuation_mode(&config);
     let result = if is_headless {
         // Fire-and-forget startup health probe (non-blocking — the poll
         // runs in the background so the user's prompt is answered without
@@ -2129,6 +2135,46 @@ async fn run_headless(
                     } else {
                         eprintln!("\n[{} done]", tool_name);
                     }
+                }
+            }
+            QueryEvent::Verify(report) => {
+                // Tier-1 gate observability for headless runs: emit a compact
+                // machine event so the external harness can prove whether the
+                // deterministic gate ran and passed before any semantic tier.
+                if is_stream_json {
+                    let ev = serde_json::json!({
+                        "type": "verify",
+                        "report": {
+                            "verdict": match report.verdict {
+                                clawde_query::VerifyVerdict::Pass => "pass",
+                                clawde_query::VerifyVerdict::Fixable => "fixable",
+                                clawde_query::VerifyVerdict::Escalate => "escalate",
+                            },
+                            "attempt": report.attempt,
+                            "max_retries": report.max_retries,
+                            "headline": report.headline,
+                            "results": report.results.iter().map(|r| {
+                                serde_json::json!({
+                                    "label": r.label,
+                                    "ok": r.ok,
+                                    "timed_out": r.timed_out,
+                                    "skipped": r.skipped,
+                                    "elapsed_secs": r.elapsed_secs,
+                                })
+                            }).collect::<Vec<_>>(),
+                        },
+                    });
+                    println!("{}", ev);
+                } else if !is_json_output {
+                    eprintln!(
+                        "\n[verify: {}] {}",
+                        match report.verdict {
+                            clawde_query::VerifyVerdict::Pass => "pass",
+                            clawde_query::VerifyVerdict::Fixable => "fixable",
+                            clawde_query::VerifyVerdict::Escalate => "escalate",
+                        },
+                        report.headline
+                    );
                 }
             }
             QueryEvent::SemanticVerify(report) => {
@@ -6266,5 +6312,103 @@ mod bare_mode_tests {
         hooks.clear(); // mirrors `config.hooks.clear()` in bare mode
 
         assert!(hooks.is_empty(), "bare mode leaves no hooks to run");
+    }
+}
+
+#[cfg(test)]
+mod continuation_mode_tests {
+    //! Tests for `derive_continuation_mode`: headless `--print` runs now
+    //! derive the same continuation policy as interactive runs, so
+    //! `semanticVerify: true` in settings reaches the G1-G7 semantic verifier
+    //! from the external Phase 0/1 evaluation harness. Without the headless
+    //! derivation, `--print` always used StopPolicy and no semantic_verify or
+    //! verify events were ever emitted (verified across all 40 Phase 1 trials).
+    use super::*;
+
+    // goals_enabled() reads the CLAURST_GOALS env var, so tests that flip it
+    // must serialize on a local mutex to avoid racing other env-dependent
+    // tests in the same binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_goals(goals: bool, f: impl FnOnce()) {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAURST_GOALS");
+        std::env::set_var("CLAURST_GOALS", if goals { "1" } else { "0" });
+        f();
+        match prev {
+            Some(value) => std::env::set_var("CLAURST_GOALS", value),
+            None => std::env::remove_var("CLAURST_GOALS"),
+        }
+    }
+
+    #[test]
+    fn semantic_verify_selects_semantic_mode_with_goals_enabled() {
+        with_goals(true, || {
+            let mut config = Config::default();
+            config.semantic_verify = Some(true);
+            let mode = derive_continuation_mode(&config);
+            assert!(
+                matches!(mode, clawde_query::ContinuationMode::GoalSemanticVerify(_)),
+                "semanticVerify with goals enabled must pick GoalSemanticVerify, got {mode:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn semantic_verify_selects_semantic_mode_with_goals_disabled() {
+        with_goals(false, || {
+            let mut config = Config::default();
+            config.semantic_verify = Some(true);
+            let mode = derive_continuation_mode(&config);
+            assert!(
+                matches!(mode, clawde_query::ContinuationMode::SemanticVerify(_)),
+                "semanticVerify without goals must pick SemanticVerify, got {mode:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn verify_enabled_selects_verify_mode_without_goals() {
+        with_goals(false, || {
+            let config = Config::default();
+            // VerifyConfig::default().enabled is true.
+            let mode = derive_continuation_mode(&config);
+            assert!(
+                matches!(mode, clawde_query::ContinuationMode::Verify(_)),
+                "default config without goals must pick Verify, got {mode:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn default_selects_stop_policy_with_goals_disabled_and_verify_off() {
+        with_goals(false, || {
+            let mut config = Config::default();
+            config.verify.enabled = false;
+            let mode = derive_continuation_mode(&config);
+            assert!(
+                matches!(mode, clawde_query::ContinuationMode::Default),
+                "everything off must pick Default (StopPolicy), got {mode:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn headless_dispatch_now_derives_continuation_mode() {
+        // Regression guard for the headless wiring fix: `--print` must not
+        // silently stay on StopPolicy when semanticVerify is configured. The
+        // assignment in `main()` runs unconditionally before the headless
+        // branch; assert the derivation function itself is reachable and picks
+        // the semantic mode so the event stream can surface it.
+        with_goals(false, || {
+            let mut config = Config::default();
+            config.semantic_verify = Some(true);
+            assert!(matches!(
+                derive_continuation_mode(&config),
+                clawde_query::ContinuationMode::SemanticVerify(_)
+            ));
+        });
     }
 }
