@@ -140,8 +140,7 @@ pub struct SemanticVerifyResponse {
 /// assistant-message field. The `message` field is accepted and ignored, but
 /// `verdict` and `summary` remain strictly required and every other unknown
 /// field is still rejected, so an ambiguous response can never authorize
-/// continuation. A response that places the verdict *inside* `message` (rather
-/// than alongside it) still fails closed: the top-level `verdict` is absent.
+/// continuation.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SemanticVerifyEnvelope {
@@ -153,6 +152,19 @@ struct SemanticVerifyEnvelope {
     #[serde(default)]
     #[allow(dead_code)]
     message: Option<serde_json::Value>,
+}
+
+/// Recovery shape for a Claude-style `{"message": {…}}` envelope that nests
+/// the verdict *inside* `message` instead of placing it at the top level.
+///
+/// The inner value is the strict [`SemanticVerifyResponse`], so a nested
+/// verdict is held to the exact same contract (`deny_unknown_fields`, required
+/// `verdict` + `summary`, bounded findings) as a top-level one.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SemanticVerifyNestedEnvelope {
+    #[serde(default)]
+    message: Option<SemanticVerifyResponse>,
 }
 
 impl From<SemanticVerifyEnvelope> for SemanticVerifyResponse {
@@ -388,6 +400,23 @@ fn extract_json_object(input: &str) -> Option<&str> {
     None
 }
 
+/// Parse one of the two accepted verdict shapes from a raw JSON fragment: a
+/// top-level verdict (with an optional ignored `message` field) or a verdict
+/// nested inside a single `message` object. Both shapes reject unknown fields
+/// and require a valid `verdict` + `summary`.
+fn parse_verdict_shape(raw: &str) -> Result<SemanticVerifyResponse, String> {
+    match serde_json::from_str::<SemanticVerifyEnvelope>(raw) {
+        Ok(envelope) => Ok(SemanticVerifyResponse::from(envelope)),
+        Err(top_level) => match serde_json::from_str::<SemanticVerifyNestedEnvelope>(raw) {
+            // A nested `message` verdict is recovered, but only when it parses
+            // as the strict inner response; otherwise the more accurate
+            // top-level error (e.g. an unknown field) is surfaced unchanged.
+            Ok(nested) => nested.message.ok_or_else(|| top_level.to_string()),
+            Err(_) => Err(top_level.to_string()),
+        },
+    }
+}
+
 /// Parse a semantic verifier response. Responses must contain a bounded JSON
 /// object with `verdict`, `summary`, and optional `findings`.
 ///
@@ -397,10 +426,11 @@ fn extract_json_object(input: &str) -> Option<&str> {
 /// strict whole-string parse and then falls back to extracting the first
 /// balanced JSON object (skipping fences and prose). The extracted object is
 /// parsed through a tolerant envelope that accepts (and ignores) a top-level
-/// `message` field. The envelope still enforces `deny_unknown_fields`, a
-/// required non-empty bounded summary, and bounded findings, so an ambiguous
-/// response can never authorize continuation: anything that is not a strictly
-/// valid verdict object is rejected.
+/// `message` field, then through a nested recovery that unwraps a verdict
+/// placed *inside* a single `message` object. Both shapes still enforce
+/// `deny_unknown_fields`, a required non-empty bounded summary, and bounded
+/// findings, so an ambiguous response can never authorize continuation:
+/// anything that is not a strictly valid verdict object is rejected.
 pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyResponse, String> {
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -414,19 +444,18 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
     }
 
     // Fast path: a bare JSON object with no surrounding prose or fences.
-    let parsed = match serde_json::from_str::<SemanticVerifyEnvelope>(trimmed) {
-        Ok(envelope) => SemanticVerifyResponse::from(envelope),
-        Err(strict_error) => {
+    let parsed = match parse_verdict_shape(trimmed) {
+        Ok(response) => response,
+        Err(fast_error) => {
             // Tolerant path: skip fences/prose and re-parse the first balanced
             // object. Any failure here remains fail-closed.
             let candidate = extract_json_object(trimmed).ok_or_else(|| {
                 format!(
-                    "semantic verifier returned malformed JSON (no JSON object found): {strict_error}"
+                    "semantic verifier returned malformed JSON (no JSON object found): {fast_error}"
                 )
             })?;
-            let envelope = serde_json::from_str::<SemanticVerifyEnvelope>(candidate)
-                .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?;
-            SemanticVerifyResponse::from(envelope)
+            parse_verdict_shape(candidate)
+                .map_err(|error| format!("semantic verifier returned malformed JSON: {error}"))?
         }
     };
     if parsed.summary.trim().is_empty() {
@@ -2127,10 +2156,25 @@ mod tests {
         .expect("object message tolerated");
         assert_eq!(nested.verdict, SemanticVerdict::Pass);
 
+        // A verdict nested *inside* a `message` object is recovered.
+        let nested_verdict = parse_semantic_verify_response(
+            r#"{"message":{"verdict":"pass","summary":"nested ok","findings":[]}}"#,
+        )
+        .expect("nested verdict recovered");
+        assert_eq!(nested_verdict.verdict, SemanticVerdict::Pass);
+        assert_eq!(nested_verdict.summary, "nested ok");
+
         // A `message` field alone (no verdict) still fails closed.
         assert!(
             parse_semantic_verify_response(r#"{"message":"The change looks correct"}"#).is_err()
         );
+
+        // A `message` object that is not itself a valid verdict still fails
+        // closed (its inner unknown fields are rejected).
+        assert!(parse_semantic_verify_response(
+            r#"{"message":{"role":"assistant","content":"looks good"}}"#
+        )
+        .is_err());
 
         // Other unknown fields are still rejected alongside `message`.
         assert!(parse_semantic_verify_response(
