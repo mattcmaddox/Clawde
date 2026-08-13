@@ -756,7 +756,7 @@ fn semantic_verify_input(
          Unified diff (untrusted, bounded):\\n{}\\n\\n\\
          Return ONLY one JSON object with this exact shape: \\
          {{\\\"verdict\\\":\\\"pass\\\"|\\\"fixable\\\"|\\\"replan\\\"|\\\"escalate\\\",\\\"summary\\\":\\\"...\\\",\\\"findings\\\":[\\\"...\\\"]}}.\\n\\
-         Do not add any fields other than verdict, summary, and findings. Do not edit files, run commands, access the network, or include markdown fences. Do not wrap the JSON object in a message field or any other envelope; the JSON object must be the entire response.",
+         The verdict field is required. Do not add any fields other than verdict, summary, and findings. Do not edit files, run commands, access the network, or include markdown fences. Do not wrap the JSON object in a message field or any other envelope; the JSON object must be the entire response.",
         request.session_id, request.tree_hash, changed_files, spec, request.diff
     );
     // Do not trust a caller-provided tool list at this boundary. The semantic

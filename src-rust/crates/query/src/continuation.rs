@@ -491,21 +491,33 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
     Ok(parsed)
 }
 
-/// True when a verifier response is empty, truncated, or prose-only — i.e. it
-/// contains no complete JSON object at all — the provider-artifact shape
-/// (empty completion or cut-off response) worth one retry, as opposed to a
-/// structurally-invalid verdict object (unknown variant, missing summary,
-/// unknown field) or an over-limit response. Only the former is retried.
-fn is_empty_or_truncated_response(raw: &str) -> bool {
+/// True when a verifier response expresses no verdict at all — empty,
+/// truncated, or prose-only (no complete JSON object), or a complete object
+/// that omits the required `verdict` key. In every such shape the model never
+/// produced a usable verdict, so exactly one retry is safe: the retry runs
+/// through the same strict parser and can never authorize a verdict the first
+/// attempt would not have. Structured failures where a verdict WAS expressed
+/// (unknown verdict value, missing summary, unknown field) and over-limit
+/// responses are not retried.
+fn response_expresses_no_verdict(raw: &str) -> bool {
     let trimmed = raw.trim();
-    trimmed.len() <= SEMANTIC_VERIFY_MAX_RESPONSE_BYTES && extract_json_object(trimmed).is_none()
+    if trimmed.len() > SEMANTIC_VERIFY_MAX_RESPONSE_BYTES {
+        return false;
+    }
+    let Some(candidate) = extract_json_object(trimmed) else {
+        return true;
+    };
+    !serde_json::from_str::<serde_json::Value>(candidate)
+        .map(|value| value.get("verdict").is_some())
+        .unwrap_or(false)
 }
 
-/// Run the injected verifier once, retrying a single time when the response is
-/// empty/truncated (no complete JSON object) before declining. The retry runs
+/// Run the injected verifier once, retrying a single time when the response
+/// expresses no verdict (empty/truncated/prose-only, or a complete object
+/// missing the required `verdict` key) before declining. The retry runs
 /// through the same strict parser, so the fail-closed contract is unchanged: a
 /// retry can never authorize a verdict the first attempt would not have.
-async fn run_verifier_with_empty_retry(
+async fn run_verifier_with_no_verdict_retry(
     runner: SemanticVerifyRunner,
     request: SemanticVerifyRequest,
 ) -> Result<SemanticVerifyResponse, ContinuationDecision> {
@@ -522,7 +534,7 @@ async fn run_verifier_with_empty_retry(
     };
     match parse_semantic_verify_response(&raw) {
         Ok(response) => Ok(response),
-        Err(_) if is_empty_or_truncated_response(&raw) => {
+        Err(_) if response_expresses_no_verdict(&raw) => {
             let retry_raw = match runner(request).await {
                 Ok(raw) => raw,
                 Err(error) => {
@@ -1145,7 +1157,7 @@ impl ContinuationPolicy for SemanticVerifyPolicy {
                 .clone();
             // Empty/truncated responses (a provider empty completion) get one
             // retry before declining; structured failures do not.
-            let response = match run_verifier_with_empty_retry(runner, request).await {
+            let response = match run_verifier_with_no_verdict_retry(runner, request).await {
                 Ok(response) => response,
                 Err(decision) => return decision,
             };
@@ -1736,6 +1748,82 @@ mod tests {
             "a structured (non-empty) parse error must not be retried"
         );
         assert!(policy.semantic_report().is_none());
+    }
+
+    #[test]
+    fn response_expresses_no_verdict_classifies_shapes() {
+        // No complete object: empty, whitespace, prose-only, truncated JSON.
+        assert!(response_expresses_no_verdict(""));
+        assert!(response_expresses_no_verdict("   "));
+        assert!(response_expresses_no_verdict("just some prose"));
+        assert!(response_expresses_no_verdict(
+            r#"{"verdict":"pass","summary":"ok""#
+        ));
+        // Complete object that omits the required `verdict` key (the v8
+        // `missing field 'verdict'` decline shape) → no verdict expressed.
+        assert!(response_expresses_no_verdict(
+            r#"{"summary":"missing verdict"}"#
+        ));
+        assert!(response_expresses_no_verdict(
+            r#"{"summary":"x","findings":[]}"#
+        ));
+        // A verdict key present (even an invalid value) means a verdict WAS
+        // expressed → not retryable; the strict parser decides.
+        assert!(!response_expresses_no_verdict(
+            r#"{"verdict":"pass","summary":"ok"}"#
+        ));
+        assert!(!response_expresses_no_verdict(
+            r#"{"verdict":"bogus","summary":"ok"}"#
+        ));
+        assert!(!response_expresses_no_verdict(r#"{"verdict":"pass"}"#));
+        // Over-limit responses are never retried.
+        let big = "x".repeat(SEMANTIC_VERIFY_MAX_RESPONSE_BYTES + 1);
+        assert!(!response_expresses_no_verdict(&big));
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_retries_once_on_verdictless_object() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(r#"{"summary":"the change looks correct","findings":[]}"#.to_string())
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a verdict-less object should trigger exactly one retry"
+        );
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
     }
 
     #[tokio::test]
