@@ -2979,6 +2979,9 @@ async fn run_interactive(
         .map(|s| s.terminal_progress_bar)
         .unwrap_or(true);
     let mut progress_shown = false;
+    // Agent tab-status (OSC 21337) emission: only write on transitions from
+    // the current known state so the pane's pty stream stays clean.
+    let mut tab_status_shown: Option<clawde_tui::TabStatus> = None;
 
     // SIGTERM handler for graceful shutdown: sets a flag that the event loop
     // checks so we can save state and restore the terminal before exiting.
@@ -3071,6 +3074,22 @@ async fn run_interactive(
         if want_progress != progress_shown {
             clawde_tui::set_terminal_progress(want_progress);
             progress_shown = want_progress;
+        }
+
+        // Level-sync the agent tab-status (OSC 21337) to the app's working
+        // state, so the Zellij `clawde-status` plugin (and supporting
+        // terminals) can surface an indicator per agent pane. Emitted only on
+        // state transitions.
+        let want_tab_status = if app.is_streaming {
+            clawde_tui::TabStatus::Busy
+        } else if app.permission_request.is_some() {
+            clawde_tui::TabStatus::Waiting
+        } else {
+            clawde_tui::TabStatus::Idle
+        };
+        if Some(want_tab_status) != tab_status_shown {
+            clawde_tui::set_tab_status(want_tab_status);
+            tab_status_shown = Some(want_tab_status);
         }
 
         // Poll for crossterm events (keyboard/mouse) with short timeout

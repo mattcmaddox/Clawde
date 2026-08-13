@@ -174,6 +174,8 @@ pub mod settings_screen;
 pub mod spec_review;
 /// Stats dialog with token usage and cost charts.
 pub mod stats_dialog;
+/// Terminal tab-status reporting (OSC 21337 `tab.status`).
+pub mod tab_status;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
 pub mod tasks_overlay;
 /// Color palette management for different themes and accessibility support.
@@ -250,6 +252,7 @@ pub use session_browser::{
     render_session_browser, SessionBrowserMode, SessionBrowserState, SessionEntry,
 };
 pub use stats_dialog::{load_stats, render_stats_dialog, StatsDialogState, StatsTab};
+pub use tab_status::{set_tab_status, TabStatus};
 pub use voice_mode_notice::{render_voice_mode_notice, VoiceModeNoticeState};
 // (FreeModeField type is now per-provider; legacy callers may still import both names.)
 pub use device_auth_dialog::{
@@ -388,6 +391,8 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     disable_raw_mode()?;
     // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
     set_terminal_progress(false);
+    // Clear any agent "tab status" (OSC 21337) we may have set.
+    set_tab_status(TabStatus::Idle);
     // Restore the original title by clearing it (terminals fall back to default).
     let _ = execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(""),);
     restore_terminal_cleanup()?;
