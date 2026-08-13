@@ -125,6 +125,10 @@ impl SemanticVerdict {
 }
 
 /// Strict, machine-readable output accepted from a semantic verifier runner.
+///
+/// Deserialization now flows through the tolerant envelopes; this attribute is
+/// retained as the public contract (only verdict/summary/findings may exist),
+/// and the type is constructed exclusively via `From<SemanticVerifyEnvelope>`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticVerifyResponse {
@@ -137,12 +141,15 @@ pub struct SemanticVerifyResponse {
 /// Tolerant wire envelope accepted from a semantic verifier runner.
 ///
 /// Some free models wrap their verdict in a Claude-style `{"message": …}`
-/// assistant-message field, or add a redundant `repeat` hint that the verdict already expresses. Both fields are accepted and ignored, but
-/// `verdict` and `summary` remain strictly required and every other unknown
-/// field is still rejected, so an ambiguous response can never authorize
-/// continuation.
+/// assistant-message field, add a redundant `repeat` hint that the verdict
+/// already expresses, or sprinkle arbitrary noise fields (e.g. a truncated
+/// `f` or a `confidence` score) next to a perfectly valid verdict. The
+/// envelope therefore IGNORES unknown fields while `verdict` and `summary`
+/// remain strictly required and bounded — authority comes from the required
+/// verdict enum, not from the absence of extra fields, so an ambiguous
+/// response (no verdict, an invalid verdict value, an empty or over-long
+/// summary) can never authorize continuation.
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SemanticVerifyEnvelope {
     verdict: SemanticVerdict,
     summary: String,
@@ -162,14 +169,13 @@ struct SemanticVerifyEnvelope {
 /// Recovery shape for a Claude-style `{"message": {…}}` envelope that nests
 /// the verdict *inside* `message` instead of placing it at the top level.
 ///
-/// The inner value is the strict [`SemanticVerifyResponse`], so a nested
-/// verdict is held to the exact same contract (`deny_unknown_fields`, required
-/// `verdict` + `summary`, bounded findings) as a top-level one.
+/// The inner value is the tolerant envelope, so a nested verdict is held to
+/// the exact same contract (required `verdict` + `summary`, bounded findings,
+/// unknown fields ignored) as a top-level one.
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SemanticVerifyNestedEnvelope {
     #[serde(default)]
-    message: Option<SemanticVerifyResponse>,
+    message: Option<SemanticVerifyEnvelope>,
 }
 
 impl From<SemanticVerifyEnvelope> for SemanticVerifyResponse {
@@ -422,10 +428,14 @@ fn parse_verdict_shape(raw: &str) -> Result<SemanticVerifyResponse, String> {
     match serde_json::from_str::<SemanticVerifyEnvelope>(raw) {
         Ok(envelope) => Ok(SemanticVerifyResponse::from(envelope)),
         Err(top_level) => match serde_json::from_str::<SemanticVerifyNestedEnvelope>(raw) {
-            // A nested `message` verdict is recovered, but only when it parses
-            // as the strict inner response; otherwise the more accurate
-            // top-level error (e.g. an unknown field) is surfaced unchanged.
-            Ok(nested) => nested.message.ok_or_else(|| top_level.to_string()),
+            // A nested `message` verdict is recovered; the tolerant inner
+            // envelope is converted through the same contract as a top-level
+            // one. When the inner is absent, the more accurate top-level error
+            // is surfaced unchanged.
+            Ok(nested) => nested
+                .message
+                .map(SemanticVerifyResponse::from)
+                .ok_or_else(|| top_level.to_string()),
             Err(_) => Err(top_level.to_string()),
         },
     }
@@ -435,16 +445,18 @@ fn parse_verdict_shape(raw: &str) -> Result<SemanticVerifyResponse, String> {
 /// object with `verdict`, `summary`, and optional `findings`.
 ///
 /// Free-tier models frequently wrap their JSON in markdown fences or prose,
-/// return empty output, or add a Claude-style `{"message": …}` field. To avoid
-/// silently skipping verification on those models, the parser first tries a
-/// strict whole-string parse and then falls back to extracting the first
-/// balanced JSON object (skipping fences and prose). The extracted object is
-/// parsed through a tolerant envelope that accepts (and ignores) a top-level
-/// `message` field, then through a nested recovery that unwraps a verdict
-/// placed *inside* a single `message` object. Both shapes still enforce
-/// `deny_unknown_fields`, a required non-empty bounded summary, and bounded
-/// findings, so an ambiguous response can never authorize continuation:
-/// anything that is not a strictly valid verdict object is rejected.
+/// return empty output, add a Claude-style `{"message": …}` field, or sprinkle
+/// arbitrary noise fields next to a valid verdict. To avoid silently skipping
+/// verification on those models, the parser first tries a strict whole-string
+/// parse and then falls back to extracting the first balanced JSON object
+/// (skipping fences and prose). The extracted object is parsed through a
+/// tolerant envelope that ignores unknown fields (but still requires a valid
+/// `verdict` enum value, a required non-empty bounded `summary`, and bounded
+/// `findings`), then through a nested recovery that unwraps a verdict placed
+/// *inside* a single `message` object. Because authority comes from the
+/// required verdict enum, an ambiguous response can never authorize
+/// continuation: anything that is not a clearly valid verdict object is
+/// rejected.
 pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyResponse, String> {
     let trimmed = response.trim();
     if trimmed.is_empty() {
@@ -2960,10 +2972,12 @@ mod tests {
         assert_eq!(legacy.verdict, SemanticVerdict::Fixable);
 
         assert!(parse_semantic_verify_response("not json").is_err());
-        assert!(parse_semantic_verify_response(
-            r#"{"verdict":"pass","summary":"ok","extra":true}"#
-        )
-        .is_err());
+        // Unknown fields are ignored, but authority comes from the required
+        // verdict enum + summary — this object still parses.
+        let noisy =
+            parse_semantic_verify_response(r#"{"verdict":"pass","summary":"ok","extra":true}"#)
+                .expect("unknown fields ignored");
+        assert_eq!(noisy.verdict, SemanticVerdict::Pass);
         assert!(parse_semantic_verify_response(
             "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\"}\n```"
         )
@@ -3015,11 +3029,13 @@ mod tests {
         // Prose with no JSON object at all still fails closed.
         assert!(parse_semantic_verify_response("just some prose, no object").is_err());
 
-        // Unknown fields still fail closed even inside a fence.
-        assert!(parse_semantic_verify_response(
-            "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"extra\":true}\n```"
+        // Unknown fields inside a fence are ignored alongside the valid
+        // verdict (free models sprinkle noise keys into fenced output too).
+        let noisy_fenced = parse_semantic_verify_response(
+            "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\",\"extra\":true}\n```",
         )
-        .is_err());
+        .expect("fenced unknown fields ignored");
+        assert_eq!(noisy_fenced.verdict, SemanticVerdict::Pass);
     }
 
     #[test]
@@ -3054,17 +3070,21 @@ mod tests {
         );
 
         // A `message` object that is not itself a valid verdict still fails
-        // closed (its inner unknown fields are rejected).
+        // closed (it carries no verdict).
         assert!(parse_semantic_verify_response(
             r#"{"message":{"role":"assistant","content":"looks good"}}"#
         )
         .is_err());
 
-        // Other unknown fields are still rejected alongside `message`.
-        assert!(parse_semantic_verify_response(
-            r#"{"message":"x","verdict":"pass","summary":"ok","extra":true}"#
+        // Arbitrary unknown fields alongside a valid verdict are ignored.
+        // Free models routinely add noise keys (a truncated `f`, confidence
+        // scores, etc.); the verdict enum + required summary stay authoritative.
+        let noisy = parse_semantic_verify_response(
+            r#"{"message":"x","verdict":"pass","summary":"ok","extra":true,"f":"noise"}"#,
         )
-        .is_err());
+        .expect("unknown fields ignored alongside a valid verdict");
+        assert_eq!(noisy.verdict, SemanticVerdict::Pass);
+        assert_eq!(noisy.summary, "ok");
     }
 
     #[test]
@@ -3088,11 +3108,13 @@ mod tests {
         // `repeat` alone (no verdict) still fails closed.
         assert!(parse_semantic_verify_response(r#"{"repeat":true}"#).is_err());
 
-        // Other unknown fields are still rejected alongside `repeat`.
-        assert!(parse_semantic_verify_response(
-            r#"{"verdict":"pass","summary":"ok","repeat":true,"extra":1}"#
+        // Unknown fields alongside a valid verdict are ignored (the v12
+        // `unknown field 'f'` decline shape).
+        let noisy = parse_semantic_verify_response(
+            r#"{"verdict":"pass","summary":"ok","repeat":true,"extra":1,"f":"x"}"#,
         )
-        .is_err());
+        .expect("unknown fields ignored alongside `repeat`");
+        assert_eq!(noisy.verdict, SemanticVerdict::Pass);
     }
 
     #[tokio::test]
