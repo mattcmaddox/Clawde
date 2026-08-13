@@ -137,7 +137,7 @@ pub struct SemanticVerifyResponse {
 /// Tolerant wire envelope accepted from a semantic verifier runner.
 ///
 /// Some free models wrap their verdict in a Claude-style `{"message": …}`
-/// assistant-message field. The `message` field is accepted and ignored, but
+/// assistant-message field, or add a redundant `repeat` hint that the verdict already expresses. Both fields are accepted and ignored, but
 /// `verdict` and `summary` remain strictly required and every other unknown
 /// field is still rejected, so an ambiguous response can never authorize
 /// continuation.
@@ -152,6 +152,11 @@ struct SemanticVerifyEnvelope {
     #[serde(default)]
     #[allow(dead_code)]
     message: Option<serde_json::Value>,
+    /// Tolerated and ignored; some models add a redundant `repeat` hint that
+    /// the `verdict` field already expresses (`fixable`/`replan`). Never read.
+    #[serde(default)]
+    #[allow(dead_code)]
+    repeat: Option<serde_json::Value>,
 }
 
 /// Recovery shape for a Claude-style `{"message": {…}}` envelope that nests
@@ -2553,6 +2558,34 @@ mod tests {
         // Other unknown fields are still rejected alongside `message`.
         assert!(parse_semantic_verify_response(
             r#"{"message":"x","verdict":"pass","summary":"ok","extra":true}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn semantic_response_parser_tolerates_repeat_field() {
+        // Some free models add a redundant `repeat` hint next to the verdict;
+        // it duplicates what `fixable`/`replan` already express, so it is
+        // accepted and ignored.
+        let with_repeat = parse_semantic_verify_response(
+            r#"{"verdict":"fixable","summary":"redo it","findings":["x"],"repeat":true}"#,
+        )
+        .expect("repeat hint accepted");
+        assert_eq!(with_repeat.verdict, SemanticVerdict::Fixable);
+        assert_eq!(with_repeat.summary, "redo it");
+
+        // A non-boolean `repeat` value is tolerated too (ignored).
+        let repeat_string =
+            parse_semantic_verify_response(r#"{"verdict":"pass","summary":"ok","repeat":"yes"}"#)
+                .expect("string repeat tolerated");
+        assert_eq!(repeat_string.verdict, SemanticVerdict::Pass);
+
+        // `repeat` alone (no verdict) still fails closed.
+        assert!(parse_semantic_verify_response(r#"{"repeat":true}"#).is_err());
+
+        // Other unknown fields are still rejected alongside `repeat`.
+        assert!(parse_semantic_verify_response(
+            r#"{"verdict":"pass","summary":"ok","repeat":true,"extra":1}"#
         )
         .is_err());
     }
