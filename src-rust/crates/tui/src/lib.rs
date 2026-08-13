@@ -392,7 +392,7 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
     set_terminal_progress(false);
     // Clear any agent "tab status" (OSC 21337) we may have set.
-    set_tab_status(TabStatus::Idle);
+    set_tab_status(TabStatus::Idle, None);
     // Restore the original title by clearing it (terminals fall back to default).
     let _ = execute!(terminal.backend_mut(), crossterm::terminal::SetTitle(""),);
     restore_terminal_cleanup()?;

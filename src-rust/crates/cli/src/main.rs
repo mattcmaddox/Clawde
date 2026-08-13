@@ -2981,7 +2981,7 @@ async fn run_interactive(
     let mut progress_shown = false;
     // Agent tab-status (OSC 21337) emission: only write on transitions from
     // the current known state so the pane's pty stream stays clean.
-    let mut tab_status_shown: Option<clawde_tui::TabStatus> = None;
+    let mut tab_status_shown: Option<(clawde_tui::TabStatus, Option<String>)> = None;
 
     // SIGTERM handler for graceful shutdown: sets a flag that the event loop
     // checks so we can save state and restore the terminal before exiting.
@@ -3087,9 +3087,11 @@ async fn run_interactive(
         } else {
             clawde_tui::TabStatus::Idle
         };
-        if Some(want_tab_status) != tab_status_shown {
-            clawde_tui::set_tab_status(want_tab_status);
-            tab_status_shown = Some(want_tab_status);
+        let topic = app.session_title.clone();
+        let current_tab_status = (want_tab_status, topic);
+        if Some(&current_tab_status) != tab_status_shown.as_ref() {
+            clawde_tui::set_tab_status(current_tab_status.0, current_tab_status.1.as_deref());
+            tab_status_shown = Some(current_tab_status);
         }
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
