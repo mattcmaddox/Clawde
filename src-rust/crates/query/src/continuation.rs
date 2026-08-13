@@ -1026,6 +1026,14 @@ impl ContinuationPolicy for GoalSemanticVerifyPolicy {
     fn will_run_checks(&self, ctx: &TurnEndContext<'_>) -> bool {
         self.semantic.will_run_checks(ctx)
     }
+
+    fn review_only_async<'a>(
+        &'a self,
+        ctx: &'a TurnEndContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
+    {
+        self.semantic.review_only_async(ctx)
+    }
 }
 
 impl ContinuationPolicy for SemanticAfterVerifyPolicy {
@@ -1125,6 +1133,60 @@ impl ContinuationPolicy for SemanticAfterVerifyPolicy {
     fn will_run_checks(&self, ctx: &TurnEndContext<'_>) -> bool {
         self.deterministic.will_run_checks(ctx)
     }
+
+    fn review_only_async<'a>(
+        &'a self,
+        ctx: &'a TurnEndContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Review-only for a turn-capped run: clear stale state, run the
+            // deterministic gate for evidence, then a single semantic review.
+            // A `fixable` verdict never spawns the G5 fixer nor re-enters the
+            // loop — its fix request is surfaced as a terminal note, and any
+            // decline stays observable through `semantic_note`.
+            self.semantic.last_report.lock().unwrap().take();
+            *self.semantic_note.lock().unwrap() = None;
+            self.semantic.reset_attempts();
+            let deterministic = self.deterministic.decide(ctx);
+            if deterministic.is_continue() {
+                return deterministic;
+            }
+            let report = self.deterministic.verify_report();
+            let deterministic_verdict = report.as_ref().map(|report| report.verdict);
+            let no_checks_detected = matches!(
+                deterministic_verdict,
+                Some(crate::verify::VerifyVerdict::Escalate)
+            ) && report
+                .as_ref()
+                .is_some_and(|report| report.results.is_empty() && !report.unavailable);
+            let review_signal = matches!(
+                deterministic_verdict,
+                Some(crate::verify::VerifyVerdict::Pass)
+            ) || (self.semantic_only_when_no_lowlevel_tests
+                && no_checks_detected);
+            if !review_signal {
+                return deterministic;
+            }
+            let decision = self.semantic.review_only_async(ctx).await;
+            // Surface the note when the review declined (no report) or when a
+            // `fixable` verdict was converted to a terminal note (the G5 fixer
+            // never runs on a capped turn, so the fix request must stay
+            // observable). Pass/replan/escalate notes duplicate the report.
+            let report = self.semantic.last_report();
+            let keep_note = report.is_none()
+                || matches!(
+                    report.as_ref().map(|report| report.verdict),
+                    Some(SemanticVerdict::Fixable)
+                );
+            if let ContinuationDecision::Stop { note: Some(note) } = &decision {
+                if keep_note {
+                    *self.semantic_note.lock().unwrap() = Some(note.clone());
+                }
+            }
+            decision
+        })
+    }
 }
 
 impl ContinuationPolicy for SemanticVerifyPolicy {
@@ -1171,6 +1233,23 @@ impl ContinuationPolicy for SemanticVerifyPolicy {
     fn semantic_report(&self) -> Option<SemanticVerifyReport> {
         self.last_report.lock().unwrap().take()
     }
+
+    fn review_only_async<'a>(
+        &'a self,
+        ctx: &'a TurnEndContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Review-only: a `fixable` verdict must not re-enter the loop or
+            // spawn the G5 fixer; surface the fix request as a terminal note.
+            match self.decide_async(ctx).await {
+                ContinuationDecision::Continue { message } => ContinuationDecision::Stop {
+                    note: Some(message),
+                },
+                decision => decision,
+            }
+        })
+    }
 }
 
 /// A policy the runner consults at the end of each completed `end_turn` turn.
@@ -1191,6 +1270,21 @@ pub trait ContinuationPolicy: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
     {
         Box::pin(async move { self.decide(ctx) })
+    }
+
+    /// Bounded read-only review of the most recent writing turn, without
+    /// continuing the loop. Used for the max-turns degradation turn: the
+    /// deterministic gate and a single semantic review run and their reports
+    /// surface through the same Verify / SemanticVerify / Status events, but
+    /// the G5 fixer never runs and the result is always terminal. The default
+    /// implementation delegates to [`Self::decide_async`]; the semantic
+    /// policies override it to strip any continuation.
+    fn review_only_async<'a>(
+        &'a self,
+        ctx: &'a TurnEndContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
+    {
+        Box::pin(async move { self.decide_async(ctx).await })
     }
 
     /// Structured report of the most recent verification round, when this
@@ -1330,6 +1424,19 @@ impl ContinuationPolicy for SpecModePolicy {
 
     fn spec_for_review(&self) -> Option<std::path::PathBuf> {
         self.last_spec_path.lock().unwrap().clone()
+    }
+
+    fn review_only_async<'a>(
+        &'a self,
+        _ctx: &'a TurnEndContext<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ContinuationDecision> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // A turn-capped SpecMode run must not auto-open the spec review
+            // dialog; the cap already ended the run.
+            *self.last_spec_path.lock().unwrap() = None;
+            ContinuationDecision::Stop { note: None }
+        })
     }
 }
 
@@ -1824,6 +1931,136 @@ mod tests {
         );
         let report = policy.semantic_report().expect("review signal surfaced");
         assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_only_fires_on_turn_capped_review() {
+        // The max-turns degradation turn gets a bounded read-only review: the
+        // semantic verifier runs once on the final writing state and the
+        // result is always terminal (the loop stops regardless of verdict).
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"final review"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.review_only_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let report = policy.semantic_report().expect("final review surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+        assert_eq!(report.summary, "final review");
+    }
+
+    #[tokio::test]
+    async fn semantic_review_only_fixable_never_continues_nor_fixes() {
+        // The load-bearing review-only guarantee for a turn-capped run: a
+        // `fixable` verdict must not continue the loop, and the G5 fixer must
+        // never run after the cap. The fix request surfaces as a terminal
+        // note and the report stays observable.
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let fix_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fix_calls_clone = fix_calls.clone();
+        let fix_runner: SemanticFixRunner = std::sync::Arc::new(move |_| {
+            fix_calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("fixed".to_string()) })
+        });
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(|_| {
+            Box::pin(async {
+                Ok(r#"{"verdict":"fixable","summary":"needs work","findings":["x"]}"#.to_string())
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            semantic_fix_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy = SemanticAfterVerifyPolicy::new(
+            verify_config,
+            project.path(),
+            Some(runner),
+            Some(fix_runner),
+        );
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.review_only_async(&context).await;
+        // Never continues, never spawns the fixer.
+        assert!(!decision.is_continue());
+        assert_eq!(fix_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // The fixable verdict stays observable as a report.
+        let report = policy.semantic_report().expect("fixable report surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Fixable);
+    }
+
+    #[tokio::test]
+    async fn semantic_review_only_respects_fail_closed_gate() {
+        // With the gate-open flag off, a no-checks turn must NOT fire the
+        // semantic review in review-only mode either (fail-closed unchanged).
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"should not run"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: false,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.review_only_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "fail-closed gate must not fire the review"
+        );
+        assert!(policy.semantic_report().is_none());
     }
 
     #[tokio::test]

@@ -742,14 +742,6 @@ pub async fn run_query_loop(
         // Defined as a macro because it must `continue`/`return` the loop.
         macro_rules! continue_or_end {
             ($assistant_msg:expr, $usage:expr) => {{
-                // The tool-less max-steps summary turn must never re-trigger
-                // continuation (anti-recursion): return its wrap-up directly.
-                if degradation_turn {
-                    return QueryOutcome::EndTurn {
-                        message: $assistant_msg,
-                        usage: $usage,
-                    };
-                }
                 let turn_ctx = crate::continuation::TurnEndContext {
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
@@ -774,7 +766,18 @@ pub async fn run_query_loop(
                         let _ = tx.send(QueryEvent::VerifyStarted);
                     }
                 }
-                let decision = continuation_policy.decide_async(&turn_ctx).await;
+                // The tool-less max-steps summary turn must never re-trigger
+                // continuation (anti-recursion), but the run's final state
+                // still gets a bounded read-only review: the deterministic
+                // gate and a single semantic review run, their reports
+                // surface through the same Verify / SemanticVerify / Status
+                // events below, and the loop then stops. The G5 fixer never
+                // runs on the capped turn.
+                let decision = if degradation_turn {
+                    continuation_policy.review_only_async(&turn_ctx).await
+                } else {
+                    continuation_policy.decide_async(&turn_ctx).await
+                };
                 // Structured verify report (audit spec Phase 1 §15.1): forward
                 // the round's per-check results to the TUI so it renders the
                 // boxed Verify indicator. Emitted for both Continue and Stop
@@ -807,6 +810,15 @@ pub async fn run_query_loop(
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::SpecForReview(path.display().to_string()));
                     }
+                }
+                // The degradation review must never continue the loop: return
+                // the summary turn's wrap-up directly, whatever the review
+                // decided.
+                if degradation_turn {
+                    return QueryOutcome::EndTurn {
+                        message: $assistant_msg,
+                        usage: $usage,
+                    };
                 }
                 match decision {
                     crate::continuation::ContinuationDecision::Continue { message } => {
@@ -3382,6 +3394,10 @@ mod tests {
         write_path: Option<String>,
         write_content: Option<String>,
         write_emitted: Arc<AtomicBool>,
+        /// When true, keep emitting `tool_use` turns after the one-shot write
+        /// (used by the max-turns degradation review test to force the cap
+        /// while still carrying a reviewable patch).
+        keep_tool_use_after_write: bool,
     }
 
     #[async_trait::async_trait]
@@ -3428,7 +3444,9 @@ mod tests {
                     .write_path
                     .as_ref()
                     .is_some_and(|_| !self.write_emitted.swap(true, AtomicOrdering::SeqCst));
-            let emit_tool_use = !self.always_end_turn && !tools_empty && self.write_path.is_none();
+            let emit_tool_use = !self.always_end_turn
+                && !tools_empty
+                && (self.write_path.is_none() || self.keep_tool_use_after_write);
 
             let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if write_tool_use {
                 let tool_id = uuid::Uuid::new_v4().to_string();
@@ -3666,6 +3684,7 @@ mod tests {
             write_path: None,
             write_content: None,
             write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
         });
         let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
 
@@ -3760,6 +3779,7 @@ mod tests {
             write_path: None,
             write_content: None,
             write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
         });
         let (outcome, messages) =
             drive_loop_with_provider(provider, tools, max_turns, continuation).await;
@@ -4387,6 +4407,7 @@ mod tests {
             write_path: Some(changed_path.to_string_lossy().into_owned()),
             write_content: Some(changed_content.to_string()),
             write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -4499,5 +4520,121 @@ mod tests {
             .summary
             .contains("fixture needs semantic review"));
         assert_eq!(fix_requests[0].findings, vec!["review the generated value"]);
+    }
+
+    /// The max-turns degradation (summary) turn now gets a bounded final
+    /// review: the semantic verifier runs once on the run's final state and
+    /// the loop still ends. Regression guard for the review-only wiring.
+    #[tokio::test]
+    async fn max_steps_runs_final_review_on_degradation_turn() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::write(fixture.path().join("notes.txt"), "plain\n").expect("fixture notes");
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let changed_path = fixture.path().join("notes.txt");
+        let changed_content = "plain\nreviewed by the final review\n";
+        let verifier_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let verifier_call_count = verifier_calls.clone();
+        let verifier: SemanticVerifyRunner = Arc::new(move |_| {
+            verifier_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Ok(r#"{"verdict":"pass","summary":"final review"}"#.to_string()) })
+        });
+
+        // Turn 1 writes the note, turn 2 is a noop tool round, turn 3 exceeds
+        // max_turns=2 and triggers the tool-less summary turn (the review).
+        let mut tools: Vec<Box<dyn Tool>> = noop_tools();
+        tools.push(Box::new(clawde_tools::FileWriteTool));
+        let recorded_tools = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded_tools,
+            always_end_turn: false,
+            write_path: Some(changed_path.to_string_lossy().into_owned()),
+            write_content: Some(changed_content.to_string()),
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: true,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = "loop-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.permission_handler = Arc::new(AllowAllHandler);
+        ctx.non_interactive = true;
+
+        let verify = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 2,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::SemanticVerify(verify),
+            semantic_verify_runner: Some(verifier),
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("write the note")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(
+            verifier_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the degradation turn must run exactly one semantic review"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&changed_path).unwrap(),
+            changed_content
+        );
+        let mut saw_semantic_pass = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let QueryEvent::SemanticVerify(report) = event {
+                assert_eq!(report.verdict, SemanticVerdict::Pass);
+                saw_semantic_pass = true;
+            }
+        }
+        assert!(
+            saw_semantic_pass,
+            "the final review must surface a semantic verify event"
+        );
     }
 }
