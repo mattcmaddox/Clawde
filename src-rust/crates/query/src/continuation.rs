@@ -207,6 +207,11 @@ pub struct SemanticVerifyRequest {
     pub spec: Option<clawde_core::spec::Spec>,
     /// Explicit allowlist for a future read-only verifier agent.
     pub read_only_tools: Vec<String>,
+    /// Reask hint for a retry attempt: the classified parse error from the
+    /// previous response, fed back into the prompt so the model can correct
+    /// its structured output. Parser-generated only, never raw model output;
+    /// None on the first attempt.
+    pub retry_hint: Option<String>,
 }
 
 /// Owned request handed to a fresh-executor fix runner (writer-verifier gap
@@ -273,6 +278,10 @@ pub const SEMANTIC_VERIFY_MAX_RESPONSE_BYTES: usize = 32 * 1024;
 pub const SEMANTIC_VERIFY_MAX_SUMMARY_CHARS: usize = 4_000;
 /// Maximum number of findings carried into a continuation note.
 pub const SEMANTIC_VERIFY_MAX_FINDINGS: usize = 16;
+/// Maximum characters of a reask hint fed back into the retry prompt. Parser
+/// errors are short in practice; this bounds the prompt even if a future error
+/// embeds a larger snippet of the rejected response.
+pub const SEMANTIC_VERIFY_MAX_RETRY_HINT_CHARS: usize = 300;
 /// Maximum size of one finding carried into a continuation note.
 pub const SEMANTIC_VERIFY_MAX_FINDING_CHARS: usize = 1_000;
 /// Maximum unified-diff characters passed to the semantic verifier.
@@ -534,8 +543,22 @@ async fn run_verifier_with_no_verdict_retry(
     };
     match parse_semantic_verify_response(&raw) {
         Ok(response) => Ok(response),
-        Err(_) if response_expresses_no_verdict(&raw) => {
-            let retry_raw = match runner(request).await {
+        Err(first_error) if response_expresses_no_verdict(&raw) => {
+            // Reask: feed the classified parse error back into the retry so the
+            // model can correct its structured output. This is parser feedback
+            // only — never raw model output — and the retry still runs through
+            // the same strict parser, so fail-closed is unchanged.
+            let mut retry_request = request;
+            // Bound the hint: parser errors are short today, but a future error
+            // could embed a larger snippet of the rejected response. The prompt
+            // must stay bounded, so truncate defensively.
+            retry_request.retry_hint = Some(
+                first_error
+                    .chars()
+                    .take(SEMANTIC_VERIFY_MAX_RETRY_HINT_CHARS)
+                    .collect(),
+            );
+            let retry_raw = match runner(retry_request).await {
                 Ok(raw) => raw,
                 Err(error) => {
                     return Err(ContinuationDecision::Stop {
@@ -736,6 +759,7 @@ impl SemanticVerifyPolicy {
             task_id: ctx.spec.as_ref().map(|spec| spec.task_id.clone()),
             spec: ctx.spec.clone(),
             read_only_tools: semantic_read_only_tool_names(),
+            retry_hint: None,
         })
     }
 
@@ -1855,6 +1879,162 @@ mod tests {
             "a structured (non-empty) parse error must not be retried"
         );
         assert!(policy.semantic_report().is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_reask_feeds_parse_error_to_retry() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let requests: std::sync::Arc<std::sync::Mutex<Vec<SemanticVerifyRequest>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |request| {
+            observed.lock().expect("request lock").push(request.clone());
+            Box::pin(async move {
+                if request.retry_hint.is_some() {
+                    // Second attempt: the reask hint is present, and the model
+                    // now returns a parseable verdict.
+                    Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string())
+                } else {
+                    // First attempt: prose-only output (no JSON object).
+                    Ok("The change looks correct.".to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        let captured = requests.lock().expect("request lock");
+        assert_eq!(
+            captured.len(),
+            2,
+            "prose-only output should trigger one reask retry"
+        );
+        assert!(
+            captured[0].retry_hint.is_none(),
+            "the first attempt must never carry a reask hint"
+        );
+        let hint = captured[1]
+            .retry_hint
+            .as_deref()
+            .expect("the retry must carry the classified parse error");
+        assert!(
+            hint.contains("malformed JSON") && hint.contains("no JSON object found"),
+            "hint should name the exact parse failure, got: {hint}"
+        );
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_reask_recovers_truncated_json_after_hint() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let requests: std::sync::Arc<std::sync::Mutex<Vec<SemanticVerifyRequest>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |request| {
+            observed.lock().expect("request lock").push(request.clone());
+            Box::pin(async move {
+                if request.retry_hint.is_some() {
+                    Ok(r#"{"verdict":"fixable","summary":"missing edge case","findings":["add boundary test"]}"#.to_string())
+                } else {
+                    // Truncated JSON (the v10 `expected , or }` decline shape):
+                    // no complete object, so no verdict is expressed.
+                    Ok(r#"{"verdict":"fixable","summary":"missing edge case""#.to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        let captured = requests.lock().expect("request lock");
+        assert_eq!(captured.len(), 2, "truncated JSON should trigger one reask");
+        let hint = captured[1]
+            .retry_hint
+            .as_deref()
+            .expect("the retry must carry the classified parse error");
+        assert!(
+            hint.contains("malformed JSON"),
+            "hint should name the parse failure, got: {hint}"
+        );
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Fixable);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_reask_declines_when_hinted_retry_also_fails() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok("still not JSON".to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a reask still gets exactly one retry before declining"
+        );
+        assert!(
+            policy.semantic_report().is_none(),
+            "a declined review leaves no report even after the reask retry"
+        );
     }
 
     #[test]
