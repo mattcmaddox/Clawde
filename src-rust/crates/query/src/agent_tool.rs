@@ -160,9 +160,28 @@ fn clawde_tools_for_network_mode(
         .collect()
 }
 
+fn validate_semantic_tool_set(tools: &[Box<dyn Tool>], allowed: &[String]) -> Result<(), String> {
+    if tools.len() != allowed.len()
+        || tools.iter().any(|tool| tool.network_capable())
+        || allowed
+            .iter()
+            .any(|name| tools.iter().filter(|tool| tool.name() == name).count() != 1)
+    {
+        return Err(
+            "semantic verifier tool allowlist did not resolve to an exact non-network tool set"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn build_semantic_verifier_tools() -> Vec<Box<dyn Tool>> {
     let allowed = semantic_verifier_tool_names();
-    build_agent_tools(Some(&allowed), true)
+    let tools = build_agent_tools(Some(&allowed), true);
+    if validate_semantic_tool_set(&tools, &allowed).is_err() {
+        return Vec::new();
+    }
+    tools
 }
 
 /// Build the AgentTool input JSON for a semantic verification request.
@@ -1133,8 +1152,21 @@ impl Tool for AgentTool {
         let model_registry = Arc::new(build_model_registry());
 
         // Build the tool list for the sub-agent.
-        // Always exclude AgentTool itself to prevent unbounded recursion.
-        let agent_tools = build_agent_tools_for_config(params.tools.as_deref(), true, &ctx.config);
+        // Always exclude AgentTool itself to prevent unbounded recursion. The
+        // semantic verifier gets a second, structural capability check here so
+        // a future allowlist/tool metadata change fails closed even if the
+        // request validator above is accidentally weakened.
+        let agent_tools =
+            if self.semantic_internal && params.description == "read-only semantic verification" {
+                let allowed = semantic_verifier_tool_names();
+                let tools = build_agent_tools_for_config(Some(&allowed), true, &ctx.config);
+                if let Err(error) = validate_semantic_tool_set(&tools, &allowed) {
+                    return ToolResult::error(error);
+                }
+                tools
+            } else {
+                build_agent_tools_for_config(params.tools.as_deref(), true, &ctx.config)
+            };
 
         // Resolve model: explicit override > managed config executor model > provider default.
         let model = resolve_subagent_model(&params, ctx);
@@ -1630,6 +1662,32 @@ mod tests {
             semantic_verify_runner(ctx).is_some(),
             "runner must be available for the free provider"
         );
+    }
+
+    #[test]
+    fn semantic_tool_set_is_exact_and_non_network_capable() {
+        let allowed = semantic_verifier_tool_names();
+        let tools = build_agent_tools_for_config(
+            Some(&allowed),
+            true,
+            &clawde_core::config::Config::default(),
+        );
+        validate_semantic_tool_set(&tools, &allowed).expect("semantic tools must be safe");
+        assert_eq!(
+            tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            allowed.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn semantic_tool_set_rejects_network_capable_allowlist_entries() {
+        let allowed = vec!["Bash".to_string()];
+        let tools = build_agent_tools_for_config(
+            Some(&allowed),
+            true,
+            &clawde_core::config::Config::default(),
+        );
+        assert!(validate_semantic_tool_set(&tools, &allowed).is_err());
     }
 
     #[test]
