@@ -279,10 +279,9 @@ fn bounded_semantic_turns(turns: u32, default: u32) -> u32 {
 
 const SEMANTIC_PATCH_SYSTEM_PROMPT: &str = "You are a bounded patch author. You have no tools and must not claim to have edited files. Return ONLY one JSON object with exactly one field: patch. The patch value must be a unified diff that applies to the named changed files and resolves every verifier finding. Do not use markdown fences, prose, comments outside the JSON object, or absolute paths. If you cannot produce a safe patch, return an empty patch string.";
 
-const SEMANTIC_VERIFY_SYSTEM_PROMPT: &str = "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict as your entire response; do not wrap it in a message field or any other envelope.";
+pub(crate) const SEMANTIC_VERIFY_SYSTEM_PROMPT: &str = "You are a read-only semantic verifier. You may inspect files and search the project, but you must never edit files, execute commands, access the network, or delegate to another agent. Return only the requested JSON verdict as your entire response; do not wrap it in a message field or any other envelope.";
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SemanticPatchResponse {
     patch: String,
 }
@@ -310,11 +309,42 @@ fn parse_semantic_patch_value(response: &str) -> Result<String, String> {
     Ok(parsed.patch)
 }
 
+fn parse_raw_unified_diff_response(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    let body = if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        let opening = lines.next()?.trim();
+        if !matches!(opening, "```diff" | "```patch") {
+            return None;
+        }
+        let closing = lines.next_back()?.trim();
+        if closing != "```" {
+            return None;
+        }
+        lines.collect::<Vec<_>>().join("\n")
+    } else {
+        trimmed.to_string()
+    };
+    let start = body
+        .find("--- ")
+        .filter(|&index| body[index..].starts_with("--- "))?;
+    let patch = body[start..].trim();
+    (patch.starts_with("--- ") && patch.contains("+++ ") && patch.contains("@@ "))
+        .then(|| patch.to_string())
+}
+
 fn parse_semantic_patch_response_for_request(
     response: &str,
     request: &crate::continuation::SemanticFixRequest,
 ) -> Result<String, String> {
-    let patch = parse_semantic_patch_value(response)?;
+    // The preferred contract is JSON. Some free models return the same
+    // unified diff directly; accept only an unmistakable raw/fenced diff and
+    // send it through the identical structural and scope checks below.
+    let patch = parse_semantic_patch_value(response).or_else(|_| {
+        parse_raw_unified_diff_response(response).ok_or_else(|| {
+            "semantic patch response was neither valid JSON nor a raw unified diff".to_string()
+        })
+    })?;
     match validate_semantic_patch_structure(&patch) {
         Ok(()) => Ok(patch),
         Err(original_error) => {
@@ -366,10 +396,52 @@ fn recover_single_file_hunk(
     Ok(reconstructed)
 }
 
+fn extract_json_object(input: &str) -> Option<&str> {
+    let start = input.find('{')?;
+    let bytes = input.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&input[start..=offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 fn normalize_semantic_patch_response(response: &str) -> Result<String, String> {
     let trimmed = response.trim();
     if !trimmed.starts_with("```") {
-        return Ok(trimmed.to_string());
+        // Free models sometimes add a short preamble or trailing explanation.
+        // Extract only one balanced JSON object; schema and patch validation
+        // below remain authoritative, so prose cannot weaken the contract.
+        return extract_json_object(trimmed)
+            .map(str::trim)
+            .filter(|json| !json.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "semantic patch response contained no JSON object".to_string());
     }
 
     // Some otherwise capable coding models wrap JSON in one markdown fence.
@@ -791,7 +863,7 @@ fn semantic_verify_input_for_config(
     )
 }
 
-fn semantic_verify_input(
+pub(crate) fn semantic_verify_input(
     request: &crate::continuation::SemanticVerifyRequest,
     model: &str,
     max_turns: u32,
@@ -1996,13 +2068,28 @@ mod tests {
 {"patch":"--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new"}
 ```"#;
         assert!(parse_semantic_patch_response(fenced).is_ok());
+        let prose = format!(
+            "Here is the requested patch:\n{}\nThis patch is scoped to src.rs.",
+            patch
+        );
+        assert!(parse_semantic_patch_response(&prose).is_ok());
+        let raw_diff = "--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new";
+        let raw_fenced = format!("```diff\n{raw_diff}\n```");
+        let request = sample_fix_request();
+        assert!(parse_semantic_patch_response_for_request(raw_diff, &request).is_ok());
+        assert!(parse_semantic_patch_response_for_request(&raw_fenced, &request).is_ok());
         assert!(parse_semantic_patch_response("```json{} ```").is_err());
         let wrong_fence = r#"```text
 {"patch":"x"}
 ```"#;
         assert!(parse_semantic_patch_response(wrong_fence).is_err());
         assert!(parse_semantic_patch_response(r#"{"patch":""}"#).is_err());
-        assert!(parse_semantic_patch_response(r#"{"patch":"x","extra":true}"#).is_err());
+        // Free models may add harmless metadata beside the patch. Ignore it
+        // while keeping the required patch field and all diff validation.
+        assert!(parse_semantic_patch_response(
+            r#"{"patch":"--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new","extra":true}"#
+        )
+        .is_ok());
         assert!(parse_semantic_patch_response(r#"{"patch":"plain prose"}"#).is_err());
         assert!(parse_semantic_patch_response(
             r#"{"patch":"--- a/src.rs\n+++ b/src.rs\n-old\n+new"}"#
