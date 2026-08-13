@@ -1620,6 +1620,15 @@ pub mod config {
         /// Maximum AgentTool turns for one read-only semantic review.
         #[serde(default = "default_semantic_max_turns")]
         pub semantic_max_turns: u32,
+        /// Provider/model route used by the semantic verifier's retry attempt.
+        /// When the first verifier response expresses no verdict (empty /
+        /// truncated / prose-only), the retry runs through this route instead
+        /// of `semantic_model`, so an upstream that repeatedly returns empty
+        /// completions (e.g. cline on a JSON-only prompt) can be bypassed on
+        /// the reask. Empty (default) reuses `semantic_model` — the retry then
+        /// hits the same upstream, which preserves today's behavior.
+        #[serde(default)]
+        pub semantic_retry_model: String,
         /// Maximum AgentTool turns for one fresh-executor fix session.
         #[serde(default = "default_semantic_fix_max_turns")]
         pub semantic_fix_max_turns: u32,
@@ -1695,6 +1704,7 @@ pub mod config {
                 timeout_secs: 180,
                 container_image: None,
                 semantic_model: DEFAULT_SEMANTIC_MODEL.to_string(),
+                semantic_retry_model: String::new(),
                 semantic_max_turns: DEFAULT_SEMANTIC_MAX_TURNS,
                 semantic_fix_max_turns: DEFAULT_SEMANTIC_FIX_MAX_TURNS,
                 semantic_max_attempts: DEFAULT_SEMANTIC_MAX_ATTEMPTS,

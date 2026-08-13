@@ -211,6 +211,45 @@ pub(crate) fn semantic_model(config: &clawde_core::config::Config) -> String {
     }
 }
 
+/// Choose which model a semantic verifier attempt runs through: the retry
+/// attempt (a reask with a parse-error hint) uses the configured retry model
+/// when set, otherwise every attempt uses the primary model.
+fn select_verifier_model(is_retry: bool, primary: &str, retry: &str) -> String {
+    if is_retry && !retry.trim().is_empty() {
+        retry.to_string()
+    } else {
+        primary.to_string()
+    }
+}
+
+/// Provider/model route for the semantic verifier's retry attempt, resolved
+/// like [`semantic_model`]. An empty/invalid configured value falls back to
+/// the primary `semantic_model` route so the retry behaves exactly like the
+/// first attempt (today's behavior). A `free/...` or `ollama/...` retry route
+/// lets the reask bypass an upstream that repeatedly returns empty
+/// completions for the JSON-only verifier prompt.
+fn semantic_retry_model(config: &clawde_core::config::Config) -> String {
+    let configured = config.verify.semantic_retry_model.trim();
+    if configured.is_empty() {
+        return semantic_model(config);
+    }
+    let active_provider = config.selected_provider_id();
+    let ok = match active_provider {
+        "free" => configured
+            .strip_prefix("free/")
+            .is_some_and(|m| !m.trim().is_empty()),
+        "ollama" => configured
+            .strip_prefix("ollama/")
+            .is_some_and(|m| !m.trim().is_empty()),
+        _ => false,
+    };
+    if ok {
+        configured.to_string()
+    } else {
+        semantic_model(config)
+    }
+}
+
 fn bounded_semantic_turns(turns: u32, default: u32) -> u32 {
     if turns == 0 {
         default
@@ -801,6 +840,7 @@ pub fn semantic_verify_runner(
     }
 
     let model = semantic_model(&ctx.config);
+    let retry_model = semantic_retry_model(&ctx.config);
     let max_turns = bounded_semantic_turns(
         ctx.config.verify.semantic_max_turns,
         clawde_core::config::DEFAULT_SEMANTIC_MAX_TURNS,
@@ -809,7 +849,12 @@ pub fn semantic_verify_runner(
     Some(Arc::new(
         move |request: crate::continuation::SemanticVerifyRequest| {
             let ctx = ctx.clone();
-            let model = model.clone();
+            // A retry request (retry_hint set) routes through the configured
+            // retry model when one exists, so an upstream that repeatedly
+            // returns empty completions (e.g. cline on a JSON-only prompt) can
+            // be bypassed on the reask. Unset retry model falls back to the
+            // primary model — identical to today's behavior.
+            let model = select_verifier_model(request.retry_hint.is_some(), &model, &retry_model);
             Box::pin(async move {
                 let input = semantic_verify_input(&request, &model, max_turns);
                 let result = AgentTool::semantic().execute(input, &ctx).await;
@@ -1667,6 +1712,58 @@ mod tests {
         assert_eq!(bounded_semantic_turns(decoded.semantic_fix_max_turns, 5), 5);
         assert_eq!(bounded_semantic_turns(decoded.semantic_max_attempts, 3), 3);
         assert_eq!(decoded.semantic_fix_max_attempts, 3);
+    }
+
+    #[test]
+    fn semantic_retry_model_resolves_like_primary_and_falls_back_when_unset() {
+        // Unset retry model falls back to the primary semantic model.
+        let mut config = clawde_core::config::Config::default();
+        assert_eq!(semantic_retry_model(&config), "free/auto");
+        config.verify.semantic_model = "free/groq/gpt-oss-120b".to_string();
+        assert_eq!(semantic_retry_model(&config), "free/groq/gpt-oss-120b");
+
+        // A valid free retry route is honored.
+        config.verify.semantic_retry_model = "free/nvidia/meta/llama-3.3-70b-instruct".to_string();
+        assert_eq!(
+            semantic_retry_model(&config),
+            "free/nvidia/meta/llama-3.3-70b-instruct"
+        );
+
+        // Invalid (foreign provider) routes fall back to the primary.
+        config.verify.semantic_retry_model = "anthropic/secret-model".to_string();
+        assert_eq!(semantic_retry_model(&config), "free/groq/gpt-oss-120b");
+
+        // Empty string falls back to primary.
+        config.verify.semantic_retry_model = String::new();
+        assert_eq!(semantic_retry_model(&config), "free/groq/gpt-oss-120b");
+    }
+
+    #[test]
+    fn verify_config_retry_model_round_trips() {
+        let mut config = clawde_core::config::Config::default();
+        config.verify.semantic_retry_model = "free/cerebras/gpt-oss-120b".to_string();
+        let serialized = serde_json::to_value(&config.verify).expect("serialize verify config");
+        let decoded: clawde_core::config::VerifyConfig =
+            serde_json::from_value(serialized).expect("deserialize verify config");
+        assert_eq!(decoded.semantic_retry_model, "free/cerebras/gpt-oss-120b");
+        let legacy: clawde_core::config::VerifyConfig =
+            serde_json::from_value(serde_json::json!({ "semantic_model": "free/auto" }))
+                .expect("legacy verify config without retry model deserializes");
+        assert_eq!(legacy.semantic_retry_model, "");
+    }
+
+    #[test]
+    fn select_verifier_model_uses_retry_route_only_for_reask_with_configured_model() {
+        let primary = "free/auto";
+        let retry = "free/groq/gpt-oss-120b";
+        // First attempt always uses the primary model.
+        assert_eq!(select_verifier_model(false, primary, retry), primary);
+        // Reask with a configured retry model routes through it.
+        assert_eq!(select_verifier_model(true, primary, retry), retry);
+        // Reask without a retry model (default) keeps the primary — the exact
+        // pre-lever behavior, so the fix is opt-in.
+        assert_eq!(select_verifier_model(true, primary, ""), primary);
+        assert_eq!(select_verifier_model(true, primary, "   "), primary);
     }
 
     #[test]
