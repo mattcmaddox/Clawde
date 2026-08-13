@@ -10009,6 +10009,19 @@ impl App {
                     crate::memory_update_notification::get_relative_memory_path(&path)
                 ));
             }
+            QueryEvent::PlanProgress(event) => {
+                self.status_message = Some(if event.persisted {
+                    format!(
+                        "Plan evidence recorded: {}",
+                        event.active_step_id.as_deref().unwrap_or("no active step")
+                    )
+                } else {
+                    format!(
+                        "Plan evidence not persisted: {}",
+                        event.error.as_deref().unwrap_or("unknown error")
+                    )
+                });
+            }
 
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;

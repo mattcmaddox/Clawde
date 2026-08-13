@@ -2196,6 +2196,29 @@ async fn run_headless(
                     }
                 }
             }
+            QueryEvent::PlanProgress(event) => {
+                if is_stream_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "plan_progress",
+                            "event": event,
+                        })
+                    );
+                } else if !is_json_output {
+                    let state = if event.persisted {
+                        "recorded"
+                    } else {
+                        "not persisted"
+                    };
+                    eprintln!(
+                        "\n[plan progress: {}] task={} step={}",
+                        state,
+                        event.task_id,
+                        event.active_step_id.as_deref().unwrap_or("none")
+                    );
+                }
+            }
             QueryEvent::Status(msg) => {
                 status_messages.push(msg.clone());
                 if is_stream_json {

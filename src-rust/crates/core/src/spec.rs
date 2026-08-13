@@ -159,10 +159,14 @@ impl Spec {
         })?;
         let approval = SpecApproval {
             spec_path: file_name.to_string_lossy().into_owned(),
-            task_id: spec.task_id,
+            task_id: spec.task_id.clone(),
             session_id: session_id.to_string(),
             content_hash: Self::content_hash(&raw),
         };
+        // Initialize the separate progress artifact before writing approval.
+        // If progress initialization fails, the spec remains unapproved and
+        // cannot authorize a write with missing or corrupt execution state.
+        crate::plan::PlanProgress::initialize_for_spec(dir, path, &raw, &spec, session_id)?;
         let approval_path = Self::approval_path(dir);
         if let Some(parent) = approval_path.parent() {
             std::fs::create_dir_all(parent)?;

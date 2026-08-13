@@ -121,8 +121,14 @@ pub use types::{
 /// that nothing calls can't silently rot (rustc's `dead_code` lint never fires
 /// for `pub` items).
 pub mod dead_code_guard;
+pub mod plan;
 pub mod skill_discovery;
 pub mod spec;
+pub use plan::{
+    PlanAdvanceEvidence, PlanEvidence, PlanProgress, PlanProgressEvent, PlanStateError, PlanStatus,
+    PlanStep, PlanStepPhase, PlanStepStatus, PlanTransition, PLAN_FAILURE_REPLAN_THRESHOLD,
+    PLAN_PROGRESS_SCHEMA_VERSION,
+};
 // Shared hierarchical slash-command metadata. Kept in core so the TUI can
 // discover nested routes without introducing a commands↔TUI dependency cycle.
 pub mod slash_commands;

@@ -395,6 +395,9 @@ pub enum QueryEvent {
     /// session-memory extraction. Carries the updated memory entrypoint so
     /// interactive clients can surface the existing memory-update notification.
     MemoryUpdated(String),
+    /// Advisory execution evidence appended to the approved plan progress
+    /// artifact. This never authorizes acceptance or advances a plan step.
+    PlanProgress(clawde_core::PlanProgressEvent),
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +528,162 @@ async fn materialize_turn_changes(
     (Some(snap.diff(hash).await), Some(patch))
 }
 
+fn truncate_plan_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}…")
+}
+
+fn plan_changed_files_summary(
+    patch: Option<&clawde_core::snapshot::Patch>,
+    project_root: &std::path::Path,
+) -> String {
+    let Some(patch) = patch else {
+        return "none".to_string();
+    };
+    let mut paths = patch
+        .files
+        .iter()
+        .take(12)
+        .map(|path| {
+            path.strip_prefix(project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace("\\\\", "/")
+        })
+        .collect::<Vec<_>>();
+    if patch.files.len() > paths.len() {
+        paths.push(format!("+{} more", patch.files.len() - paths.len()));
+    }
+    truncate_plan_text(&paths.join(", "), 700)
+}
+
+fn plan_turn_evidence(
+    project_root: &std::path::Path,
+    turn: u32,
+    stop_reason: &str,
+    wrote_files: bool,
+    tool_count: usize,
+    tool_error_count: u32,
+    patch: Option<&clawde_core::snapshot::Patch>,
+    diff: Option<&str>,
+    verify_report: Option<&crate::verify::VerifyReport>,
+    semantic_report: Option<&crate::continuation::SemanticVerifyReport>,
+    semantic_note: Option<&str>,
+) -> clawde_core::PlanEvidence {
+    let check_summary = verify_report
+        .map(|report| format!("{} ({:?})", report.headline, report.verdict))
+        .unwrap_or_else(|| "not_run".to_string());
+    let semantic_summary = semantic_report
+        .map(|report| format!("{} ({})", report.summary, report.verdict.as_str()))
+        .or_else(|| semantic_note.map(str::to_string))
+        .unwrap_or_else(|| "not_run".to_string());
+    let patch_hash = patch.map(|patch| patch.hash.as_str()).unwrap_or("none");
+    let diff_chars = diff.map(|value| value.chars().count()).unwrap_or(0);
+    clawde_core::PlanEvidence {
+        kind: "turn".to_string(),
+        summary: truncate_plan_text(
+            &format!(
+                "turn={turn}; stop_reason={}; writes={wrote_files}; tools={tool_count}; tool_errors={tool_error_count}; changed_files={}; tree_hash={patch_hash}; diff_chars={diff_chars}; checks={check_summary}; semantic={semantic_summary}",
+                truncate_plan_text(stop_reason, 80),
+                plan_changed_files_summary(patch, project_root),
+            ),
+            1_900,
+        ),
+        reference: patch
+            .and_then(|patch| patch.files.first())
+            .and_then(|path| path.strip_prefix(project_root).ok())
+            .map(|path| path.to_string_lossy().replace("\\\\", "/")),
+    }
+}
+
+fn active_plan_context(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    task_id: Option<&str>,
+) -> Option<String> {
+    let task_id = task_id?;
+    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
+        .unwrap_or_else(|| working_dir.to_path_buf());
+    let (spec_path, spec) = clawde_core::spec::Spec::approved_in(&project_root, session_id)?;
+    if spec.task_id != task_id {
+        return None;
+    }
+    let raw_spec = std::fs::read_to_string(spec_path).ok()?;
+    let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+    let progress =
+        clawde_core::PlanProgress::load_for(&project_root, task_id, session_id, &spec_hash)
+            .ok()??;
+    let active_id = progress.active_step_id.as_deref()?;
+    let step = progress.steps.iter().find(|step| step.id == active_id)?;
+    let acceptance = step
+        .acceptance
+        .iter()
+        .take(8)
+        .map(|item| format!("- {}", truncate_plan_text(item, 400)))
+        .collect::<Vec<_>>()
+        .join("\\n");
+    Some(format!(
+        "<active_plan_step>\nTask: {}\nStep: {} ({:?})\nStatus: {:?}\nAcceptance criteria:\n{}\nEvidence records: {}\nOnly the harness may advance this step; do not claim completion from prose. Work on this step and leave deterministic evidence for the next turn.\n</active_plan_step>",
+        truncate_plan_text(&spec.title, 200),
+        truncate_plan_text(&step.title, 300),
+        step.phase,
+        step.status,
+        if acceptance.is_empty() {
+            "- Use the approved task acceptance criteria.".to_string()
+        } else {
+            acceptance
+        },
+        step.evidence.len(),
+    ))
+    .map(|context| {
+        if progress.replan_required {
+            format!(
+                "{context}\nRecovery: deterministic checks failed {} consecutive times. Change the implementation approach before retrying; do not repeat the same failing action. The harness will clear this signal only after a passing check.",
+                progress.failure_streak
+            )
+        } else {
+            context
+        }
+    })
+}
+
+fn record_plan_turn_progress(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    task_id: Option<&str>,
+    evidence: clawde_core::PlanEvidence,
+    advance_evidence: clawde_core::PlanAdvanceEvidence,
+) -> Option<clawde_core::PlanProgressEvent> {
+    let task_id = task_id?;
+    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
+        .unwrap_or_else(|| working_dir.to_path_buf());
+    match clawde_core::PlanProgress::record_evidence_and_advance_for_approved_spec(
+        &project_root,
+        task_id,
+        session_id,
+        evidence.clone(),
+        advance_evidence,
+    ) {
+        Ok(Some(event)) => Some(event),
+        Ok(None) => None,
+        Err(error) => Some(clawde_core::PlanProgressEvent {
+            task_id: task_id.to_string(),
+            session_id: session_id.to_string(),
+            plan_status: clawde_core::PlanStatus::Active,
+            active_step_id: None,
+            failure_streak: 0,
+            replan_required: false,
+            evidence,
+            persisted: false,
+            transition: None,
+            error: Some(truncate_plan_text(&error.to_string(), 300)),
+        }),
+    }
+}
+
 /// Consecutive identical tool calls (same name + same input) with no writes
 /// and no diff that force a loop-health stop. Loop-engineering guidance: a
 /// model stuck repeating the exact same call (e.g. a failing Bash retry with
@@ -629,6 +788,9 @@ pub async fn run_query_loop(
     // Filled at each tool-execution site; consumed and cleared when the turn
     // ends at `continue_or_end!`.
     let mut turn_tool_signatures: Vec<String> = Vec::new();
+    // Count tool failures for the current logical turn without retaining raw
+    // tool output in the durable plan artifact.
+    let mut turn_tool_error_count: u32 = 0;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -689,6 +851,9 @@ pub async fn run_query_loop(
     // snapshot is only used for bounded change detection and does not commit or
     // modify the user's worktree.
     let snapshot_needed = tool_ctx.config.auto_commits == Some(true)
+        // Approved plan turns need the same scoped file evidence even when
+        // semantic review and auto-commits are both disabled.
+        || active_task_id.is_some()
         || matches!(
             config.continuation,
             crate::continuation::ContinuationMode::SemanticVerify(_)
@@ -800,7 +965,7 @@ pub async fn run_query_loop(
         // runaway limit); `Stop` surfaces any note and returns `EndTurn`.
         // Defined as a macro because it must `continue`/`return` the loop.
         macro_rules! continue_or_end {
-            ($assistant_msg:expr, $usage:expr) => {{
+            ($assistant_msg:expr, $usage:expr, $stop_reason:expr) => {{
                 let turn_ctx = crate::continuation::TurnEndContext {
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
@@ -828,6 +993,7 @@ pub async fn run_query_loop(
                 // actually executed this logical turn (accumulated at the
                 // execution sites below), so an end_turn message carrying only
                 // text still reflects the tool round that preceded it.
+                let tool_count = turn_tool_signatures.len();
                 let signature = if turn_tool_signatures.is_empty() {
                     None
                 } else {
@@ -876,25 +1042,67 @@ pub async fn run_query_loop(
                 // boxed Verify indicator. Emitted for both Continue and Stop
                 // outcomes; skipped rounds (read-only turns, no checks) carry
                 // no report and emit nothing.
-                if let Some(report) = continuation_policy.verify_report() {
+                let verify_report = continuation_policy.verify_report();
+                let semantic_report = continuation_policy.semantic_report();
+                let semantic_note = continuation_policy.semantic_note();
+                if let Some(report) = verify_report.clone() {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Verify(report));
                     }
                 }
-                if let Some(report) = continuation_policy.semantic_report() {
+                if let Some(report) = semantic_report.clone() {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::SemanticVerify(report));
                     }
                 }
-                // Surface a declined gate-open review signal (skip / runner
-                // error / parse failure) as a status event rather than
-                // discarding it, so the external harness can prove *why* the
-                // semantic verifier did not fire on a gate-eligible turn.
-                if let Some(note) = continuation_policy.semantic_note() {
+                if let Some(note) = semantic_note.clone() {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Status(note));
                     }
                 }
+                let plan_advance_evidence = clawde_core::PlanAdvanceEvidence {
+                    turn_made_writes: wrote_files,
+                    has_scoped_diff: $assistant_msg.snapshot_patch.is_some()
+                        && turn_diff.as_deref().is_some_and(|diff| !diff.trim().is_empty()),
+                    deterministic_checks_run: verify_report.as_ref().is_some_and(|report| {
+                        !report.unavailable && !report.results.is_empty()
+                    }),
+                    deterministic_passed: verify_report.as_ref().is_some_and(|report| {
+                        matches!(report.verdict, crate::verify::VerifyVerdict::Pass)
+                    }),
+                    deterministic_failed: verify_report.as_ref().is_some_and(|report| {
+                        !report.unavailable
+                            && report.results.iter().any(|result| !result.ok && !result.skipped)
+                    }),
+                };
+                if let Some(event) = record_plan_turn_progress(
+                    &tool_ctx.working_dir,
+                    &tool_ctx.session_id,
+                    active_task_id.as_deref(),
+                    plan_turn_evidence(
+                        &clawde_core::git_utils::get_repo_root(&tool_ctx.working_dir)
+                            .unwrap_or_else(|| tool_ctx.working_dir.clone()),
+                        turn,
+                        $stop_reason,
+                        wrote_files,
+                        tool_count,
+                        turn_tool_error_count,
+                        $assistant_msg.snapshot_patch.as_ref(),
+                        turn_diff.as_deref(),
+                        verify_report.as_ref(),
+                        semantic_report.as_ref(),
+                        semantic_note.as_deref(),
+                    ),
+                    plan_advance_evidence,
+                ) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::PlanProgress(event));
+                    }
+                }
+                // A declined gate-open review is already included in the
+                // bounded plan evidence above and was emitted as a status
+                // event before persistence.
+
                 // Spec-driven development (audit spec §10.2): when the
                 // spec-mode policy decided the stop because a spec was
                 // generated, forward its path so the TUI can auto-open the
@@ -940,6 +1148,7 @@ pub async fn run_query_loop(
                         // next turn's semantic context or write guard.
                         wrote_files = false;
                         turn_diff = None;
+                        turn_tool_error_count = 0;
                         turn_snapshot = if let Some(ref snap) = shadow_snap {
                             snap.track().await
                         } else {
@@ -1109,6 +1318,21 @@ pub async fn run_query_loop(
                         None => nudge,
                     });
                 }
+            }
+
+            // Inject the revalidated active plan step only for an approved
+            // task-bound plan. The spec and step state are harness-owned; the
+            // model sees coordination context but cannot advance it by claiming
+            // completion.
+            if let Some(plan_context) = active_plan_context(
+                &tool_ctx.working_dir,
+                &tool_ctx.session_id,
+                active_task_id.as_deref(),
+            ) {
+                patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                    Some(existing) => format!("{}\\n{}", existing, plan_context),
+                    None => plan_context,
+                });
             }
 
             // Goal system-prompt addendum (issue #230 / MI-3). Applied fresh
@@ -1850,6 +2074,9 @@ pub async fn run_query_loop(
                                 )
                                 .await
                             };
+                            if result.is_error {
+                                turn_tool_error_count += 1;
+                            }
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
                                     tool_name: tool_name.clone(),
@@ -1936,7 +2163,7 @@ pub async fn run_query_loop(
                         assistant_msg.snapshot_patch = Some(patch);
                     }
 
-                    continue_or_end!(assistant_msg, usage);
+                    continue_or_end!(assistant_msg, usage, stop_str.as_str());
                 } else if provider_id_str != "anthropic" {
                     // Non-Anthropic provider detected but no API key / credentials
                     // available.  Return a clear error instead of silently falling
@@ -2496,7 +2723,7 @@ pub async fn run_query_loop(
                         assistant_msg.snapshot_patch = Some(patch);
                     }
 
-                    continue_or_end!(assistant_msg, usage);
+                    continue_or_end!(assistant_msg, usage, stop);
                 }
                 "max_tokens" => {
                     // Mirror the TS recovery loop: inject a continuation nudge and
@@ -2688,6 +2915,9 @@ pub async fn run_query_loop(
                     // block so the conversation and TUI stay consistent.
                     let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                     for (p, result) in prepared.iter().zip(exec_results) {
+                        if result.is_error {
+                            turn_tool_error_count += 1;
+                        }
                         if !batch_cancelled {
                             let hooks = &tool_ctx.config.hooks;
                             let post_ctx = clawde_core::hooks::HookContext {
@@ -2756,7 +2986,7 @@ pub async fn run_query_loop(
                         turn_diff = turn_change_diff;
                         assistant_msg.snapshot_patch = Some(patch);
                     }
-                    continue_or_end!(assistant_msg, usage);
+                    continue_or_end!(assistant_msg, usage, "stop_sequence");
                 }
                 other => {
                     warn!(
@@ -2775,7 +3005,7 @@ pub async fn run_query_loop(
                         turn_diff = turn_change_diff;
                         assistant_msg.snapshot_patch = Some(patch);
                     }
-                    continue_or_end!(assistant_msg, usage);
+                    continue_or_end!(assistant_msg, usage, other);
                 }
             }
         }
@@ -2812,6 +3042,78 @@ mod tests {
     // guard — the same pattern as `crates/core/src/paths.rs::ENV_LOCK` — so
     // they don't race under `cargo test --workspace`'s parallel runner.
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn active_plan_context_is_bound_to_approved_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: "context-plan-task".to_string(),
+            task: "Use the active plan".to_string(),
+            session_id: Some("context-session".to_string()),
+            title: "Context plan".to_string(),
+            requirements: vec!["Keep the active step visible".to_string()],
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, "context-session").unwrap();
+
+        let context =
+            active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
+        assert!(context.contains("Keep the active step visible"));
+        assert!(context.contains("Only the harness may advance"));
+        assert!(!context.contains("Recovery:"));
+        assert!(
+            active_plan_context(dir.path(), "other-session", Some("context-plan-task")).is_none()
+        );
+
+        for _ in 0..clawde_core::PLAN_FAILURE_REPLAN_THRESHOLD {
+            clawde_core::PlanProgress::record_evidence_and_advance_for_approved_spec(
+                dir.path(),
+                "context-plan-task",
+                "context-session",
+                clawde_core::PlanEvidence {
+                    kind: "check".to_string(),
+                    summary: "A deterministic check failed.".to_string(),
+                    reference: Some("src/lib.rs".to_string()),
+                },
+                clawde_core::PlanAdvanceEvidence {
+                    deterministic_checks_run: true,
+                    deterministic_failed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let recovery_context =
+            active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
+        assert!(recovery_context.contains("Recovery:"));
+        assert!(recovery_context.contains("do not repeat the same failing action"));
+    }
+
+    #[test]
+    fn plan_turn_evidence_is_bounded_and_machine_descriptive() {
+        let evidence = plan_turn_evidence(
+            std::path::Path::new("/tmp/project"),
+            2,
+            "end_turn",
+            true,
+            3,
+            1,
+            None,
+            Some("diff"),
+            None,
+            None,
+            Some("semantic verifier declined: timeout"),
+        );
+        assert_eq!(evidence.kind, "turn");
+        assert!(evidence.summary.contains("turn=2"));
+        assert!(evidence.summary.contains("tool_errors=1"));
+        assert!(evidence
+            .summary
+            .contains("semantic verifier declined: timeout"));
+        assert!(evidence.summary.chars().count() <= 2_000);
+    }
 
     #[test]
     fn free_no_credentials_hint_is_headless_actionable() {
