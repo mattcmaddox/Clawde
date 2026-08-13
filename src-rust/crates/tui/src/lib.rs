@@ -252,7 +252,9 @@ pub use session_browser::{
     render_session_browser, SessionBrowserMode, SessionBrowserState, SessionEntry,
 };
 pub use stats_dialog::{load_stats, render_stats_dialog, StatsDialogState, StatsTab};
-pub use tab_status::{set_tab_status, TabStatus};
+pub use tab_status::{
+    emit_zellij_action, set_tab_status, zellij_action_sequence, TabStatus, ZellijAction,
+};
 pub use voice_mode_notice::{render_voice_mode_notice, VoiceModeNoticeState};
 // (FreeModeField type is now per-provider; legacy callers may still import both names.)
 pub use device_auth_dialog::{
