@@ -93,6 +93,9 @@ pub struct PlanProgressEvent {
     /// The harness asks the next turn to change approach after bounded failures.
     #[serde(default)]
     pub replan_required: bool,
+    /// At most one prior completed step to revisit before retrying the active step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backtrack_target_step_id: Option<String>,
     pub evidence: PlanEvidence,
     pub persisted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +118,9 @@ pub struct PlanProgress {
     pub failure_streak: u32,
     #[serde(default)]
     pub replan_required: bool,
+    /// A bounded recovery hint; this never changes step status by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backtrack_target_step_id: Option<String>,
     pub steps: Vec<PlanStep>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -255,6 +261,7 @@ impl PlanProgress {
             active_step_id: steps.first().map(|step| step.id.clone()),
             failure_streak: 0,
             replan_required: false,
+            backtrack_target_step_id: None,
             steps,
             created_at_ms: now,
             updated_at_ms: now,
@@ -357,6 +364,7 @@ impl PlanProgress {
             active_step_id: progress.active_step_id.clone(),
             failure_streak: progress.failure_streak,
             replan_required: progress.replan_required,
+            backtrack_target_step_id: progress.backtrack_target_step_id.clone(),
             evidence,
             persisted: true,
             transition,
@@ -378,14 +386,19 @@ impl PlanProgress {
                 .saturating_add(1)
                 .min(PLAN_FAILURE_REPLAN_THRESHOLD);
             self.replan_required = self.failure_streak >= PLAN_FAILURE_REPLAN_THRESHOLD;
+            if self.replan_required {
+                self.backtrack_target_step_id = self.previous_completed_step_id();
+            }
         }
         let transition = self.advance_from_evidence(evidence)?;
         if transition.is_some() {
             self.failure_streak = 0;
             self.replan_required = false;
+            self.backtrack_target_step_id = None;
         } else if evidence.deterministic_passed {
             self.failure_streak = 0;
             self.replan_required = false;
+            self.backtrack_target_step_id = None;
         }
         Ok(transition)
     }
@@ -518,6 +531,16 @@ impl PlanProgress {
         Ok(())
     }
 
+    fn previous_completed_step_id(&self) -> Option<String> {
+        let active_id = self.active_step_id.as_deref()?;
+        let active_index = self.steps.iter().position(|step| step.id == active_id)?;
+        self.steps[..active_index]
+            .iter()
+            .rev()
+            .find(|step| step.status == PlanStepStatus::Complete)
+            .map(|step| step.id.clone())
+    }
+
     fn step_mut(&mut self, id: &str) -> Result<&mut PlanStep, PlanStateError> {
         self.steps
             .iter_mut()
@@ -566,7 +589,18 @@ impl PlanProgress {
                     || self.active_step_id.as_ref() != active_ids.first()
                     || self.failure_streak > PLAN_FAILURE_REPLAN_THRESHOLD
                     || (!self.replan_required
-                        && self.failure_streak >= PLAN_FAILURE_REPLAN_THRESHOLD) =>
+                        && self.failure_streak >= PLAN_FAILURE_REPLAN_THRESHOLD)
+                    || (self.replan_required
+                        && self.failure_streak < PLAN_FAILURE_REPLAN_THRESHOLD)
+                    || self
+                        .backtrack_target_step_id
+                        .as_ref()
+                        .is_some_and(|target| {
+                            self.active_step_id.as_deref() == Some(target.as_str())
+                                || !self.steps.iter().any(|step| {
+                                    step.id == *target && step.status == PlanStepStatus::Complete
+                                })
+                        }) =>
             {
                 Err(PlanStateError::Corrupt(
                     "active plan has inconsistent active step".to_string(),
@@ -657,6 +691,7 @@ mod tests {
         assert_eq!(progress.active_step_id.as_deref(), Some("requirement-1"));
         assert_eq!(progress.failure_streak, 0);
         assert!(!progress.replan_required);
+        assert_eq!(progress.backtrack_target_step_id, None);
         assert_eq!(progress.steps.len(), 3);
         assert!(PlanProgress::path_for(dir.path(), &spec.task_id)
             .unwrap()
@@ -763,6 +798,32 @@ mod tests {
         assert_eq!(transition.completed_step_id, "requirement-1");
         assert_eq!(event.active_step_id.as_deref(), Some("requirement-2"));
         assert_eq!(event.plan_status, PlanStatus::Active);
+
+        for _ in 0..PLAN_FAILURE_REPLAN_THRESHOLD {
+            let recovery_event = PlanProgress::record_evidence_and_advance_for_approved_spec(
+                dir.path(),
+                &spec.task_id,
+                "session-one",
+                PlanEvidence {
+                    kind: "check".to_string(),
+                    summary: "The next requirement failed its deterministic check.".to_string(),
+                    reference: Some("src/lib.rs".to_string()),
+                },
+                PlanAdvanceEvidence {
+                    deterministic_checks_run: true,
+                    deterministic_failed: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+            if recovery_event.replan_required {
+                assert_eq!(
+                    recovery_event.backtrack_target_step_id.as_deref(),
+                    Some("requirement-1")
+                );
+            }
+        }
     }
 
     #[test]
@@ -877,6 +938,28 @@ mod tests {
         assert_eq!(transition.completed_step_id, "requirement-1");
         assert_eq!(progress.failure_streak, 0);
         assert!(!progress.replan_required);
+        assert_eq!(progress.backtrack_target_step_id, None);
+
+        for _ in 0..PLAN_FAILURE_REPLAN_THRESHOLD {
+            progress
+                .record_evidence(PlanEvidence {
+                    kind: "check".to_string(),
+                    summary: "The next step failed its deterministic check.".to_string(),
+                    reference: Some("src/lib.rs".to_string()),
+                })
+                .unwrap();
+            progress
+                .coordinate_from_evidence(PlanAdvanceEvidence {
+                    deterministic_checks_run: true,
+                    deterministic_failed: true,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            progress.backtrack_target_step_id.as_deref(),
+            Some("requirement-1")
+        );
     }
 
     #[test]

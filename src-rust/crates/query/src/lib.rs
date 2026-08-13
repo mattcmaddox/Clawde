@@ -640,8 +640,12 @@ fn active_plan_context(
     ))
     .map(|context| {
         if progress.replan_required {
+            let target = progress
+                .backtrack_target_step_id
+                .as_deref()
+                .unwrap_or("none");
             format!(
-                "{context}\nRecovery: deterministic checks failed {} consecutive times. Change the implementation approach before retrying; do not repeat the same failing action. The harness will clear this signal only after a passing check.",
+                "{context}\nRecovery: deterministic checks failed {} consecutive times. Change the implementation approach before retrying; do not repeat the same failing action. Revisit completed step '{target}' if present and verify its assumptions. The harness will clear this signal only after a passing check.",
                 progress.failure_streak
             )
         } else {
@@ -676,6 +680,7 @@ fn record_plan_turn_progress(
             active_step_id: None,
             failure_streak: 0,
             replan_required: false,
+            backtrack_target_step_id: None,
             evidence,
             persisted: false,
             transition: None,
@@ -3089,6 +3094,7 @@ mod tests {
             active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
         assert!(recovery_context.contains("Recovery:"));
         assert!(recovery_context.contains("do not repeat the same failing action"));
+        assert!(recovery_context.contains("Revisit completed step 'none'"));
     }
 
     #[test]
