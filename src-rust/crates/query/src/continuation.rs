@@ -486,6 +486,59 @@ pub fn parse_semantic_verify_response(response: &str) -> Result<SemanticVerifyRe
     Ok(parsed)
 }
 
+/// True when a verifier response is empty, truncated, or prose-only — i.e. it
+/// contains no complete JSON object at all — the provider-artifact shape
+/// (empty completion or cut-off response) worth one retry, as opposed to a
+/// structurally-invalid verdict object (unknown variant, missing summary,
+/// unknown field) or an over-limit response. Only the former is retried.
+fn is_empty_or_truncated_response(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() <= SEMANTIC_VERIFY_MAX_RESPONSE_BYTES && extract_json_object(trimmed).is_none()
+}
+
+/// Run the injected verifier once, retrying a single time when the response is
+/// empty/truncated (no complete JSON object) before declining. The retry runs
+/// through the same strict parser, so the fail-closed contract is unchanged: a
+/// retry can never authorize a verdict the first attempt would not have.
+async fn run_verifier_with_empty_retry(
+    runner: SemanticVerifyRunner,
+    request: SemanticVerifyRequest,
+) -> Result<SemanticVerifyResponse, ContinuationDecision> {
+    let raw = match runner(request.clone()).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Err(ContinuationDecision::Stop {
+                note: Some(format!(
+                    "Semantic verification could not run safely: {}",
+                    classify_semantic_runner_error(&error)
+                )),
+            });
+        }
+    };
+    match parse_semantic_verify_response(&raw) {
+        Ok(response) => Ok(response),
+        Err(_) if is_empty_or_truncated_response(&raw) => {
+            let retry_raw = match runner(request).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return Err(ContinuationDecision::Stop {
+                        note: Some(format!(
+                            "Semantic verification could not run safely: {}",
+                            classify_semantic_runner_error(&error)
+                        )),
+                    });
+                }
+            };
+            parse_semantic_verify_response(&retry_raw).map_err(|error| ContinuationDecision::Stop {
+                note: Some(format!("Semantic verification stopped: {error}")),
+            })
+        }
+        Err(error) => Err(ContinuationDecision::Stop {
+            note: Some(format!("Semantic verification stopped: {error}")),
+        }),
+    }
+}
+
 /// Read-only tools a future semantic verifier may receive.
 ///
 /// This is an explicit allowlist rather than a permission-level filter: a tool
@@ -1085,28 +1138,16 @@ impl ContinuationPolicy for SemanticVerifyPolicy {
                 .as_ref()
                 .expect("request_from_context checked runner presence")
                 .clone();
-            let raw = match runner(request).await {
-                Ok(raw) => raw,
-                Err(error) => {
-                    return ContinuationDecision::Stop {
-                        note: Some(format!(
-                            "Semantic verification could not run safely: {}",
-                            classify_semantic_runner_error(&error)
-                        )),
-                    }
-                }
+            // Empty/truncated responses (a provider empty completion) get one
+            // retry before declining; structured failures do not.
+            let response = match run_verifier_with_empty_retry(runner, request).await {
+                Ok(response) => response,
+                Err(decision) => return decision,
             };
-            match parse_semantic_verify_response(&raw) {
-                Ok(response) => {
-                    if response.verdict == SemanticVerdict::Pass {
-                        self.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    self.response_decision(response)
-                }
-                Err(error) => ContinuationDecision::Stop {
-                    note: Some(format!("Semantic verification stopped: {error}")),
-                },
+            if response.verdict == SemanticVerdict::Pass {
+                self.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
             }
+            self.response_decision(response)
         })
     }
 
@@ -1525,6 +1566,171 @@ mod tests {
         // The read-only review signal is surfaced via the semantic report.
         let report = policy.semantic_report().expect("review signal surfaced");
         assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_retries_once_on_empty_response() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(String::new())
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "empty response should trigger exactly one retry"
+        );
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_retries_on_truncated_response() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(r#"{"verdict":"pass","summary":"reviewed"#.to_string())
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"reviewed"}"#.to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "truncated JSON should trigger exactly one retry"
+        );
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_declines_when_retry_is_also_empty() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(String::new()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(
+            policy.semantic_report().is_none(),
+            "a declined review leaves no report"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_does_not_retry_a_structured_parse_error() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(r#"{"verdict":"maybe","summary":"reviewed"}"#.to_string()) })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a structured (non-empty) parse error must not be retried"
+        );
+        assert!(policy.semantic_report().is_none());
     }
 
     #[tokio::test]
