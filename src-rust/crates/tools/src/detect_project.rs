@@ -115,7 +115,10 @@ pub fn detect_project_info(root: &Path) -> ProjectInfo {
         if root.join("tox.ini").exists() {
             test_commands.push("tox".to_string());
         }
-        test_commands.push("python -m pytest".to_string());
+        // `python3` rather than `python`: modern distros (Debian/Ubuntu) ship
+        // only `python3`, and a bare `python` may be absent from PATH — which
+        // would make the detected test command spawn-fail and skip.
+        test_commands.push("python3 -m pytest".to_string());
 
         let mut lint_commands = Vec::new();
         if root.join("ruff.toml").exists() || root.join(".ruff.toml").exists() {
