@@ -525,6 +525,54 @@ async fn materialize_turn_changes(
     (Some(snap.diff(hash).await), Some(patch))
 }
 
+/// Consecutive identical tool calls (same name + same input) with no writes
+/// and no diff that force a loop-health stop. Loop-engineering guidance: a
+/// model stuck repeating the exact same call (e.g. a failing Bash retry with
+/// identical args) would otherwise burn turns until the cap. Three identical
+/// no-progress turns is a conservative threshold: a legitimate same-command
+/// retry is given headroom, but a true loop is cut short before the cap.
+pub const NO_PROGRESS_STOP_STREAK: u32 = 3;
+
+/// Update the loop-health no-progress detector and report whether the loop
+/// must stop.
+///
+/// `signature` is the joined signature of the tool calls executed this logical
+/// turn (`None` when no tools ran). The streak only advances when the SAME
+/// signature repeats with no writes and no diff; any change (different call,
+/// a write, a diff, or a text-only turn) resets it. Returns `true` when the
+/// streak reached [`NO_PROGRESS_STOP_STREAK`].
+fn update_no_progress_state(
+    signature: Option<String>,
+    last_tool_signature: &mut Option<String>,
+    no_progress_streak: &mut u32,
+    wrote_files: bool,
+    has_diff: bool,
+) -> bool {
+    // A text-only turn (no tools) is never a no-progress signature: reset.
+    let Some(sig) = signature else {
+        *last_tool_signature = None;
+        *no_progress_streak = 0;
+        return false;
+    };
+    // Any progress (a write or a diff) resets the streak even when the call
+    // signature happens to match.
+    if wrote_files || has_diff {
+        *last_tool_signature = Some(sig);
+        *no_progress_streak = 0;
+        return false;
+    }
+    // A no-progress tool turn: extend the identical-call run or start a new
+    // one (the first turn of a run already counts — matching the goal guard's
+    // 3-strike semantics).
+    if last_tool_signature.as_deref() == Some(sig.as_str()) {
+        *no_progress_streak += 1;
+    } else {
+        *no_progress_streak = 1;
+    }
+    *last_tool_signature = Some(sig);
+    *no_progress_streak >= NO_PROGRESS_STOP_STREAK
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -570,6 +618,17 @@ pub async fn run_query_loop(
     // executed a file-writing tool, so the verify continuation policy can skip
     // pure read/search turns.
     let mut wrote_files = false;
+    // Loop-health no-progress detector: the signature of the previous turn's
+    // tool calls and how many consecutive turns repeated the identical call
+    // with no writes and no diff. Reset whenever the signature changes or any
+    // progress (write/diff) happens; stops the loop at
+    // NO_PROGRESS_STOP_STREAK so a stuck model cannot burn turns to the cap.
+    let mut last_tool_signature: Option<String> = None;
+    let mut no_progress_streak: u32 = 0;
+    // Signatures of the tool calls executed during the current logical turn.
+    // Filled at each tool-execution site; consumed and cleared when the turn
+    // ends at `continue_or_end!`.
+    let mut turn_tool_signatures: Vec<String> = Vec::new();
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -759,6 +818,40 @@ pub async fn run_query_loop(
                         )
                     }),
                 };
+                // Loop-health no-progress detector (research lever): if the
+                // model repeated the IDENTICAL tool call (same name + same
+                // input) with no writes and no diff, bump the streak;
+                // otherwise reset it. At NO_PROGRESS_STOP_STREAK consecutive
+                // no-progress turns, stop instead of continuing to burn turns
+                // up to the cap. A text-only turn (None signature) or any
+                // progress resets the streak. Signatures come from the tools
+                // actually executed this logical turn (accumulated at the
+                // execution sites below), so an end_turn message carrying only
+                // text still reflects the tool round that preceded it.
+                let signature = if turn_tool_signatures.is_empty() {
+                    None
+                } else {
+                    Some(turn_tool_signatures.join("|"))
+                };
+                turn_tool_signatures.clear();
+                if update_no_progress_state(
+                    signature,
+                    &mut last_tool_signature,
+                    &mut no_progress_streak,
+                    wrote_files,
+                    turn_diff.is_some(),
+                ) {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!(
+                            "No progress detected: the model repeated the same tool call {} consecutive turns without changing any files — stopping the loop.",
+                            no_progress_streak
+                        )));
+                    }
+                    return QueryOutcome::EndTurn {
+                        message: $assistant_msg,
+                        usage: $usage,
+                    };
+                }
                 // Announce a slow round up front so the TUI can show a
                 // spinner instead of a silent wait during the checks.
                 if continuation_policy.will_run_checks(&turn_ctx) {
@@ -1734,6 +1827,11 @@ pub async fn run_query_loop(
                                 });
                             }
                             wrote_files |= is_write_tool(&tool_name);
+                            turn_tool_signatures.push(format!(
+                                "{}:{}",
+                                tool_name,
+                                serde_json::to_string(&tool_input).unwrap_or_default()
+                            ));
                             let result = if malformed_tool_calls.contains(&tool_id) {
                                 // Never execute a tool whose arguments could not
                                 // be parsed — return an error the model can see
@@ -2489,6 +2587,11 @@ pub async fn run_query_loop(
                                 });
                             }
                             wrote_files |= is_write_tool(&name);
+                            turn_tool_signatures.push(format!(
+                                "{}:{}",
+                                name,
+                                serde_json::to_string(&input).unwrap_or_default()
+                            ));
 
                             let hooks = &tool_ctx.config.hooks;
                             let hook_ctx = clawde_core::hooks::HookContext {
@@ -3398,6 +3501,11 @@ mod tests {
         /// (used by the max-turns degradation review test to force the cap
         /// while still carrying a reviewable patch).
         keep_tool_use_after_write: bool,
+        /// When true, alternate tool_use and end_turn per request so the loop
+        /// reaches `continue_or_end!` every other request with a fixed
+        /// `noop_tool` signature — used to exercise the loop-health
+        /// no-progress detector across continuation turns.
+        alternate_tool_then_end: bool,
     }
 
     #[async_trait::async_trait]
@@ -3437,6 +3545,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(tools_empty);
+            let request_index = self.tools_empty_per_request.lock().unwrap().len();
 
             let msg_id = uuid::Uuid::new_v4().to_string();
             let write_tool_use = !tools_empty
@@ -3448,86 +3557,137 @@ mod tests {
                 && !tools_empty
                 && (self.write_path.is_none() || self.keep_tool_use_after_write);
 
-            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if write_tool_use {
-                let tool_id = uuid::Uuid::new_v4().to_string();
-                let input = serde_json::json!({
-                    "file_path": self.write_path.as_deref().unwrap_or_default(),
-                    "content": self.write_content.as_deref().unwrap_or_default(),
-                });
-                vec![
-                    Ok(StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: "mock-model".to_string(),
-                        usage: UsageInfo::default(),
-                    }),
-                    Ok(StreamEvent::ContentBlockStart {
-                        index: 0,
-                        content_block: ContentBlock::ToolUse {
-                            id: tool_id,
-                            name: clawde_core::constants::TOOL_NAME_FILE_WRITE.to_string(),
-                            input,
-                            thought_signature: None,
-                        },
-                    }),
-                    Ok(StreamEvent::InputJsonDelta {
-                        index: 0,
-                        partial_json: serde_json::json!({
-                            "file_path": self.write_path.as_deref().unwrap_or_default(),
-                            "content": self.write_content.as_deref().unwrap_or_default(),
-                        })
-                        .to_string(),
-                    }),
-                    Ok(StreamEvent::MessageDelta {
-                        stop_reason: Some(StopReason::ToolUse),
-                        usage: Some(UsageInfo::default()),
-                    }),
-                    Ok(StreamEvent::MessageStop),
-                ]
-            } else if emit_tool_use {
-                let tool_id = uuid::Uuid::new_v4().to_string();
-                vec![
-                    Ok(StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: "mock-model".to_string(),
-                        usage: UsageInfo::default(),
-                    }),
-                    Ok(StreamEvent::ContentBlockStart {
-                        index: 0,
-                        content_block: ContentBlock::ToolUse {
-                            id: tool_id,
-                            name: "noop_tool".to_string(),
-                            input: serde_json::json!({}),
-                            thought_signature: None,
-                        },
-                    }),
-                    Ok(StreamEvent::InputJsonDelta {
-                        index: 0,
-                        partial_json: "{}".to_string(),
-                    }),
-                    Ok(StreamEvent::MessageDelta {
-                        stop_reason: Some(StopReason::ToolUse),
-                        usage: Some(UsageInfo::default()),
-                    }),
-                    Ok(StreamEvent::MessageStop),
-                ]
-            } else {
-                vec![
-                    Ok(StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: "mock-model".to_string(),
-                        usage: UsageInfo::default(),
-                    }),
-                    Ok(StreamEvent::TextDelta {
-                        index: 0,
-                        text: "Progress summary.".to_string(),
-                    }),
-                    Ok(StreamEvent::MessageDelta {
-                        stop_reason: Some(StopReason::EndTurn),
-                        usage: Some(UsageInfo::default()),
-                    }),
-                    Ok(StreamEvent::MessageStop),
-                ]
-            };
+            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> =
+                if self.alternate_tool_then_end && !tools_empty {
+                    // No-progress-detector fixture: alternate a fixed `noop_tool`
+                    // tool_use (request N) with an end_turn text (request N+1) so
+                    // the loop reaches `continue_or_end!` every other request
+                    // carrying the same tool signature.
+                    if request_index % 2 == 1 {
+                        let tool_id = uuid::Uuid::new_v4().to_string();
+                        vec![
+                            Ok(StreamEvent::MessageStart {
+                                id: msg_id,
+                                model: "mock-model".to_string(),
+                                usage: UsageInfo::default(),
+                            }),
+                            Ok(StreamEvent::ContentBlockStart {
+                                index: 0,
+                                content_block: ContentBlock::ToolUse {
+                                    id: tool_id,
+                                    name: "noop_tool".to_string(),
+                                    input: serde_json::json!({"repeat": true}),
+                                    thought_signature: None,
+                                },
+                            }),
+                            Ok(StreamEvent::InputJsonDelta {
+                                index: 0,
+                                partial_json: r#"{"repeat": true}"#.to_string(),
+                            }),
+                            Ok(StreamEvent::MessageDelta {
+                                stop_reason: Some(StopReason::ToolUse),
+                                usage: Some(UsageInfo::default()),
+                            }),
+                            Ok(StreamEvent::MessageStop),
+                        ]
+                    } else {
+                        vec![
+                            Ok(StreamEvent::MessageStart {
+                                id: msg_id,
+                                model: "mock-model".to_string(),
+                                usage: UsageInfo::default(),
+                            }),
+                            Ok(StreamEvent::TextDelta {
+                                index: 0,
+                                text: "Progress summary.".to_string(),
+                            }),
+                            Ok(StreamEvent::MessageDelta {
+                                stop_reason: Some(StopReason::EndTurn),
+                                usage: Some(UsageInfo::default()),
+                            }),
+                            Ok(StreamEvent::MessageStop),
+                        ]
+                    }
+                } else if write_tool_use {
+                    let tool_id = uuid::Uuid::new_v4().to_string();
+                    let input = serde_json::json!({
+                        "file_path": self.write_path.as_deref().unwrap_or_default(),
+                        "content": self.write_content.as_deref().unwrap_or_default(),
+                    });
+                    vec![
+                        Ok(StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: "mock-model".to_string(),
+                            usage: UsageInfo::default(),
+                        }),
+                        Ok(StreamEvent::ContentBlockStart {
+                            index: 0,
+                            content_block: ContentBlock::ToolUse {
+                                id: tool_id,
+                                name: clawde_core::constants::TOOL_NAME_FILE_WRITE.to_string(),
+                                input,
+                                thought_signature: None,
+                            },
+                        }),
+                        Ok(StreamEvent::InputJsonDelta {
+                            index: 0,
+                            partial_json: serde_json::json!({
+                                "file_path": self.write_path.as_deref().unwrap_or_default(),
+                                "content": self.write_content.as_deref().unwrap_or_default(),
+                            })
+                            .to_string(),
+                        }),
+                        Ok(StreamEvent::MessageDelta {
+                            stop_reason: Some(StopReason::ToolUse),
+                            usage: Some(UsageInfo::default()),
+                        }),
+                        Ok(StreamEvent::MessageStop),
+                    ]
+                } else if emit_tool_use {
+                    let tool_id = uuid::Uuid::new_v4().to_string();
+                    vec![
+                        Ok(StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: "mock-model".to_string(),
+                            usage: UsageInfo::default(),
+                        }),
+                        Ok(StreamEvent::ContentBlockStart {
+                            index: 0,
+                            content_block: ContentBlock::ToolUse {
+                                id: tool_id,
+                                name: "noop_tool".to_string(),
+                                input: serde_json::json!({}),
+                                thought_signature: None,
+                            },
+                        }),
+                        Ok(StreamEvent::InputJsonDelta {
+                            index: 0,
+                            partial_json: "{}".to_string(),
+                        }),
+                        Ok(StreamEvent::MessageDelta {
+                            stop_reason: Some(StopReason::ToolUse),
+                            usage: Some(UsageInfo::default()),
+                        }),
+                        Ok(StreamEvent::MessageStop),
+                    ]
+                } else {
+                    vec![
+                        Ok(StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: "mock-model".to_string(),
+                            usage: UsageInfo::default(),
+                        }),
+                        Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "Progress summary.".to_string(),
+                        }),
+                        Ok(StreamEvent::MessageDelta {
+                            stop_reason: Some(StopReason::EndTurn),
+                            usage: Some(UsageInfo::default()),
+                        }),
+                        Ok(StreamEvent::MessageStop),
+                    ]
+                };
 
             Ok(Box::pin(futures::stream::iter(events)))
         }
@@ -3685,6 +3845,7 @@ mod tests {
             write_content: None,
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
         });
         let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
 
@@ -3780,6 +3941,7 @@ mod tests {
             write_content: None,
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
         });
         let (outcome, messages) =
             drive_loop_with_provider(provider, tools, max_turns, continuation).await;
@@ -4408,6 +4570,7 @@ mod tests {
             write_content: Some(changed_content.to_string()),
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -4566,6 +4729,7 @@ mod tests {
             write_content: Some(changed_content.to_string()),
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: true,
+            alternate_tool_then_end: false,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -4635,6 +4799,188 @@ mod tests {
         assert!(
             saw_semantic_pass,
             "the final review must surface a semantic verify event"
+        );
+    }
+
+    // ---- Loop-health no-progress detector (research lever) ----------------
+
+    #[test]
+    fn no_progress_detector_requires_identical_signature_and_no_progress() {
+        let mut last = None;
+        let mut streak = 0;
+        // First identical no-op call: no write, no diff → streak 1, not stopped.
+        assert!(!update_no_progress_state(
+            Some("noop_tool:{}".to_string()),
+            &mut last,
+            &mut streak,
+            false,
+            false,
+        ));
+        assert_eq!(streak, 1);
+        // Same call again: streak 2.
+        assert!(!update_no_progress_state(
+            Some("noop_tool:{}".to_string()),
+            &mut last,
+            &mut streak,
+            false,
+            false,
+        ));
+        assert_eq!(streak, 2);
+        // Third identical call with no progress → STOP at NO_PROGRESS_STOP_STREAK.
+        assert!(update_no_progress_state(
+            Some("noop_tool:{}".to_string()),
+            &mut last,
+            &mut streak,
+            false,
+            false,
+        ));
+        assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
+    }
+
+    #[test]
+    fn no_progress_detector_resets_on_writes_diff_or_signature_change() {
+        let mut last = None;
+        let mut streak = 0;
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        assert_eq!(streak, 2);
+        // A write resets the streak even for the identical call.
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut last,
+            &mut streak,
+            true,
+            false,
+        ));
+        assert_eq!(streak, 0);
+        // A diff resets it too.
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut last,
+            &mut streak,
+            false,
+            true,
+        ));
+        assert_eq!(streak, 0);
+        // A different call starts a fresh streak (the first turn of the new
+        // run counts, matching the goal guard's 3-strike semantics).
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        assert!(!update_no_progress_state(
+            Some("b".to_string()),
+            &mut last,
+            &mut streak,
+            false,
+            false,
+        ));
+        assert_eq!(streak, 1);
+        // A text-only turn (None signature) also resets.
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        assert!(!update_no_progress_state(
+            None,
+            &mut last,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, 0);
+    }
+
+    /// Whole-loop wiring: a Goal-mode loop whose model repeats the same tool
+    /// call with no writes is stopped by the no-progress detector before the
+    /// turn cap, and the Status event is surfaced.
+    #[tokio::test]
+    async fn no_progress_detector_stops_repeated_tool_loop_before_cap() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = tempfile::tempdir().expect("goal home");
+        let _old = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", home.path());
+        let store = clawde_core::GoalStore::open_default().expect("goal store");
+        store
+            .set_goal("loop-test", "finish the feature", None, 0)
+            .expect("set goal");
+
+        let recorded_tools = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: recorded_tools.clone(),
+            always_end_turn: false,
+            write_path: None,
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: true,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("test client");
+        let mut ctx = deny_all_context();
+        ctx.session_id = "loop-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 20,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Goal,
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // Restore the environment before any assertion can panic.
+        match _old {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the no-progress detector must end the loop with EndTurn"
+        );
+        let request_count = recorded_tools.lock().unwrap().len();
+        assert!(
+            request_count < 40,
+            "the detector must stop well before max_turns*2 requests, got {request_count}"
+        );
+        let statuses: Vec<String> = {
+            let mut out = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                if let QueryEvent::Status(s) = event {
+                    out.push(s);
+                }
+            }
+            out
+        };
+        assert!(
+            statuses.iter().any(|s| s.contains("No progress detected")),
+            "expected a no-progress Status event, got: {statuses:?}"
         );
     }
 }
