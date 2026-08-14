@@ -127,7 +127,7 @@ pub mod spec;
 pub use plan::{
     PlanAdvanceEvidence, PlanEvidence, PlanProgress, PlanProgressEvent, PlanStateError, PlanStatus,
     PlanStep, PlanStepPhase, PlanStepStatus, PlanTransition, PLAN_FAILURE_REPLAN_THRESHOLD,
-    PLAN_PROGRESS_SCHEMA_VERSION,
+    PLAN_MAX_REPLANS, PLAN_PROGRESS_SCHEMA_VERSION,
 };
 // Shared hierarchical slash-command metadata. Kept in core so the TUI can
 // discover nested routes without introducing a commands↔TUI dependency cycle.

@@ -10,9 +10,19 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PLAN_PROGRESS_SCHEMA_VERSION: u32 = 1;
-pub const PLAN_FAILURE_REPLAN_THRESHOLD: u32 = 2;
+
 const MAX_EVIDENCE_SUMMARY_CHARS: usize = 2_000;
 const MAX_EVIDENCE_KIND_CHARS: usize = 64;
+
+/// Consecutive real deterministic failures before the harness asks the next
+/// turn to change approach (the replan signal).
+pub const PLAN_FAILURE_REPLAN_THRESHOLD: u32 = 2;
+
+/// Bounded replan budget: after this many replan signals on the same plan, the
+/// harness fail-closes the plan as `Blocked` instead of letting the model
+/// retry forever. The approved spec is never mutated; the user must approve a
+/// new spec to continue.
+pub const PLAN_MAX_REPLANS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +106,10 @@ pub struct PlanProgressEvent {
     /// The harness asks the next turn to change approach after bounded failures.
     #[serde(default)]
     pub replan_required: bool,
+    /// Bounded replan budget counter; at [`PLAN_MAX_REPLANS`] the plan is
+    /// fail-closed as `Blocked`.
+    #[serde(default)]
+    pub replan_count: u32,
     /// At most one prior completed step to revisit before retrying the active step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backtrack_target_step_id: Option<String>,
@@ -124,6 +138,11 @@ pub struct PlanProgress {
     pub failure_streak: u32,
     #[serde(default)]
     pub replan_required: bool,
+    /// How many replan signals the active plan has emitted; the bounded budget
+    /// that fail-closes the plan at [`PLAN_MAX_REPLANS`]. Cleared when a
+    /// passing check or step transition ends the recovery cycle.
+    #[serde(default)]
+    pub replan_count: u32,
     /// A bounded recovery hint; this never changes step status by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backtrack_target_step_id: Option<String>,
@@ -268,6 +287,7 @@ impl PlanProgress {
             active_step_id: steps.first().map(|step| step.id.clone()),
             failure_streak: 0,
             replan_required: false,
+            replan_count: 0,
             backtrack_target_step_id: None,
             steps,
             created_at_ms: now,
@@ -372,6 +392,7 @@ impl PlanProgress {
             active_step_id: progress.active_step_id.clone(),
             failure_streak: progress.failure_streak,
             replan_required: progress.replan_required,
+            replan_count: progress.replan_count,
             backtrack_target_step_id: progress.backtrack_target_step_id.clone(),
             evidence,
             persisted: true,
@@ -388,6 +409,11 @@ impl PlanProgress {
         &mut self,
         evidence: PlanAdvanceEvidence,
     ) -> Result<Option<PlanTransition>, PlanStateError> {
+        // Terminal plans are immutable: no further failure handling, evidence
+        // coordination, or replan accounting runs against them.
+        if self.status == PlanStatus::Complete || self.status == PlanStatus::Blocked {
+            return Ok(None);
+        }
         if evidence.deterministic_failed {
             self.phase = PlanStepPhase::Diagnose;
         } else if evidence.deterministic_checks_run {
@@ -402,7 +428,17 @@ impl PlanProgress {
                 .min(PLAN_FAILURE_REPLAN_THRESHOLD);
             self.replan_required = self.failure_streak >= PLAN_FAILURE_REPLAN_THRESHOLD;
             if self.replan_required {
+                // The bounded replan budget is harness-owned: after
+                // PLAN_MAX_REPLANS replan signals the plan fail-closes as
+                // Blocked instead of retrying forever. The approved spec is
+                // never mutated — the user must approve a new spec to
+                // continue.
+                self.replan_count = self.replan_count.saturating_add(1);
                 self.backtrack_target_step_id = self.previous_completed_step_id();
+                if self.replan_count >= PLAN_MAX_REPLANS {
+                    self.block_for_replan_budget()?;
+                    return Ok(None);
+                }
             }
         }
         let transition = self.advance_from_evidence(evidence)?;
@@ -415,13 +451,35 @@ impl PlanProgress {
                 .unwrap_or(PlanStepPhase::Verify);
             self.failure_streak = 0;
             self.replan_required = false;
+            self.replan_count = 0;
             self.backtrack_target_step_id = None;
         } else if evidence.deterministic_passed {
             self.failure_streak = 0;
             self.replan_required = false;
+            self.replan_count = 0;
             self.backtrack_target_step_id = None;
         }
         Ok(transition)
+    }
+
+    /// Fail-closed bounded termination: mark the active step and the whole
+    /// plan `Blocked` once the replan budget is exhausted. Evidence recorded
+    /// earlier in the turn stays on the step; the approved spec is untouched.
+    fn block_for_replan_budget(&mut self) -> Result<(), PlanStateError> {
+        let step_id = self.active_step_id.clone().ok_or_else(|| {
+            PlanStateError::InvalidTransition("the plan has no active step".to_string())
+        })?;
+        let step = self.step_mut(&step_id)?;
+        if step.status != PlanStepStatus::Active {
+            return Err(PlanStateError::InvalidTransition(format!(
+                "active step '{step_id}' is not active"
+            )));
+        }
+        step.status = PlanStepStatus::Blocked;
+        self.active_step_id = None;
+        self.status = PlanStatus::Blocked;
+        self.updated_at_ms = now_ms();
+        Ok(())
     }
 
     /// Advance one active step only when deterministic harness evidence is
@@ -1013,6 +1071,91 @@ mod tests {
         assert_eq!(progress.active_step_id, None);
         assert_eq!(progress.steps[0].status, PlanStepStatus::Blocked);
         assert_eq!(progress.steps[0].evidence.len(), 1);
+    }
+
+    #[test]
+    fn replan_budget_exhaustion_fail_closes_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = sample_spec("session-one");
+        spec.write_to(&spec_path).unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress =
+            PlanProgress::initialize_for_spec(dir.path(), &spec_path, &raw, &spec, "session-one")
+                .unwrap();
+
+        let failed = PlanAdvanceEvidence {
+            deterministic_checks_run: true,
+            deterministic_failed: true,
+            ..Default::default()
+        };
+        // Threshold failures raise the streak and emit the first replan signal.
+        for _ in 0..PLAN_FAILURE_REPLAN_THRESHOLD {
+            assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
+        }
+        assert!(progress.replan_required);
+        assert_eq!(progress.replan_count, 1);
+        assert_eq!(progress.status, PlanStatus::Active);
+
+        // Each further replan signal burns the bounded budget until it closes.
+        for _ in 0..(PLAN_MAX_REPLANS - 1) {
+            assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
+        }
+        assert_eq!(progress.replan_count, PLAN_MAX_REPLANS);
+        assert_eq!(progress.status, PlanStatus::Blocked);
+        assert_eq!(progress.active_step_id, None);
+        assert_eq!(progress.steps[0].status, PlanStepStatus::Blocked);
+
+        // Terminal plans stay immutable no-ops for further evidence.
+        assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
+        assert_eq!(progress.status, PlanStatus::Blocked);
+        assert_eq!(progress.replan_count, PLAN_MAX_REPLANS);
+    }
+
+    #[test]
+    fn replan_budget_clears_when_recovery_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = sample_spec("session-one");
+        spec.write_to(&spec_path).unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress =
+            PlanProgress::initialize_for_spec(dir.path(), &spec_path, &raw, &spec, "session-one")
+                .unwrap();
+
+        let failed = PlanAdvanceEvidence {
+            deterministic_checks_run: true,
+            deterministic_failed: true,
+            ..Default::default()
+        };
+        for _ in 0..PLAN_FAILURE_REPLAN_THRESHOLD {
+            assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
+        }
+        assert!(progress.replan_required);
+        assert_eq!(progress.replan_count, 1);
+
+        // A real recovery (writes + diff + passing checks) ends the cycle and
+        // resets the whole budget, so a later failure cycle starts fresh.
+        progress
+            .record_evidence(PlanEvidence {
+                kind: "check".to_string(),
+                summary: "A revised implementation passed deterministic checks.".to_string(),
+                reference: Some("src/lib.rs".to_string()),
+            })
+            .unwrap();
+        let passed = PlanAdvanceEvidence {
+            turn_made_writes: true,
+            has_scoped_diff: true,
+            deterministic_checks_run: true,
+            deterministic_passed: true,
+            deterministic_failed: false,
+        };
+        let transition = progress.coordinate_from_evidence(passed).unwrap().unwrap();
+        assert_eq!(transition.completed_step_id, "requirement-1");
+        assert_eq!(progress.replan_count, 0);
+        assert!(!progress.replan_required);
+        assert_eq!(progress.failure_streak, 0);
+        assert_eq!(progress.backtrack_target_step_id, None);
     }
 
     #[test]

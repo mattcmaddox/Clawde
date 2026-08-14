@@ -716,6 +716,7 @@ fn record_plan_turn_progress(
             active_step_id: None,
             failure_streak: 0,
             replan_required: false,
+            replan_count: 0,
             backtrack_target_step_id: None,
             evidence,
             persisted: false,
@@ -723,6 +724,40 @@ fn record_plan_turn_progress(
             error: Some(truncate_plan_text(&error.to_string(), 300)),
         }),
     }
+}
+
+/// Phase D resume awareness: build a one-line summary of an approved,
+/// in-progress plan so a run that begins with plan state (fresh accept or a
+/// restarted/resumed session) tells the model and user it is continuing from
+/// the persisted artifact. Returns `None` when there is no approved plan, the
+/// task no longer matches, or the plan is terminal.
+fn plan_resume_summary(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Option<String> {
+    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
+        .unwrap_or_else(|| working_dir.to_path_buf());
+    let (spec_path, spec) = clawde_core::spec::Spec::approved_in(&project_root, session_id)?;
+    if spec.task_id != task_id {
+        return None;
+    }
+    let raw_spec = std::fs::read_to_string(spec_path).ok()?;
+    let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+    let progress =
+        clawde_core::PlanProgress::load_for(&project_root, task_id, session_id, &spec_hash)
+            .ok()??;
+    if progress.status != clawde_core::PlanStatus::Active {
+        return None;
+    }
+    let active_id = progress.active_step_id.as_deref()?;
+    let step = progress.steps.iter().find(|step| step.id == active_id)?;
+    Some(format!(
+        "Approved plan in progress: {} — step '{}' ({:?}); continuing from the persisted plan artifact.",
+        truncate_plan_text(&spec.title, 200),
+        truncate_plan_text(&step.title, 300),
+        step.phase,
+    ))
 }
 
 /// Consecutive identical tool calls (same name + same input) with no writes
@@ -811,6 +846,21 @@ pub async fn run_query_loop(
         .and_then(|message| {
             clawde_core::spec::Spec::task_id_from_accepted_message(&message.get_all_text())
         });
+
+    // Phase D resume awareness: when this run begins with an approved,
+    // in-progress plan, tell the model and user that execution continues from
+    // the persisted artifact. This covers both a fresh accept (the plan was
+    // just initialized) and a restarted/resumed session (the artifact is
+    // re-loaded from disk through the same task marker + approval gate).
+    if let Some(task_id) = active_task_id.as_deref() {
+        if let Some(summary) =
+            plan_resume_summary(&tool_ctx.working_dir, &tool_ctx.session_id, task_id)
+        {
+            if let Some(tx) = event_tx.as_ref() {
+                let _ = tx.send(QueryEvent::Status(summary));
+            }
+        }
+    }
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
@@ -3134,6 +3184,69 @@ mod tests {
         assert!(recovery_context.contains("do not repeat the same failing action"));
         assert!(recovery_context.contains("Revisit completed step 'none' (none)"));
         assert!(recovery_context.contains("[check] A deterministic check failed."));
+    }
+
+    #[test]
+    fn plan_resume_summary_reports_active_plan_and_omits_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: "resume-plan-task".to_string(),
+            task: "Resume me".to_string(),
+            session_id: Some("resume-session".to_string()),
+            title: "Resume plan".to_string(),
+            requirements: vec!["First requirement".to_string()],
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, "resume-session").unwrap();
+
+        // An approved, active plan yields a resume summary naming the step.
+        let summary = plan_resume_summary(dir.path(), "resume-session", "resume-plan-task")
+            .expect("active plan must produce a resume summary");
+        assert!(summary.contains("Approved plan in progress: Resume plan"));
+        assert!(summary.contains("Satisfy requirement 1"));
+        assert!(summary.contains("(Implement)"));
+
+        // Wrong session or task never produces a summary.
+        assert!(plan_resume_summary(dir.path(), "other-session", "resume-plan-task").is_none());
+        assert!(plan_resume_summary(dir.path(), "resume-session", "other-task").is_none());
+
+        // Exhaust the replan budget: the plan fail-closes as Blocked, so no
+        // resume summary is advertised for a terminal artifact.
+        let failed_evidence = clawde_core::PlanAdvanceEvidence {
+            deterministic_checks_run: true,
+            deterministic_failed: true,
+            ..Default::default()
+        };
+        let fail = |summary: &str| {
+            clawde_core::PlanProgress::record_evidence_and_advance_for_approved_spec(
+                dir.path(),
+                "resume-plan-task",
+                "resume-session",
+                clawde_core::PlanEvidence {
+                    kind: "check".to_string(),
+                    summary: summary.to_string(),
+                    reference: Some("src/lib.rs".to_string()),
+                },
+                failed_evidence,
+            )
+            .unwrap()
+            .expect("plan event")
+        };
+        let pre_block_failures =
+            clawde_core::PLAN_FAILURE_REPLAN_THRESHOLD + clawde_core::PLAN_MAX_REPLANS - 2;
+        for _ in 0..pre_block_failures {
+            assert_eq!(
+                fail("a deterministic check failed").plan_status,
+                clawde_core::PlanStatus::Active
+            );
+        }
+        let blocking = fail("replan budget exhausted");
+        assert_eq!(blocking.plan_status, clawde_core::PlanStatus::Blocked);
+        assert_eq!(blocking.replan_count, clawde_core::PLAN_MAX_REPLANS);
+        assert_eq!(blocking.active_step_id, None);
+        assert!(plan_resume_summary(dir.path(), "resume-session", "resume-plan-task").is_none());
     }
 
     #[test]

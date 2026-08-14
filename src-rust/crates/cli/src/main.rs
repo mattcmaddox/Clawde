@@ -2206,12 +2206,18 @@ async fn run_headless(
                         })
                     );
                 } else if !is_json_output {
-                    let state = if event.persisted {
-                        "recorded"
-                    } else {
+                    let state = if !event.persisted {
                         "not persisted"
+                    } else {
+                        match event.plan_status {
+                            clawde_core::PlanStatus::Blocked => "blocked",
+                            clawde_core::PlanStatus::Complete => "complete",
+                            clawde_core::PlanStatus::Active => "recorded",
+                        }
                     };
-                    let recovery = if event.replan_required {
+                    let recovery = if event.plan_status == clawde_core::PlanStatus::Blocked {
+                        format!(" blocked after {} replan cycle(s)", event.replan_count)
+                    } else if event.replan_required {
                         format!(
                             " recovery=required({} failures; revisit {})",
                             event.failure_streak,
