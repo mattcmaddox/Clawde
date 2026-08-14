@@ -203,6 +203,7 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         let mut initial_failure_sent = false;
         let mut edited_tool_sent = false;
         let mut complete_tool_sent = false;
+        let mut replacement_tool_sent = false;
         let mut blocked_tool_sent = false;
         for mut stream in listener.incoming().flatten() {
             let body = read_request(&mut stream);
@@ -223,6 +224,24 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
                         "text/plain",
                     );
                     break;
+                }
+                continue;
+            }
+            if body.contains("RESUME_REPLACEMENT_PLAN") {
+                if !replacement_tool_sent {
+                    replacement_tool_sent = true;
+                    let response = tool_response(
+                        Path::new("src/replacement-plan.rs"),
+                        "REPLACEMENT_PLAN_WRITE\n",
+                    );
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        resumed_response(),
+                        "text/event-stream",
+                    );
                 }
                 continue;
             }
@@ -434,9 +453,70 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         "complete plan must not authorize a post-completion write"
     );
 
-    // Re-approve the restored bytes, then persist a terminal Blocked progress
+    // Approve a replacement task after the completed plan, then prove a fresh
+    // resumed process can write under that new accepted-task marker.
+    let replacement_spec = clawde_core::spec::Spec {
+        task_id: "replacement-process-resume-task".to_string(),
+        task: "Continue safely with a replacement approved plan".to_string(),
+        session_id: Some(session_id.to_string()),
+        title: "Replacement process-resume plan".to_string(),
+        ..Default::default()
+    };
+    replacement_spec
+        .write_to(&spec_path)
+        .expect("write replacement spec");
+    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+        .expect("approve replacement spec");
+    let replacement_raw = std::fs::read_to_string(&spec_path).expect("read replacement spec");
+    let replacement_hash = clawde_core::spec::Spec::content_hash(&replacement_raw);
+    let replacement_progress = clawde_core::PlanProgress::load_for(
+        &fixture,
+        &replacement_spec.task_id,
+        session_id,
+        &replacement_hash,
+    )
+    .expect("load replacement plan")
+    .expect("replacement plan progress");
+    assert_eq!(
+        replacement_progress.status,
+        clawde_core::PlanStatus::Active,
+        "replacement approval must reset the plan to active"
+    );
+    let replacement_path = fixture.join("src/replacement-plan.rs");
+    let mut replacement_args = common_args(&api_base, &fixture, session_id);
+    replacement_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let replacement = run_child(
+        spawn_child(
+            &replacement_args,
+            &format!(
+                "RESUME_REPLACEMENT_PLAN {}",
+                replacement_spec.accepted_task_marker()
+            ),
+            &home,
+        ),
+        Duration::from_secs(30),
+    );
+    assert!(
+        replacement.status.success(),
+        "replacement plan must resume successfully; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&replacement.stderr),
+        String::from_utf8_lossy(&replacement.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&replacement.stdout).contains("RESUMED_OK"),
+        "replacement response missing from stream: {}",
+        String::from_utf8_lossy(&replacement.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&replacement_path).expect("replacement write result"),
+        "REPLACEMENT_PLAN_WRITE\n",
+        "replacement approval must authorize only the new plan write"
+    );
+
+    // Re-approve the original bytes, then persist a terminal Blocked progress
     // artifact before the final process starts. This simulates a previous
     // process exhausting its replan budget and exiting.
+    std::fs::write(&spec_path, &approved_raw).expect("restore original approved bytes");
     clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
         .expect("reinitialize restored plan");
     let mut blocked_progress =
@@ -467,7 +547,11 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     let mut blocked_args = common_args(&api_base, &fixture, session_id);
     blocked_args.extend(["--resume".to_string(), session_id.to_string()]);
     let blocked = run_child(
-        spawn_child(&blocked_args, "RESUME_BLOCKED_PLAN", &home),
+        spawn_child(
+            &blocked_args,
+            &format!("RESUME_BLOCKED_PLAN {}", spec.accepted_task_marker()),
+            &home,
+        ),
         Duration::from_secs(30),
     );
     assert!(
@@ -512,6 +596,12 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
             body.contains("the approved plan for task 'headless-process-resume-task' is COMPLETE")
         }),
         "complete-plan tool result must contain the terminal plan error; bodies={bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("RESUME_REPLACEMENT_PLAN")),
+        "replacement-plan process must reach the provider fixture"
     );
     assert!(
         bodies.iter().any(|body| {
