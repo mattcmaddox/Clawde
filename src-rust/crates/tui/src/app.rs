@@ -7229,7 +7229,23 @@ impl App {
                         }
                         _ => {}
                     }
-                    self.prompt_input.vim_command(&c.to_string());
+                    // Kitty-capable terminals disambiguate Ctrl+V as
+                    // Char('v')+CONTROL instead of the raw \x16 control char,
+                    // and the app enables the kitty protocol by default. Map it
+                    // back so vim's VisualBlock entry (and Visual->Block
+                    // switching) behaves identically on kitty and legacy
+                    // terminals; without this, Ctrl+V in vim mode silently
+                    // entered character-visual on kitty terminals.
+                    let vim_key = if self.kitty_keyboard_active
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && matches!(c, 'v' | 'V')
+                    {
+                        "\x16".to_string()
+                    } else {
+                        c.to_string()
+                    };
+                    self.prompt_input.vim_command(&vim_key);
                 } else {
                     self.prompt_input.insert_char(c);
                 }
@@ -11344,6 +11360,29 @@ mod tests {
         );
         assert!(!app.show_help);
         assert_eq!(app.prompt_input.text, "/");
+    }
+
+    #[test]
+    fn test_ctrl_v_in_vim_mode_enters_visual_block_under_kitty_protocol() {
+        // Kitty-capable terminals deliver Ctrl+V as Char('v')+CONTROL instead
+        // of the raw \x16 control char. The app must translate it back so vim
+        // enters VisualBlock; without the translation it silently entered
+        // character-visual on kitty terminals (paste is skipped in vim modes,
+        // and plain 'v' maps to character Visual).
+        let mut app = make_app();
+        app.kitty_keyboard_active = true;
+        app.prompt_input.vim_enabled = true;
+        app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = 2;
+
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.prompt_input.vim_mode,
+            crate::prompt_input::VimMode::VisualBlock
+        );
+        assert_eq!(app.prompt_input.visual_anchor, Some(2));
     }
 
     #[test]

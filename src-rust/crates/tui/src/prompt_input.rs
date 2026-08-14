@@ -2976,6 +2976,20 @@ impl PromptInputState {
             self.visual_anchor = Some(self.cursor);
             return;
         }
+        // Ctrl+V while already in character/line visual mode switches the
+        // selection to block visual (vim parity) — reachable on both kitty
+        // (Char('v')+CONTROL translated to \x16 by the app) and legacy
+        // terminals (raw \x16).
+        if key == "\x16"
+            && matches!(self.vim_mode, VimMode::Visual | VimMode::VisualLine)
+            && self.vim_pending == VimPendingState::None
+        {
+            self.vim_mode = VimMode::VisualBlock;
+            if self.visual_anchor.is_none() {
+                self.visual_anchor = Some(self.cursor);
+            }
+            return;
+        }
         // `n` — repeat last search forward
         if key == "n"
             && self.vim_mode == VimMode::Normal
@@ -5616,6 +5630,32 @@ mod tests {
         s.vim_command("y"); // yank selection
         assert_eq!(s.yank_buf, "hello");
         assert_eq!(s.vim_mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn prompt_input_ctrl_v_enters_visual_block_from_normal() {
+        let mut s = PromptInputState::new();
+        s.vim_enabled = true;
+        s.vim_mode = VimMode::Normal;
+        s.text = "hello world".to_string();
+        s.cursor = 3;
+        s.vim_command("\x16");
+        assert_eq!(s.vim_mode, VimMode::VisualBlock);
+        assert_eq!(s.visual_anchor, Some(3));
+    }
+
+    #[test]
+    fn prompt_input_ctrl_v_switches_visual_to_block() {
+        let mut s = PromptInputState::new();
+        s.vim_enabled = true;
+        s.vim_mode = VimMode::Normal;
+        s.text = "hello world".to_string();
+        s.cursor = 0;
+        s.vim_command("v");
+        assert_eq!(s.vim_mode, VimMode::Visual);
+        s.vim_command("\x16");
+        assert_eq!(s.vim_mode, VimMode::VisualBlock);
+        assert_eq!(s.visual_anchor, Some(0));
     }
 
     // ---- Named registers ------------------------------------------------
