@@ -3284,6 +3284,19 @@ async fn run_interactive(
             Some(Event::Key(k))
         } else if app.pending_auto_submit && !app.is_streaming {
             app.pending_auto_submit = false;
+            // Spec-review Accept queues the implementation turn while the app
+            // is *idle*; the turn-completion drain only runs after a finished
+            // turn, so a queue drained only there would sit forever. When the
+            // prompt is empty, dequeue into it and re-arm so the synthesized
+            // Enter below submits the drained message immediately. The
+            // completion-handler drain then chains any further queued items.
+            if app.prompt_input.text.is_empty() {
+                if let Some(next) = app.queued_messages.pop_front() {
+                    app.prompt_input.text = next;
+                    app.prompt_input.cursor = app.prompt_input.text.len();
+                    app.pending_auto_submit = true;
+                }
+            }
             Some(Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Enter,
                 crossterm::event::KeyModifiers::NONE,
