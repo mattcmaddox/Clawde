@@ -1370,6 +1370,7 @@ impl Tool for AgentTool {
             continuation: crate::continuation::ContinuationMode::Default,
             semantic_verify_runner: None,
             semantic_fix_runner: None,
+            prompt_guard_enabled: false,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

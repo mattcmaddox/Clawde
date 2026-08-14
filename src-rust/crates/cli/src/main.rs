@@ -157,6 +157,11 @@ struct Cli {
     #[arg(long = "max-turns", default_value_t = 10)]
     max_turns: u32,
 
+    /// Opt-in prompt-injection guard: block the run if a user text prompt
+    /// carries a known instruction-override phrase (decide.rs markers)
+    #[arg(long = "guard-prompt", action = ArgAction::SetTrue)]
+    guard_prompt: bool,
+
     /// Custom system prompt
     #[arg(long = "system-prompt", short = 's')]
     system_prompt: Option<String>,
@@ -1059,6 +1064,7 @@ async fn main() -> anyhow::Result<()> {
         clawde_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
+    query_config.prompt_guard_enabled = cli.guard_prompt;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
