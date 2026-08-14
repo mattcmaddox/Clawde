@@ -188,6 +188,7 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         .expect("write approved-plan fixture");
     clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
         .expect("approve process-boundary fixture");
+    let approved_raw = std::fs::read_to_string(&spec_path).expect("read approved fixture");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider fixture");
     listener
@@ -201,9 +202,29 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         let mut initial_tool_sent = false;
         let mut initial_failure_sent = false;
         let mut edited_tool_sent = false;
+        let mut blocked_tool_sent = false;
         for mut stream in listener.incoming().flatten() {
             let body = read_request(&mut stream);
             bodies_for_server.lock().unwrap().push(body.clone());
+            if body.contains("RESUME_BLOCKED_PLAN") {
+                if !blocked_tool_sent {
+                    blocked_tool_sent = true;
+                    let response = tool_response(
+                        Path::new("src/blocked-must-not-write.rs"),
+                        "BLOCKED_MUST_NOT_WRITE\n",
+                    );
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "controlled blocked-plan failure",
+                        "text/plain",
+                    );
+                    break;
+                }
+                continue;
+            }
             if body.contains("RESUME_EDITED_SPEC") {
                 if !edited_tool_sent {
                     edited_tool_sent = true;
@@ -219,7 +240,6 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
                         "controlled edited-spec failure",
                         "text/plain",
                     );
-                    break;
                 }
                 continue;
             }
@@ -341,6 +361,54 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         "edited spec must not authorize a write"
     );
 
+    // Restore the original approved bytes, then persist a terminal Blocked
+    // progress artifact before the final process starts. This simulates a
+    // previous process exhausting its replan budget and exiting.
+    std::fs::write(&spec_path, &approved_raw).expect("restore approved spec bytes");
+    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+        .expect("re-approve restored spec");
+    let spec_hash = clawde_core::spec::Spec::content_hash(&approved_raw);
+    let mut blocked_progress =
+        clawde_core::PlanProgress::load_for(&fixture, task_id, session_id, &spec_hash)
+            .expect("load restored plan progress")
+            .expect("restored plan progress");
+    blocked_progress
+        .block_active_step(clawde_core::PlanEvidence {
+            kind: "blocked".to_string(),
+            summary: "Replan budget exhausted before process restart.".to_string(),
+            reference: Some("plans/process-resume.json".to_string()),
+        })
+        .expect("block restored plan");
+    blocked_progress
+        .save(&fixture)
+        .expect("persist blocked plan");
+    assert_eq!(
+        blocked_progress.status,
+        clawde_core::PlanStatus::Blocked,
+        "fixture must persist a blocked plan"
+    );
+    assert!(
+        clawde_core::spec::Spec::approved_in(&fixture, session_id).is_some(),
+        "fixture must retain valid approval after restoring the spec"
+    );
+
+    let blocked_path = fixture.join("src/blocked-must-not-write.rs");
+    let mut blocked_args = common_args(&api_base, &fixture, session_id);
+    blocked_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let blocked = run_child(
+        spawn_child(&blocked_args, "RESUME_BLOCKED_PLAN", &home),
+        Duration::from_secs(30),
+    );
+    assert!(
+        !blocked.status.success(),
+        "blocked plan must fail closed after restart; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&blocked.stderr),
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    assert!(
+        !blocked_path.exists(),
+        "blocked plan must not authorize a write"
+    );
     server.join().expect("provider fixture server");
     let bodies = request_bodies.lock().unwrap();
     assert!(
@@ -367,6 +435,20 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
             .iter()
             .any(|body| body.contains("RESUME_EDITED_SPEC")),
         "edited-spec process must reach the provider fixture"
+    );
+    assert!(
+        bodies.iter().any(|body| {
+            body.contains(
+                "the approved plan for task 'headless-process-resume-task' is BLOCKED after exhausting its replan budget",
+            )
+        }),
+        "blocked-plan tool result must contain the terminal plan error; bodies={bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("RESUME_BLOCKED_PLAN")),
+        "blocked-plan process must reach the provider fixture"
     );
 
     let session_path = home.join("sessions").join(format!("{session_id}.json"));
