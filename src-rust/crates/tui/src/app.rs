@@ -14,7 +14,7 @@ use crate::model_picker::{EffortLevel, FreeTask, ModelPickerState};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
     GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, KeybindingsOverlayState,
-    MessageSelectorOverlay, RewindFlowOverlay, SelectorMessage,
+    RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
@@ -1400,8 +1400,6 @@ pub struct App {
     pub history_search_overlay: HistorySearchOverlay,
     /// Global ripgrep search / quick-open overlay.
     pub global_search: GlobalSearchState,
-    /// Message selector used by /rewind.
-    pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
     /// Bridge connection state.
@@ -2064,7 +2062,6 @@ impl App {
             keybindings_overlay: KeybindingsOverlayState::new(),
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
-            message_selector: MessageSelectorOverlay::new(),
             rewind_flow: RewindFlowOverlay::new(),
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
