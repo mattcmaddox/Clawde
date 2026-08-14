@@ -193,7 +193,7 @@ impl VerifyPolicy {
         verdict: VerifyVerdict,
         headline: impl Into<String>,
     ) {
-        *self.last_report.lock().unwrap() = Some(VerifyReport {
+        self.stash_report_value(VerifyReport {
             verdict,
             results: results.to_vec(),
             attempt,
@@ -202,6 +202,12 @@ impl VerifyPolicy {
             sandbox: self.config.sandbox,
             unavailable: false,
         });
+    }
+
+    /// Stash an already-built report (used by callers that constructed the
+    /// report to run a decision predicate first).
+    fn stash_report_value(&self, report: VerifyReport) {
+        *self.last_report.lock().unwrap() = Some(report);
     }
 
     /// Cheap pre-flight guards that avoid spawning any commands. Returns the
@@ -356,14 +362,19 @@ impl VerifyPolicy {
 
         // `attempt` counts verification rounds; the first failing round is
         // auto-fix attempt 1, so up to `max_retries` fix attempts are allowed.
-        if attempt <= max_retries {
-            self.stash_report(
-                results,
-                attempt,
-                max_retries,
-                VerifyVerdict::Fixable,
-                format!("Auto-fix attempt {attempt}/{max_retries}"),
-            );
+        // Single source of truth (crate::decide): replan only while the
+        // bounded fix budget remains AND checks actually failed.
+        let replan_report = VerifyReport {
+            verdict: VerifyVerdict::Fixable,
+            results: results.to_vec(),
+            attempt,
+            max_retries,
+            headline: format!("Auto-fix attempt {attempt}/{max_retries}"),
+            sandbox: self.config.sandbox,
+            unavailable: false,
+        };
+        if crate::decide::decide_replan(&replan_report) {
+            self.stash_report_value(replan_report);
             return ContinuationDecision::Continue {
                 message: format!(
                     "Verify your changes before finishing — the last verification run reported \
