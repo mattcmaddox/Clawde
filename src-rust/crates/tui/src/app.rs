@@ -7302,7 +7302,7 @@ impl App {
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
                 } else if !self.is_streaming && self.prompt_input.is_empty() {
-                    // Cycle agent mode: build → plan → build
+                    // Cycle agent mode: build → plan → image → build
                     self.cycle_agent_mode();
                 }
             }
