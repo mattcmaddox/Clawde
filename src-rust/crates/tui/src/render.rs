@@ -3679,12 +3679,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ),
-                VimMode::VisualBlock => (
-                    "-- VISUAL BLOCK --",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
                 VimMode::Command => (
                     "-- COMMAND --",
                     Style::default()

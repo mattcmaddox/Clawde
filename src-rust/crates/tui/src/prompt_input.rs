@@ -34,8 +34,6 @@ pub enum VimMode {
     Visual,
     /// Linewise visual selection (V).
     VisualLine,
-    /// Block visual selection (Ctrl+V).
-    VisualBlock,
     /// Command-line mode (:).
     Command,
     /// In-prompt forward search (/).
@@ -49,7 +47,6 @@ impl VimMode {
             Self::Normal => "NORMAL",
             Self::Visual => "VISUAL",
             Self::VisualLine => "VISUAL LINE",
-            Self::VisualBlock => "VISUAL BLOCK",
             Self::Command => "COMMAND",
             Self::Search => "SEARCH",
         }
@@ -59,7 +56,7 @@ impl VimMode {
         match self {
             Self::Insert => Color::Blue,
             Self::Normal => Color::Green,
-            Self::Visual | Self::VisualLine | Self::VisualBlock => Color::Magenta,
+            Self::Visual | Self::VisualLine => Color::Magenta,
             Self::Command | Self::Search => Color::Cyan,
         }
     }
@@ -2967,29 +2964,6 @@ impl PromptInputState {
             self.visual_anchor = Some(ls);
             return;
         }
-        // Enter visual-block mode with Ctrl+V
-        if key == "\x16"
-            && self.vim_mode == VimMode::Normal
-            && self.vim_pending == VimPendingState::None
-        {
-            self.vim_mode = VimMode::VisualBlock;
-            self.visual_anchor = Some(self.cursor);
-            return;
-        }
-        // Ctrl+V while already in character/line visual mode switches the
-        // selection to block visual (vim parity) — reachable on both kitty
-        // (Char('v')+CONTROL translated to \x16 by the app) and legacy
-        // terminals (raw \x16).
-        if key == "\x16"
-            && matches!(self.vim_mode, VimMode::Visual | VimMode::VisualLine)
-            && self.vim_pending == VimPendingState::None
-        {
-            self.vim_mode = VimMode::VisualBlock;
-            if self.visual_anchor.is_none() {
-                self.visual_anchor = Some(self.cursor);
-            }
-            return;
-        }
         // `n` — repeat last search forward
         if key == "n"
             && self.vim_mode == VimMode::Normal
@@ -3056,52 +3030,6 @@ impl PromptInputState {
                     _ => {
                         // Motion keys extend the selection (handled by apply_vim_key below)
                     }
-                }
-            }
-        }
-        // In visual-block mode, treat like character-wise visual for single-line input
-        if self.vim_mode == VimMode::VisualBlock {
-            if let Some(anchor) = self.visual_anchor {
-                let from = anchor.min(self.cursor);
-                let to_excl = anchor.max(self.cursor);
-                let to = self.text[to_excl..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(b, _)| to_excl + b)
-                    .unwrap_or(self.text.len());
-                match key {
-                    "y" => {
-                        self.yank_buf = self.text[from..to].to_string();
-                        self.cursor = from;
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        return;
-                    }
-                    "d" | "x" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[from..to].to_string();
-                        let char_count = self.yank_buf.chars().count();
-                        self.text.drain(from..to);
-                        self.cursor = from.min(self.text.len());
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        self.vim_dot_action =
-                            Some(DotRepeatAction::DeleteChars { count: char_count });
-                        self.normalize();
-                        return;
-                    }
-                    "c" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[from..to].to_string();
-                        self.text.drain(from..to);
-                        self.cursor = from;
-                        self.vim_mode = VimMode::Insert;
-                        self.visual_anchor = None;
-                        self.vim_insert_text_before = Some(self.text.clone());
-                        self.normalize();
-                        return;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -3209,9 +3137,7 @@ impl PromptInputState {
         }
 
         // Update visual anchor tracking when in visual mode
-        if (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualBlock)
-            && self.visual_anchor.is_none()
-        {
+        if self.vim_mode == VimMode::Visual && self.visual_anchor.is_none() {
             self.visual_anchor = Some(self.cursor);
         }
         self.normalize();
@@ -5633,29 +5559,22 @@ mod tests {
     }
 
     #[test]
-    fn prompt_input_ctrl_v_enters_visual_block_from_normal() {
+    fn prompt_input_ctrl_v_is_not_a_vim_command() {
+        // Ctrl+V is clipboard paste everywhere — it must NOT enter any visual
+        // mode (block visual was removed). \x16 in Normal mode is a no-op.
         let mut s = PromptInputState::new();
         s.vim_enabled = true;
         s.vim_mode = VimMode::Normal;
         s.text = "hello world".to_string();
         s.cursor = 3;
         s.vim_command("\x16");
-        assert_eq!(s.vim_mode, VimMode::VisualBlock);
-        assert_eq!(s.visual_anchor, Some(3));
-    }
-
-    #[test]
-    fn prompt_input_ctrl_v_switches_visual_to_block() {
-        let mut s = PromptInputState::new();
-        s.vim_enabled = true;
-        s.vim_mode = VimMode::Normal;
-        s.text = "hello world".to_string();
-        s.cursor = 0;
+        assert_eq!(s.vim_mode, VimMode::Normal);
+        assert_eq!(s.visual_anchor, None);
+        // Also from character visual: no-op, stays in visual.
         s.vim_command("v");
         assert_eq!(s.vim_mode, VimMode::Visual);
         s.vim_command("\x16");
-        assert_eq!(s.vim_mode, VimMode::VisualBlock);
-        assert_eq!(s.visual_anchor, Some(0));
+        assert_eq!(s.vim_mode, VimMode::Visual);
     }
 
     // ---- Named registers ------------------------------------------------

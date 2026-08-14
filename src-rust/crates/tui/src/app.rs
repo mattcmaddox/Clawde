@@ -6977,17 +6977,12 @@ impl App {
         }
 
         // ---- Ctrl+V / Cmd+V — clipboard paste (image first, then text fallback) ----
-        // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
-        // already consumed by the vim handler above to enter VisualBlock mode).
+        // Ctrl+V pastes in every input mode (image first, then text). It is
+        // not a vim command — visual-block was removed, so there is no mode it
+        // must yield to.
         if key.code == KeyCode::Char('v')
             && (key.modifiers.contains(KeyModifiers::CONTROL)
                 || key.modifiers.contains(KeyModifiers::SUPER))
-            && !matches!(
-                self.prompt_input.vim_mode,
-                crate::prompt_input::VimMode::Normal
-                    | crate::prompt_input::VimMode::Visual
-                    | crate::prompt_input::VimMode::VisualBlock
-            )
         {
             use crate::image_paste::{
                 read_clipboard_image, read_clipboard_text, read_primary_text,
@@ -7229,23 +7224,7 @@ impl App {
                         }
                         _ => {}
                     }
-                    // Kitty-capable terminals disambiguate Ctrl+V as
-                    // Char('v')+CONTROL instead of the raw \x16 control char,
-                    // and the app enables the kitty protocol by default. Map it
-                    // back so vim's VisualBlock entry (and Visual->Block
-                    // switching) behaves identically on kitty and legacy
-                    // terminals; without this, Ctrl+V in vim mode silently
-                    // entered character-visual on kitty terminals.
-                    let vim_key = if self.kitty_keyboard_active
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT)
-                        && matches!(c, 'v' | 'V')
-                    {
-                        "\x16".to_string()
-                    } else {
-                        c.to_string()
-                    };
-                    self.prompt_input.vim_command(&vim_key);
+                    self.prompt_input.vim_command(&c.to_string());
                 } else {
                     self.prompt_input.insert_char(c);
                 }
@@ -8991,9 +8970,7 @@ impl App {
             && self.history_search.is_none()
             && !matches!(
                 self.prompt_input.vim_mode,
-                crate::prompt_input::VimMode::Normal
-                    | crate::prompt_input::VimMode::Visual
-                    | crate::prompt_input::VimMode::VisualBlock
+                crate::prompt_input::VimMode::Normal | crate::prompt_input::VimMode::Visual
             )
     }
 
@@ -11363,14 +11340,12 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_v_in_vim_mode_enters_visual_block_under_kitty_protocol() {
-        // Kitty-capable terminals deliver Ctrl+V as Char('v')+CONTROL instead
-        // of the raw \x16 control char. The app must translate it back so vim
-        // enters VisualBlock; without the translation it silently entered
-        // character-visual on kitty terminals (paste is skipped in vim modes,
-        // and plain 'v' maps to character Visual).
+    fn test_ctrl_v_in_vim_mode_does_not_touch_vim_mode() {
+        // Ctrl+V is clipboard paste in every mode — it must never act as a vim
+        // command (visual-block was removed). In the test env the clipboard
+        // tools are absent, so the paste path no-ops; the assertion is that
+        // vim mode is left untouched and no panic occurs.
         let mut app = make_app();
-        app.kitty_keyboard_active = true;
         app.prompt_input.vim_enabled = true;
         app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
         app.prompt_input.text = "hello".to_string();
@@ -11380,9 +11355,8 @@ mod tests {
 
         assert_eq!(
             app.prompt_input.vim_mode,
-            crate::prompt_input::VimMode::VisualBlock
+            crate::prompt_input::VimMode::Normal
         );
-        assert_eq!(app.prompt_input.visual_anchor, Some(2));
     }
 
     #[test]
