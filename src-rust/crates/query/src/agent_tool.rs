@@ -883,10 +883,16 @@ pub(crate) fn semantic_verify_input(
         .retry_hint
         .as_deref()
         .map(|hint| {
-            format!(
-                "\\n\\nYour previous response was rejected by the parser: {}.\\nCorrect it now and return ONLY the JSON object described above — no fences, no prose, no envelope.",
-                hint
-            )
+            if hint.starts_with("Your previous verdict was replan") {
+                format!(
+                    "\\n\\n{hint}.\\nReassess the current change with fresh eyes and return a new verdict now — only the JSON object described above."
+                )
+            } else {
+                format!(
+                    "\\n\\nYour previous response was rejected by the parser: {}.\\nCorrect it now and return ONLY the JSON object described above — no fences, no prose, no envelope.",
+                    hint
+                )
+            }
         })
         .unwrap_or_default();
     let prompt = format!(
@@ -1979,6 +1985,25 @@ mod tests {
         assert!(prompt.contains("\\\"fixable\\\""));
         assert!(prompt.contains("Do not edit files"));
         assert!(prompt.contains("include markdown fences"));
+    }
+
+    #[test]
+    fn semantic_verify_input_replan_retry_uses_reassessment_guidance() {
+        let mut request = sample_request();
+        request.retry_hint = Some(
+            "Your previous verdict was replan with this summary: criteria need review".to_string(),
+        );
+        let input = semantic_verify_input(&request, "free/auto", 3);
+        let prompt = input["prompt"].as_str().expect("prompt");
+        assert!(
+            prompt.contains("Reassess the current change with fresh eyes"),
+            "replan retry must ask for reassessment, not parser correction: {prompt}"
+        );
+        assert!(prompt.contains("criteria need review"));
+        assert!(
+            !prompt.contains("rejected by the parser"),
+            "replan retry must not reuse the parse-error wording"
+        );
     }
 
     #[test]

@@ -216,7 +216,9 @@ pub struct SemanticVerifyRequest {
     /// Reask hint for a retry attempt: the classified parse error from the
     /// previous response, fed back into the prompt so the model can correct
     /// its structured output. Parser-generated only, never raw model output;
-    /// None on the first attempt.
+    /// None on the first attempt. Also used for the bounded replan re-check:
+    /// when the first verdict is `replan`, the verifier runs once more with
+    /// the replan summary as feedback before the policy escalates.
     pub retry_hint: Option<String>,
 }
 
@@ -1254,13 +1256,42 @@ impl ContinuationPolicy for SemanticVerifyPolicy {
                 .expect("request_from_context checked runner presence")
                 .clone();
             // Empty/truncated responses (a provider empty completion) get one
-            // retry before declining; structured failures do not.
-            let response = match run_verifier_with_no_verdict_retry(runner, request).await {
-                Ok(response) => response,
-                Err(decision) => return decision,
-            };
+            // retry before declining; structured failures do not. Clone so the
+            // original is still available to build the replan re-check.
+            let response =
+                match run_verifier_with_no_verdict_retry(runner.clone(), request.clone()).await {
+                    Ok(response) => response,
+                    Err(decision) => return decision,
+                };
             if response.verdict == SemanticVerdict::Pass {
                 self.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Bounded replan re-check: a `replan` verdict re-runs the same
+            // read-only verifier exactly once, feeding the replan summary back
+            // as feedback so the model can reassess before the policy asks the
+            // user for a new spec. A request already carrying feedback is
+            // itself the retry, so a second replan is terminal (escalate) —
+            // the retry is bounded and fail-closed.
+            if response.verdict == SemanticVerdict::Replan && request.retry_hint.is_none() {
+                let mut replan_request = request.clone();
+                let feedback = format!(
+                    "Your previous verdict was replan with this summary: {}",
+                    response.summary
+                );
+                replan_request.retry_hint = Some(
+                    feedback
+                        .chars()
+                        .take(SEMANTIC_VERIFY_MAX_RETRY_HINT_CHARS)
+                        .collect(),
+                );
+                if let Ok(recheck) =
+                    run_verifier_with_no_verdict_retry(runner, replan_request).await
+                {
+                    if recheck.verdict == SemanticVerdict::Pass {
+                        self.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return self.response_decision(recheck);
+                }
             }
             self.response_decision(response)
         })
@@ -1771,6 +1802,110 @@ mod tests {
         );
         let report = policy.semantic_report().expect("review signal surfaced");
         assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_rechecks_once_when_replan_then_passes() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let hints = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let hints_clone = hints.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |request| {
+            let n = calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            hints_clone.lock().unwrap().push(request.retry_hint.clone());
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(r#"{"verdict":"replan","summary":"criteria need review"}"#.to_string())
+                } else {
+                    Ok(r#"{"verdict":"pass","summary":"reassessed"}"#.to_string())
+                }
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        // Read-only review signal: the model verdict cannot authorize
+        // continuation, so the turn still stops — but with the re-checked
+        // verdict surfaced as evidence.
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a replan verdict must re-run the verifier exactly once"
+        );
+        let hints = hints.lock().unwrap();
+        assert_eq!(hints.len(), 2);
+        assert!(hints[0].is_none(), "first call has no feedback");
+        let recheck = hints[1].as_deref().expect("recheck carries feedback");
+        assert!(
+            recheck.contains("replan") && recheck.contains("criteria need review"),
+            "recheck feedback must carry the first replan summary: {recheck}"
+        );
+        drop(hints);
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Pass);
+    }
+
+    #[tokio::test]
+    async fn semantic_verifier_recheck_escalates_when_replan_repeats() {
+        let project = tempfile::tempdir().expect("temporary project");
+        std::fs::write(project.path().join("notes.txt"), "plain\n").expect("write plain file");
+        let changed = project.path().join("notes.txt");
+        let patch = clawde_core::snapshot::Patch {
+            hash: "tree".to_string(),
+            files: vec![changed],
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let runner: SemanticVerifyRunner = std::sync::Arc::new(move |_| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                Ok(r#"{"verdict":"replan","summary":"new approach needed"}"#.to_string())
+            })
+        });
+        let verify_config = clawde_core::config::VerifyConfig {
+            semantic_only_when_no_lowlevel_tests: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let policy =
+            SemanticAfterVerifyPolicy::new(verify_config, project.path(), Some(runner), None);
+        let context = TurnEndContext {
+            working_dir: project.path(),
+            changed_files: Some(&patch),
+            changed_diff: Some("--- a/notes.txt\n+++ b/notes.txt\n+reviewed\n"),
+            ..ctx()
+        };
+        let decision = policy.decide_async(&context).await;
+        assert!(!decision.is_continue());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a repeated replan must not trigger a third verifier call"
+        );
+        // The surfaced note is the second (still-replan) verdict — the retry
+        // is bounded and the user is asked for a new spec rather than looping.
+        let report = policy.semantic_report().expect("review signal surfaced");
+        assert_eq!(report.verdict, SemanticVerdict::Replan);
+        assert!(report.summary.contains("new approach needed"));
     }
 
     #[tokio::test]
