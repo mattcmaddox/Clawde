@@ -2617,6 +2617,77 @@ mod tests {
         }
     }
 
+    /// A canned structured response used by the cross-crate `/spec` → review
+    /// integration test below. It deliberately implements the same provider
+    /// seam used by production command dispatch without making a network call.
+    struct CannedSpecProvider;
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for CannedSpecProvider {
+        fn id(&self) -> &clawde_core::ProviderId {
+            static ID: std::sync::LazyLock<clawde_core::ProviderId> =
+                std::sync::LazyLock::new(|| clawde_core::ProviderId::new("canned-spec"));
+            &ID
+        }
+
+        fn name(&self) -> &str {
+            "canned-spec"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderResponse {
+                id: "canned-spec".into(),
+                model: "canned-spec".into(),
+                content: vec![clawde_core::types::ContentBlock::Text {
+                    text: r#"{"title":"Cross-Crate Demo","requirements":["Create the harmless demo artifact"],"files_to_touch":[{"path":"phase-c-demo.txt","action":"Create","description":"Demo artifact"}],"data_models":[],"acceptance_tests":[{"description":"The demo artifact exists with the expected content"}],"edge_cases":[]}"#
+                        .to_string(),
+                }],
+                stop_reason: clawde_api::StopReason::EndTurn,
+                usage: Default::default(),
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            unimplemented!("cross-crate spec fixture does not stream")
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: false,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
     // ---- Command registry tests ---------------------------------------------
 
     #[test]
@@ -2654,6 +2725,81 @@ mod tests {
         assert!(find_command("model").is_some());
         assert!(find_command("refresh").is_some());
         assert!(find_command("version").is_some());
+    }
+
+    #[tokio::test]
+    async fn spec_generation_to_approval_initializes_bound_plan() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let dir = tempfile::tempdir().expect("create isolated project");
+        let session_id = "cross-crate-spec-session";
+        let mut ctx = make_ctx();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.session_id = session_id.to_string();
+        ctx.test_provider = Some(std::sync::Arc::new(CannedSpecProvider));
+
+        // Exercise the real command registry and `/spec` command, not the
+        // command implementation directly.
+        let result = execute_command("/spec Create a harmless demo note", &mut ctx)
+            .await
+            .expect("/spec must resolve through the registry");
+        match result {
+            CommandResult::Message(message) => {
+                assert!(message.contains("# Spec: Cross-Crate Demo"));
+                assert!(message.contains("Saved to"));
+            }
+            other => panic!("expected generated spec message, got {other:?}"),
+        }
+
+        let spec_path = clawde_core::spec::Spec::list_specs(dir.path())
+            .into_iter()
+            .next()
+            .expect("/spec writes a parseable spec artifact");
+        let raw_spec = std::fs::read_to_string(&spec_path).expect("read generated spec");
+        let spec = clawde_core::spec::Spec::parse_json(&raw_spec).expect("parse generated spec");
+        assert_eq!(spec.session_id.as_deref(), Some(session_id));
+        assert!(!spec.task_id.is_empty());
+
+        // Cross the crate boundary into the real TUI review state and accept
+        // the default action through App::handle_key_event.
+        let mut app = clawde_tui::App::new(ctx.config.clone(), ctx.cost_tracker.clone());
+        app.set_working_directory(dir.path());
+        app.spec_review.set_session_id(session_id);
+        assert!(app.intercept_slash_command_with_args("spec-review", ""));
+        assert_eq!(app.spec_review.path.as_ref(), Some(&spec_path));
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        let (approved_path, approved_spec) =
+            clawde_core::spec::Spec::approved_in(dir.path(), session_id)
+                .expect("Accept persists approval");
+        assert_eq!(approved_path, spec_path.canonicalize().unwrap());
+        assert_eq!(approved_spec.task_id, spec.task_id);
+        let progress = clawde_core::plan::PlanProgress::load_for(
+            dir.path(),
+            &spec.task_id,
+            session_id,
+            &clawde_core::spec::Spec::content_hash(&raw_spec),
+        )
+        .unwrap()
+        .expect("Accept initializes bound plan progress");
+        assert_eq!(progress.task_id, spec.task_id);
+        assert_eq!(progress.session_id, session_id);
+        assert_eq!(
+            progress.spec_hash,
+            clawde_core::spec::Spec::content_hash(&raw_spec)
+        );
+        assert!(
+            clawde_core::plan::PlanProgress::path_for(dir.path(), &spec.task_id)
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.queued_messages[0].contains("ACCEPTED"));
     }
 
     #[test]

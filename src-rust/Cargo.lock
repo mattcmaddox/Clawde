@@ -856,6 +856,7 @@ dependencies = [
  "clawde-query",
  "clawde-tools",
  "clawde-tui",
+ "crossterm 0.29.0",
  "dirs",
  "futures",
  "hostname",

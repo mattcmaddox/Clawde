@@ -1934,6 +1934,15 @@ fn matches_capability_groups(
 }
 
 impl App {
+    /// Bind UI filesystem lookups to the active project directory rather than
+    /// the process launch directory. This is especially important for slash
+    /// commands such as `/spec-review` when `--cwd` points elsewhere.
+    pub fn set_working_directory(&mut self, directory: &std::path::Path) {
+        self.current_dir = Some(directory.display().to_string());
+        self.git_branch = clawde_core::git_utils::get_repo_root(directory)
+            .map(|repo_root| clawde_core::git_utils::get_current_branch(&repo_root));
+    }
+
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         // Startup banner (once per launch, not per load): surface a corrupt
@@ -10640,6 +10649,26 @@ mod tests {
     // ---- spec review (§10) ----
 
     #[test]
+    fn spec_review_without_path_uses_active_working_directory() {
+        let mut app = make_app();
+        let dir = std::env::temp_dir().join(format!("clawde-spec-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"title":"Cwd Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+
+        app.set_working_directory(&dir);
+        assert!(app.intercept_slash_command_with_args("spec-review", ""));
+        assert!(app.spec_review.visible);
+        assert_eq!(app.spec_review.path.as_ref(), Some(&path));
+        assert_eq!(app.spec_review.spec.as_ref().unwrap().title, "Cwd Spec");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn accept_spec_disables_spec_mode_and_queues_implementation() {
         let _home = TestHome::acquire(); // keep settings writes off the real file
         let mut app = make_app();
@@ -10655,19 +10684,44 @@ mod tests {
             r#"{"task_id":"clawde-accept-test","task":"Do it","session_id":"clawde-accept-session","title":"Task Spec","requirements":["do it"],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
         )
         .unwrap();
-        // Mirror the real CLI wiring (main.rs calls set_session_id at startup)
-        // so the approval can be persisted and the implementation queued.
+        // Mirror the real CLI wiring (main.rs calls set_session_id and binds
+        // the App to the active working directory at startup). Resolve the
+        // spec through the same no-argument command users invoke.
+        app.set_working_directory(&dir);
         app.spec_review.set_session_id("clawde-accept-session");
-        app.spec_review.open(path).unwrap();
+        assert!(app.intercept_slash_command_with_args("spec-review", ""));
         assert!(app.spec_review.visible);
+        assert_eq!(app.spec_review.path.as_ref(), Some(&path));
 
-        // Enter on the default Accept action queues the implementation turn
-        // and exits spec mode so the loop cannot re-offer the same spec.
+        // Enter on the default Accept action queues the implementation turn,
+        // exits spec mode, and persists both authorization and plan state.
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.queued_messages.len(), 1);
         assert!(app.queued_messages[0].contains("ACCEPTED"));
         assert!(!app.config.spec_mode, "accept must disable spec mode");
         assert!(!app.spec_review.visible);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let (approved_path, approved_spec) =
+            clawde_core::spec::Spec::approved_in(&dir, "clawde-accept-session")
+                .expect("accept creates a bound approval record");
+        assert_eq!(approved_path, path.canonicalize().unwrap());
+        assert_eq!(approved_spec.task_id, "clawde-accept-test");
+        let progress = clawde_core::plan::PlanProgress::load_for(
+            &dir,
+            "clawde-accept-test",
+            "clawde-accept-session",
+            &clawde_core::spec::Spec::content_hash(&raw),
+        )
+        .unwrap()
+        .expect("accept initializes the bound plan artifact");
+        assert_eq!(progress.task_id, "clawde-accept-test");
+        assert_eq!(progress.session_id, "clawde-accept-session");
+        assert!(
+            clawde_core::plan::PlanProgress::path_for(&dir, "clawde-accept-test")
+                .unwrap()
+                .is_file()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

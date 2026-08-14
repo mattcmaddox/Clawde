@@ -2616,6 +2616,7 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.set_working_directory(&tool_ctx.working_dir);
     app.session_id = session.id.clone();
     app.spec_review.set_session_id(session.id.clone());
 
