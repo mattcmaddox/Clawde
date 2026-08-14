@@ -62,10 +62,10 @@ fn write_response(stream: &mut TcpStream, status: &str, body: &str, content_type
         .expect("write HTTP response");
 }
 
-fn tool_response(path: &Path) -> String {
+fn tool_response(path: &Path, content: &str) -> String {
     let arguments = serde_json::json!({
         "file_path": path.display().to_string(),
-        "content": "PROCESS_A_WRITE\n"
+        "content": content
     })
     .to_string();
     let first = serde_json::json!({
@@ -173,6 +173,22 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     )
     .expect("fixture source");
 
+    let session_id = "headless-process-resume-session";
+    let task_id = "headless-process-resume-task";
+    let spec_path = fixture.join("specs/process-resume.json");
+    let spec = clawde_core::spec::Spec {
+        task_id: task_id.to_string(),
+        task: "Resume a headless implementation safely".to_string(),
+        session_id: Some(session_id.to_string()),
+        title: "Headless process resume plan".to_string(),
+        requirements: vec!["Persist the process-boundary transcript".to_string()],
+        ..Default::default()
+    };
+    spec.write_to(&spec_path)
+        .expect("write approved-plan fixture");
+    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+        .expect("approve process-boundary fixture");
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider fixture");
     listener
         .set_nonblocking(false)
@@ -182,10 +198,31 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     let bodies_for_server = request_bodies.clone();
     let write_path = fixture.join("src/process-a.rs");
     let server = thread::spawn(move || {
-        let mut first_request = true;
+        let mut initial_tool_sent = false;
+        let mut initial_failure_sent = false;
+        let mut edited_tool_sent = false;
         for mut stream in listener.incoming().flatten() {
             let body = read_request(&mut stream);
             bodies_for_server.lock().unwrap().push(body.clone());
+            if body.contains("RESUME_EDITED_SPEC") {
+                if !edited_tool_sent {
+                    edited_tool_sent = true;
+                    let response = tool_response(
+                        Path::new("src/edited-must-not-write.rs"),
+                        "EDITED_MUST_NOT_WRITE\n",
+                    );
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "controlled edited-spec failure",
+                        "text/plain",
+                    );
+                    break;
+                }
+                continue;
+            }
             if body.contains("RESUME_PROCESS_B") {
                 write_response(
                     &mut stream,
@@ -193,13 +230,14 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
                     resumed_response(),
                     "text/event-stream",
                 );
-                break;
+                continue;
             }
-            if first_request {
-                first_request = false;
-                let response = tool_response(Path::new("src/process-a.rs"));
+            if !initial_tool_sent {
+                initial_tool_sent = true;
+                let response = tool_response(Path::new("src/process-a.rs"), "PROCESS_A_WRITE\n");
                 write_response(&mut stream, "200 OK", &response, "text/event-stream");
-            } else {
+            } else if !initial_failure_sent {
+                initial_failure_sent = true;
                 write_response(
                     &mut stream,
                     "500 Internal Server Error",
@@ -211,10 +249,16 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     });
 
     let api_base = format!("http://{}", address);
-    let session_id = "headless-process-resume-session";
     let first_args = common_args(&api_base, &fixture, session_id);
     let first = run_child(
-        spawn_child(&first_args, "START_PROCESS_A", &home),
+        spawn_child(
+            &first_args,
+            &format!(
+                "START_PROCESS_A [{task_marker}]",
+                task_marker = spec.accepted_task_marker()
+            ),
+            &home,
+        ),
         Duration::from_secs(30),
     );
     assert_ne!(
@@ -235,6 +279,27 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         request_bodies.lock().unwrap()
     );
 
+    let stale_session_id = "headless-process-stale-session";
+    let mut stale_args = common_args(&api_base, &fixture, stale_session_id);
+    stale_args.extend(["--resume".to_string(), stale_session_id.to_string()]);
+    let stale_path = fixture.join("src/stale-session-must-not-write.rs");
+    let stale = run_child(
+        spawn_child(&stale_args, "STALE_SESSION", &home),
+        Duration::from_secs(30),
+    );
+    assert!(
+        !stale.status.success(),
+        "stale session must fail before starting a fresh conversation; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&stale.stderr),
+        String::from_utf8_lossy(&stale.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("could not load headless resume session"),
+        "stale-session error must be explicit: {}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert!(!stale_path.exists(), "stale session must not create a file");
+
     let mut second_args = common_args(&api_base, &fixture, session_id);
     second_args.extend(["--resume".to_string(), session_id.to_string()]);
     let second = run_child(
@@ -253,6 +318,29 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         String::from_utf8_lossy(&second.stdout)
     );
 
+    let mut edited_spec = spec.clone();
+    edited_spec.title = "Edited after process A approval".to_string();
+    edited_spec
+        .write_to(&spec_path)
+        .expect("edit approved spec after resume");
+    let edited_path = fixture.join("src/edited-must-not-write.rs");
+    let mut edited_args = common_args(&api_base, &fixture, session_id);
+    edited_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let edited = run_child(
+        spawn_child(&edited_args, "RESUME_EDITED_SPEC", &home),
+        Duration::from_secs(30),
+    );
+    assert!(
+        !edited.status.success(),
+        "edited spec must fail closed after the model attempts a write; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&edited.stderr),
+        String::from_utf8_lossy(&edited.stdout)
+    );
+    assert!(
+        !edited_path.exists(),
+        "edited spec must not authorize a write"
+    );
+
     server.join().expect("provider fixture server");
     let bodies = request_bodies.lock().unwrap();
     assert!(
@@ -267,6 +355,18 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     assert!(
         bodies.iter().any(|body| body.contains("RESUME_PROCESS_B")),
         "a request from process B must reach the fixture"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("Plan approval required before")),
+        "edited-spec tool result must contain the fail-closed plan error"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("RESUME_EDITED_SPEC")),
+        "edited-spec process must reach the provider fixture"
     );
 
     let session_path = home.join("sessions").join(format!("{session_id}.json"));
