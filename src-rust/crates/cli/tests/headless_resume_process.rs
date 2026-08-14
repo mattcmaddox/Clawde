@@ -1,0 +1,282 @@
+//! Process-boundary coverage for headless `--resume`.
+//!
+//! The local HTTP fixture is deterministic and never contacts a real provider:
+//! process A performs a Write, then receives controlled provider failures after
+//! the tool-result boundary; process B resumes the persisted session and gets a
+//! successful response. The fixture records request bodies so the test proves
+//! process B received process A's tool result rather than merely reusing the
+//! session ID.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn binary_path() -> String {
+    env!("CARGO_BIN_EXE_clawde").to_string()
+}
+
+fn read_request(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set request timeout");
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let body_end = loop {
+        let count = stream.read(&mut chunk).expect("read HTTP request");
+        if count == 0 {
+            break None;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let end = header_end + 4 + content_length;
+        if bytes.len() >= end {
+            break Some(end);
+        }
+    };
+    let end = body_end.unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+fn write_response(stream: &mut TcpStream, status: &str, body: &str, content_type: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("write HTTP response");
+}
+
+fn tool_response(path: &Path) -> String {
+    let arguments = serde_json::json!({
+        "file_path": path.display().to_string(),
+        "content": "PROCESS_A_WRITE\n"
+    })
+    .to_string();
+    let first = serde_json::json!({
+        "id": "resume-tool",
+        "object": "chat.completion.chunk",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "resume-call",
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "arguments": arguments
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish = serde_json::json!({
+        "id": "resume-tool",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {first}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+}
+
+fn resumed_response() -> &'static str {
+    "data: {\"id\":\"resume-ok\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"RESUMED_OK\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"resume-ok\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
+}
+
+fn run_child(mut child: Child, timeout: Duration) -> Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("poll child") {
+            Some(_) => return child.wait_with_output().expect("collect child output"),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("clawde child exceeded {timeout:?}");
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn common_args(api_base: &str, cwd: &Path, session_id: &str) -> Vec<String> {
+    vec![
+        "--print".to_string(),
+        "--provider".to_string(),
+        "openai".to_string(),
+        "--model".to_string(),
+        "gpt-4o-mini".to_string(),
+        "--api-key".to_string(),
+        "test-key".to_string(),
+        "--api-base".to_string(),
+        api_base.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--max-turns".to_string(),
+        "2".to_string(),
+        "--bare".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--cwd".to_string(),
+        cwd.display().to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+    ]
+}
+
+fn spawn_child(args: &[String], prompt: &str, home: &Path) -> Child {
+    let mut command = Command::new(binary_path());
+    command
+        .args(args)
+        .arg(prompt)
+        .env("CLAWDE_HOME", home)
+        .env("RUST_LOG", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.spawn().expect("spawn clawde headless child")
+}
+
+#[test]
+fn headless_resume_survives_two_processes_and_tool_result_boundary() {
+    let fixture = std::env::temp_dir().join(format!(
+        "clawde-headless-resume-fixture-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let home = std::env::temp_dir().join(format!(
+        "clawde-headless-resume-home-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(fixture.join("src")).expect("fixture directory");
+    std::fs::create_dir_all(&home).expect("home directory");
+    std::fs::write(
+        fixture.join("src/lib.rs"),
+        "pub fn baseline() -> u32 { 1 }\n",
+    )
+    .expect("fixture source");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider fixture");
+    listener
+        .set_nonblocking(false)
+        .expect("configure provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let bodies_for_server = request_bodies.clone();
+    let write_path = fixture.join("src/process-a.rs");
+    let server = thread::spawn(move || {
+        let mut first_request = true;
+        for mut stream in listener.incoming().flatten() {
+            let body = read_request(&mut stream);
+            bodies_for_server.lock().unwrap().push(body.clone());
+            if body.contains("RESUME_PROCESS_B") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    resumed_response(),
+                    "text/event-stream",
+                );
+                break;
+            }
+            if first_request {
+                first_request = false;
+                let response = tool_response(Path::new("src/process-a.rs"));
+                write_response(&mut stream, "200 OK", &response, "text/event-stream");
+            } else {
+                write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "controlled process-A failure",
+                    "text/plain",
+                );
+            }
+        }
+    });
+
+    let api_base = format!("http://{}", address);
+    let session_id = "headless-process-resume-session";
+    let first_args = common_args(&api_base, &fixture, session_id);
+    let first = run_child(
+        spawn_child(&first_args, "START_PROCESS_A", &home),
+        Duration::from_secs(30),
+    );
+    assert_ne!(
+        first.status.code(),
+        Some(0),
+        "process A must stop on the controlled provider failure; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let written = std::fs::read_to_string(&write_path).ok();
+    assert_eq!(
+        written.as_deref(),
+        Some("PROCESS_A_WRITE\n"),
+        "process A did not materialize its tool call; status={:?}, stderr={}, stdout={}, requests={:?}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout),
+        request_bodies.lock().unwrap()
+    );
+
+    let mut second_args = common_args(&api_base, &fixture, session_id);
+    second_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let second = run_child(
+        spawn_child(&second_args, "RESUME_PROCESS_B", &home),
+        Duration::from_secs(30),
+    );
+    assert!(
+        second.status.success(),
+        "process B must resume successfully; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&second.stderr),
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("RESUMED_OK"),
+        "process B response missing from stream: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    server.join().expect("provider fixture server");
+    let bodies = request_bodies.lock().unwrap();
+    assert!(
+        bodies.len() >= 3,
+        "expected process A retries plus process B, requests={}",
+        bodies.len()
+    );
+    assert!(
+        bodies.iter().any(|body| body.contains("PROCESS_A_WRITE")),
+        "a later request must contain process A's tool-result content"
+    );
+    assert!(
+        bodies.iter().any(|body| body.contains("RESUME_PROCESS_B")),
+        "a request from process B must reach the fixture"
+    );
+
+    let session_path = home.join("sessions").join(format!("{session_id}.json"));
+    let session: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(session_path).expect("saved session"))
+            .expect("valid saved session JSON");
+    assert!(session["messages"]
+        .as_array()
+        .is_some_and(|messages| messages.len() >= 3));
+
+    std::fs::remove_dir_all(fixture).expect("remove fixture");
+    std::fs::remove_dir_all(home).expect("remove home");
+}
