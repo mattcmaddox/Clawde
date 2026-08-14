@@ -3871,6 +3871,7 @@ impl App {
             || self.compare_dialog.visible
             || self.mcp_approval.visible
             || self.file_injection_dialog.visible
+            || self.spec_review.visible
             || self.context_menu_state.is_some()
     }
     /// Insert or remove the routing pins on a routing JSON object. Pinning
@@ -10607,6 +10608,21 @@ mod tests {
         let mut app = make_app();
         app.model_picker.visible = true;
         assert!(app.needs_fast_repaint());
+    }
+
+    #[test]
+    fn spec_review_dialog_counts_as_modal_for_enter_gating() {
+        // Regression: the CLI main loop gates Enter submit/queue on
+        // any_modal_open(); without spec_review in that set, Enter while the
+        // spec dialog is open fell into the empty-input `continue` and was
+        // silently swallowed, so Accept/Edit/Reject were unreachable by
+        // keyboard even though Escape and the arrow keys worked.
+        let mut app = make_app();
+        assert!(!app.any_modal_open());
+        app.spec_review.visible = true;
+        assert!(app.any_modal_open());
+        app.spec_review.visible = false;
+        assert!(!app.any_modal_open());
     }
 
     #[test]
