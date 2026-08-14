@@ -15,6 +15,63 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn accept_spec_via_review_command(spec_root: &Path, session_id: &str) {
+    // Exercise the same user-facing path as the TUI: dispatch the real
+    // no-argument `/spec-review` command, then press Enter on its default
+    // Accept action. This deliberately avoids calling the approval API here;
+    // the helper proves that the command path materializes the approval hash
+    // and plan progress that the later subprocess must reload.
+    let mut app = clawde_tui::App::new(
+        clawde_core::Config::default(),
+        clawde_core::CostTracker::new(),
+    );
+    app.set_working_directory(spec_root);
+    app.session_id = session_id.to_string();
+    app.spec_review.set_session_id(session_id);
+    assert!(app.intercept_slash_command_with_args("spec-review", ""));
+    assert!(
+        app.spec_review.visible,
+        "spec-review must open the generated spec"
+    );
+    assert_eq!(
+        app.spec_review.selected_action,
+        clawde_tui::spec_review::ACTION_ACCEPT
+    );
+    app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        !app.spec_review.visible,
+        "Accept must close the review dialog"
+    );
+    assert_eq!(
+        app.queued_messages.len(),
+        1,
+        "Accept must queue implementation"
+    );
+    let (approved_path, approved_spec) =
+        clawde_core::spec::Spec::approved_in(spec_root, session_id)
+            .expect("Accept must persist a session-bound approval");
+    assert!(
+        app.queued_messages[0].contains(&approved_spec.accepted_task_marker()),
+        "queued implementation must carry the accepted task marker"
+    );
+    let approved_raw = std::fs::read_to_string(&approved_path).expect("read accepted spec");
+    let progress = clawde_core::plan::PlanProgress::load_for(
+        spec_root,
+        &approved_spec.task_id,
+        session_id,
+        &clawde_core::spec::Spec::content_hash(&approved_raw),
+    )
+    .expect("load progress initialized by Accept")
+    .expect("Accept must initialize bound plan progress");
+    assert_eq!(
+        progress.status,
+        clawde_core::PlanStatus::Active,
+        "Accept must initialize an active plan"
+    );
+}
+
 fn binary_path() -> String {
     env!("CARGO_BIN_EXE_clawde").to_string()
 }
@@ -186,8 +243,7 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     };
     spec.write_to(&spec_path)
         .expect("write approved-plan fixture");
-    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
-        .expect("approve process-boundary fixture");
+    accept_spec_via_review_command(&fixture, session_id);
     let approved_raw = std::fs::read_to_string(&spec_path).expect("read approved fixture");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local provider fixture");
