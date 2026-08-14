@@ -795,6 +795,7 @@ pub const NO_PROGRESS_WINDOW: usize = 4;
 /// a small alternating cycle — with no writes and no diff; any genuinely new
 /// signature, a write, a diff, or a text-only turn resets it. Returns `true`
 /// when the streak reached [`NO_PROGRESS_STOP_STREAK`].
+#[cfg(test)]
 fn update_no_progress_state(
     signature: Option<String>,
     recent_no_progress: &mut std::collections::VecDeque<String>,
@@ -802,30 +803,59 @@ fn update_no_progress_state(
     wrote_files: bool,
     has_diff: bool,
 ) -> bool {
+    update_no_progress_state_with_errors(
+        signature,
+        recent_no_progress,
+        no_progress_streak,
+        wrote_files,
+        has_diff,
+        false,
+    )
+}
+
+/// Error-aware variant of [`update_no_progress_state`]. A changing sequence of
+/// unavailable/failed tool names is still one stalled execution pattern, so
+/// error turns use a stable sentinel instead of their individual signatures.
+/// A failed file-mutator does not count as progress unless a scoped diff exists.
+fn update_no_progress_state_with_errors(
+    signature: Option<String>,
+    recent_no_progress: &mut std::collections::VecDeque<String>,
+    no_progress_streak: &mut u32,
+    wrote_files: bool,
+    has_diff: bool,
+    had_tool_errors: bool,
+) -> bool {
     // A text-only turn (no tools) is never a no-progress signature: reset.
     let Some(sig) = signature else {
         recent_no_progress.clear();
         *no_progress_streak = 0;
         return false;
     };
-    // Any progress (a write or a diff) resets the streak even when the call
-    // signature happens to match, and forgets the no-progress history.
-    if wrote_files || has_diff {
+    // A scoped diff is definitive progress. A write tool that returned an
+    // error, however, did not necessarily change anything; do not let a
+    // failed Edit/Write evade the error sentinel by setting `wrote_files`
+    // before dispatch.
+    if has_diff || (wrote_files && !had_tool_errors) {
         recent_no_progress.clear();
         *no_progress_streak = 0;
         return false;
     }
+    let effective_signature = if had_tool_errors {
+        "<tool-error>".to_string()
+    } else {
+        sig
+    };
     // A no-progress tool turn: if this signature was seen in the recent
-    // no-progress window, the model is looping (identical call or a small
-    // alternating cycle); extend the run. A genuinely new call starts a fresh
-    // run (the first turn of a run already counts — matching the goal guard's
-    // 3-strike semantics).
-    if recent_no_progress.contains(&sig) {
+    // no-progress window, the model is looping (identical call, a small
+    // alternating cycle, or changing failed-tool calls); extend the run. A
+    // genuinely new signature starts a fresh run (the first turn of a run
+    // already counts — matching the goal guard's 3-strike semantics).
+    if recent_no_progress.contains(&effective_signature) {
         *no_progress_streak += 1;
     } else {
         *no_progress_streak = 1;
     }
-    recent_no_progress.push_back(sig);
+    recent_no_progress.push_back(effective_signature);
     while recent_no_progress.len() > NO_PROGRESS_WINDOW {
         recent_no_progress.pop_front();
     }
@@ -1127,19 +1157,29 @@ pub async fn run_query_loop(
                 } else {
                     Some(turn_tool_signatures.join("|"))
                 };
+                let had_tool_errors = turn_tool_error_count > 0;
                 turn_tool_signatures.clear();
-                if update_no_progress_state(
+                if update_no_progress_state_with_errors(
                     signature,
                     &mut recent_no_progress,
                     &mut no_progress_streak,
                     wrote_files,
                     turn_diff.is_some(),
+                    had_tool_errors,
                 ) {
                     if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!(
-                            "No progress detected: the model revisited the same tool call {} consecutive turns without changing any files — stopping the loop.",
-                            no_progress_streak
-                        )));
+                        let status = if had_tool_errors {
+                            format!(
+                                "No progress detected: the model encountered tool errors for {} consecutive turns without changing any files — stopping the loop.",
+                                no_progress_streak
+                            )
+                        } else {
+                            format!(
+                                "No progress detected: the model revisited the same tool call {} consecutive turns without changing any files — stopping the loop.",
+                                no_progress_streak
+                            )
+                        };
+                        let _ = tx.send(QueryEvent::Status(status));
                     }
                     return QueryOutcome::EndTurn {
                         message: $assistant_msg,
@@ -5524,6 +5564,56 @@ mod tests {
             ));
             assert_eq!(streak, 1);
         }
+    }
+
+    #[test]
+    fn no_progress_detector_collapses_changing_tool_errors() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        // Different unavailable tools are one stalled pattern when every turn
+        // has errors and no file change. The third error turn stops early.
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:{}".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(streak, 1);
+        assert!(!update_no_progress_state_with_errors(
+            Some("RunTests:{}".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(streak, 2);
+        assert!(update_no_progress_state_with_errors(
+            Some("RunLints:{}".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
+    }
+
+    #[test]
+    fn no_progress_detector_does_not_treat_failed_write_as_progress() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        assert!(!update_no_progress_state_with_errors(
+            Some("Edit:{}".to_string()),
+            &mut recent,
+            &mut streak,
+            true,
+            false,
+            true,
+        ));
+        assert_eq!(streak, 1);
     }
 
     #[test]
