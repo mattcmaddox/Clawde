@@ -10648,6 +10648,43 @@ mod tests {
 
     // ---- spec review (§10) ----
 
+    /// The `/refresh-models` TUI intercept must run the real cache-expiry path
+    /// (`force_refresh_discovery_caches`), so the persisted free-chain
+    /// discovery caches are gone on the next chain build — not just cleared
+    /// in-process. Deterministic: seeds the caches with future-fresh
+    /// timestamps and asserts deletion, with no network or auth required.
+    #[test]
+    fn refresh_models_intercept_expires_discovery_caches() {
+        let _home = TestHome::acquire(); // isolate CLAWDE_HOME
+        let mut app = make_app();
+        let state_dir = clawde_core::config::Settings::config_dir().join("free-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("live-discovery.json"),
+            r#"{"saved_at_unix": 9999999999, "models": {"cloudflare": "@cf/qwen/qwen3-30b-a3b-fp8"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            state_dir.join("modelsdev-defaults.json"),
+            r#"{"saved_at_unix": 9999999999, "defaults": {"groq": "gpt-oss-120b"}}"#,
+        )
+        .unwrap();
+
+        assert!(app.intercept_slash_command_with_args("refresh-models", ""));
+        assert!(
+            !state_dir.join("live-discovery.json").exists(),
+            "live-discovery cache must be expired by /refresh-models"
+        );
+        assert!(
+            !state_dir.join("modelsdev-defaults.json").exists(),
+            "modelsdev defaults cache must be expired by /refresh-models"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Live model discovery refreshed — re-probing configured upstreams.")
+        );
+    }
+
     #[test]
     fn spec_review_without_path_uses_active_working_directory() {
         let mut app = make_app();
