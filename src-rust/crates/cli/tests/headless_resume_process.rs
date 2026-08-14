@@ -204,10 +204,30 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         let mut edited_tool_sent = false;
         let mut complete_tool_sent = false;
         let mut replacement_tool_sent = false;
+        let mut replacement_after_blocked_tool_sent = false;
         let mut blocked_tool_sent = false;
         for mut stream in listener.incoming().flatten() {
             let body = read_request(&mut stream);
             bodies_for_server.lock().unwrap().push(body.clone());
+            if body.contains("RESUME_REPLACEMENT_AFTER_BLOCKED") {
+                if !replacement_after_blocked_tool_sent {
+                    replacement_after_blocked_tool_sent = true;
+                    let response = tool_response(
+                        Path::new("src/replacement-after-blocked.rs"),
+                        "REPLACEMENT_AFTER_BLOCKED_WRITE\n",
+                    );
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        resumed_response(),
+                        "text/event-stream",
+                    );
+                    break;
+                }
+                continue;
+            }
             if body.contains("RESUME_BLOCKED_PLAN") {
                 if !blocked_tool_sent {
                     blocked_tool_sent = true;
@@ -223,7 +243,6 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
                         "controlled blocked-plan failure",
                         "text/plain",
                     );
-                    break;
                 }
                 continue;
             }
@@ -564,6 +583,60 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         !blocked_path.exists(),
         "blocked plan must not authorize a write"
     );
+
+    let replacement_after_blocked_spec = clawde_core::spec::Spec {
+        task_id: "replacement-after-blocked-task".to_string(),
+        task: "Recover safely with a replacement after a blocked plan".to_string(),
+        session_id: Some(session_id.to_string()),
+        title: "Replacement after blocked plan".to_string(),
+        ..Default::default()
+    };
+    replacement_after_blocked_spec
+        .write_to(&spec_path)
+        .expect("write replacement-after-blocked spec");
+    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+        .expect("approve replacement-after-blocked spec");
+    let replacement_after_blocked_raw =
+        std::fs::read_to_string(&spec_path).expect("read replacement-after-blocked spec");
+    let replacement_after_blocked_progress = clawde_core::PlanProgress::load_for(
+        &fixture,
+        &replacement_after_blocked_spec.task_id,
+        session_id,
+        &clawde_core::spec::Spec::content_hash(&replacement_after_blocked_raw),
+    )
+    .expect("load replacement-after-blocked plan")
+    .expect("replacement-after-blocked progress");
+    assert_eq!(
+        replacement_after_blocked_progress.status,
+        clawde_core::PlanStatus::Active,
+        "a replacement approval must reopen a blocked plan"
+    );
+    let replacement_after_blocked_path = fixture.join("src/replacement-after-blocked.rs");
+    let mut replacement_after_blocked_args = common_args(&api_base, &fixture, session_id);
+    replacement_after_blocked_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let replacement_after_blocked = run_child(
+        spawn_child(
+            &replacement_after_blocked_args,
+            &format!(
+                "RESUME_REPLACEMENT_AFTER_BLOCKED {}",
+                replacement_after_blocked_spec.accepted_task_marker()
+            ),
+            &home,
+        ),
+        Duration::from_secs(30),
+    );
+    assert!(
+        replacement_after_blocked.status.success(),
+        "replacement after blocked must resume successfully; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&replacement_after_blocked.stderr),
+        String::from_utf8_lossy(&replacement_after_blocked.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&replacement_after_blocked_path)
+            .expect("replacement-after-blocked write result"),
+        "REPLACEMENT_AFTER_BLOCKED_WRITE\n",
+        "replacement approval must reopen writes after a blocked plan"
+    );
     server.join().expect("provider fixture server");
     let bodies = request_bodies.lock().unwrap();
     assert!(
@@ -602,6 +675,12 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
             .iter()
             .any(|body| body.contains("RESUME_REPLACEMENT_PLAN")),
         "replacement-plan process must reach the provider fixture"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("RESUME_REPLACEMENT_AFTER_BLOCKED")),
+        "replacement-after-blocked process must reach the provider fixture"
     );
     assert!(
         bodies.iter().any(|body| {
