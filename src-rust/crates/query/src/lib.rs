@@ -769,51 +769,66 @@ fn plan_resume_summary(
     ))
 }
 
-/// Consecutive identical tool calls (same name + same input) with no writes
-/// and no diff that force a loop-health stop. Loop-engineering guidance: a
-/// model stuck repeating the exact same call (e.g. a failing Bash retry with
-/// identical args) would otherwise burn turns until the cap. Three identical
-/// no-progress turns is a conservative threshold: a legitimate same-command
-/// retry is given headroom, but a true loop is cut short before the cap.
+/// Consecutive tool turns with no writes and no diff that revisit a recently
+/// seen tool signature force a loop-health stop. Loop-engineering guidance: a
+/// model stuck repeating the same call (e.g. a failing Bash retry with
+/// identical args) — or alternating between two calls (A, B, A, B) so no single
+/// signature repeats back-to-back — would otherwise burn turns until the cap.
+/// Three no-progress turns that revisit a signature within
+/// [`NO_PROGRESS_WINDOW`] is a conservative threshold: a legitimate
+/// same-command retry is given headroom, but a true loop is cut short before
+/// the cap.
 pub const NO_PROGRESS_STOP_STREAK: u32 = 3;
+
+/// How many recent no-progress tool signatures the detector remembers. A turn
+/// whose signature appears in this window is a loop repeat, even if the
+/// signature is not identical to the immediately preceding turn (e.g. an
+/// alternating A, B, A, B cycle).
+pub const NO_PROGRESS_WINDOW: usize = 4;
 
 /// Update the loop-health no-progress detector and report whether the loop
 /// must stop.
 ///
 /// `signature` is the joined signature of the tool calls executed this logical
-/// turn (`None` when no tools ran). The streak only advances when the SAME
-/// signature repeats with no writes and no diff; any change (different call,
-/// a write, a diff, or a text-only turn) resets it. Returns `true` when the
-/// streak reached [`NO_PROGRESS_STOP_STREAK`].
+/// turn (`None` when no tools ran). The streak advances when the signature was
+/// seen within the recent no-progress window — identical back-to-back calls OR
+/// a small alternating cycle — with no writes and no diff; any genuinely new
+/// signature, a write, a diff, or a text-only turn resets it. Returns `true`
+/// when the streak reached [`NO_PROGRESS_STOP_STREAK`].
 fn update_no_progress_state(
     signature: Option<String>,
-    last_tool_signature: &mut Option<String>,
+    recent_no_progress: &mut std::collections::VecDeque<String>,
     no_progress_streak: &mut u32,
     wrote_files: bool,
     has_diff: bool,
 ) -> bool {
     // A text-only turn (no tools) is never a no-progress signature: reset.
     let Some(sig) = signature else {
-        *last_tool_signature = None;
+        recent_no_progress.clear();
         *no_progress_streak = 0;
         return false;
     };
     // Any progress (a write or a diff) resets the streak even when the call
-    // signature happens to match.
+    // signature happens to match, and forgets the no-progress history.
     if wrote_files || has_diff {
-        *last_tool_signature = Some(sig);
+        recent_no_progress.clear();
         *no_progress_streak = 0;
         return false;
     }
-    // A no-progress tool turn: extend the identical-call run or start a new
-    // one (the first turn of a run already counts — matching the goal guard's
+    // A no-progress tool turn: if this signature was seen in the recent
+    // no-progress window, the model is looping (identical call or a small
+    // alternating cycle); extend the run. A genuinely new call starts a fresh
+    // run (the first turn of a run already counts — matching the goal guard's
     // 3-strike semantics).
-    if last_tool_signature.as_deref() == Some(sig.as_str()) {
+    if recent_no_progress.contains(&sig) {
         *no_progress_streak += 1;
     } else {
         *no_progress_streak = 1;
     }
-    *last_tool_signature = Some(sig);
+    recent_no_progress.push_back(sig);
+    while recent_no_progress.len() > NO_PROGRESS_WINDOW {
+        recent_no_progress.pop_front();
+    }
     *no_progress_streak >= NO_PROGRESS_STOP_STREAK
 }
 
@@ -887,11 +902,13 @@ pub async fn run_query_loop(
     // pure read/search turns.
     let mut wrote_files = false;
     // Loop-health no-progress detector: the signature of the previous turn's
-    // tool calls and how many consecutive turns repeated the identical call
-    // with no writes and no diff. Reset whenever the signature changes or any
-    // progress (write/diff) happens; stops the loop at
+    // tool calls and how many consecutive turns revisited a recently seen
+    // no-progress signature (identical call or a small alternating cycle) with
+    // no writes and no diff. Reset whenever the signature is genuinely new or
+    // any progress (write/diff) happens; stops the loop at
     // NO_PROGRESS_STOP_STREAK so a stuck model cannot burn turns to the cap.
-    let mut last_tool_signature: Option<String> = None;
+    let mut recent_no_progress: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
     let mut no_progress_streak: u32 = 0;
     // Signatures of the tool calls executed during the current logical turn.
     // Filled at each tool-execution site; consumed and cleared when the turn
@@ -1093,9 +1110,11 @@ pub async fn run_query_loop(
                     }),
                 };
                 // Loop-health no-progress detector (research lever): if the
-                // model repeated the IDENTICAL tool call (same name + same
-                // input) with no writes and no diff, bump the streak;
-                // otherwise reset it. At NO_PROGRESS_STOP_STREAK consecutive
+                // model revisited a tool signature seen in the recent
+                // no-progress window — an IDENTICAL call (same name + same
+                // input) OR a small alternating cycle like A, B, A — with no
+                // writes and no diff, bump the streak; a genuinely new
+                // signature resets it. At NO_PROGRESS_STOP_STREAK consecutive
                 // no-progress turns, stop instead of continuing to burn turns
                 // up to the cap. A text-only turn (None signature) or any
                 // progress resets the streak. Signatures come from the tools
@@ -1111,14 +1130,14 @@ pub async fn run_query_loop(
                 turn_tool_signatures.clear();
                 if update_no_progress_state(
                     signature,
-                    &mut last_tool_signature,
+                    &mut recent_no_progress,
                     &mut no_progress_streak,
                     wrote_files,
                     turn_diff.is_some(),
                 ) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Status(format!(
-                            "No progress detected: the model repeated the same tool call {} consecutive turns without changing any files — stopping the loop.",
+                            "No progress detected: the model revisited the same tool call {} consecutive turns without changing any files — stopping the loop.",
                             no_progress_streak
                         )));
                     }
@@ -5315,12 +5334,12 @@ mod tests {
 
     #[test]
     fn no_progress_detector_requires_identical_signature_and_no_progress() {
-        let mut last = None;
+        let mut recent = std::collections::VecDeque::new();
         let mut streak = 0;
         // First identical no-op call: no write, no diff → streak 1, not stopped.
         assert!(!update_no_progress_state(
             Some("noop_tool:{}".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             false,
@@ -5329,7 +5348,7 @@ mod tests {
         // Same call again: streak 2.
         assert!(!update_no_progress_state(
             Some("noop_tool:{}".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             false,
@@ -5338,7 +5357,7 @@ mod tests {
         // Third identical call with no progress → STOP at NO_PROGRESS_STOP_STREAK.
         assert!(update_no_progress_state(
             Some("noop_tool:{}".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             false,
@@ -5348,26 +5367,50 @@ mod tests {
 
     #[test]
     fn no_progress_detector_resets_on_writes_diff_or_signature_change() {
-        let mut last = None;
+        let mut recent = std::collections::VecDeque::new();
         let mut streak = 0;
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
         assert_eq!(streak, 2);
         // A write resets the streak even for the identical call.
         assert!(!update_no_progress_state(
             Some("a".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             true,
             false,
         ));
         assert_eq!(streak, 0);
         // A diff resets it too.
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
         assert!(!update_no_progress_state(
             Some("a".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             true,
@@ -5375,27 +5418,143 @@ mod tests {
         assert_eq!(streak, 0);
         // A different call starts a fresh streak (the first turn of the new
         // run counts, matching the goal guard's 3-strike semantics).
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
         assert!(!update_no_progress_state(
             Some("b".to_string()),
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             false,
         ));
         assert_eq!(streak, 1);
         // A text-only turn (None signature) also resets.
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
-        update_no_progress_state(Some("a".to_string()), &mut last, &mut streak, false, false);
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
         assert!(!update_no_progress_state(
             None,
-            &mut last,
+            &mut recent,
             &mut streak,
             false,
             false
         ));
         assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn no_progress_detector_catches_alternating_cycle_without_writes() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        // A model alternating between two calls (A, B, A, B, ...) never
+        // repeats a signature back-to-back, but revisits A within the window:
+        // the detector must treat that as a loop, not a fresh run each turn.
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, 1);
+        assert!(!update_no_progress_state(
+            Some("b".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, 1);
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, 2);
+        // Fourth alternating turn (b revisited within the window): streak 3,
+        // which already reaches NO_PROGRESS_STOP_STREAK → STOP.
+        assert!(update_no_progress_state(
+            Some("b".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
+    }
+
+    #[test]
+    fn no_progress_detector_does_not_stop_long_distinct_probe_runs() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        // A long run of genuinely distinct read-only probes (no writes, no
+        // diff, no repeats) must never trip the detector.
+        for probe in ["read:a", "read:b", "read:c", "bash:ls", "read:d", "grep:x"] {
+            assert!(!update_no_progress_state(
+                Some(probe.to_string()),
+                &mut recent,
+                &mut streak,
+                false,
+                false,
+            ));
+            assert_eq!(streak, 1);
+        }
+    }
+
+    #[test]
+    fn no_progress_detector_resets_window_after_progress_before_repeat() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        // A, then a write, then A again: the write clears the window, so the
+        // later A is a fresh run, not a repeat of the pre-write A.
+        update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+        );
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            true,
+            false,
+        ));
+        assert_eq!(streak, 0);
+        assert!(!update_no_progress_state(
+            Some("a".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false
+        ));
+        assert_eq!(streak, 1);
     }
 
     /// Whole-loop wiring: a Goal-mode loop whose model repeats the same tool
