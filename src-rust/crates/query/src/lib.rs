@@ -647,8 +647,9 @@ fn active_plan_context(
         recent_evidence
     };
     Some(format!(
-        "<active_plan_step>\nTask: {}\nStep: {} ({:?})\nStatus: {:?}\nAcceptance criteria:\n{}\nRecent harness evidence (bounded):\n{}\nEvidence records: {}\nOnly the harness may advance this step; do not claim completion from prose. Work on this step and leave deterministic evidence for the next turn.\n</active_plan_step>",
+        "<active_plan_step>\nTask: {}\nPhase: {:?}\nStep: {} ({:?})\nStatus: {:?}\nAcceptance criteria:\n{}\nRecent harness evidence (bounded):\n{}\nEvidence records: {}\nOnly the harness may advance this step; phase labels do not authorize tools or acceptance. Work on this step and leave deterministic evidence for the next turn.\n</active_plan_step>",
         truncate_plan_text(&spec.title, 200),
+        progress.phase,
         truncate_plan_text(&step.title, 300),
         step.phase,
         step.status,
@@ -711,6 +712,7 @@ fn record_plan_turn_progress(
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
             plan_status: clawde_core::PlanStatus::Active,
+            phase: clawde_core::PlanStepPhase::Explore,
             active_step_id: None,
             failure_streak: 0,
             replan_required: false,
@@ -3100,6 +3102,7 @@ mod tests {
         let context =
             active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
         assert!(context.contains("Keep the active step visible"));
+        assert!(context.contains("Phase: Explore"));
         assert!(context.contains("Only the harness may advance"));
         assert!(!context.contains("Recovery:"));
         assert!(
@@ -3126,6 +3129,7 @@ mod tests {
         }
         let recovery_context =
             active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
+        assert!(recovery_context.contains("Phase: Diagnose"));
         assert!(recovery_context.contains("Recovery:"));
         assert!(recovery_context.contains("do not repeat the same failing action"));
         assert!(recovery_context.contains("Revisit completed step 'none' (none)"));

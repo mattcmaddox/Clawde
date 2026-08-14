@@ -35,6 +35,7 @@ pub enum PlanStepStatus {
 #[serde(rename_all = "snake_case")]
 pub enum PlanStepPhase {
     Explore,
+    Diagnose,
     Implement,
     Verify,
 }
@@ -85,6 +86,8 @@ pub struct PlanProgressEvent {
     pub task_id: String,
     pub session_id: String,
     pub plan_status: PlanStatus,
+    /// Harness-observed coordination phase; not a permission or acceptance gate.
+    pub phase: PlanStepPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_step_id: Option<String>,
     /// Consecutive real deterministic failures on the active step.
@@ -112,6 +115,9 @@ pub struct PlanProgress {
     pub spec_path: String,
     pub spec_hash: String,
     pub status: PlanStatus,
+    /// Harness-observed phase; it does not authorize tools or acceptance.
+    #[serde(default = "default_plan_phase")]
+    pub phase: PlanStepPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_step_id: Option<String>,
     #[serde(default)]
@@ -258,6 +264,7 @@ impl PlanProgress {
                 .replace('\\', "/"),
             spec_hash: Spec::content_hash(raw_spec),
             status: PlanStatus::Active,
+            phase: PlanStepPhase::Explore,
             active_step_id: steps.first().map(|step| step.id.clone()),
             failure_streak: 0,
             replan_required: false,
@@ -361,6 +368,7 @@ impl PlanProgress {
             task_id: progress.task_id.clone(),
             session_id: progress.session_id.clone(),
             plan_status: progress.status,
+            phase: progress.phase,
             active_step_id: progress.active_step_id.clone(),
             failure_streak: progress.failure_streak,
             replan_required: progress.replan_required,
@@ -381,6 +389,13 @@ impl PlanProgress {
         evidence: PlanAdvanceEvidence,
     ) -> Result<Option<PlanTransition>, PlanStateError> {
         if evidence.deterministic_failed {
+            self.phase = PlanStepPhase::Diagnose;
+        } else if evidence.deterministic_checks_run {
+            self.phase = PlanStepPhase::Verify;
+        } else if evidence.turn_made_writes || evidence.has_scoped_diff {
+            self.phase = PlanStepPhase::Implement;
+        }
+        if evidence.deterministic_failed {
             self.failure_streak = self
                 .failure_streak
                 .saturating_add(1)
@@ -392,6 +407,12 @@ impl PlanProgress {
         }
         let transition = self.advance_from_evidence(evidence)?;
         if transition.is_some() {
+            self.phase = self
+                .active_step_id
+                .as_deref()
+                .and_then(|active_id| self.steps.iter().find(|step| step.id == active_id))
+                .map(|step| step.phase)
+                .unwrap_or(PlanStepPhase::Verify);
             self.failure_streak = 0;
             self.replan_required = false;
             self.backtrack_target_step_id = None;
@@ -422,7 +443,7 @@ impl PlanProgress {
             PlanStepPhase::Verify => {
                 evidence.deterministic_checks_run && evidence.deterministic_passed
             }
-            PlanStepPhase::Explore | PlanStepPhase::Implement => {
+            PlanStepPhase::Explore | PlanStepPhase::Diagnose | PlanStepPhase::Implement => {
                 evidence.turn_made_writes
                     && evidence.has_scoped_diff
                     && evidence.deterministic_checks_run
@@ -618,6 +639,10 @@ impl PlanProgress {
     }
 }
 
+fn default_plan_phase() -> PlanStepPhase {
+    PlanStepPhase::Explore
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -689,6 +714,7 @@ mod tests {
 
         assert_eq!(progress.status, PlanStatus::Active);
         assert_eq!(progress.active_step_id.as_deref(), Some("requirement-1"));
+        assert_eq!(progress.phase, PlanStepPhase::Explore);
         assert_eq!(progress.failure_streak, 0);
         assert!(!progress.replan_required);
         assert_eq!(progress.backtrack_target_step_id, None);
@@ -914,6 +940,7 @@ mod tests {
             ..Default::default()
         };
         assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
+        assert_eq!(progress.phase, PlanStepPhase::Diagnose);
         assert_eq!(progress.failure_streak, 1);
         assert!(!progress.replan_required);
         assert!(progress.coordinate_from_evidence(failed).unwrap().is_none());
@@ -936,6 +963,7 @@ mod tests {
         };
         let transition = progress.coordinate_from_evidence(passed).unwrap().unwrap();
         assert_eq!(transition.completed_step_id, "requirement-1");
+        assert_eq!(progress.phase, PlanStepPhase::Implement);
         assert_eq!(progress.failure_streak, 0);
         assert!(!progress.replan_required);
         assert_eq!(progress.backtrack_target_step_id, None);

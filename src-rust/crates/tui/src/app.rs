@@ -10017,19 +10017,22 @@ impl App {
                     )
                 } else if event.replan_required {
                     format!(
-                        "Plan recovery required: {} failures; revisit {}",
+                        "Plan recovery required ({:?}): {} failures; revisit {}",
+                        event.phase,
                         event.failure_streak,
                         event.backtrack_target_step_id.as_deref().unwrap_or("none")
                     )
                 } else if let Some(transition) = event.transition.as_ref() {
                     format!(
-                        "Plan advanced: {} → {}",
+                        "Plan advanced ({:?}): {} → {}",
+                        event.phase,
                         transition.completed_step_id,
                         event.active_step_id.as_deref().unwrap_or("complete")
                     )
                 } else {
                     format!(
-                        "Plan evidence recorded: {}",
+                        "Plan evidence recorded ({:?}): {}",
+                        event.phase,
                         event.active_step_id.as_deref().unwrap_or("no active step")
                     )
                 });

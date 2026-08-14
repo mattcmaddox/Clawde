@@ -2221,8 +2221,9 @@ async fn run_headless(
                         String::new()
                     };
                     eprintln!(
-                        "\n[plan progress: {}] task={} step={}{}",
+                        "\n[plan progress: {}] phase={:?} task={} step={}{}",
                         state,
+                        event.phase,
                         event.task_id,
                         event.active_step_id.as_deref().unwrap_or("none"),
                         recovery
