@@ -10024,6 +10024,11 @@ impl App {
                         "Plan evidence not persisted: {}",
                         event.error.as_deref().unwrap_or("unknown error")
                     )
+                } else if event.plan_status == clawde_core::PlanStatus::Blocked {
+                    format!(
+                        "Plan blocked after {} replan cycle(s) — approve a new spec to continue.",
+                        event.replan_count
+                    )
                 } else if event.replan_required {
                     format!(
                         "Plan recovery required ({:?}): {} failures; revisit {}",
@@ -10504,6 +10509,11 @@ pub(crate) fn prepare_memory_file(
 pub(crate) fn open_file_externally(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Hermetic test seam: unit tests must never spawn desktop apps
+    // (xdg-open / open / start). Set CLAWDE_NO_EXTERNAL_OPEN=1 to no-op.
+    if std::env::var_os("CLAWDE_NO_EXTERNAL_OPEN").is_some() {
+        return Ok(());
+    }
     // Try to open with the system's default application
     #[cfg(target_os = "macos")]
     {
@@ -10783,6 +10793,125 @@ mod tests {
         // Rejecting discards the spec — spec mode stays on for the next task.
         assert!(app.config.spec_mode);
         assert!(app.queued_messages.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end Reject: resolve through the real no-argument `/spec-review`
+    /// command, navigate to Reject, and press Enter. The durable gates must
+    /// not fire: no `.approved.json`, no bound plan artifact, no queued
+    /// implementation turn, and spec mode stays on for the next task.
+    #[test]
+    fn reject_spec_via_review_command_writes_no_approval() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.config.spec_mode = true;
+        let dir = std::env::temp_dir().join(format!("clawde-reject-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"task_id":"clawde-reject-test","task":"Do not implement","session_id":"clawde-reject-session","title":"Task Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+
+        app.set_working_directory(&dir);
+        app.spec_review.set_session_id("clawde-reject-session");
+        assert!(app.intercept_slash_command_with_args("spec-review", ""));
+        assert!(app.spec_review.visible);
+        assert_eq!(app.spec_review.path.as_ref(), Some(&path));
+
+        // Accept → Edit → Reject: two Rights land on Reject.
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.spec_review.selected_action,
+            crate::spec_review::ACTION_REJECT
+        );
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.spec_review.visible, "reject must close the dialog");
+        assert!(
+            app.queued_messages.is_empty(),
+            "no implementation turn queued"
+        );
+        assert!(app.config.spec_mode, "spec mode stays on for the next task");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Spec rejected — nothing will be implemented.")
+        );
+        assert!(
+            clawde_core::spec::Spec::approved_in(&dir, "clawde-reject-session").is_none(),
+            "reject must not persist an approval record"
+        );
+        assert!(
+            !clawde_core::plan::PlanProgress::path_for(&dir, "clawde-reject-test")
+                .unwrap()
+                .exists(),
+            "reject must not initialize a plan artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end Edit: resolve through the real no-argument `/spec-review`
+    /// command, navigate to Edit, and press Enter. The dialog closes with a
+    /// path-bearing status message, and no approval/plan/queue side effects
+    /// occur. The external editor spawn is suppressed via
+    /// `CLAWDE_NO_EXTERNAL_OPEN` so the test stays hermetic.
+    #[test]
+    fn edit_spec_via_review_command_closes_without_approval() {
+        let _home = TestHome::acquire();
+        std::env::set_var("CLAWDE_NO_EXTERNAL_OPEN", "1");
+        let mut app = make_app();
+        let dir = std::env::temp_dir().join(format!("clawde-edit-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"task_id":"clawde-edit-test","task":"Edit me","session_id":"clawde-edit-session","title":"Task Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+
+        app.set_working_directory(&dir);
+        app.spec_review.set_session_id("clawde-edit-session");
+        assert!(app.intercept_slash_command_with_args("spec-review", ""));
+        assert_eq!(
+            app.spec_review.selected_action,
+            crate::spec_review::ACTION_ACCEPT
+        );
+
+        // One Right lands on Edit (Accept → Edit → Reject).
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.spec_review.selected_action,
+            crate::spec_review::ACTION_EDIT
+        );
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.spec_review.visible, "edit must close the dialog");
+        let msg = app
+            .status_message
+            .as_deref()
+            .expect("edit sets a status message");
+        assert!(
+            msg.contains("editor"),
+            "status must reference the editor: {msg}"
+        );
+        assert!(
+            msg.contains("task.json"),
+            "status must name the spec path: {msg}"
+        );
+        assert!(app.queued_messages.is_empty());
+        assert!(
+            clawde_core::spec::Spec::approved_in(&dir, "clawde-edit-session").is_none(),
+            "edit must not persist an approval record"
+        );
+        assert!(
+            !clawde_core::plan::PlanProgress::path_for(&dir, "clawde-edit-test")
+                .unwrap()
+                .exists(),
+            "edit must not initialize a plan artifact"
+        );
+        std::env::remove_var("CLAWDE_NO_EXTERNAL_OPEN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
