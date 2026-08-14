@@ -1243,7 +1243,7 @@ pub async fn run_query_loop(
                             && report.results.iter().any(|result| !result.ok && !result.skipped)
                     }),
                 };
-                if let Some(event) = record_plan_turn_progress(
+                let plan_blocked = record_plan_turn_progress(
                     &tool_ctx.working_dir,
                     &tool_ctx.session_id,
                     active_task_id.as_deref(),
@@ -1262,10 +1262,30 @@ pub async fn run_query_loop(
                         semantic_note.as_deref(),
                     ),
                     plan_advance_evidence,
-                ) {
+                )
+                .map(|event| {
+                    let blocked = event.plan_status == clawde_core::PlanStatus::Blocked;
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::PlanProgress(event));
                     }
+                    blocked
+                })
+                .unwrap_or(false);
+                // A plan that has exhausted its replan budget is terminal. Do
+                // not spend another model turn waiting for VerifyPolicy's
+                // independent retry budget; the write gate has already
+                // fail-closed and the user must approve a new spec.
+                if plan_blocked {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Plan blocked after exhausting its replan budget; stopping the loop."
+                                .to_string(),
+                        ));
+                    }
+                    return QueryOutcome::EndTurn {
+                        message: $assistant_msg,
+                        usage: $usage,
+                    };
                 }
                 // A declined gate-open review is already included in the
                 // bounded plan evidence above and was emitted as a status
@@ -5251,6 +5271,200 @@ mod tests {
             .summary
             .contains("fixture needs semantic review"));
         assert_eq!(fix_requests[0].findings, vec!["review the generated value"]);
+    }
+
+    /// A deterministic replay of repeated failed checks must exercise the real
+    /// query loop, persist the plan's bounded replan counter, stop immediately
+    /// when the plan becomes Blocked, and leave the write gate fail-closed.
+    /// This is the primary proof of the multi-turn path; live providers are
+    /// deliberately not used because their tool availability is stochastic.
+    #[tokio::test]
+    async fn approved_plan_stops_query_loop_when_replan_budget_exhausts() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::create_dir_all(fixture.path().join("src")).expect("fixture src");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"query_loop_replan_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            "#[test]\nfn deterministic_failure() { assert!(false); }\n",
+        )
+        .expect("failing fixture source");
+
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let task_id = "replan-loop-task";
+        let session_id = "replan-loop-session";
+        let spec_path = fixture.path().join("specs/replan-loop.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: task_id.to_string(),
+            task: "Exercise bounded replan termination".to_string(),
+            session_id: Some(session_id.to_string()),
+            title: "Bounded replan integration".to_string(),
+            requirements: vec![
+                "Persist failure evidence without changing the approved spec".to_string(),
+            ],
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).expect("write spec");
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+            .expect("approve spec");
+        let raw_spec = std::fs::read_to_string(&spec_path).expect("read spec");
+        clawde_core::PlanProgress::initialize_for_spec(
+            fixture.path(),
+            &spec_path,
+            &raw_spec,
+            &spec,
+            session_id,
+        )
+        .expect("initialize plan progress");
+
+        let request_tools = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: request_tools.clone(),
+            always_end_turn: false,
+            write_path: Some(
+                fixture
+                    .path()
+                    .join("src/generated.rs")
+                    .display()
+                    .to_string(),
+            ),
+            write_content: Some("pub(crate) fn generated() -> u32 { 1 }\n".to_string()),
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = session_id.to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.permission_handler = Arc::new(AllowAllHandler);
+        ctx.non_interactive = true;
+
+        let verify = clawde_core::config::VerifyConfig {
+            enabled: true,
+            max_retries: 4,
+            auto_test: true,
+            auto_lint: false,
+            skip_when_no_writes: false,
+            timeout_secs: 10,
+            ..Default::default()
+        };
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 4,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Verify(verify),
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user(format!(
+            "Implement the accepted task [{task_id_marker}]",
+            task_id_marker = format!("clawde-spec-task:{task_id}")
+        ))];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[Box::new(clawde_tools::FileWriteTool)],
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("replan replay must not hang");
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(
+            request_tools.lock().unwrap().len(),
+            5,
+            "one write request plus four deterministic failure rounds; the blocked plan must prevent a fifth retry"
+        );
+
+        let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+        let progress =
+            clawde_core::PlanProgress::load_for(fixture.path(), task_id, session_id, &spec_hash)
+                .expect("load progress")
+                .expect("progress exists");
+        assert_eq!(progress.status, clawde_core::PlanStatus::Blocked);
+        assert_eq!(progress.replan_count, clawde_core::PLAN_MAX_REPLANS);
+        assert_eq!(progress.active_step_id, None);
+        assert_eq!(
+            progress.steps[0].status,
+            clawde_core::PlanStepStatus::Blocked
+        );
+        assert_eq!(progress.steps[0].evidence.len(), 4);
+
+        let mut saw_blocked = false;
+        let mut saw_blocked_status = false;
+        let mut plan_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                QueryEvent::PlanProgress(event) => {
+                    plan_events += 1;
+                    if event.plan_status == clawde_core::PlanStatus::Blocked {
+                        saw_blocked = true;
+                        assert_eq!(event.replan_count, clawde_core::PLAN_MAX_REPLANS);
+                    }
+                }
+                QueryEvent::Status(status) if status.contains("Plan blocked") => {
+                    saw_blocked_status = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            plan_events, 4,
+            "each failed deterministic round persists evidence"
+        );
+        assert!(saw_blocked, "blocked plan event must be observable");
+        assert!(saw_blocked_status, "blocked stop status must be observable");
+
+        let blocked_write = execute_tool_for_task(
+            clawde_core::constants::TOOL_NAME_FILE_WRITE,
+            &serde_json::json!({
+                "file_path": fixture.path().join("src/after-blocked.rs"),
+                "content": "must not be written\n"
+            }),
+            &[Box::new(clawde_tools::FileWriteTool)],
+            &ctx,
+            Some(task_id),
+        )
+        .await;
+        assert!(blocked_write.is_error);
+        assert!(blocked_write.content.contains("BLOCKED"));
+        assert!(!fixture.path().join("src/after-blocked.rs").exists());
     }
 
     /// The max-turns degradation (summary) turn now gets a bounded final
