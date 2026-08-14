@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use clawde_core::config::PermissionMode;
 use clawde_core::PermissionLevel;
 
+use clawde_api::ProviderError;
+
 use crate::continuation::ContinuationDecision;
 use crate::verify::VerifyReport;
 
@@ -144,6 +146,11 @@ pub enum Recovery {
     Retry,
     /// Replan the step (not the task) and retry.
     Replan,
+    /// Re-read the repo/tool state (evidence refresh), keep the plan, retry.
+    /// Per Babu & Agrawal (arXiv:2606.01416): stale retrieved context demands
+    /// an evidence refresh, not a blind replan. Cheaper than Replan — the
+    /// step's intent survives; only its inputs are re-validated.
+    Refresh,
     /// Give up on this task.
     GiveUp,
     /// Escalate to a human.
@@ -164,13 +171,45 @@ pub fn decide_recover(
             Recovery::Retry
         }
         OrchestrationError::RateLimited if retries_left == 0 => Recovery::GiveUp,
-        // tool/schema/stale-context: replan the step, not the task
-        OrchestrationError::ToolError | OrchestrationError::StaleContext => Recovery::Replan,
+        // tool/schema failure: replan the step, not the task
+        OrchestrationError::ToolError => Recovery::Replan,
+        // stale context: refresh the evidence, keep the plan
+        OrchestrationError::StaleContext => Recovery::Refresh,
         // same error twice in a row: change approach (no-progress detector)
         _ if last_error == Some(err) => Recovery::Replan,
         // security/policy/key: never retry blindly
         OrchestrationError::AuthFailed | OrchestrationError::PolicyViolation => Recovery::Human,
         _ => Recovery::Human,
+    }
+}
+
+/// Map a structured provider error onto the orchestration taxonomy.
+///
+/// Single source of truth for the query loop's stream-error recovery
+/// (Babu & Agrawal 2026: "observable failure signal → inferred failure
+/// class → targeted recovery"). Transient signals (rate limits, quota,
+/// mid-stream hiccups, retryable server errors) classify to retry-class
+/// buckets; auth and malformed-request signals classify to never-retry
+/// buckets so the loop does not burn its budget blindly.
+pub fn classify_provider_error(err: &ProviderError) -> OrchestrationError {
+    match err {
+        ProviderError::RateLimited { .. } => OrchestrationError::RateLimited,
+        ProviderError::QuotaExceeded { .. } => OrchestrationError::QuotaExceeded,
+        ProviderError::AuthFailed { .. } => OrchestrationError::AuthFailed,
+        // Mid-stream failures are transient by nature (the provider's own
+        // `is_retryable` agrees) — treat like a rate-limit-class retry.
+        ProviderError::StreamError { .. } => OrchestrationError::RateLimited,
+        // 5xx server errors retry only when the provider flags them retryable.
+        ProviderError::ServerError {
+            is_retryable: true, ..
+        } => OrchestrationError::RateLimited,
+        ProviderError::ServerError { .. } => OrchestrationError::Other,
+        // Config/request-shape failures never fix themselves by retrying.
+        ProviderError::ContextOverflow { .. }
+        | ProviderError::ModelNotFound { .. }
+        | ProviderError::InvalidRequest { .. }
+        | ProviderError::ContentFiltered { .. }
+        | ProviderError::Other { .. } => OrchestrationError::Other,
     }
 }
 
@@ -449,14 +488,24 @@ mod tests {
     }
 
     #[test]
-    fn recover_tool_and_stale_context_replan() {
+    fn recover_tool_error_replans() {
         assert_eq!(
             decide_recover(OrchestrationError::ToolError, 0, None),
             Recovery::Replan
         );
+    }
+
+    #[test]
+    fn recover_stale_context_refreshes_evidence() {
+        // Babu & Agrawal: stale context demands an evidence refresh, not a
+        // blind replan — even with no retries left, the action is Refresh.
         assert_eq!(
             decide_recover(OrchestrationError::StaleContext, 0, None),
-            Recovery::Replan
+            Recovery::Refresh
+        );
+        assert_eq!(
+            decide_recover(OrchestrationError::StaleContext, 3, None),
+            Recovery::Refresh
         );
     }
 
@@ -543,6 +592,131 @@ mod tests {
         let mut r = report(&[false], 1, 3);
         r.results[0].skipped = true;
         assert!(!decide_replan(&r));
+    }
+
+    // ---- classify_provider_error ----------------------------------------
+
+    fn pid() -> clawde_core::provider_id::ProviderId {
+        clawde_core::provider_id::ProviderId::new("test")
+    }
+
+    #[test]
+    fn classify_transient_errors_retry_class() {
+        use ProviderError as Pe;
+        assert_eq!(
+            classify_provider_error(&Pe::RateLimited {
+                provider: pid(),
+                retry_after: Some(5)
+            }),
+            OrchestrationError::RateLimited
+        );
+        assert_eq!(
+            classify_provider_error(&Pe::QuotaExceeded {
+                provider: pid(),
+                message: "cap".into()
+            }),
+            OrchestrationError::QuotaExceeded
+        );
+        assert_eq!(
+            classify_provider_error(&Pe::StreamError {
+                provider: pid(),
+                message: "mid-stream".into(),
+                partial_response: None,
+            }),
+            OrchestrationError::RateLimited
+        );
+        assert_eq!(
+            classify_provider_error(&Pe::ServerError {
+                provider: pid(),
+                status: Some(503),
+                message: "busy".into(),
+                is_retryable: true,
+            }),
+            OrchestrationError::RateLimited
+        );
+    }
+
+    #[test]
+    fn classify_non_retryable_errors_never_retry_class() {
+        use ProviderError as Pe;
+        assert_eq!(
+            classify_provider_error(&Pe::AuthFailed {
+                provider: pid(),
+                message: "401".into()
+            }),
+            OrchestrationError::AuthFailed
+        );
+        assert_eq!(
+            classify_provider_error(&Pe::ServerError {
+                provider: pid(),
+                status: Some(501),
+                message: "nope".into(),
+                is_retryable: false,
+            }),
+            OrchestrationError::Other
+        );
+        for err in [
+            Pe::ContextOverflow {
+                provider: pid(),
+                message: "big".into(),
+                max_tokens: Some(8192),
+            },
+            Pe::ModelNotFound {
+                provider: pid(),
+                model: "x".into(),
+                suggestions: vec![],
+            },
+            Pe::InvalidRequest {
+                provider: pid(),
+                message: "bad".into(),
+            },
+            Pe::ContentFiltered {
+                provider: pid(),
+                message: "blocked".into(),
+            },
+            Pe::Other {
+                provider: pid(),
+                message: "?".into(),
+                status: None,
+                body: None,
+            },
+        ] {
+            assert_eq!(
+                classify_provider_error(&err),
+                OrchestrationError::Other,
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_then_recover_auth_never_retries() {
+        // The full path the query loop takes: an auth failure classifies to
+        // Human regardless of the remaining budget — no blind retries.
+        let err = ProviderError::AuthFailed {
+            provider: pid(),
+            message: "401".into(),
+        };
+        assert_eq!(
+            decide_recover(classify_provider_error(&err), 2, None),
+            Recovery::Human
+        );
+    }
+
+    #[test]
+    fn classify_then_recover_transient_retries_while_budgeted() {
+        let err = ProviderError::RateLimited {
+            provider: pid(),
+            retry_after: Some(30),
+        };
+        assert_eq!(
+            decide_recover(classify_provider_error(&err), 2, None),
+            Recovery::Retry
+        );
+        assert_eq!(
+            decide_recover(classify_provider_error(&err), 0, None),
+            Recovery::GiveUp
+        );
     }
 
     // ---- decide_adversarial ---------------------------------------------

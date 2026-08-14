@@ -983,6 +983,10 @@ pub async fn run_query_loop(
     // Automatic retries for the current logical completion. This survives
     // stall/error retries and is reset after a completed turn is emitted.
     let mut request_retries = 0u32;
+    // Last classified recovery error for the same-error-twice rule
+    // (decide_recover changes approach on a repeat). Survives stream
+    // retry attempts within a logical turn; reset with the other counters.
+    let mut last_recovery_error: Option<crate::decide::OrchestrationError> = None;
 
     // Measure one complete logical completion, including provider retries and
     // tool rounds. Reset when a continuation starts a new completion below.
@@ -1358,6 +1362,7 @@ pub async fn run_query_loop(
                         max_tokens_recovery_count = 0;
                         retries_left = 2;
                         request_retries = 0;
+                        last_recovery_error = None;
                         used_fallback = false;
                         goal_turn_start = std::time::Instant::now();
                         observability_started_at = std::time::Instant::now();
@@ -1991,7 +1996,9 @@ pub async fn run_query_loop(
                     // Set when the stream yields a mid-stream `Err`. The
                     // accumulated text/tool-calls are then incomplete and MUST
                     // NOT be assembled into a "completed" turn (issue #215).
-                    let mut provider_stream_error: Option<String> = None;
+                    // Kept as the structured `ProviderError` so the recovery
+                    // classifier (crate::decide) can stratify the retry.
+                    let mut provider_stream_error: Option<clawde_api::ProviderError> = None;
 
                     loop {
                         tokio::select! {
@@ -2008,7 +2015,7 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
-                                        provider_stream_error = Some(e.to_string());
+                                        provider_stream_error = Some(e);
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -2106,11 +2113,28 @@ pub async fn run_query_loop(
                     // tool-call JSON are incomplete/untrustworthy. Do NOT fall
                     // through to assemble and execute tools from a truncated
                     // stream (issue #215 — an Edit/Write could otherwise run
-                    // with empty `{}` args). Mirror the Anthropic branch's
-                    // retry semantics: retry the turn if retries remain,
-                    // otherwise surface the failure as a QueryOutcome::Error.
+                    // with empty `{}` args).
+                    //
+                    // Recovery is stratified and budgeted (crate::decide, per
+                    // Babu & Agrawal 2026): classify the failure signal, then
+                    // let decide_recover pick the action. Retry-class errors
+                    // (rate limit, quota, transient stream/server) retry while
+                    // the budget lasts; auth/config-class errors escalate
+                    // immediately — never burn retries blindly on a bad key.
                     if let Some(err) = provider_stream_error {
-                        if retries_left > 0 {
+                        let classified = crate::decide::classify_provider_error(&err);
+                        let recovery = crate::decide::decide_recover(
+                            classified,
+                            retries_left,
+                            last_recovery_error,
+                        );
+                        last_recovery_error = Some(classified);
+                        if matches!(
+                            recovery,
+                            crate::decide::Recovery::Retry
+                                | crate::decide::Recovery::Replan
+                                | crate::decide::Recovery::Refresh
+                        ) {
                             retries_left -= 1;
                             request_retries += 1;
                             warn!(
@@ -2118,11 +2142,12 @@ pub async fn run_query_loop(
                                 model = %model_id_str,
                                 retries_left,
                                 error = %err,
-                                "Provider stream error — retrying turn"
+                                recovery = ?recovery,
+                                "Provider stream error — recovering turn"
                             );
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::Status(format!(
-                                    "Stream error — retrying ({} left)…",
+                                    "Stream error ({recovery:?}) — retrying ({} left)…",
                                     retries_left + 1
                                 )));
                             }
@@ -2133,10 +2158,11 @@ pub async fn run_query_loop(
                             provider = %provider_id_str,
                             model = %model_id_str,
                             error = %err,
-                            "Provider stream error — retries exhausted; aborting turn"
+                            recovery = ?recovery,
+                            "Provider stream error — not retryable; aborting turn"
                         );
                         return QueryOutcome::Error(ClaudeError::Api(format!(
-                            "Provider '{}' stream error (model '{}'): {}",
+                            "Provider '{}' stream error (model '{}'): {} (recovery: {recovery:?})",
                             provider_id_str, model_id_str, err
                         )));
                     }
