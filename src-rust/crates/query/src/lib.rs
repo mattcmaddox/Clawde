@@ -625,8 +625,29 @@ fn active_plan_context(
         .map(|item| format!("- {}", truncate_plan_text(item, 400)))
         .collect::<Vec<_>>()
         .join("\\n");
+    let recent_evidence = step
+        .evidence
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(|evidence| {
+            let summary = evidence.summary.replace(['\n', '\r'], " ");
+            format!(
+                "- [{}] {}",
+                truncate_plan_text(&evidence.kind, 64),
+                truncate_plan_text(&summary, 360)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\\n");
+    let recent_evidence = if recent_evidence.is_empty() {
+        "- none recorded".to_string()
+    } else {
+        recent_evidence
+    };
     Some(format!(
-        "<active_plan_step>\nTask: {}\nStep: {} ({:?})\nStatus: {:?}\nAcceptance criteria:\n{}\nEvidence records: {}\nOnly the harness may advance this step; do not claim completion from prose. Work on this step and leave deterministic evidence for the next turn.\n</active_plan_step>",
+        "<active_plan_step>\nTask: {}\nStep: {} ({:?})\nStatus: {:?}\nAcceptance criteria:\n{}\nRecent harness evidence (bounded):\n{}\nEvidence records: {}\nOnly the harness may advance this step; do not claim completion from prose. Work on this step and leave deterministic evidence for the next turn.\n</active_plan_step>",
         truncate_plan_text(&spec.title, 200),
         truncate_plan_text(&step.title, 300),
         step.phase,
@@ -636,6 +657,7 @@ fn active_plan_context(
         } else {
             acceptance
         },
+        recent_evidence,
         step.evidence.len(),
     ))
     .map(|context| {
@@ -644,8 +666,20 @@ fn active_plan_context(
                 .backtrack_target_step_id
                 .as_deref()
                 .unwrap_or("none");
+            let target_detail = progress
+                .backtrack_target_step_id
+                .as_deref()
+                .and_then(|target_id| progress.steps.iter().find(|step| step.id == target_id))
+                .map(|target_step| {
+                    format!(
+                        "{}: {}",
+                        target_step.id,
+                        truncate_plan_text(&target_step.title, 240)
+                    )
+                })
+                .unwrap_or_else(|| "none".to_string());
             format!(
-                "{context}\nRecovery: deterministic checks failed {} consecutive times. Change the implementation approach before retrying; do not repeat the same failing action. Revisit completed step '{target}' if present and verify its assumptions. The harness will clear this signal only after a passing check.",
+                "{context}\nRecovery: deterministic checks failed {} consecutive times. Change the implementation approach before retrying; do not repeat the same failing action. Revisit completed step '{target}' ({target_detail}) if present and verify its assumptions. The harness will clear this signal only after a passing check.",
                 progress.failure_streak
             )
         } else {
@@ -3094,7 +3128,8 @@ mod tests {
             active_plan_context(dir.path(), "context-session", Some("context-plan-task")).unwrap();
         assert!(recovery_context.contains("Recovery:"));
         assert!(recovery_context.contains("do not repeat the same failing action"));
-        assert!(recovery_context.contains("Revisit completed step 'none'"));
+        assert!(recovery_context.contains("Revisit completed step 'none' (none)"));
+        assert!(recovery_context.contains("[check] A deterministic check failed."));
     }
 
     #[test]
