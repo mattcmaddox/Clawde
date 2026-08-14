@@ -2436,6 +2436,9 @@ async fn run_headless(
                     "provider": turn_observability.as_ref().map(|o| o.provider_id.clone()),
                     "upstream": turn_observability.as_ref().and_then(|o| o.upstream_id.clone()),
                     "model": turn_observability.as_ref().map(|o| o.model.clone()),
+                    "context_tokens_est": turn_observability
+                        .as_ref()
+                        .map(|o| o.context_tokens_est),
                     "semantic_verify": semantic_report,
                     "status": status_messages,
                 });
@@ -2459,6 +2462,9 @@ async fn run_headless(
                             "output_tokens": usage.output_tokens,
                         },
                         "cost_usd": cost_tracker.total_cost_usd(),
+                        "context_tokens_est": turn_observability
+                            .as_ref()
+                            .map(|o| o.context_tokens_est),
                     });
                     println!("{}", out);
                 }

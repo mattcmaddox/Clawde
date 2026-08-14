@@ -296,6 +296,11 @@ pub struct TurnObservability {
     /// Number of provider retry/fallback attempts within the completion.
     pub retries: u32,
     pub fallback_used: bool,
+    /// Assembled context size for this turn: real input usage when the
+    /// provider reports it, otherwise the chars/4 heuristic. Provider-
+    /// independent — the signal `decide_memory` budgets on (free providers
+    /// report `input_tokens: 0`, so this is the only truthful measurement).
+    pub context_tokens_est: u64,
 }
 
 /// F1 (free-mode audit fix): decide whether a `provider/model` dispatch to a
@@ -2408,6 +2413,10 @@ pub async fn run_query_loop(
                                 elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
                                 retries: request_retries,
                                 fallback_used: fallback_used_for_turn,
+                                context_tokens_est: compact::estimate_context_tokens(
+                                    messages,
+                                    (usage.total_input() > 0).then_some(usage.total_input()),
+                                ),
                             }),
                         });
                     }
@@ -2793,6 +2802,9 @@ pub async fn run_query_loop(
                         elapsed_ms: observability_started_at.elapsed().as_millis() as u64,
                         retries: request_retries,
                         fallback_used: used_fallback,
+                        // Reuses the exact context estimate the compaction
+                        // logic already computed for this turn (line above).
+                        context_tokens_est: context_tokens,
                     }),
                 });
             }
