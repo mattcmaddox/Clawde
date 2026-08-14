@@ -3169,7 +3169,20 @@ impl App {
                 let dir = clawde_core::git_utils::get_repo_root(&dir).unwrap_or(dir);
                 self.spec_review.open_latest(&dir)
             } else {
-                self.spec_review.open(std::path::PathBuf::from(arg))
+                let requested = std::path::PathBuf::from(arg);
+                let path = if requested.is_absolute() {
+                    requested
+                } else {
+                    let active_dir = self
+                        .current_dir
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    let root =
+                        clawde_core::git_utils::get_repo_root(&active_dir).unwrap_or(active_dir);
+                    root.join(requested)
+                };
+                self.spec_review.open(path)
             };
             match result {
                 Ok(()) => {
@@ -10712,6 +10725,32 @@ mod tests {
         assert!(app.spec_review.visible);
         assert_eq!(app.spec_review.path.as_ref(), Some(&path));
         assert_eq!(app.spec_review.spec.as_ref().unwrap().title, "Cwd Spec");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_review_with_relative_path_uses_active_working_directory() {
+        let mut app = make_app();
+        let dir = std::env::temp_dir().join(format!("clawde-spec-relative-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("specs")).unwrap();
+        let path = dir.join("specs/task.json");
+        std::fs::write(
+            &path,
+            r#"{"title":"Relative Spec","requirements":[],"files_to_touch":[],"data_models":[],"acceptance_tests":[],"edge_cases":[]}"#,
+        )
+        .unwrap();
+
+        // Simulate `--cwd <dir>` while the process itself is launched from a
+        // different directory. The explicit path is repository-relative and
+        // must resolve against the active working directory, not process cwd.
+        app.set_working_directory(&dir);
+        assert!(app.intercept_slash_command_with_args("spec-review", "specs/task.json"));
+        assert!(app.spec_review.visible);
+        assert_eq!(app.spec_review.path.as_ref(), Some(&path));
+        assert_eq!(
+            app.spec_review.spec.as_ref().unwrap().title,
+            "Relative Spec"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
