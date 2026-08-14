@@ -4094,6 +4094,12 @@ mod tests {
         /// `noop_tool` signature — used to exercise the loop-health
         /// no-progress detector across continuation turns.
         alternate_tool_then_end: bool,
+        /// Optional scripted request numbers on which to emit writes. This
+        /// keeps recovery tests deterministic without changing ordinary mock
+        /// provider behavior.
+        write_on_requests: Option<Vec<usize>>,
+        /// Content selected by the corresponding scripted write index.
+        scripted_write_contents: Option<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -4136,14 +4142,35 @@ mod tests {
             let request_index = self.tools_empty_per_request.lock().unwrap().len();
 
             let msg_id = uuid::Uuid::new_v4().to_string();
+            let scripted_write_index = self.write_on_requests.as_ref().and_then(|requests| {
+                requests
+                    .iter()
+                    .position(|request| *request == request_index)
+            });
             let write_tool_use = !tools_empty
-                && self
-                    .write_path
-                    .as_ref()
-                    .is_some_and(|_| !self.write_emitted.swap(true, AtomicOrdering::SeqCst));
+                && self.write_path.as_ref().is_some_and(|_| {
+                    if let Some(requests) = self.write_on_requests.as_ref() {
+                        requests.contains(&request_index)
+                    } else {
+                        !self.write_emitted.swap(true, AtomicOrdering::SeqCst)
+                    }
+                });
+            let current_write_content = scripted_write_index
+                .and_then(|index| {
+                    self.scripted_write_contents
+                        .as_ref()
+                        .and_then(|contents| contents.get(index))
+                })
+                .map(String::as_str)
+                .or(self.write_content.as_deref())
+                .unwrap_or_default();
             let emit_tool_use = !self.always_end_turn
                 && !tools_empty
-                && (self.write_path.is_none() || self.keep_tool_use_after_write);
+                && if self.write_on_requests.is_some() {
+                    write_tool_use
+                } else {
+                    self.write_path.is_none() || self.keep_tool_use_after_write
+                };
 
             let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> =
                 if self.alternate_tool_then_end && !tools_empty {
@@ -4200,7 +4227,7 @@ mod tests {
                     let tool_id = uuid::Uuid::new_v4().to_string();
                     let input = serde_json::json!({
                         "file_path": self.write_path.as_deref().unwrap_or_default(),
-                        "content": self.write_content.as_deref().unwrap_or_default(),
+                        "content": current_write_content,
                     });
                     vec![
                         Ok(StreamEvent::MessageStart {
@@ -4221,7 +4248,7 @@ mod tests {
                             index: 0,
                             partial_json: serde_json::json!({
                                 "file_path": self.write_path.as_deref().unwrap_or_default(),
-                                "content": self.write_content.as_deref().unwrap_or_default(),
+                                "content": current_write_content,
                             })
                             .to_string(),
                         }),
@@ -4434,6 +4461,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
             alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let (outcome, events) = drive_loop_with_observability(provider, noop_tools()).await;
 
@@ -4530,6 +4559,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
             alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let (outcome, messages) =
             drive_loop_with_provider(provider, tools, max_turns, continuation).await;
@@ -5159,6 +5190,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
             alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -5350,6 +5383,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
             alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -5467,6 +5502,177 @@ mod tests {
         assert!(!fixture.path().join("src/after-blocked.rs").exists());
     }
 
+    /// A deterministic replay of a corrected implementation must clear the
+    /// persisted recovery state and advance the approved plan instead of
+    /// incorrectly fail-closing it.
+    #[tokio::test]
+    async fn approved_plan_recovery_clears_replan_state_and_advances() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::create_dir_all(fixture.path().join("src")).expect("fixture src");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"query_loop_recovery_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            "pub fn generated_value() -> u32 { include!(\"generated.rs\") }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn generated_value_is_correct() { assert_eq!(crate::generated_value(), 1); }\n}\n",
+        )
+        .expect("fixture source");
+
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let task_id = "recovery-loop-task";
+        let session_id = "recovery-loop-session";
+        let spec_path = fixture.path().join("specs/recovery-loop.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: task_id.to_string(),
+            task: "Recover the approved implementation after a failed check".to_string(),
+            session_id: Some(session_id.to_string()),
+            title: "Successful replan recovery".to_string(),
+            requirements: vec!["Make the generated value pass its deterministic check".to_string()],
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).expect("write spec");
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+            .expect("approve spec");
+        let raw_spec = std::fs::read_to_string(&spec_path).expect("read spec");
+        clawde_core::PlanProgress::initialize_for_spec(
+            fixture.path(),
+            &spec_path,
+            &raw_spec,
+            &spec,
+            session_id,
+        )
+        .expect("initialize plan progress");
+
+        let request_tools = Arc::new(StdMutex::new(Vec::new()));
+        let generated_path = fixture.path().join("src/generated.rs");
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: request_tools.clone(),
+            always_end_turn: false,
+            write_path: Some(generated_path.display().to_string()),
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
+            write_on_requests: Some(vec![1, 3]),
+            scripted_write_contents: Some(vec!["0\n".to_string(), "1\n".to_string()]),
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = session_id.to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.permission_handler = Arc::new(AllowAllHandler);
+        ctx.non_interactive = true;
+
+        let verify = clawde_core::config::VerifyConfig {
+            enabled: true,
+            max_retries: 4,
+            auto_test: true,
+            auto_lint: false,
+            skip_when_no_writes: false,
+            timeout_secs: 10,
+            ..Default::default()
+        };
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 4,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Verify(verify),
+            ..Default::default()
+        };
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut messages = vec![Message::user(format!(
+            "Implement the accepted task [{task_id_marker}]",
+            task_id_marker = format!("clawde-spec-task:{task_id}")
+        ))];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[Box::new(clawde_tools::FileWriteTool)],
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("recovery replay must not hang");
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(request_tools.lock().unwrap().len(), 4);
+        assert_eq!(std::fs::read_to_string(&generated_path).unwrap(), "1\n");
+
+        let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+        let progress =
+            clawde_core::PlanProgress::load_for(fixture.path(), task_id, session_id, &spec_hash)
+                .expect("load progress")
+                .expect("progress exists");
+        assert_eq!(progress.status, clawde_core::PlanStatus::Active);
+        assert_eq!(progress.active_step_id.as_deref(), Some("verification"));
+        assert_eq!(
+            progress.steps[0].status,
+            clawde_core::PlanStepStatus::Complete
+        );
+        assert_eq!(progress.steps[0].evidence.len(), 2);
+        assert_eq!(progress.failure_streak, 0);
+        assert!(!progress.replan_required);
+        assert_eq!(progress.replan_count, 0);
+
+        let mut saw_failure = false;
+        let mut saw_pass = false;
+        let mut plan_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                QueryEvent::Verify(report) if report.verdict == VerifyVerdict::Fixable => {
+                    saw_failure = true;
+                }
+                QueryEvent::Verify(report) if report.verdict == VerifyVerdict::Pass => {
+                    saw_pass = true;
+                }
+                QueryEvent::PlanProgress(event) => {
+                    plan_events += 1;
+                    assert_ne!(event.plan_status, clawde_core::PlanStatus::Blocked);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_failure,
+            "the initial bad implementation must fail checks"
+        );
+        assert!(saw_pass, "the corrected implementation must pass checks");
+        assert_eq!(plan_events, 2);
+    }
+
     /// The max-turns degradation (summary) turn now gets a bounded final
     /// review: the semantic verifier runs once on the run's final state and
     /// the loop still ends. Regression guard for the review-only wiring.
@@ -5512,6 +5718,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: true,
             alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
@@ -5886,6 +6094,8 @@ mod tests {
             write_emitted: Arc::new(AtomicBool::new(false)),
             keep_tool_use_after_write: false,
             alternate_tool_then_end: true,
+            write_on_requests: None,
+            scripted_write_contents: None,
         });
         let mut registry = clawde_api::ProviderRegistry::new();
         registry.register(provider);
