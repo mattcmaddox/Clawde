@@ -757,6 +757,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_approved_spec_reopens_writes_after_terminal_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.spec_mode = true;
+        let spec_path = dir.path().join("specs/test-plan.json");
+        let session_id = "tool-dispatch-test";
+        let initial_spec = clawde_core::spec::Spec {
+            task_id: "complete-plan-task".to_string(),
+            task: "Complete plan".to_string(),
+            session_id: Some(session_id.to_string()),
+            title: "Complete plan".to_string(),
+            ..Default::default()
+        };
+        initial_spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id).unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress = clawde_core::PlanProgress::initialize_for_spec(
+            dir.path(),
+            &spec_path,
+            &raw,
+            &initial_spec,
+            session_id,
+        )
+        .unwrap();
+        while progress.active_step_id.is_some() {
+            progress
+                .record_evidence(clawde_core::PlanEvidence {
+                    kind: "complete".to_string(),
+                    summary: "Initial approved plan completed.".to_string(),
+                    reference: Some("evidence/complete.txt".to_string()),
+                })
+                .unwrap();
+            progress.complete_active_step().unwrap();
+        }
+        assert_eq!(progress.status, clawde_core::PlanStatus::Complete);
+        progress.save(dir.path()).unwrap();
+
+        let replacement_spec = clawde_core::spec::Spec {
+            task_id: "replacement-plan-task".to_string(),
+            task: "Continue with a newly approved plan".to_string(),
+            session_id: Some(session_id.to_string()),
+            title: "Replacement plan".to_string(),
+            ..Default::default()
+        };
+        replacement_spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id).unwrap();
+        let replacement_raw = std::fs::read_to_string(&spec_path).unwrap();
+        let replacement_progress = clawde_core::PlanProgress::load_for(
+            dir.path(),
+            &replacement_spec.task_id,
+            session_id,
+            &clawde_core::spec::Spec::content_hash(&replacement_raw),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replacement_progress.status,
+            clawde_core::PlanStatus::Active,
+            "a fresh approval must initialize an active replacement plan"
+        );
+        assert_eq!(
+            clawde_core::spec::Spec::approved_in(dir.path(), session_id)
+                .unwrap()
+                .1
+                .task_id,
+            replacement_spec.task_id
+        );
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+        let result = execute_tool_for_task(
+            "Edit",
+            &serde_json::json!({}),
+            &tools,
+            &ctx,
+            Some(&replacement_spec.task_id),
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "a new approved spec must reopen writes: {}",
+            result.content
+        );
+        assert_eq!(result.content, "named tool executed");
+    }
+
+    #[tokio::test]
     async fn plan_gate_rejects_unreviewed_and_stale_approval() {
         let dir = tempfile::tempdir().unwrap();
         let spec_path = dir.path().join("specs/task.json");
