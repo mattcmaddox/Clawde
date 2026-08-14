@@ -8968,10 +8968,7 @@ impl App {
             && self.permission_request.is_none()
             && !self.history_search_overlay.visible
             && self.history_search.is_none()
-            && !matches!(
-                self.prompt_input.vim_mode,
-                crate::prompt_input::VimMode::Normal | crate::prompt_input::VimMode::Visual
-            )
+            && self.prompt_input.vim_mode != crate::prompt_input::VimMode::Normal
     }
 
     fn paste_primary_into_prompt(&mut self) -> bool {

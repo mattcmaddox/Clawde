@@ -31,9 +31,6 @@ pub enum VimMode {
     #[default]
     Insert,
     Normal,
-    Visual,
-    /// Linewise visual selection (V).
-    VisualLine,
     /// Command-line mode (:).
     Command,
     /// In-prompt forward search (/).
@@ -45,8 +42,6 @@ impl VimMode {
         match self {
             Self::Insert => "INSERT",
             Self::Normal => "NORMAL",
-            Self::Visual => "VISUAL",
-            Self::VisualLine => "VISUAL LINE",
             Self::Command => "COMMAND",
             Self::Search => "SEARCH",
         }
@@ -56,7 +51,6 @@ impl VimMode {
         match self {
             Self::Insert => Color::Blue,
             Self::Normal => Color::Green,
-            Self::Visual | Self::VisualLine => Color::Magenta,
             Self::Command | Self::Search => Color::Cyan,
         }
     }
@@ -659,10 +653,6 @@ fn vim_normal(
                 .find('\n')
                 .map(|p| *cursor + p)
                 .unwrap_or(text.len());
-            false
-        }
-        "v" => {
-            *mode = VimMode::Visual;
             false
         }
         // ---- Simple motions ----
@@ -2184,8 +2174,6 @@ pub struct PromptInputState {
     pub vim_pending: VimPendingState,
     /// Undo stack: Vec of (text, cursor) snapshots before modifications.
     pub undo_stack: Vec<(String, usize)>,
-    /// Visual mode selection anchor (byte offset).
-    pub visual_anchor: Option<usize>,
     /// Last f/F/t/T find for `;`/`,` repeat.
     pub last_find: Option<(VimFindKind, char)>,
     /// Named registers: key is the register name char (a-z, 0-9, etc.), value is text.
@@ -2233,7 +2221,6 @@ impl PromptInputState {
             token_estimate: 0,
             vim_pending: VimPendingState::None,
             undo_stack: Vec::new(),
-            visual_anchor: None,
             last_find: None,
             vim_registers: std::collections::HashMap::new(),
             vim_macro_recording: None,
@@ -2656,7 +2643,6 @@ impl PromptInputState {
             }
             self.vim_mode = VimMode::Normal;
             self.vim_pending = VimPendingState::None;
-            self.visual_anchor = None;
             self.normalize();
             return;
         }
@@ -2924,15 +2910,6 @@ impl PromptInputState {
             }
             return;
         }
-        // Enter visual mode with `v` — anchor the selection start
-        if key == "v"
-            && self.vim_mode == VimMode::Normal
-            && self.vim_pending == VimPendingState::None
-        {
-            self.vim_mode = VimMode::Visual;
-            self.visual_anchor = Some(self.cursor);
-            return;
-        }
         // Enter command-line mode with `:`
         if key == ":"
             && self.vim_mode == VimMode::Normal
@@ -2949,19 +2926,6 @@ impl PromptInputState {
         {
             self.vim_mode = VimMode::Search;
             self.vim_search_buf.clear();
-            return;
-        }
-        // Enter visual-line mode with `V`
-        if key == "V"
-            && self.vim_mode == VimMode::Normal
-            && self.vim_pending == VimPendingState::None
-        {
-            self.vim_mode = VimMode::VisualLine;
-            let ls = self.text[..self.cursor]
-                .rfind('\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            self.visual_anchor = Some(ls);
             return;
         }
         // `n` — repeat last search forward
@@ -2983,104 +2947,6 @@ impl PromptInputState {
                 self.vim_search_backward(&pat);
             }
             return;
-        }
-        // In visual-line mode, `y`/`d`/`c` operate on whole lines, motion keys extend selection
-        if self.vim_mode == VimMode::VisualLine {
-            if let Some(anchor) = self.visual_anchor {
-                let line_start = |pos: usize, s: &str| -> usize {
-                    s[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0)
-                };
-                let line_end = |pos: usize, s: &str| -> usize {
-                    s[pos..].find('\n').map(|p| pos + p + 1).unwrap_or(s.len())
-                };
-                let sel_start = line_start(anchor.min(self.cursor), &self.text);
-                let sel_end = line_end(anchor.max(self.cursor), &self.text);
-                match key {
-                    "y" => {
-                        self.yank_buf = self.text[sel_start..sel_end].to_string();
-                        self.cursor = sel_start;
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        return;
-                    }
-                    "d" | "x" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[sel_start..sel_end].to_string();
-                        let char_count = self.yank_buf.chars().count();
-                        self.text.drain(sel_start..sel_end);
-                        self.cursor = sel_start.min(self.text.len());
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        self.vim_dot_action =
-                            Some(DotRepeatAction::DeleteChars { count: char_count });
-                        self.normalize();
-                        return;
-                    }
-                    "c" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[sel_start..sel_end].to_string();
-                        self.text.drain(sel_start..sel_end);
-                        self.cursor = sel_start;
-                        self.vim_mode = VimMode::Insert;
-                        self.visual_anchor = None;
-                        self.vim_insert_text_before = Some(self.text.clone());
-                        self.normalize();
-                        return;
-                    }
-                    _ => {
-                        // Motion keys extend the selection (handled by apply_vim_key below)
-                    }
-                }
-            }
-        }
-        // In visual mode, `y`/`d`/`c` operate on the selection, Escape exits
-        if self.vim_mode == VimMode::Visual {
-            if let Some(anchor) = self.visual_anchor {
-                let from = anchor.min(self.cursor);
-                let to_excl = anchor.max(self.cursor);
-                let to = self.text[to_excl..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(b, _)| to_excl + b)
-                    .unwrap_or(self.text.len());
-                match key {
-                    "y" => {
-                        self.yank_buf = self.text[from..to].to_string();
-                        self.cursor = from;
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        return;
-                    }
-                    "d" | "x" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[from..to].to_string();
-                        // Count chars to delete BEFORE mutating text
-                        let char_count = self.yank_buf.chars().count();
-                        self.text.drain(from..to);
-                        self.cursor = from.min(self.text.len());
-                        self.vim_mode = VimMode::Normal;
-                        self.visual_anchor = None;
-                        self.vim_dot_action =
-                            Some(DotRepeatAction::DeleteChars { count: char_count });
-                        self.normalize();
-                        return;
-                    }
-                    "c" => {
-                        self.push_undo();
-                        self.yank_buf = self.text[from..to].to_string();
-                        self.text.drain(from..to);
-                        self.cursor = from;
-                        self.vim_mode = VimMode::Insert;
-                        self.visual_anchor = None;
-                        self.vim_insert_text_before = Some(self.text.clone());
-                        self.normalize();
-                        return;
-                    }
-                    _ => {
-                        // Motion keys still move cursor in visual mode
-                    }
-                }
-            }
         }
 
         let snapshot_text = self.text.clone();
@@ -3136,10 +3002,6 @@ impl PromptInputState {
             }
         }
 
-        // Update visual anchor tracking when in visual mode
-        if self.vim_mode == VimMode::Visual && self.visual_anchor.is_none() {
-            self.visual_anchor = Some(self.cursor);
-        }
         self.normalize();
     }
 
@@ -3298,7 +3160,6 @@ impl PromptInputState {
         self.history_pos = None;
         self.token_estimate = 0;
         self.vim_pending = VimPendingState::None;
-        self.visual_anchor = None;
         self.vim_command_buf.clear();
         self.vim_search_buf.clear();
         // #223: emptying the buffer removes every `[Pasted text #N ...]`
@@ -4286,7 +4147,6 @@ mod tests {
     fn vim_mode_labels() {
         assert_eq!(VimMode::Insert.label(), "INSERT");
         assert_eq!(VimMode::Normal.label(), "NORMAL");
-        assert_eq!(VimMode::Visual.label(), "VISUAL");
     }
 
     #[test]
@@ -5543,38 +5403,18 @@ mod tests {
     }
 
     #[test]
-    fn prompt_input_visual_yank() {
-        let mut s = PromptInputState::new();
-        s.vim_enabled = true;
-        s.vim_mode = VimMode::Normal;
-        s.text = "hello world".to_string();
-        s.cursor = 0;
-        s.vim_command("v");
-        assert_eq!(s.vim_mode, VimMode::Visual);
-        // Move to end of word
-        s.vim_command("e");
-        s.vim_command("y"); // yank selection
-        assert_eq!(s.yank_buf, "hello");
-        assert_eq!(s.vim_mode, VimMode::Normal);
-    }
-
-    #[test]
-    fn prompt_input_ctrl_v_is_not_a_vim_command() {
-        // Ctrl+V is clipboard paste everywhere — it must NOT enter any visual
-        // mode (block visual was removed). \x16 in Normal mode is a no-op.
+    fn prompt_input_ctrl_v_and_v_are_not_vim_commands() {
+        // Ctrl+V is clipboard paste everywhere, and the visual modes were
+        // removed — \x16, v, and V are all no-ops in Normal mode.
         let mut s = PromptInputState::new();
         s.vim_enabled = true;
         s.vim_mode = VimMode::Normal;
         s.text = "hello world".to_string();
         s.cursor = 3;
         s.vim_command("\x16");
-        assert_eq!(s.vim_mode, VimMode::Normal);
-        assert_eq!(s.visual_anchor, None);
-        // Also from character visual: no-op, stays in visual.
         s.vim_command("v");
-        assert_eq!(s.vim_mode, VimMode::Visual);
-        s.vim_command("\x16");
-        assert_eq!(s.vim_mode, VimMode::Visual);
+        s.vim_command("V");
+        assert_eq!(s.vim_mode, VimMode::Normal);
     }
 
     // ---- Named registers ------------------------------------------------
@@ -5796,72 +5636,6 @@ mod tests {
         assert_eq!(s.cursor, 0);
     }
 
-    #[test]
-    fn dot_repeat_after_visual_delete() {
-        let mut s = PromptInputState::new();
-        s.vim_mode = VimMode::Normal;
-        s.text = "hello world".to_string();
-        s.cursor = 0;
-        // Enter visual, select 'hel', then delete
-        s.vim_command("v");
-        s.vim_command("l");
-        s.vim_command("l");
-        s.vim_command("d");
-        assert_eq!(s.text, "lo world");
-        // Dot-repeat should delete chars again
-        s.vim_command(".");
-        // The text should be shorter
-        assert!(s.text.len() < "lo world".len());
-    }
-
-    // ---- Visual line mode (V) -------------------------------------------
-
-    #[test]
-    fn visual_line_mode_enter() {
-        let mut s = PromptInputState::new();
-        s.vim_mode = VimMode::Normal;
-        s.text = "line one\nline two".to_string();
-        s.cursor = 0;
-        s.vim_command("V");
-        assert_eq!(s.vim_mode, VimMode::VisualLine);
-        assert!(s.visual_anchor.is_some());
-    }
-
-    #[test]
-    fn visual_line_yank() {
-        let mut s = PromptInputState::new();
-        s.vim_mode = VimMode::Normal;
-        s.text = "line one\nline two".to_string();
-        s.cursor = 0;
-        s.vim_command("V");
-        s.vim_command("y");
-        assert_eq!(s.vim_mode, VimMode::Normal);
-        assert_eq!(s.yank_buf, "line one\n");
-    }
-
-    #[test]
-    fn visual_line_delete() {
-        let mut s = PromptInputState::new();
-        s.vim_mode = VimMode::Normal;
-        s.text = "line one\nline two".to_string();
-        s.cursor = 0;
-        s.vim_command("V");
-        s.vim_command("d");
-        assert_eq!(s.vim_mode, VimMode::Normal);
-        assert_eq!(s.text, "line two");
-    }
-
-    #[test]
-    fn visual_line_escape_returns_normal() {
-        let mut s = PromptInputState::new();
-        s.vim_mode = VimMode::Normal;
-        s.text = "hello".to_string();
-        s.vim_command("V");
-        assert_eq!(s.vim_mode, VimMode::VisualLine);
-        s.vim_command("Escape");
-        assert_eq!(s.vim_mode, VimMode::Normal);
-    }
-
     // ---- Command-line mode (:) ------------------------------------------
 
     #[test]
@@ -6005,7 +5779,6 @@ mod tests {
 
     #[test]
     fn vim_mode_new_labels() {
-        assert_eq!(VimMode::VisualLine.label(), "VISUAL LINE");
         assert_eq!(VimMode::Command.label(), "COMMAND");
         assert_eq!(VimMode::Search.label(), "SEARCH");
     }
