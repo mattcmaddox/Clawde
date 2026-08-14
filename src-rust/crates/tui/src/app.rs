@@ -10010,15 +10010,27 @@ impl App {
                 ));
             }
             QueryEvent::PlanProgress(event) => {
-                self.status_message = Some(if event.persisted {
-                    format!(
-                        "Plan evidence recorded: {}",
-                        event.active_step_id.as_deref().unwrap_or("no active step")
-                    )
-                } else {
+                self.status_message = Some(if !event.persisted {
                     format!(
                         "Plan evidence not persisted: {}",
                         event.error.as_deref().unwrap_or("unknown error")
+                    )
+                } else if event.replan_required {
+                    format!(
+                        "Plan recovery required: {} failures; revisit {}",
+                        event.failure_streak,
+                        event.backtrack_target_step_id.as_deref().unwrap_or("none")
+                    )
+                } else if let Some(transition) = event.transition.as_ref() {
+                    format!(
+                        "Plan advanced: {} → {}",
+                        transition.completed_step_id,
+                        event.active_step_id.as_deref().unwrap_or("complete")
+                    )
+                } else {
+                    format!(
+                        "Plan evidence recorded: {}",
+                        event.active_step_id.as_deref().unwrap_or("no active step")
                     )
                 });
             }

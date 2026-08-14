@@ -2211,11 +2211,21 @@ async fn run_headless(
                     } else {
                         "not persisted"
                     };
+                    let recovery = if event.replan_required {
+                        format!(
+                            " recovery=required({} failures; revisit {})",
+                            event.failure_streak,
+                            event.backtrack_target_step_id.as_deref().unwrap_or("none")
+                        )
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "\n[plan progress: {}] task={} step={}",
+                        "\n[plan progress: {}] task={} step={}{}",
                         state,
                         event.task_id,
-                        event.active_step_id.as_deref().unwrap_or("none")
+                        event.active_step_id.as_deref().unwrap_or("none"),
+                        recovery
                     );
                 }
             }
