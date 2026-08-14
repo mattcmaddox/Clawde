@@ -110,11 +110,20 @@ fn plan_gate_error(
             &ctx.session_id,
             &spec_hash,
         ) {
-            if progress.status == clawde_core::PlanStatus::Blocked {
-                return Some(ToolResult::error(format!(
-                    "Plan approval required before '{}': the approved plan for task '{}' is BLOCKED after exhausting its replan budget. Generate and accept a new /spec before making file changes.",
-                    name, approved_spec.task_id
-                )));
+            match progress.status {
+                clawde_core::PlanStatus::Blocked => {
+                    return Some(ToolResult::error(format!(
+                        "Plan approval required before '{}': the approved plan for task '{}' is BLOCKED after exhausting its replan budget. Generate and accept a new /spec before making file changes.",
+                        name, approved_spec.task_id
+                    )));
+                }
+                clawde_core::PlanStatus::Complete => {
+                    return Some(ToolResult::error(format!(
+                        "Plan approval required before '{}': the approved plan for task '{}' is COMPLETE. Generate and accept a new /spec before making further file changes.",
+                        name, approved_spec.task_id
+                    )));
+                }
+                clawde_core::PlanStatus::Active => {}
             }
         }
     }
@@ -686,6 +695,64 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("BLOCKED"));
+        assert!(result.content.contains("Generate and accept a new /spec"));
+    }
+
+    #[tokio::test]
+    async fn plan_gate_blocks_writes_when_approved_plan_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.spec_mode = true;
+        let spec_path = dir.path().join("specs/test-plan.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: "complete-plan-task".to_string(),
+            task: "Complete plan".to_string(),
+            session_id: Some("tool-dispatch-test".to_string()),
+            title: "Complete plan".to_string(),
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, "tool-dispatch-test")
+            .unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress = clawde_core::PlanProgress::initialize_for_spec(
+            dir.path(),
+            &spec_path,
+            &raw,
+            &spec,
+            "tool-dispatch-test",
+        )
+        .unwrap();
+        while progress.active_step_id.is_some() {
+            progress
+                .record_evidence(clawde_core::PlanEvidence {
+                    kind: "complete".to_string(),
+                    summary: "Approved step completed deterministically.".to_string(),
+                    reference: Some("evidence/complete.txt".to_string()),
+                })
+                .unwrap();
+            progress.complete_active_step().unwrap();
+        }
+        assert_eq!(progress.status, clawde_core::PlanStatus::Complete);
+        progress.save(dir.path()).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let result = execute_tool_for_task(
+            "Edit",
+            &serde_json::json!({}),
+            &tools,
+            &ctx,
+            Some("complete-plan-task"),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "complete plan must block writes: {}",
+            result.content
+        );
+        assert!(result.content.contains("COMPLETE"));
         assert!(result.content.contains("Generate and accept a new /spec"));
     }
 

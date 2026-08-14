@@ -202,6 +202,7 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         let mut initial_tool_sent = false;
         let mut initial_failure_sent = false;
         let mut edited_tool_sent = false;
+        let mut complete_tool_sent = false;
         let mut blocked_tool_sent = false;
         for mut stream in listener.incoming().flatten() {
             let body = read_request(&mut stream);
@@ -222,6 +223,24 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
                         "text/plain",
                     );
                     break;
+                }
+                continue;
+            }
+            if body.contains("RESUME_COMPLETE_PLAN") {
+                if !complete_tool_sent {
+                    complete_tool_sent = true;
+                    let response = tool_response(
+                        Path::new("src/complete-must-not-write.rs"),
+                        "COMPLETE_MUST_NOT_WRITE\n",
+                    );
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "controlled complete-plan failure",
+                        "text/plain",
+                    );
                 }
                 continue;
             }
@@ -361,17 +380,69 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
         "edited spec must not authorize a write"
     );
 
-    // Restore the original approved bytes, then persist a terminal Blocked
-    // progress artifact before the final process starts. This simulates a
-    // previous process exhausting its replan budget and exiting.
+    // Restore the original approved bytes, then persist a terminal Complete
+    // progress artifact before the next process starts. This simulates a
+    // previous process finishing the approved plan and exiting.
     std::fs::write(&spec_path, &approved_raw).expect("restore approved spec bytes");
     clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
         .expect("re-approve restored spec");
     let spec_hash = clawde_core::spec::Spec::content_hash(&approved_raw);
-    let mut blocked_progress =
+    let mut complete_progress =
         clawde_core::PlanProgress::load_for(&fixture, task_id, session_id, &spec_hash)
             .expect("load restored plan progress")
             .expect("restored plan progress");
+    while complete_progress.active_step_id.is_some() {
+        complete_progress
+            .record_evidence(clawde_core::PlanEvidence {
+                kind: "complete".to_string(),
+                summary: "Approved step completed before process restart.".to_string(),
+                reference: Some("plans/process-resume.json".to_string()),
+            })
+            .expect("record complete-plan evidence");
+        complete_progress
+            .complete_active_step()
+            .expect("complete restored plan step");
+    }
+    assert_eq!(
+        complete_progress.status,
+        clawde_core::PlanStatus::Complete,
+        "fixture must persist a complete plan"
+    );
+    complete_progress
+        .save(&fixture)
+        .expect("persist complete plan");
+    assert!(
+        clawde_core::spec::Spec::approved_in(&fixture, session_id).is_some(),
+        "fixture must retain valid approval for a complete plan"
+    );
+
+    let complete_path = fixture.join("src/complete-must-not-write.rs");
+    let mut complete_args = common_args(&api_base, &fixture, session_id);
+    complete_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let complete = run_child(
+        spawn_child(&complete_args, "RESUME_COMPLETE_PLAN", &home),
+        Duration::from_secs(30),
+    );
+    assert!(
+        !complete.status.success(),
+        "complete plan must fail closed after restart; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&complete.stderr),
+        String::from_utf8_lossy(&complete.stdout)
+    );
+    assert!(
+        !complete_path.exists(),
+        "complete plan must not authorize a post-completion write"
+    );
+
+    // Re-approve the restored bytes, then persist a terminal Blocked progress
+    // artifact before the final process starts. This simulates a previous
+    // process exhausting its replan budget and exiting.
+    clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+        .expect("reinitialize restored plan");
+    let mut blocked_progress =
+        clawde_core::PlanProgress::load_for(&fixture, task_id, session_id, &spec_hash)
+            .expect("load reinitialized plan progress")
+            .expect("reinitialized plan progress");
     blocked_progress
         .block_active_step(clawde_core::PlanEvidence {
             kind: "blocked".to_string(),
@@ -438,11 +509,23 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     );
     assert!(
         bodies.iter().any(|body| {
+            body.contains("the approved plan for task 'headless-process-resume-task' is COMPLETE")
+        }),
+        "complete-plan tool result must contain the terminal plan error; bodies={bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|body| {
             body.contains(
                 "the approved plan for task 'headless-process-resume-task' is BLOCKED after exhausting its replan budget",
             )
         }),
         "blocked-plan tool result must contain the terminal plan error; bodies={bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("RESUME_COMPLETE_PLAN")),
+        "complete-plan process must reach the provider fixture"
     );
     assert!(
         bodies

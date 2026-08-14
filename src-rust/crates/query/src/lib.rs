@@ -616,14 +616,23 @@ fn active_plan_context(
     let progress =
         clawde_core::PlanProgress::load_for(&project_root, task_id, session_id, &spec_hash)
             .ok()??;
-    // A fail-closed blocked plan gets a bounded stop note instead of step
-    // context: the model must not keep changing files under a plan whose
-    // replan budget is exhausted. The approved spec is never modified.
-    if progress.status == clawde_core::PlanStatus::Blocked {
-        return Some(
-            "<active_plan_step>\nThe approved plan for this task is BLOCKED after exhausting its replan budget. Stop making file changes; the user must approve a new spec before further implementation. The approved spec was not modified.\n</active_plan_step>"
-                .to_string(),
-        );
+    // A terminal plan gets a bounded stop note instead of step context: the
+    // model must not keep changing files under a completed or exhausted plan.
+    // The approved spec is never modified.
+    match progress.status {
+        clawde_core::PlanStatus::Blocked => {
+            return Some(
+                "<active_plan_step>\nThe approved plan for this task is BLOCKED after exhausting its replan budget. Stop making file changes; the user must approve a new spec before further implementation. The approved spec was not modified.\n</active_plan_step>"
+                    .to_string(),
+            );
+        }
+        clawde_core::PlanStatus::Complete => {
+            return Some(
+                "<active_plan_step>\nThe approved plan for this task is COMPLETE. Stop making file changes; the user must approve a new spec before further implementation. The approved spec was not modified.\n</active_plan_step>"
+                    .to_string(),
+            );
+        }
+        clawde_core::PlanStatus::Active => {}
     }
     let active_id = progress.active_step_id.as_deref()?;
     let step = progress.steps.iter().find(|step| step.id == active_id)?;
