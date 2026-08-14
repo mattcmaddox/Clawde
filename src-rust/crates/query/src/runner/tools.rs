@@ -83,7 +83,7 @@ fn plan_gate_error(
     let project_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
         .unwrap_or_else(|| ctx.working_dir.clone());
     let approved = clawde_core::spec::Spec::approved_in(&project_root, &ctx.session_id);
-    let Some((_, approved_spec)) = approved else {
+    let Some((approved_path, approved_spec)) = approved.as_ref() else {
         return Some(ToolResult::error(format!(
             "Plan approval required before '{}': spec-driven mode is enabled, but no current task-bound spec has been accepted for session '{}' in {}/specs/. Run /spec <task>, then accept it with /spec-review before making file changes.",
             name,
@@ -96,6 +96,27 @@ fn plan_gate_error(
             "Plan approval required before '{}': the accepted spec is bound to task '{}', not the current task. Generate and review a new /spec for this task.",
             name, approved_spec.task_id
         )));
+    }
+    // Phase D fail-closed boundary: an approved plan whose replan budget is
+    // exhausted is Blocked, and a blocked plan must not authorize further
+    // writes. Shell/interpreter tools remain outside this gate, so manual
+    // recovery is still possible; continuing implementation requires a new
+    // approved spec.
+    if let Ok(raw_spec) = std::fs::read_to_string(approved_path) {
+        let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+        if let Ok(Some(progress)) = clawde_core::PlanProgress::load_for(
+            &project_root,
+            &approved_spec.task_id,
+            &ctx.session_id,
+            &spec_hash,
+        ) {
+            if progress.status == clawde_core::PlanStatus::Blocked {
+                return Some(ToolResult::error(format!(
+                    "Plan approval required before '{}': the approved plan for task '{}' is BLOCKED after exhausting its replan budget. Generate and accept a new /spec before making file changes.",
+                    name, approved_spec.task_id
+                )));
+            }
+        }
     }
     None
 }
@@ -609,6 +630,63 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.content, "named tool executed");
         assert_eq!(seen_tool.lock().as_deref(), Some("Edit"));
+    }
+
+    #[tokio::test]
+    async fn plan_gate_blocks_writes_when_approved_plan_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_context();
+        ctx.working_dir = dir.path().to_path_buf();
+        ctx.config.spec_mode = true;
+        let spec_path = dir.path().join("specs/test-plan.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: "blocked-plan-task".to_string(),
+            task: "Blocked plan".to_string(),
+            session_id: Some("tool-dispatch-test".to_string()),
+            title: "Blocked plan".to_string(),
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).unwrap();
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, "tool-dispatch-test")
+            .unwrap();
+        // The approved plan exists but is fail-closed as Blocked (replan
+        // budget exhausted) — a valid approval alone must not authorize
+        // further structured writes.
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress = clawde_core::PlanProgress::initialize_for_spec(
+            dir.path(),
+            &spec_path,
+            &raw,
+            &spec,
+            "tool-dispatch-test",
+        )
+        .unwrap();
+        progress
+            .block_active_step(clawde_core::PlanEvidence {
+                kind: "blocked".to_string(),
+                summary: "Replan budget exhausted.".to_string(),
+                reference: Some("evidence/blocked.txt".to_string()),
+            })
+            .unwrap();
+        progress.save(dir.path()).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedTool("Edit", PermissionLevel::Write))];
+
+        let result = execute_tool_for_task(
+            "Edit",
+            &serde_json::json!({}),
+            &tools,
+            &ctx,
+            Some("blocked-plan-task"),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "blocked plan must block writes: {}",
+            result.content
+        );
+        assert!(result.content.contains("BLOCKED"));
+        assert!(result.content.contains("Generate and accept a new /spec"));
     }
 
     #[tokio::test]

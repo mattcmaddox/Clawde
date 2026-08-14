@@ -377,9 +377,29 @@ impl PlanProgress {
                     "approved spec has no matching plan progress artifact",
                 )
             })?;
-        progress
-            .record_evidence(evidence.clone())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if let Err(error) = progress.record_evidence(evidence.clone()) {
+            // Terminal plans (Blocked/Complete) cannot record more evidence.
+            // Surface the durable terminal state as a persisted event instead
+            // of a misleading "evidence not persisted" error on every turn.
+            if progress.status != PlanStatus::Active {
+                return Ok(Some(PlanProgressEvent {
+                    task_id: progress.task_id.clone(),
+                    session_id: progress.session_id.clone(),
+                    plan_status: progress.status,
+                    phase: progress.phase,
+                    active_step_id: progress.active_step_id.clone(),
+                    failure_streak: progress.failure_streak,
+                    replan_required: progress.replan_required,
+                    replan_count: progress.replan_count,
+                    backtrack_target_step_id: progress.backtrack_target_step_id.clone(),
+                    evidence,
+                    persisted: true,
+                    transition: None,
+                    error: None,
+                }));
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
         let transition = progress
             .coordinate_from_evidence(advance_evidence)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -1156,6 +1176,53 @@ mod tests {
         assert!(!progress.replan_required);
         assert_eq!(progress.failure_streak, 0);
         assert_eq!(progress.backtrack_target_step_id, None);
+    }
+
+    #[test]
+    fn terminal_plan_emits_persisted_event_on_further_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = sample_spec("session-one");
+        spec.write_to(&spec_path).unwrap();
+        Spec::write_approval_for_session(&spec_path, "session-one").unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress =
+            PlanProgress::initialize_for_spec(dir.path(), &spec_path, &raw, &spec, "session-one")
+                .unwrap();
+        progress
+            .block_active_step(PlanEvidence {
+                kind: "blocked".to_string(),
+                summary: "Replan budget exhausted.".to_string(),
+                reference: Some("evidence/blocked.txt".to_string()),
+            })
+            .unwrap();
+        progress.save(dir.path()).unwrap();
+
+        // A later turn's evidence against a terminal plan must surface the
+        // durable blocked state as a persisted event, not a bogus
+        // "not persisted" error.
+        let event = PlanProgress::record_evidence_and_advance_for_approved_spec(
+            dir.path(),
+            "task-plan-progress",
+            "session-one",
+            PlanEvidence {
+                kind: "turn".to_string(),
+                summary: "Another turn attempted against the blocked plan.".to_string(),
+                reference: Some("src/lib.rs".to_string()),
+            },
+            PlanAdvanceEvidence {
+                deterministic_checks_run: true,
+                deterministic_failed: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("terminal plan still emits a persisted event");
+        assert_eq!(event.plan_status, PlanStatus::Blocked);
+        assert!(event.persisted);
+        assert_eq!(event.error, None);
+        assert_eq!(event.active_step_id, None);
+        assert_eq!(event.replan_count, 0);
     }
 
     #[test]

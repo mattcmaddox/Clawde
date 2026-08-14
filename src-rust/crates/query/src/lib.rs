@@ -616,6 +616,15 @@ fn active_plan_context(
     let progress =
         clawde_core::PlanProgress::load_for(&project_root, task_id, session_id, &spec_hash)
             .ok()??;
+    // A fail-closed blocked plan gets a bounded stop note instead of step
+    // context: the model must not keep changing files under a plan whose
+    // replan budget is exhausted. The approved spec is never modified.
+    if progress.status == clawde_core::PlanStatus::Blocked {
+        return Some(
+            "<active_plan_step>\nThe approved plan for this task is BLOCKED after exhausting its replan budget. Stop making file changes; the user must approve a new spec before further implementation. The approved spec was not modified.\n</active_plan_step>"
+                .to_string(),
+        );
+    }
     let active_id = progress.active_step_id.as_deref()?;
     let step = progress.steps.iter().find(|step| step.id == active_id)?;
     let acceptance = step
@@ -808,6 +817,20 @@ fn update_no_progress_state(
     *no_progress_streak >= NO_PROGRESS_STOP_STREAK
 }
 
+/// Extract the accepted implementation task id from a transcript.
+///
+/// Scans every message (latest marker wins), not just the last user message:
+/// tool results are user-role messages, so a follow-up turn or a resumed
+/// session whose final message is a tool result would otherwise lose the
+/// accept marker and silently deactivate the plan gate, evidence recording,
+/// and context injection. The marker alone never authorizes anything — the
+/// approval gate re-validates task/session/spec-hash before any write.
+fn accepted_task_id_from_messages(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        clawde_core::spec::Spec::task_id_from_accepted_message(&message.get_all_text())
+    })
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -836,16 +859,11 @@ pub async fn run_query_loop(
     let mut loop_ctx = tool_ctx.clone();
     loop_ctx.cancel_token = cancel_token.clone();
     let tool_ctx = &loop_ctx;
-    // Capture the accepted implementation task once. Tool results are user
-    // messages too, so re-reading the latest user message at each dispatch
-    // would lose this marker after the first tool round.
-    let mut active_task_id = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::User)
-        .and_then(|message| {
-            clawde_core::spec::Spec::task_id_from_accepted_message(&message.get_all_text())
-        });
+    // Capture the accepted implementation task from the transcript (latest
+    // marker wins). Tool results are user messages too, so scanning only the
+    // last user message would lose the marker after the first tool round or on
+    // resume — deactivating the plan gate and context.
+    let mut active_task_id = accepted_task_id_from_messages(messages);
 
     // Phase D resume awareness: when this run begins with an approved,
     // in-progress plan, tell the model and user that execution continues from
@@ -3184,6 +3202,37 @@ mod tests {
         assert!(recovery_context.contains("do not repeat the same failing action"));
         assert!(recovery_context.contains("Revisit completed step 'none' (none)"));
         assert!(recovery_context.contains("[check] A deterministic check failed."));
+    }
+
+    #[test]
+    fn accepted_task_id_survives_later_non_marker_messages() {
+        // Tool results are user-role messages; the latest user message after a
+        // tool round has no marker, so scanning only the last user message
+        // would lose the accepted task and deactivate the plan gate/context.
+        let messages = vec![
+            clawde_core::types::Message::user("earlier turn"),
+            clawde_core::types::Message::user(
+                "Implement the accepted spec [clawde-spec-task:marker-task-123].",
+            ),
+            clawde_core::types::Message::user("Tool result output without a marker"),
+        ];
+        assert_eq!(
+            accepted_task_id_from_messages(&messages).as_deref(),
+            Some("marker-task-123")
+        );
+    }
+
+    #[test]
+    fn accepted_task_id_prefers_the_latest_marker() {
+        let messages = vec![
+            clawde_core::types::Message::user("Old accepted task [clawde-spec-task:old-task-a]."),
+            clawde_core::types::Message::user("Newer accepted task [clawde-spec-task:new-task-b]."),
+            clawde_core::types::Message::user("plain follow-up"),
+        ];
+        assert_eq!(
+            accepted_task_id_from_messages(&messages).as_deref(),
+            Some("new-task-b")
+        );
     }
 
     #[test]
