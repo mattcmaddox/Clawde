@@ -1,40 +1,14 @@
-use super::*;
-use async_trait::async_trait;
+// Provider-health status block for `/status`.
+//
+// This module backs the provider-health section of the `/status` command. It
+// reads persisted free-mode runtime state (empty-completion cooldowns,
+// per-upstream dispatch telemetry) so users can see why routing chose an
+// upstream without digging through state files.
 
-pub struct StatusCommand;
-
-// ---- /status -------------------------------------------------------------
-
-#[async_trait]
-impl SlashCommand for StatusCommand {
-    fn name(&self) -> &str {
-        "status"
-    }
-    fn description(&self) -> &str {
-        "Show provider health, cooldown states, and success rates"
-    }
-    fn help(&self) -> &str {
-        "Usage: /status\n\
-         Displays the current health status of all free providers including:\n\
-         - Cooldown states (which providers are in cooldown and for how long)\n\
-         - Success rates (per-provider and per-task)\n\
-         - Latency statistics\n\
-         - Configuration (routing strategy, parallel settings)"
-    }
-
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        // Spawn blocking task to gather status
-        let run = || gather_provider_status();
-
-        match tokio::task::spawn_blocking(run).await {
-            Ok(status) => CommandResult::Message(status),
-            Err(e) => CommandResult::Error(format!("Status query failed: {}", e)),
-        }
-    }
-}
-
-/// Gather provider status information
-fn gather_provider_status() -> String {
+/// Gather provider status information (cooldowns, success rates, routing
+/// configuration). Consumed by the session-status `/status` command in
+/// `lib.rs` so both views share one invocation.
+pub(crate) fn gather_provider_status() -> String {
     let mut lines = vec!["Provider Status:\n".to_string()];
 
     // Load cooldown state from disk if available

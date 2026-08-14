@@ -1378,7 +1378,7 @@ impl SlashCommand for StatusCommand {
         "status"
     }
     fn description(&self) -> &str {
-        "Show comprehensive system and session status"
+        "Show session, system, and provider health status"
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -1443,7 +1443,8 @@ impl SlashCommand for StatusCommand {
              Hooks:          {hooks} configured\n\n\
              Usage\n\
              ─────\n\
-             {summary}",
+             {summary}\n\n\
+             {health}",
             auth_status = auth_status,
             model = ctx.config.effective_model(),
             perm = ctx.config.permission_mode,
@@ -1457,6 +1458,7 @@ impl SlashCommand for StatusCommand {
             mcp = mcp_status,
             hooks = hook_count,
             summary = ctx.cost_tracker.summary(),
+            health = crate::status::gather_provider_status(),
         ))
     }
 }
@@ -1948,7 +1950,6 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(UsageCommand),
         Box::new(DoctorCommand),
         Box::new(HealthCommand),
-        Box::new(StatusCommand),
         Box::new(LoginCommand),
         Box::new(LogoutCommand),
         Box::new(AccountsCommand),

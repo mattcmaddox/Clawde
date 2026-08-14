@@ -83,7 +83,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "normal", description: "Reset persona / output style to default", category: "Commands", tui_only: false },
     PromptCommand { name: "quit", description: "Exit Clawde", category: "Session", tui_only: false },
     PromptCommand { name: "refresh", description: "Clear saved provider auth and model caches", category: "Model & Provider", tui_only: false },
-    PromptCommand { name: "refresh-models", description: "Re-probe every configured free upstream's live model list (bypasses the discovery cache)", category: "Model & Provider", tui_only: false },
+    PromptCommand { name: "refresh-models", description: "Re-probe every configured free upstream's live model list (bypasses the discovery cache)", category: "Model & Provider", tui_only: true },
     PromptCommand { name: "rename", description: "Rename this session", category: "Session", tui_only: false },
     PromptCommand { name: "resume", description: "Resume a previous session", category: "Session", tui_only: false },
     PromptCommand { name: "review", description: "Review changes (git diff)", category: "Review & History", tui_only: false },
