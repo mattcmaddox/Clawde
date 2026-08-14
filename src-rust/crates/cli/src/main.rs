@@ -851,10 +851,42 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
     let cost_tracker = CostTracker::new();
-    // Use --session-id if provided, otherwise generate a fresh UUID.
+    // Use --session-id if provided. In headless mode, --resume must bind the
+    // query context to the persisted session before tools are constructed so
+    // the approved-plan gate sees the same session identity after restart.
+    let headless_resume_id = if is_headless {
+        match cli.resume.as_deref() {
+            Some("__last__") => {
+                let sessions = clawde_core::history::list_sessions().await;
+                match sessions.first() {
+                    Some(session) => Some(session.id.clone()),
+                    None => anyhow::bail!(
+                        "--resume requested the most recent session, but no saved sessions exist"
+                    ),
+                }
+            }
+            Some(id) => Some(id.to_string()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let (Some(explicit), Some(resumed)) = (
+        cli.session_id_flag.as_deref(),
+        headless_resume_id.as_deref(),
+    ) {
+        if explicit != resumed {
+            anyhow::bail!(
+                "--session-id '{}' does not match --resume session '{}'",
+                explicit,
+                resumed
+            );
+        }
+    }
     let session_id = cli
         .session_id_flag
         .clone()
+        .or_else(|| headless_resume_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let file_history = Arc::new(ParkingMutex::new(
         clawde_core::file_history::FileHistory::new(),
@@ -1128,6 +1160,7 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
+            headless_resume_id.as_deref(),
         )
         .await
     } else {
@@ -1930,6 +1963,76 @@ mod stream_event_tests {
     }
 }
 
+#[cfg(test)]
+mod headless_resume_tests {
+    use super::load_headless_resume_session;
+
+    #[tokio::test]
+    async fn headless_resume_loads_persisted_tool_result_transcript() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = std::env::temp_dir().join(format!("clawde-cli-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("temporary Clawde home");
+        let previous_home = std::env::var_os("CLAWDE_HOME");
+        std::env::set_var("CLAWDE_HOME", &home);
+
+        let session_id = "headless-resume-test";
+        let mut session = clawde_core::history::ConversationSession::new("mock-model".to_string());
+        session.id = session_id.to_string();
+        session.messages = vec![
+            clawde_core::types::Message::user("Continue [clawde-spec-task:resume-loop-task]"),
+            clawde_core::types::Message::user_blocks(vec![
+                clawde_core::types::ContentBlock::ToolResult {
+                    tool_use_id: "previous-write".to_string(),
+                    content: clawde_core::types::ToolResultContent::Text(
+                        "partial write completed".to_string(),
+                    ),
+                    is_error: Some(false),
+                },
+            ]),
+        ];
+        clawde_core::history::save_session(&session)
+            .await
+            .expect("save persisted headless session");
+
+        let loaded = load_headless_resume_session(session_id)
+            .await
+            .expect("load persisted headless session");
+        assert_eq!(loaded.id, session_id);
+        assert_eq!(loaded.messages.len(), 2);
+        assert!(matches!(
+            loaded.messages.last().map(|message| &message.content),
+            Some(clawde_core::types::MessageContent::Blocks(blocks))
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    clawde_core::types::ContentBlock::ToolResult { .. }
+                ))
+        ));
+
+        match previous_home {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        std::fs::remove_dir_all(home).expect("remove temporary Clawde home");
+    }
+}
+
+/// Load a persisted session for headless `--resume` mode. Interactive resume
+/// has its own TUI/session setup path; keeping this helper separate makes the
+/// process-boundary contract explicit and testable.
+async fn load_headless_resume_session(
+    resume_id: &str,
+) -> anyhow::Result<clawde_core::history::ConversationSession> {
+    if resume_id.trim().is_empty() || resume_id == "__last__" {
+        anyhow::bail!("headless resume requires a concrete session ID");
+    }
+    clawde_core::history::load_session(resume_id)
+        .await
+        .with_context(|| format!("could not load headless resume session '{resume_id}'"))
+}
+
 async fn run_headless(
     cli: &Cli,
     verbose: bool,
@@ -1938,10 +2041,17 @@ async fn run_headless(
     tool_ctx: ToolContext,
     query_config: clawde_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
+    resume_id: Option<&str>,
 ) -> anyhow::Result<()> {
     use clawde_query::{QueryEvent, QueryOutcome};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
+
+    let resumed_session = if let Some(id) = resume_id {
+        Some(load_headless_resume_session(id).await?)
+    } else {
+        None
+    };
 
     // Build initial messages list from input.
     // --input-format stream-json: stdin is newline-delimited JSON, each line is
@@ -2013,6 +2123,16 @@ async fn run_headless(
             vec![clawde_core::types::Message::user(prompt)]
         };
 
+    // A headless resume starts from the persisted conversation, then appends
+    // the new prompt/messages supplied to this process. The marker may be far
+    // earlier in the transcript; run_query_loop deliberately scans the full
+    // history so a trailing tool result cannot deactivate the plan gate.
+    if let Some(session) = resumed_session.as_ref() {
+        let mut historical = session.messages.clone();
+        historical.append(&mut messages);
+        messages = historical;
+    }
+
     // --prefill: inject a partial assistant turn before the query so the model
     // continues from that text (mirrors TS --prefill flag).
     if let Some(ref prefill_text) = cli.prefill {
@@ -2040,7 +2160,7 @@ async fn run_headless(
     let cancel_clone = cancel.clone();
 
     let query_handle = tokio::spawn(async move {
-        clawde_query::run_query_loop(
+        let outcome = clawde_query::run_query_loop(
             client_clone.as_ref(),
             &mut messages,
             tools.as_slice(),
@@ -2051,7 +2171,8 @@ async fn run_headless(
             cancel_clone,
             None,
         )
-        .await
+        .await;
+        (outcome, messages)
     });
 
     // Drop the original tx so the channel closes when the task drops its clone
@@ -2261,12 +2382,31 @@ async fn run_headless(
     }
 
     // Wait for the query task to finish and get the final outcome
-    let outcome =
-        query_handle
-            .await
-            .unwrap_or(QueryOutcome::Error(clawde_core::error::ClaudeError::Other(
+    let (outcome, final_messages) = query_handle.await.unwrap_or_else(|_| {
+        (
+            QueryOutcome::Error(clawde_core::error::ClaudeError::Other(
                 "Query task panicked".to_string(),
-            )));
+            )),
+            Vec::new(),
+        )
+    });
+
+    // Persist headless sessions as well as interactive ones. This is the
+    // process-resume boundary: a later `--resume <id>` loads the exact message
+    // history, including a trailing tool-result message, and retains the
+    // session identity used by the approved-plan gate.
+    let mut persisted_session = resumed_session.unwrap_or_else(|| {
+        clawde_core::history::ConversationSession::new(query_config.model.clone())
+    });
+    persisted_session.id = tool_ctx.session_id.clone();
+    persisted_session.model = query_config.model.clone();
+    persisted_session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    persisted_session.messages = final_messages;
+    persisted_session.total_cost = cost_tracker.total_cost_usd();
+    persisted_session.total_tokens = cost_tracker.total_tokens();
+    clawde_core::history::save_session(&persisted_session)
+        .await
+        .context("failed to persist headless session for --resume")?;
 
     // Final output
     match cli.output_format {

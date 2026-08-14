@@ -5673,6 +5673,225 @@ mod tests {
         assert_eq!(plan_events, 2);
     }
 
+    /// A fresh query-loop invocation must resume an approved plan from a
+    /// transcript whose latest message is a tool result, not the original
+    /// accepted-task marker. The same approval/session/spec-hash binding must
+    /// continue to authorize valid writes and reject stale resumes.
+    #[tokio::test]
+    async fn fresh_loop_resumes_approved_plan_and_rejects_stale_authority() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        std::fs::create_dir_all(fixture.path().join("src")).expect("fixture src");
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            "[package]\nname = \"query_loop_resume_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("fixture manifest");
+        std::fs::write(
+            fixture.path().join("src/lib.rs"),
+            "pub fn baseline() -> u32 { 1 }\n",
+        )
+        .expect("fixture source");
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["config", "user.email", "clawde@example.invalid"].as_slice(),
+            ["config", "user.name", "Clawde Test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-m", "fixture baseline"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git command failed: {args:?}");
+        }
+
+        let task_id = "resume-loop-task";
+        let session_id = "resume-loop-session";
+        let spec_path = fixture.path().join("specs/resume-loop.json");
+        let spec = clawde_core::spec::Spec {
+            task_id: task_id.to_string(),
+            task: "Resume an approved implementation safely".to_string(),
+            session_id: Some(session_id.to_string()),
+            title: "Restart-safe approved plan".to_string(),
+            requirements: vec!["Persist and resume the implementation step".to_string()],
+            ..Default::default()
+        };
+        spec.write_to(&spec_path).expect("write spec");
+        clawde_core::spec::Spec::write_approval_for_session(&spec_path, session_id)
+            .expect("approve spec");
+
+        // Simulate the previous process having made partial progress and
+        // persisted evidence before it exited.
+        let partial_path = fixture.path().join("src/partial.rs");
+        std::fs::write(&partial_path, "pub(crate) fn partial() -> u32 { 1 }\n")
+            .expect("partial implementation");
+        let raw_spec = std::fs::read_to_string(&spec_path).expect("read spec");
+        let prior_event = clawde_core::PlanProgress::record_evidence_and_advance_for_approved_spec(
+            fixture.path(),
+            task_id,
+            session_id,
+            clawde_core::PlanEvidence {
+                kind: "resume_checkpoint".to_string(),
+                summary: "Previous process persisted a partial implementation.".to_string(),
+                reference: Some("src/partial.rs".to_string()),
+            },
+            clawde_core::PlanAdvanceEvidence {
+                turn_made_writes: true,
+                has_scoped_diff: true,
+                ..Default::default()
+            },
+        )
+        .expect("persist prior evidence")
+        .expect("prior plan event");
+        assert_eq!(prior_event.plan_status, clawde_core::PlanStatus::Active);
+
+        let resumed_path = fixture.path().join("src/resumed.rs");
+        let request_tools = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: request_tools.clone(),
+            always_end_turn: false,
+            write_path: Some(resumed_path.display().to_string()),
+            write_content: Some("pub(crate) fn resumed() -> u32 { 2 }\n".to_string()),
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: false,
+            write_on_requests: None,
+            scripted_write_contents: None,
+        });
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = session_id.to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        ctx.permission_handler = Arc::new(AllowAllHandler);
+        ctx.non_interactive = true;
+
+        let config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 3,
+            provider_registry: Some(Arc::new(registry)),
+            continuation: crate::continuation::ContinuationMode::Default,
+            ..Default::default()
+        };
+
+        // This is the restart boundary: the accepted marker is earlier in the
+        // transcript, while the latest message is a non-marker tool result.
+        let mut messages = vec![
+            Message::user(format!(
+                "Continue the accepted task [{}]",
+                format!("clawde-spec-task:{task_id}")
+            )),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "previous-write".to_string(),
+                content: ToolResultContent::Text("partial write completed".to_string()),
+                is_error: Some(false),
+            }]),
+        ];
+        assert!(matches!(
+            messages.last().map(|message| &message.content),
+            Some(clawde_core::types::MessageContent::Blocks(blocks))
+                if blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { .. }
+                ))
+        ));
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[Box::new(clawde_tools::FileWriteTool)],
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                Some(event_tx),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("resumed loop must not hang");
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&resumed_path).unwrap(),
+            "pub(crate) fn resumed() -> u32 { 2 }\n"
+        );
+        assert_eq!(request_tools.lock().unwrap().len(), 2);
+        let statuses: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                QueryEvent::Status(status) => Some(status),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            statuses.iter().any(|status| {
+                status.contains("Approved plan in progress")
+                    && status.contains("Restart-safe approved plan")
+            }),
+            "fresh loop must surface resume awareness, statuses={statuses:?}"
+        );
+
+        // A different session cannot reuse the accepted task marker to write.
+        let mut stale_session_ctx = ctx.clone();
+        stale_session_ctx.session_id = "stale-resume-session".to_string();
+        let stale_session_path = fixture.path().join("src/stale-session.rs");
+        let stale_session = execute_tool_for_task(
+            clawde_core::constants::TOOL_NAME_FILE_WRITE,
+            &serde_json::json!({
+                "file_path": stale_session_path,
+                "content": "must not be written\n"
+            }),
+            &[Box::new(clawde_tools::FileWriteTool)],
+            &stale_session_ctx,
+            Some(task_id),
+        )
+        .await;
+        assert!(stale_session.is_error);
+        assert!(stale_session.content.contains("Plan approval required"));
+        assert!(!stale_session_path.exists());
+
+        // Editing the approved spec invalidates its recorded content hash, so
+        // even the original session cannot authorize a subsequent write.
+        let mut edited_spec = spec.clone();
+        edited_spec.title = "Edited after approval".to_string();
+        edited_spec.write_to(&spec_path).expect("edit spec");
+        let stale_hash_path = fixture.path().join("src/stale-hash.rs");
+        let stale_hash = execute_tool_for_task(
+            clawde_core::constants::TOOL_NAME_FILE_WRITE,
+            &serde_json::json!({
+                "file_path": stale_hash_path,
+                "content": "must not be written\n"
+            }),
+            &[Box::new(clawde_tools::FileWriteTool)],
+            &ctx,
+            Some(task_id),
+        )
+        .await;
+        assert!(stale_hash.is_error);
+        assert!(stale_hash.content.contains("Plan approval required"));
+        assert!(!stale_hash_path.exists());
+
+        let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+        assert!(
+            clawde_core::PlanProgress::load_for(fixture.path(), task_id, session_id, &spec_hash)
+                .expect("load persisted progress")
+                .is_some(),
+            "the resumed run must preserve the original persisted plan artifact"
+        );
+    }
+
     /// The max-turns degradation (summary) turn now gets a bounded final
     /// review: the semantic verifier runs once on the run's final state and
     /// the loop still ends. Regression guard for the review-only wiring.
