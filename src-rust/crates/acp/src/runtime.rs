@@ -89,7 +89,11 @@ impl AgentRuntime {
         let network_blocked = clawde_core::is_ollama_network_blocked();
         let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
             .into_iter()
-            .filter(|tool| !network_blocked || !tool.network_capable())
+            .filter(|tool| {
+                !network_blocked
+                    || !tool.network_capable()
+                    || tool.available_in_ollama_isolated_mode()
+            })
             .collect();
         tools.push(Box::new(clawde_query::AgentTool::default()));
         let tools = Arc::new(tools);

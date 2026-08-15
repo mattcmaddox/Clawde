@@ -479,6 +479,37 @@ fn is_write_tool(name: &str) -> bool {
     clawde_core::constants::is_file_mutator(name)
 }
 
+/// Whether a tool result is itself a deterministic project check. These tools
+/// report executable test/lint outcomes directly, so an active approved plan
+/// can feed their failure into durable replan accounting even when the generic
+/// continuation verifier is disabled.
+fn is_deterministic_check_tool(name: &str) -> bool {
+    matches!(name, "RunTests" | "RunLints")
+}
+
+/// Classify a direct check result without retaining its raw output in plan
+/// state. Permission, sandbox, and dispatch failures are infrastructure signals
+/// rather than deterministic code failures and must not consume replan budget.
+fn deterministic_check_observation(name: &str, result: &clawde_tools::ToolResult) -> (bool, bool) {
+    if !is_deterministic_check_tool(name) {
+        return (false, false);
+    }
+    let lower = result.content.to_ascii_lowercase();
+    let timed_out = lower.contains("timed out");
+    let passed = match name {
+        "RunTests" => lower.contains("tests passed"),
+        "RunLints" => lower.contains("lints passed"),
+        _ => false,
+    };
+    let failed = match name {
+        "RunTests" => lower.contains("tests failed"),
+        "RunLints" => lower.contains("lint issues found"),
+        _ => false,
+    };
+    let observed = timed_out || passed || failed;
+    (observed, timed_out || failed)
+}
+
 /// Resolve the effective output-style persona for a turn.
 ///
 /// Personas (`rocky` / `caveman` / `normal`) mirror the ultracode keyword: an
@@ -578,6 +609,8 @@ fn plan_turn_evidence(
     wrote_files: bool,
     tool_count: usize,
     tool_error_count: u32,
+    deterministic_check_run: bool,
+    deterministic_check_failed: bool,
     patch: Option<&clawde_core::snapshot::Patch>,
     diff: Option<&str>,
     verify_report: Option<&crate::verify::VerifyReport>,
@@ -586,6 +619,15 @@ fn plan_turn_evidence(
 ) -> clawde_core::PlanEvidence {
     let check_summary = verify_report
         .map(|report| format!("{} ({:?})", report.headline, report.verdict))
+        .or_else(|| {
+            deterministic_check_run.then(|| {
+                if deterministic_check_failed {
+                    "tool_check_failed".to_string()
+                } else {
+                    "tool_check_passed".to_string()
+                }
+            })
+        })
         .unwrap_or_else(|| "not_run".to_string());
     let semantic_summary = semantic_report
         .map(|report| format!("{} ({})", report.summary, report.verdict.as_str()))
@@ -996,6 +1038,10 @@ pub async fn run_query_loop(
     // Count tool failures for the current logical turn without retaining raw
     // tool output in the durable plan artifact.
     let mut turn_tool_error_count: u32 = 0;
+    // Direct RunTests/RunLints outcomes are deterministic plan evidence even
+    // when the separate end-of-turn verifier policy is disabled.
+    let mut turn_deterministic_check_run = false;
+    let mut turn_deterministic_check_failed = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -1253,7 +1299,7 @@ pub async fn run_query_loop(
                 // surface through the same Verify / SemanticVerify / Status
                 // events below, and the loop then stops. The G5 fixer never
                 // runs on the capped turn.
-                let decision = if degradation_turn {
+                let mut decision = if degradation_turn {
                     continuation_policy.review_only_async(&turn_ctx).await
                 } else {
                     continuation_policy.decide_async(&turn_ctx).await
@@ -1285,18 +1331,23 @@ pub async fn run_query_loop(
                     turn_made_writes: wrote_files,
                     has_scoped_diff: $assistant_msg.snapshot_patch.is_some()
                         && turn_diff.as_deref().is_some_and(|diff| !diff.trim().is_empty()),
-                    deterministic_checks_run: verify_report.as_ref().is_some_and(|report| {
-                        !report.unavailable && !report.results.is_empty()
-                    }),
-                    deterministic_passed: verify_report.as_ref().is_some_and(|report| {
-                        matches!(report.verdict, crate::verify::VerifyVerdict::Pass)
-                    }),
-                    deterministic_failed: verify_report.as_ref().is_some_and(|report| {
-                        !report.unavailable
-                            && report.results.iter().any(|result| !result.ok && !result.skipped)
-                    }),
+                    deterministic_checks_run: turn_deterministic_check_run
+                        || verify_report.as_ref().is_some_and(|report| {
+                            !report.unavailable && !report.results.is_empty()
+                        }),
+                    deterministic_passed: !turn_deterministic_check_failed
+                        && ((turn_deterministic_check_run)
+                            || verify_report.as_ref().is_some_and(|report| {
+                                matches!(report.verdict, crate::verify::VerifyVerdict::Pass)
+                            })),
+                    deterministic_failed: turn_deterministic_check_failed
+                        || verify_report.as_ref().is_some_and(|report| {
+                            !report.unavailable
+                                && report.results.iter().any(|result| !result.ok && !result.skipped)
+                        }),
                 };
-                let plan_blocked = record_plan_turn_progress(
+                let deterministic_check_failed = plan_advance_evidence.deterministic_failed;
+                let plan_event = record_plan_turn_progress(
                     &tool_ctx.working_dir,
                     &tool_ctx.session_id,
                     active_task_id.as_deref(),
@@ -1308,6 +1359,8 @@ pub async fn run_query_loop(
                         wrote_files,
                         tool_count,
                         turn_tool_error_count,
+                        turn_deterministic_check_run,
+                        turn_deterministic_check_failed,
                         $assistant_msg.snapshot_patch.as_ref(),
                         turn_diff.as_deref(),
                         verify_report.as_ref(),
@@ -1315,15 +1368,15 @@ pub async fn run_query_loop(
                         semantic_note.as_deref(),
                     ),
                     plan_advance_evidence,
-                )
-                .map(|event| {
-                    let blocked = event.plan_status == clawde_core::PlanStatus::Blocked;
+                );
+                let plan_blocked = plan_event
+                    .as_ref()
+                    .is_some_and(|event| event.plan_status == clawde_core::PlanStatus::Blocked);
+                if let Some(event) = plan_event.as_ref() {
                     if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::PlanProgress(event));
+                        let _ = tx.send(QueryEvent::PlanProgress(event.clone()));
                     }
-                    blocked
-                })
-                .unwrap_or(false);
+                }
                 // A plan that has exhausted its replan budget is terminal. Do
                 // not spend another model turn waiting for VerifyPolicy's
                 // independent retry budget; the write gate has already
@@ -1338,6 +1391,29 @@ pub async fn run_query_loop(
                     return QueryOutcome::EndTurn {
                         message: $assistant_msg,
                         usage: $usage,
+                    };
+                }
+                // In the default headless mode there is no separate VerifyPolicy
+                // continuation to feed a failed RunTests/RunLints result back to
+                // the model. An active approved plan must still get one bounded
+                // recovery turn; the persisted failure streak and replan budget
+                // decide whether that turn may write again or the plan blocks.
+                if !decision.is_continue()
+                    && deterministic_check_failed
+                    && plan_event
+                        .as_ref()
+                        .is_some_and(|event| event.plan_status == clawde_core::PlanStatus::Active)
+                {
+                    let recovery_message = if plan_event
+                        .as_ref()
+                        .is_some_and(|event| event.replan_required)
+                    {
+                        "The deterministic project check failed repeatedly. Replan is required: change the implementation approach before retrying, and do not claim success until the check passes.".to_string()
+                    } else {
+                        "The deterministic project check failed. Inspect the RunTests/RunLints failure, change the implementation approach, and retry the active approved plan step; do not claim success yet.".to_string()
+                    };
+                    decision = crate::continuation::ContinuationDecision::Continue {
+                        message: recovery_message,
                     };
                 }
                 // A declined gate-open review is already included in the
@@ -1390,6 +1466,8 @@ pub async fn run_query_loop(
                         wrote_files = false;
                         turn_diff = None;
                         turn_tool_error_count = 0;
+                        turn_deterministic_check_run = false;
+                        turn_deterministic_check_failed = false;
                         turn_snapshot = if let Some(ref snap) = shadow_snap {
                             snap.track().await
                         } else {
@@ -2363,6 +2441,10 @@ pub async fn run_query_loop(
                                 )
                                 .await
                             };
+                            let (check_run, check_failed) =
+                                deterministic_check_observation(&tool_name, &result);
+                            turn_deterministic_check_run |= check_run;
+                            turn_deterministic_check_failed |= check_failed;
                             if result.is_error {
                                 turn_tool_error_count += 1;
                             }
@@ -3211,6 +3293,10 @@ pub async fn run_query_loop(
                     // block so the conversation and TUI stay consistent.
                     let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                     for (p, result) in prepared.iter().zip(exec_results) {
+                        let (check_run, check_failed) =
+                            deterministic_check_observation(&p.name, &result);
+                        turn_deterministic_check_run |= check_run;
+                        turn_deterministic_check_failed |= check_failed;
                         if result.is_error {
                             turn_tool_error_count += 1;
                         }
@@ -3514,6 +3600,30 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_check_tools_are_explicitly_classified() {
+        assert!(is_deterministic_check_tool("RunTests"));
+        assert!(is_deterministic_check_tool("RunLints"));
+        assert!(!is_deterministic_check_tool("Bash"));
+        assert!(!is_deterministic_check_tool("Write"));
+
+        let failed = clawde_tools::ToolResult::error("Tests FAILED — pytest exited with code 1");
+        assert_eq!(
+            deterministic_check_observation("RunTests", &failed),
+            (true, true)
+        );
+        let denied = clawde_tools::ToolResult::error("Permission denied for tool 'RunTests'");
+        assert_eq!(
+            deterministic_check_observation("RunTests", &denied),
+            (false, false)
+        );
+        let passed = clawde_tools::ToolResult::success("Lints passed (cargo clippy).");
+        assert_eq!(
+            deterministic_check_observation("RunLints", &passed),
+            (true, false)
+        );
+    }
+
+    #[test]
     fn plan_turn_evidence_is_bounded_and_machine_descriptive() {
         let evidence = plan_turn_evidence(
             std::path::Path::new("/tmp/project"),
@@ -3522,6 +3632,8 @@ mod tests {
             true,
             3,
             1,
+            false,
+            false,
             None,
             Some("diff"),
             None,
@@ -3531,10 +3643,28 @@ mod tests {
         assert_eq!(evidence.kind, "turn");
         assert!(evidence.summary.contains("turn=2"));
         assert!(evidence.summary.contains("tool_errors=1"));
+        assert!(evidence.summary.contains("checks=not_run"));
         assert!(evidence
             .summary
             .contains("semantic verifier declined: timeout"));
         assert!(evidence.summary.chars().count() <= 2_000);
+
+        let failed_check = plan_turn_evidence(
+            std::path::Path::new("/tmp/project"),
+            3,
+            "end_turn",
+            true,
+            1,
+            1,
+            true,
+            true,
+            None,
+            Some("diff"),
+            None,
+            None,
+            None,
+        );
+        assert!(failed_check.summary.contains("checks=tool_check_failed"));
     }
 
     #[test]

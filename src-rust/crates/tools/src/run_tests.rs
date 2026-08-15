@@ -39,6 +39,67 @@ fn default_timeout() -> u64 {
     300
 }
 
+/// Return whether a command is a single, local test-runner invocation that can
+/// be placed inside the isolated execution sandbox. This intentionally rejects
+/// shell wrappers, pipelines, redirects, substitutions, package installation,
+/// and arbitrary interpreter code: the sandbox is a test executor, not a
+/// second Bash entry point.
+pub fn is_local_test_command(command: &str) -> bool {
+    clawde_core::bash_classifier::is_direct_test_command(command)
+}
+
+#[derive(Debug, Clone)]
+enum NetworkIsolationBackend {
+    Bubblewrap(std::path::PathBuf),
+    Unshare(std::path::PathBuf),
+}
+
+/// Find a backend that is installed *and usable by this process*.
+///
+/// Checking only `PATH` is insufficient: `unshare` is commonly installed but
+/// denied to unprivileged processes. The probe must agree with execution so we
+/// never report a sandbox as available and then silently fall through to an
+/// unsandboxed command.
+fn network_isolation_backend() -> Option<NetworkIsolationBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(bwrap) = which::which("bwrap") {
+            let usable = std::process::Command::new(&bwrap)
+                .args([
+                    "--die-with-parent",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--",
+                    "true",
+                ])
+                .status()
+                .is_ok_and(|status| status.success());
+            if usable {
+                return Some(NetworkIsolationBackend::Bubblewrap(bwrap));
+            }
+        }
+        if let Ok(unshare) = which::which("unshare") {
+            let usable = std::process::Command::new(&unshare)
+                .args(["--net", "--", "true"])
+                .status()
+                .is_ok_and(|status| status.success());
+            if usable {
+                return Some(NetworkIsolationBackend::Unshare(unshare));
+            }
+        }
+    }
+    None
+}
+
+/// Whether this host has a supported, usable network namespace backend.
+/// Isolated test execution fails closed when neither backend is usable;
+/// silently falling back to the host network would defeat Ollama isolation.
+pub fn network_isolation_available() -> bool {
+    network_isolation_backend().is_some()
+}
+
 /// Split a shell-style command line into program + args, honouring single
 /// and double quoted segments (e.g. `cargo test -- "foo bar"` or
 /// `sh -c 'exit 0'`) and backslash escapes. Not a full POSIX parser —
@@ -81,14 +142,83 @@ pub(crate) async fn run_command_with_timeout(
     working_dir: &std::path::Path,
     timeout_secs: u64,
 ) -> (String, Option<i32>, bool) {
+    run_command_with_timeout_inner(command, working_dir, timeout_secs, false).await
+}
+
+pub(crate) async fn run_command_with_timeout_isolated(
+    command: &str,
+    working_dir: &std::path::Path,
+    timeout_secs: u64,
+) -> (String, Option<i32>, bool) {
+    run_command_with_timeout_inner(command, working_dir, timeout_secs, true).await
+}
+
+async fn run_command_with_timeout_inner(
+    command: &str,
+    working_dir: &std::path::Path,
+    timeout_secs: u64,
+    network_isolated: bool,
+) -> (String, Option<i32>, bool) {
     let parts = split_command(command);
     if parts.is_empty() {
         return (String::new(), None, false);
     }
-    let mut cmd = Command::new(&parts[0]);
-    cmd.args(&parts[1..])
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
+    let mut cmd;
+    if network_isolated {
+        #[cfg(target_os = "linux")]
+        {
+            match network_isolation_backend() {
+                Some(NetworkIsolationBackend::Bubblewrap(bwrap)) => {
+                    cmd = Command::new(bwrap);
+                    cmd.args([
+                        "--die-with-parent",
+                        "--unshare-net",
+                        "--ro-bind",
+                        "/",
+                        "/",
+                        "--dev",
+                        "/dev",
+                        "--proc",
+                        "/proc",
+                        "--tmpfs",
+                        "/tmp",
+                        "--bind",
+                    ])
+                    .arg(working_dir)
+                    .arg(working_dir)
+                    .args(["--chdir"])
+                    .arg(working_dir)
+                    .arg(&parts[0])
+                    .args(&parts[1..]);
+                }
+                Some(NetworkIsolationBackend::Unshare(unshare)) => {
+                    cmd = Command::new(unshare);
+                    cmd.args(["--net", "--", &parts[0]])
+                        .args(&parts[1..])
+                        .current_dir(working_dir);
+                }
+                None => {
+                    return (
+                        "No usable network namespace backend available (need a usable bwrap or unshare)".to_string(),
+                        None,
+                        false,
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return (
+                "Isolated local tests are unsupported on this platform".to_string(),
+                None,
+                false,
+            );
+        }
+    } else {
+        cmd = Command::new(&parts[0]);
+        cmd.args(&parts[1..]).current_dir(working_dir);
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
@@ -179,8 +309,13 @@ impl Tool for RunTestsTool {
     }
 
     fn network_capable(&self) -> bool {
-        // Explicit test commands can install dependencies or call arbitrary
-        // network clients; keep strict isolated mode fail-closed.
+        // The unrestricted form can install dependencies or call arbitrary
+        // network clients. `available_in_ollama_isolated_mode` is only a
+        // declaration that execute() will validate and sandbox the command.
+        true
+    }
+
+    fn available_in_ollama_isolated_mode(&self) -> bool {
         true
     }
 
@@ -234,17 +369,40 @@ impl Tool for RunTestsTool {
         };
 
         // Execute-level permission: show the command in the permission dialog.
+        let isolated = clawde_core::is_ollama_network_blocked();
+        if isolated {
+            if !is_local_test_command(&command) {
+                return ToolResult::error(
+                    "Ollama offline mode only permits a direct local test command ".to_string()
+                        + "(for example, `python3 -m pytest -q`); shell wrappers and "
+                        + "arbitrary commands are blocked.",
+                );
+            }
+            if !network_isolation_available() {
+                return ToolResult::error(
+                    "Cannot run local tests in Ollama offline mode: no network ".to_string()
+                        + "namespace backend (bwrap or unshare) is available.",
+                );
+            }
+        }
+
         let desc = format!("[RunTests] {}", command);
         let details = format!(
-            "Runs the test suite for the project at {}",
-            project_root.display()
+            "Runs the test suite for the project at {}{}",
+            project_root.display(),
+            if isolated {
+                " inside a network-isolated local test sandbox"
+            } else {
+                ""
+            }
         );
-        if let Err(e) = ctx.check_permission_with_details_and_path(
+        if let Err(e) = ctx.check_permission_with_details_and_path_for_capability(
             self.name(),
             &desc,
             &details,
             std::path::PathBuf::from(&command),
             false,
+            !isolated,
         ) {
             return ToolResult::error(e.to_string());
         }
@@ -252,8 +410,11 @@ impl Tool for RunTestsTool {
         debug!(command = %command, root = %project_root.display(), "Running tests");
 
         let timeout_secs = params.timeout.clamp(1, 600);
-        let (output, exit_code, timed_out) =
-            run_command_with_timeout(&command, &project_root, timeout_secs).await;
+        let (output, exit_code, timed_out) = if isolated {
+            run_command_with_timeout_isolated(&command, &project_root, timeout_secs).await
+        } else {
+            run_command_with_timeout(&command, &project_root, timeout_secs).await
+        };
 
         let truncated = truncate_output(&output);
 
@@ -319,6 +480,65 @@ mod tests {
         assert_eq!(split_command("sh -c 'exit 0'"), vec!["sh", "-c", "exit 0"]);
         assert_eq!(split_command(""), Vec::<String>::new());
         assert_eq!(split_command("  single  "), vec!["single"]);
+    }
+
+    #[test]
+    fn local_test_command_accepts_direct_runners_only() {
+        for command in [
+            "python3 -m pytest -q",
+            "python3 -m unittest discover",
+            "cargo test --workspace",
+            "go test ./...",
+            "npm test",
+            "pnpm run test",
+        ] {
+            assert!(is_local_test_command(command), "should accept {command}");
+        }
+        for command in [
+            "bash -c 'pytest'",
+            "pytest; curl https://example.test",
+            "python3 -c 'import pytest'",
+            "npm install",
+            "curl https://example.test",
+        ] {
+            assert!(!is_local_test_command(command), "should reject {command}");
+        }
+    }
+
+    #[test]
+    fn run_tests_is_retained_for_isolated_mode_but_remains_network_capable() {
+        assert!(RunTestsTool.available_in_ollama_isolated_mode());
+        assert!(RunTestsTool.network_capable());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolation_availability_uses_a_real_backend_probe() {
+        assert_eq!(
+            network_isolation_available(),
+            network_isolation_backend().is_some()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn isolated_runner_executes_inside_a_network_namespace() {
+        if !network_isolation_available() {
+            eprintln!("skipping: no bwrap/unshare backend");
+            return;
+        }
+        let (output, code, timed_out) = run_command_with_timeout_isolated(
+            "python3 -c 'import pathlib; print(any(line.split()[1] == \"00000000\" for line in pathlib.Path(\"/proc/net/route\").read_text().splitlines()[1:] if len(line.split()) > 1))'",
+            std::path::Path::new("/tmp"),
+            30,
+        )
+        .await;
+        assert_eq!(code, Some(0), "isolated command failed: {output}");
+        assert!(!timed_out);
+        assert!(
+            output.trim_end().ends_with("False"),
+            "isolated namespace unexpectedly has a default route: {output}"
+        );
     }
 
     #[tokio::test]

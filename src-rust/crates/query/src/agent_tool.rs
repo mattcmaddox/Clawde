@@ -152,7 +152,10 @@ fn clawde_tools_for_network_mode(
             if exclude_agent_tool && tool.name() == clawde_core::constants::TOOL_NAME_AGENT {
                 return false;
             }
-            if network_blocked && tool.network_capable() {
+            if network_blocked
+                && tool.network_capable()
+                && !tool.available_in_ollama_isolated_mode()
+            {
                 return false;
             }
             allowed.is_none_or(|allowed| allowlisted_tool_name(allowed, tool.name()))

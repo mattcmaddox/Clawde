@@ -4047,6 +4047,16 @@ pub mod permissions {
                         return PermissionDecision::Allow;
                     }
                 }
+                // RunTests is a self-gating tool. In isolated mode its
+                // execute() path validates this same direct-test predicate and
+                // runs inside a network namespace; AcceptEdits may therefore
+                // approve the deterministic local command without creating an
+                // unanswered headless prompt. Unsafe RunTests input remains Ask.
+                if tool_name == "RunTests"
+                    && path.is_some_and(crate::bash_classifier::is_direct_test_command)
+                {
+                    return PermissionDecision::Allow;
+                }
             }
 
             // Step 5 — Plan mode: reads only
@@ -4252,7 +4262,13 @@ pub mod permissions {
                     // built-in file mutators, not only Edit. Write is required
                     // for creating new files, while BatchEdit/ApplyPatch and
                     // NotebookEdit are also ordinary edit operations.
-                    if crate::constants::is_file_mutator(&request.tool_name) || request.is_read_only
+                    if crate::constants::is_file_mutator(&request.tool_name)
+                        || request.is_read_only
+                        || (request.tool_name == "RunTests"
+                            && request
+                                .path
+                                .as_deref()
+                                .is_some_and(crate::bash_classifier::is_direct_test_command))
                     {
                         PermissionDecision::Allow
                     } else {
@@ -4569,6 +4585,30 @@ pub mod permissions {
                 PermissionDecision::Allow,
                 "AcceptEdits should allow a Low-risk deterministic test command"
             );
+            assert_eq!(
+                m.evaluate(
+                    "RunTests",
+                    "run the focused test",
+                    Some("python3 -m pytest -q"),
+                    None,
+                    &[],
+                ),
+                PermissionDecision::Allow,
+                "AcceptEdits should allow a direct RunTests command"
+            );
+            match m.evaluate(
+                "RunTests",
+                "run arbitrary command",
+                Some("sh -c 'pytest'"),
+                None,
+                &[],
+            ) {
+                PermissionDecision::Ask { .. } => {}
+                other => panic!(
+                    "Expected Ask for an unsafe RunTests command, got {:?}",
+                    other
+                ),
+            }
             match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!(
@@ -6481,6 +6521,17 @@ mod tests {
         }
         assert_eq!(
             handler.check_permission(&make_req("Bash", false)),
+            crate::permissions::PermissionDecision::Deny
+        );
+        let mut test_request = make_req("RunTests", false);
+        test_request.path = Some("python3 -m pytest -q".to_string());
+        assert_eq!(
+            handler.check_permission(&test_request),
+            crate::permissions::PermissionDecision::Allow
+        );
+        test_request.path = Some("sh -c 'pytest'".to_string());
+        assert_eq!(
+            handler.check_permission(&test_request),
             crate::permissions::PermissionDecision::Deny
         );
     }

@@ -100,6 +100,41 @@ fn is_fork_bomb(cmd: &str) -> bool {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Return whether a command is a direct local test-runner invocation.
+///
+/// This shared predicate is used by both the permission manager and the
+/// isolated `RunTests` tool. It deliberately rejects shell composition,
+/// interpreter `-c` code, package installation, and arbitrary commands before
+/// considering the executable/arguments.
+pub fn is_direct_test_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'))
+    {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    match parts[0] {
+        "pytest" | "ctest" => true,
+        "python" | "python3" | "python3.11" => {
+            matches!(parts.get(1), Some(&"-m"))
+                && matches!(parts.get(2), Some(&"pytest") | Some(&"unittest"))
+        }
+        "cargo" | "go" => parts.get(1) == Some(&"test"),
+        "npm" | "yarn" | "pnpm" | "bun" => {
+            parts.get(1) == Some(&"test")
+                || (parts.get(1) == Some(&"run") && parts.get(2) == Some(&"test"))
+        }
+        "mvn" | "gradle" | "gradlew" => parts.iter().skip(1).any(|part| *part == "test"),
+        _ => false,
+    }
+}
+
 /// Classify a bash command string and return its risk level.
 ///
 /// The analysis is intentionally conservative: when in doubt, the higher risk

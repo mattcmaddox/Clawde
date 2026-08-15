@@ -169,7 +169,10 @@ pub(crate) async fn execute_tool_for_task(
             // Isolated Ollama mode is a hard boundary for outbound tools. Keep
             // this before the permission handler so bypass/allow rules cannot
             // turn an offline session back into an online one.
-            if clawde_core::is_ollama_network_blocked() && tool.network_capable() {
+            if clawde_core::is_ollama_network_blocked()
+                && tool.network_capable()
+                && !tool.available_in_ollama_isolated_mode()
+            {
                 warn!(tool = tool.name(), "Tool blocked by isolated Ollama mode");
                 return ToolResult::error(format!(
                     "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",

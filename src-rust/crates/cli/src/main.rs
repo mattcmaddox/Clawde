@@ -1218,7 +1218,9 @@ fn build_tools_with_mcp_vec(
     let network_blocked = clawde_core::is_ollama_network_blocked();
     let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
         .into_iter()
-        .filter(|tool| !network_blocked || !tool.network_capable())
+        .filter(|tool| {
+            !network_blocked || !tool.network_capable() || tool.available_in_ollama_isolated_mode()
+        })
         .collect();
     v.push(Box::new(clawde_query::AgentTool::default()));
 
@@ -1835,7 +1837,11 @@ fn filter_tools_for_agent(
             // are preserved when the active mode changes.
             let allowed_names: Vec<String> = tools
                 .iter()
-                .filter(|t| !network_blocked || !t.network_capable())
+                .filter(|t| {
+                    !network_blocked
+                        || !t.network_capable()
+                        || t.available_in_ollama_isolated_mode()
+                })
                 .filter(|t| {
                     (matches!(t.permission_level(), PL::ReadOnly | PL::None)
                         || t.name() == "AskUserQuestion")
@@ -1856,7 +1862,11 @@ fn filter_tools_for_agent(
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| SEARCH_TOOLS.contains(&t.name()))
-                .filter(|t| !network_blocked || !t.network_capable())
+                .filter(|t| {
+                    !network_blocked
+                        || !t.network_capable()
+                        || t.available_in_ollama_isolated_mode()
+                })
                 .collect();
             Arc::new(filtered)
         }
@@ -1904,18 +1914,61 @@ fn stream_tool_start_event(tool_name: &str) -> serde_json::Value {
     serde_json::json!({ "type": "tool_start", "tool": tool_name })
 }
 
+/// Classify a tool error into a stable, redacted diagnostic code.
+///
+/// The raw result remains internal because it may contain source, credentials,
+/// or command output. The code is intentionally small and provider/tool
+/// independent so headless evidence can distinguish permission, isolation,
+/// timeout, and execution failures without exposing the payload.
+fn classify_tool_error(result: &str) -> &'static str {
+    let lower = result.to_ascii_lowercase();
+    if lower.contains("network namespace backend")
+        || lower.contains("isolated local tests are unsupported")
+    {
+        "network_sandbox_unavailable"
+    } else if lower.contains("ollama offline mode")
+        || lower.contains("network-capable tools are disabled")
+    {
+        "network_isolation_blocked"
+    } else if lower.contains("permission denied") {
+        "permission_denied"
+    } else if lower.contains("timed out") {
+        "timeout"
+    } else if lower.contains("tests failed") || lower.contains("test run failed") {
+        "test_failed"
+    } else if lower.contains("failed to spawn")
+        || lower.contains("could not be run")
+        || lower.contains("execution failed")
+    {
+        "execution_failed"
+    } else {
+        "tool_error"
+    }
+}
+
 /// Serialize the public stream-json tool-end event.
 ///
 /// Tool results are intentionally omitted: they may contain source code,
-/// credentials, or command output. The model still receives the full result
-/// internally; external consumers receive completion metadata only.
-fn stream_tool_end_event(tool_name: &str, tool_id: &str, is_error: bool) -> serde_json::Value {
-    serde_json::json!({
+/// credentials, or command output. Failed results expose only a stable,
+/// redacted `error_code`; external consumers receive enough metadata to
+/// diagnose a blocked execution without receiving the payload.
+fn stream_tool_end_event(
+    tool_name: &str,
+    tool_id: &str,
+    is_error: bool,
+    result: Option<&str>,
+) -> serde_json::Value {
+    let mut event = serde_json::json!({
         "type": "tool_end",
         "tool": tool_name,
         "id": tool_id,
         "is_error": is_error,
-    })
+    });
+    if is_error {
+        event["error_code"] =
+            serde_json::Value::String(classify_tool_error(result.unwrap_or_default()).to_string());
+    }
+    event
 }
 
 /// Serialize provider attribution without exposing credentials or raw output.
@@ -1940,18 +1993,41 @@ fn stream_provider_attribution_event(
 #[cfg(test)]
 mod stream_event_tests {
     use super::{
-        stream_provider_attribution_event, stream_tool_end_event, stream_tool_start_event,
+        classify_tool_error, stream_provider_attribution_event, stream_tool_end_event,
+        stream_tool_start_event,
     };
 
     #[test]
     fn tool_end_is_bounded_metadata_only() {
-        let event = stream_tool_end_event("Write", "tool-1", false);
+        let event = stream_tool_end_event("Write", "tool-1", false, None);
         assert_eq!(event["type"], "tool_end");
         assert_eq!(event["tool"], "Write");
         assert_eq!(event["id"], "tool-1");
         assert_eq!(event["is_error"], false);
         assert!(event.get("result").is_none());
         assert!(event.get("input").is_none());
+        assert!(event.get("error_code").is_none());
+    }
+
+    #[test]
+    fn tool_error_exposes_only_a_stable_redacted_code() {
+        let event = stream_tool_end_event(
+            "RunTests",
+            "tool-2",
+            true,
+            Some("Permission denied for tool 'RunTests': secret-token-should-not-appear"),
+        );
+        assert_eq!(event["error_code"], "permission_denied");
+        assert!(event.to_string().contains("permission_denied"));
+        assert!(!event.to_string().contains("secret-token"));
+        assert_eq!(
+            classify_tool_error("Tests FAILED — pytest exited with code 1"),
+            "test_failed"
+        );
+        assert_eq!(
+            classify_tool_error("Cannot run local tests: no network namespace backend"),
+            "network_sandbox_unavailable"
+        );
     }
 
     #[test]
@@ -2253,7 +2329,7 @@ async fn run_headless(
             QueryEvent::ToolEnd {
                 tool_name,
                 tool_id,
-                result: _,
+                result,
                 is_error,
             } => {
                 if is_stream_json {
@@ -2262,7 +2338,16 @@ async fn run_headless(
                     // Read/Bash results may contain source or secret material.
                     // The model receives the full result internally; external
                     // runners only need bounded execution metadata.
-                    let ev = stream_tool_end_event(&tool_name, &tool_id, *is_error);
+                    let ev = stream_tool_end_event(
+                        &tool_name,
+                        &tool_id,
+                        *is_error,
+                        if *is_error {
+                            Some(result.as_str())
+                        } else {
+                            None
+                        },
+                    );
                     println!("{}", ev);
                 } else if !is_json_output {
                     if *is_error {

@@ -398,7 +398,20 @@ impl ToolContext {
         &self,
         request: PermissionRequest,
     ) -> Result<(), clawde_core::error::ClaudeError> {
+        let network_capable = known_network_capability(request.tool_name.as_str());
+        // Keep the name-based compatibility path exercised for callers that
+        // use the legacy permission helpers; input-aware tools use the explicit
+        // capability variant below.
         self.ensure_network_allowed(&request.tool_name)?;
+        self.request_permission_inner_with_capability(request, network_capable)
+    }
+
+    fn request_permission_inner_with_capability(
+        &self,
+        request: PermissionRequest,
+        network_capable: bool,
+    ) -> Result<(), clawde_core::error::ClaudeError> {
+        self.ensure_network_allowed_for_tool(&request.tool_name, network_capable)?;
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
@@ -547,6 +560,29 @@ impl ToolContext {
         path: PathBuf,
         is_read_only: bool,
     ) -> Result<(), clawde_core::error::ClaudeError> {
+        self.check_permission_with_details_and_path_for_capability(
+            tool_name,
+            description,
+            details,
+            path,
+            is_read_only,
+            known_network_capability(tool_name),
+        )
+    }
+
+    /// Permission check variant for a tool whose effective network capability
+    /// depends on validated input (for example, an isolated local test runner).
+    /// The dispatcher still performs the outer capability check; this method
+    /// keeps self-gating tools from re-applying a static, overly broad fallback.
+    pub fn check_permission_with_details_and_path_for_capability(
+        &self,
+        tool_name: &str,
+        description: &str,
+        details: &str,
+        path: PathBuf,
+        is_read_only: bool,
+        network_capable: bool,
+    ) -> Result<(), clawde_core::error::ClaudeError> {
         let request = self.build_permission_request(
             tool_name,
             description,
@@ -554,12 +590,13 @@ impl ToolContext {
             is_read_only,
             Some(path),
         );
-        self.request_permission_inner(request).map_err(|_| {
-            clawde_core::error::ClaudeError::PermissionDenied(format!(
-                "Permission denied for tool '{}': {}",
-                tool_name, details
-            ))
-        })
+        self.request_permission_inner_with_capability(request, network_capable)
+            .map_err(|_| {
+                clawde_core::error::ClaudeError::PermissionDenied(format!(
+                    "Permission denied for tool '{}': {}",
+                    tool_name, details
+                ))
+            })
     }
 
     pub fn current_turn_index(&self) -> usize {
@@ -626,6 +663,17 @@ pub trait Tool: Send + Sync {
     /// backstop. Keep this capability metadata conservative: a false negative
     /// would expose an online side effect to offline mode.
     fn network_capable(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool remains available in isolated Ollama mode.
+    ///
+    /// This is separate from `network_capable()`: a tool may be network-capable
+    /// in general but expose a narrowly validated, OS-sandboxed local mode.
+    /// Such tools must enforce that mode in `execute()` and fail closed when
+    /// the sandbox is unavailable. Arbitrary shell and other network-capable
+    /// tools keep the default `false`.
+    fn available_in_ollama_isolated_mode(&self) -> bool {
         false
     }
 
@@ -874,6 +922,17 @@ mod tests {
                 "missing network capability for {name}"
             );
         }
+    }
+
+    #[test]
+    fn isolated_mode_exception_is_narrow_and_explicit() {
+        let tools = all_tools();
+        let run_tests = tools.iter().find(|tool| tool.name() == "RunTests").unwrap();
+        let bash = tools.iter().find(|tool| tool.name() == "Bash").unwrap();
+        assert!(run_tests.network_capable());
+        assert!(run_tests.available_in_ollama_isolated_mode());
+        assert!(bash.network_capable());
+        assert!(!bash.available_in_ollama_isolated_mode());
     }
 
     #[test]
