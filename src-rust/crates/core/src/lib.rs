@@ -4033,12 +4033,20 @@ pub mod permissions {
 
             // Step 4 — AcceptEdits: auto-allow built-in file mutators. `Write`
             // is required for creating new files; the other names are ordinary
-            // file-edit operations. Shell, network, and other execution tools
-            // still go through the normal permission policy.
-            if self.mode == PermissionMode::AcceptEdits
-                && crate::constants::is_file_mutator(tool_name)
-            {
-                return PermissionDecision::Allow;
+            // file-edit operations. Safe/Low Bash commands are also allowed so
+            // headless tasks can run deterministic test/lint commands without
+            // requiring an interactive approval that cannot be answered. The
+            // shared classifier keeps medium/critical shell commands gated.
+            if self.mode == PermissionMode::AcceptEdits {
+                if crate::constants::is_file_mutator(tool_name) {
+                    return PermissionDecision::Allow;
+                }
+                if tool_name == "Bash" {
+                    let command = path.unwrap_or(description);
+                    if crate::bash_classifier::is_auto_approvable(command, &self.mode) {
+                        return PermissionDecision::Allow;
+                    }
+                }
             }
 
             // Step 5 — Plan mode: reads only
@@ -4535,7 +4543,7 @@ pub mod permissions {
         }
 
         #[test]
-        fn accept_edits_allows_file_mutators_but_not_shell() {
+        fn accept_edits_allows_file_mutators_and_safe_test_commands() {
             let m = mgr(PermissionMode::AcceptEdits);
             for tool in ["Edit", "Write", "BatchEdit", "ApplyPatch", "NotebookEdit"] {
                 assert_eq!(
@@ -4550,9 +4558,23 @@ pub mod permissions {
                     "AcceptEdits should allow file mutator {tool}"
                 );
             }
+            assert_eq!(
+                m.evaluate(
+                    "Bash",
+                    "run the focused test",
+                    Some("python3 -m pytest -q"),
+                    None,
+                    &[],
+                ),
+                PermissionDecision::Allow,
+                "AcceptEdits should allow a Low-risk deterministic test command"
+            );
             match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
-                other => panic!("Expected Ask, got {:?}", other),
+                other => panic!(
+                    "Expected Ask for a medium-risk shell command, got {:?}",
+                    other
+                ),
             }
         }
 

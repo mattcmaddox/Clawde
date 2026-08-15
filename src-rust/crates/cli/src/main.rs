@@ -4995,17 +4995,40 @@ async fn run_interactive(
                         tool_use_id,
                         response,
                     }) => {
-                        // Resolve a pending permission dialog if IDs match.
-                        if let Some(ref pr) = app.permission_request {
-                            if pr.tool_use_id == tool_use_id {
-                                use clawde_bridge::PermissionResponseKind;
-                                let _allow = matches!(
-                                    response,
-                                    PermissionResponseKind::Allow
-                                        | PermissionResponseKind::AllowSession
-                                );
+                        // The bridge response must resolve the same oneshot as
+                        // the local TUI key path. Previously this only cleared
+                        // the visible dialog, leaving the Bash/tool task blocked
+                        // forever on `blocking_recv()`.
+                        use clawde_bridge::PermissionResponseKind;
+                        let decision = match response {
+                            PermissionResponseKind::Allow => {
+                                clawde_core::permissions::PermissionDecision::Allow
+                            }
+                            PermissionResponseKind::AllowSession => {
+                                clawde_core::permissions::PermissionDecision::AllowPermanently
+                            }
+                            PermissionResponseKind::Deny => {
+                                clawde_core::permissions::PermissionDecision::Deny
+                            }
+                        };
+                        let resolved = clawde_tools::resolve_pending_permission(
+                            &pending_permissions,
+                            &tool_use_id,
+                            decision,
+                        );
+                        if resolved {
+                            if app
+                                .permission_request
+                                .as_ref()
+                                .is_some_and(|pr| pr.tool_use_id == tool_use_id)
+                            {
                                 app.permission_request = None;
                             }
+                        } else {
+                            app.status_message = Some(format!(
+                                "Permission response ignored: request {} is no longer pending.",
+                                tool_use_id
+                            ));
                         }
                     }
                     Ok(TuiBridgeEvent::SessionNameUpdate { title }) => {

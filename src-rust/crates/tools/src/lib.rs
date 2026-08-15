@@ -200,6 +200,25 @@ pub struct PendingPermissionStore {
     pub waiting: HashMap<String, PendingPermissionRequest>,
 }
 
+/// Resolve a permission request that has already been surfaced to a UI.
+///
+/// The interactive TUI and the bridge/ACP UI share the same pending store.
+/// Keeping the oneshot resolution here prevents one UI path from merely
+/// dismissing its dialog while leaving the tool task blocked forever.
+pub fn resolve_pending_permission(
+    store: &Arc<parking_lot::Mutex<PendingPermissionStore>>,
+    tool_use_id: &str,
+    decision: PermissionDecision,
+) -> bool {
+    let Some(mut pending) = store.lock().waiting.remove(tool_use_id) else {
+        return false;
+    };
+    if let Some(tx) = pending.decision_tx.take() {
+        let _ = tx.send(decision);
+    }
+    true
+}
+
 /// Persistent shell state shared across Bash tool invocations within one session.
 ///
 /// The bash tool (`PtyBashTool`) reads and writes this state on every call so
@@ -989,6 +1008,53 @@ mod tests {
         // Relative paths get joined with working_dir
         let resolved = ctx.resolve_path("src/main.rs");
         assert_eq!(resolved, PathBuf::from("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_pending_permission_sends_decision_once() {
+        let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        store.lock().waiting.insert(
+            "perm-1".to_string(),
+            PendingPermissionRequest {
+                tool_use_id: "perm-1".to_string(),
+                request: clawde_core::permissions::PermissionRequest {
+                    tool_name: "Bash".to_string(),
+                    description: "run test".to_string(),
+                    details: None,
+                    is_read_only: false,
+                    path: Some("python3 -m pytest -q".to_string()),
+                    working_dir: None,
+                    allowed_roots: vec![],
+                    context_description: None,
+                },
+                reason: "approval required".to_string(),
+                decision_tx: Some(tx),
+            },
+        );
+
+        assert!(resolve_pending_permission(
+            &store,
+            "perm-1",
+            PermissionDecision::Allow,
+        ));
+        assert!(matches!(rx.try_recv(), Ok(PermissionDecision::Allow)));
+        assert!(!resolve_pending_permission(
+            &store,
+            "perm-1",
+            PermissionDecision::Deny,
+        ));
+    }
+
+    #[test]
+    fn test_resolve_pending_permission_missing_id_is_non_destructive() {
+        let store = Arc::new(parking_lot::Mutex::new(PendingPermissionStore::default()));
+        assert!(!resolve_pending_permission(
+            &store,
+            "missing",
+            PermissionDecision::Deny,
+        ));
+        assert!(store.lock().waiting.is_empty());
     }
 
     #[test]
