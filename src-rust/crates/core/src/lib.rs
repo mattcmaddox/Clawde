@@ -3968,13 +3968,36 @@ pub mod permissions {
             working_dir: Option<&std::path::Path>,
             allowed_roots: &[std::path::PathBuf],
         ) -> PermissionDecision {
+            self.evaluate_with_network_isolation(
+                tool_name,
+                description,
+                path,
+                working_dir,
+                allowed_roots,
+                crate::config::is_ollama_network_blocked(),
+            )
+        }
+
+        /// Evaluate permissions using an explicit session isolation snapshot.
+        ///
+        /// Active session handlers must use this method rather than the legacy
+        /// [`Self::evaluate`] wrapper so one session's Ollama toggle cannot
+        /// affect another session through process-global state.
+        pub fn evaluate_with_network_isolation(
+            &self,
+            tool_name: &str,
+            description: &str,
+            path: Option<&str>,
+            working_dir: Option<&std::path::Path>,
+            allowed_roots: &[std::path::PathBuf],
+            network_isolated: bool,
+        ) -> PermissionDecision {
             use crate::config::PermissionMode;
 
             // Isolated Ollama mode is a hard network-tool boundary. It must
             // run before bypass and explicit allow rules; otherwise
             // --dangerously-skip-permissions would defeat offline mode.
-            if crate::config::is_ollama_network_blocked()
-                && PermissionLevel::for_tool(tool_name) == PermissionLevel::Network
+            if network_isolated && PermissionLevel::for_tool(tool_name) == PermissionLevel::Network
             {
                 return PermissionDecision::Deny;
             }
@@ -4243,6 +4266,9 @@ pub mod permissions {
         /// Context-aware description showing user WHY the tool needs permission.
         /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: <https://example.com>"
         pub context_description: Option<String>,
+        /// Session-scoped network isolation snapshot used by managed permission
+        /// handlers. Legacy callers may leave this false and use `evaluate`.
+        pub network_isolated: bool,
     }
 
     // -----------------------------------------------------------------------
@@ -4357,12 +4383,13 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
+                let decision = m.evaluate_with_network_isolation(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
+                    request.network_isolated,
                 );
                 return match decision {
                     PermissionDecision::Ask { .. } => PermissionDecision::Deny,
@@ -4394,12 +4421,13 @@ pub mod permissions {
     impl PermissionHandler for ManagedInteractivePermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                return m.evaluate(
+                return m.evaluate_with_network_isolation(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
+                    request.network_isolated,
                 );
             }
             // If the lock is poisoned fall back to allow (user is watching)
@@ -6482,7 +6510,24 @@ mod tests {
             working_dir: None,
             allowed_roots: Vec::new(),
             context_description: None,
+            network_isolated: false,
         }
+    }
+
+    #[test]
+    fn explicit_isolation_evaluation_ignores_global_compatibility_state() {
+        let manager = crate::permissions::PermissionManager::new(
+            crate::config::PermissionMode::BypassPermissions,
+            &crate::config::Settings::default(),
+        );
+        assert_eq!(
+            manager.evaluate_with_network_isolation("WebFetch", "fetch", None, None, &[], false),
+            crate::permissions::PermissionDecision::Allow
+        );
+        assert_eq!(
+            manager.evaluate_with_network_isolation("WebFetch", "fetch", None, None, &[], true),
+            crate::permissions::PermissionDecision::Deny
+        );
     }
 
     #[test]

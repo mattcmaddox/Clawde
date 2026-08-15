@@ -4742,12 +4742,13 @@ async fn run_interactive(
                         .as_ref()
                         .and_then(|manager| manager.lock().ok())
                         .map(|manager| {
-                            manager.evaluate(
+                            manager.evaluate_with_network_isolation(
                                 &pending.request.tool_name,
                                 &pending.request.description,
                                 pending.request.path.as_deref(),
                                 pending.request.working_dir.as_deref(),
                                 &pending.request.allowed_roots,
+                                clawde_core::network_isolation_enabled(&cmd_ctx.config),
                             )
                         })
                 };

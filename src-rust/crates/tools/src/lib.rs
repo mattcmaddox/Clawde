@@ -445,6 +445,7 @@ impl ToolContext {
             working_dir: Some(self.working_dir.clone()),
             allowed_roots: self.permission_allowed_roots(),
             context_description: None,
+            network_isolated: clawde_core::network_isolation_enabled(&self.config),
         }
     }
 
@@ -1157,6 +1158,7 @@ mod tests {
                     working_dir: None,
                     allowed_roots: vec![],
                     context_description: None,
+                    network_isolated: false,
                 },
                 reason: "approval required".to_string(),
                 decision_tx: Some(tx),
