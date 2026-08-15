@@ -86,7 +86,7 @@ impl AgentRuntime {
         // attached here — the wrapper type lives in the CLI crate today and
         // adding it would create a circular dep. Built-in tools (Bash, Read,
         // Edit, Glob, Grep, WebFetch, …) cover the common ACP-editor flows.
-        let network_blocked = clawde_core::is_ollama_network_blocked();
+        let network_blocked = clawde_core::network_isolation_enabled(&config);
         let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
             .into_iter()
             .filter(|tool| {

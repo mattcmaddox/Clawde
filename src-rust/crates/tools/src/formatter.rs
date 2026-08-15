@@ -2,12 +2,16 @@
 
 use crate::ToolContext;
 
+fn formatter_allowed(config: &clawde_core::config::Config) -> bool {
+    !clawde_core::network_isolation_enabled(config)
+}
+
 /// Try to format a file using any configured formatter.
 /// Returns silently if no formatter is configured or the formatter fails.
 pub async fn try_format_file(path: &str, ctx: &ToolContext) {
     // Formatters are user-configured subprocesses and may invoke package
     // managers or network clients. Never run them in isolated/offline mode.
-    if clawde_core::is_ollama_network_blocked() {
+    if !formatter_allowed(&ctx.config) {
         return;
     }
     let formatters = &ctx.config.formatter;
@@ -50,5 +54,25 @@ pub async fn try_format_file(path: &str, ctx: &ToolContext) {
 
         // Only apply the first matching formatter.
         break;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::formatter_allowed;
+
+    #[test]
+    fn formatter_is_disabled_for_config_only_isolation() {
+        let mut config = clawde_core::config::Config::default();
+        config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        assert!(!formatter_allowed(&config));
     }
 }
