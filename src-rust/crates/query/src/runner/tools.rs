@@ -169,10 +169,7 @@ pub(crate) async fn execute_tool_for_task(
             // Isolated Ollama mode is a hard boundary for outbound tools. Keep
             // this before the permission handler so bypass/allow rules cannot
             // turn an offline session back into an online one.
-            if clawde_core::is_ollama_network_blocked()
-                && tool.network_capable()
-                && !tool.available_in_ollama_isolated_mode()
-            {
+            if clawde_core::is_ollama_network_blocked() && unavailable_in_isolated_mode(tool) {
                 warn!(tool = tool.name(), "Tool blocked by isolated Ollama mode");
                 return ToolResult::error(format!(
                     "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
@@ -204,7 +201,15 @@ pub(crate) async fn execute_tool_for_task(
         None => {
             warn!(tool = requested_name, "Unknown or inactive tool requested");
             let hint = tool_name_hint(requested_name, tools);
-            let registered_elsewhere = clawde_tools::find_tool(requested_name).is_some()
+            let registered_tool = clawde_tools::find_tool(requested_name);
+            if clawde_core::is_ollama_network_blocked()
+                && registered_tool
+                    .as_deref()
+                    .is_some_and(unavailable_in_isolated_mode)
+            {
+                return ToolResult::error(isolated_network_tool_message(requested_name));
+            }
+            let registered_elsewhere = registered_tool.is_some()
                 || requested_name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT);
             if registered_elsewhere {
                 ToolResult::error(format!(
@@ -245,7 +250,18 @@ fn find_tool_for_name<'a>(name: &str, tools: &'a [Box<dyn Tool>]) -> Option<&'a 
     }
 }
 
+fn unavailable_in_isolated_mode(tool: &dyn Tool) -> bool {
+    tool.network_capable() && !tool.available_in_ollama_isolated_mode()
+}
+
 /// Build a short recovery hint for an unknown provider-supplied tool name.
+fn isolated_network_tool_message(tool_name: &str) -> String {
+    format!(
+        "Tool '{}' is unavailable in Ollama offline mode because it is network-capable. Arbitrary shell and network tools remain blocked; use RunTests for validated local tests inside the network-isolated sandbox.",
+        tool_name
+    )
+}
+
 fn active_tool_list(tools: &[Box<dyn Tool>]) -> String {
     let mut names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
     names.sort_unstable();
@@ -930,6 +946,22 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("Empty query"));
+    }
+
+    #[test]
+    fn isolated_mode_blocks_arbitrary_shell_but_keeps_run_tests() {
+        let bash = clawde_tools::find_tool("Bash").expect("Bash is registered");
+        let run_tests = clawde_tools::find_tool("RunTests").expect("RunTests is registered");
+        assert!(unavailable_in_isolated_mode(bash.as_ref()));
+        assert!(!unavailable_in_isolated_mode(run_tests.as_ref()));
+    }
+
+    #[test]
+    fn isolated_network_tool_message_explains_the_safe_alternative() {
+        let message = isolated_network_tool_message("Bash");
+        assert!(message.contains("Ollama offline mode"));
+        assert!(message.contains("network-capable"));
+        assert!(message.contains("RunTests"));
     }
 
     #[tokio::test]
