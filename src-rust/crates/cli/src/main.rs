@@ -1919,16 +1919,21 @@ fn stream_tool_end_event(tool_name: &str, tool_id: &str, is_error: bool) -> serd
 }
 
 /// Serialize provider attribution without exposing credentials or raw output.
+/// Carries the turn's assembled context size so runners can fit the
+/// `decide_memory` threshold on per-turn data (free providers report
+/// `input_tokens: 0`).
 fn stream_provider_attribution_event(
     provider_id: &str,
     upstream_id: Option<&str>,
     model: &str,
+    context_tokens_est: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "provider_attribution",
         "provider_id": provider_id,
         "upstream_id": upstream_id,
         "model": model,
+        "context_tokens_est": context_tokens_est,
     })
 }
 
@@ -1959,11 +1964,13 @@ mod stream_event_tests {
 
     #[test]
     fn provider_attribution_is_stable_and_secret_free() {
-        let event = stream_provider_attribution_event("free", Some("groq"), "openai/gpt-oss-120b");
+        let event =
+            stream_provider_attribution_event("free", Some("groq"), "openai/gpt-oss-120b", 512);
         assert_eq!(event["type"], "provider_attribution");
         assert_eq!(event["provider_id"], "free");
         assert_eq!(event["upstream_id"], "groq");
         assert_eq!(event["model"], "openai/gpt-oss-120b");
+        assert_eq!(event["context_tokens_est"], 512);
         assert!(event.get("api_key").is_none());
         assert!(event.get("result").is_none());
     }
@@ -2228,6 +2235,7 @@ async fn run_headless(
                         &obs.provider_id,
                         obs.upstream_id.as_deref(),
                         &obs.model,
+                        obs.context_tokens_est,
                     );
                     println!("{}", ev);
                 }

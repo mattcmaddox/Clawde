@@ -267,7 +267,13 @@ pub fn decide_adversarial(enabled: bool, diff: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Token budget above which a turn's context should be summarized for memory.
-pub const MEMORY_SUMMARIZE_THRESHOLD: usize = 120_000;
+///
+/// Fitted 2026-08-14 to the first recorded `context_tokens_est` distribution
+/// (6-turn baseline series, phase-2 tasks): observed max 1250, p95 1250 —
+/// far below the old 120k guess. Lowered to 10k (≈8x observed max) so the
+/// decision can actually fire on genuinely large contexts while every
+/// measured turn is kept verbatim. Re-fit after more per-turn data lands.
+pub const MEMORY_SUMMARIZE_THRESHOLD: usize = 10_000;
 
 /// Report size (chars) above which the report itself is worth summarizing.
 pub const MEMORY_REPORT_CHARS_THRESHOLD: usize = 4_000;
