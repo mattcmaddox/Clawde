@@ -1017,7 +1017,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
+    let tools = build_tools_with_mcp(mcp_manager_arc.clone(), &config);
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -1116,7 +1116,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(turns) = def.max_turns {
                 query_config.max_turns = turns;
             }
-            filter_tools_for_agent(tools, &access, mcp_manager_arc.clone())
+            filter_tools_for_agent(tools, &access, &config, mcp_manager_arc.clone())
         } else {
             eprintln!(
                 "Warning: unknown agent '{}'. Run /agent to see available agents.",
@@ -1214,8 +1214,9 @@ async fn connect_mcp_manager_arc(
 
 fn build_tools_with_mcp_vec(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+    config: &Config,
 ) -> Vec<Box<dyn clawde_tools::Tool>> {
-    let network_blocked = clawde_core::is_ollama_network_blocked();
+    let network_blocked = clawde_core::network_isolation_enabled(config);
     let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
         .into_iter()
         .filter(|tool| {
@@ -1246,8 +1247,9 @@ fn build_tools_with_mcp_vec(
 
 fn build_tools_with_mcp(
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
+    config: &Config,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
-    Arc::new(build_tools_with_mcp_vec(mcp_manager))
+    Arc::new(build_tools_with_mcp_vec(mcp_manager, config))
 }
 
 fn model_cache_dir() -> PathBuf {
@@ -1826,10 +1828,11 @@ fn routing_strategy_changed(before: &Config, after: &Config) -> bool {
 fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     access: &str,
+    config: &Config,
     mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
 ) -> Arc<Vec<Box<dyn clawde_tools::Tool>>> {
     use clawde_tools::PermissionLevel as PL;
-    let network_blocked = clawde_core::is_ollama_network_blocked();
+    let network_blocked = clawde_core::network_isolation_enabled(config);
     match access {
         "read-only" => {
             // Collect names first because `Box<dyn Tool>` is not Clone. Rebuild
@@ -1849,7 +1852,7 @@ fn filter_tools_for_agent(
                 })
                 .map(|t| t.name().to_string())
                 .collect();
-            let rebuilt = build_tools_with_mcp_vec(mcp_manager);
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config);
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| allowed_names.iter().any(|n| n == t.name()))
@@ -1858,7 +1861,7 @@ fn filter_tools_for_agent(
         }
         "search-only" => {
             const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
-            let rebuilt = build_tools_with_mcp_vec(mcp_manager);
+            let rebuilt = build_tools_with_mcp_vec(mcp_manager, config);
             let filtered: Vec<Box<dyn clawde_tools::Tool>> = rebuilt
                 .into_iter()
                 .filter(|t| SEARCH_TOOLS.contains(&t.name()))
@@ -1874,7 +1877,7 @@ fn filter_tools_for_agent(
             if network_blocked {
                 // Rebuild from the same runtime registry because the Arc holds
                 // boxed trait objects that cannot be moved out by value.
-                Arc::new(build_tools_with_mcp_vec(mcp_manager))
+                Arc::new(build_tools_with_mcp_vec(mcp_manager, config))
             } else {
                 tools
             }
@@ -1898,7 +1901,7 @@ fn tools_for_agent_mode(
     all_agents.extend(config.agents.clone());
     all_agents
         .get(mode)
-        .map(|def| filter_tools_for_agent(all_tools.clone(), &def.access, mcp_manager))
+        .map(|def| filter_tools_for_agent(all_tools.clone(), &def.access, config, mcp_manager))
         .unwrap_or(all_tools)
 }
 
@@ -3205,7 +3208,7 @@ async fn run_interactive(
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
     // agent-mode switching can re-filter without silently dropping tools that
     // were not part of the bare `clawde_tools::all_tools()` list.
-    let mut all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone());
+    let mut all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone(), &tool_ctx.config);
     let mut tools_arc = tools;
 
     // Current cancel token (replaced each turn)
@@ -4557,7 +4560,8 @@ async fn run_interactive(
                         // `/ollama` changes the active capability boundary. Rebuild
                         // both the full registry and the current agent-filtered
                         // slice so tools disappear/return immediately.
-                        all_tools_arc = build_tools_with_mcp(tool_ctx.mcp_manager.clone());
+                        all_tools_arc =
+                            build_tools_with_mcp(tool_ctx.mcp_manager.clone(), &cmd_ctx.config);
                         tools_arc = tools_for_agent_mode(
                             all_tools_arc.clone(),
                             app.agent_mode.as_deref(),
@@ -5837,7 +5841,7 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            all_tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            all_tools_arc = build_tools_with_mcp(new_mcp_manager.clone(), &cmd_ctx.config);
             tools_arc = tools_for_agent_mode(
                 all_tools_arc.clone(),
                 app.agent_mode.as_deref(),
@@ -6639,15 +6643,34 @@ mod bare_mode_tests {
 
     #[test]
     fn full_runtime_registry_includes_bash() {
-        let tools = build_tools_with_mcp(None);
+        let tools = build_tools_with_mcp(None, &Config::default());
         assert!(tools.iter().any(|tool| tool.name() == "Bash"));
     }
 
     #[test]
+    fn config_only_isolation_filters_runtime_registry() {
+        let mut config = Config::default();
+        config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let tools = build_tools_with_mcp(None, &config);
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+        assert!(tools.iter().any(|tool| tool.name() == "RunTests"));
+        assert!(tools.iter().any(|tool| tool.name() == "RunLints"));
+    }
+
+    #[test]
     fn restricted_agent_modes_exclude_bash() {
-        let full = build_tools_with_mcp(None);
-        let plan = filter_tools_for_agent(full.clone(), "read-only", None);
-        let explore = filter_tools_for_agent(full, "search-only", None);
+        let config = Config::default();
+        let full = build_tools_with_mcp(None, &config);
+        let plan = filter_tools_for_agent(full.clone(), "read-only", &config, None);
+        let explore = filter_tools_for_agent(full, "search-only", &config, None);
 
         assert!(!plan.iter().any(|tool| tool.name() == "Bash"));
         assert!(!plan
