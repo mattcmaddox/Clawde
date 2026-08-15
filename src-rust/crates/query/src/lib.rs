@@ -2184,7 +2184,35 @@ pub async fn run_query_loop(
                                 recovery = ?recovery,
                                 "Provider stream error — recovering turn"
                             );
-                            if let Some(ref tx) = event_tx {
+                            // Respect the provider's stated cooldown before
+                            // re-dispatching (Babu & Agrawal: timeout/rate
+                            // limit → retry WITH BACKOFF). The loop previously
+                            // retried instantly, burning the whole budget on a
+                            // still-warm window — the observed failure mode in
+                            // the 2026-08-14 measurement series (groq 59s
+                            // windows, 5/6 trials rate-limited). Capped at 120s
+                            // and cancellable.
+                            if let clawde_api::ProviderError::RateLimited {
+                                retry_after: Some(secs),
+                                ..
+                            } = &err
+                            {
+                                let wait = (*secs).min(120);
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(format!(
+                                        "Rate limited — waiting {wait}s before retrying ({} left)…",
+                                        retries_left + 1
+                                    )));
+                                }
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => {
+                                        return QueryOutcome::Cancelled;
+                                    }
+                                    _ = tokio::time::sleep(
+                                        std::time::Duration::from_secs(wait),
+                                    ) => {}
+                                }
+                            } else if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::Status(format!(
                                     "Stream error ({recovery:?}) — retrying ({} left)…",
                                     retries_left + 1
