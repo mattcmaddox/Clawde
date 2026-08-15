@@ -9888,6 +9888,7 @@ impl App {
                 tool_id,
                 result,
                 is_error,
+                ..
             } => {
                 // Build a multi-line preview: show up to 3 lines, truncate if more.
                 let all_lines: Vec<&str> = result.lines().collect();

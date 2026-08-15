@@ -132,6 +132,47 @@ pub struct UserQuestionEvent {
 // Core trait & types
 // ---------------------------------------------------------------------------
 
+/// Stable machine-readable categories for tool failures.
+///
+/// The human-readable `ToolResult::content` remains the model-facing payload;
+/// this code is for orchestration, public telemetry, and recovery decisions.
+/// New tools may continue using `ToolResult::error` and receive the legacy
+/// fallback classification until they opt into a more specific category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorCode {
+    InvalidInput,
+    PermissionDenied,
+    NetworkIsolationBlocked,
+    NetworkSandboxUnavailable,
+    TestFailed,
+    LintFailed,
+    Timeout,
+    ExecutionFailed,
+    ToolUnavailable,
+    UnknownTool,
+    PlanBlocked,
+    Cancelled,
+}
+
+impl ToolErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::PermissionDenied => "permission_denied",
+            Self::NetworkIsolationBlocked => "network_isolation_blocked",
+            Self::NetworkSandboxUnavailable => "network_sandbox_unavailable",
+            Self::TestFailed => "test_failed",
+            Self::LintFailed => "lint_failed",
+            Self::Timeout => "timeout",
+            Self::ExecutionFailed => "execution_failed",
+            Self::ToolUnavailable => "tool_unavailable",
+            Self::UnknownTool => "unknown_tool",
+            Self::PlanBlocked => "plan_blocked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// The result of executing a tool.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -139,6 +180,8 @@ pub struct ToolResult {
     pub content: String,
     /// Whether this invocation was an error.
     pub is_error: bool,
+    /// Optional stable category for an error result.
+    pub error_code: Option<ToolErrorCode>,
     /// Optional structured metadata (for the TUI to render diffs, etc.).
     pub metadata: Option<Value>,
 }
@@ -148,6 +191,7 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            error_code: None,
             metadata: None,
         }
     }
@@ -156,6 +200,16 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: true,
+            error_code: None,
+            metadata: None,
+        }
+    }
+
+    pub fn error_with_code(code: ToolErrorCode, content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            error_code: Some(code),
             metadata: None,
         }
     }
@@ -1020,6 +1074,7 @@ mod tests {
         let r = ToolResult::success("done");
         assert!(!r.is_error);
         assert_eq!(r.content, "done");
+        assert!(r.error_code.is_none());
         assert!(r.metadata.is_none());
     }
 
@@ -1028,6 +1083,19 @@ mod tests {
         let r = ToolResult::error("something went wrong");
         assert!(r.is_error);
         assert_eq!(r.content, "something went wrong");
+        assert!(r.error_code.is_none());
+    }
+
+    #[test]
+    fn test_tool_result_error_code_is_stable_and_preserved() {
+        let r = ToolResult::error_with_code(ToolErrorCode::NetworkIsolationBlocked, "offline")
+            .with_metadata(serde_json::json!({"safe": true}));
+        assert_eq!(r.error_code, Some(ToolErrorCode::NetworkIsolationBlocked));
+        assert_eq!(
+            ToolErrorCode::NetworkIsolationBlocked.as_str(),
+            "network_isolation_blocked"
+        );
+        assert!(r.metadata.is_some());
     }
 
     #[test]

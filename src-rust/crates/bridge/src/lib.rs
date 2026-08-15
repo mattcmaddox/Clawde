@@ -340,6 +340,8 @@ pub enum BridgeEvent {
         tool_id: String,
         result: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_code: Option<String>,
     },
     /// The CLI needs the web UI to approve a tool use.
     PermissionRequest {
@@ -1307,6 +1309,7 @@ pub enum BridgeOutbound {
         id: String,
         output: String,
         is_error: bool,
+        error_code: Option<String>,
     },
     TurnComplete {
         message_id: String,
@@ -1527,13 +1530,19 @@ pub async fn run_bridge_loop(
                             })
                             .await;
                     }
-                    Some(BridgeOutbound::ToolEnd { id, output, is_error }) => {
+                    Some(BridgeOutbound::ToolEnd {
+                        id,
+                        output,
+                        is_error,
+                        error_code,
+                    }) => {
                         let _ = bridge_ev_tx
                             .send(BridgeEvent::ToolEnd {
                                 tool_name: String::new(),
                                 tool_id: id,
                                 result: output,
                                 is_error,
+                                error_code,
                             })
                             .await;
                     }
@@ -1702,6 +1711,30 @@ mod tests {
         let j = serde_json::to_string(&ev).unwrap();
         assert!(j.contains(r#""type":"text_delta""#));
         assert!(j.contains("hello world"));
+    }
+
+    #[test]
+    fn test_bridge_tool_error_code_is_optional_and_serialized() {
+        let ev = BridgeEvent::ToolEnd {
+            tool_name: "Bash".into(),
+            tool_id: "tool-1".into(),
+            result: "blocked".into(),
+            is_error: true,
+            error_code: Some("network_isolation_blocked".into()),
+        };
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains(r#""type":"tool_end""#));
+        assert!(j.contains("network_isolation_blocked"));
+
+        let legacy = BridgeEvent::ToolEnd {
+            tool_name: "Read".into(),
+            tool_id: "tool-2".into(),
+            result: "done".into(),
+            is_error: false,
+            error_code: None,
+        };
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("error_code"));
     }
 
     #[test]

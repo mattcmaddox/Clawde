@@ -220,6 +220,7 @@ async fn forward_events(
                 tool_id,
                 result,
                 is_error,
+                ..
             } => {
                 let status = if is_error {
                     acp::ToolCallStatus::Failed

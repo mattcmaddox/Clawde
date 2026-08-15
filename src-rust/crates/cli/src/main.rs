@@ -1957,6 +1957,7 @@ fn stream_tool_end_event(
     tool_id: &str,
     is_error: bool,
     result: Option<&str>,
+    error_code: Option<&str>,
 ) -> serde_json::Value {
     let mut event = serde_json::json!({
         "type": "tool_end",
@@ -1965,8 +1966,11 @@ fn stream_tool_end_event(
         "is_error": is_error,
     });
     if is_error {
-        event["error_code"] =
-            serde_json::Value::String(classify_tool_error(result.unwrap_or_default()).to_string());
+        event["error_code"] = serde_json::Value::String(
+            error_code
+                .unwrap_or_else(|| classify_tool_error(result.unwrap_or_default()))
+                .to_string(),
+        );
     }
     event
 }
@@ -1999,7 +2003,7 @@ mod stream_event_tests {
 
     #[test]
     fn tool_end_is_bounded_metadata_only() {
-        let event = stream_tool_end_event("Write", "tool-1", false, None);
+        let event = stream_tool_end_event("Write", "tool-1", false, None, None);
         assert_eq!(event["type"], "tool_end");
         assert_eq!(event["tool"], "Write");
         assert_eq!(event["id"], "tool-1");
@@ -2016,6 +2020,7 @@ mod stream_event_tests {
             "tool-2",
             true,
             Some("Permission denied for tool 'RunTests': secret-token-should-not-appear"),
+            Some("permission_denied"),
         );
         assert_eq!(event["error_code"], "permission_denied");
         assert!(event.to_string().contains("permission_denied"));
@@ -2331,6 +2336,7 @@ async fn run_headless(
                 tool_id,
                 result,
                 is_error,
+                error_code,
             } => {
                 if is_stream_json {
                     // Keep the machine-readable headless stream complete. Do
@@ -2347,6 +2353,7 @@ async fn run_headless(
                         } else {
                             None
                         },
+                        error_code.as_deref(),
                     );
                     println!("{}", ev);
                 } else if !is_json_output {
@@ -4778,11 +4785,13 @@ async fn run_interactive(
                         tool_id,
                         result,
                         is_error,
+                        error_code,
                         ..
                     } => Some(BridgeOutbound::ToolEnd {
                         id: tool_id.clone(),
                         output: result.clone(),
                         is_error: *is_error,
+                        error_code: error_code.clone(),
                     }),
                     QueryEvent::TurnComplete {
                         stop_reason, turn, ..
@@ -4831,6 +4840,7 @@ async fn run_interactive(
                         tool_id,
                         result,
                         is_error,
+                        error_code,
                     } => Some(
                         serde_json::json!({
                             "type": "tool_end",
@@ -4838,6 +4848,7 @@ async fn run_interactive(
                             "tool_id": tool_id,
                             "result": result,
                             "is_error": is_error,
+                            "error_code": error_code,
                         })
                         .to_string(),
                     ),

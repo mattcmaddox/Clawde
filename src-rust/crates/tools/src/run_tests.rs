@@ -10,7 +10,7 @@
 // TUI shows a permission dialog before the command runs.
 
 use crate::detect_project::detect_project_info;
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -343,7 +343,12 @@ impl Tool for RunTestsTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: RunTestsInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         let project_root = params
@@ -359,7 +364,8 @@ impl Tool for RunTestsTool {
                 match info.test_commands.first() {
                     Some(c) => c.clone(),
                     None => {
-                        return ToolResult::error(
+                        return ToolResult::error_with_code(
+                            ToolErrorCode::ExecutionFailed,
                             "No test command detected for this project. Pass an explicit \
                              `command` (e.g. \"cargo test --workspace\").",
                         )
@@ -372,14 +378,16 @@ impl Tool for RunTestsTool {
         let isolated = clawde_core::is_ollama_network_blocked();
         if isolated {
             if !is_local_test_command(&command) {
-                return ToolResult::error(
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkIsolationBlocked,
                     "Ollama offline mode only permits a direct local test command ".to_string()
                         + "(for example, `python3 -m pytest -q`); shell wrappers and "
                         + "arbitrary commands are blocked.",
                 );
             }
             if !network_isolation_available() {
-                return ToolResult::error(
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkSandboxUnavailable,
                     "Cannot run local tests in Ollama offline mode: no network ".to_string()
                         + "namespace backend (bwrap or unshare) is available.",
                 );
@@ -404,7 +412,7 @@ impl Tool for RunTestsTool {
             false,
             !isolated,
         ) {
-            return ToolResult::error(e.to_string());
+            return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }
 
         debug!(command = %command, root = %project_root.display(), "Running tests");
@@ -420,18 +428,27 @@ impl Tool for RunTestsTool {
 
         match exit_code {
             Some(0) => ToolResult::success(format!("Tests passed ({}).\n{}", command, truncated)),
-            Some(code) => ToolResult::error(format!(
-                "Tests FAILED — '{}' exited with code {}\n{}",
-                command, code, truncated
-            )),
+            Some(code) => ToolResult::error_with_code(
+                ToolErrorCode::TestFailed,
+                format!(
+                    "Tests FAILED — '{}' exited with code {}\n{}",
+                    command, code, truncated
+                ),
+            ),
             None => {
                 if timed_out {
-                    ToolResult::error(format!(
-                        "'{}' timed out after {}s\n{}",
-                        command, timeout_secs, truncated
-                    ))
+                    ToolResult::error_with_code(
+                        ToolErrorCode::Timeout,
+                        format!(
+                            "'{}' timed out after {}s\n{}",
+                            command, timeout_secs, truncated
+                        ),
+                    )
                 } else {
-                    ToolResult::error(format!("'{}' could not be run.\n{}", command, truncated))
+                    ToolResult::error_with_code(
+                        ToolErrorCode::ExecutionFailed,
+                        format!("'{}' could not be run.\n{}", command, truncated),
+                    )
                 }
             }
         }
@@ -605,5 +622,6 @@ mod tests {
             res.content
         );
         assert!(res.content.contains("fail"));
+        assert_eq!(res.error_code, Some(ToolErrorCode::TestFailed));
     }
 }

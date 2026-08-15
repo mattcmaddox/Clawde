@@ -3,6 +3,7 @@
 // Behavior-preserving move.
 
 use crate::*;
+use clawde_tools::ToolErrorCode;
 
 /// Parse the accumulated JSON arguments of a streamed tool call.
 ///
@@ -84,18 +85,24 @@ fn plan_gate_error(
         .unwrap_or_else(|| ctx.working_dir.clone());
     let approved = clawde_core::spec::Spec::approved_in(&project_root, &ctx.session_id);
     let Some((approved_path, approved_spec)) = approved.as_ref() else {
-        return Some(ToolResult::error(format!(
-            "Plan approval required before '{}': spec-driven mode is enabled, but no current task-bound spec has been accepted for session '{}' in {}/specs/. Run /spec <task>, then accept it with /spec-review before making file changes.",
-            name,
-            ctx.session_id,
-            project_root.display()
-        )));
+        return Some(ToolResult::error_with_code(
+            ToolErrorCode::PlanBlocked,
+            format!(
+                "Plan approval required before '{}': spec-driven mode is enabled, but no current task-bound spec has been accepted for session '{}' in {}/specs/. Run /spec <task>, then accept it with /spec-review before making file changes.",
+                name,
+                ctx.session_id,
+                project_root.display()
+            ),
+        ));
     };
     if active_task_id != Some(approved_spec.task_id.as_str()) {
-        return Some(ToolResult::error(format!(
-            "Plan approval required before '{}': the accepted spec is bound to task '{}', not the current task. Generate and review a new /spec for this task.",
-            name, approved_spec.task_id
-        )));
+        return Some(ToolResult::error_with_code(
+            ToolErrorCode::PlanBlocked,
+            format!(
+                "Plan approval required before '{}': the accepted spec is bound to task '{}', not the current task. Generate and review a new /spec for this task.",
+                name, approved_spec.task_id
+            ),
+        ));
     }
     // Phase D fail-closed boundary: an approved plan whose replan budget is
     // exhausted is Blocked, and a blocked plan must not authorize further
@@ -112,16 +119,22 @@ fn plan_gate_error(
         ) {
             match progress.status {
                 clawde_core::PlanStatus::Blocked => {
-                    return Some(ToolResult::error(format!(
-                        "Plan approval required before '{}': the approved plan for task '{}' is BLOCKED after exhausting its replan budget. Generate and accept a new /spec before making file changes.",
-                        name, approved_spec.task_id
-                    )));
+                    return Some(ToolResult::error_with_code(
+                        ToolErrorCode::PlanBlocked,
+                        format!(
+                            "Plan approval required before '{}': the approved plan for task '{}' is BLOCKED after exhausting its replan budget. Generate and accept a new /spec before making file changes.",
+                            name, approved_spec.task_id
+                        ),
+                    ));
                 }
                 clawde_core::PlanStatus::Complete => {
-                    return Some(ToolResult::error(format!(
-                        "Plan approval required before '{}': the approved plan for task '{}' is COMPLETE. Generate and accept a new /spec before making further file changes.",
-                        name, approved_spec.task_id
-                    )));
+                    return Some(ToolResult::error_with_code(
+                        ToolErrorCode::PlanBlocked,
+                        format!(
+                            "Plan approval required before '{}': the approved plan for task '{}' is COMPLETE. Generate and accept a new /spec before making further file changes.",
+                            name, approved_spec.task_id
+                        ),
+                    ));
                 }
                 clawde_core::PlanStatus::Active => {}
             }
@@ -171,10 +184,13 @@ pub(crate) async fn execute_tool_for_task(
             // turn an offline session back into an online one.
             if clawde_core::is_ollama_network_blocked() && unavailable_in_isolated_mode(tool) {
                 warn!(tool = tool.name(), "Tool blocked by isolated Ollama mode");
-                return ToolResult::error(format!(
-                    "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
-                    tool.name()
-                ));
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkIsolationBlocked,
+                    format!(
+                        "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
+                        tool.name()
+                    ),
+                );
             }
 
             // Central permission backstop (issue #210): if a tool does not gate
@@ -193,7 +209,10 @@ pub(crate) async fn execute_tool_for_task(
                         requested_tool = requested_name,
                         "Tool blocked by central permission backstop"
                     );
-                    return ToolResult::error(e.to_string());
+                    return ToolResult::error_with_code(
+                        ToolErrorCode::PermissionDenied,
+                        e.to_string(),
+                    );
                 }
             }
             tool.execute(input.clone(), ctx).await
@@ -207,24 +226,36 @@ pub(crate) async fn execute_tool_for_task(
                     .as_deref()
                     .is_some_and(unavailable_in_isolated_mode)
             {
-                return ToolResult::error(isolated_network_tool_message(requested_name));
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkIsolationBlocked,
+                    isolated_network_tool_message(requested_name),
+                );
             }
             let registered_elsewhere = registered_tool.is_some()
                 || requested_name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT);
             if registered_elsewhere {
-                ToolResult::error(format!(
-                    "Tool '{}' is registered but not active in this session. {} Enable it in the agent/tool settings or use one of the active tools.",
-                    requested_name,
-                    active_tool_list(tools)
-                ))
+                ToolResult::error_with_code(
+                    ToolErrorCode::ToolUnavailable,
+                    format!(
+                        "Tool '{}' is registered but not active in this session. {} Enable it in the agent/tool settings or use one of the active tools.",
+                        requested_name,
+                        active_tool_list(tools)
+                    ),
+                )
             } else if hint.is_empty() {
-                ToolResult::error(format!(
-                    "Unknown tool: {}. This tool is not available in the active tool set. {}",
-                    requested_name,
-                    active_tool_list(tools)
-                ))
+                ToolResult::error_with_code(
+                    ToolErrorCode::UnknownTool,
+                    format!(
+                        "Unknown tool: {}. This tool is not available in the active tool set. {}",
+                        requested_name,
+                        active_tool_list(tools)
+                    ),
+                )
             } else {
-                ToolResult::error(format!("Unknown tool: {}. {}", requested_name, hint))
+                ToolResult::error_with_code(
+                    ToolErrorCode::UnknownTool,
+                    format!("Unknown tool: {}. {}", requested_name, hint),
+                )
             }
         }
     }
@@ -340,7 +371,7 @@ where
         results = futures::future::join_all(exec_futures) => (results, false),
         _ = cancel_token.cancelled() => {
             let cancelled = (0..count)
-                .map(|_| ToolResult::error(TOOL_CANCELLED_MSG))
+                .map(|_| ToolResult::error_with_code(ToolErrorCode::Cancelled, TOOL_CANCELLED_MSG))
                 .collect();
             (cancelled, true)
         }

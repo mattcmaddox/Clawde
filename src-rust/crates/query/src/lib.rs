@@ -80,7 +80,7 @@ use clawde_core::config::Config;
 use clawde_core::cost::CostTracker;
 use clawde_core::error::ClaudeError;
 use clawde_core::types::{ContentBlock, Message, Role, ToolResultContent, UsageInfo};
-use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -353,6 +353,8 @@ pub enum QueryEvent {
         tool_id: String,
         result: String,
         is_error: bool,
+        /// Stable machine-readable category when the tool supplied one.
+        error_code: Option<String>,
     },
     /// The model finished a turn.
     TurnComplete {
@@ -495,15 +497,18 @@ fn deterministic_check_observation(name: &str, result: &clawde_tools::ToolResult
         return (false, false);
     }
     let lower = result.content.to_ascii_lowercase();
-    let timed_out = lower.contains("timed out");
+    let timed_out =
+        result.error_code == Some(ToolErrorCode::Timeout) || lower.contains("timed out");
     let passed = match name {
         "RunTests" => lower.contains("tests passed"),
         "RunLints" => lower.contains("lints passed"),
         _ => false,
     };
-    let failed = match name {
-        "RunTests" => lower.contains("tests failed"),
-        "RunLints" => lower.contains("lint issues found"),
+    let failed = match (name, result.error_code) {
+        ("RunTests", Some(ToolErrorCode::TestFailed))
+        | ("RunLints", Some(ToolErrorCode::LintFailed)) => true,
+        ("RunTests", _) => lower.contains("tests failed"),
+        ("RunLints", _) => lower.contains("lint issues found"),
         _ => false,
     };
     let observed = timed_out || passed || failed;
@@ -2454,6 +2459,9 @@ pub async fn run_query_loop(
                                     tool_id: tool_id.clone(),
                                     result: result.content.clone(),
                                     is_error: result.is_error,
+                                    error_code: result
+                                        .error_code
+                                        .map(|code| code.as_str().to_string()),
                                 });
                             }
                             tool_results.push(ContentBlock::ToolResult {
@@ -3332,6 +3340,7 @@ pub async fn run_query_loop(
                                 tool_id: p.id.clone(),
                                 result: result.content.clone(),
                                 is_error: result.is_error,
+                                error_code: result.error_code.map(|code| code.as_str().to_string()),
                             });
                         }
 
@@ -3606,7 +3615,10 @@ mod tests {
         assert!(!is_deterministic_check_tool("Bash"));
         assert!(!is_deterministic_check_tool("Write"));
 
-        let failed = clawde_tools::ToolResult::error("Tests FAILED — pytest exited with code 1");
+        let failed = clawde_tools::ToolResult::error_with_code(
+            ToolErrorCode::TestFailed,
+            "Tests FAILED — pytest exited with code 1",
+        );
         assert_eq!(
             deterministic_check_observation("RunTests", &failed),
             (true, true)

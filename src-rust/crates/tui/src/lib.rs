@@ -2115,6 +2115,7 @@ mod tests {
             tool_id: "t1".to_string(),
             result: "output".to_string(),
             is_error: false,
+            error_code: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Done);
     }
@@ -2135,6 +2136,7 @@ mod tests {
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
             is_error: true,
+            error_code: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Error);
         assert!(app.status_message.is_some());

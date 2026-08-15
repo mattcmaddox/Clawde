@@ -10,7 +10,7 @@
 
 use crate::detect_project::detect_project_info;
 use crate::run_tests::{run_command_with_timeout, truncate_output};
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -88,7 +88,12 @@ impl Tool for RunLintsTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: RunLintsInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::InvalidInput,
+                    format!("Invalid input: {}", e),
+                )
+            }
         };
 
         let project_root = params
@@ -104,7 +109,8 @@ impl Tool for RunLintsTool {
                 match info.lint_commands.first() {
                     Some(c) => c.clone(),
                     None => {
-                        return ToolResult::error(
+                        return ToolResult::error_with_code(
+                            ToolErrorCode::ExecutionFailed,
                             "No lint command detected for this project. Pass an explicit \
                              `command` (e.g. \"cargo clippy -- -D warnings\").",
                         )
@@ -126,7 +132,7 @@ impl Tool for RunLintsTool {
             std::path::PathBuf::from(&command),
             false,
         ) {
-            return ToolResult::error(e.to_string());
+            return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }
 
         debug!(command = %command, root = %project_root.display(), "Running lints");
@@ -139,18 +145,27 @@ impl Tool for RunLintsTool {
 
         match exit_code {
             Some(0) => ToolResult::success(format!("Lints passed ({}).\n{}", command, truncated)),
-            Some(code) => ToolResult::error(format!(
-                "Lint issues found — '{}' exited with code {}\n{}",
-                command, code, truncated
-            )),
+            Some(code) => ToolResult::error_with_code(
+                ToolErrorCode::LintFailed,
+                format!(
+                    "Lint issues found — '{}' exited with code {}\n{}",
+                    command, code, truncated
+                ),
+            ),
             None => {
                 if timed_out {
-                    ToolResult::error(format!(
-                        "'{}' timed out after {}s\n{}",
-                        command, timeout_secs, truncated
-                    ))
+                    ToolResult::error_with_code(
+                        ToolErrorCode::Timeout,
+                        format!(
+                            "'{}' timed out after {}s\n{}",
+                            command, timeout_secs, truncated
+                        ),
+                    )
                 } else {
-                    ToolResult::error(format!("'{}' could not be run.\n{}", command, truncated))
+                    ToolResult::error_with_code(
+                        ToolErrorCode::ExecutionFailed,
+                        format!("'{}' could not be run.\n{}", command, truncated),
+                    )
                 }
             }
         }
@@ -195,6 +210,7 @@ mod tests {
             res.content
         );
         assert!(res.content.contains("warning"));
+        assert_eq!(res.error_code, Some(ToolErrorCode::LintFailed));
     }
     #[test]
     fn split_command_reused_from_run_tests() {
