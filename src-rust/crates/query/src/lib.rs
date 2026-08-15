@@ -2190,14 +2190,12 @@ pub async fn run_query_loop(
                             // retried instantly, burning the whole budget on a
                             // still-warm window — the observed failure mode in
                             // the 2026-08-14 measurement series (groq 59s
-                            // windows, 5/6 trials rate-limited). Capped at 120s
-                            // and cancellable.
-                            if let clawde_api::ProviderError::RateLimited {
-                                retry_after: Some(secs),
-                                ..
-                            } = &err
-                            {
-                                let wait = (*secs).min(120);
+                            // windows, 5/6 trials rate-limited). The backoff
+                            // computation is centralized in
+                            // decide::rate_limit_backoff_secs (capped at 120s,
+                            // cancellable; a fixed 5s floor when the provider
+                            // omits retry_after — the common 429 shape).
+                            if let Some(wait) = crate::decide::rate_limit_backoff_secs(&err) {
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx.send(QueryEvent::Status(format!(
                                         "Rate limited — waiting {wait}s before retrying ({} left)…",

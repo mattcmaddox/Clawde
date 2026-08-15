@@ -213,6 +213,35 @@ pub fn classify_provider_error(err: &ProviderError) -> OrchestrationError {
     }
 }
 
+/// Maximum wait honored for a provider-stated `retry_after` (seconds).
+/// Matches the cap the query loop historically applied to rate-limit sleeps.
+pub const MAX_RATE_LIMIT_BACKOFF_SECS: u64 = 120;
+
+/// Default backoff when a rate-limited error omits `retry_after` (seconds).
+/// The generic HTTP 429 path and free-chain timeouts both produce
+/// `RateLimited { retry_after: None }`, so this — not the provider-stated
+/// value — is the common case. A short fixed floor beats an instant retry
+/// that burns the whole budget on a still-warm window.
+pub const DEFAULT_RATE_LIMIT_BACKOFF_SECS: u64 = 5;
+
+/// How long to wait before retrying a provider error, if a backoff applies.
+///
+/// - `RateLimited` with a stated `retry_after` → the stated value, capped at
+///   [`MAX_RATE_LIMIT_BACKOFF_SECS`].
+/// - `RateLimited` without one → [`DEFAULT_RATE_LIMIT_BACKOFF_SECS`].
+/// - Any other error → `None` (no backoff; the caller retries or escalates
+///   immediately per `decide_recover`).
+pub fn rate_limit_backoff_secs(err: &ProviderError) -> Option<u64> {
+    match err {
+        ProviderError::RateLimited {
+            retry_after: Some(secs),
+            ..
+        } => Some((*secs).min(MAX_RATE_LIMIT_BACKOFF_SECS)),
+        ProviderError::RateLimited { .. } => Some(DEFAULT_RATE_LIMIT_BACKOFF_SECS),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 4. decide_commit — bool
 // ---------------------------------------------------------------------------/// Never auto-commit. Returns true only on an explicit user commit
@@ -732,6 +761,73 @@ mod tests {
             decide_recover(classify_provider_error(&err), 0, None),
             Recovery::GiveUp
         );
+    }
+
+    // ---- rate_limit_backoff_secs ----------------------------------------
+
+    #[test]
+    fn backoff_honors_provider_stated_retry_after() {
+        let err = ProviderError::RateLimited {
+            provider: pid(),
+            retry_after: Some(59),
+        };
+        assert_eq!(rate_limit_backoff_secs(&err), Some(59));
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        let err = ProviderError::RateLimited {
+            provider: pid(),
+            retry_after: Some(500),
+        };
+        assert_eq!(
+            rate_limit_backoff_secs(&err),
+            Some(MAX_RATE_LIMIT_BACKOFF_SECS)
+        );
+        assert_eq!(MAX_RATE_LIMIT_BACKOFF_SECS, 120);
+    }
+
+    #[test]
+    fn backoff_defaults_when_retry_after_missing() {
+        // The common shape: generic HTTP 429 and free-chain timeouts emit
+        // retry_after: None. Must not retry instantly.
+        let err = ProviderError::RateLimited {
+            provider: pid(),
+            retry_after: None,
+        };
+        assert_eq!(
+            rate_limit_backoff_secs(&err),
+            Some(DEFAULT_RATE_LIMIT_BACKOFF_SECS)
+        );
+    }
+
+    #[test]
+    fn backoff_none_for_non_rate_limit_errors() {
+        use ProviderError as Pe;
+        for err in [
+            Pe::StreamError {
+                provider: pid(),
+                message: "mid-stream".into(),
+                partial_response: None,
+            },
+            Pe::ServerError {
+                provider: pid(),
+                status: Some(503),
+                message: "busy".into(),
+                is_retryable: true,
+            },
+            Pe::AuthFailed {
+                provider: pid(),
+                message: "401".into(),
+            },
+            Pe::ContextOverflow {
+                provider: pid(),
+                message: "big".into(),
+                max_tokens: Some(8192),
+            },
+        ] {
+            assert_eq!(rate_limit_backoff_secs(&err), None, "{err:?}");
+        }
     }
 
     // ---- decide_adversarial ---------------------------------------------
