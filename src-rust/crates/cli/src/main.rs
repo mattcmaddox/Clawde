@@ -3908,6 +3908,8 @@ async fn run_interactive(
                                     // reload_provider_runtime_state block there.
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    base_query_config.network_blocked =
+                                        clawde_core::network_isolation_enabled(&cmd_ctx.config);
                                     app.config = applied_cfg.clone();
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
@@ -3941,6 +3943,8 @@ async fn run_interactive(
                                         routing_strategy_changed(&cmd_ctx.config, &applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    base_query_config.network_blocked =
+                                        clawde_core::network_isolation_enabled(&cmd_ctx.config);
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -4374,6 +4378,8 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let mut ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
+                        qcfg.network_blocked =
+                            clawde_core::network_isolation_enabled(&cmd_ctx.config);
                         qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                         qcfg.model = clawde_api::effective_model_for_config(
                             &cmd_ctx.config,
@@ -4560,6 +4566,8 @@ async fn run_interactive(
                         );
                     }
                     tool_ctx.config = app.config.clone();
+                    base_query_config.network_blocked =
+                        clawde_core::network_isolation_enabled(&cmd_ctx.config);
                     // The task-routing dialog (/routing edit) writes pins and
                     // flips the strategy directly into app.config; rebuild the
                     // provider registry in place so it applies immediately
@@ -4895,6 +4903,7 @@ async fn run_interactive(
                 let tools_arc_clone = tools_arc.clone();
                 let ctx_clone = tool_ctx.clone();
                 let mut qcfg = base_query_config.clone();
+                qcfg.network_blocked = clawde_core::network_isolation_enabled(&cmd_ctx.config);
                 qcfg.model =
                     clawde_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
@@ -5050,6 +5059,8 @@ async fn run_interactive(
                         let tools_arc_clone = tools_arc.clone();
                         let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
+                        qcfg.network_blocked =
+                            clawde_core::network_isolation_enabled(&cmd_ctx.config);
                         qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                         qcfg.model = clawde_api::effective_model_for_config(
                             &cmd_ctx.config,
@@ -5188,6 +5199,7 @@ async fn run_interactive(
                 let tools_arc_clone = tools_arc.clone();
                 let ctx_clone = tool_ctx.clone();
                 let mut qcfg = base_query_config.clone();
+                qcfg.network_blocked = clawde_core::network_isolation_enabled(&cmd_ctx.config);
                 qcfg.continuation = derive_continuation_mode(&cmd_ctx.config);
                 qcfg.model =
                     clawde_api::effective_model_for_config(&cmd_ctx.config, &model_registry);

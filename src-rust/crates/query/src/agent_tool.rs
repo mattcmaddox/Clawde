@@ -137,7 +137,7 @@ fn build_agent_tools_for_config(
     exclude_agent_tool: bool,
     config: &clawde_core::config::Config,
 ) -> Vec<Box<dyn Tool>> {
-    let network_blocked = config.resolve_ollama_mode() == clawde_core::config::OllamaMode::Isolated;
+    let network_blocked = clawde_core::network_isolation_enabled(config);
     clawde_tools_for_network_mode(allowed, exclude_agent_tool, network_blocked)
 }
 
@@ -1198,9 +1198,7 @@ impl Tool for AgentTool {
         // validated free-mode or remote-Ollama request contract; matching JSON
         // from an ordinary AgentTool is insufficient.
         if !(self.semantic_internal && semantic_agent_network_allowed(&params, ctx)) {
-            let config_isolated =
-                ctx.config.resolve_ollama_mode() == clawde_core::config::OllamaMode::Isolated;
-            if config_isolated || clawde_core::is_ollama_network_blocked() {
+            if clawde_core::network_isolation_enabled(&ctx.config) {
                 return ToolResult::error(format!(
                     "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
                     self.name()
@@ -1350,6 +1348,7 @@ impl Tool for AgentTool {
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
+            network_blocked: clawde_core::network_isolation_enabled(&ctx.config),
             thinking_budget: None,
             memory_max_tokens: None,
             memory_enabled: None,
@@ -1395,7 +1394,7 @@ impl Tool for AgentTool {
             let _ = clawde_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
-            let agent_tools_bg = build_agent_tools(None, true);
+            let agent_tools_bg = build_agent_tools_for_config(None, true, &ctx.config);
 
             let client_bg = client.clone();
             let ctx_bg = ctx.clone();
@@ -1600,7 +1599,7 @@ pub fn init_team_swarm_runner() {
                 let model_registry = Arc::new(build_model_registry());
 
                 // Build the tool list, filtering to the allowlist if provided.
-                let agent_tools = build_agent_tools(tools.as_deref(), true);
+                let agent_tools = build_agent_tools_for_config(tools.as_deref(), true, &ctx.config);
 
                 let model = resolve_subagent_model(
                     &AgentInput {
@@ -1759,6 +1758,25 @@ mod tests {
             tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
             allowed.iter().map(String::as_str).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn config_only_isolation_filters_subagent_network_tools() {
+        let mut config = clawde_core::config::Config::default();
+        config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let tools = build_agent_tools_for_config(None, true, &config);
+        assert!(tools.iter().any(|tool| tool.name() == "RunTests"));
+        assert!(tools.iter().any(|tool| tool.name() == "RunLints"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+        assert!(!tools.iter().any(|tool| tool.name() == "WebFetch"));
     }
 
     #[test]

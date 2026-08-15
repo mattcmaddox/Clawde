@@ -134,11 +134,9 @@ impl Tool for RunLintsTool {
         };
 
         // Execute-level permission: show the command in the permission dialog.
-        // Prefer the session config, while retaining the process-global toggle
-        // as a compatibility fallback for `/ollama` sessions that have not yet
-        // rebuilt their runtime config.
-        let isolated = ctx.config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated
-            || clawde_core::is_ollama_network_blocked();
+        // Read the session config so one runtime's `/ollama` toggle cannot
+        // change another session's lint policy.
+        let isolated = clawde_core::network_isolation_enabled(&ctx.config);
         if isolated {
             if !is_local_lint_command(&command) {
                 return ToolResult::error_with_code(

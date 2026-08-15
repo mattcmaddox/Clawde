@@ -535,7 +535,7 @@ impl ToolContext {
         tool_name: &str,
         network_capable: bool,
     ) -> Result<(), clawde_core::error::ClaudeError> {
-        if clawde_core::is_ollama_network_blocked() && network_capable {
+        if clawde_core::network_isolation_enabled(&self.config) && network_capable {
             return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
                 "Tool '{}' is unavailable in Ollama offline mode: network-capable tools are disabled.",
                 tool_name
@@ -1185,6 +1185,29 @@ mod tests {
             PermissionDecision::Deny,
         ));
         assert!(store.lock().waiting.is_empty());
+    }
+
+    #[test]
+    fn config_only_isolation_blocks_permission_backstop_network_tools() {
+        let mut ctx = test_tool_context(Arc::new(AskPermissionHandler {
+            reason: "should not reach permission handler".to_string(),
+        }));
+        ctx.config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+
+        let error = ctx
+            .ensure_network_allowed_for_tool("WebFetch", true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("offline mode"));
+        assert!(error.contains("WebFetch"));
     }
 
     #[test]

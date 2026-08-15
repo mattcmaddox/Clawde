@@ -48,6 +48,12 @@ pub fn is_local_test_command(command: &str) -> bool {
     clawde_core::bash_classifier::is_direct_test_command(command)
 }
 
+/// Resolve the offline mode for this session from its session-scoped config.
+/// Live `/ollama` toggles update that config before the next turn.
+fn is_network_isolated(ctx: &ToolContext) -> bool {
+    clawde_core::network_isolation_enabled(&ctx.config)
+}
+
 #[derive(Debug, Clone)]
 enum NetworkIsolationBackend {
     Bubblewrap(std::path::PathBuf),
@@ -375,7 +381,7 @@ impl Tool for RunTestsTool {
         };
 
         // Execute-level permission: show the command in the permission dialog.
-        let isolated = clawde_core::is_ollama_network_blocked();
+        let isolated = is_network_isolated(ctx);
         if isolated {
             if !is_local_test_command(&command) {
                 return ToolResult::error_with_code(
@@ -526,6 +532,33 @@ mod tests {
     fn run_tests_is_retained_for_isolated_mode_but_remains_network_capable() {
         assert!(RunTestsTool.available_in_ollama_isolated_mode());
         assert!(RunTestsTool.network_capable());
+    }
+
+    #[tokio::test]
+    async fn config_isolation_blocks_non_direct_test_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        ctx.config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+
+        let result = RunTestsTool
+            .execute(json!({"command": "sh -c 'echo should-not-run'"}), &ctx)
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.error_code,
+            Some(ToolErrorCode::NetworkIsolationBlocked)
+        );
+        assert!(result.content.contains("direct local test command"));
+        assert!(!result.content.contains("should-not-run"));
     }
 
     #[cfg(target_os = "linux")]

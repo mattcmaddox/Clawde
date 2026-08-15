@@ -182,7 +182,9 @@ pub(crate) async fn execute_tool_for_task(
             // Isolated Ollama mode is a hard boundary for outbound tools. Keep
             // this before the permission handler so bypass/allow rules cannot
             // turn an offline session back into an online one.
-            if clawde_core::is_ollama_network_blocked() && unavailable_in_isolated_mode(tool) {
+            if clawde_core::network_isolation_enabled(&ctx.config)
+                && unavailable_in_isolated_mode(tool)
+            {
                 warn!(tool = tool.name(), "Tool blocked by isolated Ollama mode");
                 return ToolResult::error_with_code(
                     ToolErrorCode::NetworkIsolationBlocked,
@@ -221,7 +223,7 @@ pub(crate) async fn execute_tool_for_task(
             warn!(tool = requested_name, "Unknown or inactive tool requested");
             let hint = tool_name_hint(requested_name, tools);
             let registered_tool = clawde_tools::find_tool(requested_name);
-            if clawde_core::is_ollama_network_blocked()
+            if clawde_core::network_isolation_enabled(&ctx.config)
                 && registered_tool
                     .as_deref()
                     .is_some_and(unavailable_in_isolated_mode)
@@ -995,6 +997,28 @@ mod tests {
         assert!(message.contains("Ollama offline mode"));
         assert!(message.contains("network-capable"));
         assert!(message.contains("RunTests"));
+    }
+
+    #[tokio::test]
+    async fn config_only_isolation_blocks_inactive_network_tool() {
+        let mut ctx = test_context();
+        ctx.config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), serde_json::json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(clawde_tools::ToolSearchTool)];
+        let result = execute_tool("Bash", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert_eq!(
+            result.error_code,
+            Some(ToolErrorCode::NetworkIsolationBlocked)
+        );
+        assert!(result.content.contains("Ollama offline mode"));
     }
 
     #[tokio::test]

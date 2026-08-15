@@ -3698,12 +3698,25 @@ impl App {
                     OllamaMode::Auto => OllamaMode::Isolated,
                     OllamaMode::Isolated => OllamaMode::Auto,
                 };
+                let mode_val = match next {
+                    OllamaMode::Auto => "auto",
+                    OllamaMode::Isolated => "isolated",
+                };
+                // Update the live session config before persisting. The CLI
+                // copies App.config into ToolContext before the next turn;
+                // without this, the global flag would be the only live signal
+                // and could leak one session's isolation state into another.
+                self.config
+                    .provider_configs
+                    .entry("ollama".to_string())
+                    .or_default()
+                    .options
+                    .insert(
+                        "mode".to_string(),
+                        serde_json::Value::String(mode_val.to_string()),
+                    );
                 // Persist to settings so the choice survives restarts.
                 if let Ok(mut settings) = Settings::load_sync() {
-                    let mode_val = match next {
-                        OllamaMode::Auto => "auto",
-                        OllamaMode::Isolated => "isolated",
-                    };
                     settings
                         .providers
                         .entry("ollama".to_string())
@@ -12123,6 +12136,28 @@ mod tests {
                 .unwrap_or(false),
             "/model must store the selection as ollama/<model>"
         );
+    }
+
+    #[test]
+    fn ollama_toggle_updates_live_session_config() {
+        let _home = TestHome::acquire();
+        let was_blocked = clawde_core::is_ollama_network_blocked();
+        let mut app = make_app();
+        assert_eq!(
+            app.config.resolve_ollama_mode(),
+            clawde_core::OllamaMode::Auto
+        );
+        assert!(app.intercept_slash_command("ollama"));
+        assert_eq!(
+            app.config.resolve_ollama_mode(),
+            clawde_core::OllamaMode::Isolated
+        );
+        assert!(app.intercept_slash_command("ollama"));
+        assert_eq!(
+            app.config.resolve_ollama_mode(),
+            clawde_core::OllamaMode::Auto
+        );
+        clawde_core::set_ollama_network_blocked(was_blocked);
     }
 
     #[test]

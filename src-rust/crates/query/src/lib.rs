@@ -119,6 +119,9 @@ pub struct QueryConfig {
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
+    /// Effective session network isolation snapshot used by prompt assembly.
+    /// Refreshed from the live session config before each query turn.
+    pub network_blocked: bool,
     /// Optional cap (tokens) on the `<memory>` block injected into the system
     /// prompt (audit spec §18.3). Copied from `Config::memory.max_tokens`.
     pub memory_max_tokens: Option<u32>,
@@ -217,6 +220,7 @@ impl Default for QueryConfig {
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            network_blocked: false,
             thinking_budget: None,
             memory_max_tokens: None,
             memory_enabled: None,
@@ -249,6 +253,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
             managed_agents: cfg.managed_agents.clone(),
@@ -269,6 +274,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
             managed_agents: cfg.managed_agents.clone(),
@@ -3706,6 +3712,7 @@ mod tests {
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            network_blocked: false,
             memory_max_tokens: None,
             memory_enabled: None,
             thinking_budget: None,
@@ -3802,6 +3809,19 @@ mod tests {
                 text.contains(clawde_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
                 "Default prompt must contain the dynamic boundary marker"
             );
+        } else {
+            panic!("Expected SystemPrompt::Text");
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_uses_config_only_network_isolation() {
+        let mut cfg = make_config(None, None);
+        cfg.network_blocked = true;
+        let prompt = build_system_prompt(&cfg);
+        if let SystemPrompt::Text(text) = prompt {
+            assert!(text.contains("<offline_mode>"));
+            assert!(text.contains("Network tools"));
         } else {
             panic!("Expected SystemPrompt::Text");
         }

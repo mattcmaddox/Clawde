@@ -97,9 +97,10 @@ pub use key_ring::{KeyRing, KeyStatus};
 
 // Re-export commonly used types at the crate root
 pub use config::{
-    builtin_managed_agent_presets, default_agents, is_ollama_network_blocked, ollama_unload_models,
-    set_ollama_network_blocked, spawn_ollama_unload, strip_jsonc_comments, substitute_env_vars,
-    AcpServerConfig, AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    builtin_managed_agent_presets, default_agents, is_ollama_network_blocked,
+    network_isolation_enabled, ollama_unload_models, set_ollama_network_blocked,
+    spawn_ollama_unload, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
+    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaMode,
     OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, VerifyConfig,
     VerifySandbox,
@@ -991,6 +992,16 @@ pub mod config {
     /// (ollama is in isolated / offline mode).
     pub fn is_ollama_network_blocked() -> bool {
         OLLAMA_NETWORK_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolve network isolation for a session from its own configuration.
+    ///
+    /// Session code must use this instead of the process-global compatibility
+    /// flag: one TUI/ACP session must not change another session's tool policy.
+    /// Legacy APIs without a `Config` continue to use
+    /// [`is_ollama_network_blocked`] directly.
+    pub fn network_isolation_enabled(config: &Config) -> bool {
+        config.resolve_ollama_mode() == OllamaMode::Isolated
     }
 
     /// Fire-and-forget: unload all currently loaded Ollama models from VRAM.
