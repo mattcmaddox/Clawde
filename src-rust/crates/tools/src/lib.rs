@@ -982,9 +982,12 @@ mod tests {
     fn isolated_mode_exception_is_narrow_and_explicit() {
         let tools = all_tools();
         let run_tests = tools.iter().find(|tool| tool.name() == "RunTests").unwrap();
+        let run_lints = tools.iter().find(|tool| tool.name() == "RunLints").unwrap();
         let bash = tools.iter().find(|tool| tool.name() == "Bash").unwrap();
         assert!(run_tests.network_capable());
         assert!(run_tests.available_in_ollama_isolated_mode());
+        assert!(run_lints.network_capable());
+        assert!(run_lints.available_in_ollama_isolated_mode());
         assert!(bash.network_capable());
         assert!(!bash.available_in_ollama_isolated_mode());
     }

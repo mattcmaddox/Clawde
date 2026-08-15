@@ -983,8 +983,10 @@ mod tests {
     fn isolated_mode_blocks_arbitrary_shell_but_keeps_run_tests() {
         let bash = clawde_tools::find_tool("Bash").expect("Bash is registered");
         let run_tests = clawde_tools::find_tool("RunTests").expect("RunTests is registered");
+        let run_lints = clawde_tools::find_tool("RunLints").expect("RunLints is registered");
         assert!(unavailable_in_isolated_mode(bash.as_ref()));
         assert!(!unavailable_in_isolated_mode(run_tests.as_ref()));
+        assert!(!unavailable_in_isolated_mode(run_lints.as_ref()));
     }
 
     #[test]

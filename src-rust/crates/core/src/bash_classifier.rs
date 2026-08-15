@@ -135,6 +135,46 @@ pub fn is_direct_test_command(command: &str) -> bool {
     }
 }
 
+/// Return whether a command is a single, local lint/typecheck invocation that
+/// can run inside the isolated execution sandbox. This is deliberately separate
+/// from `is_direct_test_command`: lint tools have different entry points, but
+/// the same shell-composition and network restrictions apply.
+pub fn is_direct_lint_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n' | '\r'))
+    {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    match parts[0] {
+        "cargo" => matches!(parts.get(1), Some(&"check") | Some(&"clippy")),
+        "python" | "python3" | "python3.11" => {
+            matches!(parts.get(1), Some(&"-m"))
+                && matches!(
+                    parts.get(2),
+                    Some(&"ruff") | Some(&"mypy") | Some(&"pyright")
+                )
+        }
+        "ruff" | "mypy" | "pyright" | "eslint" | "biome" | "tsc" | "rubocop" | "swiftlint"
+        | "pylint" => true,
+        "npm" | "yarn" | "pnpm" | "bun" => {
+            parts.get(1) == Some(&"lint")
+                || (parts.get(1) == Some(&"run")
+                    && matches!(parts.get(2), Some(&"lint") | Some(&"typecheck")))
+        }
+        "go" => parts.get(1) == Some(&"vet"),
+        "dotnet" => parts.get(1) == Some(&"format"),
+        "mix" => parts.get(1) == Some(&"format"),
+        _ => false,
+    }
+}
+
 /// Classify a bash command string and return its risk level.
 ///
 /// The analysis is intentionally conservative: when in doubt, the higher risk
@@ -575,6 +615,31 @@ pub fn is_auto_approvable(command: &str, permission_mode: &PermissionMode) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_direct_lint_commands() {
+        for command in [
+            "cargo clippy --all-targets",
+            "cargo check --workspace",
+            "python3 -m ruff check .",
+            "ruff check .",
+            "npm run lint",
+            "pnpm run typecheck",
+            "go vet ./...",
+            "tsc --noEmit",
+        ] {
+            assert!(is_direct_lint_command(command), "should accept {command}");
+        }
+        for command in [
+            "sh -c 'cargo clippy'",
+            "cargo clippy; curl https://example.test",
+            "python3 -c 'run lint'",
+            "npm install",
+            "curl https://example.test",
+        ] {
+            assert!(!is_direct_lint_command(command), "should reject {command}");
+        }
+    }
 
     #[test]
     fn test_safe_commands() {

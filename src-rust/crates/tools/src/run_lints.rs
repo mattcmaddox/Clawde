@@ -9,7 +9,10 @@
 // `ctx.check_permission*` with an `Execute` permission level.
 
 use crate::detect_project::detect_project_info;
-use crate::run_tests::{run_command_with_timeout, truncate_output};
+use crate::run_tests::{
+    network_isolation_available, run_command_with_timeout, run_command_with_timeout_isolated,
+    truncate_output,
+};
 use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -36,6 +39,12 @@ fn default_timeout() -> u64 {
     300
 }
 
+/// Return whether a command is a direct local lint/typecheck invocation that
+/// can run inside the isolated execution sandbox.
+pub fn is_local_lint_command(command: &str) -> bool {
+    clawde_core::bash_classifier::is_direct_lint_command(command)
+}
+
 #[async_trait]
 impl Tool for RunLintsTool {
     // Gates itself: calls `ctx.check_permission_with_details_and_path` (Execute).
@@ -59,8 +68,13 @@ impl Tool for RunLintsTool {
     }
 
     fn network_capable(&self) -> bool {
-        // Explicit lint commands can install dependencies or make arbitrary
-        // outbound requests.
+        // The unrestricted form can install dependencies or make arbitrary
+        // outbound requests. The isolated form is retained only for validated
+        // direct lint/typecheck commands.
+        true
+    }
+
+    fn available_in_ollama_isolated_mode(&self) -> bool {
         true
     }
 
@@ -120,17 +134,47 @@ impl Tool for RunLintsTool {
         };
 
         // Execute-level permission: show the command in the permission dialog.
+        // Prefer the session config, while retaining the process-global toggle
+        // as a compatibility fallback for `/ollama` sessions that have not yet
+        // rebuilt their runtime config.
+        let isolated = ctx.config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated
+            || clawde_core::is_ollama_network_blocked();
+        if isolated {
+            if !is_local_lint_command(&command) {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkIsolationBlocked,
+                    "Ollama offline mode only permits a direct local lint/typecheck command "
+                        .to_string()
+                        + "(for example, `cargo clippy -- -D warnings`); shell wrappers and "
+                        + "arbitrary commands are blocked.",
+                );
+            }
+            if !network_isolation_available() {
+                return ToolResult::error_with_code(
+                    ToolErrorCode::NetworkSandboxUnavailable,
+                    "Cannot run local lint/typecheck commands in Ollama offline mode: no network "
+                        .to_string()
+                        + "namespace backend (bwrap or unshare) is available.",
+                );
+            }
+        }
         let desc = format!("[RunLints] {}", command);
         let details = format!(
-            "Runs the linter/typechecker for the project at {}",
-            project_root.display()
+            "Runs the linter/typechecker for the project at {}{}",
+            project_root.display(),
+            if isolated {
+                " inside a network-isolated local lint sandbox"
+            } else {
+                ""
+            }
         );
-        if let Err(e) = ctx.check_permission_with_details_and_path(
+        if let Err(e) = ctx.check_permission_with_details_and_path_for_capability(
             self.name(),
             &desc,
             &details,
             std::path::PathBuf::from(&command),
             false,
+            !isolated,
         ) {
             return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }
@@ -138,8 +182,11 @@ impl Tool for RunLintsTool {
         debug!(command = %command, root = %project_root.display(), "Running lints");
 
         let timeout_secs = params.timeout.clamp(1, 600);
-        let (output, exit_code, timed_out) =
-            run_command_with_timeout(&command, &project_root, timeout_secs).await;
+        let (output, exit_code, timed_out) = if isolated {
+            run_command_with_timeout_isolated(&command, &project_root, timeout_secs).await
+        } else {
+            run_command_with_timeout(&command, &project_root, timeout_secs).await
+        };
 
         let truncated = truncate_output(&output);
 
@@ -196,6 +243,55 @@ mod tests {
         assert!(res.content.contains("Lints passed"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn execute_direct_lint_in_isolated_sandbox() {
+        if !network_isolation_available() || which::which("cargo").is_err() {
+            eprintln!("skipping: isolated lint prerequisites unavailable");
+            return;
+        }
+        let clippy_available = std::process::Command::new("cargo")
+            .args(["clippy", "--version"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !clippy_available {
+            eprintln!("skipping: cargo clippy unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname=\"isolated-lint\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn answer() -> i32 { 42 }\n",
+        )
+        .unwrap();
+
+        let mut ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        ctx.config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                options: [("mode".to_string(), json!("isolated"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let result = RunLintsTool
+            .execute(
+                json!({"command": "cargo clippy --quiet", "timeout": 120}),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error, "isolated lint failed: {}", result.content);
+        assert!(result.content.contains("Lints passed"));
+    }
+
     #[tokio::test]
     async fn execute_with_explicit_command_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -212,6 +308,22 @@ mod tests {
         assert!(res.content.contains("warning"));
         assert_eq!(res.error_code, Some(ToolErrorCode::LintFailed));
     }
+    #[test]
+    fn isolated_lint_capability_is_narrow() {
+        assert!(RunLintsTool.available_in_ollama_isolated_mode());
+        assert!(RunLintsTool.network_capable());
+        for command in ["cargo clippy --all-targets", "python3 -m ruff check ."] {
+            assert!(is_local_lint_command(command), "should accept {command}");
+        }
+        for command in [
+            "sh -c 'cargo clippy'",
+            "npm install",
+            "cargo clippy; curl x",
+        ] {
+            assert!(!is_local_lint_command(command), "should reject {command}");
+        }
+    }
+
     #[test]
     fn split_command_reused_from_run_tests() {
         // The lint tool reuses the shared splitter — pin the contract.
