@@ -178,6 +178,25 @@ fn validate_semantic_tool_set(tools: &[Box<dyn Tool>], allowed: &[String]) -> Re
     Ok(())
 }
 
+/// Build the semantic verifier's exact read-only tool set for a session.
+///
+/// Callers that have a live session must use this config-aware entry point so
+/// the tool boundary cannot depend on process-global compatibility state.
+pub fn build_semantic_verifier_tools_for_config(
+    config: &clawde_core::config::Config,
+) -> Vec<Box<dyn Tool>> {
+    let allowed = semantic_verifier_tool_names();
+    let tools = build_agent_tools_for_config(Some(&allowed), true, config);
+    if validate_semantic_tool_set(&tools, &allowed).is_err() {
+        return Vec::new();
+    }
+    tools
+}
+
+/// Legacy semantic verifier builder for callers that have no session config.
+///
+/// Active runtime and diagnostics paths should use
+/// [`build_semantic_verifier_tools_for_config`] instead.
 pub fn build_semantic_verifier_tools() -> Vec<Box<dyn Tool>> {
     let allowed = semantic_verifier_tool_names();
     let tools = build_agent_tools(Some(&allowed), true);
@@ -1756,6 +1775,17 @@ mod tests {
         validate_semantic_tool_set(&tools, &allowed).expect("semantic tools must be safe");
         assert_eq!(
             tools.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+            allowed.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        // Keep the no-config compatibility entry point covered while ensuring
+        // active session callers use the explicit-config builder above.
+        let legacy_tools = build_semantic_verifier_tools();
+        assert_eq!(
+            legacy_tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
             allowed.iter().map(String::as_str).collect::<Vec<_>>()
         );
     }
