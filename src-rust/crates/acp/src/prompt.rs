@@ -50,6 +50,15 @@ pub async fn handle(
     // Reset the session's cancellation token for this new turn.
     let cancel = session.cancel_token.clone();
 
+    // Build per-session configuration. ACP additional directories are
+    // permission roots for this session only; never mutate the shared runtime
+    // config because multiple ACP sessions may run concurrently.
+    let mut session_config = runtime.config.clone();
+    session_config.project_dir = Some(session.cwd.clone());
+    session_config
+        .additional_dirs
+        .extend(session.additional_directories.iter().cloned());
+
     // Build per-session ToolContext.
     let permission_handler: Arc<dyn clawde_core::PermissionHandler> =
         Arc::new(AcpPermissionHandler);
@@ -63,9 +72,9 @@ pub async fn handle(
         current_turn: session.current_turn.clone(),
         non_interactive: false, // ACP routes permissions via the bridge
         mcp_manager: runtime.mcp_manager.clone(),
-        config: runtime.config.clone(),
+        config: session_config.clone(),
         provider_registry: Some(runtime.provider_registry.clone()),
-        managed_agent_config: runtime.config.managed_agents.clone(),
+        managed_agent_config: session_config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
         permission_manager: Some(runtime.permission_manager.clone()),
@@ -93,13 +102,16 @@ pub async fn handle(
         ev_rx,
     ));
 
-    // Run the query loop.
+    // Run the query loop with the session's working directory reflected in
+    // prompt/tool metadata as well as the ToolContext.
+    let mut query_config = runtime.query_config.clone();
+    query_config.working_directory = Some(session.cwd.display().to_string());
     let outcome = clawde_query::run_query_loop(
         runtime.api_client.as_ref(),
         &mut messages,
         runtime.tools.as_slice(),
         &tool_ctx,
-        &runtime.query_config,
+        &query_config,
         runtime.cost_tracker.clone(),
         Some(ev_tx),
         cancel,

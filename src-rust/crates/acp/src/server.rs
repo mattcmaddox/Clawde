@@ -1,5 +1,6 @@
 //! Top-level ACP request / notification dispatcher.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
@@ -154,16 +155,21 @@ impl AgentServer {
         self: &Arc<Self>,
         req: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
-        if !req.cwd.is_absolute() {
-            return Err(acp::Error::invalid_params().data(Some(
-                serde_json::json!({ "reason": "cwd must be absolute" }),
-            )));
+        if let Err(reason) = validate_session_directories(&req.cwd, &req.additional_directories) {
+            return Err(
+                acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+            );
         }
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        let state = SessionState::new(session_id.clone(), req.cwd.clone());
+        let state = SessionState::new(
+            session_id.clone(),
+            req.cwd.clone(),
+            req.additional_directories.clone(),
+        );
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
-        // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.
+        // v1: MCP routing remains runtime-scoped; filesystem roots are
+        // session-scoped and are applied by the prompt handler.
         if !req.mcp_servers.is_empty() {
             warn!(
                 count = req.mcp_servers.len(),
@@ -189,6 +195,41 @@ impl AgentServer {
             }
         };
         crate::prompt::handle(self.runtime.clone(), self.connection.clone(), session, req).await
+    }
+}
+
+fn validate_session_directories(cwd: &Path, additional: &[PathBuf]) -> Result<(), String> {
+    if !cwd.is_absolute() {
+        return Err("cwd must be absolute".to_string());
+    }
+    if let Some(path) = additional.iter().find(|path| !path.is_absolute()) {
+        return Err(format!(
+            "additional_directories must be absolute: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_session_directories;
+    use std::path::Path;
+
+    #[test]
+    fn session_directories_require_absolute_paths() {
+        assert!(validate_session_directories(Path::new("/workspace"), &[]).is_ok());
+        assert!(validate_session_directories(
+            Path::new("/workspace"),
+            &[Path::new("/shared").to_path_buf()]
+        )
+        .is_ok());
+        assert!(validate_session_directories(Path::new("workspace"), &[]).is_err());
+        assert!(validate_session_directories(
+            Path::new("/workspace"),
+            &[Path::new("shared").to_path_buf()]
+        )
+        .is_err());
     }
 }
 

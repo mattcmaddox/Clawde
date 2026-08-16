@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 pub struct SessionState {
     pub session_id: acp::SessionId,
     pub cwd: PathBuf,
+    /// Additional absolute roots granted by the ACP client for this session.
+    pub additional_directories: Vec<PathBuf>,
     pub messages: parking_lot::Mutex<Vec<Message>>,
     pub cancel_token: CancellationToken,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
@@ -22,10 +24,15 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(session_id: acp::SessionId, cwd: PathBuf) -> Arc<Self> {
+    pub fn new(
+        session_id: acp::SessionId,
+        cwd: PathBuf,
+        additional_directories: Vec<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
             cwd,
+            additional_directories,
             messages: parking_lot::Mutex::new(Vec::new()),
             cancel_token: CancellationToken::new(),
             pending_permissions: Arc::new(parking_lot::Mutex::new(
