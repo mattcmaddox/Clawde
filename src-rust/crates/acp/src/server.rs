@@ -143,7 +143,7 @@ impl AgentServer {
             .agent_capabilities(
                 acp::AgentCapabilities::new()
                     .load_session(false)
-                    .prompt_capabilities(acp::PromptCapabilities::new())
+                    .prompt_capabilities(acp::PromptCapabilities::new().image(true))
                     .mcp_capabilities(acp::McpCapabilities::new()),
             );
         response = response.agent_info(Some(agent_info));

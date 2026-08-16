@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
 use clawde_api::streaming::{AnthropicStreamEvent, ContentDelta};
-use clawde_core::types::Message;
+use clawde_core::types::{ContentBlock, ImageSource, Message};
 use clawde_query::{QueryEvent, QueryOutcome};
 use clawde_tools::ToolContext;
 use tokio::sync::mpsc;
@@ -33,17 +33,19 @@ pub async fn handle(
 ) -> Result<acp::PromptResponse, acp::Error> {
     // Convert prompt content blocks → a single user message in Clawde's
     // internal format.
-    let user_text = render_prompt_blocks(&params.prompt);
-    if user_text.trim().is_empty() {
+    let prompt_blocks = render_prompt_blocks(&params.prompt);
+    if prompt_blocks.is_empty() {
         return Err(acp::Error::invalid_params());
     }
 
-    // Append the user turn to the session transcript.
+    // Append the user turn to the session transcript, preserving supported
+    // image blocks so the provider can receive visual context instead of an
+    // apparently empty text-only prompt.
     let mut messages: Vec<Message> = {
         let guard = session.messages.lock();
         guard.clone()
     };
-    messages.push(Message::user(user_text));
+    messages.push(Message::user_blocks(prompt_blocks));
 
     // Reset the session's cancellation token for this new turn.
     let cancel = session.cancel_token.clone();
@@ -131,37 +133,72 @@ pub async fn handle(
     Ok(acp::PromptResponse::new(stop_reason))
 }
 
-/// Concatenate text from prompt content blocks. Image / Audio / embedded
-/// resources are dropped here (they require additional prompt capabilities
-/// which v1 does not advertise) but are tracked for telemetry.
-fn render_prompt_blocks(blocks: &[acp::ContentBlock]) -> String {
-    let mut parts: Vec<String> = Vec::new();
+/// Convert ACP prompt blocks into Clawde's provider-facing content blocks.
+///
+/// ACP images are base64 payloads (or URI-backed when data is empty), and the
+/// core/API message model already has a compatible image representation. Audio
+/// remains deliberately unsupported until the provider request path supports
+/// it end-to-end; it is not silently converted to text.
+fn render_prompt_blocks(blocks: &[acp::ContentBlock]) -> Vec<ContentBlock> {
+    let mut rendered = Vec::new();
     for block in blocks {
         match block {
-            acp::ContentBlock::Text(t) => parts.push(t.text.clone()),
-            acp::ContentBlock::ResourceLink(link) => {
-                parts.push(format!("[resource link: {}]", link.uri));
-            }
-            acp::ContentBlock::Resource(res) => {
-                // Best-effort: emit any embedded text.
-                let json = serde_json::to_value(res).unwrap_or_default();
-                if let Some(text) = json
-                    .get("resource")
-                    .and_then(|r| r.get("text"))
-                    .and_then(|t| t.as_str())
-                {
-                    parts.push(text.to_string());
+            acp::ContentBlock::Text(text) => {
+                if !text.text.is_empty() {
+                    rendered.push(ContentBlock::Text {
+                        text: text.text.clone(),
+                    });
                 }
             }
-            acp::ContentBlock::Image(_) | acp::ContentBlock::Audio(_) => {
-                warn!("ACP: ignoring multimedia content block (capability not advertised)");
+            acp::ContentBlock::ResourceLink(link) => rendered.push(ContentBlock::Text {
+                text: format!("[resource link: {}]", link.uri),
+            }),
+            acp::ContentBlock::Resource(resource) => {
+                // Preserve embedded text. Binary resources require a resolver;
+                // retain an explicit bounded marker instead of dropping context.
+                let json = serde_json::to_value(resource).unwrap_or_default();
+                if let Some(text) = json
+                    .get("resource")
+                    .and_then(|value| value.get("text"))
+                    .and_then(|value| value.as_str())
+                {
+                    rendered.push(ContentBlock::Text {
+                        text: text.to_string(),
+                    });
+                } else {
+                    rendered.push(ContentBlock::Text {
+                        text: "[embedded binary resource omitted]".to_string(),
+                    });
+                }
             }
-            _ => {
-                warn!("ACP: ignoring unknown content block variant");
+            acp::ContentBlock::Image(image) => {
+                let source = if !image.data.is_empty() {
+                    ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: Some(image.mime_type.clone()),
+                        data: Some(image.data.clone()),
+                        url: None,
+                    }
+                } else if let Some(uri) = image.uri.clone() {
+                    ImageSource {
+                        source_type: "url".to_string(),
+                        media_type: Some(image.mime_type.clone()),
+                        data: None,
+                        url: Some(uri),
+                    }
+                } else {
+                    warn!("ACP: dropping image with neither data nor URI");
+                    continue;
+                };
+                rendered.push(ContentBlock::Image { source });
             }
+            acp::ContentBlock::Audio(_) => {
+                warn!("ACP: ignoring audio content block (capability not advertised)");
+            }
+            _ => warn!("ACP: ignoring unknown content block variant"),
         }
     }
-    parts.join("\n\n")
+    rendered
 }
 
 /// Pump QueryEvents → `session/update` SessionNotifications.
@@ -295,6 +332,55 @@ async fn send_session_update(
         warn!(?e, "ACP: failed to send session/update");
     } else {
         debug!("ACP: sent session/update");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_prompt_blocks;
+    use agent_client_protocol_schema as acp;
+    use clawde_core::types::ContentBlock as CoreContentBlock;
+
+    #[test]
+    fn image_prompt_block_becomes_provider_image() {
+        let blocks = render_prompt_blocks(&[acp::ContentBlock::Image(acp::ImageContent::new(
+            "aGVsbG8=",
+            "image/png",
+        ))]);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            CoreContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type.as_deref(), Some("image/png"));
+                assert_eq!(source.data.as_deref(), Some("aGVsbG8="));
+                assert!(source.url.is_none());
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uri_image_prompt_block_preserves_url_source() {
+        let blocks = render_prompt_blocks(&[acp::ContentBlock::Image(
+            acp::ImageContent::new("", "image/jpeg").uri("https://example.test/image.jpg"),
+        )]);
+        match &blocks[0] {
+            CoreContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "url");
+                assert_eq!(
+                    source.url.as_deref(),
+                    Some("https://example.test/image.jpg")
+                );
+                assert!(source.data.is_none());
+            }
+            other => panic!("expected URL image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_text_does_not_create_a_prompt_block() {
+        let blocks = render_prompt_blocks(&[acp::ContentBlock::Text(acp::TextContent::new(""))]);
+        assert!(blocks.is_empty());
     }
 }
 
