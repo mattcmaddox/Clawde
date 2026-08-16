@@ -48,7 +48,7 @@ pub async fn handle(
     messages.push(Message::user_blocks(prompt_blocks));
 
     // Reset the session's cancellation token for this new turn.
-    let cancel = session.cancel_token.clone();
+    let cancel = session.current_cancel_token();
 
     // Build per-session configuration. ACP additional directories are
     // permission roots for this session only; never mutate the shared runtime

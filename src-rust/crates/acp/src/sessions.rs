@@ -17,7 +17,7 @@ pub struct SessionState {
     /// Additional absolute roots granted by the ACP client for this session.
     pub additional_directories: Vec<PathBuf>,
     pub messages: parking_lot::Mutex<Vec<Message>>,
-    pub cancel_token: CancellationToken,
+    cancel_token: parking_lot::Mutex<CancellationToken>,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     pub file_history: Arc<parking_lot::Mutex<clawde_core::file_history::FileHistory>>,
     pub current_turn: Arc<std::sync::atomic::AtomicUsize>,
@@ -34,7 +34,7 @@ impl SessionState {
             cwd,
             additional_directories,
             messages: parking_lot::Mutex::new(Vec::new()),
-            cancel_token: CancellationToken::new(),
+            cancel_token: parking_lot::Mutex::new(CancellationToken::new()),
             pending_permissions: Arc::new(parking_lot::Mutex::new(
                 PendingPermissionStore::default(),
             )),
@@ -43,6 +43,22 @@ impl SessionState {
             )),
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Snapshot the token for the current prompt turn.
+    pub fn current_cancel_token(&self) -> CancellationToken {
+        self.cancel_token.lock().clone()
+    }
+
+    /// Cancel the in-flight turn and replace its token for the next prompt.
+    pub fn cancel_current_turn(&self) {
+        let current = {
+            let mut token = self.cancel_token.lock();
+            let current = token.clone();
+            *token = CancellationToken::new();
+            current
+        };
+        current.cancel();
     }
 }
 
@@ -67,5 +83,29 @@ impl SessionRegistry {
 
     pub fn remove(&self, id: &acp::SessionId) -> Option<Arc<SessionState>> {
         self.inner.remove(id).map(|(_, v)| v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionState;
+    use agent_client_protocol_schema as acp;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cancelling_a_turn_rearms_the_next_turn_token() {
+        let session = SessionState::new(
+            acp::SessionId::new("test-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        let first = session.current_cancel_token();
+        assert!(!first.is_cancelled());
+
+        session.cancel_current_turn();
+
+        assert!(first.is_cancelled());
+        let next = session.current_cancel_token();
+        assert!(!next.is_cancelled());
     }
 }
