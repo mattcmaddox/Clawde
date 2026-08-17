@@ -549,9 +549,16 @@ impl GoogleProvider {
         if let Some(parts) = parts {
             for part in parts {
                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                    content_blocks.push(ContentBlock::Text {
-                        text: text.to_string(),
-                    });
+                    if part.get("thought").and_then(|thought| thought.as_bool()) == Some(true) {
+                        content_blocks.push(ContentBlock::Thinking {
+                            thinking: text.to_string(),
+                            signature: thought_signature_from_part(part).unwrap_or_default(),
+                        });
+                    } else {
+                        content_blocks.push(ContentBlock::Text {
+                            text: text.to_string(),
+                        });
+                    }
                 } else if let Some(fc) = part.get("functionCall") {
                     let name = fc
                         .get("name")
@@ -714,6 +721,9 @@ impl LlmProvider for GoogleProvider {
             let mut byte_stream = byte_stream;
             let text_block_index: usize = 0;
             let mut tool_block_index: usize = 1000;
+            let mut thinking_block_index: usize = 2000;
+            let mut open_thinking_blocks: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
             let mut open_tool_calls: std::collections::HashMap<usize, (usize, String, String)> =
                 std::collections::HashMap::new();
             let mut emitted_message_start = false;
@@ -811,10 +821,41 @@ impl LlmProvider for GoogleProvider {
                             if let Some(parts) = parts {
                                 for (part_idx, part) in parts.iter().enumerate() {
                                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                        yield Ok(StreamEvent::TextDelta {
-                                            index: text_block_index,
-                                            text: text.to_string(),
-                                        });
+                                        let is_thought = part
+                                            .get("thought")
+                                            .and_then(|thought| thought.as_bool())
+                                            == Some(true);
+                                        if is_thought {
+                                            let (index, is_new) = if let Some(index) =
+                                                open_thinking_blocks.get(&part_idx)
+                                            {
+                                                (*index, false)
+                                            } else {
+                                                let index = thinking_block_index;
+                                                thinking_block_index += 1;
+                                                open_thinking_blocks.insert(part_idx, index);
+                                                (index, true)
+                                            };
+                                            if is_new {
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index,
+                                                    content_block: ContentBlock::Thinking {
+                                                        thinking: String::new(),
+                                                        signature: thought_signature_from_part(part)
+                                                            .unwrap_or_default(),
+                                                    },
+                                                });
+                                            }
+                                            yield Ok(StreamEvent::ThinkingDelta {
+                                                index,
+                                                thinking: text.to_string(),
+                                            });
+                                        } else {
+                                            yield Ok(StreamEvent::TextDelta {
+                                                index: text_block_index,
+                                                text: text.to_string(),
+                                            });
+                                        }
                                     } else if let Some(fc) = part.get("functionCall") {
                                         let name = fc
                                             .get("name")
@@ -874,6 +915,15 @@ impl LlmProvider for GoogleProvider {
                                 yield Ok(StreamEvent::ContentBlockStop {
                                     index: text_block_index,
                                 });
+
+                                // Close thought blocks before tool call blocks.
+                                let mut thinking_indices: Vec<usize> =
+                                    open_thinking_blocks.values().copied().collect();
+                                thinking_indices.sort_unstable();
+                                for idx in thinking_indices {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: idx });
+                                }
+                                open_thinking_blocks.clear();
 
                                 // Close tool call blocks.
                                 let mut tool_indices: Vec<usize> =
@@ -1105,6 +1155,35 @@ mod tests {
         assert!(matches!(
             &parsed.content[1],
             ContentBlock::ToolUse { id, .. } if id == "call_search_2"
+        ));
+    }
+
+    #[test]
+    fn parse_response_body_maps_thought_parts_to_thinking_blocks() {
+        let provider = GoogleProvider::new("test".to_string());
+        let response = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [
+                        { "text": "internal plan", "thought": true },
+                        { "text": "visible answer" }
+                    ]
+                }
+            }],
+            "usageMetadata": {}
+        });
+
+        let parsed = provider
+            .parse_response_body(&response, "gemini-3-flash-preview")
+            .expect("parsed response");
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::Thinking { thinking, .. } if thinking == "internal plan"
+        ));
+        assert!(matches!(
+            &parsed.content[1],
+            ContentBlock::Text { text } if text == "visible answer"
         ));
     }
 

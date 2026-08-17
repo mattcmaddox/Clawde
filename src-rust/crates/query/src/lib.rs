@@ -475,6 +475,12 @@ fn effective_effort_for_turn(
     config_effort: Option<clawde_core::effort::EffortLevel>,
     messages: &[Message],
 ) -> Option<clawde_core::effort::EffortLevel> {
+    // An explicit off override must win over keyword activation as well as the
+    // persisted/provider defaults; otherwise a prompt containing "ultracode"
+    // would silently re-enable reasoning after `/thinking off`.
+    if config_effort == Some(clawde_core::effort::EffortLevel::None) {
+        return config_effort;
+    }
     if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
         if clawde_core::effort::text_triggers_ultracode(&last_user.get_all_text()) {
             return Some(clawde_core::effort::EffortLevel::Ultracode);
@@ -3952,6 +3958,73 @@ mod tests {
     }
 
     #[test]
+    fn test_build_provider_options_for_google_thinking_off() {
+        let options = build_provider_options(
+            "google",
+            "gemini-3-flash-preview",
+            Some(clawde_core::effort::EffortLevel::None),
+            None,
+            None,
+        );
+        assert_eq!(
+            options["thinkingConfig"]["includeThoughts"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            options["thinkingConfig"]["thinkingLevel"],
+            serde_json::json!("minimal")
+        );
+
+        let gemini_25 = build_provider_options(
+            "google",
+            "gemini-2.5-pro",
+            Some(clawde_core::effort::EffortLevel::None),
+            None,
+            None,
+        );
+        assert_eq!(
+            gemini_25["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            gemini_25["thinkingConfig"]["includeThoughts"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn test_build_provider_options_for_deepseek_thinking_modes() {
+        let disabled = build_provider_options(
+            "deepseek",
+            "deepseek-v4",
+            Some(clawde_core::effort::EffortLevel::None),
+            None,
+            None,
+        );
+        assert_eq!(disabled["thinking"]["type"], serde_json::json!("disabled"));
+        assert!(disabled.get("reasoningEffort").is_none());
+
+        let high = build_provider_options(
+            "deepseek",
+            "deepseek-v4",
+            Some(clawde_core::effort::EffortLevel::High),
+            Some(10_000),
+            None,
+        );
+        assert_eq!(high["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(high["reasoningEffort"], serde_json::json!("high"));
+
+        let max = build_provider_options(
+            "deepseek",
+            "deepseek-v4",
+            Some(clawde_core::effort::EffortLevel::Max),
+            None,
+            None,
+        );
+        assert_eq!(max["reasoningEffort"], serde_json::json!("max"));
+    }
+
+    #[test]
     fn test_build_provider_options_for_openrouter_gpt5() {
         let options = build_provider_options(
             "openrouter",
@@ -5269,6 +5342,15 @@ mod tests {
         assert_eq!(
             effective_effort_for_turn(Some(EffortLevel::Low), &msgs),
             Some(EffortLevel::Ultracode)
+        );
+    }
+
+    #[test]
+    fn explicit_off_beats_ultracode_keyword() {
+        let msgs = vec![Message::user("ultracode this task")];
+        assert_eq!(
+            effective_effort_for_turn(Some(clawde_core::effort::EffortLevel::None), &msgs),
+            Some(clawde_core::effort::EffortLevel::None)
         );
     }
 

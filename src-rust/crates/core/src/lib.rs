@@ -4781,6 +4781,12 @@ pub mod history {
         pub updated_at: chrono::DateTime<chrono::Utc>,
         pub messages: Vec<Message>,
         pub model: String,
+        /// Session-scoped reasoning override. `None` means inherit the
+        /// invocation/config/provider default; `Some(EffortLevel::None)`
+        /// explicitly disables reasoning where supported. Older session files
+        /// omit this field.
+        #[serde(default, rename = "effort", skip_serializing_if = "Option::is_none")]
+        pub effort: Option<crate::effort::EffortLevel>,
         pub title: Option<String>,
         pub working_dir: Option<String>,
         /// Tags for filtering / searching sessions.
@@ -4821,6 +4827,7 @@ pub mod history {
                 updated_at: now,
                 messages: vec![],
                 model,
+                effort: None,
                 title: None,
                 working_dir: None,
                 tags: vec![],
@@ -5002,6 +5009,7 @@ pub mod history {
             updated_at: now,
             messages: source.messages[..clamped_idx].to_vec(),
             model: source.model.clone(),
+            effort: source.effort,
             title: new_title
                 .map(|t| t.to_string())
                 .or_else(|| source.title.as_ref().map(|t| format!("{} (branch)", t))),

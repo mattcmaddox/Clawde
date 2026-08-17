@@ -1836,6 +1836,40 @@ fn normalize_provider_from_model(config: &mut Config) {
     }
 }
 
+/// Select the model's balanced native reasoning tier for `/thinking on`.
+///
+/// The model registry is authoritative when available: Gemini 2.5, for example,
+/// starts at `high`, while OpenAI reasoning models expose a lower `low`/`medium`
+/// tier. Models without native reasoning still receive the historical `medium`
+/// effort so temperature/prompt behavior remains consistent, but provider
+/// adapters must not emit thinking fields for them.
+fn default_thinking_effort(
+    config: &Config,
+    model_registry: &clawde_api::ModelRegistry,
+) -> clawde_core::effort::EffortLevel {
+    let provider = config.selected_provider_id();
+    let model = clawde_api::effective_model_for_config(config, model_registry);
+    let model_id = model
+        .strip_prefix(&format!("{provider}/"))
+        .unwrap_or(&model);
+
+    if !clawde_api::model_is_reasoning(provider, model_id, Some(model_registry)) {
+        return clawde_core::effort::EffortLevel::Medium;
+    }
+
+    let levels = clawde_api::supported_efforts(provider, model_id, Some(model_registry));
+    levels
+        .iter()
+        .copied()
+        .find(|level| *level == clawde_core::effort::EffortLevel::Medium)
+        .or_else(|| {
+            levels
+                .into_iter()
+                .find(|level| *level != clawde_core::effort::EffortLevel::None)
+        })
+        .unwrap_or(clawde_core::effort::EffortLevel::Medium)
+}
+
 /// Whether the free-mode routing strategy differs between two configs.
 ///
 /// Compares only `providers.free.options.routing.strategy` — task-preference
@@ -2286,7 +2320,18 @@ async fn run_headless(
     let cancel = CancellationToken::new();
     let client_clone = client.clone();
     let tool_ctx_clone = tool_ctx.clone();
-    let qcfg = query_config.clone();
+    let mut qcfg = query_config.clone();
+    if let Some(session) = resumed_session.as_ref() {
+        // A saved session override outranks invocation-level flags when a
+        // conversation crosses a process boundary.
+        qcfg.effort_level = session.effort;
+        qcfg.thinking_budget = session
+            .effort
+            .and_then(|level| level.thinking_budget_tokens());
+        if !session.model.is_empty() {
+            qcfg.model = session.model.clone();
+        }
+    }
     let tracker_clone = cost_tracker.clone();
     let event_tx_clone = event_tx.clone();
     let cancel_clone = cancel.clone();
@@ -2936,7 +2981,7 @@ async fn run_interactive(
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     // The TUI and query effort types are now the same canonical enum, so this is
     // a direct assignment.
-    if let Some(level) = base_query_config.effort_level {
+    if let Some(level) = session.effort.or(base_query_config.effort_level) {
         app.effort_level = level;
     }
     app.provider_registry = base_query_config.provider_registry.clone();
@@ -3254,7 +3299,7 @@ async fn run_interactive(
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
-    let mut current_effort: Option<clawde_core::effort::EffortLevel> = None;
+    let mut current_effort: Option<clawde_core::effort::EffortLevel> = session.effort;
 
     // Background update check: spawned once at startup; result delivered via channel.
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -3716,6 +3761,7 @@ async fn run_interactive(
                                         model,
                                         Some(tool_ctx.working_dir.display().to_string()),
                                     );
+                                    session.effort = current_effort;
                                     messages.clear();
                                     app.replace_messages(Vec::new());
                                     tool_ctx.session_id = session.id.clone();
@@ -3809,6 +3855,10 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
+                                    current_effort = session.effort;
+                                    if let Some(level) = current_effort {
+                                        app.effort_level = level;
+                                    }
                                     messages = session.messages.clone();
                                     app.replace_messages(messages.clone());
                                     cmd_ctx.config.model = Some(session.model.clone());
@@ -4136,16 +4186,18 @@ async fn run_interactive(
                                 Some(CommandResult::ThinkingChange(action)) => {
                                     match action {
                                         clawde_commands::ThinkingAction::On => {
-                                            // /thinking on creates a session override. Reuse
-                                            // the configured effort when it is enabled; an
-                                            // absent or explicit-off default falls back to the
-                                            // canonical balanced level.
-                                            let level = match base_query_config.effort_level {
-                                                Some(clawde_core::effort::EffortLevel::None)
-                                                | None => clawde_core::effort::EffortLevel::Medium,
-                                                Some(level) => level,
-                                            };
+                                            // /thinking on creates a session override at the
+                                            // active model's balanced native reasoning tier; a
+                                            // non-reasoning model falls back to the canonical
+                                            // balanced effort without emitting thinking fields.
+                                            let level = default_thinking_effort(
+                                                &cmd_ctx.config,
+                                                &model_registry,
+                                            );
                                             current_effort = Some(level);
+                                            session.effort = current_effort;
+                                            let _ =
+                                                clawde_core::history::save_session(&session).await;
                                             app.effort_level = level;
                                             app.status_message = Some(format!(
                                                 "Thinking enabled for this session at {} {}.",
@@ -4158,6 +4210,9 @@ async fn run_interactive(
                                             // distinguishable from an absent override.
                                             current_effort =
                                                 Some(clawde_core::effort::EffortLevel::None);
+                                            session.effort = current_effort;
+                                            let _ =
+                                                clawde_core::history::save_session(&session).await;
                                             app.effort_level =
                                                 clawde_core::effort::EffortLevel::None;
                                             app.status_message = Some(
@@ -4203,6 +4258,8 @@ async fn run_interactive(
                                     clawde_core::effort::EffortLevel::from_str(&cmd_args)
                                 {
                                     current_effort = Some(level);
+                                    session.effort = current_effort;
+                                    let _ = clawde_core::history::save_session(&session).await;
                                     app.effort_level = level;
                                     app.status_message = Some(format!(
                                         "Effort: {} {}",
@@ -4785,6 +4842,7 @@ async fn run_interactive(
                 match clawde_core::history::load_session(&session_id).await {
                     Ok(resumed_session) => {
                         session = resumed_session;
+                        current_effort = session.effort;
                         messages = session.messages.clone();
                         app.replace_messages(messages.clone());
                         cmd_ctx.config.model = Some(session.model.clone());
@@ -5015,6 +5073,10 @@ async fn run_interactive(
                 qcfg.model =
                     clawde_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                if let Some(level) = current_effort {
+                    qcfg.effort_level = Some(level);
+                    qcfg.thinking_budget = level.thinking_budget_tokens();
+                }
                 // Auto-compact is a maintenance turn, not a goal turn: never let
                 // it trigger in-loop goal continuation.
                 qcfg.continuation = clawde_query::ContinuationMode::Default;
@@ -5175,6 +5237,10 @@ async fn run_interactive(
                             &model_registry,
                         );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                            qcfg.thinking_budget = level.thinking_budget_tokens();
+                        }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -5312,6 +5378,10 @@ async fn run_interactive(
                 qcfg.model =
                     clawde_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                if let Some(level) = current_effort {
+                    qcfg.effort_level = Some(level);
+                    qcfg.thinking_budget = level.thinking_budget_tokens();
+                }
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();

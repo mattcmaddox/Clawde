@@ -139,7 +139,15 @@ pub(crate) fn build_provider_options(
 
     if provider_id == "google" && model_id.contains("gemini") {
         if model_id.contains("2.5") {
-            if let Some(budget) = thinking_budget {
+            if effort_level == Some(clawde_core::effort::EffortLevel::None) {
+                options.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({
+                        "includeThoughts": false,
+                        "thinkingBudget": 0,
+                    }),
+                );
+            } else if let Some(budget) = thinking_budget {
                 options.insert(
                     "thinkingConfig".to_string(),
                     serde_json::json!({
@@ -149,13 +157,52 @@ pub(crate) fn build_provider_options(
                 );
             }
         } else if model_id.contains("3.") || model_id.contains("gemini-3") {
+            let disabled = effort_level == Some(clawde_core::effort::EffortLevel::None);
             options.insert(
                 "thinkingConfig".to_string(),
                 serde_json::json!({
-                    "includeThoughts": true,
-                    "thinkingLevel": google_thinking_level_for_effort(effort_level),
+                    "includeThoughts": !disabled,
+                    "thinkingLevel": if disabled {
+                        "minimal"
+                    } else {
+                        google_thinking_level_for_effort(effort_level)
+                    },
                 }),
             );
+        }
+    }
+
+    // DeepSeek exposes thinking independently of the OpenAI GPT reasoning
+    // model families. Keep this mapping provider/model-specific so DeepSeek V4
+    // and reasoner/chat variants do not depend on an unrelated GPT-5 check.
+    if provider_id == "deepseek" {
+        match effort_level {
+            Some(clawde_core::effort::EffortLevel::None)
+            | Some(clawde_core::effort::EffortLevel::Low) => {
+                options.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({ "type": "disabled" }),
+                );
+            }
+            Some(clawde_core::effort::EffortLevel::XHigh)
+            | Some(clawde_core::effort::EffortLevel::Max)
+            | Some(clawde_core::effort::EffortLevel::Ultracode) => {
+                options.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({ "type": "enabled" }),
+                );
+                options.insert("reasoningEffort".to_string(), serde_json::json!("max"));
+            }
+            None
+            | Some(clawde_core::effort::EffortLevel::Minimal)
+            | Some(clawde_core::effort::EffortLevel::Medium)
+            | Some(clawde_core::effort::EffortLevel::High) => {
+                options.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({ "type": "enabled" }),
+                );
+                options.insert("reasoningEffort".to_string(), serde_json::json!("high"));
+            }
         }
     }
 
@@ -224,41 +271,6 @@ pub(crate) fn build_provider_options(
             && provider_id != "azure"
         {
             options.insert("textVerbosity".to_string(), serde_json::json!("low"));
-
-            // DeepSeek V4 thinking mode: map effort level to thinking/reasoning_effort params.
-            // DeepSeek docs: thinking={"type":"enabled/disabled"}, reasoning_effort="high"|"max"
-            // low/medium are mapped to "high" by the API; xhigh mapped to "max".
-            if provider_id == "deepseek" {
-                match effort_level {
-                    None
-                    | Some(clawde_core::effort::EffortLevel::Minimal)
-                    | Some(clawde_core::effort::EffortLevel::Medium)
-                    | Some(clawde_core::effort::EffortLevel::High) => {
-                        options.insert(
-                            "thinking".to_string(),
-                            serde_json::json!({"type": "enabled"}),
-                        );
-                        options.insert("reasoningEffort".to_string(), serde_json::json!("high"));
-                    }
-                    Some(clawde_core::effort::EffortLevel::XHigh)
-                    | Some(clawde_core::effort::EffortLevel::Max)
-                    | Some(clawde_core::effort::EffortLevel::Ultracode) => {
-                        options.insert(
-                            "thinking".to_string(),
-                            serde_json::json!({"type": "enabled"}),
-                        );
-                        options.insert("reasoningEffort".to_string(), serde_json::json!("max"));
-                    }
-                    // `none` and `low` both disable DeepSeek's thinking mode.
-                    Some(clawde_core::effort::EffortLevel::None)
-                    | Some(clawde_core::effort::EffortLevel::Low) => {
-                        options.insert(
-                            "thinking".to_string(),
-                            serde_json::json!({"type": "disabled"}),
-                        );
-                    }
-                }
-            }
         }
     }
 
