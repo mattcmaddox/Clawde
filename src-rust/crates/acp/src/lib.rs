@@ -362,6 +362,19 @@ mod bind_tests {
         )
         .is_ok());
     }
+
+    #[tokio::test]
+    async fn tcp_server_rejects_non_loopback_before_runtime_startup() {
+        let config = clawde_core::config::AcpServerConfig::default();
+        let error = super::run_acp_server_tcp(
+            "0.0.0.0:0",
+            Some(&config),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("non-loopback ACP bind must fail closed by default");
+        assert!(error.to_string().contains("refusing ACP non-loopback bind"));
+    }
 }
 
 /// Start an embedded ACP TCP server in a background tokio task if enabled in config.

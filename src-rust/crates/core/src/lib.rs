@@ -6124,6 +6124,28 @@ mod tests {
     // ---- Config tests -------------------------------------------------------
 
     #[test]
+    fn acp_server_non_loopback_opt_in_roundtrips() {
+        let default = crate::config::AcpServerConfig::default();
+        assert!(!default.allow_non_loopback);
+        assert_eq!(default.listen, "127.0.0.1:9876");
+
+        let camel: crate::config::AcpServerConfig =
+            serde_json::from_str(r#"{"listen":"0.0.0.0:9876","allowNonLoopback":true}"#)
+                .expect("parse camelCase ACP bind policy");
+        assert!(camel.allow_non_loopback);
+        assert_eq!(camel.listen, "0.0.0.0:9876");
+
+        let snake: crate::config::AcpServerConfig =
+            serde_json::from_str(r#"{"listen":"0.0.0.0:9876","allow_non_loopback":true}"#)
+                .expect("parse snake_case ACP bind policy alias");
+        assert!(snake.allow_non_loopback);
+
+        let json = serde_json::to_string(&camel).expect("serialize ACP bind policy");
+        assert!(json.contains("allowNonLoopback"));
+        assert!(json.contains("true"));
+    }
+
+    #[test]
     fn test_config_mouse_capture_defaults_on() {
         // Unset (None) must read as enabled to preserve historical behaviour.
         let cfg = crate::config::Config::default();
