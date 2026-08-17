@@ -29,5 +29,3 @@ agent-client-protocol-schema = { version = "0.13", default-features = false }
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
-thiserror = "1"
-url = "2"

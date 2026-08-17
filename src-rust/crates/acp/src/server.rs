@@ -222,9 +222,11 @@ fn validate_session_remote_server(
             name
         ));
     }
-    // Production mode: require HTTPS for non-localhost hosts.
+    // Production mode: require HTTPS for non-localhost hosts. The same
+    // policy is re-applied at connect time by the SSRF-aware client in
+    // clawde-mcp (pinned DNS + redirect validation).
     let production_mode = true;
-    if let Err(e) = crate::ssrf::validate_url(url, production_mode) {
+    if let Err(e) = clawde_mcp::ssrf::validate_url(url, production_mode) {
         return Err(format!(
             "session MCP {} server '{}' URL failed SSRF validation: {}",
             server_type, name, e

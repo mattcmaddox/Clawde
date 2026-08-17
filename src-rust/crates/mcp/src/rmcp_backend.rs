@@ -142,6 +142,20 @@ impl RmcpClientBackend {
         auth_token: Option<String>,
         protocol_version: rmcp_model::ProtocolVersion,
     ) -> anyhow::Result<Self> {
+        Self::connect_http_with_client(config, auth_token, protocol_version, None).await
+    }
+
+    /// Streamable HTTP connection using a caller-supplied reqwest client.
+    ///
+    /// Session connections pass an SSRF-hardened client (pinned DNS + redirect
+    /// validation); `None` falls back to rmcp's default client for trusted,
+    /// user-configured global servers.
+    pub async fn connect_http_with_client(
+        config: &clawde_core::config::McpServerConfig,
+        auth_token: Option<String>,
+        protocol_version: rmcp_model::ProtocolVersion,
+        client: Option<reqwest::Client>,
+    ) -> anyhow::Result<Self> {
         let endpoint = config
             .url
             .clone()
@@ -152,7 +166,10 @@ impl RmcpClientBackend {
             transport_config = transport_config.auth_header(token);
         }
 
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let transport = match client {
+            Some(client) => StreamableHttpClientTransport::with_client(client, transport_config),
+            None => StreamableHttpClientTransport::from_config(transport_config),
+        };
         let client_info = build_client_info(protocol_version);
         Self::connect_with_transport(config, transport, client_info, "http").await
     }
@@ -161,10 +178,22 @@ impl RmcpClientBackend {
         config: &clawde_core::config::McpServerConfig,
         auth_token: Option<String>,
     ) -> anyhow::Result<Self> {
+        Self::connect_legacy_sse_with_client(config, auth_token, None).await
+    }
+
+    /// Legacy SSE connection using a caller-supplied reqwest client.
+    ///
+    /// Session connections pass an SSRF-hardened client; `None` falls back to
+    /// a default client for trusted, user-configured global servers.
+    pub async fn connect_legacy_sse_with_client(
+        config: &clawde_core::config::McpServerConfig,
+        auth_token: Option<String>,
+        client: Option<reqwest::Client>,
+    ) -> anyhow::Result<Self> {
         // Legacy SSE servers still expose the real POST endpoint via
         // `event: endpoint`; keep a thin compatibility shim here and hand the
         // session and capability flow back to rmcp once connected.
-        let transport = LegacySseRmcpTransport::connect(config, auth_token).await?;
+        let transport = LegacySseRmcpTransport::connect(config, auth_token, client).await?;
         let client_info = build_client_info(rmcp_model::ProtocolVersion::V_2024_11_05);
         Self::connect_with_transport(config, transport, client_info, "sse").await
     }
@@ -236,12 +265,13 @@ impl LegacySseRmcpTransport {
     async fn connect(
         config: &clawde_core::config::McpServerConfig,
         auth_token: Option<String>,
+        client: Option<reqwest::Client>,
     ) -> anyhow::Result<Self> {
         let sse_url = config
             .url
             .clone()
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no URL configured", config.name))?;
-        let client = reqwest::Client::new();
+        let client = client.unwrap_or_else(reqwest::Client::new);
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let transport = Self {
             server_name: config.name.clone(),
@@ -923,6 +953,161 @@ mod tests {
             .expect("fetch test response")
     }
 
+    /// Minimal stateful streamable-HTTP MCP server. Serves up to 8 connections
+    /// and answers `initialize`, `notifications/initialized`, `tools/list`, and
+    /// `ping` so a real client can complete the handshake and discover tools.
+    async fn serve_mcp_http_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mcp http test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let request = read_http_request(&mut stream).await;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&request.body).unwrap_or(serde_json::Value::Null);
+                    let is_notification = value.get("id").map(|id| id.is_null()).unwrap_or(true);
+                    let response_body = json_rpc_response_for(&value);
+                    let response = if is_notification {
+                        format!(
+                            "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    /// Read an HTTP/1.1 request: headers plus the exact `Content-Length` body.
+    /// The body may not arrive in the first read on loopback, so keep reading
+    /// until the advertised byte count is consumed.
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> HttpRequest {
+        let mut buffer = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut tmp).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&tmp[..read]);
+            if let Some(pos) = find_header_end(&buffer) {
+                let header_text = String::from_utf8_lossy(&buffer[..pos]);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let body_start = pos + 4;
+                if buffer.len() >= body_start + content_length {
+                    return HttpRequest {
+                        body: String::from_utf8_lossy(
+                            &buffer[body_start..body_start + content_length],
+                        )
+                        .into_owned(),
+                    };
+                }
+            }
+        }
+        HttpRequest {
+            body: String::new(),
+        }
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    struct HttpRequest {
+        body: String,
+    }
+
+    fn json_rpc_response_for(value: &serde_json::Value) -> String {
+        let method = value.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        if id.is_null() {
+            return String::new();
+        }
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "test-mcp", "version": "1.0" },
+            }),
+            "tools/list" => serde_json::json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo tool",
+                    "inputSchema": { "type": "object", "properties": {} }
+                }]
+            }),
+            "ping" => serde_json::json!({}),
+            _ => serde_json::json!({}),
+        };
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+    }
+
+    #[tokio::test]
+    async fn session_http_connect_discovers_tools_through_hardened_client() {
+        let url = serve_mcp_http_server().await;
+        let config = McpServerConfig {
+            name: "local-http".to_string(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            server_type: "http".to_string(),
+            origin: Default::default(),
+        };
+        let manager = crate::McpManager::connect_session(&[config])
+            .await
+            .expect("session HTTP connect over localhost must succeed");
+        assert_eq!(manager.server_count(), 1);
+        let catalog = manager
+            .server_catalog("local-http")
+            .expect("catalog for connected server");
+        assert_eq!(catalog.tool_count, 1, "must discover the echo tool");
+    }
+
+    #[tokio::test]
+    async fn session_http_rejects_private_url_before_connecting() {
+        let config = McpServerConfig {
+            name: "private".to_string(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("https://192.168.1.1:8080/mcp".to_string()),
+            server_type: "http".to_string(),
+            origin: Default::default(),
+        };
+        let result = crate::McpManager::connect_session(&[config]).await;
+        let Err(error) = result else {
+            panic!("private URL must be rejected by SSRF policy");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("SSRF") || message.contains("blocked"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
     #[test]
     fn build_client_info_sets_expected_protocol_and_identity() {
         let info = build_client_info(rmcp_model::ProtocolVersion::V_2024_11_05);
@@ -950,7 +1135,7 @@ mod tests {
         let url = serve_single_response("200 OK", "text/event-stream", body).await;
         let config = test_sse_config(url.clone());
 
-        let transport = LegacySseRmcpTransport::connect(&config, None)
+        let transport = LegacySseRmcpTransport::connect(&config, None, None)
             .await
             .expect("connect legacy sse transport");
 

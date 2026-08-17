@@ -35,6 +35,7 @@ pub mod connection_manager;
 pub mod oauth;
 pub mod registry;
 pub mod rmcp_backend;
+pub mod ssrf;
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion
@@ -684,6 +685,86 @@ pub mod client {
             Ok(Self::from_backend(Arc::new(backend)))
         }
 
+        /// Connect an ACP-provided streamable HTTP server through an
+        /// SSRF-hardened client (pinned DNS + redirect validation).
+        pub async fn connect_http_session(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+        ) -> anyhow::Result<Self> {
+            let client = crate::ssrf::build_ssrf_aware_client(
+                config.url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("session MCP server '{}' has no URL", config.name)
+                })?,
+                true,
+            )?;
+            let mut last_error = None;
+            for &protocol_version in transport::STREAMABLE_HTTP_PROTOCOL_VERSIONS {
+                let protocol_version = serde_json::from_value::<rmcp::model::ProtocolVersion>(
+                    Value::String(protocol_version.to_string()),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': invalid streamable HTTP protocol version '{}': {}",
+                        config.name,
+                        protocol_version,
+                        e
+                    )
+                })?;
+                let protocol_version_label = protocol_version.as_str().to_string();
+                match crate::rmcp_backend::RmcpClientBackend::connect_http_with_client(
+                    config,
+                    auth_token.clone(),
+                    protocol_version,
+                    Some(client.clone()),
+                )
+                .await
+                {
+                    Ok(backend) => return Ok(Self::from_backend(Arc::new(backend))),
+                    Err(e) => {
+                        let message = e.to_string();
+                        if Self::is_unsupported_protocol_error(&message) {
+                            debug!(
+                                server = %config.name,
+                                protocol_version = %protocol_version_label,
+                                error = %message,
+                                "Streamable HTTP protocol version unsupported; trying fallback"
+                            );
+                            last_error = Some(e);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Err(last_error.unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "MCP server '{}': no supported streamable HTTP protocol version found",
+                    config.name
+                )
+            }))
+        }
+
+        /// Connect an ACP-provided legacy SSE server through an SSRF-hardened
+        /// client (pinned DNS + redirect validation).
+        pub async fn connect_sse_session(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+        ) -> anyhow::Result<Self> {
+            let client = crate::ssrf::build_ssrf_aware_client(
+                config.url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("session MCP server '{}' has no URL", config.name)
+                })?,
+                true,
+            )?;
+            let backend = crate::rmcp_backend::RmcpClientBackend::connect_legacy_sse_with_client(
+                config,
+                auth_token,
+                Some(client),
+            )
+            .await?;
+            Ok(Self::from_backend(Arc::new(backend)))
+        }
+
         /// Connect a client-provided stdio server with a scrubbed environment.
         /// The caller must provide an absolute executable path and explicit env.
         pub async fn connect_stdio_sandboxed(config: &McpServerConfig) -> anyhow::Result<Self> {
@@ -1101,9 +1182,15 @@ impl McpManager {
                     }
                 },
                 "http" | "sse" => {
-                    // Load auth token if available
+                    // Load auth token if available; the SSRF-hardened client is
+                    // built inside the session connect methods.
                     let auth_token = manager.load_token(&config.name).await;
-                    match client::McpClient::connect(config, auth_token).await {
+                    let result = if config.server_type == "sse" {
+                        client::McpClient::connect_sse_session(config, auth_token).await
+                    } else {
+                        client::McpClient::connect_http_session(config, auth_token).await
+                    };
+                    match result {
                         Ok(client) => {
                             info!(
                                 server = %config.name,
