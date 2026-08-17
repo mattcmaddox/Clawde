@@ -256,6 +256,7 @@ impl QueryConfig {
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
+            effort_level: cfg.default_effort,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
@@ -277,6 +278,7 @@ impl QueryConfig {
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
+            effort_level: cfg.default_effort,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }

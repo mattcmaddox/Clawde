@@ -1109,15 +1109,18 @@ async fn main() -> anyhow::Result<()> {
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
-    if let Some(ref level_str) = cli.effort {
-        if let Some(level) = clawde_core::effort::EffortLevel::from_str(level_str) {
-            query_config.effort_level = Some(level);
-        } else {
-            eprintln!(
-                "Warning: unknown effort level '{}' — expected low/medium/high/max",
-                level_str
-            );
-        }
+    // CLI effort is an invocation-scoped override over the persisted default.
+    let cli_effort_override = cli
+        .effort
+        .as_deref()
+        .and_then(clawde_core::effort::EffortLevel::from_str);
+    if let Some(level) = cli_effort_override {
+        query_config.effort_level = Some(level);
+    } else if let Some(level_str) = cli.effort.as_deref() {
+        eprintln!(
+            "Warning: unknown effort level '{}' — expected none/minimal/low/medium/high/xhigh/max/ultracode",
+            level_str
+        );
     }
     if let Some(usd) = cli.max_budget_usd {
         query_config.max_budget_usd = Some(usd);
@@ -1221,6 +1224,7 @@ async fn main() -> anyhow::Result<()> {
             tools,
             tool_ctx,
             query_config,
+            cli_effort_override,
             cost_tracker,
             cli.resume,
             bridge_config,
@@ -2799,6 +2803,7 @@ async fn run_interactive(
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     tool_ctx: ToolContext,
     query_config: clawde_query::QueryConfig,
+    cli_effort_override: Option<clawde_core::effort::EffortLevel>,
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
     bridge_config: Option<clawde_bridge::BridgeConfig>,
@@ -3990,6 +3995,14 @@ async fn run_interactive(
                                     // Sync auto-compact toggle (Gap 6: footer indicator in-session).
                                     app.auto_compact_enabled = applied_cfg.auto_compact;
                                     app.config = applied_cfg.clone();
+                                    // A persisted default applies immediately only when
+                                    // there is no invocation- or session-scoped override.
+                                    if cli_effort_override.is_none() && current_effort.is_none() {
+                                        base_query_config.effort_level = applied_cfg.default_effort;
+                                        app.effort_level = applied_cfg
+                                            .default_effort
+                                            .unwrap_or(clawde_core::effort::EffortLevel::Medium);
+                                    }
                                     session.model = clawde_api::effective_model_for_config(
                                         &cmd_ctx.config,
                                         &model_registry,
@@ -4119,6 +4132,61 @@ async fn run_interactive(
                                     )?;
                                     app.kitty_keyboard_active =
                                         clawde_tui::keyboard_enhancement_active();
+                                }
+                                Some(CommandResult::ThinkingChange(action)) => {
+                                    match action {
+                                        clawde_commands::ThinkingAction::On => {
+                                            // /thinking on creates a session override. Reuse
+                                            // the configured effort when it is enabled; an
+                                            // absent or explicit-off default falls back to the
+                                            // canonical balanced level.
+                                            let level = match base_query_config.effort_level {
+                                                Some(clawde_core::effort::EffortLevel::None)
+                                                | None => clawde_core::effort::EffortLevel::Medium,
+                                                Some(level) => level,
+                                            };
+                                            current_effort = Some(level);
+                                            app.effort_level = level;
+                                            app.status_message = Some(format!(
+                                                "Thinking enabled for this session at {} {}.",
+                                                level.symbol(),
+                                                level.label()
+                                            ));
+                                        }
+                                        clawde_commands::ThinkingAction::Off => {
+                                            // Explicit off is session-scoped and must remain
+                                            // distinguishable from an absent override.
+                                            current_effort =
+                                                Some(clawde_core::effort::EffortLevel::None);
+                                            app.effort_level =
+                                                clawde_core::effort::EffortLevel::None;
+                                            app.status_message = Some(
+                                                "Thinking disabled for this session where supported."
+                                                    .to_string(),
+                                            );
+                                        }
+                                        clawde_commands::ThinkingAction::Status => {
+                                            app.status_message =
+                                                Some(if let Some(level) = current_effort {
+                                                    format!(
+                                                    "Thinking effort: {} {} (session override).",
+                                                    level.symbol(),
+                                                    level.label()
+                                                )
+                                                } else if let Some(level) =
+                                                    base_query_config.effort_level
+                                                {
+                                                    format!(
+                                                    "Thinking effort: {} {} (persisted default).",
+                                                    level.symbol(),
+                                                    level.label()
+                                                )
+                                                } else {
+                                                    "Thinking effort: provider/model default."
+                                                        .to_string()
+                                                });
+                                        }
+                                    }
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
@@ -4431,6 +4499,10 @@ async fn run_interactive(
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
+                            // A session override must also override an invocation-level
+                            // --thinking budget; otherwise /thinking off would still
+                            // enable thinking through QueryConfig.thinking_budget.
+                            qcfg.thinking_budget = level.thinking_budget_tokens();
                         }
                         // Wire completion_notifier if a command queue is available.
                         if let Some(ref cq) = qcfg.command_queue {

@@ -1309,6 +1309,15 @@ pub mod config {
         pub api_key: Option<String>,
         pub model: Option<String>,
         pub max_tokens: Option<u32>,
+        /// Default reasoning effort for new sessions. A live session or CLI
+        /// override takes precedence over this persisted preference.
+        #[serde(
+            default,
+            rename = "defaultEffort",
+            alias = "default_effort",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub default_effort: Option<crate::effort::EffortLevel>,
         pub permission_mode: PermissionMode,
         pub theme: Theme,
         #[serde(default)]
@@ -2815,6 +2824,7 @@ pub mod config {
                 api_key: over.config.api_key.or(base.config.api_key),
                 model: over.config.model.or(base.config.model),
                 max_tokens: over.config.max_tokens.or(base.config.max_tokens),
+                default_effort: over.config.default_effort.or(base.config.default_effort),
                 permission_mode: over.config.permission_mode,
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
@@ -6185,6 +6195,27 @@ mod tests {
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mouse_capture, Some(false));
         assert!(!back.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_default_effort_serde_roundtrip() {
+        let cfg = crate::config::Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("defaultEffort"));
+
+        let cfg = crate::config::Config {
+            default_effort: Some(crate::effort::EffortLevel::High),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"defaultEffort\":\"high\""));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_effort, Some(crate::effort::EffortLevel::High));
+
+        // Older settings files without the field remain valid.
+        let old = r#"{"model":"claude-sonnet-4-6"}"#;
+        let back: crate::config::Config = serde_json::from_str(old).unwrap();
+        assert_eq!(back.default_effort, None);
     }
 
     #[test]

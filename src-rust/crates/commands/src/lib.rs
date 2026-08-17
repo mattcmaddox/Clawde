@@ -43,6 +43,17 @@ pub struct CommandContext {
     pub test_provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>>,
 }
 
+/// Session-scoped action requested by `/thinking`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingAction {
+    /// Enable reasoning for the current session using the configured/default level.
+    On,
+    /// Disable reasoning for the current session where the provider supports it.
+    Off,
+    /// Report the current session/default state without changing anything.
+    Status,
+}
+
 /// Result of running a slash command.
 #[derive(Debug)]
 pub enum CommandResult {
@@ -54,6 +65,8 @@ pub enum CommandResult {
     ConfigChange(Config),
     /// Modify the configuration and show a specific status message.
     ConfigChangeMessage(Config, String),
+    /// Change reasoning for the current session without persisting it.
+    ThinkingChange(ThinkingAction),
     /// Trigger a background MCP OAuth flow and request runtime reconnect on success.
     McpAuthFlow {
         /// The configured MCP server name.
@@ -1668,23 +1681,19 @@ impl SlashCommand for ThinkingCommand {
         vec!["think"]
     }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // Extended thinking is configured through the model; just inform the user
-        let model = ctx.config.effective_model();
-        if model.contains("claude-3-5") || model.contains("claude-3.5") {
-            CommandResult::Message(
-                "Extended thinking is not available for Claude 3.5 models.\n\
-                 Use claude-opus-4-6 or claude-sonnet-4-6 for extended thinking."
-                    .to_string(),
-            )
-        } else {
-            CommandResult::Message(format!(
-                "Extended thinking is available with {}.\n\
-                 You can request thinking by asking Clawde to 'think step by step' or \
-                 'think carefully before answering'.",
-                model
-            ))
-        }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let action = match args.trim().to_ascii_lowercase().as_str() {
+            "" => ThinkingAction::Status,
+            "on" | "enable" | "enabled" | "true" | "1" => ThinkingAction::On,
+            "off" | "disable" | "disabled" | "false" | "0" => ThinkingAction::Off,
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown argument '{}'. Use /thinking on, /thinking off, or /thinking.",
+                    other
+                ));
+            }
+        };
+        CommandResult::ThinkingChange(action)
     }
 }
 
@@ -3788,6 +3797,43 @@ mod tests {
             }
             other => panic!("Expected Error for unknown arg, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn thinking_command_returns_session_actions() {
+        let mut ctx = make_ctx();
+        let command = ThinkingCommand;
+
+        assert!(matches!(
+            command.execute("on", &mut ctx).await,
+            CommandResult::ThinkingChange(ThinkingAction::On)
+        ));
+        assert!(matches!(
+            command.execute("off", &mut ctx).await,
+            CommandResult::ThinkingChange(ThinkingAction::Off)
+        ));
+        assert!(matches!(
+            command.execute("", &mut ctx).await,
+            CommandResult::ThinkingChange(ThinkingAction::Status)
+        ));
+    }
+    #[tokio::test]
+    async fn thinking_command_rejects_unknown_arguments() {
+        let mut ctx = make_ctx();
+        let result = ThinkingCommand.execute("sometimes", &mut ctx).await;
+        assert!(
+            matches!(result, CommandResult::Error(message) if message.contains("/thinking on"))
+        );
+    }
+
+    #[tokio::test]
+    async fn config_command_reports_persisted_default_effort() {
+        let mut ctx = make_ctx();
+        ctx.config.default_effort = Some(clawde_core::effort::EffortLevel::High);
+        let result = ConfigCommand.execute("get default-effort", &mut ctx).await;
+        assert!(
+            matches!(result, CommandResult::Message(message) if message == "default-effort = high")
+        );
     }
 }
 // ---- arg_completions system tests ----------------------------------

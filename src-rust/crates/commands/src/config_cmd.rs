@@ -66,6 +66,11 @@ impl SlashCommand for ConfigCommand {
                     "Set permission mode (default, accept-edits, bypass-permissions, plan)".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "set default-effort".into(),
+                description: "Set the default reasoning effort".into(),
+                available: true,
+            });
         }
         if partial == "get" || partial.starts_with("get ") {
             completions.push(ArgCompletion {
@@ -88,6 +93,11 @@ impl SlashCommand for ConfigCommand {
                 description: "Show current permission mode".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "get default-effort".into(),
+                description: "Show the default reasoning effort".into(),
+                available: true,
+            });
         }
         if partial == "unset" || partial.starts_with("unset ") {
             completions.push(ArgCompletion {
@@ -100,6 +110,11 @@ impl SlashCommand for ConfigCommand {
                 description: "Reset output style to default".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "unset default-effort".into(),
+                description: "Use the provider/model default effort".into(),
+                available: true,
+            });
         }
         completions
     }
@@ -109,7 +124,7 @@ impl SlashCommand for ConfigCommand {
         if args.is_empty() || matches!(args, "show" | "get") {
             let json = serde_json::to_string_pretty(&ctx.config).unwrap_or_default();
             return CommandResult::Message(format!(
-                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <default|concise|explanatory|learning|formal|casual>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config unset <model|output-style>",
+                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <default|concise|explanatory|learning|formal|casual>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config set default-effort <none|minimal|low|medium|high|xhigh|max|ultracode>\n  /config unset <model|output-style|default-effort>",
                 json
             ));
         }
@@ -127,6 +142,13 @@ impl SlashCommand for ConfigCommand {
                 "permission-mode" | "permission_mode" => CommandResult::Message(format!(
                     "permission-mode = {:?}",
                     ctx.config.permission_mode
+                )),
+                "default-effort" | "default_effort" => CommandResult::Message(format!(
+                    "default-effort = {}",
+                    ctx.config
+                        .default_effort
+                        .map(|level| level.as_str())
+                        .unwrap_or("provider-default")
                 )),
                 other => CommandResult::Error(format!("Unknown config key '{}'", other)),
             };
@@ -164,6 +186,22 @@ impl SlashCommand for ConfigCommand {
                     CommandResult::ConfigChangeMessage(
                         new_config,
                         "Output style reset to default.".to_string(),
+                    )
+                }
+                "default-effort" | "default_effort" => {
+                    let mut new_config = ctx.config.clone();
+                    new_config.default_effort = None;
+                    if let Err(err) = save_settings_mutation(|settings| {
+                        settings.config.default_effort = None;
+                    }) {
+                        return CommandResult::Error(format!(
+                            "Failed to save configuration: {}",
+                            err
+                        ));
+                    }
+                    CommandResult::ConfigChangeMessage(
+                        new_config,
+                        "Default effort reset to the provider/model default.".to_string(),
                     )
                 }
                 other => CommandResult::Error(format!("Unknown config key '{}'", other)),
@@ -272,6 +310,28 @@ impl SlashCommand for ConfigCommand {
                 CommandResult::ConfigChangeMessage(
                     new_config,
                     format!("Permission mode set to {}.", value.trim().to_lowercase()),
+                )
+            }
+            "default-effort" | "default_effort" => {
+                let Some(level) = clawde_core::effort::EffortLevel::from_str(value) else {
+                    return CommandResult::Error(format!(
+                        "Unknown effort level '{}'. Use: none | minimal | low | medium | high | xhigh | max | ultracode",
+                        value
+                    ));
+                };
+                let mut new_config = ctx.config.clone();
+                new_config.default_effort = Some(level);
+                if let Err(err) = save_settings_mutation(|settings| {
+                    settings.config.default_effort = Some(level);
+                }) {
+                    return CommandResult::Error(format!("Failed to save configuration: {}", err));
+                }
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!(
+                        "Default effort set to {} for subsequent requests without a session override.",
+                        level.label()
+                    ),
                 )
             }
             other => CommandResult::Error(format!("Unknown config key '{}'", other)),
