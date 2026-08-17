@@ -101,11 +101,27 @@ impl RmcpClientBackend {
     pub async fn connect_stdio(
         config: &clawde_core::config::McpServerConfig,
     ) -> anyhow::Result<Self> {
+        Self::connect_stdio_with_env_policy(config, false).await
+    }
+
+    pub async fn connect_stdio_sandboxed(
+        config: &clawde_core::config::McpServerConfig,
+    ) -> anyhow::Result<Self> {
+        Self::connect_stdio_with_env_policy(config, true).await
+    }
+
+    async fn connect_stdio_with_env_policy(
+        config: &clawde_core::config::McpServerConfig,
+        clear_environment: bool,
+    ) -> anyhow::Result<Self> {
         let command = config.command.clone().ok_or_else(|| {
             anyhow::anyhow!("MCP server '{}' has no command configured", config.name)
         })?;
 
         let transport = TokioChildProcess::new(Command::new(&command).configure(|cmd| {
+            if clear_environment {
+                cmd.env_clear();
+            }
             cmd.args(&config.args);
             cmd.envs(&config.env);
         }))

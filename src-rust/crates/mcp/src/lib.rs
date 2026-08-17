@@ -684,6 +684,14 @@ pub mod client {
             Ok(Self::from_backend(Arc::new(backend)))
         }
 
+        /// Connect a client-provided stdio server with a scrubbed environment.
+        /// The caller must provide an absolute executable path and explicit env.
+        pub async fn connect_stdio_sandboxed(config: &McpServerConfig) -> anyhow::Result<Self> {
+            let backend =
+                crate::rmcp_backend::RmcpClientBackend::connect_stdio_sandboxed(config).await?;
+            Ok(Self::from_backend(Arc::new(backend)))
+        }
+
         // ---- High-level API -----------------------------------------------
 
         pub async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
@@ -1015,6 +1023,49 @@ impl McpManager {
             }
         }
         manager
+    }
+
+    /// Connect ACP-provided stdio servers with a scrubbed child environment.
+    ///
+    /// This path intentionally supports stdio only. HTTP/SSE client-provided
+    /// servers remain disabled until their URL and credential policy is
+    /// separately designed. Initialization is transactional: a failed server
+    /// tears down any earlier connections and returns an error.
+    pub async fn connect_session_stdio(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
+        let mut manager = Self::new();
+        for config in configs {
+            if config.server_type != "stdio" {
+                anyhow::bail!(
+                    "session MCP server '{}' uses unsupported transport '{}'; only stdio is enabled",
+                    config.name,
+                    config.server_type
+                );
+            }
+            manager
+                .server_configs
+                .insert(config.name.clone(), config.clone());
+            match client::McpClient::connect_stdio_sandboxed(config).await {
+                Ok(client) => {
+                    info!(
+                        server = %config.name,
+                        tools = client.tools.len(),
+                        "Session MCP server connected"
+                    );
+                    manager
+                        .clients
+                        .insert(config.name.clone(), Arc::new(client));
+                }
+                Err(error) => {
+                    manager.shutdown();
+                    return Err(anyhow::anyhow!(
+                        "session MCP server '{}' failed to initialize: {}",
+                        config.name,
+                        error
+                    ));
+                }
+            }
+        }
+        Ok(manager)
     }
 
     // -----------------------------------------------------------------------

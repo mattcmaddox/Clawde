@@ -1,5 +1,6 @@
 //! Top-level ACP request / notification dispatcher.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::connection::{Connection, Inbound};
 use crate::runtime::AgentRuntime;
-use crate::sessions::{SessionRegistry, SessionState};
+use crate::sessions::{SessionMcpContext, SessionRegistry, SessionState};
 
 /// The ACP agent: owns the connection, the runtime, and the session registry.
 pub struct AgentServer {
@@ -153,16 +154,33 @@ impl AgentServer {
                 acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
             );
         }
-        if let Err(reason) = validate_session_mcp_servers(&req.mcp_servers) {
-            return Err(
-                acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
-            );
-        }
+        let mcp_configs = match validate_session_mcp_servers(&req.mcp_servers) {
+            Ok(configs) => configs,
+            Err(reason) => {
+                return Err(acp::Error::invalid_params()
+                    .data(Some(serde_json::json!({ "reason": reason }))));
+            }
+        };
+        let mcp_context = if mcp_configs.is_empty() {
+            SessionMcpContext::empty()
+        } else {
+            let manager = clawde_mcp::McpManager::connect_session_stdio(&mcp_configs)
+                .await
+                .map_err(|error| {
+                    acp::Error::invalid_params().data(Some(serde_json::json!({
+                        "reason": format!("failed to initialize session MCP servers: {}", error)
+                    })))
+                })?;
+            let manager = Arc::new(manager);
+            manager.clone().spawn_notification_poll_loop();
+            SessionMcpContext::from_manager(manager)
+        };
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        let state = SessionState::new(
+        let state = SessionState::new_with_mcp(
             session_id.clone(),
             req.cwd.clone(),
             req.additional_directories.clone(),
+            mcp_context,
         );
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
@@ -200,15 +218,90 @@ fn validate_session_directories(cwd: &Path, additional: &[PathBuf]) -> Result<()
     Ok(())
 }
 
-fn validate_session_mcp_servers(servers: &[acp::McpServer]) -> Result<(), String> {
-    if servers.is_empty() {
-        Ok(())
-    } else {
-        Err(
-            "session-specific MCP servers are not supported yet; configure MCP servers in settings.json"
-                .to_string(),
-        )
+fn validate_session_mcp_servers(
+    servers: &[acp::McpServer],
+) -> Result<Vec<clawde_core::config::McpServerConfig>, String> {
+    const MAX_SESSION_MCP_SERVERS: usize = 8;
+    const MAX_ARGS: usize = 128;
+    const MAX_ENV: usize = 64;
+    const MAX_VALUE_BYTES: usize = 16 * 1024;
+
+    if servers.len() > MAX_SESSION_MCP_SERVERS {
+        return Err(format!(
+            "at most {} session MCP servers are allowed",
+            MAX_SESSION_MCP_SERVERS
+        ));
     }
+
+    let mut names = HashSet::new();
+    let mut configs = Vec::with_capacity(servers.len());
+    for server in servers {
+        let stdio =
+            match server {
+                acp::McpServer::Stdio(stdio) => stdio,
+                _ => return Err(
+                    "session MCP currently supports only stdio servers; HTTP/SSE remain disabled"
+                        .to_string(),
+                ),
+            };
+        if stdio.name.trim().is_empty() || !names.insert(stdio.name.clone()) {
+            return Err(format!(
+                "session MCP server names must be non-empty and unique: '{}'",
+                stdio.name
+            ));
+        }
+        if !stdio.command.is_absolute() {
+            return Err(format!(
+                "session MCP stdio command must be an absolute path: {}",
+                stdio.command.display()
+            ));
+        }
+        if stdio.args.len() > MAX_ARGS {
+            return Err(format!(
+                "session MCP server '{}' has too many arguments",
+                stdio.name
+            ));
+        }
+        if stdio.env.len() > MAX_ENV {
+            return Err(format!(
+                "session MCP server '{}' has too many environment variables",
+                stdio.name
+            ));
+        }
+        let mut env = std::collections::HashMap::new();
+        for variable in &stdio.env {
+            if variable.name.is_empty()
+                || variable.name.contains('=')
+                || variable.name.bytes().any(|byte| byte.is_ascii_control())
+                || variable.value.len() > MAX_VALUE_BYTES
+                || variable.value.contains("${")
+            {
+                return Err(format!(
+                    "session MCP server '{}' has an invalid or unsafe environment variable",
+                    stdio.name
+                ));
+            }
+            if env
+                .insert(variable.name.clone(), variable.value.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "session MCP server '{}' contains duplicate environment variable '{}'",
+                    stdio.name, variable.name
+                ));
+            }
+        }
+        configs.push(clawde_core::config::McpServerConfig {
+            name: stdio.name.clone(),
+            command: Some(stdio.command.to_string_lossy().into_owned()),
+            args: stdio.args.clone(),
+            env,
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: Default::default(),
+        });
+    }
+    Ok(configs)
 }
 
 #[cfg(test)]
@@ -234,14 +327,25 @@ mod tests {
     }
 
     #[test]
-    fn session_mcp_servers_fail_closed_until_per_session_routing_exists() {
-        assert!(validate_session_mcp_servers(&[]).is_ok());
-        let server = acp::McpServer::Http(acp::McpServerHttp::new(
+    fn session_mcp_servers_accept_only_safe_stdio_configs() {
+        assert!(validate_session_mcp_servers(&[]).unwrap().is_empty());
+
+        let relative = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "server"));
+        let error = validate_session_mcp_servers(&[relative]).unwrap_err();
+        assert!(error.contains("absolute path"));
+
+        let http = acp::McpServer::Http(acp::McpServerHttp::new(
             "remote",
             "https://example.test/mcp",
         ));
-        let error = validate_session_mcp_servers(&[server]).unwrap_err();
-        assert!(error.contains("not supported yet"));
+        let error = validate_session_mcp_servers(&[http]).unwrap_err();
+        assert!(error.contains("only stdio"));
+
+        let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "/bin/server"));
+        let configs = validate_session_mcp_servers(&[stdio]).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].server_type, "stdio");
+        assert_eq!(configs[0].command.as_deref(), Some("/bin/server"));
     }
 }
 
