@@ -261,6 +261,102 @@ Security:
   The explicit --allow-non-loopback opt-in is intended for protected deployments.
 "#;
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AcpCliOptions {
+    listen: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    allow_non_loopback: bool,
+}
+
+fn parse_acp_args(args: &[String]) -> anyhow::Result<AcpCliOptions> {
+    let mut options = AcpCliOptions::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--allow-non-loopback" => {
+                if options.allow_non_loopback {
+                    anyhow::bail!("duplicate ACP option: --allow-non-loopback");
+                }
+                options.allow_non_loopback = true;
+            }
+            "--listen" | "--tls-cert" | "--tls-key" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("ACP option '{}' requires a value", arg))?;
+                if value.starts_with('-') || value.is_empty() {
+                    anyhow::bail!("ACP option '{}' requires a non-empty value", arg);
+                }
+                set_acp_option(&mut options, arg, value.clone())?;
+                index += 1;
+            }
+            value if value.starts_with("--listen=") => {
+                set_acp_option(
+                    &mut options,
+                    "--listen",
+                    value["--listen=".len()..].to_string(),
+                )?;
+            }
+            value if value.starts_with("--tls-cert=") => {
+                set_acp_option(
+                    &mut options,
+                    "--tls-cert",
+                    value["--tls-cert=".len()..].to_string(),
+                )?;
+            }
+            value if value.starts_with("--tls-key=") => {
+                set_acp_option(
+                    &mut options,
+                    "--tls-key",
+                    value["--tls-key=".len()..].to_string(),
+                )?;
+            }
+            "-h" | "--help" => {
+                // Help is handled before this parser in main(); keep this
+                // branch useful for direct callers and parser tests.
+                return Ok(options);
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unknown ACP option: {}", value);
+            }
+            value => {
+                anyhow::bail!("unexpected ACP argument: {}", value);
+            }
+        }
+        index += 1;
+    }
+
+    if options.tls_cert.is_some() != options.tls_key.is_some() {
+        anyhow::bail!("--tls-cert and --tls-key must be provided together");
+    }
+    if options.listen.is_none()
+        && (options.allow_non_loopback || options.tls_cert.is_some() || options.tls_key.is_some())
+    {
+        anyhow::bail!("TCP-only ACP options require --listen <ADDR>");
+    }
+
+    Ok(options)
+}
+
+fn set_acp_option(options: &mut AcpCliOptions, option: &str, value: String) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("ACP option '{}' requires a non-empty value", option);
+    }
+    let target = match option {
+        "--listen" => &mut options.listen,
+        "--tls-cert" => &mut options.tls_cert,
+        "--tls-key" => &mut options.tls_key,
+        _ => anyhow::bail!("unsupported ACP option: {}", option),
+    };
+    if target.is_some() {
+        anyhow::bail!("duplicate ACP option: {}", option);
+    }
+    *target = Some(value);
+    Ok(())
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliPermissionMode {
     Default,
@@ -422,41 +518,22 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
 
-        let listen = raw_args
-            .iter()
-            .position(|a| a == "--listen")
-            .and_then(|pos| raw_args.get(pos + 1).map(|s| s.to_string()));
-        if let Some(addr) = listen {
+        let acp_options = parse_acp_args(&raw_args[2..])
+            .map_err(|error| anyhow::anyhow!("invalid ACP arguments: {error}\n\n{ACP_USAGE}"))?;
+        if let Some(addr) = acp_options.listen {
             // Standalone mode: load base config from settings, then apply CLI overrides.
             let settings = clawde_core::config::Settings::load()
                 .await
                 .unwrap_or_default();
             let mut acp_config = settings.acp_server.clone();
-            if raw_args.iter().any(|arg| arg == "--allow-non-loopback") {
+            if acp_options.allow_non_loopback {
                 acp_config.allow_non_loopback = true;
             }
-
-            // Parse --tls-cert / --tls-key from raw args (if provided, they override settings).
-            let tls_cert = raw_args
-                .iter()
-                .position(|a| a == "--tls-cert")
-                .and_then(|pos| raw_args.get(pos + 1).cloned());
-            let tls_key = raw_args
-                .iter()
-                .position(|a| a == "--tls-key")
-                .and_then(|pos| raw_args.get(pos + 1).cloned());
-            if let Some(cert) = tls_cert {
+            if let Some(cert) = acp_options.tls_cert {
                 acp_config.tls_cert_path = Some(cert);
             }
-            if let Some(key) = tls_key {
+            if let Some(key) = acp_options.tls_key {
                 acp_config.tls_key_path = Some(key);
-            }
-            if acp_config.tls_cert_path.is_some() != acp_config.tls_key_path.is_some() {
-                eprintln!(
-                    "Warning: --tls-cert and --tls-key must be used together; TLS not enabled"
-                );
-                acp_config.tls_cert_path = None;
-                acp_config.tls_key_path = None;
             }
 
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -6547,6 +6624,91 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
     match opt {
         Some(s) => serde_json::Value::String(s.clone()),
         None => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod acp_cli_tests {
+    use super::{parse_acp_args, AcpCliOptions, ACP_USAGE};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_stdio_defaults() {
+        assert_eq!(parse_acp_args(&[]).unwrap(), AcpCliOptions::default());
+    }
+
+    #[test]
+    fn parses_tcp_and_tls_options_in_both_forms() {
+        let parsed = parse_acp_args(&args(&[
+            "--listen",
+            "127.0.0.1:9876",
+            "--tls-cert=cert.pem",
+            "--tls-key",
+            "key.pem",
+            "--allow-non-loopback",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            AcpCliOptions {
+                listen: Some("127.0.0.1:9876".into()),
+                tls_cert: Some("cert.pem".into()),
+                tls_key: Some("key.pem".into()),
+                allow_non_loopback: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_values_and_unknown_arguments() {
+        for candidate in [
+            vec!["--listen"],
+            vec!["--tls-cert"],
+            vec!["--tls-key"],
+            vec!["--unknown"],
+            vec!["positional"],
+        ] {
+            assert!(
+                parse_acp_args(&args(&candidate)).is_err(),
+                "expected rejection for {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_partial_tls_and_tcp_options_in_stdio_mode() {
+        assert!(parse_acp_args(&args(&["--tls-cert", "cert.pem"])).is_err());
+        assert!(parse_acp_args(&args(&["--tls-key", "key.pem"])).is_err());
+        assert!(parse_acp_args(&args(&["--allow-non-loopback"])).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_options() {
+        assert!(
+            parse_acp_args(&args(&["--listen", "127.0.0.1:1", "--listen=127.0.0.1:2",])).is_err()
+        );
+        assert!(parse_acp_args(&args(&[
+            "--allow-non-loopback",
+            "--allow-non-loopback",
+            "--listen",
+            "127.0.0.1:1",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn usage_mentions_every_acp_transport_option() {
+        for option in [
+            "--listen <ADDR>",
+            "--tls-cert <PATH>",
+            "--tls-key <PATH>",
+            "--allow-non-loopback",
+        ] {
+            assert!(ACP_USAGE.contains(option), "missing {option} from help");
+        }
     }
 }
 
