@@ -1,6 +1,6 @@
 //! MCP tool wrappers shared by the CLI and ACP runtimes.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
 use clawde_core::types::ToolDefinition;
 use serde_json::Value;
@@ -47,10 +47,13 @@ impl Tool for McpToolWrapper {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let desc = format!("Run MCP tool {}", self.tool_def.name);
         if let Err(error) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
-            return ToolResult::error(error.to_string());
+            return ToolResult::error_with_code(
+                ToolErrorCode::NetworkIsolationBlocked,
+                error.to_string(),
+            );
         }
         if let Err(error) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(error.to_string());
+            return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, error.to_string());
         }
 
         let prefix = format!("{}_", self.server_name);
@@ -65,12 +68,15 @@ impl Tool for McpToolWrapper {
             Ok(result) => {
                 let text = clawde_mcp::mcp_result_to_string(&result);
                 if result.is_error {
-                    ToolResult::error(text)
+                    ToolResult::error_with_code(ToolErrorCode::ExecutionFailed, text)
                 } else {
                     ToolResult::success(text)
                 }
             }
-            Err(error) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, error)),
+            Err(error) => ToolResult::error_with_code(
+                ToolErrorCode::ExecutionFailed,
+                format!("MCP tool '{}' failed: {}", bare_name, error),
+            ),
         }
     }
 }
@@ -93,7 +99,7 @@ pub fn mcp_tool_wrappers(manager: Arc<clawde_mcp::McpManager>) -> Vec<Box<dyn To
 #[cfg(test)]
 mod tests {
     use super::{mcp_tool_wrappers, McpToolWrapper};
-    use crate::Tool;
+    use crate::{Tool, ToolErrorCode};
     use clawde_core::types::ToolDefinition;
     use std::sync::Arc;
 
@@ -101,6 +107,19 @@ mod tests {
     fn empty_mcp_manager_exposes_no_wrappers() {
         let manager = Arc::new(clawde_mcp::McpManager::new());
         assert!(mcp_tool_wrappers(manager).is_empty());
+    }
+
+    #[test]
+    fn mcp_wrapper_error_categories_are_stable() {
+        assert_eq!(
+            ToolErrorCode::NetworkIsolationBlocked.as_str(),
+            "network_isolation_blocked"
+        );
+        assert_eq!(
+            ToolErrorCode::PermissionDenied.as_str(),
+            "permission_denied"
+        );
+        assert_eq!(ToolErrorCode::ExecutionFailed.as_str(), "execution_failed");
     }
 
     #[test]
