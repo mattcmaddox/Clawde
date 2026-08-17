@@ -875,6 +875,40 @@ pub enum McpAuthState {
 // MCP Manager: manages multiple server connections
 // ---------------------------------------------------------------------------
 
+/// Exact route for one discovered MCP tool.
+///
+/// `public_name` is the name exposed to the model, while `remote_name` is the
+/// name sent to the owning MCP server. Keeping both names explicit avoids
+/// routing by parsing a delimiter in the public name.
+#[derive(Debug, Clone)]
+pub struct McpToolBinding {
+    pub public_name: String,
+    pub server_name: String,
+    pub remote_name: String,
+    pub definition: ToolDefinition,
+}
+
+/// Build the compatibility public name used by existing CLI/TUI callers.
+/// The binding still retains the unmodified remote name for execution.
+fn public_tool_name(server_name: &str, remote_name: &str) -> String {
+    format!("{}_{}", server_name, remote_name)
+}
+
+fn validate_unique_tool_bindings(bindings: &[McpToolBinding]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for binding in bindings {
+        if !seen.insert(binding.public_name.as_str()) {
+            anyhow::bail!(
+                "duplicate MCP public tool name '{}' (server '{}', remote tool '{}')",
+                binding.public_name,
+                binding.server_name,
+                binding.remote_name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Manages a pool of MCP server connections.
 pub struct McpManager {
     clients: HashMap<String, Arc<McpClient>>,
@@ -1039,42 +1073,92 @@ impl McpManager {
     // Tool / resource helpers
     // -----------------------------------------------------------------------
 
-    /// Get all tool definitions from all connected servers.
-    pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
-        let mut defs = vec![];
+    /// Build exact bindings for all tools from all connected servers.
+    ///
+    /// Existing public names remain `<server>_<tool>` for compatibility, but
+    /// execution never reverses that string. Duplicate public names are
+    /// rejected because exposing either route would be ambiguous.
+    pub fn try_tool_bindings(&self) -> anyhow::Result<Vec<McpToolBinding>> {
+        let mut bindings = Vec::new();
         for (server_name, client) in &self.clients {
-            for td in client.tool_definitions() {
-                // Prefix tool name with server name to avoid conflicts
-                let prefixed = ToolDefinition {
-                    name: format!("{}_{}", server_name, td.name),
-                    description: format!("[{}] {}", server_name, td.description),
-                    input_schema: td.input_schema.clone(),
+            for tool in &client.tools {
+                let remote_name = tool.name.clone();
+                let public_name = public_tool_name(server_name, &remote_name);
+                let definition = ToolDefinition {
+                    name: public_name.clone(),
+                    description: format!(
+                        "[{}] {}",
+                        server_name,
+                        tool.description.clone().unwrap_or_default()
+                    ),
+                    input_schema: tool.input_schema.clone(),
                 };
-                defs.push((server_name.clone(), prefixed));
+                bindings.push(McpToolBinding {
+                    public_name,
+                    server_name: server_name.clone(),
+                    remote_name,
+                    definition,
+                });
             }
         }
-        defs
+        validate_unique_tool_bindings(&bindings)?;
+        Ok(bindings)
     }
 
-    /// Execute a tool call, routing to the correct server.
-    /// Tool name format: `<server_name>_<tool_name>`.
-    pub async fn call_tool(
-        &self,
-        prefixed_name: &str,
-        arguments: Option<Value>,
-    ) -> anyhow::Result<CallToolResult> {
-        // Find the server name by matching prefix
-        for (server_name, client) in &self.clients {
-            let prefix = format!("{}_", server_name);
-            if let Some(tool_name) = prefixed_name.strip_prefix(&prefix) {
-                return client.call_tool(tool_name, arguments).await;
+    /// Get all tool definitions from all connected servers.
+    ///
+    /// This compatibility method retains its historical infallible signature;
+    /// an ambiguous registry fails closed and emits no MCP definitions.
+    pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
+        match self.try_tool_bindings() {
+            Ok(bindings) => bindings
+                .into_iter()
+                .map(|binding| (binding.server_name, binding.definition))
+                .collect(),
+            Err(error) => {
+                warn!(error = %error, "MCP tool registry rejected ambiguous bindings");
+                Vec::new()
             }
         }
-        Err(anyhow::anyhow!(
-            "No MCP server found for tool '{}'. Connected servers: [{}]",
-            prefixed_name,
-            self.clients.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
+    }
+
+    /// Execute using an exact discovered binding.
+    pub async fn call_tool_binding(
+        &self,
+        binding: &McpToolBinding,
+        arguments: Option<Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        let client = self.clients.get(&binding.server_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "No MCP server found for bound tool '{}' (server '{}')",
+                binding.public_name,
+                binding.server_name
+            )
+        })?;
+        client.call_tool(&binding.remote_name, arguments).await
+    }
+
+    /// Execute a tool by its historical public name.
+    ///
+    /// This remains for CLI/TUI callers, but resolves through the exact binding
+    /// index rather than parsing the public name into a server/tool pair.
+    pub async fn call_tool(
+        &self,
+        public_name: &str,
+        arguments: Option<Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        let binding = self
+            .try_tool_bindings()?
+            .into_iter()
+            .find(|binding| binding.public_name == public_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No MCP tool binding found for '{}'. Connected servers: [{}]",
+                    public_name,
+                    self.clients.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?;
+        self.call_tool_binding(&binding, arguments).await
     }
 
     /// Number of connected servers.
@@ -1630,6 +1714,51 @@ mod tests {
     fn test_manager_failed_servers_empty() {
         let mgr = McpManager::new();
         assert!(mgr.failed_servers().is_empty());
+    }
+
+    #[test]
+    fn exact_binding_preserves_server_and_remote_names() {
+        let binding = McpToolBinding {
+            public_name: public_tool_name("server_with_underscore", "remote_tool"),
+            server_name: "server_with_underscore".to_string(),
+            remote_name: "remote_tool".to_string(),
+            definition: ToolDefinition {
+                name: "server_with_underscore_remote_tool".to_string(),
+                description: "test".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        };
+
+        assert_eq!(binding.public_name, "server_with_underscore_remote_tool");
+        assert_eq!(binding.server_name, "server_with_underscore");
+        assert_eq!(binding.remote_name, "remote_tool");
+    }
+
+    #[test]
+    fn duplicate_public_binding_names_are_rejected() {
+        let binding = |server_name: &str, remote_name: &str| McpToolBinding {
+            public_name: "ambiguous_tool".to_string(),
+            server_name: server_name.to_string(),
+            remote_name: remote_name.to_string(),
+            definition: ToolDefinition {
+                name: "ambiguous_tool".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        };
+
+        let error = validate_unique_tool_bindings(&[
+            binding("server_a", "tool"),
+            binding("server_b", "tool"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate MCP public tool name"));
+    }
+
+    #[test]
+    fn empty_manager_has_no_exact_tool_bindings() {
+        let mgr = McpManager::new();
+        assert!(mgr.try_tool_bindings().unwrap().is_empty());
     }
 
     #[test]

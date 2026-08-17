@@ -2,25 +2,23 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use async_trait::async_trait;
-use clawde_core::types::ToolDefinition;
 use serde_json::Value;
 use std::sync::Arc;
 
 /// Expose one connected MCP tool as a normal Clawde tool.
 pub struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
+    binding: clawde_mcp::McpToolBinding,
     manager: Arc<clawde_mcp::McpManager>,
 }
 
 #[async_trait]
 impl Tool for McpToolWrapper {
     fn name(&self) -> &str {
-        &self.tool_def.name
+        &self.binding.public_name
     }
 
     fn description(&self) -> &str {
-        &self.tool_def.description
+        &self.binding.definition.description
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -41,11 +39,11 @@ impl Tool for McpToolWrapper {
     }
 
     fn input_schema(&self) -> Value {
-        self.tool_def.input_schema.clone()
+        self.binding.definition.input_schema.clone()
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
+        let desc = format!("Run MCP tool {}", self.binding.public_name);
         if let Err(error) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
             return ToolResult::error_with_code(
                 ToolErrorCode::NetworkIsolationBlocked,
@@ -56,15 +54,10 @@ impl Tool for McpToolWrapper {
             return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, error.to_string());
         }
 
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
+        let bare_name = &self.binding.remote_name;
         let args = if input.is_null() { None } else { Some(input) };
 
-        match self.manager.call_tool(&self.tool_def.name, args).await {
+        match self.manager.call_tool_binding(&self.binding, args).await {
             Ok(result) => {
                 let text = clawde_mcp::mcp_result_to_string(&result);
                 if result.is_error {
@@ -84,12 +77,15 @@ impl Tool for McpToolWrapper {
 /// Build wrappers for all tools exposed by a connected MCP manager.
 pub fn mcp_tool_wrappers(manager: Arc<clawde_mcp::McpManager>) -> Vec<Box<dyn Tool>> {
     manager
-        .all_tool_definitions()
+        .try_tool_bindings()
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "MCP tool wrappers disabled because bindings are ambiguous");
+            Vec::new()
+        })
         .into_iter()
-        .map(|(server_name, tool_def)| {
+        .map(|binding| {
             Box::new(McpToolWrapper {
-                tool_def,
-                server_name,
+                binding,
                 manager: manager.clone(),
             }) as Box<dyn Tool>
         })
@@ -125,12 +121,16 @@ mod tests {
     #[test]
     fn mcp_wrapper_self_gates_to_avoid_double_prompting() {
         let wrapper = McpToolWrapper {
-            tool_def: ToolDefinition {
-                name: "server_tool".to_string(),
-                description: "test".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
+            binding: clawde_mcp::McpToolBinding {
+                public_name: "server_tool".to_string(),
+                server_name: "server".to_string(),
+                remote_name: "tool".to_string(),
+                definition: ToolDefinition {
+                    name: "server_tool".to_string(),
+                    description: "test".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
             },
-            server_name: "server".to_string(),
             manager: Arc::new(clawde_mcp::McpManager::new()),
         };
         assert!(wrapper.self_gates());
