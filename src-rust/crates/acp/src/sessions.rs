@@ -21,6 +21,9 @@ pub struct SessionState {
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     pub file_history: Arc<parking_lot::Mutex<clawde_core::file_history::FileHistory>>,
     pub current_turn: Arc<std::sync::atomic::AtomicUsize>,
+    /// Serialize prompts within one session. ACP dispatches requests on
+    /// independent tasks, but transcript/tool execution must remain ordered.
+    prompt_lock: tokio::sync::Mutex<()>,
 }
 
 impl SessionState {
@@ -42,7 +45,14 @@ impl SessionState {
                 clawde_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            prompt_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Serialize prompt handlers for this session while allowing
+    /// `session/cancel` notifications to cancel the active turn.
+    pub(crate) async fn lock_prompt(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.prompt_lock.lock().await
     }
 
     /// Snapshot the token for the current prompt turn.
@@ -91,6 +101,19 @@ mod tests {
     use super::SessionState;
     use agent_client_protocol_schema as acp;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn prompt_lock_serializes_turns() {
+        let session = SessionState::new(
+            acp::SessionId::new("test-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        let first = session.lock_prompt().await;
+        assert!(session.prompt_lock.try_lock().is_err());
+        drop(first);
+        assert!(session.prompt_lock.try_lock().is_ok());
+    }
 
     #[test]
     fn cancelling_a_turn_rearms_the_next_turn_token() {

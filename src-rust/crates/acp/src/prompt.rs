@@ -31,6 +31,12 @@ pub async fn handle(
     session: Arc<SessionState>,
     params: acp::PromptRequest,
 ) -> Result<acp::PromptResponse, acp::Error> {
+    // ACP request dispatch is concurrent, but a session transcript and its
+    // tool execution are ordered state. Hold this guard for the full turn so
+    // a second prompt cannot clone stale messages and overwrite the first
+    // prompt's transcript when it completes.
+    let _prompt_guard = session.lock_prompt().await;
+
     // Convert prompt content blocks → a single user message in Clawde's
     // internal format.
     let prompt_blocks = render_prompt_blocks(&params.prompt);
