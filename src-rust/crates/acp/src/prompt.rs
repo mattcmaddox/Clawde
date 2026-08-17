@@ -65,6 +65,11 @@ pub async fn handle(
         .additional_dirs
         .extend(session.additional_directories.iter().cloned());
 
+    // Build a session-specific tool snapshot when this session owns MCP
+    // connections. Empty sessions continue to reuse the startup registry.
+    let session_mcp = session.mcp.manager();
+    let session_tools = runtime.tools_for_session(session_mcp.clone());
+
     // Build per-session ToolContext.
     let permission_handler: Arc<dyn clawde_core::PermissionHandler> =
         Arc::new(AcpPermissionHandler);
@@ -77,7 +82,7 @@ pub async fn handle(
         file_history: session.file_history.clone(),
         current_turn: session.current_turn.clone(),
         non_interactive: false, // ACP routes permissions via the bridge
-        mcp_manager: runtime.mcp_manager.clone(),
+        mcp_manager: session_mcp.or_else(|| runtime.mcp_manager.clone()),
         config: session_config.clone(),
         provider_registry: Some(runtime.provider_registry.clone()),
         managed_agent_config: session_config.managed_agents.clone(),
@@ -115,7 +120,7 @@ pub async fn handle(
     let outcome = clawde_query::run_query_loop(
         runtime.api_client.as_ref(),
         &mut messages,
-        runtime.tools.as_slice(),
+        session_tools.as_slice(),
         &tool_ctx,
         &query_config,
         runtime.cost_tracker.clone(),

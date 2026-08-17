@@ -30,6 +30,34 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Build a tool vector for one ACP session.
+    ///
+    /// Ordinary sessions reuse the startup snapshot. A session with its own
+    /// MCP manager receives fresh built-in instances plus wrappers bound to
+    /// that manager, so dynamic MCP tools cannot leak into another session.
+    pub fn tools_for_session(
+        &self,
+        session_mcp: Option<Arc<clawde_mcp::McpManager>>,
+    ) -> Arc<Vec<Box<dyn Tool>>> {
+        let Some(manager) = session_mcp else {
+            return self.tools.clone();
+        };
+        let network_blocked = clawde_core::network_isolation_enabled(&self.config);
+        let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
+            .into_iter()
+            .filter(|tool| {
+                !network_blocked
+                    || !tool.network_capable()
+                    || tool.available_in_ollama_isolated_mode()
+            })
+            .collect();
+        tools.push(Box::new(clawde_query::AgentTool::default()));
+        if !network_blocked {
+            tools.extend(clawde_tools::mcp_tool_wrappers(manager));
+        }
+        Arc::new(tools)
+    }
+
     /// Build the runtime from on-disk settings, env vars, and a working
     /// directory. Mirrors the headless startup path but with ACP-specific
     /// defaults (non-interactive, permission decisions routed back to the
