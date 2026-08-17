@@ -29,6 +29,7 @@ mod prompt;
 mod runtime;
 mod server;
 mod sessions;
+pub mod ssrf;
 
 use std::fs;
 use std::sync::Arc;

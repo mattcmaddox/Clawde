@@ -134,12 +134,15 @@ impl AgentServer {
         let agent_info = acp::Implementation::new("clawde", env!("CARGO_PKG_VERSION"))
             .title(Some("Clawde".to_string()));
 
+        // Advertise HTTP and SSE MCP support (stdio is always available)
+        let mcp_capabilities = acp::McpCapabilities::new().http(true).sse(true);
+
         let mut response = acp::InitializeResponse::new(acp::ProtocolVersion::V1)
             .agent_capabilities(
                 acp::AgentCapabilities::new()
                     .load_session(false)
                     .prompt_capabilities(acp::PromptCapabilities::new().image(true))
-                    .mcp_capabilities(acp::McpCapabilities::new()),
+                    .mcp_capabilities(mcp_capabilities),
             );
         response = response.agent_info(Some(agent_info));
         Ok(response)
@@ -164,7 +167,7 @@ impl AgentServer {
         let mcp_context = if mcp_configs.is_empty() {
             SessionMcpContext::empty()
         } else {
-            let manager = clawde_mcp::McpManager::connect_session_stdio(&mcp_configs)
+            let manager = clawde_mcp::McpManager::connect_session(&mcp_configs)
                 .await
                 .map_err(|error| {
                     acp::Error::invalid_params().data(Some(serde_json::json!({
@@ -205,6 +208,31 @@ impl AgentServer {
     }
 }
 
+/// Validate the name and URL of a remote (http/sse) session MCP server.
+/// Applies SSRF protection and uniqueness checks before a config is created.
+fn validate_session_remote_server(
+    name: &str,
+    url: &str,
+    server_type: &str,
+    names: &mut HashSet<String>,
+) -> Result<(), String> {
+    if name.trim().is_empty() || !names.insert(name.to_string()) {
+        return Err(format!(
+            "session MCP server names must be non-empty and unique: '{}'",
+            name
+        ));
+    }
+    // Production mode: require HTTPS for non-localhost hosts.
+    let production_mode = true;
+    if let Err(e) = crate::ssrf::validate_url(url, production_mode) {
+        return Err(format!(
+            "session MCP {} server '{}' URL failed SSRF validation: {}",
+            server_type, name, e
+        ));
+    }
+    Ok(())
+}
+
 fn validate_session_directories(cwd: &Path, additional: &[PathBuf]) -> Result<(), String> {
     if !cwd.is_absolute() {
         return Err("cwd must be absolute".to_string());
@@ -236,70 +264,96 @@ fn validate_session_mcp_servers(
     let mut names = HashSet::new();
     let mut configs = Vec::with_capacity(servers.len());
     for server in servers {
-        let stdio =
-            match server {
-                acp::McpServer::Stdio(stdio) => stdio,
-                _ => return Err(
-                    "session MCP currently supports only stdio servers; HTTP/SSE remain disabled"
+        match server {
+            acp::McpServer::Stdio(stdio) => {
+                if stdio.name.trim().is_empty() || !names.insert(stdio.name.clone()) {
+                    return Err(format!(
+                        "session MCP server names must be non-empty and unique: '{}'",
+                        stdio.name
+                    ));
+                }
+                if !stdio.command.is_absolute() {
+                    return Err(format!(
+                        "session MCP stdio command must be an absolute path: {}",
+                        stdio.command.display()
+                    ));
+                }
+                if stdio.args.len() > MAX_ARGS {
+                    return Err(format!(
+                        "session MCP server '{}' has too many arguments",
+                        stdio.name
+                    ));
+                }
+                if stdio.env.len() > MAX_ENV {
+                    return Err(format!(
+                        "session MCP server '{}' has too many environment variables",
+                        stdio.name
+                    ));
+                }
+                let mut env = std::collections::HashMap::new();
+                for variable in &stdio.env {
+                    if variable.name.is_empty()
+                        || variable.name.contains('=')
+                        || variable.name.bytes().any(|byte| byte.is_ascii_control())
+                        || variable.value.len() > MAX_VALUE_BYTES
+                        || variable.value.contains("${")
+                    {
+                        return Err(format!(
+                            "session MCP server '{}' has an invalid or unsafe environment variable",
+                            stdio.name
+                        ));
+                    }
+                    if env
+                        .insert(variable.name.clone(), variable.value.clone())
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "session MCP server '{}' contains duplicate environment variable '{}'",
+                            stdio.name, variable.name
+                        ));
+                    }
+                }
+                configs.push(clawde_core::config::McpServerConfig {
+                    name: stdio.name.clone(),
+                    command: Some(stdio.command.to_string_lossy().into_owned()),
+                    args: stdio.args.clone(),
+                    env,
+                    url: None,
+                    server_type: "stdio".to_string(),
+                    origin: Default::default(),
+                });
+            }
+            acp::McpServer::Http(http) => {
+                validate_session_remote_server(&http.name, &http.url, "http", &mut names)?;
+                configs.push(clawde_core::config::McpServerConfig {
+                    name: http.name.clone(),
+                    command: None,
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    url: Some(http.url.clone()),
+                    server_type: "http".to_string(),
+                    origin: Default::default(),
+                });
+            }
+            acp::McpServer::Sse(sse) => {
+                validate_session_remote_server(&sse.name, &sse.url, "sse", &mut names)?;
+                configs.push(clawde_core::config::McpServerConfig {
+                    name: sse.name.clone(),
+                    command: None,
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    url: Some(sse.url.clone()),
+                    server_type: "sse".to_string(),
+                    origin: Default::default(),
+                });
+            }
+            _ => {
+                return Err(
+                    "session MCP server type not supported; only stdio, http, and sse are enabled"
                         .to_string(),
-                ),
-            };
-        if stdio.name.trim().is_empty() || !names.insert(stdio.name.clone()) {
-            return Err(format!(
-                "session MCP server names must be non-empty and unique: '{}'",
-                stdio.name
-            ));
-        }
-        if !stdio.command.is_absolute() {
-            return Err(format!(
-                "session MCP stdio command must be an absolute path: {}",
-                stdio.command.display()
-            ));
-        }
-        if stdio.args.len() > MAX_ARGS {
-            return Err(format!(
-                "session MCP server '{}' has too many arguments",
-                stdio.name
-            ));
-        }
-        if stdio.env.len() > MAX_ENV {
-            return Err(format!(
-                "session MCP server '{}' has too many environment variables",
-                stdio.name
-            ));
-        }
-        let mut env = std::collections::HashMap::new();
-        for variable in &stdio.env {
-            if variable.name.is_empty()
-                || variable.name.contains('=')
-                || variable.name.bytes().any(|byte| byte.is_ascii_control())
-                || variable.value.len() > MAX_VALUE_BYTES
-                || variable.value.contains("${")
-            {
-                return Err(format!(
-                    "session MCP server '{}' has an invalid or unsafe environment variable",
-                    stdio.name
-                ));
-            }
-            if env
-                .insert(variable.name.clone(), variable.value.clone())
-                .is_some()
-            {
-                return Err(format!(
-                    "session MCP server '{}' contains duplicate environment variable '{}'",
-                    stdio.name, variable.name
-                ));
+                );
             }
         }
-        configs.push(clawde_core::config::McpServerConfig {
-            name: stdio.name.clone(),
-            command: Some(stdio.command.to_string_lossy().into_owned()),
-            args: stdio.args.clone(),
-            env,
-            url: None,
-            server_type: "stdio".to_string(),
-            origin: Default::default(),
-        });
     }
     Ok(configs)
 }
@@ -327,25 +381,61 @@ mod tests {
     }
 
     #[test]
-    fn session_mcp_servers_accept_only_safe_stdio_configs() {
+    fn session_mcp_servers_accept_stdio_and_http() {
         assert!(validate_session_mcp_servers(&[]).unwrap().is_empty());
 
+        // Stdio: relative path rejected
         let relative = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "server"));
         let error = validate_session_mcp_servers(&[relative]).unwrap_err();
         assert!(error.contains("absolute path"));
 
+        // HTTP: valid HTTPS accepted
         let http = acp::McpServer::Http(acp::McpServerHttp::new(
             "remote",
             "https://example.test/mcp",
         ));
-        let error = validate_session_mcp_servers(&[http]).unwrap_err();
-        assert!(error.contains("only stdio"));
+        let configs = validate_session_mcp_servers(&[http.clone()]).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].server_type, "http");
+        assert_eq!(configs[0].url.as_deref(), Some("https://example.test/mcp"));
 
+        // HTTP: localhost accepted
+        let http_localhost = acp::McpServer::Http(acp::McpServerHttp::new(
+            "local-http",
+            "http://localhost:8080/mcp",
+        ));
+        let configs = validate_session_mcp_servers(&[http_localhost]).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].server_type, "http");
+
+        // HTTP: private IP rejected
+        let http_private = acp::McpServer::Http(acp::McpServerHttp::new(
+            "private",
+            "http://192.168.1.1:8080/mcp",
+        ));
+        let error = validate_session_mcp_servers(&[http_private]).unwrap_err();
+        assert!(error.contains("SSRF"));
+
+        // SSE: valid HTTPS accepted
+        let sse = acp::McpServer::Sse(acp::McpServerSse::new(
+            "remote-sse",
+            "https://example.test/sse",
+        ));
+        let configs = validate_session_mcp_servers(&[sse]).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].server_type, "sse");
+        assert_eq!(configs[0].url.as_deref(), Some("https://example.test/sse"));
+
+        // Stdio: valid config accepted
         let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "/bin/server"));
-        let configs = validate_session_mcp_servers(&[stdio]).unwrap();
+        let configs = validate_session_mcp_servers(&[stdio.clone()]).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].server_type, "stdio");
         assert_eq!(configs[0].command.as_deref(), Some("/bin/server"));
+
+        // Mixed: stdio + http accepted
+        let mixed = validate_session_mcp_servers(&[stdio, http]).unwrap();
+        assert_eq!(mixed.len(), 2);
     }
 }
 

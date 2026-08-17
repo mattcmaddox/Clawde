@@ -717,11 +717,13 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

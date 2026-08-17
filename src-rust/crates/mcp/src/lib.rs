@@ -1068,6 +1068,76 @@ impl McpManager {
         Ok(manager)
     }
 
+    /// Connect ACP-provided session MCP servers (stdio and HTTP/SSE).
+    ///
+    /// Initialization is transactional: a failed server tears down any
+    /// earlier connections and returns an error. HTTP/SSE servers are
+    /// validated with SSRF protection before connecting.
+    pub async fn connect_session(configs: &[McpServerConfig]) -> anyhow::Result<Self> {
+        let mut manager = Self::new();
+        for config in configs {
+            manager
+                .server_configs
+                .insert(config.name.clone(), config.clone());
+            match config.server_type.as_str() {
+                "stdio" => match client::McpClient::connect_stdio_sandboxed(config).await {
+                    Ok(client) => {
+                        info!(
+                            server = %config.name,
+                            tools = client.tools.len(),
+                            "Session MCP stdio server connected"
+                        );
+                        manager
+                            .clients
+                            .insert(config.name.clone(), Arc::new(client));
+                    }
+                    Err(error) => {
+                        manager.shutdown();
+                        return Err(anyhow::anyhow!(
+                            "session MCP server '{}' failed to initialize: {}",
+                            config.name,
+                            error
+                        ));
+                    }
+                },
+                "http" | "sse" => {
+                    // Load auth token if available
+                    let auth_token = manager.load_token(&config.name).await;
+                    match client::McpClient::connect(config, auth_token).await {
+                        Ok(client) => {
+                            info!(
+                                server = %config.name,
+                                transport = %config.server_type,
+                                tools = client.tools.len(),
+                                "Session MCP HTTP/SSE server connected"
+                            );
+                            manager
+                                .clients
+                                .insert(config.name.clone(), Arc::new(client));
+                        }
+                        Err(error) => {
+                            manager.shutdown();
+                            return Err(anyhow::anyhow!(
+                                "session MCP server '{}' failed to initialize: {}",
+                                config.name,
+                                error
+                            ));
+                        }
+                    }
+                }
+                other => {
+                    manager.shutdown();
+                    return Err(anyhow::anyhow!(
+                        "session MCP server '{}' uses unsupported transport '{}'",
+                        config.name,
+                        other
+                    ));
+                }
+            }
+        }
+        Ok(manager)
+    }
+
     // -----------------------------------------------------------------------
     // Status / query API (used by /mcp command and McpConnectionManager)
     // -----------------------------------------------------------------------
