@@ -391,7 +391,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Fast-path: `claude acp` — start the Agent Client Protocol server.
-    // With `--listen <addr>`, starts in TCP mode for LAN access.
+    // With `--listen <addr>`, starts in TCP mode. Non-loopback binding also
+    // requires the explicit `--allow-non-loopback` opt-in because ACP has no
+    // application-level authentication.
     // Optional `--tls-cert <path> --tls-key <path>` enables TLS.
     if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
         let listen = raw_args
@@ -404,6 +406,9 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .unwrap_or_default();
             let mut acp_config = settings.acp_server.clone();
+            if raw_args.iter().any(|arg| arg == "--allow-non-loopback") {
+                acp_config.allow_non_loopback = true;
+            }
 
             // Parse --tls-cert / --tls-key from raw args (if provided, they override settings).
             let tls_cert = raw_args

@@ -19,8 +19,10 @@ clawde acp --listen 127.0.0.1:9876
 
 This starts the ACP server in TCP mode, accepting local connections on port
 `9876`. The process runs headlessly — no interactive TUI is shown. ACP has no
-application-level authentication, so do not replace `127.0.0.1` with
-`0.0.0.0` unless you add an authenticated, protected transport.
+application-level authentication, so loopback is enforced by default. A
+non-loopback bind requires both an authenticated deployment boundary and an
+explicit opt-in (`--allow-non-loopback` or
+`acpServer.allowNonLoopback: true`).
 
 The configured local-Ollama service uses a separate settings profile:
 
@@ -45,7 +47,8 @@ Add to `~/.clawde/settings.json`:
 {
   "acpServer": {
     "enabled": true,
-    "listen": "127.0.0.1:9876"
+    "listen": "127.0.0.1:9876",
+    "allowNonLoopback": false
   }
 }
 ```
@@ -177,6 +180,29 @@ an unauthenticated ACP listener to untrusted clients.
   tool bindings are isolated by session, but credentials and process resources
   remain process-scoped. Use a dedicated `CLAWDE_HOME` profile when an external
   app should use local Ollama rather than your normal Free Mode credentials.
+
+### Future: multi-tenant remote ACP
+
+Multi-tenant remote ACP is intentionally **out of scope for the current
+single-user, trusted-local design**. It becomes a separate product phase only
+if Clawde is deployed as a shared service for mutually untrusted clients.
+
+Before enabling that deployment model, Clawde would need:
+
+- authenticated client identity and authorization, rather than relying on ACP
+  transport or TLS alone;
+- per-client provider and MCP credential isolation, including token storage and
+  rotation rules;
+- workspace/filesystem sandboxing and strict separation of global tools;
+- per-client quotas, concurrency limits, cancellation ownership, and audit logs;
+- an explicit non-loopback binding guard that requires an authenticated tunnel,
+  reverse proxy, or equivalent protected deployment; and
+- integration tests for cross-client session, workspace, tool, and credential
+  isolation.
+
+Until that phase is designed and implemented, use ACP on `127.0.0.1` or through
+an authenticated SSH/private-network tunnel. Do not expose the current ACP
+listener directly to the public internet or to mutually untrusted LAN clients.
 
 ## ACP Protocol Methods
 

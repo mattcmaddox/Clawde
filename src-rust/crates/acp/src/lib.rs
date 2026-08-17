@@ -145,10 +145,18 @@ pub async fn run_acp_server_tcp(
         info!(?addr, cwd = %working_dir.display(), "ACP: starting TCP server (plain TCP)");
     }
 
-    let runtime = Arc::new(AgentRuntime::build(working_dir).await?);
-
+    // Bind before constructing the runtime so an unsafe address is rejected
+    // before credentials, providers, or MCP resources are initialized.
     let listener = TcpListener::bind(&addr).await?;
-    info!(?addr, "ACP: TCP server listening (cancel on shutdown)");
+    let bound_addr = listener.local_addr()?;
+    let allow_non_loopback = config.is_some_and(|cfg| cfg.allow_non_loopback);
+    validate_acp_bind_address(bound_addr, allow_non_loopback)?;
+
+    let runtime = Arc::new(AgentRuntime::build(working_dir).await?);
+    info!(
+        ?bound_addr,
+        "ACP: TCP server listening (cancel on shutdown)"
+    );
 
     // Track every per-connection task so shutdown can drain them while the
     // runtime is still alive. Dropping the runtime with an in-flight prompt
@@ -283,6 +291,76 @@ pub async fn run_acp_server_tcp(
             info!(?peer, "ACP: TCP connection closed");
         });
         conn_tasks.push(handle);
+    }
+}
+
+fn validate_acp_bind_address(
+    addr: std::net::SocketAddr,
+    allow_non_loopback: bool,
+) -> anyhow::Result<()> {
+    let is_loopback = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    };
+    if is_loopback || allow_non_loopback {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing ACP non-loopback bind at {addr}; ACP has no application-level authentication. Use 127.0.0.1 or an authenticated tunnel, or explicitly opt in with acpServer.allowNonLoopback=true / --allow-non-loopback"
+    )
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::validate_acp_bind_address;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn allows_ipv4_and_ipv6_loopback() {
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9876),
+            false,
+        )
+        .is_ok());
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9876),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn allows_ipv4_mapped_loopback() {
+        let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1);
+        assert!(
+            validate_acp_bind_address(SocketAddr::new(IpAddr::V6(mapped), 9876), false,).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_non_loopback_by_default() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert!(validate_acp_bind_address(SocketAddr::new(ip, 9876), false).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_non_loopback() {
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9876),
+            true,
+        )
+        .is_ok());
     }
 }
 

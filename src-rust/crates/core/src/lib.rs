@@ -1932,6 +1932,10 @@ pub mod config {
         /// Address to bind, e.g. "0.0.0.0:9876".
         #[serde(default = "default_acp_listen")]
         pub listen: String,
+        /// Explicitly allow binding to a non-loopback address. ACP has no
+        /// application-level authentication, so this must be opt-in.
+        #[serde(default, rename = "allowNonLoopback", alias = "allow_non_loopback")]
+        pub allow_non_loopback: bool,
         /// Path to a PEM-encoded TLS certificate file (enables TLS when set).
         #[serde(
             default,
@@ -1959,6 +1963,7 @@ pub mod config {
             Self {
                 enabled: false,
                 listen: default_acp_listen(),
+                allow_non_loopback: false,
                 tls_cert_path: None,
                 tls_key_path: None,
             }

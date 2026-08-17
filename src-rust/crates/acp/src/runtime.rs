@@ -104,10 +104,10 @@ impl AgentRuntime {
 
         let cost_tracker = CostTracker::new();
 
-        // MCP servers from settings — connect upfront so their tools are
+        // Global MCP servers from settings connect upfront so their tools are
         // visible to every session. Per-session MCP servers supplied via
-        // `session/new` are rejected by the dispatcher until session-owned
-        // connection and tool-registry routing is implemented.
+        // `session/new` are connected separately by the session-owned MCP
+        // context in the ACP dispatcher.
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
         // Build tools: built-ins + AgentTool + trusted configured MCP tools.
