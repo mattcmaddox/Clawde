@@ -175,7 +175,7 @@ impl SessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionState;
+    use super::{SessionRegistry, SessionState};
     use agent_client_protocol_schema as acp;
     use std::path::PathBuf;
 
@@ -215,5 +215,34 @@ mod tests {
         assert!(first.is_cancelled());
         let next = session.current_cancel_token();
         assert!(!next.is_cancelled());
+    }
+
+    #[test]
+    fn registry_shutdown_cancels_all_active_turns() {
+        let registry = SessionRegistry::new();
+        let first_session = SessionState::new(
+            acp::SessionId::new("first-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        let second_session = SessionState::new(
+            acp::SessionId::new("second-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        let first_turn = first_session.current_cancel_token();
+        let second_turn = second_session.current_cancel_token();
+        registry.insert(first_session);
+        registry.insert(second_session);
+
+        registry.cancel_all_turns();
+
+        assert!(first_turn.is_cancelled());
+        assert!(second_turn.is_cancelled());
+        assert!(!registry
+            .get(&acp::SessionId::new("first-session"))
+            .unwrap()
+            .current_cancel_token()
+            .is_cancelled());
     }
 }

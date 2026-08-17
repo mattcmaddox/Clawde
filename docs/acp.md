@@ -85,7 +85,7 @@ looks like:
     "agentCapabilities": {
       "loadSession": false,
       "promptCapabilities": {},
-      "mcpCapabilities": {}
+      "mcpCapabilities": { "http": true, "sse": true }
     },
     "agentInfo": {
       "name": "clawde",
@@ -129,7 +129,43 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
   -days 365 -nodes -subj "/CN=clawde-acp"
 ```
 
-## Security Considerations
+## Session MCP
+
+`session/new` may include a session-owned `mcpServers` roster. Clawde supports
+these ACP server types:
+
+- `stdio` — launches an isolated child process. The command must be an absolute
+  path; argument, environment-variable, value-size, duplicate-name, and server
+  count limits are enforced.
+- `http` — connects to a streamable-HTTP MCP endpoint.
+- `sse` — connects to a legacy SSE MCP endpoint.
+
+Session MCP connections and tool bindings belong to that ACP session rather than
+the process-wide global MCP manager. Removing or shutting down a session stops
+its notification tasks and closes its session-owned MCP resources. A failed
+multi-server initialization is transactional: previously opened session
+connections are torn down before the session is rejected.
+
+### Remote session-MCP security
+
+Remote HTTP/SSE URLs supplied by an ACP client pass two layers of validation:
+
+1. **Before connection:** malformed URLs, unsupported schemes, private and
+   reserved IPv4/IPv6 ranges, loopback, link-local/cloud-metadata addresses, and
+   non-HTTPS production URLs are rejected. Plain HTTP is allowed only for local
+   development endpoints.
+2. **At connection time:** DNS answers are resolved and checked before reqwest
+   connects, so the transport uses only validated addresses. Every redirect hop
+   is checked again and redirect chains are capped. This protects against DNS
+   rebinding and redirect-based SSRF bypasses.
+
+Client-provided ACP HTTP headers are intentionally not forwarded to remote MCP
+servers. This prevents token passthrough from an ACP client; authentication must
+come through Clawde's existing validated credential/OAuth flow. Per-process
+credential storage is not a substitute for ACP authorization, so do not expose
+an unauthenticated ACP listener to untrusted clients.
+
+### General ACP security
 
 - **No authentication** — ACP v1 has no token/credential field in its
   `authenticate` method. Bind to `127.0.0.1` for local-only access.
@@ -137,9 +173,10 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
   use TLS plus an authenticated tunnel or reverse proxy. TLS alone does not add
   ACP authorization.
 - **Process-level sharing** — Every connected client shares the ACP process's
-  provider registry, settings profile, API access, and tools. Use a dedicated
-  `CLAWDE_HOME` profile when an external app should use local Ollama rather than
-  your normal Free Mode credentials.
+  provider registry, settings profile, API access, and global tools. Session MCP
+  tool bindings are isolated by session, but credentials and process resources
+  remain process-scoped. Use a dedicated `CLAWDE_HOME` profile when an external
+  app should use local Ollama rather than your normal Free Mode credentials.
 
 ## ACP Protocol Methods
 
@@ -147,7 +184,7 @@ openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
 |------------------------------|-----------|---------------------------------------------|
 | `initialize`                 | Client → Server | Capability negotiation                  |
 | `authenticate`               | Client → Server | No-op (transport-level only)            |
-| `session/new`                | Client → Server | Create a session with cwd               |
+| `session/new`                | Client → Server | Create a session with cwd + session-owned MCP roster |
 | `session/prompt`             | Client → Server | Run a turn; streams `session/update`    |
 | `session/cancel`             | Client → Server | Cancel an in-flight prompt              |
 | `session/update`             | Server → Client | Streamed text/tool deltas               |

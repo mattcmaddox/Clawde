@@ -18,10 +18,13 @@
 //! | `session/update`             | A → C (no resp) | Streamed text/tool deltas              |
 //! | `session/request_permission` | A → C      | Tool approval dialog                        |
 //!
-//! Per-session MCP server configs supplied via `session/new` are rejected with
-//! `invalid_params` until unified session-owned MCP routing is implemented.
-//! Configured global MCP servers from `settings.json` remain available to all
-//! sessions subject to the runtime trust and isolation checks.
+//! Per-session MCP server configs supplied via `session/new` are validated and
+//! connected in a session-owned context. stdio, streamable HTTP, and legacy SSE
+//! transports are supported; remote transports use SSRF validation, DNS-pinned
+//! clients, and redirect checks. Client-supplied HTTP headers are not forwarded;
+//! authentication uses Clawde's existing credential flow. Configured global MCP
+//! servers from `settings.json` remain available to all sessions subject to the
+//! runtime trust and isolation checks.
 
 mod connection;
 mod permission;
