@@ -40,6 +40,30 @@ impl PermissionHandler for AcpPermissionHandler {
     }
 }
 
+/// Build the structured input shown with an ACP permission request.
+///
+/// Keep the human-readable title/reason for existing clients, but also expose
+/// the target and isolation context so a client can render an informed dialog
+/// without scraping prose. This contains request metadata only; credentials
+/// and environment values are never copied into it.
+fn permission_raw_input(request: &PermissionRequest) -> serde_json::Value {
+    serde_json::json!({
+        "tool": request.tool_name,
+        "description": request.description,
+        "details": request.details,
+        "context_description": request.context_description,
+        "read_only": request.is_read_only,
+        "path": request.path,
+        "working_dir": request.working_dir.as_ref().map(|path| path.display().to_string()),
+        "allowed_roots": request
+            .allowed_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "network_isolated": request.network_isolated,
+    })
+}
+
 /// Drain a single pending permission request, route it through the
 /// connection as `session/request_permission`, and fire the oneshot with
 /// the resulting decision.
@@ -72,7 +96,8 @@ pub async fn forward_pending(
     let fields = acp::ToolCallUpdateFields::new()
         .kind(Some(infer_tool_kind(&request)))
         .status(Some(acp::ToolCallStatus::Pending))
-        .title(Some(title));
+        .title(Some(title))
+        .raw_input(Some(permission_raw_input(&request)));
     let tool_call = acp::ToolCallUpdate::new(acp::ToolCallId::new(tool_use_id.as_str()), fields);
 
     let options = vec![
@@ -149,6 +174,55 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
 /// Spawn a task that watches the shared `PendingPermissionStore` and
 /// forwards each enqueued request through the ACP connection. The task
 /// exits when `cancel` is fired or the connection drops.
+#[cfg(test)]
+mod tests {
+    use super::permission_raw_input;
+    use clawde_core::permissions::PermissionRequest;
+    use std::path::PathBuf;
+
+    #[test]
+    fn permission_request_exposes_target_and_isolation_context() {
+        let input = permission_raw_input(&PermissionRequest {
+            tool_name: "Bash".to_string(),
+            description: "Run Bash".to_string(),
+            details: Some("ls -la".to_string()),
+            is_read_only: false,
+            path: Some("/workspace/file.txt".to_string()),
+            working_dir: Some(PathBuf::from("/workspace")),
+            allowed_roots: vec![PathBuf::from("/workspace"), PathBuf::from("/shared")],
+            context_description: Some("execute a local command".to_string()),
+            network_isolated: true,
+        });
+
+        assert_eq!(input["tool"], "Bash");
+        assert_eq!(input["details"], "ls -la");
+        assert_eq!(input["path"], "/workspace/file.txt");
+        assert_eq!(input["network_isolated"], true);
+        assert_eq!(
+            input["allowed_roots"],
+            serde_json::json!(["/workspace", "/shared"])
+        );
+    }
+
+    #[test]
+    fn permission_request_metadata_does_not_add_credentials() {
+        let input = permission_raw_input(&PermissionRequest {
+            tool_name: "WebFetch".to_string(),
+            description: "Fetch URL".to_string(),
+            details: None,
+            is_read_only: true,
+            path: None,
+            working_dir: None,
+            allowed_roots: Vec::new(),
+            context_description: None,
+            network_isolated: false,
+        });
+        assert!(input.get("api_key").is_none());
+        assert!(input.get("token").is_none());
+        assert!(input.get("authorization").is_none());
+    }
+}
+
 pub fn spawn_drainer(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
