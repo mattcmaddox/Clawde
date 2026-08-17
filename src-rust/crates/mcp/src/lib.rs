@@ -22,6 +22,7 @@ use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -923,6 +924,10 @@ pub struct McpManager {
     /// manager/session shutdown explicit instead of relying on a future stream
     /// item to observe that the weak manager reference disappeared.
     notification_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Latest successfully refreshed tool snapshots, keyed by server name.
+    /// The initial client snapshot remains the fallback until the first refresh.
+    tool_snapshots: std::sync::RwLock<HashMap<String, Vec<McpTool>>>,
+    tool_registry_revision: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -942,6 +947,8 @@ impl McpManager {
             server_configs: HashMap::new(),
             resource_subscriptions: DashMap::new(),
             notification_tasks: std::sync::Mutex::new(Vec::new()),
+            tool_snapshots: std::sync::RwLock::new(HashMap::new()),
+            tool_registry_revision: AtomicU64::new(0),
         }
     }
 
@@ -1085,8 +1092,16 @@ impl McpManager {
     /// rejected because exposing either route would be ambiguous.
     pub fn try_tool_bindings(&self) -> anyhow::Result<Vec<McpToolBinding>> {
         let mut bindings = Vec::new();
+        let refreshed = self
+            .tool_snapshots
+            .read()
+            .expect("MCP tool snapshot lock poisoned");
         for (server_name, client) in &self.clients {
-            for tool in &client.tools {
+            let tools = refreshed
+                .get(server_name)
+                .map(Vec::as_slice)
+                .unwrap_or(client.tools.as_slice());
+            for tool in tools {
                 let remote_name = tool.name.clone();
                 let public_name = public_tool_name(server_name, &remote_name);
                 let definition = ToolDefinition {
@@ -1108,6 +1123,27 @@ impl McpManager {
         }
         validate_unique_tool_bindings(&bindings)?;
         Ok(bindings)
+    }
+
+    /// Return the revision of the current dynamic MCP tool registry.
+    pub fn tool_registry_revision(&self) -> u64 {
+        self.tool_registry_revision.load(Ordering::Acquire)
+    }
+
+    /// Refresh one server's tool snapshot and publish it atomically.
+    pub async fn refresh_server_tools(&self, server_name: &str) -> anyhow::Result<u64> {
+        let client = self.clients.get(server_name).cloned().ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' not found or not connected", server_name)
+        })?;
+        let tools = client.list_tools().await?;
+        {
+            let mut snapshots = self
+                .tool_snapshots
+                .write()
+                .expect("MCP tool snapshot lock poisoned");
+            snapshots.insert(server_name.to_string(), tools);
+        }
+        Ok(self.tool_registry_revision.fetch_add(1, Ordering::AcqRel) + 1)
     }
 
     /// Get all tool definitions from all connected servers.
@@ -1197,6 +1233,10 @@ impl McpManager {
         self.clients.clear();
         self.failed_servers.clear();
         self.server_configs.clear();
+        if let Ok(mut snapshots) = self.tool_snapshots.write() {
+            snapshots.clear();
+        }
+        self.tool_registry_revision.store(0, Ordering::Release);
     }
 
     /// Number of connected servers.
@@ -1464,9 +1504,28 @@ impl McpManager {
 
                     match result {
                         Ok(raw) => {
+                            let tools_changed = raw.get("method").and_then(Value::as_str)
+                                == Some("notifications/tools/list_changed");
                             client_clone
                                 .process_notification(raw, &manager.resource_subscriptions)
                                 .await;
+                            if tools_changed {
+                                match manager
+                                    .refresh_server_tools(&client_clone.server_name)
+                                    .await
+                                {
+                                    Ok(revision) => debug!(
+                                        server = %client_clone.server_name,
+                                        revision,
+                                        "MCP tool registry refreshed"
+                                    ),
+                                    Err(error) => warn!(
+                                        server = %client_clone.server_name,
+                                        error = %error,
+                                        "MCP tool registry refresh failed"
+                                    ),
+                                }
+                            }
                         }
                         Err(e) => {
                             debug!(
@@ -1809,6 +1868,20 @@ mod tests {
     fn empty_manager_has_no_exact_tool_bindings() {
         let mgr = McpManager::new();
         assert!(mgr.try_tool_bindings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_registry_revision_starts_at_zero() {
+        let mgr = McpManager::new();
+        assert_eq!(mgr.tool_registry_revision(), 0);
+    }
+
+    #[tokio::test]
+    async fn refreshing_unknown_server_fails_without_advancing_revision() {
+        let mgr = McpManager::new();
+        let error = mgr.refresh_server_tools("missing").await.unwrap_err();
+        assert!(error.to_string().contains("not found or not connected"));
+        assert_eq!(mgr.tool_registry_revision(), 0);
     }
 
     #[test]
