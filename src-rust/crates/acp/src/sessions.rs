@@ -161,6 +161,16 @@ impl SessionRegistry {
             state
         })
     }
+
+    /// Cancel every active session's in-flight turn. Used at server shutdown
+    /// so prompts observe `cancel_token.cancelled()` at their next await point
+    /// (see `run_query_loop`) and exit cooperatively — `JoinHandle::abort`
+    /// cannot interrupt a task blocked in a blocking-pool operation.
+    pub fn cancel_all_turns(&self) {
+        for entry in self.inner.iter() {
+            entry.value().cancel_current_turn();
+        }
+    }
 }
 
 #[cfg(test)]

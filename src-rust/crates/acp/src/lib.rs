@@ -147,11 +147,47 @@ pub async fn run_acp_server_tcp(
     let listener = TcpListener::bind(&addr).await?;
     info!(?addr, "ACP: TCP server listening (cancel on shutdown)");
 
+    // Track every per-connection task so shutdown can drain them while the
+    // runtime is still alive. Dropping the runtime with an in-flight prompt
+    // (a reqwest timer poll) triggers a Tokio "context is being shutdown"
+    // panic, so we must abort in-flight work before returning.
+    let mut conn_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     loop {
         let (stream, peer) = tokio::select! {
             result = listener.accept() => result?,
             _ = cancel.cancelled() => {
                 info!("ACP: TCP server shutting down (cancellation requested)");
+                // Cooperative drain: each connection task observes the cancel
+                // token and aborts its own in-flight dispatch tasks + reader,
+                // so no timer is polled after the runtime begins shutting
+                // down. Bound the wait, then force-abort stragglers.
+                let mut pending: Vec<Option<tokio::task::JoinHandle<()>>> =
+                    std::mem::take(&mut conn_tasks)
+                        .into_iter()
+                        .map(Some)
+                        .collect();
+                // Await with `Option::take` so the force-abort fallback below
+                // still owns the not-yet-awaited handles (draining the vec
+                // mid-await would leave the fallback with nothing to abort).
+                let deadline = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        for slot in &mut pending {
+                            if let Some(handle) = slot.take() {
+                                let _ = handle.await;
+                            }
+                        }
+                    },
+                );
+                if deadline.await.is_err() {
+                    for slot in pending {
+                        if let Some(handle) = slot {
+                            handle.abort();
+                            let _ = handle.await;
+                        }
+                    }
+                }
                 return Ok(());
             }
         };
@@ -181,29 +217,66 @@ pub async fn run_acp_server_tcp(
             )
         };
 
-        tokio::spawn(async move {
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
             let connection = Connection::new(writer);
             let server = AgentServer::new(connection.clone(), runtime);
 
             let (tx, mut rx) = mpsc::unbounded_channel();
-            let reader_fut = connection::run_reader(connection.clone(), reader, tx);
+            // Spawn the reader as its own task so this connection task can
+            // abort it on shutdown (a plain join would wait for the client to
+            // disconnect).
+            let reader_task = tokio::spawn(connection::run_reader(connection.clone(), reader, tx));
 
-            let dispatch_fut = async {
-                let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-                while let Some(msg) = rx.recv().await {
-                    tasks.push(server.dispatch(msg));
+            let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(msg) => tasks.push(server.dispatch(msg)),
+                        // Reader finished: the client disconnected.
+                        None => break,
+                    },
+                    // Server shutdown requested: cancel in-flight work while
+                    // the runtime is still alive. The prompt handler is a
+                    // separate spawned task (see AgentServer::dispatch), so it
+                    // must be aborted explicitly — otherwise it keeps polling
+                    // a timer during runtime shutdown and panics. Cancelling
+                    // session turns first makes prompts exit cooperatively at
+                    // their next await point, which the abort then reaps
+                    // immediately.
+                    _ = task_cancel.cancelled() => {
+                        server.sessions.cancel_all_turns();
+                        for handle in &tasks {
+                            handle.abort();
+                        }
+                        reader_task.abort();
+                        break;
+                    }
                 }
-                for handle in tasks {
-                    let _ = handle.await;
+            }
+            // Drain phase: wait for in-flight dispatch tasks, but cancel
+            // session turns first so prompts observe the cancellation
+            // cooperatively (JoinHandle::abort cannot interrupt a task
+            // running on the blocking pool). After cancellation, await each
+            // handle briefly; if a task ignores the cooperative cancel, abort
+            // and detach rather than blocking shutdown forever.
+            server.sessions.cancel_all_turns();
+            for mut handle in tasks {
+                let deadline = tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle);
+                if deadline.await.is_err() {
+                    handle.abort();
+                    // Do not await: the task may be on the blocking pool and
+                    // uncancellable. Cooperatively cancelled prompts exit on
+                    // their own shortly after.
                 }
-            };
-
-            let (reader_res, _) = tokio::join!(reader_fut, dispatch_fut);
-            if let Err(e) = reader_res {
+            }
+            let reader_res = reader_task.await;
+            if let Ok(Err(e)) = reader_res {
                 warn!(?peer, error = %e, "ACP: TCP reader error");
             }
             info!(?peer, "ACP: TCP connection closed");
         });
+        conn_tasks.push(handle);
     }
 }
 
