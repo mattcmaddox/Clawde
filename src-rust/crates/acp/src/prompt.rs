@@ -213,6 +213,32 @@ fn render_prompt_blocks(blocks: &[acp::ContentBlock]) -> Vec<ContentBlock> {
     rendered
 }
 
+/// Convert a query tool result into ACP's raw-output shape.
+///
+/// Successful results retain their existing JSON-or-string representation.
+/// Failed results are wrapped so ACP clients can distinguish stable tool
+/// categories such as `network_isolation_blocked` from a generic execution
+/// failure without parsing human-readable text.
+fn acp_tool_output(result: &str, is_error: bool, error_code: Option<&str>) -> serde_json::Value {
+    if !is_error && error_code.is_none() {
+        return serde_json::from_str(result)
+            .unwrap_or_else(|_| serde_json::Value::String(result.to_string()));
+    }
+
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "error".to_string(),
+        serde_json::Value::String(result.to_string()),
+    );
+    if let Some(code) = error_code {
+        output.insert(
+            "error_code".to_string(),
+            serde_json::Value::String(code.to_string()),
+        );
+    }
+    serde_json::Value::Object(output)
+}
+
 /// Pump QueryEvents → `session/update` SessionNotifications.
 async fn forward_events(
     connection: Arc<Connection>,
@@ -269,7 +295,7 @@ async fn forward_events(
                 tool_id,
                 result,
                 is_error,
-                ..
+                error_code,
             } => {
                 let status = if is_error {
                     acp::ToolCallStatus::Failed
@@ -279,15 +305,14 @@ async fn forward_events(
                 let content = vec![acp::ToolCallContent::Content(acp::Content::new(
                     acp::ContentBlock::Text(acp::TextContent::new(result.clone())),
                 ))];
-                let raw_output = serde_json::from_str::<serde_json::Value>(&result)
-                    .ok()
-                    .or_else(|| Some(serde_json::Value::String(result.clone())));
-                let mut fields = acp::ToolCallUpdateFields::new()
+                // Preserve the human-readable result in `content`, while
+                // carrying the stable machine-readable category through ACP
+                // raw_output for clients that need recovery/telemetry.
+                let raw_output = acp_tool_output(&result, is_error, error_code.as_deref());
+                let fields = acp::ToolCallUpdateFields::new()
                     .status(status)
-                    .content(content);
-                if let Some(out) = raw_output {
-                    fields = fields.raw_output(Some(out));
-                }
+                    .content(content)
+                    .raw_output(Some(raw_output));
                 let update =
                     acp::ToolCallUpdate::new(acp::ToolCallId::new(tool_id.as_str()), fields);
                 send_session_update(
@@ -393,6 +418,29 @@ mod tests {
     fn empty_text_does_not_create_a_prompt_block() {
         let blocks = render_prompt_blocks(&[acp::ContentBlock::Text(acp::TextContent::new(""))]);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn failed_tool_output_preserves_stable_error_code() {
+        let output = super::acp_tool_output(
+            "Tool is unavailable in Ollama offline mode",
+            true,
+            Some("network_isolation_blocked"),
+        );
+        assert_eq!(
+            output.get("error").and_then(|value| value.as_str()),
+            Some("Tool is unavailable in Ollama offline mode")
+        );
+        assert_eq!(
+            output.get("error_code").and_then(|value| value.as_str()),
+            Some("network_isolation_blocked")
+        );
+    }
+
+    #[test]
+    fn successful_tool_output_keeps_existing_json_shape() {
+        let output = super::acp_tool_output(r#"{"status":"ok"}"#, false, None);
+        assert_eq!(output, serde_json::json!({"status": "ok"}));
     }
 }
 
