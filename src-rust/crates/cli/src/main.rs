@@ -37,9 +37,7 @@ pub const FEEDBACK_CHANNEL: &str = env!("FEEDBACK_CHANNEL");
 pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
 use anyhow::Context;
-use async_trait::async_trait;
 use clap::{ArgAction, Parser, ValueEnum};
-use clawde_core::types::ToolDefinition;
 use clawde_core::{
     config::{Config, PermissionMode, Settings},
     constants::APP_VERSION,
@@ -47,80 +45,12 @@ use clawde_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use clawde_tools::ToolContext;
 use parking_lot::Mutex as ParkingMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
-
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager: Arc<clawde_mcp::McpManager>,
-}
-
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn network_capable(&self) -> bool {
-        // An MCP server may make arbitrary network calls, regardless of whether
-        // its advertised tool looks read-only.
-        true
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
-            return ToolResult::error(e.to_string());
-        }
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
-        let args = if input.is_null() { None } else { Some(input) };
-
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let text = clawde_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
@@ -1227,14 +1157,7 @@ fn build_tools_with_mcp_vec(
 
     if let Some(ref manager_arc) = mcp_manager {
         if !network_blocked {
-            for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-                let wrapper = McpToolWrapper {
-                    tool_def,
-                    server_name,
-                    manager: manager_arc.clone(),
-                };
-                v.push(Box::new(wrapper));
-            }
+            v.extend(clawde_tools::mcp_tool_wrappers(manager_arc.clone()));
         }
         debug!(
             total_tools = v.len(),

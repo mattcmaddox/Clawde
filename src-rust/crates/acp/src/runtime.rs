@@ -82,10 +82,9 @@ impl AgentRuntime {
         // tracked in plan/migration-todo).
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
-        // Build tools: built-ins + AgentTool. MCP tool wrappers are NOT
-        // attached here — the wrapper type lives in the CLI crate today and
-        // adding it would create a circular dep. Built-in tools (Bash, Read,
-        // Edit, Glob, Grep, WebFetch, …) cover the common ACP-editor flows.
+        // Build tools: built-ins + AgentTool + trusted configured MCP tools.
+        // MCP wrappers are treated as network-capable and are omitted in
+        // isolated Ollama mode, matching the CLI registry boundary.
         let network_blocked = clawde_core::network_isolation_enabled(&config);
         let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
             .into_iter()
@@ -96,6 +95,11 @@ impl AgentRuntime {
             })
             .collect();
         tools.push(Box::new(clawde_query::AgentTool::default()));
+        if !network_blocked {
+            if let Some(manager) = &mcp_manager {
+                tools.extend(clawde_tools::mcp_tool_wrappers(manager.clone()));
+            }
+        }
         let tools = Arc::new(tools);
 
         let mut query_config = QueryConfig::from_config(&config);
