@@ -177,7 +177,10 @@ pub async fn run_acp_server_tcp(
                     std::time::Duration::from_secs(5),
                     async {
                         for slot in &mut pending {
-                            if let Some(handle) = slot.take() {
+                            // Borrow the handle while awaiting it so a timeout
+                            // leaves ownership in `pending` for the force-abort
+                            // fallback below.
+                            if let Some(handle) = slot.as_mut() {
                                 let _ = handle.await;
                             }
                         }
