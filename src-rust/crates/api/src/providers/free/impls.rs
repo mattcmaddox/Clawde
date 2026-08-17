@@ -2629,6 +2629,10 @@ mod tests {
         /// When set, records the `max_tokens` value seen by `create_message`
         /// so tests can assert dispatch-time clamping.
         seen_max_tokens: Option<Arc<Mutex<Option<u32>>>>,
+        /// When set, records the full `ProviderRequest` seen by
+        /// `create_message` so tests can assert per-upstream request shaping
+        /// (effort override → `provider_options`) at dispatch time.
+        seen_request: Option<Arc<Mutex<Option<ProviderRequest>>>>,
         /// When set, reports a key-ring status via `key_ring_status()` so
         /// tests can exercise `upstream_key_health()`.
         ring_status: Option<(usize, usize, Option<u64>)>,
@@ -2662,6 +2666,11 @@ mod tests {
             if let Some(rec) = &self.seen_max_tokens {
                 if let Ok(mut g) = rec.lock() {
                     *g = Some(request.max_tokens);
+                }
+            }
+            if let Some(rec) = &self.seen_request {
+                if let Ok(mut g) = rec.lock() {
+                    *g = Some(request.clone());
                 }
             }
             if let Some(log) = &self.attempt_log {
@@ -2855,6 +2864,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok,
                 seen_max_tokens: None,
+                seen_request: None,
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: None,
@@ -2874,6 +2884,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok: false,
                 seen_max_tokens: None,
+                seen_request: None,
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: None,
@@ -2891,9 +2902,33 @@ mod tests {
                 id: ProviderId::new(id),
                 ok,
                 seen_max_tokens: None,
+                seen_request: None,
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: Some(log),
+                fail_msg: None,
+            }),
+            effective_model: None,
+        }
+    }
+
+    /// Entry whose `create_message` receives a recorder capturing the full
+    /// request as dispatched — used to assert per-upstream thinking shaping.
+    fn entry_with_request_recorder(
+        id: &'static str,
+        recorder: Arc<Mutex<Option<ProviderRequest>>>,
+    ) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StubProvider {
+                id: ProviderId::new(id),
+                ok: true,
+                seen_max_tokens: None,
+                seen_request: Some(recorder),
+                ring_status: None,
+                exhaustion: None,
+                attempt_log: None,
                 fail_msg: None,
             }),
             effective_model: None,
@@ -2912,6 +2947,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok,
                 seen_max_tokens: Some(recorder),
+                seen_request: None,
                 ring_status: None,
                 exhaustion: None,
                 attempt_log: None,
@@ -2929,6 +2965,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok: true,
                 seen_max_tokens: None,
+                seen_request: None,
                 ring_status: None,
                 exhaustion: Some(recorder),
                 attempt_log: None,
@@ -2946,6 +2983,7 @@ mod tests {
                 id: ProviderId::new(id),
                 ok: true,
                 seen_max_tokens: None,
+                seen_request: None,
                 ring_status: Some(ring),
                 exhaustion: None,
                 attempt_log: None,
@@ -5349,6 +5387,146 @@ mod tests {
             .provider_options
             .as_object()
             .map_or(true, |o| o.is_empty()));
+    }
+
+    // -------------------------------------------------------------------
+    // End-to-end: effort override → FreeProvider dispatch → upstream request
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn effort_override_shapes_google_upstream_request_end_to_end() {
+        use clawde_core::effort::EffortLevel;
+
+        let recorder = Arc::new(Mutex::new(None));
+        let chain = vec![entry_with_request_recorder("google", recorder.clone())];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        // Pinned free route → gemini-2.5-flash on the google upstream.
+        let mut req = dummy_request("free/google/gemini-2.5-flash");
+        req.max_tokens = 32;
+        req.effort_level = Some(EffortLevel::High);
+        provider
+            .create_message(req.clone())
+            .await
+            .expect("dispatch succeeds");
+
+        let seen = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("google upstream saw a request");
+        assert_eq!(seen.model, "gemini-2.5-flash", "upstream model id replaced");
+        let opts = seen.provider_options.as_object().expect("options");
+        let tc = &opts["thinkingConfig"];
+        assert_eq!(tc["includeThoughts"], serde_json::json!(true));
+        // High = 10_000 budget clamped to max_tokens - 1 (32 - 1 = 31).
+        assert_eq!(tc["thinkingBudget"], serde_json::json!(31));
+    }
+
+    #[tokio::test]
+    async fn effort_off_shapes_google_upstream_request_end_to_end() {
+        use clawde_core::effort::EffortLevel;
+
+        let recorder = Arc::new(Mutex::new(None));
+        let chain = vec![entry_with_request_recorder("google", recorder.clone())];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let mut req = dummy_request("free/google/gemini-2.5-flash");
+        req.effort_level = Some(EffortLevel::None);
+        provider
+            .create_message(req.clone())
+            .await
+            .expect("dispatch succeeds");
+
+        let seen = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream saw a request");
+        let opts = seen.provider_options.as_object().expect("options");
+        let tc = &opts["thinkingConfig"];
+        assert_eq!(tc["includeThoughts"], serde_json::json!(false));
+        assert_eq!(tc["thinkingBudget"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn no_override_leaves_free_upstream_request_unshaped() {
+        let recorder = Arc::new(Mutex::new(None));
+        let chain = vec![entry_with_request_recorder("google", recorder.clone())];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let req = dummy_request("free/google/gemini-2.5-flash");
+        provider
+            .create_message(req.clone())
+            .await
+            .expect("dispatch succeeds");
+
+        let seen = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream saw a request");
+        assert!(
+            seen.provider_options
+                .as_object()
+                .map_or(true, |o| o.is_empty()),
+            "no override must leave provider_options untouched: {:?}",
+            seen.provider_options
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_override_shapes_deepseek_upstream_request_end_to_end() {
+        use clawde_core::effort::EffortLevel;
+
+        let recorder = Arc::new(Mutex::new(None));
+        let chain = vec![entry_with_request_recorder("cline", recorder.clone())];
+        let provider = FreeProvider::with_routing(
+            chain,
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        let mut req = dummy_request("free/cline/deepseek/deepseek-v4-flash");
+        req.effort_level = Some(EffortLevel::Max);
+        provider
+            .create_message(req.clone())
+            .await
+            .expect("dispatch succeeds");
+
+        let seen = recorder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream saw a request");
+        assert_eq!(seen.model, "deepseek/deepseek-v4-flash");
+        let opts = seen.provider_options.as_object().expect("options");
+        assert_eq!(opts["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("max"));
     }
 }
 

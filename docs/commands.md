@@ -376,25 +376,31 @@ Connect to a remote AI provider or configure a custom provider endpoint. Support
 
 ### /thinking
 
-Configure extended thinking for the current session. Extended thinking allows the model to reason through problems before responding, at the cost of additional tokens.
+Configure or report extended thinking for the current session. Extended thinking lets the model reason through its response before answering — higher quality on hard problems, at the cost of additional tokens.
 
 ```
-/thinking
-/thinking on
-/thinking off
+/thinking            — show the active thinking level and its source
+/thinking on         — enable thinking on the active model's native reasoning tier
+/thinking off        — explicitly disable thinking on the active model
 ```
 
-See also `/effort` for a higher-level interface to thinking depth.
+- `on` resolves the active model's balanced native tier (e.g. `high` on Gemini 2.5, `low` on OpenAI GPT-5 family). Models without native reasoning keep the balanced effort so temperature/prompt behaviour stays consistent, but no thinking parameters are sent.
+- `off` is an explicit override, distinct from "no override". Providers that expose a disable knob (Gemini, DeepSeek) turn thinking off; providers with no such knob fall back to their minimum level.
+- `/thinking` is **session-scoped**: it survives a compacted or resumed conversation but never writes to `settings.json`. Use `/config set default-effort` for a persistent default.
+
+See also `/effort` for the higher-level, level-based interface.
 
 ---
 
 ### /effort
 
-Set the thinking effort level. This is a convenience wrapper over `/thinking` that maps human-readable levels to token budgets.
+Set the thinking effort level for the current session. Like `/thinking`, it is session-scoped and takes effect immediately on the next request.
 
 | Level | Description |
 |-------|-------------|
-| `low` | Minimal thinking; fastest responses |
+| `none` | Explicitly disable thinking (where supported) |
+| `minimal` | Smallest thinking budget |
+| `low` | Minimal thinking; deterministic temperature, fastest responses |
 | `medium` | Balanced thinking and speed |
 | `high` | Deep reasoning; slower responses |
 | `max` | Maximum token budget for thinking |
@@ -405,6 +411,8 @@ Set the thinking effort level. This is a convenience wrapper over `/thinking` th
 /effort high
 /effort max
 ```
+
+Effort resolution (highest wins): session override (`/effort`, `/thinking`) > CLI `--effort` > persisted `config.defaultEffort` > provider/model default. For how each level maps onto a provider's native thinking parameters (Gemini budgets/levels, DeepSeek `high`/`max`, OpenAI-family `reasoning_effort`), see the [configuration reference](configuration.md#reasoning-and-effort).
 
 ---
 

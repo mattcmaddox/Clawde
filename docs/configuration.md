@@ -73,6 +73,36 @@ The `config` object holds runtime behaviour options.
 | `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (`free/auto` in Free Mode; e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"free"` | Active provider (`free` = Free Mode router across your configured free upstreams). See the [Providers](#providers) section. |
+| `defaultEffort` | string \| null | null | Persisted thinking-effort default: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultracode`. Applies whenever no session or CLI override exists. Manage with `/config set|get|unset default-effort`. |
+
+### Reasoning and effort
+
+Thinking depth is controlled by a single canonical effort level. Per-turn resolution, highest wins:
+
+```text
+session override (/effort, /thinking on|off)
+  > CLI --effort
+  > persisted settings.json  config.defaultEffort
+  > provider/model default
+```
+
+- `/effort <level>` and `/thinking on|off` are **session-scoped**: they apply to the current conversation (and survive a saved-session resume) but never write to `settings.json`.
+- `none` is an explicit "disable thinking" override, distinct from absent. It beats keyword activation (e.g. `ultracode`) and disables thinking where the provider supports it; providers without a disable knob fall back to their minimum level.
+- `defaultEffort` is only the fallback — `/effort` or `/thinking` in the session always wins.
+
+Each provider translates the level to its native thinking parameters:
+
+| Provider family | Mapping |
+|---|---|
+| Anthropic | `budget_tokens` from the level (1024 … 20000), `< max_tokens` |
+| OpenAI (GPT-5 / o-series) | `reasoning_effort: none \| minimal \| low \| medium \| high` |
+| Google Gemini 2.5 | `thinkingConfig.thinkingBudget` + `includeThoughts` (budget clamped below `maxOutputTokens`) |
+| Google Gemini 3.x | `thinkingConfig.thinkingLevel` (`minimal` … `high`) + `includeThoughts` |
+| DeepSeek V4 | `thinking.type: enabled\|disabled` + `reasoning_effort: high \| max` |
+| Qwen3 (OpenAI-compatible hosts) | `reasoning_effort` |
+| Other models (Llama, GLM, gpt-oss, …) | no thinking parameters — the level only tunes temperature/prompt behaviour |
+
+In Free Mode the router applies the override per upstream at dispatch time, so `/effort high` correctly turns on Gemini thinking when the chain lands on `free/google/…` and emits `reasoning_effort` for a DeepSeek or Qwen3 model elsewhere — each upstream only ever sees parameters its model family accepts.
 
 ### Ollama remote GPU and offline tool mode
 
