@@ -919,6 +919,10 @@ pub struct McpManager {
     /// Active resource subscriptions: (server_name, uri) → change event sender.
     pub resource_subscriptions:
         DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+    /// Notification tasks owned by this manager. Keeping the handles here makes
+    /// manager/session shutdown explicit instead of relying on a future stream
+    /// item to observe that the weak manager reference disappeared.
+    notification_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -937,6 +941,7 @@ impl McpManager {
             failed_servers: Vec::new(),
             server_configs: HashMap::new(),
             resource_subscriptions: DashMap::new(),
+            notification_tasks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1159,6 +1164,39 @@ impl McpManager {
                 )
             })?;
         self.call_tool_binding(&binding, arguments).await
+    }
+
+    /// Disconnect one configured server and release its client.
+    ///
+    /// This is synchronous because dropping the rmcp client closes its
+    /// transport; notification tasks are cancelled separately below.
+    pub fn disconnect(&mut self, server_name: &str) -> bool {
+        let removed_client = self.clients.remove(server_name).is_some();
+        let removed_config = self.server_configs.remove(server_name).is_some();
+        let had_failed = self
+            .failed_servers
+            .iter()
+            .any(|(name, _)| name == server_name);
+        self.failed_servers.retain(|(name, _)| name != server_name);
+        self.resource_subscriptions
+            .retain(|(name, _), _| name != server_name);
+        removed_client || removed_config || had_failed
+    }
+
+    /// Stop notification tasks and release all managed clients/configuration.
+    ///
+    /// Session owners should call this before dropping their MCP context. It is
+    /// also invoked by `Drop` as a last-resort cleanup path.
+    pub fn shutdown(&mut self) {
+        if let Ok(mut tasks) = self.notification_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        self.resource_subscriptions.clear();
+        self.clients.clear();
+        self.failed_servers.clear();
+        self.server_configs.clear();
     }
 
     /// Number of connected servers.
@@ -1412,7 +1450,7 @@ impl McpManager {
             let client_clone = Arc::clone(client);
             let manager_weak = Arc::downgrade(&self);
 
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 // Subscribe to the transport's notification stream
                 let mut notification_stream = client_clone.subscribe_to_notifications();
 
@@ -1441,7 +1479,19 @@ impl McpManager {
                     }
                 }
             });
+            if let Ok(mut tasks) = self.notification_tasks.lock() {
+                tasks.push(task);
+            } else {
+                task.abort();
+                warn!("MCP notification task registry is poisoned; task aborted");
+            }
         }
+    }
+}
+
+impl Drop for McpManager {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1759,6 +1809,48 @@ mod tests {
     fn empty_manager_has_no_exact_tool_bindings() {
         let mgr = McpManager::new();
         assert!(mgr.try_tool_bindings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_clears_manager_state() {
+        let mut mgr = McpManager::new();
+        mgr.server_configs.insert(
+            "server".to_string(),
+            McpServerConfig {
+                name: "server".to_string(),
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                url: None,
+                server_type: "stdio".to_string(),
+                origin: Default::default(),
+            },
+        );
+        mgr.shutdown();
+        mgr.shutdown();
+        assert_eq!(mgr.server_count(), 0);
+        assert!(mgr.server_names().is_empty());
+        assert!(mgr.failed_servers().is_empty());
+    }
+
+    #[test]
+    fn disconnect_removes_server_configuration_and_subscriptions() {
+        let mut mgr = McpManager::new();
+        mgr.server_configs.insert(
+            "server".to_string(),
+            McpServerConfig {
+                name: "server".to_string(),
+                command: None,
+                args: vec![],
+                env: HashMap::new(),
+                url: None,
+                server_type: "stdio".to_string(),
+                origin: Default::default(),
+            },
+        );
+        assert!(mgr.disconnect("server"));
+        assert!(!mgr.disconnect("server"));
+        assert!(mgr.server_configs.is_empty());
     }
 
     #[test]
