@@ -78,8 +78,8 @@ impl AgentRuntime {
 
         // MCP servers from settings — connect upfront so their tools are
         // visible to every session. Per-session MCP servers supplied via
-        // `session/new` params are additive on top of this (v1: ignored,
-        // tracked in plan/migration-todo).
+        // `session/new` are rejected by the dispatcher until session-owned
+        // connection and tool-registry routing is implemented.
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
         // Build tools: built-ins + AgentTool + trusted configured MCP tools.

@@ -18,10 +18,10 @@
 //! | `session/update`             | A → C (no resp) | Streamed text/tool deltas              |
 //! | `session/request_permission` | A → C      | Tool approval dialog                        |
 //!
-//! Per-session MCP server configs supplied via `session/new` are accepted
-//! but currently ignored in favour of the global `settings.json` MCP roster.
-//! This will be resolved as part of the planned unified MCP routing work
-//! (see `src-rust/plan/migration-todo.md`).
+//! Per-session MCP server configs supplied via `session/new` are rejected with
+//! `invalid_params` until unified session-owned MCP routing is implemented.
+//! Configured global MCP servers from `settings.json` remain available to all
+//! sessions subject to the runtime trust and isolation checks.
 
 mod connection;
 mod permission;
