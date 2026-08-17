@@ -9,6 +9,49 @@ use clawde_tools::PendingPermissionStore;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
+/// Session-owned MCP resources. The manager is optional until a session
+/// requests MCP servers; keeping this context on the session prevents future
+/// ACP sessions from accidentally sharing dynamic tool bindings.
+pub struct SessionMcpContext {
+    manager: Option<Arc<clawde_mcp::McpManager>>,
+    shutdown: CancellationToken,
+}
+
+impl SessionMcpContext {
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            manager: None,
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    pub fn from_manager(manager: Arc<clawde_mcp::McpManager>) -> Arc<Self> {
+        Arc::new(Self {
+            manager: Some(manager),
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    pub fn manager(&self) -> Option<Arc<clawde_mcp::McpManager>> {
+        self.manager.clone()
+    }
+
+    pub fn shutdown(&self) {
+        if !self.shutdown.is_cancelled() {
+            self.shutdown.cancel();
+            if let Some(manager) = &self.manager {
+                manager.stop_notification_tasks();
+            }
+        }
+    }
+}
+
+impl Drop for SessionMcpContext {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// One ACP session — a logical conversation with its own cwd, transcript,
 /// MCP server roster, and cancellation token.
 pub struct SessionState {
@@ -16,6 +59,8 @@ pub struct SessionState {
     pub cwd: PathBuf,
     /// Additional absolute roots granted by the ACP client for this session.
     pub additional_directories: Vec<PathBuf>,
+    /// MCP connections and dynamic tool context owned by this session.
+    pub mcp: Arc<SessionMcpContext>,
     pub messages: parking_lot::Mutex<Vec<Message>>,
     cancel_token: parking_lot::Mutex<CancellationToken>,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
@@ -32,10 +77,25 @@ impl SessionState {
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
     ) -> Arc<Self> {
+        Self::new_with_mcp(
+            session_id,
+            cwd,
+            additional_directories,
+            SessionMcpContext::empty(),
+        )
+    }
+
+    pub fn new_with_mcp(
+        session_id: acp::SessionId,
+        cwd: PathBuf,
+        additional_directories: Vec<PathBuf>,
+        mcp: Arc<SessionMcpContext>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
             cwd,
             additional_directories,
+            mcp,
             messages: parking_lot::Mutex::new(Vec::new()),
             cancel_token: parking_lot::Mutex::new(CancellationToken::new()),
             pending_permissions: Arc::new(parking_lot::Mutex::new(
@@ -61,6 +121,10 @@ impl SessionState {
     }
 
     /// Cancel the in-flight turn and replace its token for the next prompt.
+    pub fn shutdown(&self) {
+        self.mcp.shutdown();
+    }
+
     pub fn cancel_current_turn(&self) {
         let current = {
             let mut token = self.cancel_token.lock();
@@ -92,7 +156,10 @@ impl SessionRegistry {
     }
 
     pub fn remove(&self, id: &acp::SessionId) -> Option<Arc<SessionState>> {
-        self.inner.remove(id).map(|(_, v)| v)
+        self.inner.remove(id).map(|(_, state)| {
+            state.shutdown();
+            state
+        })
     }
 }
 
@@ -113,6 +180,14 @@ mod tests {
         assert!(session.prompt_lock.try_lock().is_err());
         drop(first);
         assert!(session.prompt_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn empty_session_mcp_context_has_no_manager() {
+        let context = super::SessionMcpContext::empty();
+        assert!(context.manager().is_none());
+        context.shutdown();
+        context.shutdown();
     }
 
     #[test]

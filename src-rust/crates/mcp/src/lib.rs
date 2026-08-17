@@ -1219,16 +1219,24 @@ impl McpManager {
         removed_client || removed_config || had_failed
     }
 
-    /// Stop notification tasks and release all managed clients/configuration.
-    ///
-    /// Session owners should call this before dropping their MCP context. It is
-    /// also invoked by `Drop` as a last-resort cleanup path.
-    pub fn shutdown(&mut self) {
+    /// Stop notification tasks without requiring unique ownership of the
+    /// manager. Session contexts use this during their own teardown while
+    /// prompt/tool handles may still hold temporary manager references.
+    pub fn stop_notification_tasks(&self) {
         if let Ok(mut tasks) = self.notification_tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();
             }
         }
+    }
+
+    /// Stop notification tasks and release all managed clients/configuration.
+    ///
+    /// Session owners should call this before dropping their MCP context when
+    /// they have unique ownership. It is also invoked by `Drop` as a last-resort
+    /// cleanup path.
+    pub fn shutdown(&mut self) {
+        self.stop_notification_tasks();
         self.resource_subscriptions.clear();
         self.clients.clear();
         self.failed_servers.clear();
