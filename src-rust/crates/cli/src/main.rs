@@ -243,6 +243,24 @@ struct Cli {
     refresh_models: bool,
 }
 
+const ACP_USAGE: &str = r#"Usage: clawde acp [OPTIONS]
+
+Start Clawde as an Agent Client Protocol (ACP) server.
+Without --listen, ACP uses newline-delimited JSON-RPC over stdin/stdout.
+
+Options:
+  --listen <ADDR>            Listen over TCP instead of stdio
+  --tls-cert <PATH>          PEM certificate for TCP TLS
+  --tls-key <PATH>           PEM private key for TCP TLS (use with --tls-cert)
+  --allow-non-loopback       Explicitly allow a non-loopback TCP bind
+  -h, --help                 Show this help
+
+Security:
+  Non-loopback binds are rejected by default because ACP has no application-
+  level authentication. Use localhost or an authenticated SSH/private tunnel.
+  The explicit --allow-non-loopback opt-in is intended for protected deployments.
+"#;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliPermissionMode {
     Default,
@@ -396,6 +414,14 @@ async fn main() -> anyhow::Result<()> {
     // application-level authentication.
     // Optional `--tls-cert <path> --tls-key <path>` enables TLS.
     if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
+        if raw_args[2..]
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h")
+        {
+            print!("{ACP_USAGE}");
+            return Ok(());
+        }
+
         let listen = raw_args
             .iter()
             .position(|a| a == "--listen")
