@@ -153,6 +153,11 @@ impl AgentServer {
                 acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
             );
         }
+        if let Err(reason) = validate_session_mcp_servers(&req.mcp_servers) {
+            return Err(
+                acp::Error::invalid_params().data(Some(serde_json::json!({ "reason": reason })))
+            );
+        }
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
         let state = SessionState::new(
             session_id.clone(),
@@ -160,15 +165,6 @@ impl AgentServer {
             req.additional_directories.clone(),
         );
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
-
-        // v1: MCP routing remains runtime-scoped; filesystem roots are
-        // session-scoped and are applied by the prompt handler.
-        if !req.mcp_servers.is_empty() {
-            warn!(
-                count = req.mcp_servers.len(),
-                "ACP: session-specific MCP servers are not yet routed (v1) — using global config"
-            );
-        }
 
         self.sessions.insert(state);
         Ok(acp::NewSessionResponse::new(session_id))
@@ -204,9 +200,21 @@ fn validate_session_directories(cwd: &Path, additional: &[PathBuf]) -> Result<()
     Ok(())
 }
 
+fn validate_session_mcp_servers(servers: &[acp::McpServer]) -> Result<(), String> {
+    if servers.is_empty() {
+        Ok(())
+    } else {
+        Err(
+            "session-specific MCP servers are not supported yet; configure MCP servers in settings.json"
+                .to_string(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_session_directories;
+    use super::{validate_session_directories, validate_session_mcp_servers};
+    use agent_client_protocol_schema as acp;
     use std::path::Path;
 
     #[test]
@@ -223,6 +231,17 @@ mod tests {
             &[Path::new("shared").to_path_buf()]
         )
         .is_err());
+    }
+
+    #[test]
+    fn session_mcp_servers_fail_closed_until_per_session_routing_exists() {
+        assert!(validate_session_mcp_servers(&[]).is_ok());
+        let server = acp::McpServer::Http(acp::McpServerHttp::new(
+            "remote",
+            "https://example.test/mcp",
+        ));
+        let error = validate_session_mcp_servers(&[server]).unwrap_err();
+        assert!(error.contains("not supported yet"));
     }
 }
 
