@@ -2091,6 +2091,9 @@ pub async fn run_query_loop(
                                 .get(&provider_id_str)
                                 .map(|pc| &pc.options),
                         ),
+                        // Carried for the composite FreeProvider, which re-shapes
+                        // per-upstream thinking parameters at dispatch time.
+                        effort_level: effective_effort_level,
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -2106,10 +2109,24 @@ pub async fn run_query_loop(
                     };
 
                     // Accumulators for building the final assistant message.
-                    let mut text_chunks: Vec<String> = Vec::new();
-                    // Accumulate reasoning/thinking content for providers like
-                    // DeepSeek that require reasoning_content to be sent back.
-                    let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Blocks are recorded in the order the provider emitted
+                    // them (on ContentBlockStart, or lazily on the first delta
+                    // for providers that omit starts), so interleaved thinking
+                    // / text / tool blocks keep their original order instead of
+                    // being regrouped thinking-then-text-then-tools. The
+                    // reasoning_content replay is emitted by the adapter as a
+                    // top-level field, so this ordering is safe for strict
+                    // backends (DeepSeek etc.).
+                    enum StreamedBlockKind {
+                        Text(String),
+                        Thinking { text: String, signature: String },
+                        Tool,
+                    }
+                    struct StreamedBlock {
+                        index: usize,
+                        kind: StreamedBlockKind,
+                    }
+                    let mut streamed_blocks: Vec<StreamedBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
@@ -2189,22 +2206,141 @@ pub async fn run_query_loop(
                                             }
                                             clawde_api::StreamEvent::ContentBlockStart {
                                                 index,
-                                                content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
+                                                content_block,
                                             } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
+                                                match content_block {
+                                                    ContentBlock::ToolUse { id, name, thought_signature, .. } => {
+                                                        tool_call_blocks.insert(
+                                                            *index,
+                                                            (id.clone(), name.clone(), String::new(), thought_signature.clone()),
+                                                        );
+                                                        if !streamed_blocks.iter().any(|b| b.index == *index) {
+                                                            streamed_blocks.push(StreamedBlock {
+                                                                index: *index,
+                                                                kind: StreamedBlockKind::Tool,
+                                                            });
+                                                        }
+                                                    }
+                                                    ContentBlock::Text { text } => {
+                                                        if let Some(entry) = streamed_blocks
+                                                            .iter_mut()
+                                                            .find(|b| b.index == *index)
+                                                        {
+                                                            if let StreamedBlockKind::Text(buf) = &mut entry.kind {
+                                                                buf.push_str(text);
+                                                            }
+                                                        } else {
+                                                            streamed_blocks.push(StreamedBlock {
+                                                                index: *index,
+                                                                kind: StreamedBlockKind::Text(text.clone()),
+                                                            });
+                                                        }
+                                                    }
+                                                    ContentBlock::Thinking {
+                                                        thinking,
+                                                        signature,
+                                                    } => {
+                                                        if let Some(entry) = streamed_blocks
+                                                            .iter_mut()
+                                                            .find(|b| b.index == *index)
+                                                        {
+                                                            if let StreamedBlockKind::Thinking {
+                                                                text,
+                                                                signature: sig,
+                                                            } = &mut entry.kind
+                                                            {
+                                                                text.push_str(thinking);
+                                                                sig.push_str(signature);
+                                                            }
+                                                        } else {
+                                                            streamed_blocks.push(StreamedBlock {
+                                                                index: *index,
+                                                                kind: StreamedBlockKind::Thinking {
+                                                                    text: thinking.clone(),
+                                                                    signature: signature.clone(),
+                                                                },
+                                                            });
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
-                                            clawde_api::StreamEvent::TextDelta { text, .. } => {
-                                                text_chunks.push(text.clone());
+                                            clawde_api::StreamEvent::TextDelta { index, text } => {
+                                                if let Some(entry) = streamed_blocks
+                                                    .iter_mut()
+                                                    .find(|b| b.index == *index)
+                                                {
+                                                    if let StreamedBlockKind::Text(buf) = &mut entry.kind {
+                                                        buf.push_str(text);
+                                                    }
+                                                } else {
+                                                    streamed_blocks.push(StreamedBlock {
+                                                        index: *index,
+                                                        kind: StreamedBlockKind::Text(text.clone()),
+                                                    });
+                                                }
                                             }
-                                            clawde_api::StreamEvent::ThinkingDelta { thinking, .. } => {
-                                                thinking_chunks.push(thinking.clone());
+                                            clawde_api::StreamEvent::ThinkingDelta { index, thinking } => {
+                                                if let Some(entry) = streamed_blocks
+                                                    .iter_mut()
+                                                    .find(|b| b.index == *index)
+                                                {
+                                                    if let StreamedBlockKind::Thinking { text, .. } = &mut entry.kind {
+                                                        text.push_str(thinking);
+                                                    }
+                                                } else {
+                                                    streamed_blocks.push(StreamedBlock {
+                                                        index: *index,
+                                                        kind: StreamedBlockKind::Thinking {
+                                                            text: thinking.clone(),
+                                                            signature: String::new(),
+                                                        },
+                                                    });
+                                                }
                                             }
-                                            clawde_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
-                                                thinking_chunks.push(reasoning.clone());
+                                            clawde_api::StreamEvent::ReasoningDelta { index, reasoning } => {
+                                                // Alias for thinking text used by some providers
+                                                // (DeepSeek reasoning_content); fold into the same
+                                                // block as ThinkingDelta.
+                                                if let Some(entry) = streamed_blocks
+                                                    .iter_mut()
+                                                    .find(|b| b.index == *index)
+                                                {
+                                                    if let StreamedBlockKind::Thinking { text, .. } = &mut entry.kind {
+                                                        text.push_str(reasoning);
+                                                    }
+                                                } else {
+                                                    streamed_blocks.push(StreamedBlock {
+                                                        index: *index,
+                                                        kind: StreamedBlockKind::Thinking {
+                                                            text: reasoning.clone(),
+                                                            signature: String::new(),
+                                                        },
+                                                    });
+                                                }
+                                            }
+                                            clawde_api::StreamEvent::SignatureDelta { index, signature } => {
+                                                if let Some(StreamedBlockKind::Thinking { signature: sig, .. }) =
+                                                    streamed_blocks
+                                                        .iter_mut()
+                                                        .find(|b| b.index == *index)
+                                                        .map(|b| &mut b.kind)
+                                                {
+                                                    sig.push_str(signature);
+                                                }
                                             }
                                             clawde_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
+                                                }
+                                                // Defensive: some providers emit deltas without a
+                                                // preceding ToolUse start; record the block slot so
+                                                // ordering stays deterministic.
+                                                if !streamed_blocks.iter().any(|b| b.index == *index) {
+                                                    streamed_blocks.push(StreamedBlock {
+                                                        index: *index,
+                                                        kind: StreamedBlockKind::Tool,
+                                                    });
                                                 }
                                             }
                                             clawde_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
@@ -2329,29 +2465,11 @@ pub async fn run_query_loop(
                         )));
                     }
 
-                    // Build the content blocks from accumulated stream data.
+                    // Build the content blocks from accumulated stream data,
+                    // preserving the interleaved order the provider emitted
+                    // them (thinking / text / tool blocks stay in place).
                     let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-                    // Thinking / reasoning block — must come first so that
-                    // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking = thinking_chunks.join("");
-                    if !combined_thinking.is_empty() {
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking.clone(),
-                            signature: String::new(),
-                        });
-                    }
-
-                    let combined_text = text_chunks.join("");
-                    if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text {
-                            text: combined_text.clone(),
-                        });
-                    }
-
-                    // Reconstruct tool-use blocks (sorted by index for determinism).
-                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
-                    tc_indices.sort();
                     // Tool calls whose accumulated JSON arguments failed to
                     // parse. We still emit a tool_use block (so the assistant
                     // message stays well-formed and every tool_use has a
@@ -2360,31 +2478,45 @@ pub async fn run_query_loop(
                     // error to the model so it can retry (issue #215).
                     let mut malformed_tool_calls: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
-                    for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) =
-                            tool_call_blocks.remove(&idx)
-                        {
-                            let input = match parse_tool_args(&json_str) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(
-                                        provider = %provider_id_str,
-                                        tool = %name,
-                                        tool_id = %id,
-                                        error = %e,
-                                        "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
-                                    );
-                                    malformed_tool_calls.insert(id.clone());
-                                    // Placeholder input — this call is never executed.
-                                    serde_json::json!({})
+                    for block in streamed_blocks {
+                        match block.kind {
+                            StreamedBlockKind::Text(text) if !text.is_empty() => {
+                                content_blocks.push(ContentBlock::Text { text });
+                            }
+                            StreamedBlockKind::Thinking { text, signature } if !text.is_empty() => {
+                                content_blocks.push(ContentBlock::Thinking {
+                                    thinking: text,
+                                    signature,
+                                });
+                            }
+                            StreamedBlockKind::Tool => {
+                                if let Some((id, name, json_str, thought_signature)) =
+                                    tool_call_blocks.remove(&block.index)
+                                {
+                                    let input = match parse_tool_args(&json_str) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            warn!(
+                                                provider = %provider_id_str,
+                                                tool = %name,
+                                                tool_id = %id,
+                                                error = %e,
+                                                "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
+                                            );
+                                            malformed_tool_calls.insert(id.clone());
+                                            // Placeholder input — this call is never executed.
+                                            serde_json::json!({})
+                                        }
+                                    };
+                                    content_blocks.push(ContentBlock::ToolUse {
+                                        id,
+                                        name,
+                                        input,
+                                        thought_signature,
+                                    });
                                 }
-                            };
-                            content_blocks.push(ContentBlock::ToolUse {
-                                id,
-                                name,
-                                input,
-                                thought_signature,
-                            });
+                            }
+                            _ => {}
                         }
                     }
 
@@ -2503,7 +2635,7 @@ pub async fn run_query_loop(
                     // screen ("agent randomly stops"). Surface a placeholder
                     // so the user always sees *some* assistant output and
                     // knows the turn really ended.
-                    if combined_text.is_empty() && combined_thinking.is_empty() {
+                    if content_blocks.is_empty() {
                         let placeholder = format!(
                             "(no response from {}/{} — model ended the turn with stop_reason \"{}\")",
                             provider_id_str, model_id_str, stop_str
@@ -5084,6 +5216,85 @@ mod tests {
             1,
             "exactly one placeholder expected, got: {}",
             final_text
+        );
+    }
+
+    /// Thinking emitted BETWEEN text segments must stay in place rather than
+    /// being hoisted above the answer (the previous always-thinking-first
+    /// grouping). Text segments targeted at distinct stream indices stay
+    /// separate blocks; segments on the same index merge within that block.
+    #[tokio::test]
+    async fn stream_blocks_keep_interleaved_thinking_order() {
+        use clawde_api::provider_types::StopReason;
+        use clawde_api::StreamEvent;
+
+        let provider = Arc::new(ScriptedStreamProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            events: vec![
+                Ok(StreamEvent::MessageStart {
+                    id: "m1".to_string(),
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                // First answer segment.
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Answer part one. ".to_string(),
+                }),
+                // Turnaround-style reasoning emitted AFTER the answer started.
+                Ok(StreamEvent::ThinkingDelta {
+                    index: 100,
+                    thinking: "reconsidering the approach".to_string(),
+                }),
+                // Second answer segment on a fresh block index.
+                Ok(StreamEvent::TextDelta {
+                    index: 1,
+                    text: "Answer part two. ".to_string(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 1,
+                    text: "Answer part three.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: None,
+                }),
+                Ok(StreamEvent::MessageStop),
+            ],
+        });
+
+        let (outcome, messages) = drive_loop_with_scripted(provider, noop_tools()).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        let msg = &messages[1];
+        let blocks = match &msg.content {
+            clawde_core::types::MessageContent::Blocks(b) => b,
+            _ => panic!("assistant message must use blocks"),
+        };
+        assert_eq!(blocks.len(), 3, "text / thinking / text expected");
+        assert!(
+            matches!(
+                &blocks[0],
+                ContentBlock::Text { text } if text == "Answer part one. "
+            ),
+            "first block must be the first text segment, got: {:?}",
+            blocks[0]
+        );
+        assert!(
+            matches!(
+                &blocks[1],
+                ContentBlock::Thinking { thinking, .. } if thinking == "reconsidering the approach"
+            ),
+            "thinking must stay between the text segments, got: {:?}",
+            blocks[1]
+        );
+        assert!(
+            matches!(
+                &blocks[2],
+                ContentBlock::Text { text } if text == "Answer part two. Answer part three."
+            ),
+            "same-index text segments must merge, got: {:?}",
+            blocks[2]
         );
     }
 

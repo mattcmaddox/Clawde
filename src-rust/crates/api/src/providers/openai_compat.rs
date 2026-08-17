@@ -1544,6 +1544,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1609,6 +1610,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1687,6 +1689,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1764,6 +1767,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1829,6 +1833,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1872,6 +1877,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1913,6 +1919,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };
@@ -1947,6 +1954,7 @@ mod tests {
             top_k: None,
             top_p: None,
             thinking: None,
+            effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
         };

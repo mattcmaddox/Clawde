@@ -182,6 +182,7 @@ impl SlashCommand for ReviewCommand {
             top_k: None,
             stop_sequences: vec![],
             thinking: None,
+            effort_level: None,
             provider_options: serde_json::Value::Object(Default::default()),
         };
 

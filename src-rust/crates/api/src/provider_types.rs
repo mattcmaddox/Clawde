@@ -83,6 +83,15 @@ pub struct ProviderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
 
+    /// Reasoning effort override for this request. `None` lets the
+    /// provider/model default apply. Direct providers receive the effort
+    /// through `provider_options` (assembled by the query layer); the
+    /// composite FreeProvider reads this field at dispatch time to re-shape
+    /// per-upstream thinking parameters, since it cannot know which upstream
+    /// will serve the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<clawde_core::effort::EffortLevel>,
+
     /// Arbitrary provider-specific options merged into the request body.
     /// Defaults to an empty JSON object `{}`.
     #[serde(default)]

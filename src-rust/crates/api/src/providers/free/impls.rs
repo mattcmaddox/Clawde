@@ -1080,6 +1080,7 @@ impl RetryingFreeStream {
         let provider = self.chain[hedge_idx].provider.clone();
         let mut req = self.request.clone();
         req.model = hedge_model.clone();
+        shape_thinking_for_upstream(&mut req, &self.chain[hedge_idx]);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -1366,6 +1367,7 @@ impl RetryingFreeStream {
             let mut req = self.request.clone();
             req.model = model.clone();
             clamp_max_tokens_for(&mut req, entry);
+            shape_thinking_for_upstream(&mut req, entry);
             let timeout = self.adaptive_timeout(idx);
             let provider = entry.provider.clone();
 
@@ -1526,6 +1528,7 @@ impl Stream for RetryingFreeStream {
                             let mut req = self.request.clone();
                             req.model = model.clone();
                             clamp_max_tokens_for(&mut req, entry);
+                            shape_thinking_for_upstream(&mut req, entry);
                             let timeout = self.adaptive_timeout(idx);
                             let provider = entry.provider.clone();
                             self.parallel_idx = idx;
@@ -1836,6 +1839,7 @@ impl LlmProvider for FreeProvider {
             let mut req = request.clone();
             req.model = upstream_model;
             self.clamp_max_tokens(&mut req, idx);
+            shape_thinking_for_upstream(&mut req, entry);
 
             let start = Instant::now();
             let timeout = self.adaptive_timeout(idx);
@@ -1940,6 +1944,7 @@ impl LlmProvider for FreeProvider {
             let mut req = request.clone();
             req.model = upstream_model.clone();
             self.clamp_max_tokens(&mut req, idx);
+            shape_thinking_for_upstream(&mut req, entry);
 
             let _start = Instant::now();
             let timeout = self.adaptive_timeout(idx);
@@ -2962,6 +2967,7 @@ mod tests {
             top_k: None,
             stop_sequences: Vec::new(),
             thinking: None,
+            effort_level: None,
             provider_options: serde_json::Value::Null,
         }
     }
@@ -5228,6 +5234,121 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::AuthFailed { .. }));
+    }
+    // -------------------------------------------------------------------
+    // Per-upstream thinking shaping
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn shape_thinking_google_gemini_25_uses_budget_clamped_to_max_tokens() {
+        use clawde_core::effort::EffortLevel;
+        let mut req = dummy_request("gemini-2.5-flash");
+        req.max_tokens = 32;
+        req.effort_level = Some(EffortLevel::High);
+        let goog = entry("google", true);
+        shape_thinking_for_upstream(&mut req, &goog);
+        let opts = req.provider_options.as_object().expect("options");
+        let thinking = &opts["thinkingConfig"];
+        assert_eq!(thinking["includeThoughts"], serde_json::json!(true));
+        // High = 10_000 budget, but Gemini requires budget < maxOutputTokens,
+        // and the upstream cap already clamped max_tokens to 32.
+        assert_eq!(thinking["thinkingBudget"], serde_json::json!(31));
+    }
+
+    #[test]
+    fn shape_thinking_google_2_5_off_disables_budget() {
+        use clawde_core::effort::EffortLevel;
+        let mut req = dummy_request("gemini-2.5-flash");
+        req.effort_level = Some(EffortLevel::None);
+        let goog = entry("google", true);
+        shape_thinking_for_upstream(&mut req, &goog);
+        let opts = req.provider_options.as_object().expect("options");
+        let cfg = &opts["thinkingConfig"];
+        assert_eq!(cfg["includeThoughts"], serde_json::json!(false));
+        assert_eq!(cfg["thinkingBudget"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn shape_thinking_google_3_uses_level() {
+        use clawde_core::effort::EffortLevel;
+        let mut req = dummy_request("gemini-3-flash-preview");
+        req.effort_level = Some(EffortLevel::Medium);
+        let goog = entry("google", true);
+        shape_thinking_for_upstream(&mut req, &goog);
+        let opts = req.provider_options.as_object().expect("options");
+        let cfg = &opts["thinkingConfig"];
+        assert_eq!(cfg["includeThoughts"], serde_json::json!(true));
+        assert_eq!(cfg["thinkingLevel"], serde_json::json!("medium"));
+
+        req.effort_level = Some(EffortLevel::Minimal);
+        shape_thinking_for_upstream(&mut req, &goog);
+        let cfg = &req.provider_options.as_object().expect("options")["thinkingConfig"];
+        assert_eq!(cfg["thinkingLevel"], serde_json::json!("minimal"));
+    }
+
+    #[test]
+    fn shape_thinking_deepseek_enabled_disabled_and_max() {
+        use clawde_core::effort::EffortLevel;
+        let cline = entry("cline", true);
+
+        let mut req = dummy_request("deepseek/deepseek-v4-flash");
+        req.effort_level = Some(EffortLevel::High);
+        shape_thinking_for_upstream(&mut req, &cline);
+        let opts = req.provider_options.as_object().expect("options");
+        assert_eq!(opts["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("high"));
+
+        req.effort_level = Some(EffortLevel::Max);
+        shape_thinking_for_upstream(&mut req, &cline);
+        let opts = req.provider_options.as_object().expect("options");
+        assert_eq!(opts["thinking"]["type"], serde_json::json!("enabled"));
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("max"));
+
+        req.effort_level = Some(EffortLevel::None);
+        shape_thinking_for_upstream(&mut req, &cline);
+        let opts = req.provider_options.as_object().expect("options");
+        assert_eq!(opts["thinking"]["type"], serde_json::json!("disabled"));
+        assert!(opts.get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn shape_thinking_openai_compat_only_reasoning_families() {
+        use clawde_core::effort::EffortLevel;
+        let groq = entry("groq", true);
+
+        let mut req = dummy_request("qwen/qwen3-30b-a3b-fp8");
+        req.effort_level = Some(EffortLevel::Medium);
+        shape_thinking_for_upstream(&mut req, &groq);
+        let opts = req.provider_options.as_object().expect("options");
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("medium"));
+
+        // Qwen3 + explicit off maps to "none" so the model still thinks at
+        // its minimum rather than using unknown-parameter errors.
+        req.effort_level = Some(EffortLevel::None);
+        shape_thinking_for_upstream(&mut req, &groq);
+        let opts = req.provider_options.as_object().expect("options");
+        assert_eq!(opts["reasoningEffort"], serde_json::json!("none"));
+
+        // Non-reasoning models (Llama) must not receive a parameter their
+        // API may reject.
+        let hf = entry("huggingface", true);
+        let mut llama = dummy_request("meta-llama/Llama-3.3-70B-Instruct");
+        llama.effort_level = Some(EffortLevel::High);
+        shape_thinking_for_upstream(&mut llama, &hf);
+        assert!(llama
+            .provider_options
+            .as_object()
+            .map_or(true, |o| o.is_empty()));
+    }
+
+    #[test]
+    fn shape_thinking_no_override_is_noop() {
+        let mut req = dummy_request("gemini-2.5-flash");
+        shape_thinking_for_upstream(&mut req, &entry("google", true));
+        assert!(req
+            .provider_options
+            .as_object()
+            .map_or(true, |o| o.is_empty()));
     }
 }
 

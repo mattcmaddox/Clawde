@@ -1069,6 +1069,7 @@ mod tests {
             top_k: None,
             stop_sequences: vec![],
             thinking: None,
+            effort_level: None,
             provider_options: json!({}),
         }
     }

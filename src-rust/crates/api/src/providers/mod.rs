@@ -1,6 +1,12 @@
 pub mod anthropic;
 pub use anthropic::AnthropicProvider;
 
+pub mod effort_shaping;
+pub use effort_shaping::{
+    deepseek_reasoning_effort_for_level, google_thinking_level_for_effort,
+    openai_compat_reasoning_model, openai_reasoning_effort_for_level, openai_reasoning_model,
+};
+
 pub(crate) mod message_normalization;
 pub(crate) mod request_options;
 

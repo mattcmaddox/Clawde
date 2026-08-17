@@ -476,6 +476,7 @@ mod tests {
             top_k: None,
             stop_sequences: Vec::new(),
             thinking: thinking.then(|| ThinkingConfig::enabled(4096)),
+            effort_level: None,
             provider_options: serde_json::json!({}),
         }
     }

@@ -1120,6 +1120,7 @@ async fn summarise_head(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
+        effort_level: None,
         provider_options: Default::default(),
     };
 
@@ -1662,6 +1663,7 @@ pub async fn context_collapse(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
+        effort_level: None,
         provider_options: Default::default(),
     };
 

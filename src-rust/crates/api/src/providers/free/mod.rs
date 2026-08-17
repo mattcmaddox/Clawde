@@ -268,6 +268,114 @@ fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
     }
 }
 
+/// Shape an explicit effort override onto the upstream's native thinking
+/// parameters.
+///
+/// The query layer cannot know which upstream will serve a `free` request
+/// (the plan depends on cooldown / latency / task routing), so the chain
+/// re-assembles per-entry request parameters at dispatch time — mirroring the
+/// `build_provider_options` the query layer performs for direct providers.
+/// No-op when the request carries no effort override, or when the upstream's
+/// model family exposes no thinking control. Single source of truth for the
+/// per-upstream mapping; used by every dispatch site (non-streaming
+/// fallback, streaming fallback, `RetryingFreeStream` re-dispatch, and the
+/// hedge path).
+fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
+    use crate::providers::effort_shaping::{
+        deepseek_reasoning_effort_for_level, google_thinking_level_for_effort,
+        openai_compat_reasoning_model, openai_reasoning_effort_for_level,
+    };
+    use clawde_core::effort::EffortLevel;
+
+    let Some(level) = req.effort_level else {
+        return;
+    };
+    // Requests assembled without provider options (test-constructed requests)
+    // must not silently drop the override — fuse into an object first.
+    if !req.provider_options.is_object() {
+        req.provider_options = serde_json::json!({});
+    }
+    let Some(options) = req.provider_options.as_object_mut() else {
+        return;
+    };
+    let upstream = entry.upstream.id;
+    let model = req.model.to_ascii_lowercase();
+    let off = level == EffortLevel::None;
+
+    match upstream {
+        // Gemini: thinkingConfig lives in generationConfig and is expressed
+        // as a budget (2.5 models) or a level (3.x models). Mirrors the
+        // query-layer's google branch.
+        "google" => {
+            if model.contains("2.5") {
+                let mut budget = if off {
+                    0
+                } else {
+                    level.thinking_budget_tokens().unwrap_or(0)
+                };
+                // Gemini requires budget < maxOutputTokens (Clawde already
+                // clamps max_tokens to the upstream cap at this point).
+                budget = budget.min(req.max_tokens.saturating_sub(1));
+                options.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({
+                        "includeThoughts": !off,
+                        "thinkingBudget": budget,
+                    }),
+                );
+            } else if model.contains("3.") || model.contains("gemini-3") {
+                options.insert(
+                    "thinkingConfig".to_string(),
+                    serde_json::json!({
+                        "includeThoughts": !off,
+                        "thinkingLevel": if off {
+                            "minimal"
+                        } else {
+                            google_thinking_level_for_effort(Some(level))
+                        },
+                    }),
+                );
+            }
+        }
+        // DeepSeek models are served by cline / opencode-zen / openrouter
+        // through OpenAI-compatible endpoints that pass `thinking` through.
+        _ if model.starts_with("deepseek") || model.contains("/deepseek") => {
+            // `none` and `low` both disable DeepSeek thinking (query parity).
+            let enabled = !off && level != EffortLevel::Low;
+            options.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": if enabled { "enabled" } else { "disabled" } }),
+            );
+            // Drop any leftover effort key from an earlier shape pass so a
+            // disabled request never carries reasoning parameters.
+            if enabled {
+                options.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::json!(deepseek_reasoning_effort_for_level(level)),
+                );
+            } else {
+                options.remove("reasoningEffort");
+            }
+        }
+        // OpenAI reasoning families (GPT-5 / O-series / Qwen3) via
+        // OpenAI-compatible upstreams; the copilot adapter accepts the same
+        // `reasoningEffort` key. Explicit-off maps to "none" so the model
+        // thinks at its minimum rather than not at all.
+        _ => {
+            if openai_compat_reasoning_model(&model) {
+                options.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::json!(if off {
+                        "none"
+                    } else {
+                        openai_reasoning_effort_for_level(level)
+                    }),
+                );
+            }
+        }
+    }
+}
+
 /// Serialize provider-state writes in this process. The per-file lock below
 /// extends the same guarantee across separate Clawde processes.
 static PERSISTENCE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

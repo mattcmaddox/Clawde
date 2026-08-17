@@ -6,49 +6,20 @@ use crate::*;
 pub(crate) fn reasoning_effort_for_level(
     effort_level: clawde_core::effort::EffortLevel,
 ) -> &'static str {
-    use clawde_core::effort::EffortLevel;
-    match effort_level {
-        // `none`/`minimal` are the two OpenAI reasoning_effort tiers below `low`;
-        // pass them through verbatim (the model's variants ladder only offers
-        // them where the API accepts them).
-        EffortLevel::None => "none",
-        EffortLevel::Minimal => "minimal",
-        EffortLevel::Low => "low",
-        EffortLevel::Medium => "medium",
-        // XHigh/Max/Ultracode collapse to "high" for the generic OpenAI-family
-        // `reasoning_effort` value. Providers that accept a higher tier (e.g.
-        // Codex's "xhigh") get it via the provider-specific override below;
-        // defaulting to "high" keeps unknown providers safe.
-        EffortLevel::High | EffortLevel::XHigh | EffortLevel::Max | EffortLevel::Ultracode => {
-            "high"
-        }
-    }
+    // Single source of truth: the composite FreeProvider shapes per-upstream
+    // thinking options from the same ladder mapping, so the two paths can
+    // never drift apart.
+    clawde_api::providers::effort_shaping::openai_reasoning_effort_for_level(effort_level)
 }
 
 pub(crate) fn google_thinking_level_for_effort(
     effort_level: Option<clawde_core::effort::EffortLevel>,
 ) -> &'static str {
-    use clawde_core::effort::EffortLevel;
-    match effort_level.unwrap_or(EffortLevel::High) {
-        // Google's thinkingLevel has no "none"; floor it at "low". "minimal" is a
-        // real gemini-3 thinking level, so pass Minimal through.
-        EffortLevel::None => "low",
-        EffortLevel::Minimal => "minimal",
-        EffortLevel::Low => "low",
-        EffortLevel::Medium => "medium",
-        // Gemini's top thinking level is "high"; XHigh/Max/Ultracode all map onto it.
-        EffortLevel::High | EffortLevel::XHigh | EffortLevel::Max | EffortLevel::Ultracode => {
-            "high"
-        }
-    }
+    clawde_api::providers::effort_shaping::google_thinking_level_for_effort(effort_level)
 }
 
 pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
-    let model_id = model_id.to_ascii_lowercase();
-    model_id.starts_with("gpt-5")
-        || model_id.starts_with("o1")
-        || model_id.starts_with("o3")
-        || model_id.starts_with("o4")
+    clawde_api::providers::effort_shaping::openai_reasoning_model(model_id)
 }
 
 pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
