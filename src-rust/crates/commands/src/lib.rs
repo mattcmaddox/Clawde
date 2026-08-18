@@ -324,7 +324,10 @@ async fn provider_for_config(
 /// Resolve the provider a command should use: an explicit test override wins,
 /// otherwise build one from config. The override keeps command unit tests
 /// hermetic (no network) while leaving production behavior unchanged.
-async fn resolve_command_provider(
+///
+/// `pub` so the interactive CLI can resolve the provider for a background
+/// command task (e.g. `/compact`) before spawning it.
+pub async fn resolve_command_provider(
     ctx: &CommandContext,
 ) -> Option<std::sync::Arc<dyn clawde_api::LlmProvider>> {
     if let Some(provider) = &ctx.test_provider {
@@ -892,14 +895,16 @@ enum CompactError {
 /// construction, API call with timeout, response parsing, and formatting.
 /// Each caller maps the result into the appropriate [`CommandResult`] variant.
 async fn try_compact(
-    ctx: &CommandContext,
+    provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>>,
+    messages: &[clawde_core::types::Message],
     msg_count: usize,
     custom_instructions: Option<&str>,
     compact_model: &str,
+    effort: Option<clawde_core::effort::EffortLevel>,
 ) -> Result<String, CompactError> {
-    let transcript = build_conversation_transcript(&ctx.messages);
+    let transcript = build_conversation_transcript(messages);
 
-    let provider = match resolve_command_provider(ctx).await {
+    let provider = match provider {
         Some(p) => p,
         None => return Err(CompactError::NoProvider),
     };
@@ -929,7 +934,7 @@ async fn try_compact(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
-        effort_level: ctx.effort,
+        effort_level: effort,
         provider_options: serde_json::Value::Object(Default::default()),
     };
 
@@ -975,80 +980,116 @@ impl SlashCommand for CompactCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let msg_count = ctx.messages.len();
-        if msg_count < 2 {
-            return CommandResult::Message(
-                "Conversation has fewer than 2 messages -- nothing to compact.".to_string(),
-            );
+        let provider = resolve_command_provider(ctx).await;
+        run_compact_command(
+            ctx.messages.clone(),
+            provider,
+            ctx.config.clone(),
+            ctx.effort,
+            args,
+        )
+        .await
+    }
+}
+
+/// Run `/compact` to completion and return the same [`CommandResult`] the
+/// registry command produces.
+///
+/// Shared by [`CompactCommand`] and the interactive CLI's background
+/// compaction task: `/compact` calls the model and can take up to
+/// [`COMPACT_API_TIMEOUT`], so the CLI spawns it on a detached task (Esc
+/// cancels) instead of freezing the render loop. Taking owned, `Send` inputs
+/// instead of a `&mut CommandContext` lets the task run outside command
+/// dispatch while staying behaviorally identical to the registry path.
+pub async fn run_compact_command(
+    messages: Vec<clawde_core::types::Message>,
+    provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>>,
+    config: clawde_core::config::Config,
+    effort: Option<clawde_core::effort::EffortLevel>,
+    args: &str,
+) -> CommandResult {
+    let msg_count = messages.len();
+    if msg_count < 2 {
+        return CommandResult::Message(
+            "Conversation has fewer than 2 messages -- nothing to compact.".to_string(),
+        );
+    }
+
+    // Determine whether to inject (send) or preview, and collect any
+    // custom instructions from the arguments (skipped for "send").
+    let is_send = args.trim().eq_ignore_ascii_case("send");
+    let custom_instructions = if is_send || args.trim().is_empty() {
+        None
+    } else {
+        Some(args.trim())
+    };
+
+    let compact_model = resolve_fast_model_id(&config);
+
+    match try_compact(
+        provider,
+        &messages,
+        msg_count,
+        custom_instructions,
+        &compact_model,
+        effort,
+    )
+    .await
+    {
+        Ok(formatted) => {
+            if is_send {
+                CommandResult::UserMessage(format!(
+                    "[Compact requested - {} earlier messages summarized. Summary below replaces them. Please continue from where we left off.]\n\n<compact-summary>\n{}\n</compact-summary>",
+                    msg_count, formatted
+                ))
+            } else {
+                CommandResult::Message(format!(
+                    "Conversation Compact\n------------------\nOriginal messages: {msg_count}\nModel: {compact_model}\n\n{formatted}\n\n----\nUse /compact send to ask the model to perform the compaction (replace history with this summary)."
+                ))
+            }
         }
-
-        // Determine whether to inject (send) or preview, and collect any
-        // custom instructions from the arguments (skipped for "send").
-        let is_send = args.trim().eq_ignore_ascii_case("send");
-        let custom_instructions = if is_send || args.trim().is_empty() {
-            None
-        } else {
-            Some(args.trim())
-        };
-
-        let compact_model = resolve_fast_model_id(&ctx.config);
-
-        match try_compact(ctx, msg_count, custom_instructions, &compact_model).await {
-            Ok(formatted) => {
-                if is_send {
-                    CommandResult::UserMessage(format!(
-                        "[Compact requested - {} earlier messages summarized. Summary below replaces them. Please continue from where we left off.]\n\n<compact-summary>\n{}\n</compact-summary>",
-                        msg_count, formatted
-                    ))
+        Err(CompactError::NoProvider) => CommandResult::Error(
+            "No provider available for compaction. Configure an API key first.".to_string(),
+        ),
+        Err(CompactError::ProviderError) => {
+            if is_send {
+                CommandResult::Error(
+                    "Compact send failed. Try /compact first to preview.".to_string(),
+                )
+            } else {
+                let fallback_instruction = if args.trim().is_empty() {
+                    "Provide a detailed summary of our conversation so far, preserving all key technical details, decisions made, file paths mentioned, and current task status."
                 } else {
-                    CommandResult::Message(format!(
-                        "Conversation Compact\n------------------\nOriginal messages: {msg_count}\nModel: {compact_model}\n\n{formatted}\n\n----\nUse /compact send to ask the model to perform the compaction (replace history with this summary)."
-                    ))
-                }
+                    args.trim()
+                };
+                CommandResult::UserMessage(format!(
+                    "[Compact requested ({} messages). Instruction: {}]",
+                    msg_count, fallback_instruction
+                ))
             }
-            Err(CompactError::NoProvider) => CommandResult::Error(
-                "No provider available for compaction. Configure an API key first.".to_string(),
-            ),
-            Err(CompactError::ProviderError) => {
-                if is_send {
-                    CommandResult::Error(
-                        "Compact send failed. Try /compact first to preview.".to_string(),
-                    )
-                } else {
-                    let fallback_instruction = if args.trim().is_empty() {
-                        "Provide a detailed summary of our conversation so far, preserving all key technical details, decisions made, file paths mentioned, and current task status."
-                    } else {
-                        args.trim()
-                    };
-                    CommandResult::UserMessage(format!(
-                        "[Compact requested ({} messages). Instruction: {}]",
-                        msg_count, fallback_instruction
-                    ))
-                }
+        }
+        Err(CompactError::Timeout) => {
+            if is_send {
+                CommandResult::Error(format!(
+                    "Compact send timed out after {} seconds. Try /compact first to preview.",
+                    COMPACT_API_TIMEOUT.as_secs()
+                ))
+            } else {
+                CommandResult::Message(format!(
+                    "Compact request timed out after {} seconds. Try again or use /compact send to request the model to summarise the conversation in a new message.",
+                    COMPACT_API_TIMEOUT.as_secs()
+                ))
             }
-            Err(CompactError::Timeout) => {
-                if is_send {
-                    CommandResult::Error(format!(
-                        "Compact send timed out after {} seconds. Try /compact first to preview.",
-                        COMPACT_API_TIMEOUT.as_secs()
-                    ))
-                } else {
-                    CommandResult::Message(format!(
-                        "Compact request timed out after {} seconds. Try again or use /compact send to request the model to summarise the conversation in a new message.",
-                        COMPACT_API_TIMEOUT.as_secs()
-                    ))
-                }
-            }
-            Err(CompactError::EmptySummary) => {
-                if is_send {
-                    CommandResult::Error(
-                        "Compact summary was empty. Cannot perform compaction.".to_string(),
-                    )
-                } else {
-                    CommandResult::Error(
-                        "Compact summary was empty. Try again or use /compact send.".to_string(),
-                    )
-                }
+        }
+        Err(CompactError::EmptySummary) => {
+            if is_send {
+                CommandResult::Error(
+                    "Compact summary was empty. Cannot perform compaction.".to_string(),
+                )
+            } else {
+                CommandResult::Error(
+                    "Compact summary was empty. Try again or use /compact send.".to_string(),
+                )
             }
         }
     }
@@ -3596,6 +3637,74 @@ mod tests {
                 );
             }
             other => panic!("expected UserMessage, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compact_command_short_circuits_fewer_than_two_messages() {
+        let result = run_compact_command(
+            vec![Message::user("only one")],
+            None,
+            clawde_core::config::Config::default(),
+            None,
+            "",
+        )
+        .await;
+        match &result {
+            CommandResult::Message(m) if m.contains("fewer than 2 messages") => {}
+            other => panic!("expected short-circuit Message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compact_command_no_provider_returns_error() {
+        let result = run_compact_command(
+            vec![Message::user("a"), Message::assistant("b")],
+            None,
+            clawde_core::config::Config::default(),
+            None,
+            "",
+        )
+        .await;
+        match &result {
+            CommandResult::Error(e) if e.contains("No provider") => {}
+            other => panic!("expected NoProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compact_command_preview_with_canned_provider() {
+        let provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>> =
+            Some(std::sync::Arc::new(CannedProvider::new()));
+        let result = run_compact_command(
+            vec![Message::user("Hello"), Message::assistant("Hi there!")],
+            provider,
+            clawde_core::config::Config::default(),
+            None,
+            "",
+        )
+        .await;
+        match &result {
+            CommandResult::Message(m) if m.contains("Conversation Compact") => {}
+            other => panic!("expected preview Message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compact_command_send_injects_summary() {
+        let provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>> =
+            Some(std::sync::Arc::new(CannedProvider::new()));
+        let result = run_compact_command(
+            vec![Message::user("Hello"), Message::assistant("Hi there!")],
+            provider,
+            clawde_core::config::Config::default(),
+            None,
+            "send",
+        )
+        .await;
+        match &result {
+            CommandResult::UserMessage(m) if m.contains("[Compact requested") => {}
+            other => panic!("expected injected UserMessage, got {other:?}"),
         }
     }
 

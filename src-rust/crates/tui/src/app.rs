@@ -1327,6 +1327,14 @@ pub struct App {
     /// a verify round is running its checks (potentially slow) and the status
     /// row should show a `verifying…` spinner instead of silent wait.
     pub is_verifying: bool,
+    /// True between [`QueryEvent::CompactStarted`] and [`QueryEvent::Compact`]:
+    /// a background `/compact` request is in flight and the status row shows a
+    /// `compacting…` spinner. Esc while set raises
+    /// [`App::compact_cancel_requested`] so the CLI can abort the request.
+    pub is_compacting: bool,
+    /// Set by Esc while [`App::is_compacting`] — the CLI frame loop observes
+    /// this and cancels the in-flight compaction's cancellation token.
+    pub compact_cancel_requested: bool,
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
@@ -2041,6 +2049,8 @@ impl App {
             system_annotations: Vec::new(),
             verify: None,
             is_verifying: false,
+            is_compacting: false,
+            compact_cancel_requested: false,
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
@@ -4082,6 +4092,7 @@ impl App {
     pub fn needs_fast_repaint(&self) -> bool {
         self.is_streaming
             || self.is_verifying
+            || self.is_compacting
             || self.effort_picker.wants_animation()
             || self.any_modal_open()
     }
@@ -4889,6 +4900,20 @@ impl App {
         let key = normalize_layout_shortcut_key(key);
         let key_context = self.current_key_context();
         let key = normalize_configured_vertical_navigation(key, &self.keybindings, &key_context);
+
+        // Esc while a background /compact is in flight aborts it. Checked
+        // before any dialog handling so the cancel works even if a modal is
+        // open; the CLI observes `compact_cancel_requested` next frame and
+        // cancels the token driving the model call.
+        if self.is_compacting
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && !self.notifications.current_is_error()
+        {
+            self.compact_cancel_requested = true;
+            self.status_message = Some("Cancelling compaction…".to_string());
+            return false;
+        }
 
         // Dismiss error modal with Esc
         if key.code == KeyCode::Esc && self.notifications.current_is_error() {
@@ -10065,6 +10090,23 @@ impl App {
                 self.push_verify_annotation(report);
             }
 
+            QueryEvent::CompactStarted => {
+                // The model call is about to run in the background — surface
+                // a `compacting…` spinner until the outcome lands.
+                self.is_compacting = true;
+                self.compact_cancel_requested = false;
+            }
+
+            QueryEvent::Compact(outcome) => {
+                // The CLI performs the side effects (preview push, summary
+                // injection + new turn); the TUI only clears the spinner.
+                self.is_compacting = false;
+                self.compact_cancel_requested = false;
+                if matches!(outcome, clawde_query::CompactOutcome::Cancelled) {
+                    self.status_message = Some("Compaction cancelled.".to_string());
+                }
+            }
+
             QueryEvent::SemanticVerify(report) => {
                 self.is_verifying = false;
                 let findings = if report.findings.is_empty() {
@@ -12359,6 +12401,46 @@ mod tests {
             "Verify sandbox 'container' could not prepare image".to_string(),
         ));
         assert!(!app.is_verifying);
+    }
+
+    #[test]
+    fn test_compact_spinner_lifecycle_and_esc_cancel() {
+        let mut app = make_app();
+        assert!(!app.is_compacting);
+
+        // CompactStarted arms the spinner and fast repaint.
+        app.handle_query_event(QueryEvent::CompactStarted);
+        assert!(app.is_compacting);
+        assert!(app.needs_fast_repaint());
+
+        // Esc while compacting requests cancellation; no dialog is open.
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+        assert!(app.compact_cancel_requested);
+        assert!(app.is_compacting, "spinner stays until the outcome lands");
+
+        // The outcome disarms everything and surfaces the cancellation note.
+        app.handle_query_event(QueryEvent::Compact(clawde_query::CompactOutcome::Cancelled));
+        assert!(!app.is_compacting);
+        assert!(!app.compact_cancel_requested);
+        assert!(!app.needs_fast_repaint());
+        assert_eq!(app.status_message.as_deref(), Some("Compaction cancelled."));
+    }
+
+    #[test]
+    fn test_compact_esc_does_not_cancel_when_not_compacting() {
+        let mut app = make_app();
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+        assert!(!app.compact_cancel_requested);
     }
 
     #[test]

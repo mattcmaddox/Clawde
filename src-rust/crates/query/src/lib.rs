@@ -419,6 +419,31 @@ pub enum QueryEvent {
     /// Advisory execution evidence appended to the approved plan progress
     /// artifact. This never authorizes acceptance or advances a plan step.
     PlanProgress(clawde_core::PlanProgressEvent),
+    /// A background `/compact` request started (interactive path). Emitted
+    /// before the model call so the TUI can show a `compacting…` indicator
+    /// instead of a silent wait; paired with [`QueryEvent::Compact`], which
+    /// reports the outcome.
+    CompactStarted,
+    /// Outcome of a background `/compact` request (interactive path only;
+    /// headless runs execute compaction inline through the command registry).
+    Compact(CompactOutcome),
+}
+
+/// Result of a background `/compact` request, delivered via
+/// [`QueryEvent::Compact`]. Kept free of `CommandResult` so the query crate
+/// (which cannot depend on the commands crate) can carry it.
+#[derive(Debug, Clone)]
+pub enum CompactOutcome {
+    /// `/compact` preview — show the summary to the user (does not go to the
+    /// model).
+    Preview(String),
+    /// `/compact send` — inject the summary as a user message and continue
+    /// with a new turn.
+    Summary(String),
+    /// The request failed (provider error, timeout, empty summary).
+    Error(String),
+    /// The user cancelled the in-flight request (Esc).
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------

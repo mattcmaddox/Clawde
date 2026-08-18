@@ -3364,6 +3364,8 @@ async fn run_interactive(
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
+    // Cancel token for an in-flight background /compact request (Esc cancels).
+    let mut compact_cancel: Option<CancellationToken> = None;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     type MessagesArc = Arc<tokio::sync::Mutex<Vec<clawde_core::types::Message>>>;
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
@@ -3788,6 +3790,54 @@ async fn run_interactive(
                                         }
                                     });
                                 });
+                                continue;
+                            }
+
+                            // ── /compact: background dispatch ───────────────────────
+                            // Compaction calls the model and can take up to
+                            // COMPACT_API_TIMEOUT (10s); running it inline would
+                            // freeze the render loop with no feedback and no way to
+                            // abort. Spawn it on a background task driven by a
+                            // CancellationToken (Esc cancels) and stream the outcome
+                            // back through the event channel, mirroring /verify. The
+                            // shared helper (`run_compact_command`) keeps this path
+                            // behaviorally identical to the registry command, and the
+                            // outcome is handled below wherever QueryEvents drain.
+                            if cmd_name == "compact" {
+                                let provider =
+                                    clawde_commands::resolve_command_provider(&cmd_ctx).await;
+                                let ct = CancellationToken::new();
+                                compact_cancel = Some(ct.clone());
+                                let tx = event_tx.clone();
+                                let msgs = messages.clone();
+                                let cfg = cmd_ctx.config.clone();
+                                let effort = current_effort;
+                                let args = cmd_args.clone();
+                                tokio::spawn(async move {
+                                    let outcome = tokio::select! {
+                                        _ = ct.cancelled() => {
+                                            clawde_query::CompactOutcome::Cancelled
+                                        }
+                                        result = clawde_commands::run_compact_command(
+                                            msgs, provider, cfg, effort, &args,
+                                        ) => match result {
+                                            CommandResult::UserMessage(summary) => {
+                                                clawde_query::CompactOutcome::Summary(summary)
+                                            }
+                                            CommandResult::Message(preview) => {
+                                                clawde_query::CompactOutcome::Preview(preview)
+                                            }
+                                            CommandResult::Error(e) => {
+                                                clawde_query::CompactOutcome::Error(e)
+                                            }
+                                            _ => clawde_query::CompactOutcome::Error(
+                                                "Compact request failed.".to_string(),
+                                            ),
+                                        },
+                                    };
+                                    let _ = tx.send(QueryEvent::Compact(outcome));
+                                });
+                                let _ = event_tx.send(QueryEvent::CompactStarted);
                                 continue;
                             }
 
@@ -4861,6 +4911,14 @@ async fn run_interactive(
                     let previous_allowed_tools = app.config.allowed_tools.clone();
                     let previous_disallowed_tools = app.config.disallowed_tools.clone();
                     app.handle_key_event(key);
+                    // Esc during a background /compact aborts it — observe the
+                    // TUI's cancel request and drop the in-flight model call.
+                    if app.compact_cancel_requested {
+                        if let Some(ct) = compact_cancel.as_ref() {
+                            ct.cancel();
+                        }
+                        app.compact_cancel_requested = false;
+                    }
                     if previous_permission_mode
                         != clawde_core::config::PermissionMode::BypassPermissions
                         && app.config.permission_mode
@@ -5206,6 +5264,76 @@ async fn run_interactive(
                 };
                 if let Some(payload) = relay_payload {
                     let _ = relay_ev_tx.try_send(payload);
+                }
+            }
+            // Background /compact outcome — perform the CLI-side effects the
+            // registry path would have done inline, then let the TUI clear
+            // its `compacting…` spinner.
+            if let QueryEvent::Compact(outcome) = &evt {
+                compact_cancel = None;
+                match outcome {
+                    clawde_query::CompactOutcome::Preview(text) => {
+                        app.push_message(clawde_core::types::Message::assistant(text.clone()));
+                    }
+                    clawde_query::CompactOutcome::Error(e) => {
+                        app.status_message = Some(format!("Error: {}", e));
+                    }
+                    clawde_query::CompactOutcome::Cancelled => {}
+                    clawde_query::CompactOutcome::Summary(summary) => {
+                        // Inject the summary as a user message and start a
+                        // fresh turn, mirroring the auto-compact path below.
+                        let user_msg = clawde_core::types::Message::user(summary.clone());
+                        messages.push(user_msg.clone());
+                        app.push_message(user_msg);
+                        session.messages = messages.clone();
+                        session.updated_at = chrono::Utc::now();
+
+                        let ct = CancellationToken::new();
+                        cancel = Some(ct.clone());
+                        let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                        let msgs_arc_clone = msgs_arc.clone();
+                        let tools_arc_clone = tools_arc.clone();
+                        let ctx_clone = tool_ctx.clone();
+                        let mut qcfg = base_query_config.clone();
+                        qcfg.network_blocked =
+                            clawde_core::network_isolation_enabled(&cmd_ctx.config);
+                        qcfg.model = clawde_api::effective_model_for_config(
+                            &cmd_ctx.config,
+                            &model_registry,
+                        );
+                        qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                            qcfg.thinking_budget = level.thinking_budget_tokens();
+                        }
+                        // Compaction continuation is a maintenance turn, not a
+                        // goal turn — never let it trigger in-loop goal
+                        // continuation.
+                        qcfg.continuation = clawde_query::ContinuationMode::Default;
+                        let tracker = cost_tracker.clone();
+                        let tx = event_tx.clone();
+                        let client_clone = client.clone();
+                        app.is_streaming = true;
+
+                        let handle = tokio::spawn(async move {
+                            let mut msgs = msgs_arc_clone.lock().await.clone();
+                            let outcome = clawde_query::run_query_loop(
+                                client_clone.as_ref(),
+                                &mut msgs,
+                                tools_arc_clone.as_slice(),
+                                &ctx_clone,
+                                &qcfg,
+                                tracker,
+                                Some(tx),
+                                ct,
+                                None,
+                            )
+                            .await;
+                            *msgs_arc_clone.lock().await = msgs;
+                            outcome
+                        });
+                        current_query = Some((handle, msgs_arc));
+                    }
                 }
             }
             app.handle_query_event(evt);

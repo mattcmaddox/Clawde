@@ -3239,6 +3239,7 @@ fn should_render_status_row(app: &App) -> bool {
     // and key health are shown in the prompt config row (Row 2) instead.
     app.voice_recording
         || app.is_verifying
+        || app.is_compacting
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
         || has_exhausted_keys
@@ -3311,6 +3312,17 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         let spinner = SPINNER[(app.frame_count as usize) % SPINNER.len()];
         vec![Span::styled(
             format!("{spinner} verifying…"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else if app.is_compacting {
+        // A background /compact request is in flight — spinning indicator so
+        // the model call (up to COMPACT_API_TIMEOUT) never looks like a hang.
+        // Esc cancels it.
+        let spinner = SPINNER[(app.frame_count as usize) % SPINNER.len()];
+        vec![Span::styled(
+            format!("{spinner} compacting…"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
