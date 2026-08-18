@@ -1001,6 +1001,9 @@ pub async fn run_query_loop(
     // making the loop authoritative here means a parent cancel reaches tools.
     let mut loop_ctx = tool_ctx.clone();
     loop_ctx.cancel_token = cancel_token.clone();
+    // Carry the loop's effective effort so sub-agents (which build their own
+    // QueryConfig from the ToolContext) inherit the parent's override.
+    loop_ctx.effort = config.effort_level;
     let tool_ctx = &loop_ctx;
     // Capture the accepted implementation task from the transcript (latest
     // marker wins). Tool results are user messages too, so scanning only the
@@ -3046,6 +3049,7 @@ pub async fn run_query_loop(
                         &config.model,
                         context_window,
                         &mut compact_state,
+                        config.effort_level,
                         &cancel_token,
                     )
                     .await
@@ -4397,6 +4401,7 @@ mod tests {
             config: clawde_core::config::Config::default(),
             provider_registry: None,
             managed_agent_config: None,
+            effort: None,
             completion_notifier: None,
             pending_permissions: None,
             permission_manager: None,
@@ -6022,8 +6027,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut messages = vec![Message::user(format!(
-            "Implement the accepted task [{task_id_marker}]",
-            task_id_marker = format!("clawde-spec-task:{task_id}")
+            "Implement the accepted task [clawde-spec-task:{task_id}]"
         ))];
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -6209,8 +6213,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut messages = vec![Message::user(format!(
-            "Implement the accepted task [{task_id_marker}]",
-            task_id_marker = format!("clawde-spec-task:{task_id}")
+            "Implement the accepted task [clawde-spec-task:{task_id}]"
         ))];
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -6389,8 +6392,7 @@ mod tests {
         // transcript, while the latest message is a non-marker tool result.
         let mut messages = vec![
             Message::user(format!(
-                "Continue the accepted task [{}]",
-                format!("clawde-spec-task:{task_id}")
+                "Continue the accepted task [clawde-spec-task:{task_id}]"
             )),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "previous-write".to_string(),
@@ -6895,8 +6897,8 @@ mod tests {
     /// turn cap, and the Status event is surfaced.
     #[tokio::test]
     async fn no_progress_detector_stops_repeated_tool_loop_before_cap() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _g = ENV_LOCK.lock().await;
         let home = tempfile::tempdir().expect("goal home");
         let _old = std::env::var_os("CLAWDE_HOME");
         std::env::set_var("CLAWDE_HOME", home.path());

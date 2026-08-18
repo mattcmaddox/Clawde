@@ -87,6 +87,7 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
 // AgentTool
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct AgentTool {
     semantic_internal: bool,
 }
@@ -95,14 +96,6 @@ impl AgentTool {
     pub(crate) fn semantic() -> Self {
         Self {
             semantic_internal: true,
-        }
-    }
-}
-
-impl Default for AgentTool {
-    fn default() -> Self {
-        Self {
-            semantic_internal: false,
         }
     }
 }
@@ -1373,7 +1366,9 @@ impl Tool for AgentTool {
             memory_enabled: None,
             temperature: None,
             tool_result_budget: 50_000,
-            effort_level: None,
+            // Sub-agents inherit the parent session's thinking-effort override
+            // (rebound onto the ToolContext by run_query_loop).
+            effort_level: ctx.effort,
             command_queue: None,
             skill_index: None,
             max_budget_usd: None,
@@ -1705,6 +1700,7 @@ mod tests {
             config,
             provider_registry: None,
             managed_agent_config: None,
+            effort: None,
             completion_notifier: None,
             pending_permissions: None,
             permission_manager: None,
@@ -2135,12 +2131,9 @@ mod tests {
     #[test]
     fn semantic_patch_response_is_strict_and_bounded() {
         let patch = r#"{"patch":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"}"#;
-        assert_eq!(
-            parse_semantic_patch_response(patch)
-                .unwrap()
-                .contains("+++ b/src/lib.rs"),
-            true
-        );
+        assert!(parse_semantic_patch_response(patch)
+            .unwrap()
+            .contains("+++ b/src/lib.rs"));
         let fenced = r#"```json
 {"patch":"--- a/src.rs\n+++ b/src.rs\n@@ -1 +1 @@\n-old\n+new"}
 ```"#;

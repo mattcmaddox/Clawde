@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Monotonic counter for unique tmp filenames. Two saves racing in the same
 /// process must never share a `.auth.json.clawde-tmp-*` path or one rename
@@ -21,7 +21,7 @@ struct AuthFileLock {
 }
 
 impl AuthFileLock {
-    fn acquire(auth_path: &PathBuf) -> Option<Self> {
+    fn acquire(auth_path: &Path) -> Option<Self> {
         let path = auth_path.with_file_name("auth.json.lock");
         let parent = path.parent()?;
         let _ = std::fs::create_dir_all(parent);
@@ -1160,7 +1160,7 @@ mod tests {
                 key: "gsk-free-12345678".into(),
             },
         );
-        assert!(store.credentials.get("groq").is_none());
+        assert!(!store.credentials.contains_key("groq"));
         assert_eq!(store.keys_for("groq").map(|keys| keys.len()), Some(1));
 
         // Repeated writes are idempotent and do not create duplicate slots.
@@ -1168,7 +1168,7 @@ mod tests {
         assert_eq!(store.keys_for("groq").unwrap().len(), 1);
 
         let reloaded = AuthStore::load();
-        assert!(reloaded.credentials.get("groq").is_none());
+        assert!(!reloaded.credentials.contains_key("groq"));
         assert_eq!(reloaded.keys_for("groq").map(|keys| keys.len()), Some(1));
     }
 
@@ -1189,8 +1189,8 @@ mod tests {
             },
         );
         assert!(store.migrate_legacy_free_credentials());
-        assert!(store.credentials.get("nvidia").is_none());
-        assert!(store.credentials.get("openai").is_some());
+        assert!(!store.credentials.contains_key("nvidia"));
+        assert!(store.credentials.contains_key("openai"));
         assert_eq!(store.keys_for("nvidia").map(|keys| keys.len()), Some(1));
     }
 
@@ -1224,7 +1224,7 @@ mod tests {
         );
 
         assert!(store.migrate_legacy_free_credentials());
-        assert!(store.credentials.get("groq").is_none());
+        assert!(!store.credentials.contains_key("groq"));
         assert!(store.keys_for("groq").is_none());
     }
 

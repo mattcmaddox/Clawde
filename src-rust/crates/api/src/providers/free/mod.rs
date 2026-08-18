@@ -984,7 +984,7 @@ impl AdaptiveConcurrency {
         let window = self
             .latency_window
             .entry(provider_id.to_string())
-            .or_insert_with(VecDeque::new);
+            .or_default();
         window.push_back(latency_secs);
 
         // Keep only recent observations (based on time window)
@@ -1010,9 +1010,7 @@ impl AdaptiveConcurrency {
         // Update limit based on Netflix formula
         let current_limit = self.limits.get(provider_id).copied().unwrap_or(10);
         let queue_size = (current_limit as f64).sqrt() as u32;
-        let new_limit = ((current_limit as f64 * gradient) as u32 + queue_size)
-            .max(1)
-            .min(100); // Cap at 100 concurrent requests
+        let new_limit = ((current_limit as f64 * gradient) as u32 + queue_size).clamp(1, 100); // Cap at 100 concurrent requests
 
         self.limits.insert(provider_id.to_string(), new_limit);
     }
@@ -1934,7 +1932,7 @@ pub fn first_free_upstream_key(
                     .cloned()
             })
             .or_else(|| std::env::var("OPENCODE_API_KEY").ok())
-            .or_else(|| clawde_core::AuthStore::opencode_cli_api_key())
+            .or_else(clawde_core::AuthStore::opencode_cli_api_key)
     } else {
         auth_store
             .keys_for(upstream_id)
@@ -2791,7 +2789,7 @@ impl Default for MemoryBudgetConfig {
 }
 
 /// All provider cooldown profiles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderProfiles {
     /// Per-provider cooldown profiles
     pub profiles: HashMap<String, ProviderCooldownProfile>,
@@ -2799,16 +2797,6 @@ pub struct ProviderProfiles {
     pub defaults: ProviderCooldownProfile,
     /// Parallel attempt configuration
     pub parallel: ParallelConfig,
-}
-
-impl Default for ProviderProfiles {
-    fn default() -> Self {
-        Self {
-            profiles: HashMap::new(),
-            defaults: ProviderCooldownProfile::default(),
-            parallel: ParallelConfig::default(),
-        }
-    }
 }
 
 impl ProviderProfiles {

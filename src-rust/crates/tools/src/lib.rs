@@ -394,6 +394,9 @@ pub struct ToolContext {
     pub provider_registry: Option<std::sync::Arc<clawde_api::ProviderRegistry>>,
     /// Managed agent (manager-executor) configuration, if active.
     pub managed_agent_config: Option<clawde_core::config::ManagedAgentConfig>,
+    /// Current session thinking-effort override. `run_query_loop` rebinds this
+    /// from the loop's `QueryConfig` so sub-agents inherit the parent's effort.
+    pub effort: Option<clawde_core::effort::EffortLevel>,
     /// Optional notifier for injecting completion messages into the next agent turn.
     /// Set when the query loop has a command queue wired up.
     pub completion_notifier: Option<CompletionNotifier>,
@@ -919,6 +922,7 @@ mod tests {
             config: Config::default(),
             provider_registry: None,
             managed_agent_config: None,
+            effort: None,
             completion_notifier: None,
             pending_permissions: None,
             permission_manager: None,

@@ -522,8 +522,8 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 }
 
 /// Successful Cline model discovery cached by credential fingerprint.
-static CLINE_LIVE_MODELS: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Vec<String>)>>> =
-    std::sync::OnceLock::new();
+type ClineLiveModelsCache = std::sync::OnceLock<std::sync::Mutex<Option<(u64, Vec<String>)>>>;
+static CLINE_LIVE_MODELS: ClineLiveModelsCache = std::sync::OnceLock::new();
 
 /// Clear the Cline model-list cache after authentication or credential changes.
 pub(crate) fn refresh_cline_model_cache() {

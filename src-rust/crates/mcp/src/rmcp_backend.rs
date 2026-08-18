@@ -271,7 +271,7 @@ impl LegacySseRmcpTransport {
             .url
             .clone()
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no URL configured", config.name))?;
-        let client = client.unwrap_or_else(reqwest::Client::new);
+        let client = client.unwrap_or_default();
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let transport = Self {
             server_name: config.name.clone(),
@@ -973,9 +973,8 @@ mod tests {
                     let is_notification = value.get("id").map(|id| id.is_null()).unwrap_or(true);
                     let response_body = json_rpc_response_for(&value);
                     let response = if is_notification {
-                        format!(
-                            "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
                     } else {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

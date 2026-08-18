@@ -31,6 +31,7 @@ fn default_command_context() -> CommandContext {
         mcp_auth_runner: None,
         provider_registry: None,
         test_provider: None,
+        effort: None,
     }
 }
 

@@ -386,7 +386,7 @@ impl SlashCommand for RenameCommand {
             top_k: None,
             stop_sequences: vec![],
             thinking: None,
-            effort_level: None,
+            effort_level: ctx.effort,
             provider_options: serde_json::Value::Object(Default::default()),
         };
 
@@ -618,7 +618,7 @@ impl SlashCommand for SummaryCommand {
             top_k: None,
             stop_sequences: vec![],
             thinking: None,
-            effort_level: None,
+            effort_level: ctx.effort,
             provider_options: serde_json::Value::Object(Default::default()),
         };
 

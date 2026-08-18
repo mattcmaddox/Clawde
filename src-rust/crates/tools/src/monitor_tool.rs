@@ -283,6 +283,7 @@ mod tests {
             config: Config::default(),
             provider_registry: None,
             managed_agent_config: None,
+            effort: None,
             completion_notifier: None,
             pending_permissions: None,
             permission_manager: None,

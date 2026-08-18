@@ -174,6 +174,35 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
 /// Spawn a task that watches the shared `PendingPermissionStore` and
 /// forwards each enqueued request through the ACP connection. The task
 /// exits when `cancel` is fired or the connection drops.
+pub fn spawn_drainer(
+    connection: Arc<Connection>,
+    session_id: acp::SessionId,
+    store: Arc<parking_lot::Mutex<PendingPermissionStore>>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let popped: Vec<PendingPermissionRequest> = {
+                let mut guard = store.lock();
+                guard.queue.drain(..).collect()
+            };
+            for pending in popped {
+                let conn = connection.clone();
+                let sid = session_id.clone();
+                tokio::spawn(async move {
+                    forward_pending(conn, sid, pending).await;
+                });
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::permission_raw_input;
@@ -221,33 +250,4 @@ mod tests {
         assert!(input.get("token").is_none());
         assert!(input.get("authorization").is_none());
     }
-}
-
-pub fn spawn_drainer(
-    connection: Arc<Connection>,
-    session_id: acp::SessionId,
-    store: Arc<parking_lot::Mutex<PendingPermissionStore>>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = ticker.tick() => {}
-            }
-            let popped: Vec<PendingPermissionRequest> = {
-                let mut guard = store.lock();
-                guard.queue.drain(..).collect()
-            };
-            for pending in popped {
-                let conn = connection.clone();
-                let sid = session_id.clone();
-                tokio::spawn(async move {
-                    forward_pending(conn, sid, pending).await;
-                });
-            }
-        }
-    })
 }

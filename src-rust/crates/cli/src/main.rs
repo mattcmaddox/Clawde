@@ -578,6 +578,7 @@ async fn main() -> anyhow::Result<()> {
                 let config = settings.effective_config();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let cmd_ctx = clawde_commands::CommandContext {
+                    effort: config.default_effort,
                     config,
                     cost_tracker: CostTracker::new(),
                     messages: vec![],
@@ -1016,6 +1017,8 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         provider_registry: None, // filled below with the canonical Arc
         managed_agent_config: config.managed_agents.clone(),
+        // Effort is rebound per turn by run_query_loop from the QueryConfig.
+        effort: None,
         completion_notifier: None,
         pending_permissions: Some(pending_permissions.clone()),
         permission_manager: Some(permission_manager.clone()),
@@ -2135,10 +2138,8 @@ mod headless_resume_tests {
 
     #[tokio::test]
     async fn headless_resume_loads_persisted_tool_result_transcript() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
         let home = std::env::temp_dir().join(format!("clawde-cli-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("temporary Clawde home");
         let previous_home = std::env::var_os("CLAWDE_HOME");
@@ -2412,7 +2413,7 @@ async fn run_headless(
                 if !is_json_output {
                     eprintln!("\n[{}...]", tool_name);
                 } else {
-                    let ev = stream_tool_start_event(&tool_name);
+                    let ev = stream_tool_start_event(tool_name);
                     println!("{}", ev);
                 }
             }
@@ -2430,8 +2431,8 @@ async fn run_headless(
                     // The model receives the full result internally; external
                     // runners only need bounded execution metadata.
                     let ev = stream_tool_end_event(
-                        &tool_name,
-                        &tool_id,
+                        tool_name,
+                        tool_id,
                         *is_error,
                         if *is_error {
                             Some(result.as_str())
@@ -3286,6 +3287,9 @@ async fn run_interactive(
         mcp_auth_runner: None,
         provider_registry: base_query_config.provider_registry.clone(),
         test_provider: None,
+        // `current_effort` is declared just below (initialised to `session.effort`),
+        // so seed the context with the same value and keep it in sync per turn.
+        effort: session.effort,
     };
 
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
@@ -4736,6 +4740,7 @@ async fn run_interactive(
                         let _ = clawde_core::history::save_session(&session).await;
                     }
                     cmd_ctx.config = app.config.clone();
+                    cmd_ctx.effort = current_effort;
                     if app.ollama_mode != previous_ollama_mode {
                         // `/ollama` changes the active capability boundary. Rebuild
                         // both the full registry and the current agent-filtered
@@ -7014,8 +7019,10 @@ mod continuation_mode_tests {
     #[test]
     fn semantic_verify_selects_semantic_mode_with_goals_enabled() {
         with_goals(true, || {
-            let mut config = Config::default();
-            config.semantic_verify = Some(true);
+            let config = Config {
+                semantic_verify: Some(true),
+                ..Default::default()
+            };
             let mode = derive_continuation_mode(&config);
             assert!(
                 matches!(mode, clawde_query::ContinuationMode::GoalSemanticVerify(_)),
@@ -7027,8 +7034,10 @@ mod continuation_mode_tests {
     #[test]
     fn semantic_verify_selects_semantic_mode_with_goals_disabled() {
         with_goals(false, || {
-            let mut config = Config::default();
-            config.semantic_verify = Some(true);
+            let config = Config {
+                semantic_verify: Some(true),
+                ..Default::default()
+            };
             let mode = derive_continuation_mode(&config);
             assert!(
                 matches!(mode, clawde_query::ContinuationMode::SemanticVerify(_)),
@@ -7071,8 +7080,10 @@ mod continuation_mode_tests {
         // branch; assert the derivation function itself is reachable and picks
         // the semantic mode so the event stream can surface it.
         with_goals(false, || {
-            let mut config = Config::default();
-            config.semantic_verify = Some(true);
+            let config = Config {
+                semantic_verify: Some(true),
+                ..Default::default()
+            };
             assert!(matches!(
                 derive_continuation_mode(&config),
                 clawde_query::ContinuationMode::SemanticVerify(_)

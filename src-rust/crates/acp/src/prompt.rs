@@ -86,6 +86,8 @@ pub async fn handle(
         config: session_config.clone(),
         provider_registry: Some(runtime.provider_registry.clone()),
         managed_agent_config: session_config.managed_agents.clone(),
+        // Effort is rebound per turn by run_query_loop from the QueryConfig.
+        effort: None,
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
         permission_manager: Some(runtime.permission_manager.clone()),
@@ -383,6 +385,36 @@ async fn send_session_update(
     }
 }
 
+fn classify_tool_kind(tool_name: &str) -> acp::ToolKind {
+    match tool_name {
+        "Read" | "FileRead" => acp::ToolKind::Read,
+        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => {
+            acp::ToolKind::Edit
+        }
+        "Bash" | "Shell" | "Execute" => acp::ToolKind::Execute,
+        "WebFetch" | "WebSearch" => acp::ToolKind::Fetch,
+        "Glob" | "Grep" | "GlobTool" => acp::ToolKind::Search,
+        "Delete" | "Rm" => acp::ToolKind::Delete,
+        "Move" | "Rename" => acp::ToolKind::Move,
+        "Think" | "Sequential" => acp::ToolKind::Think,
+        _ => acp::ToolKind::Other,
+    }
+}
+
+/// Compose a short, human-readable title for a tool call. Falls back to the
+/// tool's bare name if no descriptive field is present.
+fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String {
+    if let Some(input) = raw_input {
+        // Prefer path-like fields for file tools.
+        for key in &["file_path", "path", "filename", "url", "pattern", "command"] {
+            if let Some(v) = input.get(*key).and_then(|x| x.as_str()) {
+                return format!("{}: {}", tool_name, v);
+            }
+        }
+    }
+    tool_name.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::render_prompt_blocks;
@@ -453,34 +485,4 @@ mod tests {
         let output = super::acp_tool_output(r#"{"status":"ok"}"#, false, None);
         assert_eq!(output, serde_json::json!({"status": "ok"}));
     }
-}
-
-fn classify_tool_kind(tool_name: &str) -> acp::ToolKind {
-    match tool_name {
-        "Read" | "FileRead" => acp::ToolKind::Read,
-        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => {
-            acp::ToolKind::Edit
-        }
-        "Bash" | "Shell" | "Execute" => acp::ToolKind::Execute,
-        "WebFetch" | "WebSearch" => acp::ToolKind::Fetch,
-        "Glob" | "Grep" | "GlobTool" => acp::ToolKind::Search,
-        "Delete" | "Rm" => acp::ToolKind::Delete,
-        "Move" | "Rename" => acp::ToolKind::Move,
-        "Think" | "Sequential" => acp::ToolKind::Think,
-        _ => acp::ToolKind::Other,
-    }
-}
-
-/// Compose a short, human-readable title for a tool call. Falls back to the
-/// tool's bare name if no descriptive field is present.
-fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String {
-    if let Some(input) = raw_input {
-        // Prefer path-like fields for file tools.
-        for key in &["file_path", "path", "filename", "url", "pattern", "command"] {
-            if let Some(v) = input.get(*key).and_then(|x| x.as_str()) {
-                return format!("{}: {}", tool_name, v);
-            }
-        }
-    }
-    tool_name.to_string()
 }

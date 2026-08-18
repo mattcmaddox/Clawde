@@ -22,6 +22,7 @@
 //   full compaction and can fire proactively at 75 % capacity.
 
 use clawde_api::{LlmProvider, ProviderRequest, SystemPrompt};
+use clawde_core::effort::EffortLevel;
 use clawde_core::error::ClaudeError;
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
@@ -334,7 +335,19 @@ pub async fn micro_compact_if_needed(
     );
 
     let target_tokens = config.summary_target_tokens as u32;
-    match summarise_head(provider, messages, split_at, model, target_tokens, cancel).await {
+    // Micro-compact is not yet wired to a live QueryConfig; it runs with no
+    // effort override (provider/model default) until a caller supplies one.
+    match summarise_head(
+        provider,
+        messages,
+        split_at,
+        model,
+        target_tokens,
+        None,
+        cancel,
+    )
+    .await
+    {
         Ok(new_msgs) => {
             info!(
                 original = total,
@@ -1003,6 +1016,7 @@ async fn summarise_head(
     split_at: usize,
     model: &str,
     max_summary_tokens: u32,
+    effort: Option<EffortLevel>,
     cancel: &CancellationToken,
 ) -> Result<Vec<Message>, ClaudeError> {
     if split_at == 0 {
@@ -1120,7 +1134,7 @@ async fn summarise_head(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
-        effort_level: None,
+        effort_level: effort,
         provider_options: Default::default(),
     };
 
@@ -1226,6 +1240,7 @@ pub async fn compact_conversation(
     provider: &dyn LlmProvider,
     messages: &[Message],
     model: &str,
+    effort: Option<EffortLevel>,
     cancel: &CancellationToken,
 ) -> Result<Vec<Message>, ClaudeError> {
     if cancel.is_cancelled() {
@@ -1255,7 +1270,7 @@ pub async fn compact_conversation(
     );
 
     // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(provider, messages, split_at, model, 20_000, cancel).await
+    summarise_head(provider, messages, split_at, model, 20_000, effort, cancel).await
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
@@ -1271,6 +1286,7 @@ pub async fn auto_compact_if_needed(
     model: &str,
     context_window: u64,
     state: &mut AutoCompactState,
+    effort: Option<EffortLevel>,
     cancel: &CancellationToken,
 ) -> Option<Vec<Message>> {
     if cancel.is_cancelled() || !should_auto_compact_for_window(input_tokens, context_window, state)
@@ -1315,7 +1331,7 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(provider, messages, model, cancel).await {
+    match compact_conversation(provider, messages, model, effort, cancel).await {
         Ok(new_msgs) => {
             state.on_success();
             info!(
@@ -1550,6 +1566,7 @@ pub async fn reactive_compact(
         split_at,
         &config.model,
         20_000,
+        config.effort_level,
         &cancel,
     )
     .await?;
@@ -1663,7 +1680,7 @@ pub async fn context_collapse(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
-        effort_level: None,
+        effort_level: config.effort_level,
         provider_options: Default::default(),
     };
 
@@ -2538,6 +2555,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            None,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -2565,6 +2583,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            None,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -2605,6 +2624,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            None,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -2642,6 +2662,7 @@ mod tests {
                 task_provider.as_ref(),
                 &messages,
                 "test-model",
+                None,
                 &task_cancel,
             )
             .await
@@ -2683,6 +2704,7 @@ mod tests {
                 "test-model",
                 200_000,
                 &mut state,
+                None,
                 &task_cancel,
             )
             .await;

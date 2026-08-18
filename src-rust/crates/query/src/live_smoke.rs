@@ -302,9 +302,10 @@ fn error_category(error: impl std::fmt::Display) -> &'static str {
         "server_error"
     } else if message.contains("stream error") || message.contains("streamerror") {
         "stream_error"
-    } else if message.contains("no choices") || message.contains("no message in choice") {
-        "response_parse_error"
-    } else if message.contains("failed to parse response") {
+    } else if message.contains("no choices")
+        || message.contains("no message in choice")
+        || message.contains("failed to parse response")
+    {
         "response_parse_error"
     } else if message.contains("malformed")
         || message.contains("strict parser")
@@ -455,6 +456,7 @@ fn production_tool_context(
         config,
         provider_registry: None,
         managed_agent_config: None,
+        effort: None,
         completion_notifier: None,
         pending_permissions: None,
         permission_manager: None,

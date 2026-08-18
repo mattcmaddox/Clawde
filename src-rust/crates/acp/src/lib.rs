@@ -195,11 +195,9 @@ pub async fn run_acp_server_tcp(
                     },
                 );
                 if deadline.await.is_err() {
-                    for slot in pending {
-                        if let Some(handle) = slot {
-                            handle.abort();
-                            let _ = handle.await;
-                        }
+                    for handle in pending.into_iter().flatten() {
+                        handle.abort();
+                        let _ = handle.await;
                     }
                 }
                 return Ok(());
@@ -316,67 +314,6 @@ fn validate_acp_bind_address(
     )
 }
 
-#[cfg(test)]
-mod bind_tests {
-    use super::validate_acp_bind_address;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    #[test]
-    fn allows_ipv4_and_ipv6_loopback() {
-        assert!(validate_acp_bind_address(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9876),
-            false,
-        )
-        .is_ok());
-        assert!(validate_acp_bind_address(
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9876),
-            false,
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn allows_ipv4_mapped_loopback() {
-        let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1);
-        assert!(
-            validate_acp_bind_address(SocketAddr::new(IpAddr::V6(mapped), 9876), false,).is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_non_loopback_by_default() {
-        for ip in [
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        ] {
-            assert!(validate_acp_bind_address(SocketAddr::new(ip, 9876), false).is_err());
-        }
-    }
-
-    #[test]
-    fn explicit_opt_in_allows_non_loopback() {
-        assert!(validate_acp_bind_address(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9876),
-            true,
-        )
-        .is_ok());
-    }
-
-    #[tokio::test]
-    async fn tcp_server_rejects_non_loopback_before_runtime_startup() {
-        let config = clawde_core::config::AcpServerConfig::default();
-        let error = super::run_acp_server_tcp(
-            "0.0.0.0:0",
-            Some(&config),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .expect_err("non-loopback ACP bind must fail closed by default");
-        assert!(error.to_string().contains("refusing ACP non-loopback bind"));
-    }
-}
-
 /// Start an embedded ACP TCP server in a background tokio task if enabled in config.
 /// The server runs on the configured address (default `127.0.0.1:9876`) and accepts
 /// ACP JSON-RPC connections from LAN clients. Tokio cancels the task on shutdown.
@@ -466,4 +403,65 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<tokio_ru
         .map_err(|e| anyhow::anyhow!("invalid TLS key/cert pair: {}", e))?;
 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::validate_acp_bind_address;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn allows_ipv4_and_ipv6_loopback() {
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9876),
+            false,
+        )
+        .is_ok());
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9876),
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn allows_ipv4_mapped_loopback() {
+        let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1);
+        assert!(
+            validate_acp_bind_address(SocketAddr::new(IpAddr::V6(mapped), 9876), false,).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_non_loopback_by_default() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert!(validate_acp_bind_address(SocketAddr::new(ip, 9876), false).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_opt_in_allows_non_loopback() {
+        assert!(validate_acp_bind_address(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9876),
+            true,
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn tcp_server_rejects_non_loopback_before_runtime_startup() {
+        let config = clawde_core::config::AcpServerConfig::default();
+        let error = super::run_acp_server_tcp(
+            "0.0.0.0:0",
+            Some(&config),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("non-loopback ACP bind must fail closed by default");
+        assert!(error.to_string().contains("refusing ACP non-loopback bind"));
+    }
 }

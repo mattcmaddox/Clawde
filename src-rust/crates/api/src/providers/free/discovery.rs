@@ -350,137 +350,6 @@ pub fn fetch_cline_free_models(cline_api_key: &str) -> Option<Vec<String>> {
     Some(ids)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cline_discovery_headers_include_sdk_client_type() {
-        assert_eq!(
-            request_headers(&[("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)]),
-            vec![(
-                "X-CLIENT-TYPE".to_string(),
-                CLINE_SDK_CLIENT_TYPE.to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn opencode_discovery_ignores_paid_models() {
-        let payload = serde_json::json!({
-            "data": [
-                {"id": "minimax-m2.5"},
-                {"id": "deepseek-v4-flash-free"},
-                {"id": "big-pickle"},
-                {"id": "mimo-v2.5-free"}
-            ]
-        });
-        assert_eq!(
-            select_opencode_zen_free_models(&payload),
-            Some(vec![
-                "deepseek-v4-flash-free".to_string(),
-                "mimo-v2.5-free".to_string()
-            ])
-        );
-        assert_eq!(
-            select_opencode_zen_free_models(&payload)
-                .and_then(|models| models.into_iter().next())
-                .as_deref(),
-            Some("deepseek-v4-flash-free")
-        );
-    }
-
-    #[test]
-    fn opencode_discovery_returns_none_without_free_models() {
-        let payload = serde_json::json!({
-            "data": [{"id": "minimax-m2.5"}, {"id": "big-pickle"}]
-        });
-        assert_eq!(select_opencode_zen_free_models(&payload), None);
-    }
-
-    #[test]
-    fn cloudflare_discovery_extracts_cf_models_and_prefers_text_generation() {
-        let payload = serde_json::json!({
-            "success": true,
-            "result": [
-                {"name": "@cf/baai/bge-m3", "task": {"name": "Text Embeddings"}},
-                {"name": "@cf/qwen/qwen3-30b-a3b-fp8", "task": {"name": "Text Generation"}},
-                {"name": "@cf/openai/gpt-oss-120b", "task": {"name": "Text Generation"}},
-                {"name": "not-a-cf-model", "task": {"name": "Text Generation"}}
-            ]
-        });
-        assert_eq!(
-            collect_cloudflare_available_models(&payload),
-            vec![
-                "@cf/qwen/qwen3-30b-a3b-fp8",
-                "@cf/openai/gpt-oss-120b",
-                "@cf/baai/bge-m3",
-            ]
-        );
-    }
-
-    #[test]
-    fn cloudflare_discovery_returns_empty_for_invalid_payload() {
-        assert!(collect_cloudflare_available_models(&serde_json::json!({})).is_empty());
-        assert!(
-            collect_cloudflare_available_models(&serde_json::json!({ "result": "nope" }))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn cohere_discovery_extracts_model_names() {
-        let payload = serde_json::json!({
-            "models": [
-                {"name": "north-mini-code-1-0"},
-                {"name": "command-r-plus", "context_length": 128000}
-            ]
-        });
-        assert_eq!(
-            collect_cohere_model_ids(&payload),
-            vec!["north-mini-code-1-0", "command-r-plus"]
-        );
-        assert!(collect_cohere_model_ids(&serde_json::json!({})).is_empty());
-    }
-
-    #[test]
-    fn select_available_model_prefers_modelsdev_pick() {
-        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
-        let auto = HashMap::from([(
-            "cloudflare".to_string(),
-            "@cf/qwen/qwen3-30b-a3b-fp8".to_string(),
-        )]);
-        assert_eq!(
-            select_available_model("cloudflare", &available, &auto).as_deref(),
-            Some("@cf/qwen/qwen3-30b-a3b-fp8")
-        );
-    }
-
-    #[test]
-    fn select_available_model_prefers_catalog_default_when_modelsdev_pick_absent() {
-        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
-        let auto = HashMap::from([("cloudflare".to_string(), "some-other-model".to_string())]);
-        // models.dev pick is not on the live list → catalog default wins.
-        assert_eq!(
-            select_available_model("cloudflare", &available, &auto).as_deref(),
-            Some("@cf/qwen/qwen3-30b-a3b-fp8")
-        );
-    }
-
-    #[test]
-    fn select_available_model_falls_back_to_first() {
-        let available: Vec<&str> = vec!["m1", "m2"];
-        assert_eq!(
-            select_available_model("cloudflare", &available, &HashMap::new()).as_deref(),
-            Some("m1")
-        );
-        assert_eq!(
-            select_available_model("cloudflare", &[], &HashMap::new()),
-            None
-        );
-    }
-}
-
 /// Fetch OpenRouter's current free models from their models API.
 ///
 /// OpenRouter's API at `https://openrouter.ai/api/v1/models` returns
@@ -904,4 +773,135 @@ pub fn fetch_gemini_models(api_key: &str) -> Option<String> {
         model_ids.len(),
     );
     Some((*first).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cline_discovery_headers_include_sdk_client_type() {
+        assert_eq!(
+            request_headers(&[("X-CLIENT-TYPE", CLINE_SDK_CLIENT_TYPE)]),
+            vec![(
+                "X-CLIENT-TYPE".to_string(),
+                CLINE_SDK_CLIENT_TYPE.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn opencode_discovery_ignores_paid_models() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "minimax-m2.5"},
+                {"id": "deepseek-v4-flash-free"},
+                {"id": "big-pickle"},
+                {"id": "mimo-v2.5-free"}
+            ]
+        });
+        assert_eq!(
+            select_opencode_zen_free_models(&payload),
+            Some(vec![
+                "deepseek-v4-flash-free".to_string(),
+                "mimo-v2.5-free".to_string()
+            ])
+        );
+        assert_eq!(
+            select_opencode_zen_free_models(&payload)
+                .and_then(|models| models.into_iter().next())
+                .as_deref(),
+            Some("deepseek-v4-flash-free")
+        );
+    }
+
+    #[test]
+    fn opencode_discovery_returns_none_without_free_models() {
+        let payload = serde_json::json!({
+            "data": [{"id": "minimax-m2.5"}, {"id": "big-pickle"}]
+        });
+        assert_eq!(select_opencode_zen_free_models(&payload), None);
+    }
+
+    #[test]
+    fn cloudflare_discovery_extracts_cf_models_and_prefers_text_generation() {
+        let payload = serde_json::json!({
+            "success": true,
+            "result": [
+                {"name": "@cf/baai/bge-m3", "task": {"name": "Text Embeddings"}},
+                {"name": "@cf/qwen/qwen3-30b-a3b-fp8", "task": {"name": "Text Generation"}},
+                {"name": "@cf/openai/gpt-oss-120b", "task": {"name": "Text Generation"}},
+                {"name": "not-a-cf-model", "task": {"name": "Text Generation"}}
+            ]
+        });
+        assert_eq!(
+            collect_cloudflare_available_models(&payload),
+            vec![
+                "@cf/qwen/qwen3-30b-a3b-fp8",
+                "@cf/openai/gpt-oss-120b",
+                "@cf/baai/bge-m3",
+            ]
+        );
+    }
+
+    #[test]
+    fn cloudflare_discovery_returns_empty_for_invalid_payload() {
+        assert!(collect_cloudflare_available_models(&serde_json::json!({})).is_empty());
+        assert!(
+            collect_cloudflare_available_models(&serde_json::json!({ "result": "nope" }))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cohere_discovery_extracts_model_names() {
+        let payload = serde_json::json!({
+            "models": [
+                {"name": "north-mini-code-1-0"},
+                {"name": "command-r-plus", "context_length": 128000}
+            ]
+        });
+        assert_eq!(
+            collect_cohere_model_ids(&payload),
+            vec!["north-mini-code-1-0", "command-r-plus"]
+        );
+        assert!(collect_cohere_model_ids(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn select_available_model_prefers_modelsdev_pick() {
+        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
+        let auto = HashMap::from([(
+            "cloudflare".to_string(),
+            "@cf/qwen/qwen3-30b-a3b-fp8".to_string(),
+        )]);
+        assert_eq!(
+            select_available_model("cloudflare", &available, &auto).as_deref(),
+            Some("@cf/qwen/qwen3-30b-a3b-fp8")
+        );
+    }
+
+    #[test]
+    fn select_available_model_prefers_catalog_default_when_modelsdev_pick_absent() {
+        let available: Vec<&str> = vec!["m2", "@cf/qwen/qwen3-30b-a3b-fp8", "m1"];
+        let auto = HashMap::from([("cloudflare".to_string(), "some-other-model".to_string())]);
+        // models.dev pick is not on the live list → catalog default wins.
+        assert_eq!(
+            select_available_model("cloudflare", &available, &auto).as_deref(),
+            Some("@cf/qwen/qwen3-30b-a3b-fp8")
+        );
+    }
+
+    #[test]
+    fn select_available_model_falls_back_to_first() {
+        let available: Vec<&str> = vec!["m1", "m2"];
+        assert_eq!(
+            select_available_model("cloudflare", &available, &HashMap::new()).as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            select_available_model("cloudflare", &[], &HashMap::new()),
+            None
+        );
+    }
 }

@@ -41,6 +41,7 @@ pub(crate) fn allow_all_context(working_dir: PathBuf) -> ToolContext {
         config: clawde_core::config::Config::default(),
         provider_registry: None,
         managed_agent_config: None,
+        effort: None,
         completion_notifier: None,
         pending_permissions: None,
         permission_manager: None,

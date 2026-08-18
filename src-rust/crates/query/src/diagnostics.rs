@@ -208,8 +208,10 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
     // Keep the diagnostic policy and the tool-boundary policy on the same
     // explicit session configuration. This avoids the legacy process-global
     // Ollama flag even when another test or session has toggled it.
-    let mut session_config = Config::default();
-    session_config.verify = config.clone();
+    let session_config = Config {
+        verify: config.clone(),
+        ..Default::default()
+    };
     let fixture = FixtureGuard::new();
     let mut checks = Vec::new();
     let mut semantic_verdict = None;

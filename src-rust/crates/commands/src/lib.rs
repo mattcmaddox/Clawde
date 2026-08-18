@@ -41,6 +41,10 @@ pub struct CommandContext {
     /// build a provider from config (`provider_for_config`) use this instead,
     /// keeping unit tests hermetic (no network calls).
     pub test_provider: Option<std::sync::Arc<dyn clawde_api::LlmProvider>>,
+    /// Current session thinking-effort override (None = provider/model default).
+    /// Populated by the CLI runtime so auxiliary requests (spec/review/compact/
+    /// summary/rename) inherit the same effort as the main loop.
+    pub effort: Option<clawde_core::effort::EffortLevel>,
 }
 
 /// Session-scoped action requested by `/thinking`.
@@ -858,7 +862,7 @@ async fn try_compact(
         top_k: None,
         stop_sequences: vec![],
         thinking: None,
-        effort_level: None,
+        effort_level: ctx.effort,
         provider_options: serde_json::Value::Object(Default::default()),
     };
 
@@ -2545,6 +2549,7 @@ mod tests {
             mcp_auth_runner: None,
             provider_registry: None,
             test_provider: None,
+            effort: None,
         }
     }
 
@@ -2553,15 +2558,27 @@ mod tests {
     /// hermetically in unit tests.
     fn make_ctx_with_canned_provider() -> CommandContext {
         let mut ctx = make_ctx();
-        ctx.test_provider = Some(std::sync::Arc::new(CannedProvider {}));
+        ctx.test_provider = Some(std::sync::Arc::new(CannedProvider::new()));
         ctx
     }
 
     /// A deterministic [`clawde_api::LlmProvider`] returning a fixed text
     /// response, so tests never touch the network. Mirror of the mock patterns
     /// in `query/src/compact.rs` (GateMockProvider) and
-    /// `api/src/providers/key_rotating.rs` (MockProvider).
-    struct CannedProvider;
+    /// `api/src/providers/key_rotating.rs` (MockProvider). Records the last
+    /// request's `effort_level` per instance so tests can assert the session
+    /// override flowed into the auxiliary request.
+    struct CannedProvider {
+        last_effort: std::sync::Mutex<Option<clawde_core::effort::EffortLevel>>,
+    }
+
+    impl CannedProvider {
+        fn new() -> Self {
+            Self {
+                last_effort: std::sync::Mutex::new(None),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl clawde_api::LlmProvider for CannedProvider {
@@ -2579,6 +2596,7 @@ mod tests {
             &self,
             request: clawde_api::ProviderRequest,
         ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            *self.last_effort.lock().unwrap() = request.effort_level;
             Ok(clawde_api::ProviderResponse {
                 id: "canned".into(),
                 model: request.model,
@@ -3397,6 +3415,23 @@ mod tests {
             }
             other => panic!("expected Message, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_compact_inherits_session_effort_override() {
+        let provider = std::sync::Arc::new(CannedProvider::new());
+        let mut ctx = make_ctx();
+        ctx.test_provider = Some(provider.clone());
+        ctx.effort = Some(clawde_core::effort::EffortLevel::High);
+        ctx.messages.push(Message::user("Hello"));
+        ctx.messages.push(Message::assistant("Hi there!"));
+        let cmd = find_command("compact").unwrap();
+        let _ = cmd.execute("", &mut ctx).await;
+        assert_eq!(
+            *provider.last_effort.lock().unwrap(),
+            Some(clawde_core::effort::EffortLevel::High),
+            "/compact must propagate the session effort override into the request"
+        );
     }
 
     #[tokio::test]

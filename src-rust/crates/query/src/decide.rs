@@ -62,9 +62,7 @@ pub fn decide_mode(_task: &str, touched: &[PathBuf], changed_lines: usize) -> Mo
         )
     });
     let multi_file = touched.len() > 1;
-    if (touches_code && multi_file)
-        || (!multi_file && touches_code && changed_lines > PLAN_LINE_THRESHOLD)
-    {
+    if touches_code && (multi_file || changed_lines > PLAN_LINE_THRESHOLD) {
         Mode::Plan
     } else {
         Mode::Execute
@@ -104,7 +102,7 @@ pub fn decide_verify(
     if file_written {
         return VerifyDecision::Run;
     }
-    let last_not_edit = history.last().map_or(true, |k| *k == ToolRunKind::ReadOnly);
+    let last_not_edit = history.last().is_none_or(|k| *k == ToolRunKind::ReadOnly);
     if last_not_edit || matches!(task_category, "greeting" | "config") {
         return VerifyDecision::Skip;
     }

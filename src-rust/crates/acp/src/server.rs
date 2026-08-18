@@ -360,6 +360,15 @@ fn validate_session_mcp_servers(
     Ok(configs)
 }
 
+fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, acp::Error> {
+    let value = params.ok_or_else(acp::Error::invalid_params)?;
+    serde_json::from_value(value).map_err(|e| {
+        acp::Error::invalid_params().data(Some(
+            serde_json::json!({ "deserialize_error": e.to_string() }),
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{validate_session_directories, validate_session_mcp_servers};
@@ -396,7 +405,7 @@ mod tests {
             "remote",
             "https://example.test/mcp",
         ));
-        let configs = validate_session_mcp_servers(&[http.clone()]).unwrap();
+        let configs = validate_session_mcp_servers(std::slice::from_ref(&http)).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].server_type, "http");
         assert_eq!(configs[0].url.as_deref(), Some("https://example.test/mcp"));
@@ -430,7 +439,7 @@ mod tests {
 
         // Stdio: valid config accepted
         let stdio = acp::McpServer::Stdio(acp::McpServerStdio::new("local", "/bin/server"));
-        let configs = validate_session_mcp_servers(&[stdio.clone()]).unwrap();
+        let configs = validate_session_mcp_servers(std::slice::from_ref(&stdio)).unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].server_type, "stdio");
         assert_eq!(configs[0].command.as_deref(), Some("/bin/server"));
@@ -439,13 +448,4 @@ mod tests {
         let mixed = validate_session_mcp_servers(&[stdio, http]).unwrap();
         assert_eq!(mixed.len(), 2);
     }
-}
-
-fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, acp::Error> {
-    let value = params.ok_or_else(acp::Error::invalid_params)?;
-    serde_json::from_value(value).map_err(|e| {
-        acp::Error::invalid_params().data(Some(
-            serde_json::json!({ "deserialize_error": e.to_string() }),
-        ))
-    })
 }

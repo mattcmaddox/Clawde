@@ -947,14 +947,8 @@ struct HedgeState {
     /// The hedge request's abort handle
     hedge_abort: Option<tokio::task::JoinHandle<()>>,
     /// The hedge request's response channel
-    hedge_response: Option<
-        tokio::sync::oneshot::Receiver<
-            Result<
-                Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-                ProviderError,
-            >,
-        >,
-    >,
+    hedge_response:
+        Option<tokio::sync::oneshot::Receiver<Result<BoxedProviderStream, ProviderError>>>,
     /// Timestamp when hedge was initiated
     hedge_started: Option<Instant>,
     /// Index of the hedge provider
@@ -1136,9 +1130,7 @@ impl RetryingFreeStream {
 
     /// Poll for hedge response.
     /// Returns Some(stream) if hedge responded first, None otherwise.
-    fn poll_hedge(
-        &mut self,
-    ) -> Option<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>> {
+    fn poll_hedge(&mut self) -> Option<BoxedProviderStream> {
         if !self.hedge_state.hedge_in_flight {
             return None;
         }
@@ -1295,11 +1287,9 @@ impl RetryingFreeStream {
         };
 
         // Use retry_after if provider respects it, otherwise use profile default
-        let secs = if profile.respects_retry_after && retry_after_secs.is_some() {
-            retry_after_secs.unwrap()
-        } else {
-            profile.server_error_cooldown_secs
-        };
+        let secs = retry_after_secs
+            .filter(|_| profile.respects_retry_after)
+            .unwrap_or(profile.server_error_cooldown_secs);
 
         if secs == 0 {
             return;
@@ -5376,7 +5366,7 @@ mod tests {
         assert!(llama
             .provider_options
             .as_object()
-            .map_or(true, |o| o.is_empty()));
+            .is_none_or(|o| o.is_empty()));
     }
 
     #[test]
@@ -5386,7 +5376,7 @@ mod tests {
         assert!(req
             .provider_options
             .as_object()
-            .map_or(true, |o| o.is_empty()));
+            .is_none_or(|o| o.is_empty()));
     }
 
     // -------------------------------------------------------------------
@@ -5490,7 +5480,7 @@ mod tests {
         assert!(
             seen.provider_options
                 .as_object()
-                .map_or(true, |o| o.is_empty()),
+                .is_none_or(|o| o.is_empty()),
             "no override must leave provider_options untouched: {:?}",
             seen.provider_options
         );
@@ -6099,17 +6089,18 @@ mod hedge_tests {
     #[test]
     fn test_should_start_hedge_disabled() {
         // When hedging is disabled, should_start_hedge should return false
-        // This tests the configuration check
-        let profiles = Arc::new(ProviderProfiles::default());
-        // The hedge check is in should_start_hedge, which checks profiles.parallel.hedging.enabled
-        // Default config has hedging disabled
+        // This tests the configuration check. The hedge check is in
+        // should_start_hedge, which checks profiles.parallel.hedging.enabled;
+        // the default config has hedging disabled.
     }
 
     #[test]
     fn test_cancel_hedge() {
-        let mut hedge = HedgeState::default();
-        hedge.hedge_in_flight = true;
-        hedge.hedge_started = Some(Instant::now());
+        let mut hedge = HedgeState {
+            hedge_in_flight: true,
+            hedge_started: Some(Instant::now()),
+            ..Default::default()
+        };
 
         // Cancel should reset all fields
         // We can't easily test the abort handle without a real JoinHandle
