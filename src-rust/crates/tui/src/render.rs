@@ -4172,6 +4172,35 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Compute the `[start, end)` slice of a suggestion list to render in the
+/// popup, given the area height, the selected row, and whether the last row
+/// is a faded hint.
+///
+/// Windows `max_visible` rows centered on `selected` (like the transcript),
+/// but never lets a trailing faded hint fall below the fold — free-form
+/// placeholders such as `<objective>` are "what to type next" guidance and
+/// must stay visible even when the selectable rows fill the popup (e.g.
+/// `/goal` shows all five subcommands plus the dimmed `<objective>` hint).
+fn suggestion_window(
+    len: usize,
+    max_visible: usize,
+    selected: usize,
+    last_is_faded: bool,
+) -> (usize, usize) {
+    if len == 0 || max_visible == 0 {
+        return (0, 0);
+    }
+    let selected = selected.min(len - 1);
+    let mut start = selected
+        .saturating_sub(max_visible / 2)
+        .min(len.saturating_sub(max_visible));
+    if last_is_faded && start + max_visible < len {
+        start = len.saturating_sub(max_visible);
+    }
+    let end = (start + max_visible).min(len);
+    (start, end)
+}
+
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
     let suggestions = &app.prompt_input.suggestions;
     if suggestions.is_empty() || area.height == 0 {
@@ -4179,11 +4208,12 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let selected = app.prompt_input.suggestion_index.unwrap_or(0);
-    let max_visible = area.height as usize;
-    let start = selected
-        .saturating_sub(max_visible / 2)
-        .min(suggestions.len().saturating_sub(max_visible));
-    let end = (start + max_visible).min(suggestions.len());
+    let (start, end) = suggestion_window(
+        suggestions.len(),
+        area.height as usize,
+        selected,
+        suggestions.last().is_some_and(|s| s.faded),
+    );
     let label_width = area.width.saturating_div(3).max(12) as usize;
 
     for (row, suggestion) in suggestions[start..end].iter().enumerate() {
@@ -4237,10 +4267,12 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
             TypeaheadSource::ArgCompletion => {
                 let value = suggestion.arg_value.as_deref().unwrap_or(&suggestion.text);
                 let display_name = truncate_text(value, label_width);
+                // Faded rows use the theme's muted hint color (no DIM — the
+                // palette hint is already muted; stacking DIM on DarkGray
+                // made placeholders like `<api-key>` unreadable).
+                let hint_color = crate::theme_colors::current_palette().hint;
                 let label_style = if suggestion.faded {
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
+                    Style::default().fg(hint_color)
                 } else {
                     label_style
                 };
@@ -4250,9 +4282,7 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
                 ));
                 if !suggestion.description.is_empty() {
                     let desc_style = if suggestion.faded {
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM)
+                        Style::default().fg(hint_color)
                     } else {
                         detail_style
                     };
@@ -4792,6 +4822,39 @@ mod tool_block_tests {
         let mut lines = Vec::new();
         render_tool_block_lines(&mut lines, b, 0);
         lines.iter().map(flatten_line_text).collect()
+    }
+
+    #[test]
+    fn suggestion_window_fits_all_rows() {
+        assert_eq!(suggestion_window(2, 5, 0, false), (0, 2));
+        assert_eq!(suggestion_window(6, 10, 0, true), (0, 6));
+    }
+
+    #[test]
+    fn suggestion_window_centers_on_selection() {
+        // No faded hint: pure selection-centering window, as before.
+        assert_eq!(suggestion_window(10, 5, 0, false), (0, 5));
+        assert_eq!(suggestion_window(10, 5, 7, false), (5, 10));
+        assert_eq!(suggestion_window(10, 5, 4, false), (2, 7));
+    }
+
+    #[test]
+    fn suggestion_window_keeps_trailing_faded_hint_visible() {
+        // 6 rows in a 5-row popup: the trailing <objective> hint must not be
+        // windowed out, even though the selection sits at the top.
+        assert_eq!(suggestion_window(6, 5, 0, true), (1, 6));
+        // Selection in the middle: hint still wins the last row.
+        assert_eq!(suggestion_window(6, 5, 2, true), (1, 6));
+        // Larger lists scroll to the bottom so the hint is the last row.
+        assert_eq!(suggestion_window(10, 5, 0, true), (5, 10));
+        // Selected already at the end — hint already inside the window.
+        assert_eq!(suggestion_window(6, 5, 5, true), (1, 6));
+    }
+
+    #[test]
+    fn suggestion_window_empty_or_zero_height() {
+        assert_eq!(suggestion_window(0, 5, 0, true), (0, 0));
+        assert_eq!(suggestion_window(6, 0, 0, true), (0, 0));
     }
 
     #[test]

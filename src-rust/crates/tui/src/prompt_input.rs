@@ -4176,9 +4176,11 @@ pub fn render_prompt_input(
                             let ghost = truncate_to_width(&placeholder, avail as usize);
                             Paragraph::new(Line::from(vec![Span::styled(
                                 ghost,
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::DIM),
+                                // Theme-aware muted color. No DIM modifier:
+                                // the palette's hint color is already muted by
+                                // design, and stacking DIM on top of DarkGray
+                                // made the placeholder unreadable.
+                                Style::default().fg(crate::theme_colors::current_palette().hint),
                             )]))
                             .render(
                                 Rect {
@@ -4625,6 +4627,12 @@ mod tests {
         assert_eq!(buf[(31, 1)].symbol(), ">");
         // The cursor block still occupies its own cell before the ghost.
         assert_eq!(buf[(22, 1)].symbol(), "\u{2588}");
+        // The ghost uses the theme's muted hint color (readable, but clearly
+        // dimmer than the typed text) — not the old DarkGray+DIM double-dim.
+        let hint = crate::theme_colors::current_palette().hint;
+        assert_eq!(buf[(23, 1)].fg, hint);
+        assert_eq!(buf[(31, 1)].fg, hint);
+        assert_ne!(hint, Color::DarkGray);
     }
 
     #[test]
