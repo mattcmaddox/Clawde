@@ -98,12 +98,13 @@ pub use key_ring::{KeyRing, KeyStatus};
 // Re-export commonly used types at the crate root
 pub use config::{
     builtin_managed_agent_presets, default_agents, is_ollama_network_blocked,
-    network_isolation_enabled, ollama_unload_models, set_ollama_network_blocked,
-    spawn_ollama_unload, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
+    network_isolation_enabled, ollama_status, ollama_status_for_config, ollama_unload_models,
+    ollama_unload_models_for_config, set_ollama_network_blocked, spawn_ollama_unload,
+    spawn_ollama_unload_for_config, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
     AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
-    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaMode,
-    OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, VerifyConfig,
-    VerifySandbox,
+    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaLoadedModel,
+    OllamaMode, OllamaStatus, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig,
+    Theme, VerifyConfig, VerifySandbox,
 };
 pub use error::{ClaudeError, Result};
 pub use import_config::{
@@ -977,13 +978,13 @@ pub mod config {
 
     /// Global flag controlling whether network-level tool operations are
     /// blocked.  Set by the `/ollama` toggle; read by
-    /// [`PermissionManager::evaluate`] to auto-deny [`PermissionLevel::Network`]
+    /// [`PermissionManager::evaluate`] to auto-deny network-capable tool
     /// operations.
     static OLLAMA_NETWORK_BLOCKED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    /// Set the global network block flag.  When `true`, all
-    /// [`PermissionLevel::Network`] tool operations are denied.
+    /// Set the global network block flag. When `true`, all network-capable
+    /// tool operations are denied by the compatibility evaluator.
     pub fn set_ollama_network_blocked(blocked: bool) {
         OLLAMA_NETWORK_BLOCKED.store(blocked, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1004,18 +1005,33 @@ pub mod config {
         config.resolve_ollama_mode() == OllamaMode::Isolated
     }
 
-    /// Fire-and-forget: unload all currently loaded Ollama models from VRAM.
-    /// Safe to call from any thread; the HTTP work runs on a background thread.
-    pub fn spawn_ollama_unload() {
-        let _ = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Handle::try_current() {
-                Ok(h) => h,
-                Err(_) => return,
-            };
-            rt.block_on(async {
-                let _ = ollama_unload_models().await;
+    /// Fire-and-forget: unload the selected Ollama model from VRAM.
+    ///
+    /// The work is scheduled on the current Tokio runtime when one exists.
+    /// Calls made outside an async runtime get a small fallback runtime on a
+    /// background thread instead of silently doing nothing.
+    pub fn spawn_ollama_unload_for_config(config: Config, model: Option<String>) {
+        let task = async move {
+            let _ = ollama_unload_models_for_config(&config, model.as_deref()).await;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                    return;
+                };
+                runtime.block_on(task);
             });
-        });
+        }
+    }
+
+    /// Fire-and-forget unload using the persisted effective configuration.
+    /// Prefer [`spawn_ollama_unload_for_config`] for active sessions so CLI
+    /// overrides and unsaved runtime changes are respected.
+    pub fn spawn_ollama_unload() {
+        let config = Settings::load_sync().unwrap_or_default().effective_config();
+        spawn_ollama_unload_for_config(config, None);
     }
 
     /// Resolve the Ollama host URL from settings/env.
@@ -1140,50 +1156,175 @@ pub mod config {
             })
     }
 
-    /// Send keep_alive=0 requests to unload all loaded Ollama models.
-    pub async fn ollama_unload_models() -> Result<usize, String> {
-        let Some(base_url) = resolve_ollama_host() else {
-            return Ok(0);
-        };
-        let client = reqwest::Client::new();
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    pub struct OllamaLoadedModel {
+        pub name: String,
+        #[serde(default)]
+        pub size: Option<u64>,
+        #[serde(default)]
+        pub size_vram: Option<u64>,
+        #[serde(default)]
+        pub expires_at: Option<String>,
+        #[serde(default)]
+        pub context_length: Option<u64>,
+    }
 
-        let ps_body = client
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    struct OllamaPsResponse {
+        #[serde(default)]
+        models: Vec<OllamaLoadedModel>,
+    }
+
+    /// Current models loaded by an Ollama server, including the VRAM sizes
+    /// reported by Ollama's native `/api/ps` endpoint.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OllamaStatus {
+        pub models: Vec<OllamaLoadedModel>,
+    }
+
+    async fn ollama_status_at(
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> Result<OllamaStatus, String> {
+        let response = client
             .get(format!("{}/api/ps", base_url))
             .timeout(std::time::Duration::from_secs(3))
             .send()
             .await
-            .map_err(|e| format!("Failed to reach Ollama: {}", e))?
+            .map_err(|e| format!("Failed to reach Ollama: {}", e))?;
+        let status = response.status();
+        let body = response
             .text()
             .await
-            .map_err(|e| format!("Failed to read response: {}", e))?;
+            .map_err(|e| format!("Failed to read Ollama status: {}", e))?;
+        if !status.is_success() {
+            return Err(format!("Ollama /api/ps returned HTTP {}", status.as_u16()));
+        }
+        let payload: OllamaPsResponse = serde_json::from_str(&body)
+            .map_err(|e| format!("Failed to parse Ollama status: {}", e))?;
+        Ok(OllamaStatus {
+            models: payload.models,
+        })
+    }
 
-        let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&ps_body)
-            .ok()
-            .and_then(|v| {
-                v.get("models")?
-                    .as_array()?
-                    .iter()
-                    .map(|m| m.get("name")?.as_str().map(String::from))
-                    .collect()
-            })
+    /// Return the models currently loaded by the configured Ollama server.
+    pub async fn ollama_status_for_config(config: &Config) -> Result<OllamaStatus, String> {
+        let Some(base_url) = config.resolve_provider_api_base("ollama") else {
+            return Err("Ollama has no valid endpoint configured.".to_string());
+        };
+        let client = reqwest::Client::new();
+        ollama_status_at(&client, &base_url).await
+    }
+
+    /// Return the models currently loaded by the persisted Ollama server.
+    pub async fn ollama_status() -> Result<OllamaStatus, String> {
+        let config = Settings::load_sync()
+            .map(|settings| settings.effective_config())
             .unwrap_or_default();
+        ollama_status_for_config(&config).await
+    }
 
-        let mut count = 0usize;
-        for model in &models {
+    /// Send keep_alive=0 requests to unload loaded Ollama models.
+    ///
+    /// When `model` is `Some`, only that already-loaded model is targeted. An
+    /// unloaded model is never mentioned in a generate request because doing
+    /// so could load it just to immediately evict it.
+    pub async fn ollama_unload_models_for_config(
+        config: &Config,
+        model: Option<&str>,
+    ) -> Result<usize, String> {
+        let Some(base_url) = config.resolve_provider_api_base("ollama") else {
+            return Ok(0);
+        };
+        let client = reqwest::Client::new();
+        let initial = ollama_status_at(&client, &base_url).await?;
+        let targets: Vec<String> = match model {
+            Some(model) => initial
+                .models
+                .iter()
+                .filter(|loaded| loaded.name == model || loaded.name == format!("{}:latest", model))
+                .map(|loaded| loaded.name.clone())
+                .collect(),
+            None => initial
+                .models
+                .iter()
+                .map(|loaded| loaded.name.clone())
+                .collect(),
+        };
+
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unloaded = 0usize;
+        let mut failures = Vec::new();
+        for target in &targets {
             let body = serde_json::json!({
-                "model": model,
+                "model": target,
                 "prompt": "",
+                "stream": false,
                 "keep_alive": 0,
             });
-            let _ = client
+            let response = client
                 .post(format!("{}/api/generate", base_url))
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .await;
-            count += 1;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    if response.text().await.is_ok() {
+                        unloaded += 1;
+                    } else {
+                        failures.push(format!("{}: unreadable response", target));
+                    }
+                }
+                Ok(response) => {
+                    failures.push(format!("{}: HTTP {}", target, response.status().as_u16()))
+                }
+                Err(error) => failures.push(format!("{}: {}", target, error)),
+            }
         }
-        Ok(count)
+
+        if !failures.is_empty() {
+            return Err(format!(
+                "Unloaded {unloaded}/{} model(s); {}",
+                targets.len(),
+                failures.join("; ")
+            ));
+        }
+
+        // Ollama removes the model asynchronously. Poll briefly so callers do
+        // not report success while the model is still resident in VRAM.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let remaining = ollama_status_at(&client, &base_url).await?.models;
+            let still_loaded = match model {
+                Some(_) => remaining
+                    .iter()
+                    .any(|loaded| targets.contains(&loaded.name)),
+                None => !remaining.is_empty(),
+            };
+            if !still_loaded {
+                return Ok(unloaded);
+            }
+        }
+
+        Err(format!(
+            "Ollama accepted the unload request, but {} model(s) remain loaded.",
+            match model {
+                Some(_) => targets.len(),
+                None => initial.models.len(),
+            }
+        ))
+    }
+
+    /// Unload every currently loaded model from the persisted Ollama server.
+    pub async fn ollama_unload_models() -> Result<usize, String> {
+        let config = Settings::load_sync()
+            .map(|settings| settings.effective_config())
+            .unwrap_or_default();
+        ollama_unload_models_for_config(&config, None).await
     }
 
     // ---- ProviderConfig --------------------------------------------------
@@ -2069,6 +2210,16 @@ pub mod config {
                 .unwrap_or_default()
         }
 
+        /// Automatic VRAM eviction is opt-in because an Ollama endpoint may
+        /// be shared by multiple Clawde instances or other applications.
+        pub fn ollama_auto_unload_enabled(&self) -> bool {
+            self.provider_configs
+                .get("ollama")
+                .and_then(|cfg| cfg.options.get("auto_unload"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }
+
         /// Whether app-level mouse capture should be enabled. Defaults to `true`
         /// (capture on) when unset, preserving historical behaviour; users opt out
         /// via `"mouseCapture": false` to restore native terminal text selection
@@ -2624,12 +2775,39 @@ pub mod config {
             if self.provider.is_some() && config.provider.is_none() {
                 config.provider = self.provider.clone();
             }
-            // Merge top-level `providers` map into config.provider_configs.
-            for (id, pc) in &self.providers {
-                config
-                    .provider_configs
-                    .entry(id.clone())
-                    .or_insert_with(|| pc.clone());
+            // Merge top-level `providers` into the embedded provider map.
+            // Nested config values win, but fields/options that were not set
+            // there still inherit from the documented top-level location. This
+            // matters for Ollama: the TUI writes options under `config`, while
+            // many users keep `api_base` under top-level `providers`.
+            for (id, top_level) in &self.providers {
+                let Some(nested) = config.provider_configs.get_mut(id) else {
+                    config
+                        .provider_configs
+                        .insert(id.clone(), top_level.clone());
+                    continue;
+                };
+                if nested.api_key.is_none() {
+                    nested.api_key = top_level.api_key.clone();
+                }
+                if nested.api_base.is_none() {
+                    nested.api_base = top_level.api_base.clone();
+                }
+                if nested.models_whitelist.is_empty() {
+                    nested.models_whitelist = top_level.models_whitelist.clone();
+                }
+                if nested.models_blacklist.is_empty() {
+                    nested.models_blacklist = top_level.models_blacklist.clone();
+                }
+                if nested.request_timeout_secs.is_none() {
+                    nested.request_timeout_secs = top_level.request_timeout_secs;
+                }
+                for (key, value) in &top_level.options {
+                    nested
+                        .options
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
             }
             // Merge top-level `modelOverrides` into config.model_overrides
             // (nested `config` block wins for keys present in both).
@@ -3202,6 +3380,201 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
             assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn ollama_status_payload_parses_vram_fields() {
+            let payload: OllamaPsResponse = serde_json::from_value(serde_json::json!({
+                "models": [{
+                    "name": "qwen2.5-coder:7b",
+                    "size": 4_700_000_000u64,
+                    "size_vram": 4_200_000_000u64,
+                    "expires_at": "2026-08-18T12:00:00Z",
+                    "context_length": 12288
+                }]
+            }))
+            .expect("valid Ollama /api/ps payload");
+            assert_eq!(payload.models.len(), 1);
+            assert_eq!(payload.models[0].name, "qwen2.5-coder:7b");
+            assert_eq!(payload.models[0].size_vram, Some(4_200_000_000));
+            assert_eq!(payload.models[0].context_length, Some(12_288));
+        }
+
+        #[test]
+        fn effective_config_merges_ollama_top_level_fields_into_nested_options() {
+            let mut settings = Settings::default();
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .api_base = Some("http://devbox:11434".to_string());
+            settings
+                .providers
+                .get_mut("ollama")
+                .expect("provider inserted")
+                .options
+                .insert("num_ctx".to_string(), serde_json::json!(16_384));
+            settings
+                .config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("keep_alive".to_string(), serde_json::json!(0));
+
+            let config = settings.effective_config();
+            let ollama = config
+                .provider_configs
+                .get("ollama")
+                .expect("ollama config must exist");
+            assert_eq!(ollama.api_base.as_deref(), Some("http://devbox:11434"));
+            assert_eq!(
+                ollama
+                    .options
+                    .get("num_ctx")
+                    .and_then(|value| value.as_u64()),
+                Some(16_384)
+            );
+            // The nested setting wins when both locations provide the same key.
+            assert_eq!(
+                ollama
+                    .options
+                    .get("keep_alive")
+                    .and_then(|value| value.as_i64()),
+                Some(0)
+            );
+        }
+
+        #[tokio::test]
+        async fn ollama_unload_targets_only_named_loaded_model() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for step in 0..3 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0_u8; 8192];
+                    let size = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..size]);
+                    let body = match step {
+                        0 => {
+                            assert!(request.starts_with("GET /api/ps "));
+                            serde_json::json!({
+                                "models": [
+                                    {"name": "qwen2.5-coder:7b"},
+                                    {"name": "llama3:8b"}
+                                ]
+                            })
+                            .to_string()
+                        }
+                        1 => {
+                            assert!(request.starts_with("POST /api/generate "));
+                            assert!(request.contains("\"model\":\"qwen2.5-coder:7b\""));
+                            assert!(!request.contains("llama3:8b"));
+                            "{}".to_string()
+                        }
+                        _ => {
+                            assert!(request.starts_with("GET /api/ps "));
+                            serde_json::json!({"models": [{"name": "llama3:8b"}]}).to_string()
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+
+            let mut config = Config::default();
+            let provider = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some(format!("http://{address}/v1"));
+            provider
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+            let unload_result =
+                ollama_unload_models_for_config(&config, Some("qwen2.5-coder:7b")).await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(
+                server_result.is_ok(),
+                "mock Ollama server timed out or failed: {:?}",
+                server_result
+            );
+            assert!(
+                server_result.unwrap().is_ok(),
+                "mock Ollama server task failed"
+            );
+            assert_eq!(unload_result.unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn ollama_unload_reports_http_failures() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for (status, body) in [
+                    (
+                        "200 OK",
+                        serde_json::json!({"models": [{"name": "qwen2.5-coder:7b"}]}).to_string(),
+                    ),
+                    ("500 Internal Server Error", "backend failed".to_string()),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0_u8; 8192];
+                    let _ = stream.read(&mut request).await.unwrap();
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+
+            let mut config = Config::default();
+            let provider = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some(format!("http://{address}"));
+            provider
+                .options
+                .insert("mode".to_string(), serde_json::json!("isolated"));
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+
+            let result = ollama_unload_models_for_config(&config, Some("qwen2.5-coder:7b")).await;
+            let server_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+            assert!(server_result.is_ok());
+            assert!(server_result.unwrap().is_ok());
+            assert!(result.unwrap_err().contains("HTTP 500"));
+        }
+
+        #[test]
+        fn ollama_auto_unload_requires_explicit_opt_in() {
+            let mut config = Config::default();
+            assert!(!config.ollama_auto_unload_enabled());
+            config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert("auto_unload".to_string(), serde_json::json!(true));
+            assert!(config.ollama_auto_unload_enabled());
         }
 
         #[test]

@@ -2764,14 +2764,27 @@ impl App {
 
     /// Switch the active provider while clearing any explicit model override.
     fn set_provider_default(&mut self, provider_id: String) {
-        // Auto-unload Ollama models when switching away.
-        if self.config.provider.as_deref() == Some("ollama") && provider_id != "ollama" {
-            clawde_core::spawn_ollama_unload();
+        let old_provider = self.config.selected_provider_id().to_string();
+        let old_model = self.model_name.clone();
+        let model = self.display_default_model_for_provider(&provider_id);
+        let old_bare = old_model.strip_prefix("ollama/").unwrap_or(&old_model);
+        let new_bare = model.strip_prefix("ollama/").unwrap_or(&model);
+
+        // Target only the model owned by this session. Unloading every model on
+        // a shared remote Ollama server could interrupt another Clawde instance.
+        if self.config.ollama_auto_unload_enabled()
+            && old_provider == "ollama"
+            && (provider_id != "ollama" || old_bare != new_bare)
+            && !old_bare.is_empty()
+        {
+            clawde_core::spawn_ollama_unload_for_config(
+                self.config.clone(),
+                Some(old_bare.to_string()),
+            );
         }
+
         self.config.provider = Some(provider_id.clone());
         self.config.model = None;
-
-        let model = self.display_default_model_for_provider(&provider_id);
         self.cost_tracker.set_model(&model);
         self.model_name = model;
         self.refresh_context_window_size();
@@ -2941,14 +2954,33 @@ impl App {
 
     /// Update the active model name (also updates config + cost tracker).
     pub fn set_model(&mut self, model: String) {
+        let old_provider = self.config.selected_provider_id().to_string();
+        let old_model = self.model_name.clone();
+        let inferred_provider = Self::infer_provider_from_model(&model);
+        let new_provider = inferred_provider
+            .as_deref()
+            .unwrap_or(old_provider.as_str());
+        let old_bare = old_model.strip_prefix("ollama/").unwrap_or(&old_model);
+        let new_bare = model.strip_prefix("ollama/").unwrap_or(&model);
+
+        // This covers both leaving Ollama and switching between two Ollama
+        // models. Targeting the old model avoids evicting unrelated models on
+        // a shared GPU server.
+        if self.config.ollama_auto_unload_enabled()
+            && old_provider == "ollama"
+            && (new_provider != "ollama" || old_bare != new_bare)
+            && !old_bare.is_empty()
+        {
+            clawde_core::spawn_ollama_unload_for_config(
+                self.config.clone(),
+                Some(old_bare.to_string()),
+            );
+        }
+
         self.cost_tracker.set_model(&model);
         self.model_name = model.clone();
-        self.config.model = Some(model.clone());
-        if let Some(provider) = Self::infer_provider_from_model(&model) {
-            let old_provider = self.config.provider.as_deref().unwrap_or("");
-            if old_provider == "ollama" && provider != "ollama" {
-                clawde_core::spawn_ollama_unload();
-            }
+        self.config.model = Some(model);
+        if let Some(provider) = inferred_provider {
             self.config.provider = Some(provider.clone());
             self.reset_free_task_sort_if_not_free(&provider);
         }
@@ -3038,6 +3070,12 @@ impl App {
         let cmd = cmd.as_str();
 
         if cmd == "mcp" && !args.trim().is_empty() {
+            return false;
+        }
+        // `/ollama status` is an async command because it queries the native
+        // Ollama endpoint; leave it for the commands/CLI layer instead of
+        // treating it as the mode toggle.
+        if cmd == "ollama" && args.trim().eq_ignore_ascii_case("status") {
             return false;
         }
         // /compare and its nested aliases open the shared comparison dialog.
@@ -6243,9 +6281,6 @@ impl App {
                         // and /model is untouched (its picker provider IS the
                         // active provider, so `provider` won't be "free").
                         if provider == "free" && self.config.provider.as_deref() != Some("free") {
-                            if self.config.provider.as_deref() == Some("ollama") {
-                                clawde_core::spawn_ollama_unload();
-                            }
                             self.config.provider = Some("free".to_string());
                         }
                         self.persist_provider_and_model();

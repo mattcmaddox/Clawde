@@ -193,6 +193,9 @@ pub struct SettingsScreen {
     pub ollama_require_explicit_host: bool,
     /// Ollama: permit loopback only when mode is explicitly isolated.
     pub ollama_allow_local_host: bool,
+    /// Ollama: automatically unload this session's previous model on switch.
+    /// Disabled by default because the endpoint may be shared.
+    pub ollama_auto_unload: bool,
     /// Ollama: explicitly configured remote host URL. Empty means unavailable.
     pub ollama_default_host: String,
     /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
@@ -270,6 +273,7 @@ impl SettingsScreen {
             ollama_num_predict: "2K".to_string(),
             ollama_require_explicit_host: true,
             ollama_allow_local_host: false,
+            ollama_auto_unload: false,
             ollama_default_host: String::new(),
             permission_mode: "default".to_string(),
             allowed_tools: String::new(),
@@ -424,8 +428,7 @@ impl SettingsScreen {
         self.preferred_search_backend = s.preferred_search_backend.clone();
 
         // Read Ollama options from provider config.
-        let ollama_opts = s
-            .config
+        let ollama_opts = effective_config
             .provider_configs
             .get("ollama")
             .map(|pc| &pc.options);
@@ -444,6 +447,12 @@ impl SettingsScreen {
         self.ollama_require_explicit_host = ollama_opts
             .and_then(|o| o.get("require_explicit_host").and_then(|v| v.as_bool()))
             .unwrap_or(true);
+        self.ollama_allow_local_host = ollama_opts
+            .and_then(|o| o.get("allow_local_host").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        self.ollama_auto_unload = ollama_opts
+            .and_then(|o| o.get("auto_unload").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
         self.ollama_default_host = ollama_opts
             .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
             .unwrap_or_default()
@@ -920,12 +929,15 @@ impl Default for SettingsScreen {
 // ---------------------------------------------------------------------------
 
 const OLLAMA_CTX_PRESETS: &[(&str, u64)] = &[
+    ("model default", 0),
     ("4K", 4_096),
     ("8K", 8_192),
     ("12K", 12_288),
     ("16K", 16_384),
     ("24K", 24_576),
     ("32K", 32_768),
+    ("64K", 65_536),
+    ("128K", 131_072),
 ];
 
 const OLLAMA_PREDICT_PRESETS: &[(&str, u64)] = &[
@@ -937,6 +949,7 @@ const OLLAMA_PREDICT_PRESETS: &[(&str, u64)] = &[
 ];
 
 const OLLAMA_KEEP_ALIVE_PRESETS: &[(&str, i64)] = &[
+    ("unload after request", 0),
     ("5 min", 300),
     ("10 min", 600),
     ("30 min", 1_800),
@@ -955,16 +968,16 @@ fn num_ctx_to_preset(n: u64) -> String {
             return label.to_string();
         }
     }
-    format!("{}K", n / 1024)
+    format!("{}K (custom)", n / 1024)
 }
 
-fn preset_to_num_ctx(preset: &str) -> u64 {
+fn preset_to_num_ctx(preset: &str) -> Option<u64> {
     for (label, val) in OLLAMA_CTX_PRESETS {
         if *label == preset {
-            return *val;
+            return (*val != 0).then_some(*val);
         }
     }
-    12_288
+    None
 }
 
 fn num_predict_to_preset(n: u64) -> String {
@@ -986,24 +999,24 @@ fn preset_to_num_predict(preset: &str) -> u64 {
 }
 
 fn keep_alive_to_preset(n: i64) -> String {
-    if n <= 0 {
-        return "forever".to_string();
-    }
     for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
         if *val == n {
             return label.to_string();
         }
     }
-    format!("{}s", n)
+    if n < 0 {
+        return "forever".to_string();
+    }
+    format!("{}s (custom)", n)
 }
 
-fn preset_to_keep_alive(preset: &str) -> String {
+fn preset_to_keep_alive(preset: &str) -> i64 {
     for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
         if *label == preset {
-            return val.to_string();
+            return *val;
         }
     }
-    "-1".to_string()
+    -1
 }
 
 fn ollama_ctx_labels() -> Vec<&'static str> {
@@ -1037,7 +1050,8 @@ fn get_or_create_routing_json(config: &Config) -> serde_json::Value {
 // This is what powers the per-row origin tag: compare the global and project
 // snapshots against the built-in default.
 fn value_from_settings(settings: &Settings, key: &str) -> String {
-    let c = &settings.config;
+    let effective_config = settings.effective_config();
+    let c = &effective_config;
     match key {
         "max_tokens" => c.max_tokens.map(|n| n.to_string()).unwrap_or_default(),
         "auto_compact" => settings.auto_compact.to_string(),
@@ -1102,6 +1116,14 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
             .and_then(|o| o.get("require_explicit_host").and_then(|v| v.as_bool()))
             .map(|b| b.to_string())
             .unwrap_or_default(),
+        "ollama_allow_local_host" => ollama_opts(c)
+            .and_then(|o| o.get("allow_local_host").and_then(|v| v.as_bool()))
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
+        "ollama_auto_unload" => ollama_opts(c)
+            .and_then(|o| o.get("auto_unload").and_then(|v| v.as_bool()))
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
         "ollama_default_host" => ollama_opts(c)
             .and_then(|o| o.get("default_host").and_then(|v| v.as_str()))
             .unwrap_or_default()
@@ -1135,6 +1157,7 @@ fn default_value_for(key: &str) -> String {
         | "ollama_num_predict"
         | "ollama_require_explicit_host"
         | "ollama_allow_local_host"
+        | "ollama_auto_unload"
         | "allowed_tools"
         | "disallowed_tools"
         | "ollama_default_host"
@@ -1732,6 +1755,26 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         SettingEffect::Immediate,
         SettingKind::Bool,
         bool_v(screen.ollama_require_explicit_host),
+    ));
+    entries.push(make_entry(
+        "ollama_allow_local_host",
+        "Ollama: Allow local host",
+        "Allow localhost/127.0.0.1 only while Ollama mode is isolated. Enable this for a deliberately local WSL Ollama instance; it is ignored in auto mode.",
+        SECTION_OLLAMA,
+        "false".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Bool,
+        bool_v(screen.ollama_allow_local_host),
+    ));
+    entries.push(make_entry(
+        "ollama_auto_unload",
+        "Ollama: Auto-unload on switch",
+        "Automatically unload the previous model when switching models or providers. Disabled by default because the configured server may be shared.",
+        SECTION_OLLAMA,
+        "false".to_string(),
+        SettingEffect::Immediate,
+        SettingKind::Bool,
+        bool_v(screen.ollama_auto_unload),
     ));
     entries.push(make_entry(
         "ollama_default_host",
@@ -2549,29 +2592,69 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, config: &mut Config, ke
             _ = c
                 .provider_configs
                 .get_mut("ollama")
-                .and_then(|pc| pc.options.remove("num_ctx"))
+                .and_then(|pc| pc.options.remove("num_ctx"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("num_ctx"));
         }
         "ollama_keep_alive" => {
             _ = c
                 .provider_configs
                 .get_mut("ollama")
-                .and_then(|pc| pc.options.remove("keep_alive"))
+                .and_then(|pc| pc.options.remove("keep_alive"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("keep_alive"));
         }
         "ollama_num_predict" => {
             _ = c
                 .provider_configs
                 .get_mut("ollama")
-                .and_then(|pc| pc.options.remove("num_predict"))
+                .and_then(|pc| pc.options.remove("num_predict"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("num_predict"));
         }
         "ollama_require_explicit_host" => {
             _ = c
                 .provider_configs
                 .get_mut("ollama")
                 .and_then(|pc| pc.options.remove("require_explicit_host"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("require_explicit_host"));
+        }
+        "ollama_allow_local_host" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("allow_local_host"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("allow_local_host"));
+        }
+        "ollama_auto_unload" => {
+            _ = c
+                .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("auto_unload"));
+            _ = s
+                .providers
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("auto_unload"));
         }
         "ollama_default_host" => {
             _ = c
                 .provider_configs
+                .get_mut("ollama")
+                .and_then(|pc| pc.options.remove("default_host"));
+            _ = s
+                .providers
                 .get_mut("ollama")
                 .and_then(|pc| pc.options.remove("default_host"));
         }
@@ -2641,6 +2724,7 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "allowed_tools" => screen.allowed_tools.clear(),
         "disallowed_tools" => screen.disallowed_tools.clear(),
         "ollama_allow_local_host" => screen.ollama_allow_local_host = false,
+        "ollama_auto_unload" => screen.ollama_auto_unload = false,
         _ => {}
     }
 }
@@ -2779,6 +2863,44 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                             .insert("require_explicit_host".to_string(), val);
                         let _ = screen.settings_snapshot.save_sync();
                     }
+                    "ollama_allow_local_host" => {
+                        screen.ollama_allow_local_host = new_value;
+                        let val = serde_json::Value::from(new_value);
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("allow_local_host".to_string(), val.clone());
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("allow_local_host".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "ollama_auto_unload" => {
+                        screen.ollama_auto_unload = new_value;
+                        let val = serde_json::Value::from(new_value);
+                        screen
+                            .settings_snapshot
+                            .config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("auto_unload".to_string(), val.clone());
+                        config
+                            .provider_configs
+                            .entry("ollama".to_string())
+                            .or_default()
+                            .options
+                            .insert("auto_unload".to_string(), val);
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
                     "memory_enabled" => {
                         screen.memory_enabled = new_value;
                         screen.settings_snapshot.config.memory.enabled = Some(new_value);
@@ -2891,26 +3013,34 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
                     }
                     "ollama_num_ctx" => {
                         screen.ollama_num_ctx = new_value.to_string();
-                        let val = serde_json::Value::from(preset_to_num_ctx(new_value));
-                        screen
+                        let provider = screen
                             .settings_snapshot
                             .config
                             .provider_configs
                             .entry("ollama".to_string())
-                            .or_default()
-                            .options
-                            .insert("num_ctx".to_string(), val.clone());
+                            .or_default();
                         config
                             .provider_configs
                             .entry("ollama".to_string())
-                            .or_default()
-                            .options
-                            .insert("num_ctx".to_string(), val);
+                            .or_default();
+                        if let Some(ctx) = preset_to_num_ctx(new_value) {
+                            let val = serde_json::Value::from(ctx);
+                            provider.options.insert("num_ctx".to_string(), val.clone());
+                            config
+                                .provider_configs
+                                .get_mut("ollama")
+                                .and_then(|pc| pc.options.insert("num_ctx".to_string(), val));
+                        } else {
+                            provider.options.remove("num_ctx");
+                            if let Some(pc) = config.provider_configs.get_mut("ollama") {
+                                pc.options.remove("num_ctx");
+                            }
+                        }
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     "ollama_keep_alive" => {
                         screen.ollama_keep_alive = new_value.to_string();
-                        let val = serde_json::Value::String(preset_to_keep_alive(new_value));
+                        let val = serde_json::Value::from(preset_to_keep_alive(new_value));
                         screen
                             .settings_snapshot
                             .config
@@ -2963,6 +3093,31 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen, config: &mut Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_keep_alive_preserves_unload_semantics() {
+        assert_eq!(keep_alive_to_preset(0), "unload after request");
+        assert_eq!(preset_to_keep_alive("unload after request"), 0);
+        assert_eq!(keep_alive_to_preset(-1), "forever");
+        assert_eq!(preset_to_keep_alive("forever"), -1);
+    }
+
+    #[test]
+    fn ollama_context_presets_support_model_defaults_and_larger_models() {
+        assert_eq!(preset_to_num_ctx("model default"), None);
+        assert_eq!(preset_to_num_ctx("64K"), Some(65_536));
+        assert_eq!(num_ctx_to_preset(131_072), "128K");
+        assert_eq!(num_ctx_to_preset(65_537), "64K (custom)");
+    }
+
+    #[test]
+    fn ollama_auto_unload_defaults_to_disabled() {
+        let screen = SettingsScreen::new();
+        assert!(!screen.ollama_auto_unload);
+        assert!(all_entries(&screen)
+            .iter()
+            .any(|entry| entry.key == "ollama_auto_unload" && entry.value == "false"));
+    }
 
     #[test]
     fn settings_screen_new_has_sensible_defaults() {

@@ -569,6 +569,19 @@ Then run the explicitly configured remote model:
 clawde --provider ollama --model llama3.2 "explain this code"
 ```
 
+**VRAM controls:**
+
+- `/ollama status` reports loaded models and the VRAM sizes reported by Ollama.
+- `/unload` unloads every currently loaded model on the configured server.
+- `/unload <model>` unloads only the named loaded model, for example
+  `/unload qwen2.5-coder:7b`.
+- Automatic unload on provider/model switch is disabled by default. Enable
+  `Ollama: Auto-unload on switch` only when the configured server is dedicated
+  to this Clawde session; targeting the previous model still cannot prove that
+  another instance is not using the same model.
+- Separate Clawde instances should use explicit `/unload <model>` only when
+  they coordinate ownership of a shared Ollama server.
+
 **Remote GPU default:**
 
 For a GPU server shared across machines on a LAN, `api_base` is the clearest

@@ -347,13 +347,52 @@ impl SlashCommand for OllamaModeCommand {
                 description: "Ollama isolated — network tools blocked for privacy".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "status".into(),
+                description: "Show loaded models and reported VRAM usage".into(),
+                available: true,
+            },
         ]
     }
 
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if args.trim().eq_ignore_ascii_case("status") {
+            return match clawde_core::ollama_status_for_config(&ctx.config).await {
+                Ok(status) if status.models.is_empty() => CommandResult::Message(
+                    "Ollama is reachable; no models are loaded in VRAM.".to_string(),
+                ),
+                Ok(status) => {
+                    let total_vram: u64 = status
+                        .models
+                        .iter()
+                        .filter_map(|model| model.size_vram)
+                        .sum();
+                    let models = status
+                        .models
+                        .iter()
+                        .map(|model| {
+                            let vram = model
+                                .size_vram
+                                .map(|bytes| format!("{} MB VRAM", bytes / 1_048_576))
+                                .unwrap_or_else(|| "VRAM unknown".to_string());
+                            format!("{} ({})", model.name, vram)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    CommandResult::Message(format!(
+                        "Ollama loaded: {}\nTotal reported VRAM: {} MB",
+                        models,
+                        total_vram / 1_048_576
+                    ))
+                }
+                Err(error) => CommandResult::Error(error),
+            };
+        }
+
         CommandResult::Message(
             "Ollama mode is toggled in the TUI. Use /ollama without arguments \
-             or press Alt+O to switch between auto and isolated mode."
+             or press Alt+O to switch between auto and isolated mode.\n\
+             Use /ollama status to see loaded models and reported VRAM."
                 .to_string(),
         )
     }

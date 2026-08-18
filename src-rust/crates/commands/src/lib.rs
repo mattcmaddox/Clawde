@@ -1924,14 +1924,26 @@ impl SlashCommand for UnloadCommand {
         "Unload the Ollama model from GPU VRAM"
     }
     fn help(&self) -> &str {
-        "Usage: /unload\n\n\
-         Forces Ollama to immediately unload the current model from VRAM,\n\
-         freeing the GPU for other applications (e.g. gaming). The model\n\
-         will reload on the next chat request."
+        "Usage: /unload [model]\n\n\
+         Forces Ollama to immediately unload the selected model from VRAM.\n\
+         With no model argument, unloads every model currently loaded by the\n\
+         configured Ollama server. The model reloads on the next chat request."
     }
 
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        match clawde_core::ollama_unload_models().await {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let requested = args.trim();
+        let requested = (!requested.is_empty()).then(|| {
+            requested
+                .strip_prefix("ollama/")
+                .unwrap_or(requested)
+                .to_string()
+        });
+        match clawde_core::ollama_unload_models_for_config(&ctx.config, requested.as_deref()).await
+        {
+            Ok(0) if requested.is_some() => CommandResult::Message(format!(
+                "Model '{}' is not currently loaded.",
+                requested.unwrap_or_default()
+            )),
             Ok(0) => CommandResult::Message("No models currently loaded in Ollama.".to_string()),
             Ok(n) => CommandResult::Message(format!("Unloaded {} model(s) from VRAM.", n)),
             Err(e) => CommandResult::Error(e),
