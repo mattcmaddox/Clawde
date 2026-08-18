@@ -563,3 +563,68 @@ impl Tool for TaskOutputTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn task_new_defaults_to_pending() {
+        let t = Task::new("subject", "description");
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert_eq!(t.subject, "subject");
+        assert_eq!(t.description, "description");
+        assert!(t.owner.is_none());
+        assert!(t.blocks.is_empty());
+        assert!(t.blocked_by.is_empty());
+        assert!(!t.id.is_empty());
+    }
+
+    #[test]
+    fn task_status_display_strings() {
+        assert_eq!(TaskStatus::Pending.to_string(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TaskStatus::Completed.to_string(), "completed");
+        assert_eq!(TaskStatus::Deleted.to_string(), "deleted");
+        assert_eq!(TaskStatus::Running.to_string(), "running");
+        assert_eq!(TaskStatus::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn task_summary_value_shape() {
+        let t = Task::new("subject", "description");
+        let v = t.to_summary_value();
+        assert_eq!(v["id"], t.id);
+        assert_eq!(v["subject"], "subject");
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["owner"], Value::Null);
+        assert_eq!(v["blocked_by"], json!([]));
+    }
+
+    #[test]
+    fn task_full_value_shape() {
+        let t = Task::new("subject", "description");
+        let v = t.to_full_value();
+        assert_eq!(v["description"], "description");
+        assert_eq!(v["blocks"], json!([]));
+        assert_eq!(v["output"], Value::Null);
+        assert_eq!(v["status"], "pending");
+    }
+
+    #[test]
+    fn task_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(TaskStatus::InProgress).unwrap(),
+            json!("in_progress")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskStatus::Running).unwrap(),
+            json!("running")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskStatus::Deleted).unwrap(),
+            json!("deleted")
+        );
+    }
+}

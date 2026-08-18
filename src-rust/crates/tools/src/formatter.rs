@@ -62,6 +62,12 @@ mod tests {
     use super::formatter_allowed;
 
     #[test]
+    fn formatter_allowed_without_isolation() {
+        let config = clawde_core::config::Config::default();
+        assert!(formatter_allowed(&config));
+    }
+
+    #[test]
     fn formatter_is_disabled_for_config_only_isolation() {
         let mut config = clawde_core::config::Config::default();
         config.provider_configs.insert(

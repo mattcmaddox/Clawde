@@ -399,3 +399,97 @@ impl Tool for WebFetchTool {
         ToolResult::success(text)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_html_removes_tags_keeps_text() {
+        assert_eq!(strip_html("<p>Hello <b>world</b></p>"), "Hello world");
+        // Block open+close each emit a newline, leaving one blank line.
+        assert_eq!(strip_html("<h1>Title</h1><p>Body</p>"), "Title\n\nBody");
+    }
+
+    #[test]
+    fn strip_html_drops_script_and_style_content() {
+        let html = "<script>var secret = 'xss';</script><style>.x{color:red}</style>visible";
+        assert_eq!(strip_html(html), "visible");
+        // Case-insensitive script/style detection.
+        let upper = "<SCRIPT>bad()</SCRIPT>ok";
+        assert_eq!(strip_html(upper), "ok");
+    }
+
+    #[test]
+    fn strip_html_decodes_basic_entities() {
+        assert_eq!(strip_html("a &amp; b &lt;c&gt;"), "a & b <c>");
+        assert_eq!(
+            strip_html("&quot;quoted&quot; &#39;apos&#39; &apos;x&apos;"),
+            "\"quoted\" 'apos' 'x'"
+        );
+        assert_eq!(strip_html("a&nbsp;b"), "a b");
+        // Unknown entities are kept verbatim.
+        assert_eq!(strip_html("&unknown;"), "&unknown;");
+    }
+
+    #[test]
+    fn strip_html_block_tags_become_newlines() {
+        assert_eq!(strip_html("<div>one</div><div>two</div>"), "one\n\ntwo");
+        assert_eq!(strip_html("<ul><li>a</li><li>b</li></ul>"), "a\n\nb");
+        // Void block tags (no closer) emit a single newline.
+        assert_eq!(strip_html("one<br>two"), "one\ntwo");
+    }
+
+    #[test]
+    fn strip_html_handles_unclosed_tag_and_comment() {
+        // Text after an unclosed tag is dropped (still in-tag).
+        assert_eq!(strip_html("text <div"), "text");
+        // Comments are consumed as tags; surrounding text survives.
+        assert_eq!(strip_html("a <!-- hidden --> b"), "a  b");
+    }
+
+    #[test]
+    fn strip_html_empty_and_whitespace_only() {
+        assert_eq!(strip_html(""), "");
+        assert_eq!(strip_html("   "), "");
+        assert_eq!(strip_html("<p>   </p>"), "");
+    }
+
+    #[test]
+    fn strip_html_collapses_blank_lines() {
+        // Extra blank lines between paragraphs collapse to at most two.
+        assert_eq!(strip_html("<p>a</p>\n\n\n<p>b</p>"), "a\n\n\nb");
+    }
+
+    #[test]
+    fn is_edge_case_html_flags_low_word_count() {
+        assert!(is_edge_case_html("<html><body>tiny</body></html>", "tiny")); // ~50 words is still below the 100-word threshold.
+        let words = std::iter::repeat_n("word", 50)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(is_edge_case_html("<body>hi</body>", &words));
+    }
+
+    #[test]
+    fn is_edge_case_html_requires_semantic_tags() {
+        let words = std::iter::repeat_n("word", 200)
+            .collect::<Vec<_>>()
+            .join(" ");
+        // 200 words but no <article>/<main>/<body> → flagged.
+        assert!(is_edge_case_html("<div><span>ignored</span></div>", &words));
+        // Same content with a semantic tag passes.
+        assert!(!is_edge_case_html("<html><body>hi</body></html>", &words));
+        // Tag detection is case-insensitive.
+        assert!(!is_edge_case_html("<HTML><BODY>hi</BODY></HTML>", &words));
+    }
+
+    #[test]
+    fn url_hash_is_deterministic_and_distinct() {
+        let a = url_hash("https://example.com/page");
+        assert_eq!(a, url_hash("https://example.com/page"));
+        assert_ne!(a, url_hash("https://example.com/other"));
+        assert!(!a.is_empty());
+        // Hex output.
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}

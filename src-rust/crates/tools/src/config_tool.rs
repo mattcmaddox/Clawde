@@ -214,3 +214,23 @@ fn permission_mode_str(mode: &clawde_core::config::PermissionMode) -> &'static s
         PermissionMode::Plan => "plan",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::config::PermissionMode;
+
+    #[test]
+    fn permission_mode_str_maps_all_modes() {
+        assert_eq!(permission_mode_str(&PermissionMode::Default), "default");
+        assert_eq!(
+            permission_mode_str(&PermissionMode::AcceptEdits),
+            "accept_edits"
+        );
+        assert_eq!(
+            permission_mode_str(&PermissionMode::BypassPermissions),
+            "bypass_permissions"
+        );
+        assert_eq!(permission_mode_str(&PermissionMode::Plan), "plan");
+    }
+}
