@@ -70,7 +70,7 @@ All six gaps identified in the auto-compact research have been implemented and t
 ### [commands] /compact command improvements
 - [x] `build_conversation_transcript()` fixed for UTF-8 safety using `char_indices()`
 - [x] Added `test_compact_non_ascii_messages` test with CJK, accented, and emoji characters
-- [ ] Consider timeout / cancellation for long compaction requests
+- [x] Timeout / cancellation for long compaction requests — `/compact` now runs on a background task (mirrors `/verify`): a `compacting…` spinner shows in the status row, Esc cancels the in-flight model call via a `CancellationToken`, and preview results render as assistant messages (`/compact send` injects the summary and starts a fresh turn). Headless runs stay inline via the registry. Shared `run_compact_command` in `commands/src/lib.rs` keeps both paths identical (commit 1e10060).
 
 ### [commands] /ctx-viz command
 - [x] Context visualization command added
@@ -85,7 +85,8 @@ All six gaps identified in the auto-compact research have been implemented and t
 ### [tests] Test coverage gaps
 - [x] `grep_tool.rs` — added 4 comprehensive unit tests (non-ASCII UTF-8, empty file, regex special chars, line anchors)
 - [x] `glob_tool.rs` — 14 unit tests added (non-ASCII paths, empty dirs, recursive patterns, edge cases)
-- [ ] Tools crate overall still has low test coverage
+- [x] `web_fetch.rs` / `config_tool.rs` / `tasks.rs` — added 17 unit tests (the three tools modules with none): `strip_html` tag/script/style/entity handling, edge-case HTML detection, `url_hash` determinism, `permission_mode_str` mapping, and Task construction/status/JSON shapes (commit 94164b2)
+- [ ] Tools crate overall still has low test coverage (remaining untested logic: `web_fetch` caching + execute paths, `tasks` global-store execute paths, `config_tool` execute)
 - [ ] Commands crate tests are many but many are basic registry checks
 
 ### [tui] Context visualization
