@@ -65,3 +65,43 @@ impl Tool for SleepTool {
         ToolResult::success(format!("Slept for {}ms.", duration_ms))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_ms_errors() {
+        let res = SleepTool
+            .execute(
+                json!({}),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn accepts_ms_and_alias_fields() {
+        for input in [json!({ "ms": 0 }), json!({ "duration_ms": 0 })] {
+            let res = SleepTool
+                .execute(input, &crate::test_support::allow_all_context(".".into()))
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert_eq!(res.content, "Slept for 0ms.");
+        }
+    }
+
+    #[tokio::test]
+    async fn short_sleep_reports_elapsed_ms() {
+        let res = SleepTool
+            .execute(
+                json!({ "ms": 1 }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "Slept for 1ms.");
+    }
+}

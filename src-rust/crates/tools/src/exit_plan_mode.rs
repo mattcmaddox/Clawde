@@ -60,3 +60,42 @@ impl Tool for ExitPlanModeTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_summary_includes_summary_and_metadata() {
+        let res = ExitPlanModeTool
+            .execute(
+                json!({ "summary": "refactor the parser" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(
+            res.content,
+            "Exited plan mode. Plan summary: refactor the parser"
+        );
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["type"], "exit_plan_mode");
+        assert_eq!(meta["summary"], "refactor the parser");
+    }
+
+    #[tokio::test]
+    async fn without_summary_uses_default_message() {
+        let res = ExitPlanModeTool
+            .execute(
+                json!({}),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(
+            res.content,
+            "Exited plan mode. All tools are now available."
+        );
+        assert_eq!(res.metadata.unwrap()["summary"], Value::Null);
+    }
+}

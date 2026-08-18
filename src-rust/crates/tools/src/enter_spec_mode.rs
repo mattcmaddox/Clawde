@@ -73,3 +73,40 @@ impl Tool for EnterSpecModeTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_task_includes_task_and_metadata() {
+        let res = EnterSpecModeTool
+            .execute(
+                json!({ "task": "add retries" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("add retries"), "{}", res.content);
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["type"], "enter_spec_mode");
+        assert_eq!(meta["task"], "add retries");
+    }
+
+    #[tokio::test]
+    async fn without_task_uses_default_message() {
+        let res = EnterSpecModeTool
+            .execute(
+                json!({}),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(
+            res.content.starts_with("Entered spec mode."),
+            "{}",
+            res.content
+        );
+        assert_eq!(res.metadata.unwrap()["task"], Value::Null);
+    }
+}

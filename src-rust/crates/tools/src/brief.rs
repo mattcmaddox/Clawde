@@ -158,3 +158,99 @@ async fn resolve_attachment(path: &Path) -> Result<AttachmentMeta, String> {
         is_image,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_input_errors() {
+        let res = BriefTool
+            .execute(
+                json!({ "message": 42 }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn empty_message_errors() {
+        let res = BriefTool
+            .execute(
+                json!({ "message": "  " }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("Message cannot be empty"),
+            "{}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_attachment_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let res = BriefTool
+            .execute(
+                json!({ "message": "hi", "attachments": ["nope.txt"] }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("Failed to resolve attachments"),
+            "{}",
+            res.content
+        );
+        assert!(res.content.contains("nope.txt"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn image_attachment_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), b"fake-png-bytes").unwrap();
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let res = BriefTool
+            .execute(
+                json!({ "message": "here is the screenshot", "attachments": ["shot.png"] }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["message"], "here is the screenshot");
+        assert_eq!(meta["status"], "normal");
+        let att = &meta["attachments"][0];
+        assert_eq!(att["is_image"], true);
+        assert_eq!(
+            att["path"],
+            dir.path().join("shot.png").display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn text_attachment_and_proactive_status() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("log.txt"), "some log output").unwrap();
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let res = BriefTool
+            .execute(
+                json!({ "message": "build finished", "status": "proactive", "attachments": ["log.txt"] }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "build finished");
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["status"], "proactive");
+        assert!(meta["sentAt"].is_string());
+        let att = &meta["attachments"][0];
+        assert_eq!(att["is_image"], false);
+        assert_eq!(att["size"], 15);
+    }
+}

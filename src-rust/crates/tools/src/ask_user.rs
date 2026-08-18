@@ -102,3 +102,77 @@ impl Tool for AskUserQuestionTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interactive_ctx() -> ToolContext {
+        let mut ctx = crate::test_support::allow_all_context(std::path::PathBuf::from("."));
+        ctx.non_interactive = false;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn non_interactive_mode_errors() {
+        let res = AskUserQuestionTool
+            .execute(
+                json!({ "question": "continue?" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("non-interactive mode"),
+            "{}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn no_channel_uses_legacy_metadata_path() {
+        let res = AskUserQuestionTool
+            .execute(
+                json!({ "question": "pick one", "options": ["a", "b"] }),
+                &interactive_ctx(),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "Question: pick one");
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["type"], "ask_user");
+        assert_eq!(meta["question"], "pick one");
+        assert_eq!(meta["options"], json!(["a", "b"]));
+    }
+
+    #[tokio::test]
+    async fn invalid_input_errors() {
+        let res = AskUserQuestionTool
+            .execute(json!({ "question": 42 }), &interactive_ctx())
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn channel_path_returns_user_answer() {
+        let mut ctx = interactive_ctx();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UserQuestionEvent>();
+        ctx.user_question_tx = Some(tx);
+
+        // Answer the question as the user would from the TUI side-channel.
+        let responder = tokio::spawn(async move {
+            if let Some(event) = rx.recv().await {
+                let _ = event.reply_tx.send("yes".to_string());
+            }
+        });
+
+        let res = AskUserQuestionTool
+            .execute(json!({ "question": "proceed?" }), &ctx)
+            .await;
+        responder.await.unwrap();
+
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "The user answered: yes");
+    }
+}

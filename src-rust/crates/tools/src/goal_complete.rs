@@ -95,3 +95,109 @@ impl Tool for GoalCompleteTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::{GoalStatus, GoalStore};
+
+    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
+    /// `GoalStore::open_default` resolves the goal DB under the config dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so goal
+    /// DB reads/writes never touch the real config dir (and never race other
+    /// env-mutating tests under parallelism).
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against other env-mutating tests (same std::sync::Mutex
+    // convention as crate::paths::ENV_LOCK). Test-only, single acquisition.
+    async fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", dir.path());
+        let out = f(dir.path().to_path_buf()).await;
+        std::env::remove_var("CLAWDE_HOME");
+        out
+    }
+
+    #[tokio::test]
+    async fn invalid_input_errors() {
+        let res = GoalCompleteTool
+            .execute(
+                json!({ "audit_summary": "only summary" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn empty_audit_summary_errors() {
+        let res = GoalCompleteTool
+            .execute(
+                json!({ "audit_summary": "   ", "evidence": "tests pass" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("audit_summary cannot be empty"),
+            "{}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_evidence_errors() {
+        let res = GoalCompleteTool
+            .execute(
+                json!({ "audit_summary": "done", "evidence": "" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(
+            res.content.contains("evidence cannot be empty"),
+            "{}",
+            res.content
+        );
+    }
+
+    #[tokio::test]
+    async fn marks_active_goal_complete() {
+        with_temp_home(|home| async move {
+            let store = GoalStore::open_default().expect("goal store");
+            store
+                .set_goal("eol-test", "finish the feature", None, 0)
+                .expect("set goal");
+
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = GoalCompleteTool
+                .execute(
+                    json!({ "audit_summary": "all deliverables met", "evidence": "3 tests pass" }),
+                    &ctx,
+                )
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert!(
+                res.content.contains("Goal marked complete"),
+                "{}",
+                res.content
+            );
+            assert!(
+                res.content.contains("all deliverables met"),
+                "{}",
+                res.content
+            );
+
+            let goal = store.get_goal("eol-test").expect("goal exists");
+            assert_eq!(goal.status, GoalStatus::Complete);
+        })
+        .await;
+    }
+}

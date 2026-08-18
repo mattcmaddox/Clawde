@@ -61,3 +61,39 @@ impl Tool for EnterPlanModeTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_reason_includes_reason_and_metadata() {
+        let res = EnterPlanModeTool
+            .execute(
+                json!({ "reason": "tread carefully" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "Entered plan mode: tread carefully");
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["type"], "enter_plan_mode");
+        assert_eq!(meta["reason"], "tread carefully");
+    }
+
+    #[tokio::test]
+    async fn without_reason_uses_default_message() {
+        let res = EnterPlanModeTool
+            .execute(
+                json!({}),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(
+            res.content,
+            "Entered plan mode. Only read-only operations are allowed."
+        );
+        assert_eq!(res.metadata.unwrap()["reason"], Value::Null);
+    }
+}

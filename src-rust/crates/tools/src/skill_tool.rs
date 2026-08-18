@@ -234,3 +234,105 @@ fn strip_frontmatter(content: &str) -> String {
     }
     content.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
+    /// `skill_search_dirs` includes `config_dir()/commands`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so skill
+    /// discovery never reads real user skills (and never races other
+    /// env-mutating tests under parallelism).
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against other env-mutating tests (same std::sync::Mutex
+    // convention as crate::paths::ENV_LOCK). Test-only, single acquisition.
+    async fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", dir.path());
+        let out = f(dir.path().to_path_buf()).await;
+        std::env::remove_var("CLAWDE_HOME");
+        out
+    }
+
+    #[test]
+    fn strip_frontmatter_removes_yaml_block() {
+        let raw = "---\nname: demo\ndescription: A demo skill\n---\n\nBody text here";
+        assert_eq!(strip_frontmatter(raw), "Body text here");
+    }
+
+    #[test]
+    fn strip_frontmatter_passthrough_without_block() {
+        let raw = "Just a body, no frontmatter";
+        assert_eq!(strip_frontmatter(raw), raw);
+        // Unclosed frontmatter is left verbatim too.
+        let unclosed = "---\nname: demo\nBody text here";
+        assert_eq!(strip_frontmatter(unclosed), unclosed);
+    }
+
+    #[tokio::test]
+    async fn list_skills_is_hermetic_and_lists_bundled() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = SkillTool.execute(json!({ "skill": "list" }), &ctx).await;
+            assert!(!res.is_error, "{}", res.content);
+            assert!(res.content.contains("[bundled]"), "{}", res.content);
+            assert!(res.content.contains("Available skills"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loads_disk_skill_with_argument_substitution() {
+        with_temp_home(|home| async move {
+            let commands_dir = home.join(".claurst").join("commands");
+            std::fs::create_dir_all(&commands_dir).unwrap();
+            std::fs::write(
+                commands_dir.join("test-skill.md"),
+                "---\nname: test-skill\ndescription: A test skill\n---\n\nDo the thing with $ARGUMENTS",
+            )
+            .unwrap();
+
+            let ctx = crate::test_support::allow_all_context(home.clone());
+            let res = SkillTool
+                .execute(json!({ "skill": "test-skill", "args": "carefully" }), &ctx)
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert_eq!(res.content, "Do the thing with carefully");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn loads_bundled_skill_through_execute() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = SkillTool
+                .execute(json!({ "skill": "simplify", "args": "this code" }), &ctx)
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert!(res.content.contains("this code"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_skill_errors() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = SkillTool
+                .execute(json!({ "skill": "does-not-exist" }), &ctx)
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("not found"), "{}", res.content);
+        })
+        .await;
+    }
+}

@@ -59,3 +59,35 @@ impl Tool for SyntheticOutputTool {
         ToolResult::success("Structured output provided successfully")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn object_input_succeeds() {
+        let res = SyntheticOutputTool
+            .execute(
+                json!({ "result": { "answer": 42 } }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "Structured output provided successfully");
+    }
+
+    #[tokio::test]
+    async fn non_object_input_errors() {
+        for bad in [json!([1, 2, 3]), json!("string"), json!(42), json!(null)] {
+            let res = SyntheticOutputTool
+                .execute(bad, &crate::test_support::allow_all_context(".".into()))
+                .await;
+            assert!(res.is_error, "expected error, got: {}", res.content);
+            assert!(
+                res.content.contains("requires a JSON object"),
+                "{}",
+                res.content
+            );
+        }
+    }
+}

@@ -152,3 +152,121 @@ impl Tool for SendMessageTool {
         ToolResult::success(format!("Message sent to '{}': {}", params.to, preview))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialises tests against the global `INBOX`: it is a process-wide
+    /// singleton shared by every SendMessage invocation, so parallel tests
+    /// would otherwise observe each other's messages.
+    static INBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future against a freshly cleared `INBOX`, restoring the empty
+    /// state afterwards so no message leaks into the next test.
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises INBOX access across
+    // all SendMessage tests (same convention as the ENV_LOCK guards used for
+    // env-mutating tests). Test-only, single acquisition.
+    async fn with_empty_inbox<T>(f: impl FnOnce() -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = INBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        INBOX.clear();
+        let out = f().await;
+        INBOX.clear();
+        out
+    }
+
+    fn ctx() -> crate::ToolContext {
+        crate::test_support::allow_all_context(std::path::PathBuf::from("."))
+    }
+
+    #[tokio::test]
+    async fn directed_message_lands_in_recipient_inbox() {
+        with_empty_inbox(|| async move {
+            let res = SendMessageTool
+                .execute(json!({ "to": "bob", "message": "ping" }), &ctx())
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert_eq!(res.content, "Message sent to 'bob': ping");
+
+            let inbox = peek_inbox("bob");
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].content, "ping");
+            assert_eq!(inbox[0].to, "bob");
+            assert_eq!(inbox[0].from, "eol-test");
+
+            // drain removes them.
+            let drained = drain_inbox("bob");
+            assert_eq!(drained.len(), 1);
+            assert!(peek_inbox("bob").is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_no_recipients_queues_message() {
+        with_empty_inbox(|| async move {
+            let res = SendMessageTool
+                .execute(json!({ "to": "*", "message": "all hands" }), &ctx())
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert!(res.content.contains("Broadcast queued"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_delivers_to_existing_inboxes() {
+        with_empty_inbox(|| async move {
+            // A directed message first creates alice's inbox.
+            SendMessageTool
+                .execute(json!({ "to": "alice", "message": "setup" }), &ctx())
+                .await;
+            let res = SendMessageTool
+                .execute(json!({ "to": "*", "message": "broadcast!" }), &ctx())
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            assert!(
+                res.content.contains("Broadcast to 1 agent"),
+                "{}",
+                res.content
+            );
+
+            let inbox = peek_inbox("alice");
+            assert_eq!(inbox.len(), 2);
+            assert_eq!(inbox[1].content, "broadcast!");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_message_errors() {
+        with_empty_inbox(|| async move {
+            let res = SendMessageTool
+                .execute(json!({ "to": "bob", "message": "" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(
+                res.content.contains("Message cannot be empty"),
+                "{}",
+                res.content
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn invalid_input_errors() {
+        with_empty_inbox(|| async move {
+            let res = SendMessageTool
+                .execute(json!({ "to": "bob" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("Invalid input"), "{}", res.content);
+        })
+        .await;
+    }
+}

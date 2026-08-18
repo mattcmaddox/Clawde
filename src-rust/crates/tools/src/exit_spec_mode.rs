@@ -68,3 +68,40 @@ impl Tool for ExitSpecModeTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_summary_includes_summary_and_metadata() {
+        let res = ExitSpecModeTool
+            .execute(
+                json!({ "summary": "ship the parser" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("ship the parser"), "{}", res.content);
+        let meta = res.metadata.unwrap();
+        assert_eq!(meta["type"], "exit_spec_mode");
+        assert_eq!(meta["summary"], "ship the parser");
+    }
+
+    #[tokio::test]
+    async fn without_summary_uses_default_message() {
+        let res = ExitSpecModeTool
+            .execute(
+                json!({}),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(
+            res.content.starts_with("Exited spec mode."),
+            "{}",
+            res.content
+        );
+        assert_eq!(res.metadata.unwrap()["summary"], Value::Null);
+    }
+}
