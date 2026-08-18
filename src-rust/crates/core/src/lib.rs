@@ -4349,10 +4349,9 @@ pub mod permissions {
 
         /// Evaluate whether `tool_name` should be allowed to run.
         ///
-        /// Evaluation order (faithful to TS behaviour):
-        /// 1. BypassPermissions → always Allow.
-        /// 2. Check deny rules (persistent first, then session) → if any
-        ///    matched, Deny.
+        /// Evaluation order (faithful to the capability policy):
+        /// 1. Hard boundaries and explicit deny rules.
+        /// 2. BypassPermissions → Allow when no deny matched.
         /// 3. Check allow rules (persistent first, then session) → if any
         ///    matched, Allow.
         /// 4. AcceptEdits → Allow (auto-accept file edits).
@@ -4433,13 +4432,8 @@ pub mod permissions {
                 return PermissionDecision::Deny;
             }
 
-            if self.mode == PermissionMode::BypassPermissions {
-                return PermissionDecision::Allow;
-            }
-
-            // Steps 2–3 — evaluate explicit rules (deny has priority over
-            // allow; persistent rules evaluated before session rules within
-            // each polarity, matching TS rule-source ordering)
+            // Evaluate explicit rules before bypass so a persistent or
+            // session deny remains a hard boundary in bypass mode.
             let all_rules = self
                 .persistent_rules
                 .iter()
@@ -4463,6 +4457,10 @@ pub mod permissions {
 
             if deny_matched {
                 return PermissionDecision::Deny;
+            }
+
+            if self.mode == PermissionMode::BypassPermissions {
+                return PermissionDecision::Allow;
             }
 
             if allow_matched {
@@ -4909,6 +4907,21 @@ pub mod permissions {
             assert_eq!(
                 m.evaluate("Bash", "rm -rf /", None, None, &[]),
                 PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn bypass_does_not_override_explicit_deny_rule() {
+            let mut m = mgr(PermissionMode::BypassPermissions);
+            m.add_rule(PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: None,
+                action: PermissionAction::Deny,
+                scope: PermissionScope::Session,
+            });
+            assert_eq!(
+                m.evaluate("Bash", "echo blocked", None, None, &[]),
+                PermissionDecision::Deny
             );
         }
 
