@@ -377,3 +377,133 @@ fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_ctx(working_dir: PathBuf) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir,
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    /// Create a throwaway git repository with an `origin` remote pointing at
+    /// `remote_url` (if given). Hermetic: exercises the real git CLI against
+    /// a temp dir, no network.
+    fn make_repo(remote_url: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .expect("git binary available");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        if let Some(url) = remote_url {
+            run(&["remote", "add", "origin", url]);
+        }
+        dir
+    }
+
+    #[test]
+    fn parse_github_remote_url_https_variants() {
+        assert_eq!(
+            parse_github_remote_url("https://github.com/octo/cat.git"),
+            Some(("octo".into(), "cat".into()))
+        );
+        // No .git suffix.
+        assert_eq!(
+            parse_github_remote_url("https://github.com/octo/cat"),
+            Some(("octo".into(), "cat".into()))
+        );
+        // http scheme.
+        assert_eq!(
+            parse_github_remote_url("http://github.com/octo/cat.git"),
+            Some(("octo".into(), "cat".into()))
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_url_ssh_variant() {
+        assert_eq!(
+            parse_github_remote_url("git@github.com:octo/cat.git"),
+            Some(("octo".into(), "cat".into()))
+        );
+    }
+
+    #[test]
+    fn parse_github_remote_url_rejects_other_hosts_and_shapes() {
+        assert_eq!(
+            parse_github_remote_url("https://gitlab.com/octo/cat.git"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote_url("https://github.com/only-owner"),
+            None
+        );
+        assert_eq!(parse_github_remote_url("git@gitlab.com:octo/cat.git"), None);
+        assert_eq!(parse_github_remote_url("not a url"), None);
+        assert_eq!(parse_github_remote_url(""), None);
+    }
+
+    #[test]
+    fn detect_github_owner_repo_reads_origin_remote() {
+        let repo = make_repo(Some("git@github.com:acme/widget.git"));
+        assert_eq!(
+            detect_github_owner_repo(repo.path()),
+            Some(("acme".into(), "widget".into()))
+        );
+    }
+
+    #[test]
+    fn detect_github_owner_repo_returns_none_without_remote() {
+        let repo = make_repo(None);
+        assert_eq!(detect_github_owner_repo(repo.path()), None);
+    }
+
+    #[tokio::test]
+    async fn execute_in_empty_repo_returns_no_diff_message() {
+        let repo = make_repo(None);
+        let mut ctx = make_ctx(repo.path().to_path_buf());
+        match ReviewCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No diff found"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_bad_base_ref_errors() {
+        let repo = make_repo(None);
+        let mut ctx = make_ctx(repo.path().to_path_buf());
+        // No commits exist, so `git diff <ref>...HEAD` fails and the command
+        // surfaces the git error instead of calling the LLM.
+        match ReviewCommand.execute("main", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("git diff failed"), "{}", e);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+}

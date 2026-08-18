@@ -86,8 +86,8 @@ All six gaps identified in the auto-compact research have been implemented and t
 - [x] `grep_tool.rs` — added 4 comprehensive unit tests (non-ASCII UTF-8, empty file, regex special chars, line anchors)
 - [x] `glob_tool.rs` — 14 unit tests added (non-ASCII paths, empty dirs, recursive patterns, edge cases)
 - [x] `web_fetch.rs` / `config_tool.rs` / `tasks.rs` — added 17 unit tests (the three tools modules with none): `strip_html` tag/script/style/entity handling, edge-case HTML detection, `url_hash` determinism, `permission_mode_str` mapping, and Task construction/status/JSON shapes (commit 94164b2)
-- [ ] Tools crate overall still has low test coverage (remaining untested logic: `web_fetch` caching + execute paths, `tasks` global-store execute paths, `config_tool` execute)
-- [ ] Commands crate tests are many but many are basic registry checks
+- [x] Tools crate overall still has low test coverage — closed in two passes: `web_fetch` caching + execute paths, `tasks` global-store execute paths, `config_tool` execute (commit 6153b59), then execute-path coverage for the 11 remaining untested modules: mode switches, synthetic_output, sleep, goal_complete, ask_user, brief, send_message, skill_tool (commit f23c7c8)
+- [x] Commands crate tests are many but many are basic registry checks — added execute-path coverage for `/goal` (budget parsing, status/set/pause/resume/clear/complete against a temp-home GoalStore, token-budget flag, too-long objective) and `/review` (GitHub remote-URL parsing, origin-remote detection in a real temp git repo, empty-repo and bad-base-ref execute paths)
 
 ### [tui] Context visualization
 - [x] The `context_viz.rs` module now shows a FreeProvider key health table.

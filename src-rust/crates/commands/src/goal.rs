@@ -288,3 +288,263 @@ fn goal_status(session_id: &str) -> CommandResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::{GoalStatus, GoalStore};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so goal
+    /// DB reads/writes never touch the real config dir. Shares the commands
+    /// crate's `CLAWDE_HOME_LOCK` with the keys/accounts tests so these tests
+    /// serialize with every other env-mutating test under parallelism.
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against all other env-mutating tests in this crate (same
+    // std::sync::Mutex convention as crate::paths::ENV_LOCK). Test-only.
+    async fn with_temp_home<T>(f: impl FnOnce(PathBuf) -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = crate::tests::CLAWDE_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAWDE_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let out = f(tmp.path().to_path_buf()).await;
+        match prev {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        out
+    }
+
+    fn make_ctx(working_dir: PathBuf) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir,
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    fn open_store() -> GoalStore {
+        GoalStore::open_default().expect("goal store opens under temp home")
+    }
+
+    #[test]
+    fn parse_token_budget_handles_k_m_and_plain() {
+        assert_eq!(parse_token_budget("250K"), Some(250_000));
+        assert_eq!(parse_token_budget("2k"), Some(2_000));
+        assert_eq!(parse_token_budget("1M"), Some(1_000_000));
+        assert_eq!(parse_token_budget("3m"), Some(3_000_000));
+        assert_eq!(parse_token_budget("500000"), Some(500_000));
+        assert_eq!(parse_token_budget(" 250K "), Some(250_000));
+    }
+
+    #[test]
+    fn parse_token_budget_rejects_garbage() {
+        assert_eq!(parse_token_budget(""), None);
+        assert_eq!(parse_token_budget("   "), None);
+        assert_eq!(parse_token_budget("abc"), None);
+        assert_eq!(parse_token_budget("10x"), None);
+        assert_eq!(parse_token_budget("-5K"), None);
+    }
+
+    #[tokio::test]
+    async fn status_without_goal_shows_prompt() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            match GoalCommand.execute("status", &mut ctx).await {
+                CommandResult::Message(m) => assert!(m.contains("No active goal"), "{}", m),
+                other => panic!("expected Message, got {:?}", other),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_goal_persists_and_kicks_off() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            match GoalCommand
+                .execute("migrate the API to Fastify", &mut ctx)
+                .await
+            {
+                CommandResult::UserMessage(m) => {
+                    assert!(m.contains("migrate the API to Fastify"), "{}", m)
+                }
+                other => panic!("expected UserMessage, got {:?}", other),
+            }
+            let goal = open_store()
+                .get_goal("test-session")
+                .expect("goal persisted");
+            assert_eq!(goal.status, GoalStatus::Active);
+            assert_eq!(goal.objective, "migrate the API to Fastify");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_goal_with_tokens_flag_parses_budget() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            GoalCommand
+                .execute("--tokens 250K migrate the API to Fastify", &mut ctx)
+                .await;
+            let goal = open_store()
+                .get_goal("test-session")
+                .expect("goal persisted");
+            assert_eq!(goal.token_budget, Some(250_000));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn status_shows_active_goal() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            GoalCommand
+                .execute("migrate the API to Fastify", &mut ctx)
+                .await;
+            match GoalCommand.execute("status", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("Goal status"), "{}", m);
+                    assert!(m.contains("migrate the API to Fastify"), "{}", m);
+                    assert!(m.contains("Status:"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pause_then_resume_round_trip() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            GoalCommand
+                .execute("migrate the API to Fastify", &mut ctx)
+                .await;
+
+            match GoalCommand.execute("pause", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("Goal paused"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+            assert_eq!(
+                open_store().get_goal("test-session").unwrap().status,
+                GoalStatus::Paused
+            );
+            // Pausing twice is idempotent and informative.
+            match GoalCommand.execute("pause", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("already paused"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+
+            match GoalCommand.execute("resume", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("Goal resumed"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+            assert_eq!(
+                open_store().get_goal("test-session").unwrap().status,
+                GoalStatus::Active
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn clear_removes_goal() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            GoalCommand
+                .execute("migrate the API to Fastify", &mut ctx)
+                .await;
+            match GoalCommand.execute("clear", &mut ctx).await {
+                CommandResult::Message(m) => assert_eq!(m, "Goal cleared."),
+                other => panic!("expected Message, got {:?}", other),
+            }
+            assert!(open_store().get_goal("test-session").is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_without_goal_is_informative() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            match GoalCommand.execute("complete", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("No active goal"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_with_goal_injects_audit_message() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            GoalCommand
+                .execute("migrate the API to Fastify", &mut ctx)
+                .await;
+            match GoalCommand.execute("complete", &mut ctx).await {
+                CommandResult::UserMessage(m) => {
+                    assert!(m.contains("completion audit"), "{}", m);
+                    assert!(m.contains("migrate the API to Fastify"), "{}", m);
+                }
+                other => panic!("expected UserMessage, got {:?}", other),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_objective_shows_usage() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            match GoalCommand.execute("--tokens 250K", &mut ctx).await {
+                CommandResult::Message(m) => {
+                    assert!(m.contains("Usage: /goal <objective>"), "{}", m);
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn objective_too_long_errors() {
+        with_temp_home(|_home| async move {
+            let mut ctx = make_ctx(PathBuf::from("."));
+            let long = "x".repeat(clawde_core::MAX_OBJECTIVE_CHARS + 1);
+            match GoalCommand.execute(&long, &mut ctx).await {
+                CommandResult::Error(e) => {
+                    assert!(e.contains("Objective too long"), "{}", e);
+                }
+                other => panic!("expected Error, got {:?}", other),
+            }
+        })
+        .await;
+    }
+}
