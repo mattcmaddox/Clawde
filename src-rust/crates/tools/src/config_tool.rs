@@ -233,4 +233,196 @@ mod tests {
         );
         assert_eq!(permission_mode_str(&PermissionMode::Plan), "plan");
     }
+
+    // ---- execute path -----------------------------------------------------
+
+    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
+    /// `execute` reads and persists `settings.json` under the config dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so
+    /// settings reads/writes never touch the real config dir (and never race
+    /// other env-mutating tests under parallelism).
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against other env-mutating tests (same std::sync::Mutex
+    // convention as crate::paths::ENV_LOCK). Test-only, single acquisition.
+    async fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", dir.path());
+        let out = f(dir.path().to_path_buf()).await;
+        std::env::remove_var("CLAWDE_HOME");
+        out
+    }
+
+    #[tokio::test]
+    async fn list_setting_returns_all_supported_settings() {
+        let res = ConfigTool
+            .execute(
+                json!({ "setting": "list" }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        for (key, _) in SUPPORTED_SETTINGS {
+            assert!(
+                res.content.contains(key),
+                "missing {} in {}",
+                key,
+                res.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_input_errors_without_settings() {
+        let res = ConfigTool
+            .execute(
+                json!({ "setting": 42 }),
+                &crate::test_support::allow_all_context(".".into()),
+            )
+            .await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn set_model_persists_and_reads_back() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home.clone());
+            let set = ConfigTool
+                .execute(
+                    json!({ "setting": "model", "value": "my-test-model" }),
+                    &ctx,
+                )
+                .await;
+            assert!(!set.is_error, "{}", set.content);
+            assert_eq!(set.content, "model = \"my-test-model\"");
+            // Persisted to disk under the temp home.
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["config"]["model"], "my-test-model");
+            // A fresh load sees the new value.
+            let get = ConfigTool
+                .execute(json!({ "setting": "model" }), &ctx)
+                .await;
+            assert!(!get.is_error, "{}", get.content);
+            assert_eq!(get.content, "model = \"my-test-model\"");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_max_tokens_persists_and_reads_back() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let set = ConfigTool
+                .execute(json!({ "setting": "max_tokens", "value": 2048 }), &ctx)
+                .await;
+            assert!(!set.is_error, "{}", set.content);
+            assert_eq!(set.content, "max_tokens = 2048");
+            let get = ConfigTool
+                .execute(json!({ "setting": "max_tokens" }), &ctx)
+                .await;
+            assert_eq!(get.content, "max_tokens = 2048");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_boolean_settings_round_trip() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let v = ConfigTool
+                .execute(json!({ "setting": "verbose", "value": true }), &ctx)
+                .await;
+            assert!(!v.is_error, "{}", v.content);
+            assert_eq!(v.content, "verbose = true");
+            let a = ConfigTool
+                .execute(json!({ "setting": "auto_compact", "value": false }), &ctx)
+                .await;
+            assert!(!a.is_error, "{}", a.content);
+            assert_eq!(a.content, "auto_compact = false");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_permission_mode_round_trip_and_validates() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let set = ConfigTool
+                .execute(
+                    json!({ "setting": "permission_mode", "value": "plan" }),
+                    &ctx,
+                )
+                .await;
+            assert!(!set.is_error, "{}", set.content);
+            assert_eq!(set.content, "permission_mode = \"plan\"");
+            let get = ConfigTool
+                .execute(json!({ "setting": "permission_mode" }), &ctx)
+                .await;
+            assert_eq!(get.content, "permission_mode = \"plan\"");
+            // Invalid mode is rejected before any persistence.
+            let bad = ConfigTool
+                .execute(
+                    json!({ "setting": "permission_mode", "value": "nope" }),
+                    &ctx,
+                )
+                .await;
+            assert!(bad.is_error);
+            assert!(
+                bad.content.contains("Unknown permission_mode"),
+                "{}",
+                bad.content
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wrong_value_types_error() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            for (setting, value, needle) in [
+                ("model", json!(42), "'model' must be a string"),
+                ("verbose", json!("yes"), "'verbose' must be true or false"),
+                (
+                    "max_tokens",
+                    json!("lots"),
+                    "'max_tokens' must be a positive integer",
+                ),
+            ] {
+                let res = ConfigTool
+                    .execute(json!({ "setting": setting, "value": value }), &ctx)
+                    .await;
+                assert!(res.is_error, "{} should error", setting);
+                assert!(res.content.contains(needle), "{}: {}", setting, res.content);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_setting_errors_on_get_and_set() {
+        with_temp_home(|home| async move {
+            let ctx = crate::test_support::allow_all_context(home);
+            let get = ConfigTool
+                .execute(json!({ "setting": "bogus" }), &ctx)
+                .await;
+            assert!(get.is_error);
+            assert!(get.content.contains("Unknown setting"), "{}", get.content);
+            let set = ConfigTool
+                .execute(json!({ "setting": "bogus", "value": 1 }), &ctx)
+                .await;
+            assert!(set.is_error);
+            assert!(set.content.contains("Unknown setting"), "{}", set.content);
+        })
+        .await;
+    }
 }

@@ -492,4 +492,153 @@ mod tests {
         // Hex output.
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    // ---- cache + execute paths -------------------------------------------
+
+    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
+    /// `execute` reads and writes the extraction cache under the config dir.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so cache
+    /// reads/writes never touch the real config dir (and never race the
+    /// real home's cache under parallelism).
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against other env-mutating tests (same std::sync::Mutex
+    // convention as crate::paths::ENV_LOCK). Test-only, single acquisition,
+    // no re-entrancy — no deadlock risk.
+    async fn with_temp_home<T>(f: impl FnOnce(std::path::PathBuf) -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        // Recover from poisoning so one failing test can't cascade
+        // PoisonError failures into every other env-mutating test.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", dir.path());
+        let out = f(dir.path().to_path_buf()).await;
+        std::env::remove_var("CLAWDE_HOME");
+        out
+    }
+
+    /// Serve a single canned HTTP response on a loopback port and return its
+    /// URL. The listener thread accepts one connection, reads the request
+    /// head, and replies — enough for a hermetic reqwest round-trip.
+    fn serve_once(status_line: &str, content_type: &str, body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = std::io::Read::read(&mut sock, &mut buf);
+                let response = format!(
+                    "{status_line}\r\nContent-Type: {content_type}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut sock, response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn web_cache_round_trip() {
+        with_temp_home(|_home| async move {
+            let url = "https://example.com/cached-page";
+            assert_eq!(load_cached_extraction(url), None);
+            save_cached_extraction(url, "extracted body");
+            assert_eq!(
+                load_cached_extraction(url).as_deref(),
+                Some("extracted body")
+            );
+            // A different URL never collides with the same cache file.
+            assert_eq!(load_cached_extraction("https://example.com/other"), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn web_cache_missing_url_returns_none() {
+        with_temp_home(|_home| async move {
+            assert_eq!(load_cached_extraction("https://never.saved.example/"), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_invalid_input_errors_without_network() {
+        let ctx = crate::test_support::allow_all_context(std::path::PathBuf::from("."));
+        let res = WebFetchTool.execute(json!({ "url": 42 }), &ctx).await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn fetch_plain_text_from_local_server() {
+        with_temp_home(|home| async move {
+            let url = serve_once(
+                "HTTP/1.1 200 OK",
+                "text/plain; charset=utf-8",
+                "hello world",
+            );
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = WebFetchTool.execute(json!({ "url": url }), &ctx).await;
+            assert!(!res.is_error, "fetch failed: {}", res.content);
+            assert_eq!(res.content, "hello world");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_html_strips_tags_without_semantic_extraction() {
+        with_temp_home(|home| async move {
+            // 120 words inside a <body> tag: past the 100-word edge-case
+            // threshold AND semantically tagged, so the basic strip path runs
+            // with no semantic-extraction API call.
+            let words = std::iter::repeat_n("word", 120)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let html = format!("<html><body><p>{words}</p></body></html>");
+            let url = serve_once("HTTP/1.1 200 OK", "text/html; charset=utf-8", &html);
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = WebFetchTool.execute(json!({ "url": url }), &ctx).await;
+            assert!(!res.is_error, "fetch failed: {}", res.content);
+            assert_eq!(res.content, words);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_http_error_reports_status() {
+        with_temp_home(|home| async move {
+            let url = serve_once("HTTP/1.1 404 Not Found", "text/plain", "nope");
+            let ctx = crate::test_support::allow_all_context(home);
+            let res = WebFetchTool.execute(json!({ "url": url }), &ctx).await;
+            assert!(res.is_error);
+            assert!(res.content.contains("HTTP 404"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_result_is_saved_to_cache() {
+        with_temp_home(|home| async move {
+            let url = serve_once("HTTP/1.1 200 OK", "text/plain", "cached payload");
+            let ctx = crate::test_support::allow_all_context(home);
+            let first = WebFetchTool.execute(json!({ "url": url }), &ctx).await;
+            assert!(!first.is_error, "fetch failed: {}", first.content);
+            // execute saves the extracted text to the on-disk cache; the
+            // fetch-then-check order means the cache saves extraction work,
+            // not network round-trips, so verify the write directly.
+            assert_eq!(
+                load_cached_extraction(&url).as_deref(),
+                Some("cached payload")
+            );
+        })
+        .await;
+    }
 }

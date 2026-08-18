@@ -627,4 +627,258 @@ mod tests {
             json!("deleted")
         );
     }
+
+    // ---- global-store execute path ---------------------------------------
+
+    /// Serialises tests against `TASK_STORE`: it is a process-global singleton
+    /// shared by every task tool, so parallel tests would otherwise observe
+    /// each other's tasks. Each test starts and ends with an empty store.
+    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future against a freshly cleared `TASK_STORE`, restoring the
+    /// empty state afterwards so no task leaks into the next test.
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises TASK_STORE access
+    // across all task tests (same convention as the ENV_LOCK guards used for
+    // env-mutating tests). Test-only, single acquisition, no re-entrancy.
+    async fn with_empty_store<T>(f: impl FnOnce() -> T) -> T::Output
+    where
+        T: std::future::Future,
+    {
+        let _lock = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        TASK_STORE.clear();
+        let out = f().await;
+        TASK_STORE.clear();
+        out
+    }
+
+    fn ctx() -> crate::ToolContext {
+        crate::test_support::allow_all_context(std::path::PathBuf::from("."))
+    }
+
+    fn task_id_from(content: &str) -> String {
+        let v: Value = serde_json::from_str(content).expect("task create JSON");
+        v["task_id"].as_str().expect("task_id").to_string()
+    }
+
+    async fn create_task(subject: &str) -> String {
+        let res = TaskCreateTool
+            .execute(json!({ "subject": subject, "description": "d" }), &ctx())
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        task_id_from(&res.content)
+    }
+
+    #[tokio::test]
+    async fn create_then_get_round_trip() {
+        with_empty_store(|| async move {
+            let res = TaskCreateTool
+                .execute(
+                    json!({ "subject": "ship it", "description": "do the thing", "metadata": { "k": 1 } }),
+                    &ctx(),
+                )
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            let id = task_id_from(&res.content);
+
+            let got = TaskGetTool.execute(json!({ "task_id": id }), &ctx()).await;
+            assert!(!got.is_error, "{}", got.content);
+            let v: Value = serde_json::from_str(&got.content).unwrap();
+            assert_eq!(v["subject"], "ship it");
+            assert_eq!(v["description"], "do the thing");
+            assert_eq!(v["status"], "pending");
+            assert_eq!(v["metadata"], json!({ "k": 1 }));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn get_missing_task_returns_null_success() {
+        with_empty_store(|| async move {
+            let res = TaskGetTool
+                .execute(json!({ "task_id": "no-such-id" }), &ctx())
+                .await;
+            assert!(!res.is_error);
+            assert_eq!(res.content.trim(), "null");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_changes_fields_and_status() {
+        with_empty_store(|| async move {
+            let id = create_task("before").await;
+            let res = TaskUpdateTool
+                .execute(
+                    json!({ "task_id": id, "subject": "after", "status": "in_progress", "owner": "buffy" }),
+                    &ctx(),
+                )
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            let v: Value = serde_json::from_str(&res.content).unwrap();
+            assert_eq!(v["success"], true);
+            assert_eq!(v["updated_fields"], json!(["subject", "status", "owner"]));
+
+            let got: Value =
+                serde_json::from_str(&TaskGetTool.execute(json!({ "task_id": id }), &ctx()).await.content)
+                    .unwrap();
+            assert_eq!(got["subject"], "after");
+            assert_eq!(got["status"], "in_progress");
+            assert_eq!(got["owner"], "buffy");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_missing_task_errors() {
+        with_empty_store(|| async move {
+            let res = TaskUpdateTool
+                .execute(json!({ "task_id": "missing", "subject": "x" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("not found"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_status_deleted_removes_task() {
+        with_empty_store(|| async move {
+            let id = create_task("doomed").await;
+            let res = TaskUpdateTool
+                .execute(json!({ "task_id": id, "status": "deleted" }), &ctx())
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            // Gone from the store: get returns null, list omits it.
+            let got = TaskGetTool.execute(json!({ "task_id": id }), &ctx()).await;
+            assert_eq!(got.content.trim(), "null");
+            let list = TaskListTool.execute(json!({}), &ctx()).await;
+            let v: Value = serde_json::from_str(&list.content).unwrap();
+            assert_eq!(v, json!([]));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_filters_completed_by_default() {
+        with_empty_store(|| async move {
+            let keep = create_task("keep me").await;
+            let done = create_task("done").await;
+            TaskUpdateTool
+                .execute(json!({ "task_id": done, "status": "completed" }), &ctx())
+                .await;
+
+            let list = TaskListTool.execute(json!({}), &ctx()).await;
+            assert!(!list.is_error, "{}", list.content);
+            let v: Value = serde_json::from_str(&list.content).unwrap();
+            let ids: Vec<&str> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, vec![keep.as_str()]);
+
+            let all = TaskListTool
+                .execute(json!({ "include_completed": true }), &ctx())
+                .await;
+            let v: Value = serde_json::from_str(&all.content).unwrap();
+            assert_eq!(v.as_array().unwrap().len(), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stop_requires_running_task_and_completes_it() {
+        with_empty_store(|| async move {
+            let pending = create_task("idle").await;
+            let res = TaskStopTool
+                .execute(json!({ "task_id": pending }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("not running"), "{}", res.content);
+
+            let running = create_task("busy").await;
+            TaskUpdateTool
+                .execute(json!({ "task_id": running, "status": "running" }), &ctx())
+                .await;
+            let stop = TaskStopTool
+                .execute(json!({ "task_id": running }), &ctx())
+                .await;
+            assert!(!stop.is_error, "{}", stop.content);
+            let got: Value = serde_json::from_str(
+                &TaskGetTool
+                    .execute(json!({ "task_id": running }), &ctx())
+                    .await
+                    .content,
+            )
+            .unwrap();
+            assert_eq!(got["status"], "completed");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stop_missing_task_errors() {
+        with_empty_store(|| async move {
+            let res = TaskStopTool
+                .execute(json!({ "task_id": "ghost" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("not found"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn output_reports_task_and_status() {
+        with_empty_store(|| async move {
+            let id = create_task("producer").await;
+            let res = TaskOutputTool
+                .execute(json!({ "task_id": id, "block": false }), &ctx())
+                .await;
+            assert!(!res.is_error, "{}", res.content);
+            let v: Value = serde_json::from_str(&res.content).unwrap();
+            assert_eq!(v["retrieval_status"], "success");
+            assert_eq!(v["task"]["subject"], "producer");
+            assert_eq!(v["task"]["output"], Value::Null);
+
+            TaskUpdateTool
+                .execute(json!({ "task_id": id, "output": "done!" }), &ctx())
+                .await;
+            let v: Value = serde_json::from_str(
+                &TaskOutputTool
+                    .execute(json!({ "task_id": id }), &ctx())
+                    .await
+                    .content,
+            )
+            .unwrap();
+            assert_eq!(v["task"]["output"], "done!");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn output_missing_task_errors() {
+        with_empty_store(|| async move {
+            let res = TaskOutputTool
+                .execute(json!({ "task_id": "ghost" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("not found"), "{}", res.content);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn create_invalid_input_errors() {
+        with_empty_store(|| async move {
+            let res = TaskCreateTool
+                .execute(json!({ "subject": "no description" }), &ctx())
+                .await;
+            assert!(res.is_error);
+            assert!(res.content.contains("Invalid input"), "{}", res.content);
+        })
+        .await;
+    }
 }
