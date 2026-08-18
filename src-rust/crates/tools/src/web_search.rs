@@ -8,7 +8,7 @@
 //   (none)              → DuckDuckGo (fallback, Instant Answers only)
 //
 // Cooldown tracking is used for Firecrawl keys: after a key is exhausted
-// (429/401/403/5xx), it is skipped for a cooldown period before being retried.
+// (408/429/401/403/5xx), it is skipped for a cooldown period before being retried.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -319,7 +319,38 @@ fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {
 }
 
 fn is_retryable_firecrawl_status(status: u16) -> bool {
-    matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
+    matches!(status, 401 | 403 | 408 | 429) || (500..=599).contains(&status)
+}
+
+fn append_firecrawl_key(
+    keys: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    key: &str,
+) {
+    let trimmed = key.trim();
+    if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+        keys.push(trimmed.to_string());
+    }
+}
+
+fn collect_firecrawl_keys_from_store(store: &clawde_core::AuthStore) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Preserve a legacy single API credential as the first stored key. This
+    // prevents adding a /keys rotation pool from silently dropping an older
+    // credential stored in AuthStore.credentials.
+    if let Some(clawde_core::StoredCredential::ApiKey { key }) = store.get("firecrawl") {
+        append_firecrawl_key(&mut keys, &mut seen, key);
+    }
+
+    if let Some(stored_keys) = store.keys_for("firecrawl") {
+        for key in stored_keys {
+            append_firecrawl_key(&mut keys, &mut seen, key);
+        }
+    }
+
+    keys
 }
 
 /// Collect Firecrawl API keys from all sources: env var first, then AuthStore.
@@ -330,21 +361,13 @@ pub fn collect_firecrawl_keys() -> Vec<String> {
     // 1. From env var (backward compatible)
     if let Ok(env_val) = std::env::var("FIRECRAWL_API_KEY") {
         for key in parse_comma_separated(&env_val) {
-            if seen.insert(key.clone()) {
-                keys.push(key);
-            }
+            append_firecrawl_key(&mut keys, &mut seen, &key);
         }
     }
 
     // 2. From AuthStore (managed via /keys command)
-    let store = clawde_core::AuthStore::load();
-    if let Some(stored_keys) = store.keys_for("firecrawl") {
-        for key in stored_keys {
-            let trimmed = key.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                keys.push(trimmed.to_string());
-            }
-        }
+    for key in collect_firecrawl_keys_from_store(&clawde_core::AuthStore::load()) {
+        append_firecrawl_key(&mut keys, &mut seen, &key);
     }
 
     keys
@@ -1023,6 +1046,34 @@ mod tests {
     }
 
     #[test]
+    fn firecrawl_key_pool_merges_legacy_credential_and_rotation_keys() {
+        let mut store = clawde_core::AuthStore::default();
+        store.credentials.insert(
+            "firecrawl".to_string(),
+            clawde_core::StoredCredential::ApiKey {
+                key: "legacy-firecrawl-key-123456".to_string(),
+            },
+        );
+        store.keys.insert(
+            "firecrawl".to_string(),
+            vec![
+                "rotation-firecrawl-key-123456".to_string(),
+                " legacy-firecrawl-key-123456 ".to_string(),
+                "second-firecrawl-key-123456".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            collect_firecrawl_keys_from_store(&store),
+            vec![
+                "legacy-firecrawl-key-123456",
+                "rotation-firecrawl-key-123456",
+                "second-firecrawl-key-123456",
+            ]
+        );
+    }
+
+    #[test]
     fn legacy_cooldown_entry_deserializes_without_retaining_plaintext_shape() {
         let entry: FirecrawlCooldownEntry = serde_json::from_value(json!({
             "key": "legacy-secret",
@@ -1050,6 +1101,7 @@ mod tests {
     #[test]
     fn firecrawl_retry_statuses_include_transient_server_errors() {
         assert!(is_retryable_firecrawl_status(401));
+        assert!(is_retryable_firecrawl_status(408));
         assert!(is_retryable_firecrawl_status(429));
         assert!(is_retryable_firecrawl_status(503));
         assert!(!is_retryable_firecrawl_status(400));
@@ -1287,6 +1339,61 @@ mod tests {
             requests[1].headers.get("authorization").map(String::as_str),
             Some("Bearer local-firecrawl-key-second-123456")
         );
+    }
+
+    #[tokio::test]
+    async fn firecrawl_http_408_rotates_to_the_next_key() {
+        let (base_url, server) = spawn_http_mock(vec![
+            (408, "request timed out".to_string()),
+            (
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "web": [{
+                            "title": "Recovered after timeout",
+                            "url": "https://example.com/timeout-recovered",
+                            "description": "Second key succeeded after a retryable timeout"
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let endpoint = format!("{base_url}/v2/search");
+        let first_key = "local-firecrawl-key-timeout-123456";
+        let second_key = "local-firecrawl-key-timeout2-123456";
+        let result = search_firecrawl_at(
+            "retry timeout",
+            1,
+            &[first_key, second_key],
+            &endpoint,
+            false,
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "unexpected Firecrawl error: {}",
+            result.content
+        );
+        assert!(result.content.contains("Recovered after timeout"));
+
+        let requests = server
+            .await
+            .expect("Firecrawl timeout mock should join")
+            .expect("Firecrawl timeout mock should capture requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer local-firecrawl-key-timeout-123456")
+        );
+        assert_eq!(
+            requests[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer local-firecrawl-key-timeout2-123456")
+        );
+
+        clear_cooldown(&firecrawl_key_fingerprint(first_key));
     }
 
     #[tokio::test]

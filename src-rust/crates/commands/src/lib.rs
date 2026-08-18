@@ -1878,7 +1878,8 @@ impl SlashCommand for SourcesCommand {
                 "Last search backend used: {}\n\
                  \n\
                  The search backend is also shown in the footer as 'search:{backend}'.\n\
-                 Configure your search preference via FIRECRAWL_API_KEY or SEARXNG_URL env vars.",
+                 Configure credentials via FIRECRAWL_API_KEY or /keys, and choose a backend via\n\
+                 PREFERRED_SEARCH_BACKEND or the persisted preferredSearchBackend setting.",
                 backend
             ))
         }
