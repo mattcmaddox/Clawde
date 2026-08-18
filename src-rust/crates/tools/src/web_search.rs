@@ -38,6 +38,7 @@ struct FirecrawlCooldownEntry {
 
 const FIRECRAWL_COOLDOWN_FILE: &str = "firecrawl_cooldowns.json";
 const FIRECRAWL_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const FIRECRAWL_SEARCH_URL: &str = "https://api.firecrawl.dev/v2/search";
 const MAX_RESULT_FIELD_CHARS: usize = 2_000;
 const MAX_SEARCH_OUTPUT_CHARS: usize = 20_000;
 
@@ -597,6 +598,16 @@ fn format_searxng_results(data: &Value, max: usize) -> String {
 ///
 /// API docs: https://docs.firecrawl.dev/api-reference/endpoint/search
 async fn search_firecrawl(query: &str, num_results: usize, keys: &[&str]) -> ToolResult {
+    search_firecrawl_at(query, num_results, keys, FIRECRAWL_SEARCH_URL, true).await
+}
+
+async fn search_firecrawl_at(
+    query: &str,
+    num_results: usize,
+    keys: &[&str],
+    endpoint: &str,
+    persist_state: bool,
+) -> ToolResult {
     let client = reqwest::Client::builder()
         .timeout(FIRECRAWL_HTTP_TIMEOUT)
         .build()
@@ -624,7 +635,7 @@ async fn search_firecrawl(query: &str, num_results: usize, keys: &[&str]) -> Too
         }
 
         let response = client
-            .post("https://api.firecrawl.dev/v2/search")
+            .post(endpoint)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
@@ -661,12 +672,16 @@ async fn search_firecrawl(query: &str, num_results: usize, keys: &[&str]) -> Too
                 last_error = Some(message);
                 continue;
             }
-            persist_cooldowns();
+            if persist_state {
+                persist_cooldowns();
+            }
             return ToolResult::error(message);
         }
 
         clear_cooldown(&key_id);
-        persist_cooldowns();
+        if persist_state {
+            persist_cooldowns();
+        }
 
         let body_text = match response.text().await {
             Ok(text) => text,
@@ -689,7 +704,9 @@ async fn search_firecrawl(query: &str, num_results: usize, keys: &[&str]) -> Too
         return ToolResult::success(format!("[via Firecrawl]\n{}", results));
     }
 
-    persist_cooldowns();
+    if persist_state {
+        persist_cooldowns();
+    }
     let msg = last_error.unwrap_or_else(|| "All Firecrawl API keys exhausted.".to_string());
     ToolResult::error(msg)
 }
@@ -852,6 +869,128 @@ fn urlencoding_simple(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: String,
+        target: String,
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    async fn read_mock_request(stream: &mut TcpStream) -> Result<CapturedRequest, String> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("read mock request: {error}"))?;
+            if read == 0 {
+                return Err("mock client closed before sending headers".to_string());
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            if bytes.len() > 64 * 1024 {
+                return Err("mock request headers exceeded 64 KiB".to_string());
+            }
+        };
+
+        let header_text = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|error| format!("mock request headers were not UTF-8: {error}"))?;
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines
+            .next()
+            .ok_or_else(|| "mock request had no request line".to_string())?;
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts
+            .next()
+            .ok_or_else(|| "mock request had no method".to_string())?
+            .to_string();
+        let target = request_parts
+            .next()
+            .ok_or_else(|| "mock request had no target".to_string())?
+            .to_string();
+        let headers = lines
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.to_ascii_lowercase(), value.trim().to_string()))
+            })
+            .collect::<HashMap<_, _>>();
+        let content_length = headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|error| format!("read mock request body: {error}"))?;
+            if read == 0 {
+                return Err("mock client closed before sending the body".to_string());
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+
+        Ok(CapturedRequest {
+            method,
+            target,
+            headers,
+            body: bytes[header_end..header_end + content_length].to_vec(),
+        })
+    }
+
+    async fn spawn_http_mock(
+        responses: Vec<(u16, String)>,
+    ) -> (String, JoinHandle<Result<Vec<CapturedRequest>, String>>) {
+        let responses = responses
+            .into_iter()
+            .map(|(status, body)| (status, Vec::new(), body))
+            .collect();
+        spawn_http_mock_with_headers(responses).await
+    }
+
+    async fn spawn_http_mock_with_headers(
+        responses: Vec<(u16, Vec<(String, String)>, String)>,
+    ) -> (String, JoinHandle<Result<Vec<CapturedRequest>, String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind local HTTP mock");
+        let address = listener.local_addr().expect("read local HTTP mock address");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for (status, headers, body) in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|error| format!("accept mock request: {error}"))?;
+                let request = read_mock_request(&mut stream).await?;
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let extra_headers = headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect::<String>();
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .map_err(|error| format!("write mock response: {error}"))?;
+                requests.push(request);
+            }
+            Ok(requests)
+        });
+        (format!("http://{address}"), handle)
+    }
 
     #[test]
     fn key_fingerprint_and_label_never_expose_the_key() {
@@ -967,6 +1106,234 @@ mod tests {
         assert!(output.contains("Useful content"));
         assert!(!output.contains(char::from_u32(27).unwrap()));
         assert!(output.chars().count() <= MAX_SEARCH_OUTPUT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn searxng_request_and_response_use_local_http_mock() {
+        let (base_url, server) = spawn_http_mock(vec![(
+            200,
+            json!({
+                "results": [{
+                    "title": "Rust HTTP",
+                    "url": "https://example.com/rust",
+                    "content": "A local fixture result"
+                }]
+            })
+            .to_string(),
+        )])
+        .await;
+        let result = search_searxng("rust async", 2, std::slice::from_ref(&base_url)).await;
+        assert!(
+            !result.is_error,
+            "unexpected SearXNG error: {}",
+            result.content
+        );
+        assert!(result.content.contains("[via SearXNG]"));
+        assert!(result.content.contains("Rust HTTP"));
+
+        let requests = server
+            .await
+            .expect("SearXNG mock task should join")
+            .expect("SearXNG mock should capture request");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].target,
+            "/search?q=rust+async&format=json&safesearch=0"
+        );
+        assert_eq!(
+            requests[0].headers.get("accept").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(requests[0].body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn searxng_rotates_to_the_next_configured_instance() {
+        let (base_url, server) = spawn_http_mock(vec![
+            (500, "temporary failure".to_string()),
+            (
+                200,
+                json!({
+                    "results": [{
+                        "title": "Recovered SearXNG",
+                        "url": "https://example.com/recovered",
+                        "content": "Second instance succeeded"
+                    }]
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let urls = vec![base_url.clone(), base_url];
+        let result = search_searxng("rotate", 1, &urls).await;
+        assert!(
+            !result.is_error,
+            "unexpected SearXNG error: {}",
+            result.content
+        );
+        assert!(result.content.contains("Recovered SearXNG"));
+
+        let requests = server
+            .await
+            .expect("SearXNG rotation mock task should join")
+            .expect("SearXNG rotation mock should capture requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].target.starts_with("/search?q=rotate"));
+        assert!(requests[1].target.starts_with("/search?q=rotate"));
+    }
+
+    #[tokio::test]
+    async fn searxng_malformed_http_response_is_reported() {
+        let (base_url, server) = spawn_http_mock(vec![(200, "not-json".to_string())]).await;
+        let result = search_searxng("malformed", 1, &[base_url]).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Failed to parse SearXNG"));
+        server
+            .await
+            .expect("SearXNG malformed mock task should join")
+            .expect("SearXNG malformed mock should capture request");
+    }
+
+    #[tokio::test]
+    async fn firecrawl_request_and_response_use_local_http_mock() {
+        let (base_url, server) = spawn_http_mock(vec![(
+            200,
+            json!({
+                "success": true,
+                "data": {
+                    "web": [{
+                        "title": "Firecrawl HTTP",
+                        "url": "https://example.com/firecrawl",
+                        "description": "A local Firecrawl fixture"
+                    }]
+                }
+            })
+            .to_string(),
+        )])
+        .await;
+        let endpoint = format!("{base_url}/v2/search");
+        let key = "local-firecrawl-key-success-123456";
+        let result = search_firecrawl_at("rust async", 3, &[key], &endpoint, false).await;
+        assert!(
+            !result.is_error,
+            "unexpected Firecrawl error: {}",
+            result.content
+        );
+        assert!(result.content.contains("[via Firecrawl]"));
+        assert!(result.content.contains("Firecrawl HTTP"));
+
+        let requests = server
+            .await
+            .expect("Firecrawl mock task should join")
+            .expect("Firecrawl mock should capture request");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].target, "/v2/search");
+        assert_eq!(
+            requests[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer local-firecrawl-key-success-123456")
+        );
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("valid JSON body");
+        assert_eq!(
+            body.get("query").and_then(Value::as_str),
+            Some("rust async")
+        );
+        assert_eq!(body.get("limit").and_then(Value::as_u64), Some(3));
+    }
+
+    #[tokio::test]
+    async fn firecrawl_http_5xx_rotates_to_the_next_key() {
+        let (base_url, server) = spawn_http_mock(vec![
+            (503, "temporary failure".to_string()),
+            (
+                200,
+                json!({
+                    "success": true,
+                    "data": {
+                        "web": [{
+                            "title": "Recovered",
+                            "url": "https://example.com/recovered",
+                            "description": "Second key succeeded"
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let endpoint = format!("{base_url}/v2/search");
+        let first_key = "local-firecrawl-key-first-123456";
+        let second_key = "local-firecrawl-key-second-123456";
+        let result =
+            search_firecrawl_at("retry me", 1, &[first_key, second_key], &endpoint, false).await;
+        assert!(
+            !result.is_error,
+            "unexpected Firecrawl error: {}",
+            result.content
+        );
+        assert!(result.content.contains("Recovered"));
+
+        let requests = server
+            .await
+            .expect("Firecrawl retry mock task should join")
+            .expect("Firecrawl retry mock should capture requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].headers.get("authorization").map(String::as_str),
+            Some("Bearer local-firecrawl-key-first-123456")
+        );
+        assert_eq!(
+            requests[1].headers.get("authorization").map(String::as_str),
+            Some("Bearer local-firecrawl-key-second-123456")
+        );
+    }
+
+    #[tokio::test]
+    async fn firecrawl_retry_after_header_controls_cooldown() {
+        let (base_url, server) = spawn_http_mock_with_headers(vec![(
+            429,
+            vec![("Retry-After".to_string(), "60".to_string())],
+            "rate limited".to_string(),
+        )])
+        .await;
+        let endpoint = format!("{base_url}/v2/search");
+        let key = "local-firecrawl-key-retry-after-123456";
+        let started = Instant::now();
+        let result = search_firecrawl_at("retry-after", 1, &[key], &endpoint, false).await;
+        assert!(result.is_error);
+        let cooldown =
+            cooldown_until(&firecrawl_key_fingerprint(key)).expect("429 should record a cooldown");
+        assert!(cooldown.saturating_duration_since(started) >= Duration::from_secs(59));
+        clear_cooldown(&firecrawl_key_fingerprint(key));
+
+        let requests = server
+            .await
+            .expect("Retry-After mock task should join")
+            .expect("Retry-After mock should capture request");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn firecrawl_malformed_http_response_is_reported() {
+        let (base_url, server) = spawn_http_mock(vec![(200, "not-json".to_string())]).await;
+        let endpoint = format!("{base_url}/v2/search");
+        let result = search_firecrawl_at(
+            "malformed",
+            1,
+            &["local-firecrawl-key-malformed-123456"],
+            &endpoint,
+            false,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result
+            .content
+            .contains("Failed to parse Firecrawl response"));
+        server
+            .await
+            .expect("Firecrawl malformed mock task should join")
+            .expect("Firecrawl malformed mock should capture request");
     }
 
     #[test]
