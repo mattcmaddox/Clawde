@@ -6,10 +6,18 @@
 #   2. TUI test-target compile (`cargo check -p clawde-tui --tests`) — catches
 #      test-code compile breaks that plain `cargo check --workspace` skips
 #      (test targets are not compiled by the default check/build).
+#   3. Idle-CPU smoke probe (`scripts/probes/idle-cpu-probe.py`) — fails if an
+#      idle TUI session repaints at full rate, i.e. the
+#      `App::needs_fast_repaint()` / poll-timeout throttle regressed. Runs with
+#      a shortened window (5s warmup / 6s idle) to stay quick; Linux-only, and
+#      skipped when the debug binary is missing or older than the staged Rust
+#      sources (a stale binary would silently test the previous code).
 #
 # Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
-# Skip only the slower cargo check (keep the instant fmt check):
+# Skip only the slower cargo check + probe (keep the instant fmt check):
 #   CLAWDE_HOOK_SKIP_TESTS=1 git commit ...
+# Skip only the idle-CPU probe:
+#   CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...
 set -u
 
 if [ "${SKIP_CLAWDE_HOOK:-0}" = "1" ]; then
@@ -41,6 +49,52 @@ if ! cargo check -p clawde-tui --tests >/dev/null 2>&1; then
     echo "pre-commit: clawde-tui test targets do not compile."
     echo "  Note: plain 'cargo check --workspace' skips test targets; CI's"
     echo "  'cargo test --workspace' compiles them and would fail."
+    exit 1
+fi
+
+# ---- Idle-CPU smoke probe ------------------------------------------------
+# The probe needs the debug binary, and only tells us anything if that binary
+# is at least as new as every staged .rs file. Otherwise we'd measure the
+# previous build (a false pass). Missing/stale binary → skip with a hint;
+# non-Linux → the probe self-skips with exit 2 (treat as a pass).
+if [ "${CLAWDE_HOOK_SKIP_IDLE_CPU:-0}" = "1" ]; then
+    exit 0
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    exit 0
+fi
+
+BINARY="$ROOT/src-rust/target/debug/clawde"
+if [ ! -x "$BINARY" ]; then
+    echo "pre-commit: skipping idle-CPU probe — debug binary not built"
+    echo "  (run 'cargo build' in src-rust/ to enable this check)."
+    exit 0
+fi
+
+newest_staged_rs=$(git diff --cached --name-only | grep '^src-rust/.*\.rs$' | while read -r f; do
+    if [ -f "$ROOT/$f" ]; then
+        stat -c %Y "$ROOT/$f" 2>/dev/null
+    fi
+done | sort -rn | head -1)
+binary_mtime=$(stat -c %Y "$BINARY" 2>/dev/null || echo 0)
+if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
+    echo "pre-commit: skipping idle-CPU probe — debug binary is stale"
+    echo "  (run 'cargo build' in src-rust/ so the probe tests the staged code)."
+    exit 0
+fi
+
+python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
+    --binary "$BINARY" --warmup-secs 5 --idle-secs 6 --max-cpu-secs 1.2 \
+    >/dev/null 2>&1
+status=$?
+if [ "$status" -eq 2 ]; then
+    exit 0  # probe self-skipped (non-Linux)
+fi
+if [ "$status" -ne 0 ]; then
+    echo "pre-commit: idle-CPU probe FAILED — the TUI repaints at full rate while idle."
+    echo "  Check App::needs_fast_repaint() (crates/tui/src/app.rs) and the poll"
+    echo "  timeout (crates/cli/src/main.rs). Run the probe manually for details:"
+    echo "    python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde"
     exit 1
 fi
 

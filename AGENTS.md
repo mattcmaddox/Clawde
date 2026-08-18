@@ -110,7 +110,8 @@ cargo check -p clawde-tui --tests
 
 ### Pre-commit hook
 
-`.githooks/pre-commit` runs rustfmt + the TUI test-target check before commits
+`.githooks/pre-commit` runs rustfmt + the TUI test-target check + an idle-CPU
+smoke probe (skipped when the debug binary is missing/stale) before commits
 (see the script header). Enable once per clone:
 
 ```bash
