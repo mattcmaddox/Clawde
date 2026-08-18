@@ -3161,18 +3161,32 @@ mod tests {
     fn all_entries_returns_expected_settings() {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
-        // Base settings are always present (30 with the permission-mode entry),
-        // plus 0-3 conditional file injection settings.
+        // The settings list intentionally grows as features add controls, so
+        // validate its baseline and structure rather than imposing a brittle
+        // upper bound on the number of editable entries.
         assert!(
             entries.len() >= 28,
             "Should have at least 28 editable settings, got {}",
             entries.len()
         );
-        assert!(
-            entries.len() <= 40,
-            "Should have at most 40 editable settings, got {}",
-            entries.len()
+        let keys: std::collections::HashSet<&str> = entries.iter().map(|entry| entry.key).collect();
+        assert_eq!(
+            keys.len(),
+            entries.len(),
+            "Editable settings must not contain duplicate keys"
         );
+        for required in [
+            "permission_mode",
+            "allowed_tools",
+            "disallowed_tools",
+            "preferredSearchBackend",
+            "ollama_auto_unload",
+        ] {
+            assert!(
+                keys.contains(required),
+                "Missing expected setting '{required}'"
+            );
+        }
     }
 
     #[test]
