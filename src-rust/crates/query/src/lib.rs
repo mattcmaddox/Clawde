@@ -2266,6 +2266,13 @@ pub async fn run_query_loop(
                                                 }
                                             }
                                             clawde_api::StreamEvent::TextDelta { index, text } => {
+                                                // Invariant: every provider keeps separate index
+                                                // namespaces per block kind (google: text 0,
+                                                // tools 1000+, thinking 2000+; openai-chat and
+                                                // anthropic: strictly increasing per block). A
+                                                // text delta whose index is held by a Tool entry
+                                                // would be dropped here — no current provider
+                                                // produces that shape.
                                                 if let Some(entry) = streamed_blocks
                                                     .iter_mut()
                                                     .find(|b| b.index == *index)
@@ -5209,8 +5216,9 @@ mod tests {
             "transcript must include the retried answer, got: {}",
             final_text
         );
-        // The wrapper's placeholder lands in text_chunks, so the query loop's
-        // own empty-turn fallback (lib.rs) must NOT emit a second placeholder.
+        // The wrapper's placeholder lands in the streamed text block, so the
+        // query loop's own empty-turn fallback (lib.rs) must NOT emit a
+        // second placeholder.
         assert_eq!(
             final_text.matches("no response from").count(),
             1,

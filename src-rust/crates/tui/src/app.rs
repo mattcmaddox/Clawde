@@ -1520,6 +1520,9 @@ pub struct App {
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
     pub effort_picker: crate::effort_picker::EffortPickerState,
+    /// Set when the effort picker applied a selection on Enter (so the CLI
+    /// runtime can surface it into `current_effort` / the persisted session).
+    pub effort_picker_applied: bool,
     /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
     pub routing_dialog: crate::routing_dialog::RoutingDialogState,
     /// Spec review dialog (/spec-review <file> — audit spec §10 Accept/Edit/Reject).
@@ -2121,6 +2124,7 @@ impl App {
             file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             effort_picker: crate::effort_picker::EffortPickerState::new(),
+            effort_picker_applied: false,
             routing_dialog: crate::routing_dialog::RoutingDialogState::new(),
             spec_review: crate::spec_review::SpecReviewState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
@@ -4986,6 +4990,7 @@ impl App {
                         chosen.symbol(),
                         chosen.label()
                     ));
+                    self.effort_picker_applied = true;
                 }
                 _ => {}
             }

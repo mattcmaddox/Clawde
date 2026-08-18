@@ -597,5 +597,39 @@ fn headless_effort_precedence_flows_into_provider_request() {
         bodies3
     );
 
+    // Scenario 4: a resumed session WITHOUT a saved effort must NOT clear the
+    // CLI override — fall through to --effort low (not the persisted high).
+    let home4 = base_home.join("s4");
+    std::fs::create_dir_all(home4.join("sessions")).expect("home s4 sessions");
+    std::fs::write(
+        home4.join("settings.json"),
+        r#"{"config": {"defaultEffort": "high"}}"#,
+    )
+    .expect("write settings s4");
+    // Older/untouched session files omit the effort field.
+    std::fs::write(
+        home4.join("sessions").join(format!("{session_id}.json")),
+        r#"{"id":"effort-precedence-session","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z","messages":[{"role":"user","content":"earlier"}],"model":"gpt-5-mini"}"#,
+    )
+    .expect("write session s4");
+    let (out4, bodies4) = run_scenario(
+        &["--effort", "low", "--resume", session_id],
+        "EFFORT_PROBE",
+        &home4,
+        session_id,
+    );
+    assert!(
+        out4.status.success(),
+        "s4 stderr={}",
+        String::from_utf8_lossy(&out4.stderr)
+    );
+    assert!(
+        bodies4
+            .iter()
+            .any(|b| b.contains("\"reasoning_effort\":\"low\"")),
+        "an absent session effort must fall through to CLI --effort low; bodies={:?}",
+        bodies4
+    );
+
     std::fs::remove_dir_all(&base_home).expect("remove effort homes");
 }

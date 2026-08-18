@@ -403,7 +403,9 @@ Set the thinking effort level for the current session. Like `/thinking`, it is s
 | `low` | Minimal thinking; deterministic temperature, fastest responses |
 | `medium` | Balanced thinking and speed |
 | `high` | Deep reasoning; slower responses |
+| `xhigh` | Very deep reasoning |
 | `max` | Maximum token budget for thinking |
+| `ultracode` | Top reasoning tier, plus the ultracode operating procedure |
 
 ```
 /effort low

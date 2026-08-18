@@ -2323,11 +2323,13 @@ async fn run_headless(
     let mut qcfg = query_config.clone();
     if let Some(session) = resumed_session.as_ref() {
         // A saved session override outranks invocation-level flags when a
-        // conversation crosses a process boundary.
-        qcfg.effort_level = session.effort;
-        qcfg.thinking_budget = session
-            .effort
-            .and_then(|level| level.thinking_budget_tokens());
+        // conversation crosses a process boundary. Only override when the
+        // session actually carries an override — an absent effort must fall
+        // through to the CLI flag / persisted default, not clear them.
+        if let Some(level) = session.effort {
+            qcfg.effort_level = Some(level);
+            qcfg.thinking_budget = level.thinking_budget_tokens();
+        }
         if !session.model.is_empty() {
             qcfg.model = session.model.clone();
         }
@@ -3666,11 +3668,10 @@ async fn run_interactive(
                                 app.intercept_slash_command_with_args(&cmd_name, &cmd_args)
                             };
 
-                            // Sync effort level when TUI cycled the visual indicator
-                            // (no-args /effort → cycle Low→Med→High→Max→Low).
-                            if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
-                                current_effort = Some(app.effort_level);
-                            }
+                            // The no-args /effort picker applies its selection on
+                            // Enter inside App; the CLI runtime learns it below
+                            // (after handle_key_event) via `effort_picker_applied`.
+                            // Opening the picker alone must not pin an override.
 
                             // Honour exit/quit triggered by TUI intercept immediately.
                             if app.should_exit {
@@ -4186,14 +4187,24 @@ async fn run_interactive(
                                 Some(CommandResult::ThinkingChange(action)) => {
                                     match action {
                                         clawde_commands::ThinkingAction::On => {
-                                            // /thinking on creates a session override at the
-                                            // active model's balanced native reasoning tier; a
-                                            // non-reasoning model falls back to the canonical
-                                            // balanced effort without emitting thinking fields.
-                                            let level = default_thinking_effort(
-                                                &cmd_ctx.config,
-                                                &model_registry,
-                                            );
+                                            // /thinking on creates a session override. A
+                                            // persisted non-off default is the user's stated
+                                            // preference and wins; otherwise fall back to the
+                                            // active model's balanced native reasoning tier (a
+                                            // non-reasoning model gets the canonical balanced
+                                            // effort without emitting thinking fields).
+                                            let level = cmd_ctx
+                                                .config
+                                                .default_effort
+                                                .filter(|level| {
+                                                    *level != clawde_core::effort::EffortLevel::None
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    default_thinking_effort(
+                                                        &cmd_ctx.config,
+                                                        &model_registry,
+                                                    )
+                                                });
                                             current_effort = Some(level);
                                             session.effort = current_effort;
                                             let _ =
@@ -4715,6 +4726,15 @@ async fn run_interactive(
 
                     let previous_ollama_mode = app.ollama_mode;
                     app.handle_key_event(key);
+                    // Effort picker applied a selection on Enter: surface it into
+                    // the session override and persist it, mirroring `/effort
+                    // <level>` so the choice survives a resume.
+                    if app.effort_picker_applied {
+                        app.effort_picker_applied = false;
+                        current_effort = Some(app.effort_level);
+                        session.effort = current_effort;
+                        let _ = clawde_core::history::save_session(&session).await;
+                    }
                     cmd_ctx.config = app.config.clone();
                     if app.ollama_mode != previous_ollama_mode {
                         // `/ollama` changes the active capability boundary. Rebuild
