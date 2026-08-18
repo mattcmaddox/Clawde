@@ -450,3 +450,152 @@ fn headless_resume_survives_two_processes_and_tool_result_boundary() {
     std::fs::remove_dir_all(fixture).expect("remove fixture");
     std::fs::remove_dir_all(home).expect("remove home");
 }
+
+/// Effort-precedence coverage across a real process boundary: persisted
+/// `config.defaultEffort` must reach the provider request as `reasoning_effort`
+/// on a reasoning model, `--effort` must outrank it, and a resumed session's
+/// saved `effort` must outrank both. The mock fixture records the request
+/// bodies so the assertions inspect exactly what the binary sent.
+#[test]
+fn headless_effort_precedence_flows_into_provider_request() {
+    fn end_turn_response() -> &'static str {
+        "data: {\"id\":\"effort-ok\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"EFFORT_OK\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"effort-ok\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
+    }
+
+    /// Bind a fixture server, spawn the real binary against it, and return
+    /// the recorded request bodies. `extra` are additional CLI args (e.g.
+    /// `--effort` / `--resume`).
+    fn run_scenario(
+        extra: &[&str],
+        prompt: &str,
+        home: &Path,
+        session_id: &str,
+    ) -> (std::process::Output, Vec<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind effort fixture");
+        let address = listener.local_addr().expect("effort fixture address");
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_bodies = bodies.clone();
+        // Detached: the thread blocks on `incoming()` until the test process
+        // exits, so it must never be joined. Each scenario binds its own port.
+        let _server = thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let body = read_request(&mut stream);
+                server_bodies.lock().unwrap().push(body.clone());
+                if body.contains("EFFORT_PROBE") {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        end_turn_response(),
+                        "text/event-stream",
+                    );
+                } else {
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "unexpected request",
+                        "text/plain",
+                    );
+                }
+            }
+        });
+        let api_base = format!("http://{}", address);
+        let cwd = std::env::temp_dir().join(format!("clawde-effort-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).expect("effort fixture cwd");
+        let mut args = common_args(&api_base, &cwd, session_id);
+        // reasoning_effort is only emitted for OpenAI reasoning families, and
+        // the OpenAI provider blocks gpt-5/o-series (Responses API) — so route
+        // through the OpenAI-compatible openrouter provider instead.
+        let model_pos = args.iter().position(|a| a == "gpt-4o-mini").unwrap();
+        args[model_pos] = "gpt-5-mini".to_string();
+        let provider_pos = args.iter().position(|a| a == "openai").unwrap();
+        args[provider_pos] = "openrouter".to_string();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let child = spawn_child(&args, prompt, home);
+        let output = run_child(child, Duration::from_secs(30));
+        std::fs::remove_dir_all(&cwd).expect("remove effort fixture cwd");
+        let recorded = bodies.lock().unwrap().clone();
+        (output, recorded)
+    }
+
+    let base_home =
+        std::env::temp_dir().join(format!("clawde-effort-home-{}", uuid::Uuid::new_v4()));
+    let session_id = "effort-precedence-session";
+
+    // Scenario 1: persisted defaultEffort alone reaches the request body.
+    let home1 = base_home.join("s1");
+    std::fs::create_dir_all(&home1).expect("home s1");
+    std::fs::write(
+        home1.join("settings.json"),
+        r#"{"config": {"defaultEffort": "high"}}"#,
+    )
+    .expect("write settings s1");
+    let (out1, bodies1) = run_scenario(&[], "EFFORT_PROBE", &home1, session_id);
+    assert!(
+        out1.status.success(),
+        "s1 stderr={}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert!(
+        bodies1
+            .iter()
+            .any(|b| b.contains("\"reasoning_effort\":\"high\"")),
+        "persisted defaultEffort=high must reach the request as reasoning_effort; bodies={:?}",
+        bodies1
+    );
+
+    // Scenario 2: CLI --effort outranks the persisted default.
+    let home2 = base_home.join("s2");
+    std::fs::create_dir_all(&home2).expect("home s2");
+    std::fs::write(
+        home2.join("settings.json"),
+        r#"{"config": {"defaultEffort": "high"}}"#,
+    )
+    .expect("write settings s2");
+    let (out2, bodies2) = run_scenario(&["--effort", "low"], "EFFORT_PROBE", &home2, session_id);
+    assert!(
+        out2.status.success(),
+        "s2 stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(
+        bodies2
+            .iter()
+            .any(|b| b.contains("\"reasoning_effort\":\"low\"")),
+        "CLI --effort low must outrank the persisted high default; bodies={:?}",
+        bodies2
+    );
+
+    // Scenario 3: a resumed session's saved effort outranks CLI --effort.
+    let home3 = base_home.join("s3");
+    std::fs::create_dir_all(home3.join("sessions")).expect("home s3 sessions");
+    std::fs::write(
+        home3.join("settings.json"),
+        r#"{"config": {"defaultEffort": "medium"}}"#,
+    )
+    .expect("write settings s3");
+    std::fs::write(
+        home3.join("sessions").join(format!("{session_id}.json")),
+        r#"{"id":"effort-precedence-session","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z","messages":[{"role":"user","content":"earlier"}],"model":"gpt-5-mini","effort":"high"}"#,
+    )
+    .expect("write session s3");
+    let (out3, bodies3) = run_scenario(
+        &["--effort", "low", "--resume", session_id],
+        "EFFORT_PROBE",
+        &home3,
+        session_id,
+    );
+    assert!(
+        out3.status.success(),
+        "s3 stderr={}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
+    assert!(
+        bodies3
+            .iter()
+            .any(|b| b.contains("\"reasoning_effort\":\"high\"")),
+        "resumed session effort must outrank CLI --effort low; bodies={:?}",
+        bodies3
+    );
+
+    std::fs::remove_dir_all(&base_home).expect("remove effort homes");
+}

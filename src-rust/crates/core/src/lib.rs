@@ -6719,6 +6719,48 @@ mod tests {
     }
 
     #[test]
+    fn test_message_interleaved_thinking_blocks_keep_order() {
+        // A single turn may carry several thinking blocks interleaved with
+        // text (stream-order assembly, e.g. Gemini turnaround thinking).
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Text { text: "A ".into() },
+            ContentBlock::Thinking {
+                thinking: "ponder one".into(),
+                signature: "s1".into(),
+            },
+            ContentBlock::Text { text: "B ".into() },
+            ContentBlock::Thinking {
+                thinking: "ponder two".into(),
+                signature: "s2".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ]);
+        let thinking: Vec<&str> = msg
+            .get_thinking_blocks()
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["ponder one", "ponder two"],
+            "thinking blocks must keep stream order"
+        );
+        assert_eq!(
+            msg.get_all_text(),
+            "A B ",
+            "get_all_text must not leak thinking content"
+        );
+    }
+
+    #[test]
     fn test_message_get_text_returns_first_text_block() {
         let msg = Message::assistant_blocks(vec![
             ContentBlock::Thinking {

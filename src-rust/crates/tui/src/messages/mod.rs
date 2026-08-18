@@ -2544,6 +2544,60 @@ mod tests {
     }
 
     #[test]
+    fn render_message_renders_interleaved_thinking_and_text_in_order() {
+        // Stream-order assembly can produce text / thinking / text / thinking
+        // within one turn; every thinking block must render its own heading
+        // and text blocks must stay in their emitted positions.
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "first answer".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: "first reasoning".to_string(),
+                signature: "s1".to_string(),
+            },
+            ContentBlock::Text {
+                text: "second answer".to_string(),
+            },
+            ContentBlock::Thinking {
+                thinking: "second reasoning".to_string(),
+                signature: "s2".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
+            },
+        ]);
+        let ctx = RenderContext {
+            width: 80,
+            highlight: true,
+            show_thinking: true,
+            ..Default::default()
+        };
+
+        let rendered = render_message(&msg, &ctx)
+            .into_iter()
+            .map(|line| line_text(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(rendered.matches("Thinking").count(), 2);
+        assert!(rendered.contains("first reasoning"));
+        assert!(rendered.contains("second reasoning"));
+        let first = rendered.find("first answer").expect("first text");
+        let second = rendered.find("second answer").expect("second text");
+        let think_one = rendered.find("first reasoning").expect("first thinking");
+        let think_two = rendered.find("second reasoning").expect("second thinking");
+        assert!(
+            first < think_one && think_one < second && second < think_two,
+            "interleaved order must be preserved, got:\n{rendered}"
+        );
+        assert!(rendered.contains("read_file"));
+    }
+
+    #[test]
     fn render_message_renders_user_text_in_brief_prompt_style() {
         let msg = Message::user("hello from user");
         let ctx = RenderContext::default();
