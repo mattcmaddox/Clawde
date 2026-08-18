@@ -68,8 +68,8 @@ impl Tool for ListMcpResourcesTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        if let Err(e) = ctx.check_permission(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool(
+            self,
             &format!(
                 "List MCP resources{}",
                 params
@@ -168,8 +168,8 @@ impl Tool for ReadMcpResourceTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        if let Err(e) = ctx.check_permission(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool(
+            self,
             &format!("Read MCP resource {}:{}", params.server, params.uri),
             true,
         ) {

@@ -71,8 +71,9 @@ pub async fn handle(
     let session_tools = runtime.tools_for_session(session_mcp.clone());
 
     // Build per-session ToolContext.
-    let permission_handler: Arc<dyn clawde_core::PermissionHandler> =
-        Arc::new(AcpPermissionHandler);
+    let permission_handler: Arc<dyn clawde_core::PermissionHandler> = Arc::new(
+        AcpPermissionHandler::new(session.permission_manager.clone()),
+    );
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
         permission_mode: runtime.config.permission_mode.clone(),
@@ -90,7 +91,7 @@ pub async fn handle(
         effort: None,
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
-        permission_manager: Some(runtime.permission_manager.clone()),
+        permission_manager: Some(session.permission_manager.clone()),
         user_question_tx: None,
         // Bind to this turn's cancel token so the parallel tool executor and any
         // sub-agents observe cancellation (issue #218). `run_query_loop` also
@@ -104,6 +105,7 @@ pub async fn handle(
         connection.clone(),
         session.session_id.clone(),
         session.pending_permissions.clone(),
+        session.permission_manager.clone(),
         drainer_cancel.clone(),
     );
 

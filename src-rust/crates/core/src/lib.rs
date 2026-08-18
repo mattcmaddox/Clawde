@@ -3705,29 +3705,35 @@ pub mod permissions {
     // Danger level assigned to each tool type
     // -----------------------------------------------------------------------
 
-    /// How dangerous a tool operation is — used as the default decision when
-    /// no explicit rule matches.
+    /// Capability tier assigned by the tool implementation.
+    ///
+    /// This is the single permission taxonomy used by the core policy engine,
+    /// the tool trait, agent filtering, and audit reports. Network reachability
+    /// is deliberately a separate capability bit: WebSearch is read-only but
+    /// network-capable, while Bash is execute-capable and network-capable.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum PermissionLevel {
-        /// Read-only operations (Glob, Grep, Read, WebSearch, etc.).
-        Read,
-        /// File write/edit operations (Write, Edit).
+        /// No external or persistent side effects.
+        None,
+        /// Reads local or remote data without mutating it.
+        ReadOnly,
+        /// Creates or modifies files or other workspace state.
         Write,
-        /// Shell command execution (Bash).
+        /// Runs code, spawns processes, or schedules future execution.
         Execute,
-        /// Outbound network access (WebFetch).
-        Network,
+        /// Broad system control such as desktop input or unrestricted devices.
+        Dangerous,
+        /// An operation that must never execute.
+        Forbidden,
     }
 
     impl PermissionLevel {
-        /// Derive the permission level from a well-known tool name.
-        pub fn for_tool(tool_name: &str) -> Self {
-            match tool_name {
-                "Bash" | "bash" => Self::Execute,
-                "Write" | "Edit" | "NotebookEdit" => Self::Write,
-                "WebFetch" | "WebSearch" | "RemoteTrigger" => Self::Network,
-                _ => Self::Read,
-            }
+        pub const fn is_read_only(self) -> bool {
+            matches!(self, Self::None | Self::ReadOnly)
+        }
+
+        pub const fn requires_approval(self) -> bool {
+            !self.is_read_only()
         }
     }
 
@@ -3776,7 +3782,7 @@ pub mod permissions {
         pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
             // Tool name check
             if let Some(ref rule_tool) = self.tool_name {
-                if rule_tool != tool_name {
+                if !rule_tool.eq_ignore_ascii_case(tool_name) {
                     return false;
                 }
             }
@@ -3867,7 +3873,9 @@ pub mod permissions {
         level: PermissionLevel,
     ) -> String {
         match level {
-            PermissionLevel::Execute => description.to_string(),
+            PermissionLevel::Execute | PermissionLevel::Dangerous | PermissionLevel::Forbidden => {
+                description.to_string()
+            }
             PermissionLevel::Write => {
                 let target = path.unwrap_or(description);
                 let extra = if target.contains("/etc/") || target.contains("\\etc\\") {
@@ -3880,14 +3888,7 @@ pub mod permissions {
                 };
                 format!("{} wants to write to `{}`{}", tool_name, target, extra)
             }
-            PermissionLevel::Network => {
-                let url = path.unwrap_or(description);
-                format!(
-                    "WebFetch wants to fetch: `{}`\nThis will make an outbound HTTP request.",
-                    url
-                )
-            }
-            PermissionLevel::Read => {
+            PermissionLevel::None | PermissionLevel::ReadOnly => {
                 let target = path.unwrap_or(description);
                 format!("{} wants to read: `{}`", tool_name, target)
             }
@@ -3936,6 +3937,11 @@ pub mod permissions {
         pub session_rules: Vec<PermissionRule>,
         /// Rules loaded from / saved to settings.json.
         pub persistent_rules: Vec<PermissionRule>,
+        /// Explicit tool allowlist. When non-empty, only these tools are exposed
+        /// and allowed by the runtime policy.
+        pub allowed_tools: Vec<String>,
+        /// Explicit tool denylist. Deny always wins over every other decision.
+        pub denied_tools: Vec<String>,
         /// Pending interactive decisions keyed by tool_use_id.
         pending: Vec<PendingPermission>,
     }
@@ -3946,6 +3952,8 @@ pub mod permissions {
         pub fn new(
             mode: crate::config::PermissionMode,
             settings: &crate::config::Settings,
+            allowed_tools: &[String],
+            denied_tools: &[String],
         ) -> Self {
             let persistent_rules = settings
                 .permission_rules
@@ -3956,6 +3964,8 @@ pub mod permissions {
                 mode,
                 session_rules: Vec::new(),
                 persistent_rules,
+                allowed_tools: allowed_tools.to_vec(),
+                denied_tools: denied_tools.to_vec(),
                 pending: Vec::new(),
             }
         }
@@ -3983,9 +3993,30 @@ pub mod permissions {
             working_dir: Option<&std::path::Path>,
             allowed_roots: &[std::path::PathBuf],
         ) -> PermissionDecision {
-            self.evaluate_with_network_isolation(
+            let is_read_only = matches!(
+                tool_name,
+                crate::constants::TOOL_NAME_FILE_READ
+                    | crate::constants::TOOL_NAME_GLOB
+                    | crate::constants::TOOL_NAME_GREP
+                    | crate::constants::TOOL_NAME_WEB_FETCH
+                    | crate::constants::TOOL_NAME_WEB_SEARCH
+            );
+            let network_capable = matches!(
+                tool_name,
+                crate::constants::TOOL_NAME_WEB_FETCH | crate::constants::TOOL_NAME_WEB_SEARCH
+            );
+            self.evaluate_with_capabilities(
                 tool_name,
                 description,
+                if is_read_only {
+                    PermissionLevel::ReadOnly
+                } else if crate::constants::is_file_mutator(tool_name) {
+                    PermissionLevel::Write
+                } else {
+                    PermissionLevel::Execute
+                },
+                network_capable,
+                false,
                 path,
                 working_dir,
                 allowed_roots,
@@ -3998,10 +4029,13 @@ pub mod permissions {
         /// Active session handlers must use this method rather than the legacy
         /// [`Self::evaluate`] wrapper so one session's Ollama toggle cannot
         /// affect another session through process-global state.
-        pub fn evaluate_with_network_isolation(
+        pub fn evaluate_with_capabilities(
             &self,
             tool_name: &str,
             description: &str,
+            level: PermissionLevel,
+            network_capable: bool,
+            stateful: bool,
             path: Option<&str>,
             working_dir: Option<&std::path::Path>,
             allowed_roots: &[std::path::PathBuf],
@@ -4009,15 +4043,23 @@ pub mod permissions {
         ) -> PermissionDecision {
             use crate::config::PermissionMode;
 
-            // Isolated Ollama mode is a hard network-tool boundary. It must
-            // run before bypass and explicit allow rules; otherwise
-            // --dangerously-skip-permissions would defeat offline mode.
-            if network_isolated && PermissionLevel::for_tool(tool_name) == PermissionLevel::Network
+            // Isolation and forbidden capabilities are hard boundaries. They
+            // run before bypass and explicit allow rules.
+            if level == PermissionLevel::Forbidden || (network_isolated && network_capable) {
+                return PermissionDecision::Deny;
+            }
+
+            let listed = |names: &[String]| {
+                names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool_name))
+            };
+            if listed(&self.denied_tools)
+                || (!self.allowed_tools.is_empty() && !listed(&self.allowed_tools))
             {
                 return PermissionDecision::Deny;
             }
 
-            // Bypass everything except the isolated-mode network boundary.
             if self.mode == PermissionMode::BypassPermissions {
                 return PermissionDecision::Allow;
             }
@@ -4054,31 +4096,9 @@ pub mod permissions {
                 return PermissionDecision::Allow;
             }
 
-            let level = match PermissionLevel::for_tool(tool_name) {
-                PermissionLevel::Read
-                    if !matches!(
-                        tool_name,
-                        "Read"
-                            | "Glob"
-                            | "Grep"
-                            | "ListMcpResources"
-                            | "ReadMcpResource"
-                            | "LSP"
-                            | "Skill"
-                    ) =>
-                {
-                    PermissionLevel::Execute
-                }
-                other => other,
-            };
-            let read_in_workspace = path.is_some_and(|target| {
-                is_path_within_allowed_roots(target, working_dir, allowed_roots)
+            let should_ask_read = path.is_some_and(|target| {
+                !is_path_within_allowed_roots(target, working_dir, allowed_roots)
             });
-            let should_ask_read = match tool_name {
-                "ListMcpResources" | "ReadMcpResource" => true,
-                _ if matches!(level, PermissionLevel::Read) && path.is_some() => !read_in_workspace,
-                _ => false,
-            };
 
             // Step 4 — AcceptEdits: auto-allow built-in file mutators. `Write`
             // is required for creating new files; the other names are ordinary
@@ -4087,6 +4107,14 @@ pub mod permissions {
             // requiring an interactive approval that cannot be answered. The
             // shared classifier keeps medium/critical shell commands gated.
             if self.mode == PermissionMode::AcceptEdits {
+                if stateful {
+                    return PermissionDecision::Ask {
+                        reason: format!(
+                            "Tool '{}' changes session or coordination state",
+                            tool_name
+                        ),
+                    };
+                }
                 if crate::constants::is_file_mutator(tool_name) {
                     return PermissionDecision::Allow;
                 }
@@ -4110,22 +4138,23 @@ pub mod permissions {
 
             // Step 5 — Plan mode: reads only
             if self.mode == PermissionMode::Plan {
-                return match level {
-                    PermissionLevel::Read => PermissionDecision::Allow,
-                    _ => PermissionDecision::Deny,
+                return if level.is_read_only() && !stateful {
+                    PermissionDecision::Allow
+                } else {
+                    PermissionDecision::Deny
                 };
             }
 
             // Step 6 — Default / remaining AcceptEdits behavior.
-            match level {
-                PermissionLevel::Read if !should_ask_read => PermissionDecision::Allow,
-                PermissionLevel::Read
-                | PermissionLevel::Write
-                | PermissionLevel::Execute
-                | PermissionLevel::Network => {
-                    let reason = format_permission_reason(tool_name, description, path, level);
-                    PermissionDecision::Ask { reason }
+            if stateful {
+                PermissionDecision::Ask {
+                    reason: format!("Tool '{}' changes session or coordination state", tool_name),
                 }
+            } else if level.is_read_only() && (!should_ask_read || network_capable) {
+                PermissionDecision::Allow
+            } else {
+                let reason = format_permission_reason(tool_name, description, path, level);
+                PermissionDecision::Ask { reason }
             }
         }
 
@@ -4284,6 +4313,13 @@ pub mod permissions {
         /// Session-scoped network isolation snapshot used by managed permission
         /// handlers. Legacy callers may leave this false and use `evaluate`.
         pub network_isolated: bool,
+        /// Typed capability tier supplied by the tool implementation.
+        pub permission_level: PermissionLevel,
+        /// Whether this invocation can reach an external network or endpoint.
+        pub network_capable: bool,
+        /// Whether this invocation mutates session or coordination state even
+        /// when it does not write files or spawn a process.
+        pub stateful: bool,
     }
 
     // -----------------------------------------------------------------------
@@ -4314,13 +4350,14 @@ pub mod permissions {
                     // built-in file mutators, not only Edit. Write is required
                     // for creating new files, while BatchEdit/ApplyPatch and
                     // NotebookEdit are also ordinary edit operations.
-                    if crate::constants::is_file_mutator(&request.tool_name)
-                        || request.is_read_only
-                        || (request.tool_name == "RunTests"
-                            && request
-                                .path
-                                .as_deref()
-                                .is_some_and(crate::bash_classifier::is_direct_test_command))
+                    if !request.stateful
+                        && (crate::constants::is_file_mutator(&request.tool_name)
+                            || request.is_read_only
+                            || (request.tool_name == "RunTests"
+                                && request
+                                    .path
+                                    .as_deref()
+                                    .is_some_and(crate::bash_classifier::is_direct_test_command)))
                     {
                         PermissionDecision::Allow
                     } else {
@@ -4328,14 +4365,14 @@ pub mod permissions {
                     }
                 }
                 PermissionMode::Plan => {
-                    if request.is_read_only {
+                    if request.is_read_only && !request.stateful {
                         PermissionDecision::Allow
                     } else {
                         PermissionDecision::Deny
                     }
                 }
                 PermissionMode::Default => {
-                    if request.is_read_only {
+                    if request.is_read_only && !request.stateful {
                         PermissionDecision::Allow
                     } else {
                         PermissionDecision::Deny
@@ -4362,7 +4399,7 @@ pub mod permissions {
             use crate::config::PermissionMode;
             match self.mode {
                 PermissionMode::Plan => {
-                    if request.is_read_only {
+                    if request.is_read_only && !request.stateful {
                         PermissionDecision::Allow
                     } else {
                         PermissionDecision::Deny
@@ -4398,9 +4435,12 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate_with_network_isolation(
+                let decision = m.evaluate_with_capabilities(
                     &request.tool_name,
                     &request.description,
+                    request.permission_level,
+                    request.network_capable,
+                    request.stateful,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
@@ -4436,17 +4476,21 @@ pub mod permissions {
     impl PermissionHandler for ManagedInteractivePermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                return m.evaluate_with_network_isolation(
+                return m.evaluate_with_capabilities(
                     &request.tool_name,
                     &request.description,
+                    request.permission_level,
+                    request.network_capable,
+                    request.stateful,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                     request.network_isolated,
                 );
             }
-            // If the lock is poisoned fall back to allow (user is watching)
-            PermissionDecision::Allow
+            // A poisoned permission manager must fail closed. Never treat
+            // lock failure as approval, even in an interactive session.
+            PermissionDecision::Deny
         }
 
         fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
@@ -4483,7 +4527,7 @@ pub mod permissions {
         use crate::config::{PermissionMode, Settings};
 
         fn mgr(mode: PermissionMode) -> PermissionManager {
-            PermissionManager::new(mode, &Settings::default())
+            PermissionManager::new(mode, &Settings::default(), &[], &[])
         }
 
         #[test]
@@ -4566,6 +4610,34 @@ pub mod permissions {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
+        }
+
+        #[test]
+        fn poisoned_interactive_manager_denies_closed() {
+            let manager = Arc::new(Mutex::new(mgr(PermissionMode::Default)));
+            let poisoned = manager.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison permission manager for fail-closed test");
+            })
+            .join();
+
+            let handler = ManagedInteractivePermissionHandler::new(manager);
+            let request = PermissionRequest {
+                tool_name: "Bash".to_string(),
+                description: "run a command".to_string(),
+                details: None,
+                is_read_only: false,
+                path: None,
+                working_dir: None,
+                allowed_roots: Vec::new(),
+                context_description: None,
+                network_isolated: false,
+                permission_level: PermissionLevel::Execute,
+                network_capable: false,
+                stateful: false,
+            };
+            assert_eq!(handler.check_permission(&request), PermissionDecision::Deny);
         }
 
         #[test]
@@ -4745,10 +4817,10 @@ pub mod permissions {
                 "WebFetch",
                 "fetch",
                 Some("https://example.com"),
-                PermissionLevel::Network,
+                PermissionLevel::ReadOnly,
             );
             assert!(s.contains("https://example.com"));
-            assert!(s.contains("HTTP request"));
+            assert!(s.contains("wants to read"));
         }
     }
 }
@@ -6577,6 +6649,13 @@ mod tests {
             allowed_roots: Vec::new(),
             context_description: None,
             network_isolated: false,
+            permission_level: if is_read_only {
+                PermissionLevel::ReadOnly
+            } else {
+                PermissionLevel::Execute
+            },
+            network_capable: false,
+            stateful: false,
         }
     }
 
@@ -6585,13 +6664,80 @@ mod tests {
         let manager = crate::permissions::PermissionManager::new(
             crate::config::PermissionMode::BypassPermissions,
             &crate::config::Settings::default(),
+            &[],
+            &[],
         );
         assert_eq!(
-            manager.evaluate_with_network_isolation("WebFetch", "fetch", None, None, &[], false),
+            manager.evaluate_with_capabilities(
+                "WebFetch",
+                "fetch",
+                PermissionLevel::ReadOnly,
+                true,
+                false,
+                None,
+                None,
+                &[],
+                false,
+            ),
             crate::permissions::PermissionDecision::Allow
         );
         assert_eq!(
-            manager.evaluate_with_network_isolation("WebFetch", "fetch", None, None, &[], true),
+            manager.evaluate_with_capabilities(
+                "WebFetch",
+                "fetch",
+                PermissionLevel::ReadOnly,
+                true,
+                false,
+                None,
+                None,
+                &[],
+                true,
+            ),
+            crate::permissions::PermissionDecision::Deny
+        );
+    }
+
+    #[test]
+    fn stateful_read_only_tools_are_asked_or_denied_by_mode() {
+        let manager = crate::permissions::PermissionManager::new(
+            crate::config::PermissionMode::Default,
+            &crate::config::Settings::default(),
+            &[],
+            &[],
+        );
+        assert!(matches!(
+            manager.evaluate_with_capabilities(
+                "SendMessage",
+                "send coordination message",
+                PermissionLevel::None,
+                false,
+                true,
+                None,
+                None,
+                &[],
+                false,
+            ),
+            crate::permissions::PermissionDecision::Ask { .. }
+        ));
+
+        let plan_manager = crate::permissions::PermissionManager::new(
+            crate::config::PermissionMode::Plan,
+            &crate::config::Settings::default(),
+            &[],
+            &[],
+        );
+        assert_eq!(
+            plan_manager.evaluate_with_capabilities(
+                "SendMessage",
+                "send coordination message",
+                PermissionLevel::None,
+                false,
+                true,
+                None,
+                None,
+                &[],
+                false,
+            ),
             crate::permissions::PermissionDecision::Deny
         );
     }
@@ -6676,6 +6822,8 @@ mod tests {
             crate::permissions::PermissionManager::new(
                 crate::config::PermissionMode::Default,
                 &crate::config::Settings::default(),
+                &[],
+                &[],
             ),
         ));
         let handler = crate::permissions::InteractivePermissionHandler::with_manager(manager);
@@ -6691,6 +6839,8 @@ mod tests {
             crate::permissions::PermissionManager::new(
                 crate::config::PermissionMode::Default,
                 &crate::config::Settings::default(),
+                &[],
+                &[],
             ),
         ));
         let handler = crate::permissions::InteractivePermissionHandler::with_manager(manager);

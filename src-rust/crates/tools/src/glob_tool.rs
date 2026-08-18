@@ -67,8 +67,8 @@ impl Tool for GlobTool {
             .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("Glob {} in {}", params.pattern, base_dir.display()),
             base_dir.clone(),
             true,
@@ -103,8 +103,8 @@ impl Tool for GlobTool {
                         }
                     }
                     if !ctx.path_is_within_workspace(&path) {
-                        if let Err(e) = ctx.check_permission_for_path(
-                            self.name(),
+                        if let Err(e) = ctx.check_permission_for_tool_path(
+                            self,
                             &format!("Glob result {}", path.display()),
                             path.clone(),
                             true,

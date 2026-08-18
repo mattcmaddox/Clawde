@@ -312,8 +312,8 @@ impl Tool for WebFetchTool {
         };
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool(
+            self,
             &format!("Fetch {}", params.url),
             true, // read-only
         ) {

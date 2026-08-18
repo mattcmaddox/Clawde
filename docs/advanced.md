@@ -543,9 +543,9 @@ The `/memory` command opens the memory management UI for viewing, editing, and o
 | Mode | Description |
 |---|---|
 | `default` | Prompts the user before executing dangerous or write operations. |
-| `plan` | Read-only; write and execute require explicit approval. |
-| `autoAccept` | Accepts all tool calls without prompting. Use with caution. |
-| `bypassPermissions` | Skips the permission system entirely. Intended for trusted automation only. |
+| `plan` | Read-only; write, execute, and stateful coordination tools are denied. |
+| `acceptEdits` | File edits are auto-approved; execution and stateful coordination still require approval. |
+| `bypassPermissions` | Skips ordinary prompts, but deny rules, forbidden capabilities, and isolation boundaries remain enforced. |
 
 The active mode is set with `--permission-mode <mode>` or via the `PermissionRequest` hook.
 
@@ -556,16 +556,16 @@ Every tool is classified into a risk tier that determines the default permission
 | Tier | Examples | Default behaviour |
 |---|---|---|
 | `forbidden` | Directly destructive operations | Always blocked |
-| `dangerous` | Broad filesystem writes, network access | Prompt required |
+| `dangerous` | Broad system access | Prompt required |
 | `execute` | Bash, shell commands | Prompt required |
 | `write` | FileWrite, FileEdit, TodoWrite | Prompt in default mode |
-| `readonly` | FileRead, Glob, Grep, WebFetch | Allowed automatically |
+| `readonly` | FileRead, Glob, Grep, WebFetch | Allowed automatically; network reachability is tracked separately |
 
 ### Bash command risk classification
 
 Within `BashTool`, commands are further classified by analysing the command string against known patterns. Commands matching dangerous patterns (e.g. `rm -rf`, `dd if=`, pipe chains with destructive intent) receive a higher risk rating and may be blocked depending on the active permission mode.
 
-The `PermissionRequest` hook can intercept any tool call before the user prompt is displayed, allowing automated allow/deny decisions based on context.
+The `PermissionRequest` hook can intercept any tool call before the user prompt is displayed, allowing automated allow/deny decisions based on context. `/doctor` also runs a deterministic audit of built-in permission and capability metadata. Explicit `allowed_tools` and `disallowed_tools` rules affect both model exposure and runtime dispatch; deny always wins.
 
 ---
 

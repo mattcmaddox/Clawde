@@ -32,8 +32,8 @@ Every tool in Clawde implements a common `Tool` interface. This interface define
 
 - **Identity** — name, aliases, MCP info
 - **Input schema** — a Zod schema validating the input the model must provide
-- **Capability flags** — `isReadOnly`, `isDestructive`, `isConcurrencySafe`
-- **Permission check** — `checkPermissions()` called before execution
+- **Capability flags** — permission level, network capability, isolated-mode availability, and stateful coordination metadata
+- **Permission check** — central permission resolution and any tool-specific check before execution
 - **Execution** — `call()` performs the actual operation
 - **UI rendering** — React/Ink components for TUI display
 
@@ -53,11 +53,12 @@ Each tool is assigned a conceptual permission level based on what it can do:
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| **None** | No external effects; purely passive | `SleepTool` |
-| **ReadOnly** | Reads data; no writes or execution | `FileReadTool`, `GlobTool`, `WebFetchTool` |
-| **Write** | Creates or modifies data | `FileWriteTool`, `FileEditTool`, `ConfigTool` |
-| **Execute** | Runs code or spawns processes | `BashTool`, `TaskCreateTool`, `SendMessageTool` |
+| **None** | No direct file/process capability. Stateful tools may still use this level, but are gated by their stateful flag. | `SleepTool`, `SendMessageTool` |
+| **ReadOnly** | Reads local or remote data without mutating it | `FileReadTool`, `GlobTool`, `WebFetchTool` |
+| **Write** | Creates or modifies files or workspace state | `FileWriteTool`, `FileEditTool`, `ConfigTool` |
+| **Execute** | Runs code, spawns processes, or schedules future execution | `BashTool`, `CronCreateTool`, `RemoteTriggerTool` |
 | **Dangerous** | Broad system access; high blast radius | `ComputerUseTool` |
+| **Forbidden** | Registered only to make a hard-block explicit; never executes | none currently |
 
 ### Permission Modes
 
@@ -65,17 +66,20 @@ The active permission mode controls how `checkPermissions()` behaves:
 
 | Mode | Behavior |
 |------|----------|
-| `default` | Prompts the user for any tool that isn't pre-approved |
-| `plan` | All write/execute tools are blocked; read-only tools run freely |
-| `auto` | Non-destructive tools run without prompting; destructive tools prompt |
-| `acceptEdits` | File edits are auto-approved; shell execution still prompts |
-| `bypassPermissions` | All tools run without prompting (headless/CI use) |
+| `default` | Read-only tools, including read-only network tools, run without prompting; writes, execution, and stateful coordination ask |
+| `plan` | Read-only non-stateful tools run freely; writes, execution, and stateful coordination are denied |
+| `acceptEdits` | File edits are auto-approved; execution and stateful coordination still require approval |
+| `bypassPermissions` | Skips ordinary prompts, but explicit deny rules, forbidden capabilities, and network isolation remain hard boundaries |
+
+There is no separate `Network` permission level. Network reachability is a
+capability flag, so a read-only network tool is allowed in default mode while
+arbitrary execution remains an execute-level operation.
 
 ### Interactive vs. Auto Mode
 
 **Interactive mode** (default REPL): Clawde presents a confirmation prompt for any tool that lacks a pre-existing approval rule. The user can approve once, approve always (adding a permanent rule), or deny.
 
-**Auto mode** (`--dangerously-skip-permissions` or `bypassPermissions`): No prompts are shown. All tool calls execute immediately. Use only in trusted, sandboxed environments.
+**Bypass mode** (`--dangerously-skip-permissions` or `bypassPermissions`): No ordinary prompts are shown. Explicit deny rules, forbidden capabilities, and Ollama network isolation still apply. Use only in trusted, sandboxed environments.
 
 ### Permission Rules
 
@@ -85,7 +89,7 @@ Rules are stored per-project and per-user. A rule specifies:
 - **Path pattern** (optional, for file tools)
 - **Decision**: `allow` or `deny`
 
-Rules are evaluated in order; the first match wins. Manage rules with `/permissions`.
+Deny rules always win over allow rules. A matching deny hides the tool from the model and blocks direct/internal dispatch; a matching allow exposes the tool and skips the normal approval prompt. Manage individual rules with `/permissions allow|deny <tool>` or edit the comma-separated `Allowed tools` and `Denied tools` entries in the TUI `/settings` screen. The deterministic built-in metadata audit is included in `/doctor`.
 
 ### Read-Before-Write Enforcement
 

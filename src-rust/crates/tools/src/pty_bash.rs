@@ -735,8 +735,8 @@ impl Tool for PtyBashTool {
             .unwrap_or("This will execute a shell command.")
             .to_string();
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &reason,
             std::path::PathBuf::from(&params.command),
             false,

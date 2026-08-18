@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clawde_core::config::{Config, Settings};
-use clawde_core::permissions::PermissionManager;
 use clawde_core::CostTracker;
 use clawde_query::QueryConfig;
 use clawde_tools::Tool;
@@ -25,7 +24,6 @@ pub struct AgentRuntime {
     pub cost_tracker: Arc<CostTracker>,
     pub query_config: QueryConfig,
     pub mcp_manager: Option<Arc<clawde_mcp::McpManager>>,
-    pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub working_dir: PathBuf,
 }
 
@@ -43,17 +41,39 @@ impl AgentRuntime {
             return self.tools.clone();
         };
         let network_blocked = clawde_core::network_isolation_enabled(&self.config);
-        let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
-            .into_iter()
-            .filter(|tool| {
-                !network_blocked
-                    || !tool.network_capable()
-                    || tool.available_in_ollama_isolated_mode()
-            })
-            .collect();
-        tools.push(Box::new(clawde_query::AgentTool::default()));
+        let mut tools = builtin_tools_for_config(&self.config);
+        let agent_allowed = self.config.allowed_tools.is_empty()
+            || self
+                .config
+                .allowed_tools
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+        let agent_denied = self
+            .config
+            .disallowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+        if agent_allowed && !agent_denied && !network_blocked {
+            tools.push(Box::new(clawde_query::AgentTool::default()));
+        }
         if !network_blocked {
-            tools.extend(clawde_tools::mcp_tool_wrappers(manager));
+            tools.extend(
+                clawde_tools::mcp_tool_wrappers(manager)
+                    .into_iter()
+                    .filter(|tool| {
+                        (self.config.allowed_tools.is_empty()
+                            || self
+                                .config
+                                .allowed_tools
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                            && !self
+                                .config
+                                .disallowed_tools
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(tool.name()))
+                    }),
+            );
         }
         Arc::new(tools)
     }
@@ -97,11 +117,6 @@ impl AgentRuntime {
             client_config,
         ));
 
-        let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
-            config.permission_mode.clone(),
-            &settings,
-        )));
-
         let cost_tracker = CostTracker::new();
 
         // Global MCP servers from settings connect upfront so their tools are
@@ -114,18 +129,36 @@ impl AgentRuntime {
         // MCP wrappers are treated as network-capable and are omitted in
         // isolated Ollama mode, matching the CLI registry boundary.
         let network_blocked = clawde_core::network_isolation_enabled(&config);
-        let mut tools: Vec<Box<dyn Tool>> = clawde_tools::all_tools()
-            .into_iter()
-            .filter(|tool| {
-                !network_blocked
-                    || !tool.network_capable()
-                    || tool.available_in_ollama_isolated_mode()
-            })
-            .collect();
-        tools.push(Box::new(clawde_query::AgentTool::default()));
+        let mut tools = builtin_tools_for_config(&config);
+        let agent_allowed = config.allowed_tools.is_empty()
+            || config
+                .allowed_tools
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+        let agent_denied = config
+            .disallowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+        if agent_allowed && !agent_denied && !network_blocked {
+            tools.push(Box::new(clawde_query::AgentTool::default()));
+        }
         if !network_blocked {
             if let Some(manager) = &mcp_manager {
-                tools.extend(clawde_tools::mcp_tool_wrappers(manager.clone()));
+                tools.extend(
+                    clawde_tools::mcp_tool_wrappers(manager.clone())
+                        .into_iter()
+                        .filter(|tool| {
+                            (config.allowed_tools.is_empty()
+                                || config
+                                    .allowed_tools
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                                && !config
+                                    .disallowed_tools
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
+                        }),
+                );
             }
         }
         let tools = Arc::new(tools);
@@ -143,10 +176,30 @@ impl AgentRuntime {
             cost_tracker,
             query_config,
             mcp_manager,
-            permission_manager,
             working_dir,
         })
     }
+}
+
+fn builtin_tools_for_config(config: &Config) -> Vec<Box<dyn Tool>> {
+    let network_blocked = clawde_core::network_isolation_enabled(config);
+    clawde_tools::all_tools()
+        .into_iter()
+        .filter(|tool| {
+            (!network_blocked
+                || !tool.network_capable()
+                || tool.available_in_ollama_isolated_mode())
+                && (config.allowed_tools.is_empty()
+                    || config
+                        .allowed_tools
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                && !config
+                    .disallowed_tools
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
+        })
+        .collect()
 }
 
 async fn build_mcp_manager(
@@ -184,4 +237,31 @@ async fn build_mcp_manager(
     let mgr = Arc::new(clawde_mcp::McpManager::connect_all(&decision.allowed).await);
     mgr.clone().spawn_notification_poll_loop();
     Some(mgr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::builtin_tools_for_config;
+    use clawde_core::config::Config;
+
+    #[test]
+    fn acp_allow_and_deny_lists_filter_builtin_tools() {
+        let config = Config {
+            allowed_tools: vec!["Read".to_string(), "Grep".to_string(), "Bash".to_string()],
+            disallowed_tools: vec!["grep".to_string(), "Bash".to_string()],
+            ..Default::default()
+        };
+
+        let tools = builtin_tools_for_config(&config);
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Grep"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[test]
+    fn acp_empty_allowlist_preserves_default_builtin_exposure() {
+        let tools = builtin_tools_for_config(&Config::default());
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(tools.iter().any(|tool| tool.name() == "Bash"));
+    }
 }

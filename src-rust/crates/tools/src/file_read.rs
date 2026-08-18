@@ -70,8 +70,8 @@ impl Tool for FileReadTool {
         debug!(path = %path.display(), "Reading file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("Read {}", path.display()),
             path.clone(),
             true,

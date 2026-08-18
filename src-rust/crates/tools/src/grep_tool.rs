@@ -149,8 +149,8 @@ impl Tool for GrepTool {
             .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("Grep {} in {}", params.pattern, search_path.display()),
             search_path.clone(),
             true,
@@ -241,8 +241,8 @@ impl Tool for GrepTool {
             let path = entry.path();
 
             if !ctx.path_is_within_workspace(path) {
-                if let Err(e) = ctx.check_permission_for_path(
-                    self.name(),
+                if let Err(e) = ctx.check_permission_for_tool_path(
+                    self,
                     &format!("Grep result {}", path.display()),
                     path.to_path_buf(),
                     true,

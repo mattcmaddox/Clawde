@@ -132,6 +132,19 @@ fn build_agent_tools_for_config(
 ) -> Vec<Box<dyn Tool>> {
     let network_blocked = clawde_core::network_isolation_enabled(config);
     clawde_tools_for_network_mode(allowed, exclude_agent_tool, network_blocked)
+        .into_iter()
+        .filter(|tool| {
+            (config.allowed_tools.is_empty()
+                || config
+                    .allowed_tools
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                && !config
+                    .disallowed_tools
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
+        })
+        .collect()
 }
 
 fn clawde_tools_for_network_mode(
@@ -1143,8 +1156,10 @@ impl Tool for AgentTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        // The agent inherits parent permissions; no extra level required.
-        PermissionLevel::None
+        // Launching a sub-agent starts another execution loop. It inherits the
+        // parent's policy, but the launch itself is still an execute-capability
+        // and must pass the central permission backstop.
+        PermissionLevel::Execute
     }
 
     fn network_capable(&self) -> bool {

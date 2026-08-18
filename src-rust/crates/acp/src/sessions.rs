@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
+use clawde_core::permissions::PermissionManager;
 use clawde_core::types::Message;
 use clawde_tools::PendingPermissionStore;
 use dashmap::DashMap;
@@ -64,6 +65,10 @@ pub struct SessionState {
     pub messages: parking_lot::Mutex<Vec<Message>>,
     cancel_token: parking_lot::Mutex<CancellationToken>,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
+    /// Permission rules and session approvals are isolated per ACP session.
+    /// Sharing the runtime manager would let one client approve a tool for all
+    /// other concurrent sessions.
+    pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub file_history: Arc<parking_lot::Mutex<clawde_core::file_history::FileHistory>>,
     pub current_turn: Arc<std::sync::atomic::AtomicUsize>,
     /// Serialize prompts within one session. ACP dispatches requests on
@@ -77,11 +82,19 @@ impl SessionState {
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
     ) -> Arc<Self> {
+        let settings = clawde_core::config::Settings::default();
+        let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
+            clawde_core::config::PermissionMode::Default,
+            &settings,
+            &[],
+            &[],
+        )));
         Self::new_with_mcp(
             session_id,
             cwd,
             additional_directories,
             SessionMcpContext::empty(),
+            permission_manager,
         )
     }
 
@@ -90,6 +103,7 @@ impl SessionState {
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         mcp: Arc<SessionMcpContext>,
+        permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
@@ -101,6 +115,7 @@ impl SessionState {
             pending_permissions: Arc::new(parking_lot::Mutex::new(
                 PendingPermissionStore::default(),
             )),
+            permission_manager,
             file_history: Arc::new(parking_lot::Mutex::new(
                 clawde_core::file_history::FileHistory::new(),
             )),
@@ -198,6 +213,42 @@ mod tests {
         assert!(context.manager().is_none());
         context.shutdown();
         context.shutdown();
+    }
+
+    #[test]
+    fn permission_approvals_do_not_cross_session_boundaries() {
+        let first = SessionState::new(
+            acp::SessionId::new("first-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        let second = SessionState::new(
+            acp::SessionId::new("second-session"),
+            PathBuf::from("/workspace"),
+            Vec::new(),
+        );
+        first
+            .permission_manager
+            .lock()
+            .unwrap()
+            .add_session_allow("Bash");
+
+        assert_eq!(
+            first
+                .permission_manager
+                .lock()
+                .unwrap()
+                .evaluate("Bash", "echo ok", None, None, &[]),
+            clawde_core::PermissionDecision::Allow
+        );
+        assert!(matches!(
+            second
+                .permission_manager
+                .lock()
+                .unwrap()
+                .evaluate("Bash", "echo ok", None, None, &[]),
+            clawde_core::PermissionDecision::Ask { .. }
+        ));
     }
 
     #[test]

@@ -4359,6 +4359,7 @@ mod tests {
         name: &'static str,
         level: PermissionLevel,
         self_gates: bool,
+        stateful: bool,
         ran: Arc<AtomicBool>,
     }
 
@@ -4375,6 +4376,9 @@ mod tests {
         }
         fn self_gates(&self) -> bool {
             self.self_gates
+        }
+        fn stateful(&self) -> bool {
+            self.stateful
         }
         fn input_schema(&self) -> Value {
             serde_json::json!({"type": "object"})
@@ -4420,6 +4424,7 @@ mod tests {
             name: "MockExec",
             level: PermissionLevel::Execute,
             self_gates: false,
+            stateful: false,
             ran: ran.clone(),
         })];
         let ctx = deny_all_context();
@@ -4443,6 +4448,7 @@ mod tests {
             name: "MockSelfGated",
             level: PermissionLevel::Execute,
             self_gates: true,
+            stateful: false,
             ran: ran.clone(),
         })];
         let ctx = deny_all_context();
@@ -4470,6 +4476,7 @@ mod tests {
                 name: "MockSafe",
                 level,
                 self_gates: false,
+                stateful: false,
                 ran: ran.clone(),
             })];
             let ctx = deny_all_context();
@@ -4487,6 +4494,56 @@ mod tests {
                 level
             );
         }
+    }
+
+    #[tokio::test]
+    async fn backstop_gates_stateful_none_tool() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockCoordination",
+            level: PermissionLevel::None,
+            self_gates: false,
+            stateful: true,
+            ran: ran.clone(),
+        })];
+        let ctx = deny_all_context();
+        let result = execute_tool("MockCoordination", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(!ran.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_rules_apply_at_runtime_even_for_read_tools() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockRead",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            stateful: false,
+            ran: ran.clone(),
+        })];
+        let mut ctx = deny_all_context();
+        ctx.config.disallowed_tools.push("MockRead".to_string());
+        let result = execute_tool("MockRead", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(!ran.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_allow_skips_normal_backstop_prompt() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockExec",
+            level: PermissionLevel::Execute,
+            self_gates: false,
+            stateful: false,
+            ran: ran.clone(),
+        })];
+        let mut ctx = deny_all_context();
+        ctx.config.allowed_tools.push("MockExec".to_string());
+        let result = execute_tool("MockExec", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(!result.is_error);
+        assert!(ran.load(AtomicOrdering::SeqCst));
     }
 
     #[test]
@@ -4852,6 +4909,7 @@ mod tests {
             name: "noop_tool",
             level: PermissionLevel::ReadOnly,
             self_gates: false,
+            stateful: false,
             ran: Arc::new(AtomicBool::new(false)),
         })]
     }

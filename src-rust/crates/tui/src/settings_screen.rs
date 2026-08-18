@@ -191,10 +191,16 @@ pub struct SettingsScreen {
     /// Ollama: require an explicit remote host (loopback is always rejected).
     /// Kept for settings-file compatibility; remote-only resolution is always enforced.
     pub ollama_require_explicit_host: bool,
+    /// Ollama: permit loopback only when mode is explicitly isolated.
+    pub ollama_allow_local_host: bool,
     /// Ollama: explicitly configured remote host URL. Empty means unavailable.
     pub ollama_default_host: String,
     /// Permission mode ("default", "acceptEdits", "bypassPermissions", "plan").
     pub permission_mode: String,
+    /// Comma-separated tool allowlist. Empty means no allowlist.
+    pub allowed_tools: String,
+    /// Comma-separated tool denylist. Deny rules take precedence over allows.
+    pub disallowed_tools: String,
     /// Verify sandbox mode ("direct" / "worktree" / "container").
     pub verify_sandbox: String,
     /// Container image for the `container` verify sandbox (empty = auto).
@@ -263,8 +269,11 @@ impl SettingsScreen {
             ollama_keep_alive: "forever".to_string(),
             ollama_num_predict: "2K".to_string(),
             ollama_require_explicit_host: true,
+            ollama_allow_local_host: false,
             ollama_default_host: String::new(),
             permission_mode: "default".to_string(),
+            allowed_tools: String::new(),
+            disallowed_tools: String::new(),
             verify_sandbox: "direct".to_string(),
             verify_container_image: String::new(),
             memory_enabled: true,
@@ -282,6 +291,7 @@ impl SettingsScreen {
     /// This is called on initialization and when opening the settings screen.
     fn apply_settings_from_snapshot(&mut self) {
         let s = &self.effective_snapshot;
+        let effective_config = s.effective_config();
         self.auto_compact = s.auto_compact;
         self.notifications = s.notifications;
         self.show_turn_duration = s.show_turn_duration;
@@ -316,8 +326,10 @@ impl SettingsScreen {
         self.file_autocomplete_limit = s.config.file_autocomplete_limit.to_string();
         self.file_autocomplete_show_hidden_files = s.config.file_autocomplete_show_hidden_files;
         self.file_injection_max_size = s.config.file_injection_max_size.to_string();
-        self.permission_mode = permission_mode_str(&s.config.permission_mode);
-        self.verify_sandbox = s.config.verify.sandbox.label().to_string();
+        self.permission_mode = permission_mode_str(&effective_config.permission_mode);
+        self.allowed_tools = effective_config.allowed_tools.join(", ");
+        self.disallowed_tools = effective_config.disallowed_tools.join(", ");
+        self.verify_sandbox = effective_config.verify.sandbox.label().to_string();
         self.verify_container_image = s.config.verify.container_image.clone().unwrap_or_default();
         self.memory_enabled = s.config.memory.enabled.unwrap_or(true);
         self.memory_max_tokens = s
@@ -640,6 +652,28 @@ impl SettingsScreen {
                         self.memory_max_tokens = trimmed.to_string();
                         refresh_memory = true;
                     }
+                }
+                "allowed_tools" => {
+                    let parsed: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    self.allowed_tools = parsed.join(", ");
+                    config.allowed_tools = parsed.clone();
+                    self.settings_snapshot.config.allowed_tools = parsed;
+                }
+                "disallowed_tools" => {
+                    let parsed: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    self.disallowed_tools = parsed.join(", ");
+                    config.disallowed_tools = parsed.clone();
+                    self.settings_snapshot.config.disallowed_tools = parsed;
                 }
                 "output_style" => {
                     let v = if value.is_empty() {
@@ -1035,6 +1069,8 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         .to_string(),
         "disable_claude_mds" => c.disable_claude_mds.to_string(),
         "permission_mode" => permission_mode_str(&c.permission_mode),
+        "allowed_tools" => c.allowed_tools.join(", "),
+        "disallowed_tools" => c.disallowed_tools.join(", "),
         "verify_sandbox" => c.verify.sandbox.config_name().to_string(),
         "verify_container_image" => c.verify.container_image.clone().unwrap_or_default(),
         "memory_max_tokens" => c
@@ -1098,6 +1134,9 @@ fn default_value_for(key: &str) -> String {
         | "ollama_keep_alive"
         | "ollama_num_predict"
         | "ollama_require_explicit_host"
+        | "ollama_allow_local_host"
+        | "allowed_tools"
+        | "disallowed_tools"
         | "ollama_default_host"
         | "keybinding_preset"
         | "verify_container_image"
@@ -1273,6 +1312,26 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
                 options: vec!["default", "acceptEdits", "bypassPermissions", "plan"],
             },
             screen.permission_mode.clone(),
+        ),
+        make_entry(
+            "allowed_tools",
+            "Allowed tools",
+            "Optional comma-separated allowlist. When non-empty, only these tool names are exposed and executable. Denied tools still win if a name appears in both lists.",
+            SECTION_COMMON,
+            String::new(),
+            SettingEffect::Immediate,
+            SettingKind::Text,
+            screen.allowed_tools.clone(),
+        ),
+        make_entry(
+            "disallowed_tools",
+            "Denied tools",
+            "Optional comma-separated denylist. Denied tools are hidden from the model and blocked at runtime, including indirect/internal calls.",
+            SECTION_COMMON,
+            String::new(),
+            SettingEffect::Immediate,
+            SettingKind::Text,
+            screen.disallowed_tools.clone(),
         ),
         make_entry(
             "verify_sandbox",
@@ -2331,7 +2390,7 @@ pub fn handle_settings_key(
                 .collect();
             if let Some(entry) = filtered.get(screen.selected_idx) {
                 if !matches!(entry_origin(screen, entry.key), SettingOrigin::Default) {
-                    reset_setting_to_default(screen, entry.key);
+                    reset_setting_to_default(screen, config, entry.key);
                 }
             }
         }
@@ -2388,7 +2447,7 @@ fn visual_line_for(filtered: &[&SettingsEntry], filtered_idx: usize) -> usize {
 /// Reset a single setting back to its built-in default by clearing the global
 /// override from `settings_snapshot` and re-saving. The row's origin tag flips
 /// from Global/Project → Default immediately.
-fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
+fn reset_setting_to_default(screen: &mut SettingsScreen, config: &mut Config, key: &str) {
     let s = &mut screen.settings_snapshot;
     let c = &mut s.config;
     match key {
@@ -2417,7 +2476,18 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, key: &str) {
         // Option-like strings — set to their default.
         "output_style" => c.output_style = None,
         "output_format" => c.output_format = clawde_core::config::OutputFormat::Text,
-        "permission_mode" => c.permission_mode = clawde_core::config::PermissionMode::Default,
+        "permission_mode" => {
+            c.permission_mode = clawde_core::config::PermissionMode::Default;
+            config.permission_mode = clawde_core::config::PermissionMode::Default;
+        }
+        "allowed_tools" => {
+            c.allowed_tools.clear();
+            config.allowed_tools.clear();
+        }
+        "disallowed_tools" => {
+            c.disallowed_tools.clear();
+            config.disallowed_tools.clear();
+        }
         "verify_sandbox" => c.verify.sandbox = clawde_core::config::VerifySandbox::Direct,
         "verify_container_image" => c.verify.container_image = None,
         "memory_enabled" => c.memory.enabled = None,
@@ -2568,6 +2638,9 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "ollama_num_ctx" => screen.ollama_num_ctx = "12K".to_string(),
         "ollama_keep_alive" => screen.ollama_keep_alive = "forever".to_string(),
         "ollama_num_predict" => screen.ollama_num_predict = "2K".to_string(),
+        "allowed_tools" => screen.allowed_tools.clear(),
+        "disallowed_tools" => screen.disallowed_tools.clear(),
+        "ollama_allow_local_host" => screen.ollama_allow_local_host = false,
         _ => {}
     }
 }
@@ -2899,6 +2972,34 @@ mod tests {
         assert_eq!(screen.selected_idx, 0);
         assert!(screen.edit_field.is_none());
         assert!(screen.edit_value.is_empty());
+    }
+
+    #[test]
+    fn permission_tool_lists_are_exposed_in_settings() {
+        let mut screen = fresh_controlled_screen();
+        screen.settings_snapshot.config.allowed_tools =
+            vec!["Read".to_string(), "Glob".to_string()];
+        screen.settings_snapshot.config.disallowed_tools = vec!["Bash".to_string()];
+        screen.effective_snapshot = screen.settings_snapshot.clone();
+        screen.apply_settings_from_snapshot();
+
+        let entries = all_entries(&screen);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.key == "allowed_tools")
+                .unwrap()
+                .value,
+            "Read, Glob"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.key == "disallowed_tools")
+                .unwrap()
+                .value,
+            "Bash"
+        );
     }
 
     #[test]

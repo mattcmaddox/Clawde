@@ -300,8 +300,8 @@ impl Tool for ApplyPatchTool {
 
         // Permission check.
         if !params.dry_run {
-            if let Err(e) = ctx.check_permission(
-                self.name(),
+            if let Err(e) = ctx.check_permission_for_tool(
+                self,
                 &format!("ApplyPatch to {} file(s)", file_patches.len()),
                 false,
             ) {

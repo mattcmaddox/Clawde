@@ -84,8 +84,8 @@ impl Tool for FileEditTool {
         debug!(path = %path.display(), "Editing file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("Edit {}", path.display()),
             path.clone(),
             false,

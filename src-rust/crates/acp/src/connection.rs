@@ -166,6 +166,22 @@ impl Connection {
             warn!(?id, "ACP: received response for unknown request id");
         }
     }
+
+    /// Fail every outbound request when the inbound transport closes. Without
+    /// this, a caller waiting in `send_request` can remain blocked forever
+    /// after the ACP client disconnects before replying.
+    fn fail_pending(&self) {
+        let keys: Vec<String> = self
+            .pending
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            if let Some((_, tx)) = self.pending.remove(&key) {
+                let _ = tx.send(Err(acp::Error::internal_error()));
+            }
+        }
+    }
 }
 
 fn id_to_key(id: &acp::RequestId) -> String {
@@ -192,9 +208,16 @@ where
 
     loop {
         line.clear();
-        let n = buffered.read_line(&mut line).await?;
+        let n = match buffered.read_line(&mut line).await {
+            Ok(n) => n,
+            Err(error) => {
+                connection.fail_pending();
+                return Err(error.into());
+            }
+        };
         if n == 0 {
             debug!("ACP: stdin EOF, shutting down reader");
+            connection.fail_pending();
             break;
         }
         let trimmed = line.trim();
@@ -247,6 +270,7 @@ where
                 .to_string();
             let params = v.get("params").cloned();
             if tx.send(Inbound::Request { id, method, params }).is_err() {
+                connection.fail_pending();
                 break;
             }
         } else if has_method {
@@ -258,6 +282,7 @@ where
                 .to_string();
             let params = v.get("params").cloned();
             if tx.send(Inbound::Notification { method, params }).is_err() {
+                connection.fail_pending();
                 break;
             }
         } else {
@@ -274,7 +299,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+
+    struct ErrorReader {
+        gate: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl AsyncRead for ErrorReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match Pin::new(&mut self.gate).poll(cx) {
+                Poll::Ready(_) => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "test connection reset",
+                ))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
 
     /// `send_response` must emit a newline-delimited JSON object containing
     /// `jsonrpc: "2.0"`, the request id, and the result payload.
@@ -371,6 +419,93 @@ mod tests {
         // Orphan response is routed internally; nothing surfaces here.
         assert!(rx.recv().await.is_none(), "no further messages expected");
         let _ = reader_handle.await;
+    }
+
+    /// EOF must resolve every pending outbound request so none remain blocked
+    /// after an ACP client disconnects.
+    #[tokio::test]
+    async fn reader_eof_fails_all_pending_requests() {
+        let (client_to_server, server_reader) = duplex(8192);
+        let (server_writer, client_reader) = duplex(8192);
+        let connection = Connection::new(server_writer);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let reader_handle = tokio::spawn(run_reader(connection.clone(), server_reader, tx));
+
+        let client_handle = tokio::spawn(async move {
+            let mut reader = BufReader::new(client_reader);
+            let mut first = String::new();
+            let mut second = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            reader.read_line(&mut second).await.unwrap();
+            assert!(!first.is_empty());
+            assert!(!second.is_empty());
+            // Closing the client-to-server half simulates a client process
+            // exiting before it answers either permission request.
+            drop(client_to_server);
+        });
+
+        let first = connection.send_request::<_, serde_json::Value>(
+            "session/request_permission",
+            serde_json::json!({"request": 1}),
+        );
+        let second = connection.send_request::<_, serde_json::Value>(
+            "session/request_permission",
+            serde_json::json!({"request": 2}),
+        );
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .expect("pending requests must resolve after EOF");
+
+        assert!(matches!(first_result, Ok(Err(_))));
+        assert!(matches!(second_result, Ok(Err(_))));
+        client_handle.await.unwrap();
+        drop(connection);
+        reader_handle.await.unwrap().unwrap();
+    }
+
+    /// A reader I/O error must resolve every pending outbound request too.
+    #[tokio::test]
+    async fn reader_error_fails_all_pending_requests() {
+        let (server_writer, mut client_reader) = duplex(8192);
+        let connection = Connection::new(server_writer);
+        let (error_tx, error_rx) = tokio::sync::oneshot::channel();
+        let reader_task = tokio::spawn(run_reader(
+            connection.clone(),
+            ErrorReader { gate: error_rx },
+            mpsc::unbounded_channel().0,
+        ));
+
+        let client_task = tokio::spawn(async move {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&mut client_reader);
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.is_empty());
+            error_tx.send(()).unwrap();
+        });
+
+        let request = tokio::spawn({
+            let connection = connection.clone();
+            async move {
+                connection
+                    .send_request::<_, serde_json::Value>(
+                        "session/request_permission",
+                        serde_json::json!({"request": 1}),
+                    )
+                    .await
+            }
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("pending request must resolve after a reader error")
+            .unwrap();
+        assert!(matches!(result, Ok(Err(_))));
+
+        client_task.await.unwrap();
+        drop(connection);
+        assert!(reader_task.await.unwrap().is_err());
     }
 
     /// `send_request` resolves when a response with the matching id arrives.

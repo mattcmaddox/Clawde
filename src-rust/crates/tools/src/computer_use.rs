@@ -149,7 +149,7 @@ impl Tool for ComputerUseTool {
 
         // Permission gate
         let desc = format!("computer: {}", params.action);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
+        if let Err(e) = ctx.check_permission_for_tool(self, &desc, false) {
             return ToolResult::error(e.to_string());
         }
 

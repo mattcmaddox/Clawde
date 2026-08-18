@@ -37,6 +37,10 @@ impl Tool for GoalCompleteTool {
         PermissionLevel::None
     }
 
+    fn stateful(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",

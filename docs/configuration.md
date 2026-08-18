@@ -245,8 +245,8 @@ Example:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allowed_tools` | array of strings | [] (all) | Restrict the tool set to this explicit list. An empty array means all tools are available. |
-| `disallowed_tools` | array of strings | [] | Always deny these tools, regardless of other settings. |
+| `allowed_tools` | array of strings | [] (all) | Expose only these tools and treat matching calls as explicitly approved. An empty array means all tools are eligible. |
+| `disallowed_tools` | array of strings | [] | Hide and hard-block these tools at runtime; deny wins if a name appears in both lists. |
 
 Tool names match the internal names: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
 `Grep`, `WebSearch`, `WebFetch`, `TodoWrite`, `TodoRead`, and MCP tool names
@@ -332,31 +332,33 @@ tool calls are approved.
 
 ### `default`
 
-Read-only operations (file reads, searches, glob) are permitted automatically.
-Write and execute operations (file writes, shell commands) prompt the user for
-confirmation in the TUI, or are denied in headless mode.
+Read-only operations (file reads, searches, glob, and read-only network tools)
+are permitted automatically. Writes, execution, and stateful coordination
+operations prompt the user in the TUI, or are denied in headless mode.
 
 ### `acceptEdits`
 
-All tool calls — reads, writes, and shell commands — are automatically
-accepted without prompting. This is useful for trusted automation pipelines
-where you want maximum throughput.
+File-edit operations are automatically accepted without prompting. Execution
+and stateful coordination still follow their normal approval policy. This is
+useful for trusted edit-heavy workflows without making arbitrary execution
+implicit.
 
 ### `bypassPermissions`
 
-All permission checks are skipped entirely. Every tool call is allowed
-unconditionally. This mode cannot be used when running as root or via `sudo`
-on Unix systems (Clawde blocks it).
+Ordinary approval prompts are skipped. Explicit deny rules, forbidden
+capabilities, and network-isolation boundaries still block calls. This mode
+cannot be used when running as root or via `sudo` on Unix systems (Clawde
+blocks it).
 
 Use with caution: the model can read and modify any file reachable from the
 current working directory without any user confirmation.
 
 ### `plan`
 
-Read-only mode. File reads and searches are allowed; file writes and command
-execution are blocked. This matches the built-in `plan` agent's behaviour and
-is useful for code analysis sessions where you want to prevent accidental
-modifications.
+Read-only mode. File reads and searches are allowed; file writes, command
+execution, and stateful coordination are blocked. This matches the built-in
+`plan` agent's behaviour and is useful for code analysis sessions where you
+want to prevent accidental modifications.
 
 The permission mode can also be overridden per-session on the command line:
 

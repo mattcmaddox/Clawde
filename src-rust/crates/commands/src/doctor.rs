@@ -26,6 +26,7 @@ impl SlashCommand for DoctorCommand {
          - Disk space\n\
          - Config file integrity\n\
          - Tool permission summary\n\
+         - Deterministic tool metadata audit\n\
          - Clawde version"
     }
 
@@ -364,6 +365,33 @@ impl SlashCommand for DoctorCommand {
             lines.push(format!(
                 "  ⚠ Require confirmation: {} tool(s)",
                 confirm_count
+            ));
+        }
+        lines.push(String::new());
+
+        // ── Deterministic permission audit ──────────────────────────────────
+        let audit = clawde_tools::audit_builtin_tools();
+        lines.push("Permission Audit".to_string());
+        lines.push(format!(
+            "  • Audited {} built-in tools; {} structural violation(s), {} warning(s)",
+            audit.entries.len(),
+            audit.violations.len(),
+            audit.warnings.len()
+        ));
+        if audit.violations.is_empty() {
+            lines.push("  ✓ Tool metadata and registry invariants are valid".to_string());
+        } else {
+            for violation in audit.violations.iter().take(12) {
+                lines.push(format!("  ✗ {violation}"));
+            }
+        }
+        for warning in audit.warnings.iter().take(12) {
+            lines.push(format!("  ⚠ {warning}"));
+        }
+        if audit.warnings.len() > 12 {
+            lines.push(format!(
+                "    … and {} more warning(s)",
+                audit.warnings.len() - 12
             ));
         }
         lines.push(String::new());

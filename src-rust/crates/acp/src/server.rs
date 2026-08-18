@@ -179,11 +179,19 @@ impl AgentServer {
             SessionMcpContext::from_manager(manager)
         };
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
+        let permission_manager =
+            Arc::new(std::sync::Mutex::new(clawde_core::PermissionManager::new(
+                self.runtime.config.permission_mode.clone(),
+                &self.runtime.settings,
+                &self.runtime.config.allowed_tools,
+                &self.runtime.config.disallowed_tools,
+            )));
         let state = SessionState::new_with_mcp(
             session_id.clone(),
             req.cwd.clone(),
             req.additional_directories.clone(),
             mcp_context,
+            permission_manager,
         );
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 

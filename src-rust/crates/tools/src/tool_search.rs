@@ -82,9 +82,26 @@ fn one_line(desc: &str) -> String {
 }
 
 /// Build the searchable catalog from the live tool registry plus supplements.
-fn build_catalog() -> Vec<CatalogEntry> {
+fn build_catalog(ctx: &ToolContext) -> Vec<CatalogEntry> {
+    let tool_is_active = |tool: &dyn Tool| {
+        (!clawde_core::network_isolation_enabled(&ctx.config)
+            || !tool.network_capable()
+            || tool.available_in_ollama_isolated_mode())
+            && (ctx.config.allowed_tools.is_empty()
+                || ctx
+                    .config
+                    .allowed_tools
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name())))
+            && !ctx
+                .config
+                .disallowed_tools
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(tool.name()))
+    };
     let mut entries: Vec<CatalogEntry> = all_tools()
-        .iter()
+        .into_iter()
+        .filter(|tool| tool_is_active(tool.as_ref()))
         .map(|t| CatalogEntry {
             name: t.name().to_string(),
             description: one_line(t.description()),
@@ -93,7 +110,19 @@ fn build_catalog() -> Vec<CatalogEntry> {
         .collect();
 
     for (name, desc) in SUPPLEMENTAL_TOOLS {
-        if !entries.iter().any(|e| e.name == *name) {
+        let agent_available = !clawde_core::network_isolation_enabled(&ctx.config)
+            && (ctx.config.allowed_tools.is_empty()
+                || ctx
+                    .config
+                    .allowed_tools
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(name)))
+            && !ctx
+                .config
+                .disallowed_tools
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(name));
+        if agent_available && !entries.iter().any(|e| e.name == *name) {
             entries.push(CatalogEntry {
                 name: (*name).to_string(),
                 description: one_line(desc),
@@ -183,7 +212,7 @@ impl Tool for ToolSearchTool {
 
         let query = params.query.trim();
         let max = params.max_results.clamp(1, 20);
-        let catalog = build_catalog();
+        let catalog = build_catalog(_ctx);
 
         // ---- select: prefix — direct lookup by exact name(s) ----------------
         if let Some(names_str) = query.strip_prefix("select:").map(str::trim) {
@@ -299,6 +328,22 @@ mod tests {
         if let (Some(ws), Some(wf)) = (ws, wf) {
             assert!(ws < wf, "WebSearch should rank above WebFetch:\n{out}");
         }
+    }
+
+    #[tokio::test]
+    async fn configured_denies_are_not_searchable() {
+        let tool = ToolSearchTool;
+        let mut context = ctx();
+        context
+            .config
+            .disallowed_tools
+            .push("WebSearch".to_string());
+        let out = tool
+            .execute(json!({ "query": "select:WebSearch,WebFetch" }), &context)
+            .await;
+        assert!(!out.content.contains("WebSearch:"));
+        assert!(out.content.contains("WebFetch:"));
+        assert!(out.content.contains("Not found: WebSearch"));
     }
 
     #[tokio::test]

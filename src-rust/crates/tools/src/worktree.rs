@@ -118,7 +118,7 @@ impl Tool for EnterWorktreeTool {
             }
         }
 
-        if let Err(e) = ctx.check_permission(self.name(), "Create a git worktree", false) {
+        if let Err(e) = ctx.check_permission_for_tool(self, "Create a git worktree", false) {
             return ToolResult::error(e.to_string());
         }
 
@@ -234,8 +234,8 @@ impl Tool for EnterWorktreeTool {
                              and never executed. Re-create the worktree without it, or run a safer command.",
                             cmd
                         )
-                    } else if let Err(e) = ctx.check_permission(
-                        self.name(),
+                    } else if let Err(e) = ctx.check_permission_for_tool(
+                        self,
                         &format!("Run post-create command in the new worktree: {}", cmd),
                         false,
                     ) {

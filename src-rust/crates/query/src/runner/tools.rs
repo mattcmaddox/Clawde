@@ -22,13 +22,15 @@ pub(crate) fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error
     serde_json::from_str(trimmed)
 }
 
-/// Whether a `PermissionLevel` must be gated by the central backstop.
-///
-/// Only `None` and `ReadOnly` are exempt; every other level (`Write`,
-/// `Execute`, `Dangerous`, `Forbidden`) represents a side-effecting action that
-/// the backstop must confirm before it runs.
+/// Whether a permission tier must be gated by the central backstop.
 pub(crate) fn permission_level_is_gated(level: PermissionLevel) -> bool {
-    !matches!(level, PermissionLevel::None | PermissionLevel::ReadOnly)
+    level.requires_approval()
+}
+
+/// Whether a tool must be gated by the central backstop. Stateful coordination
+/// tools are gated even when their capability tier is `None`.
+fn tool_requires_backstop(tool: &dyn Tool) -> bool {
+    tool.stateful() || permission_level_is_gated(tool.permission_level())
 }
 
 /// Synthesize a human-readable permission description for a tool that does not
@@ -174,6 +176,29 @@ pub(crate) async fn execute_tool_for_task(
                 resolved_tool = tool.name(),
                 "Executing tool"
             );
+            let explicitly_denied = ctx
+                .config
+                .disallowed_tools
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(tool.name()));
+            let explicitly_allowed = ctx
+                .config
+                .allowed_tools
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(tool.name()));
+            if explicitly_denied || (!ctx.config.allowed_tools.is_empty() && !explicitly_allowed) {
+                warn!(
+                    tool = tool.name(),
+                    "Tool blocked by configured tool access rules"
+                );
+                return ToolResult::error_with_code(
+                    ToolErrorCode::PermissionDenied,
+                    format!(
+                        "Tool '{}' is blocked by the configured tool access rules.",
+                        tool.name()
+                    ),
+                );
+            }
             if let Some(blocked) = plan_gate_error(tool.name(), ctx, active_task_id) {
                 warn!(tool = tool.name(), "Tool blocked by plan-artifact gate");
                 return blocked;
@@ -202,10 +227,10 @@ pub(crate) async fn execute_tool_for_task(
             // internally opt out via `self_gates() == true` (no double-prompt),
             // and read-only / no-permission tools are skipped. This makes a tool
             // that forgets to gate itself secure by default.
-            if !tool.self_gates() && permission_level_is_gated(tool.permission_level()) {
+            if !tool.self_gates() && tool_requires_backstop(tool) && !explicitly_allowed {
                 let canonical_name = tool.name();
                 let description = synthesize_permission_description(canonical_name, input);
-                if let Err(e) = ctx.check_permission(canonical_name, &description, false) {
+                if let Err(e) = ctx.check_permission_for_tool(tool, &description, false) {
                     warn!(
                         tool = canonical_name,
                         requested_tool = requested_name,

@@ -153,12 +153,13 @@ impl Tool for PowerShellTool {
                     params.description.as_deref().unwrap_or(&params.command)
                 );
                 let details = risk_explanation(PsRiskLevel::High, &params.command);
-                if let Err(e) = ctx.check_permission_with_details_and_path(
-                    self.name(),
+                if let Err(e) = ctx.check_permission_with_details_and_path_for_tool(
+                    self,
                     &desc,
                     &details,
                     std::path::PathBuf::from(&params.command),
                     false,
+                    Some(true),
                 ) {
                     return ToolResult::error(e.to_string());
                 }
@@ -181,12 +182,13 @@ impl Tool for PowerShellTool {
                         params.description.as_deref().unwrap_or(&params.command)
                     );
                     let details = risk_explanation(PsRiskLevel::Medium, &params.command);
-                    if let Err(e) = ctx.check_permission_with_details_and_path(
-                        self.name(),
+                    if let Err(e) = ctx.check_permission_with_details_and_path_for_tool(
+                        self,
                         &desc,
                         &details,
                         std::path::PathBuf::from(&params.command),
                         false,
+                        Some(true),
                     ) {
                         return ToolResult::error(e.to_string());
                     }
@@ -204,8 +206,8 @@ impl Tool for PowerShellTool {
                     .unwrap_or("This will execute a PowerShell command.")
                     .to_string();
 
-                if let Err(e) = ctx.check_permission_for_path(
-                    self.name(),
+                if let Err(e) = ctx.check_permission_for_tool_path(
+                    self,
                     &reason,
                     std::path::PathBuf::from(&params.command),
                     false,

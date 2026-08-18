@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - 'src-rust/**'
+      - 'scripts/probes/tui-permissions-smoke.py'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src-rust/**'
+      - 'scripts/probes/tui-permissions-smoke.py'
       - '.github/workflows/ci.yml'
 
 concurrency:
@@ -44,7 +46,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
+          sudo apt-get install -y libasound2-dev pkg-config tmux
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -98,3 +100,15 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: src-rust
         run: cargo fmt --all --check
+
+      - name: Build debug binary for TUI probe
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        run: cargo build --locked --package clawde
+
+      - name: TUI permission smoke probe
+        if: runner.os == 'Linux'
+        run: |
+          python3 scripts/probes/tui-permissions-smoke.py \
+            --binary src-rust/target/debug/clawde \
+            --timeout-secs 20

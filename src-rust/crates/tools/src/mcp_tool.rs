@@ -50,7 +50,7 @@ impl Tool for McpToolWrapper {
                 error.to_string(),
             );
         }
-        if let Err(error) = ctx.check_permission(self.name(), &desc, false) {
+        if let Err(error) = ctx.check_permission_for_tool(self, &desc, false) {
             return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, error.to_string());
         }
 

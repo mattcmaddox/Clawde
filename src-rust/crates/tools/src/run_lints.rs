@@ -166,13 +166,13 @@ impl Tool for RunLintsTool {
                 ""
             }
         );
-        if let Err(e) = ctx.check_permission_with_details_and_path_for_capability(
-            self.name(),
+        if let Err(e) = ctx.check_permission_with_details_and_path_for_tool(
+            self,
             &desc,
             &details,
             std::path::PathBuf::from(&command),
             false,
-            !isolated,
+            Some(!isolated),
         ) {
             return ToolResult::error_with_code(ToolErrorCode::PermissionDenied, e.to_string());
         }

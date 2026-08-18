@@ -63,7 +63,7 @@ impl Tool for FileWriteTool {
 
         // Permission check
         if let Err(e) =
-            ctx.check_permission(self.name(), &format!("Write {}", path.display()), false)
+            ctx.check_permission_for_tool(self, &format!("Write {}", path.display()), false)
         {
             return ToolResult::error(e.to_string());
         }

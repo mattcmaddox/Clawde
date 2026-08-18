@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use clawde_core::config::PermissionMode;
 use clawde_core::cost::CostTracker;
+pub use clawde_core::permissions::PermissionLevel;
 use clawde_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
 use clawde_core::types::ToolDefinition;
 use serde_json::Value;
@@ -222,26 +223,6 @@ impl ToolResult {
     }
 }
 
-/// Permission level required by a tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionLevel {
-    /// No permission needed (read-only, purely informational).
-    None,
-    /// Read-only access to the filesystem or network.
-    ReadOnly,
-    /// Write access to the filesystem.
-    Write,
-    /// Arbitrary command execution.
-    Execute,
-    /// Potentially dangerous (e.g., bypass sandbox).
-    Dangerous,
-    /// Unconditionally forbidden — the action must never be executed regardless
-    /// of permission mode.  Used by the bash tool (`PtyBashTool`) when the
-    /// classifier identifies a `Critical`-risk command (e.g. `rm -rf /`,
-    /// fork-bomb, `dd if=…`).
-    Forbidden,
-}
-
 #[derive(Debug)]
 pub struct PendingPermissionRequest {
     pub tool_use_id: String,
@@ -416,6 +397,13 @@ pub struct ToolContext {
     pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
+#[derive(Clone, Copy)]
+struct PermissionCapabilities {
+    level: PermissionLevel,
+    network_capable: bool,
+    stateful: bool,
+}
+
 impl ToolContext {
     /// Resolve a potentially relative path against the working directory.
     pub fn resolve_path(&self, path: &str) -> PathBuf {
@@ -440,6 +428,7 @@ impl ToolContext {
         details: Option<String>,
         is_read_only: bool,
         path: Option<PathBuf>,
+        capabilities: PermissionCapabilities,
     ) -> PermissionRequest {
         PermissionRequest {
             tool_name: tool_name.to_string(),
@@ -451,6 +440,9 @@ impl ToolContext {
             allowed_roots: self.permission_allowed_roots(),
             context_description: None,
             network_isolated: clawde_core::network_isolation_enabled(&self.config),
+            permission_level: capabilities.level,
+            network_capable: capabilities.network_capable,
+            stateful: capabilities.stateful,
         }
     }
 
@@ -458,20 +450,26 @@ impl ToolContext {
         &self,
         request: PermissionRequest,
     ) -> Result<(), clawde_core::error::ClaudeError> {
-        let network_capable = known_network_capability(request.tool_name.as_str());
-        // Keep the name-based compatibility path exercised for callers that
-        // use the legacy permission helpers; input-aware tools use the explicit
-        // capability variant below.
-        self.ensure_network_allowed(&request.tool_name)?;
-        self.request_permission_inner_with_capability(request, network_capable)
-    }
-
-    fn request_permission_inner_with_capability(
-        &self,
-        request: PermissionRequest,
-        network_capable: bool,
-    ) -> Result<(), clawde_core::error::ClaudeError> {
-        self.ensure_network_allowed_for_tool(&request.tool_name, network_capable)?;
+        let explicitly_denied = self
+            .config
+            .disallowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&request.tool_name));
+        let explicitly_allowed = self
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&request.tool_name));
+        if explicitly_denied || (!self.config.allowed_tools.is_empty() && !explicitly_allowed) {
+            return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
+                "Tool '{}' is blocked by the configured tool access rules",
+                request.tool_name
+            )));
+        }
+        self.ensure_network_allowed_for_tool(&request.tool_name, request.network_capable)?;
+        if explicitly_allowed {
+            return Ok(());
+        }
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
@@ -518,18 +516,6 @@ impl ToolContext {
         }
     }
 
-    /// Reject a network-capable tool when Ollama is in isolated mode.
-    ///
-    /// This is intentionally separate from the permission handler: bypass mode
-    /// can skip ordinary permission decisions, but it must not re-enable online
-    /// tools in an isolated session.
-    pub fn ensure_network_allowed(
-        &self,
-        tool_name: &str,
-    ) -> Result<(), clawde_core::error::ClaudeError> {
-        self.ensure_network_allowed_for_tool(tool_name, known_network_capability(tool_name))
-    }
-
     /// Enforce the isolated-mode boundary using the tool's capability metadata.
     ///
     /// The dispatcher calls this with `Tool::network_capable()`. Self-gating
@@ -550,51 +536,76 @@ impl ToolContext {
         Ok(())
     }
 
-    /// Check permissions for a tool invocation.
-    pub fn check_permission(
+    /// Check permissions using the concrete tool's typed capabilities.
+    pub fn check_permission_for_tool(
         &self,
-        tool_name: &str,
+        tool: &dyn Tool,
         description: &str,
         is_read_only: bool,
     ) -> Result<(), clawde_core::error::ClaudeError> {
-        let request =
-            self.build_permission_request(tool_name, description, None, is_read_only, None);
+        let request = self.build_permission_request(
+            tool.name(),
+            description,
+            None,
+            is_read_only,
+            None,
+            PermissionCapabilities {
+                level: tool.permission_level(),
+                network_capable: tool.network_capable(),
+                stateful: tool.stateful(),
+            },
+        );
         self.request_permission_inner(request)
     }
 
-    pub fn check_permission_for_path(
+    pub fn check_permission_for_tool_path(
         &self,
-        tool_name: &str,
+        tool: &dyn Tool,
         description: &str,
         path: PathBuf,
         is_read_only: bool,
     ) -> Result<(), clawde_core::error::ClaudeError> {
-        let request =
-            self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
+        let request = self.build_permission_request(
+            tool.name(),
+            description,
+            None,
+            is_read_only,
+            Some(path),
+            PermissionCapabilities {
+                level: tool.permission_level(),
+                network_capable: tool.network_capable(),
+                stateful: tool.stateful(),
+            },
+        );
         self.request_permission_inner(request)
     }
 
-    /// Like `check_permission` but also passes structured `details` text
-    /// (e.g. a risk explanation) that the TUI permission dialog can display.
-    #[allow(dead_code)]
-    pub fn check_permission_with_details(
+    pub fn check_permission_with_details_and_path_for_tool(
         &self,
-        tool_name: &str,
+        tool: &dyn Tool,
         description: &str,
         details: &str,
+        path: PathBuf,
         is_read_only: bool,
+        network_capable: Option<bool>,
     ) -> Result<(), clawde_core::error::ClaudeError> {
         let request = self.build_permission_request(
-            tool_name,
+            tool.name(),
             description,
             Some(details.to_string()),
             is_read_only,
-            None,
+            Some(path),
+            PermissionCapabilities {
+                level: tool.permission_level(),
+                network_capable: network_capable.unwrap_or_else(|| tool.network_capable()),
+                stateful: tool.stateful(),
+            },
         );
         self.request_permission_inner(request).map_err(|_| {
             clawde_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}': {}",
-                tool_name, details
+                tool.name(),
+                details
             ))
         })
     }
@@ -610,53 +621,6 @@ impl ToolContext {
                 .map(|root| std::fs::canonicalize(&root).unwrap_or(root)),
         );
         roots.iter().any(|root| resolved.starts_with(root))
-    }
-
-    pub fn check_permission_with_details_and_path(
-        &self,
-        tool_name: &str,
-        description: &str,
-        details: &str,
-        path: PathBuf,
-        is_read_only: bool,
-    ) -> Result<(), clawde_core::error::ClaudeError> {
-        self.check_permission_with_details_and_path_for_capability(
-            tool_name,
-            description,
-            details,
-            path,
-            is_read_only,
-            known_network_capability(tool_name),
-        )
-    }
-
-    /// Permission check variant for a tool whose effective network capability
-    /// depends on validated input (for example, an isolated local test runner).
-    /// The dispatcher still performs the outer capability check; this method
-    /// keeps self-gating tools from re-applying a static, overly broad fallback.
-    pub fn check_permission_with_details_and_path_for_capability(
-        &self,
-        tool_name: &str,
-        description: &str,
-        details: &str,
-        path: PathBuf,
-        is_read_only: bool,
-        network_capable: bool,
-    ) -> Result<(), clawde_core::error::ClaudeError> {
-        let request = self.build_permission_request(
-            tool_name,
-            description,
-            Some(details.to_string()),
-            is_read_only,
-            Some(path),
-        );
-        self.request_permission_inner_with_capability(request, network_capable)
-            .map_err(|_| {
-                clawde_core::error::ClaudeError::PermissionDenied(format!(
-                    "Permission denied for tool '{}': {}",
-                    tool_name, details
-                ))
-            })
     }
 
     pub fn current_turn_index(&self) -> usize {
@@ -678,30 +642,6 @@ impl ToolContext {
             tool_name,
         );
     }
-}
-
-/// Conservative fallback for direct permission paths that only have a tool
-/// name rather than a `Tool` trait object. The dispatcher always uses the
-/// capability-aware method above; dynamic MCP wrappers pass `true` explicitly.
-fn known_network_capability(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "WebSearch"
-            | "WebFetch"
-            | "RemoteTrigger"
-            | "Bash"
-            | "PowerShell"
-            | "REPL"
-            | "LSP"
-            | "ListMcpResources"
-            | "ReadMcpResource"
-            | "Agent"
-            | "TeamCreate"
-            | "RunTests"
-            | "RunLints"
-            | "EnterWorktree"
-            | "CronCreate"
-    )
 }
 
 /// The trait every tool must implement.
@@ -750,6 +690,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool mutates session or coordination state without being
+    /// a filesystem/process capability. Read-only agents exclude these tools.
+    fn stateful(&self) -> bool {
+        false
+    }
+
     /// Whether this tool is "advanced" / rarely used and a candidate for
     /// deferred (on-demand) disclosure rather than being sent in every request.
     ///
@@ -780,6 +726,122 @@ pub trait Tool: Send + Sync {
             description: self.description().to_string(),
             input_schema: self.input_schema(),
         }
+    }
+}
+
+/// One built-in tool's permission and capability metadata as reported by the
+/// deterministic audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAuditEntry {
+    pub name: String,
+    pub permission_level: PermissionLevel,
+    pub network_capable: bool,
+    pub available_in_ollama_isolated_mode: bool,
+    pub self_gates: bool,
+    pub stateful: bool,
+    pub findings: Vec<String>,
+}
+
+/// Deterministic report for the built-in tool registry. `violations` are
+/// structural errors that should be fixed in code; `warnings` document
+/// intentional policy edges that deserve review when a tool is changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAuditReport {
+    pub entries: Vec<ToolAuditEntry>,
+    pub violations: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl ToolAuditReport {
+    pub fn has_violations(&self) -> bool {
+        !self.violations.is_empty()
+    }
+}
+
+/// Audit every statically registered built-in tool without executing it.
+///
+/// Dynamic MCP tools are audited when they are wrapped and exposed by their
+/// session; this report intentionally covers only the built-in registry so it
+/// remains deterministic and safe for `/doctor`.
+pub fn audit_builtin_tools() -> ToolAuditReport {
+    let tools = all_tools();
+    let mut entries = Vec::with_capacity(tools.len());
+    let mut violations = Vec::new();
+    let mut warnings = Vec::new();
+    let mut names = std::collections::HashSet::new();
+
+    for tool in tools {
+        let name = tool.name().to_string();
+        let mut findings = Vec::new();
+        if name.trim().is_empty() {
+            findings.push("empty tool name".to_string());
+            violations.push("a registered tool has an empty name".to_string());
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            findings.push("duplicate tool name".to_string());
+            violations.push(format!("duplicate tool name: {}", name));
+        }
+        if tool.description().trim().is_empty() {
+            findings.push("empty description".to_string());
+            violations.push(format!("{} has an empty description", name));
+        }
+        let schema = tool.input_schema();
+        if !schema.is_object()
+            || (schema.get("type").is_none() && schema.get("properties").is_none())
+        {
+            findings.push("invalid input schema".to_string());
+            violations.push(format!("{} has an invalid input schema", name));
+        }
+
+        let permission_level = tool.permission_level();
+        let network_capable = tool.network_capable();
+        let isolated = tool.available_in_ollama_isolated_mode();
+        let self_gates = tool.self_gates();
+        let stateful = tool.stateful();
+        if permission_level == PermissionLevel::Forbidden {
+            findings.push("forbidden tool is registered".to_string());
+            violations.push(format!("{} is registered with Forbidden permission", name));
+        }
+        if stateful && permission_level.is_read_only() {
+            let finding = format!(
+                "{} is stateful but uses {:?}; the stateful policy must remain enabled",
+                name, permission_level
+            );
+            findings.push(finding.clone());
+            warnings.push(finding);
+        }
+        if network_capable && permission_level.is_read_only() {
+            let finding = format!(
+                "{} is read-only but network-capable; allowed by default outside isolation",
+                name
+            );
+            findings.push(finding.clone());
+            warnings.push(finding);
+        }
+        if network_capable && isolated && !self_gates {
+            let finding = format!(
+                "{} relies on central dispatch for its isolated-mode exception",
+                name
+            );
+            findings.push(finding.clone());
+            warnings.push(finding);
+        }
+
+        entries.push(ToolAuditEntry {
+            name,
+            permission_level,
+            network_capable,
+            available_in_ollama_isolated_mode: isolated,
+            self_gates,
+            stateful,
+            findings,
+        });
+    }
+
+    ToolAuditReport {
+        entries,
+        violations,
+        warnings,
     }
 }
 
@@ -1000,6 +1062,35 @@ mod tests {
     }
 
     #[test]
+    fn permission_audit_covers_registry_and_has_no_structural_violations() {
+        let report = audit_builtin_tools();
+        assert_eq!(report.entries.len(), all_tools().len());
+        assert!(
+            !report.has_violations(),
+            "permission audit violations: {:?}",
+            report.violations
+        );
+        assert!(report.entries.iter().any(|entry| entry.stateful));
+        assert!(report.entries.iter().any(|entry| entry.network_capable));
+    }
+
+    #[test]
+    fn permission_audit_marks_stateful_none_tools_explicitly() {
+        let report = audit_builtin_tools();
+        let send = report
+            .entries
+            .iter()
+            .find(|entry| entry.name == "SendMessage")
+            .expect("SendMessage must be audited");
+        assert_eq!(send.permission_level, PermissionLevel::None);
+        assert!(send.stateful);
+        assert!(send
+            .findings
+            .iter()
+            .any(|finding| finding.contains("stateful")));
+    }
+
+    #[test]
     fn test_all_tools_have_non_empty_descriptions() {
         for tool in all_tools() {
             assert!(
@@ -1165,6 +1256,9 @@ mod tests {
                     allowed_roots: vec![],
                     context_description: None,
                     network_isolated: false,
+                    permission_level: PermissionLevel::Execute,
+                    network_capable: false,
+                    stateful: false,
                 },
                 reason: "approval required".to_string(),
                 decision_tx: Some(tx),
@@ -1229,6 +1323,11 @@ mod tests {
             Some("[High risk] This may modify system-wide security policy.".to_string()),
             false,
             Some(PathBuf::from("Set-ExecutionPolicy RemoteSigned")),
+            PermissionCapabilities {
+                level: PermissionLevel::Execute,
+                network_capable: true,
+                stateful: false,
+            },
         );
 
         let error = ctx
@@ -1250,6 +1349,11 @@ mod tests {
             None,
             false,
             Some(PathBuf::from("ls -la")),
+            PermissionCapabilities {
+                level: PermissionLevel::Execute,
+                network_capable: true,
+                stateful: false,
+            },
         );
 
         let error = ctx

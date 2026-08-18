@@ -403,6 +403,14 @@ enum CliInputFormat {
     StreamJson,
 }
 
+fn parse_tool_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn resolve_bridge_config(
     settings: &Settings,
     auth_credential: &str,
@@ -703,6 +711,12 @@ async fn main() -> anyhow::Result<()> {
     }
     config.verbose = verbose;
     config.output_format = cli.output_format.into();
+    if let Some(raw) = &cli.allowed_tools {
+        config.allowed_tools = parse_tool_list(raw);
+    }
+    if let Some(raw) = &cli.disallowed_tools {
+        config.disallowed_tools = parse_tool_list(raw);
+    }
     // --bare implies --no-claude-md: opening an untrusted repo in bare mode
     // must not load or inject AGENTS.md memory files.
     config.disable_claude_mds = cli.no_claude_md || cli.bare;
@@ -883,6 +897,8 @@ async fn main() -> anyhow::Result<()> {
     let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
         config.permission_mode.clone(),
         &settings,
+        &config.allowed_tools,
+        &config.disallowed_tools,
     )));
 
     let permission_handler: Arc<dyn clawde_core::PermissionHandler> = if is_headless {
@@ -1265,14 +1281,50 @@ fn build_tools_with_mcp_vec(
     let mut v: Vec<Box<dyn clawde_tools::Tool>> = clawde_tools::all_tools()
         .into_iter()
         .filter(|tool| {
-            !network_blocked || !tool.network_capable() || tool.available_in_ollama_isolated_mode()
+            (!network_blocked
+                || !tool.network_capable()
+                || tool.available_in_ollama_isolated_mode())
+                && (config.allowed_tools.is_empty()
+                    || config
+                        .allowed_tools
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                && !config
+                    .disallowed_tools
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(tool.name()))
         })
         .collect();
-    v.push(Box::new(clawde_query::AgentTool::default()));
+    let agent_allowed = config.allowed_tools.is_empty()
+        || config
+            .allowed_tools
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+    let agent_denied = config
+        .disallowed_tools
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(clawde_core::constants::TOOL_NAME_AGENT));
+    if agent_allowed && !agent_denied && !network_blocked {
+        v.push(Box::new(clawde_query::AgentTool::default()));
+    }
 
     if let Some(ref manager_arc) = mcp_manager {
         if !network_blocked {
-            v.extend(clawde_tools::mcp_tool_wrappers(manager_arc.clone()));
+            v.extend(
+                clawde_tools::mcp_tool_wrappers(manager_arc.clone())
+                    .into_iter()
+                    .filter(|tool| {
+                        (config.allowed_tools.is_empty()
+                            || config
+                                .allowed_tools
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(tool.name())))
+                            && !config
+                                .disallowed_tools
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(tool.name()))
+                    }),
+            );
         }
         debug!(
             total_tools = v.len(),
@@ -1920,6 +1972,7 @@ fn filter_tools_for_agent(
                 .filter(|t| {
                     (matches!(t.permission_level(), PL::ReadOnly | PL::None)
                         || t.name() == "AskUserQuestion")
+                        && !t.stateful()
                         && t.name() != clawde_core::constants::TOOL_NAME_AGENT
                 })
                 .map(|t| t.name().to_string())
@@ -2722,7 +2775,7 @@ fn permission_request_from_core(
     let tool_name = pending.request.tool_name.clone();
     let tool_use_id = pending.tool_use_id.clone();
 
-    match (tool_name.as_str(), pending.request.path.clone()) {
+    let request = match (tool_name.as_str(), pending.request.path.clone()) {
         ("Bash", Some(command)) => {
             let suggested_prefix = command
                 .split_whitespace()
@@ -2755,7 +2808,12 @@ fn permission_request_from_core(
             reason,
             pending.request.path.clone(),
         ),
-    }
+    };
+    request.with_capabilities(
+        pending.request.network_capable,
+        pending.request.stateful,
+        pending.request.network_isolated,
+    )
 }
 
 /// Append any session messages not yet mirrored to the per-project JSONL
@@ -4004,7 +4062,37 @@ async fn run_interactive(
                                     tool_ctx.config = applied_cfg.clone();
                                     base_query_config.network_blocked =
                                         clawde_core::network_isolation_enabled(&cmd_ctx.config);
+                                    all_tools_arc = build_tools_with_mcp(
+                                        tool_ctx.mcp_manager.clone(),
+                                        &cmd_ctx.config,
+                                    );
+                                    tools_arc = tools_for_agent_mode(
+                                        all_tools_arc.clone(),
+                                        app.agent_mode.as_deref(),
+                                        &cmd_ctx.config,
+                                        tool_ctx.mcp_manager.clone(),
+                                    );
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.mode = applied_cfg.permission_mode.clone();
+                                            manager.allowed_tools =
+                                                applied_cfg.allowed_tools.clone();
+                                            manager.denied_tools =
+                                                applied_cfg.disallowed_tools.clone();
+                                        }
+                                    }
+                                    let entered_bypass_mode =
+                                        app.config.permission_mode
+                                            != clawde_core::config::PermissionMode::BypassPermissions
+                                            && applied_cfg.permission_mode
+                                                == clawde_core::config::PermissionMode::BypassPermissions;
                                     app.config = applied_cfg.clone();
+                                    if entered_bypass_mode
+                                        && !settings.skip_dangerous_mode_permission_prompt
+                                    {
+                                        app.bypass_permissions_dialog.show();
+                                        app.bypass_permissions_dialog_shown = true;
+                                    }
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -4039,6 +4127,36 @@ async fn run_interactive(
                                     tool_ctx.config = applied_cfg.clone();
                                     base_query_config.network_blocked =
                                         clawde_core::network_isolation_enabled(&cmd_ctx.config);
+                                    all_tools_arc = build_tools_with_mcp(
+                                        tool_ctx.mcp_manager.clone(),
+                                        &cmd_ctx.config,
+                                    );
+                                    tools_arc = tools_for_agent_mode(
+                                        all_tools_arc.clone(),
+                                        app.agent_mode.as_deref(),
+                                        &cmd_ctx.config,
+                                        tool_ctx.mcp_manager.clone(),
+                                    );
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.mode = applied_cfg.permission_mode.clone();
+                                            manager.allowed_tools =
+                                                applied_cfg.allowed_tools.clone();
+                                            manager.denied_tools =
+                                                applied_cfg.disallowed_tools.clone();
+                                        }
+                                    }
+                                    let entered_bypass_mode =
+                                        app.config.permission_mode
+                                            != clawde_core::config::PermissionMode::BypassPermissions
+                                            && applied_cfg.permission_mode
+                                                == clawde_core::config::PermissionMode::BypassPermissions;
+                                    if entered_bypass_mode
+                                        && !settings.skip_dangerous_mode_permission_prompt
+                                    {
+                                        app.bypass_permissions_dialog.show();
+                                        app.bypass_permissions_dialog_shown = true;
+                                    }
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -4049,6 +4167,10 @@ async fn run_interactive(
                                     }
                                     // Sync auto-compact toggle (Gap 6: footer indicator in-session).
                                     app.auto_compact_enabled = applied_cfg.auto_compact;
+                                    app.plan_mode = matches!(
+                                        applied_cfg.permission_mode,
+                                        clawde_core::config::PermissionMode::Plan
+                                    );
                                     app.config = applied_cfg.clone();
                                     // A persisted default applies immediately only when
                                     // there is no invocation- or session-scoped override.
@@ -4729,7 +4851,24 @@ async fn run_interactive(
                     }
 
                     let previous_ollama_mode = app.ollama_mode;
+                    let previous_permission_mode = app.config.permission_mode.clone();
+                    let previous_allowed_tools = app.config.allowed_tools.clone();
+                    let previous_disallowed_tools = app.config.disallowed_tools.clone();
                     app.handle_key_event(key);
+                    if previous_permission_mode
+                        != clawde_core::config::PermissionMode::BypassPermissions
+                        && app.config.permission_mode
+                            == clawde_core::config::PermissionMode::BypassPermissions
+                        && !app.bypass_permissions_dialog.visible
+                        && !settings.skip_dangerous_mode_permission_prompt
+                    {
+                        // Runtime mode changes need the same explicit warning as
+                        // startup/configured bypass mode. Do this before syncing
+                        // the manager so no subsequent tool call can run while
+                        // the warning is awaiting confirmation.
+                        app.bypass_permissions_dialog.show();
+                        app.bypass_permissions_dialog_shown = true;
+                    }
                     // Effort picker applied a selection on Enter: surface it into
                     // the session override and persist it, mirroring `/effort
                     // <level>` so the choice survives a resume.
@@ -4741,10 +4880,13 @@ async fn run_interactive(
                     }
                     cmd_ctx.config = app.config.clone();
                     cmd_ctx.effort = current_effort;
-                    if app.ollama_mode != previous_ollama_mode {
-                        // `/ollama` changes the active capability boundary. Rebuild
-                        // both the full registry and the current agent-filtered
-                        // slice so tools disappear/return immediately.
+                    let tool_access_changed = previous_allowed_tools != app.config.allowed_tools
+                        || previous_disallowed_tools != app.config.disallowed_tools;
+                    if app.ollama_mode != previous_ollama_mode || tool_access_changed {
+                        // `/ollama` and the settings screen can both change
+                        // the active tool boundary. Rebuild both the full
+                        // registry and the current agent-filtered slice so
+                        // tools disappear/return immediately.
                         all_tools_arc =
                             build_tools_with_mcp(tool_ctx.mcp_manager.clone(), &cmd_ctx.config);
                         tools_arc = tools_for_agent_mode(
@@ -4928,9 +5070,12 @@ async fn run_interactive(
                         .as_ref()
                         .and_then(|manager| manager.lock().ok())
                         .map(|manager| {
-                            manager.evaluate_with_network_isolation(
+                            manager.evaluate_with_capabilities(
                                 &pending.request.tool_name,
                                 &pending.request.description,
+                                pending.request.permission_level,
+                                pending.request.network_capable,
+                                pending.request.stateful,
                                 pending.request.path.as_deref(),
                                 pending.request.working_dir.as_deref(),
                                 &pending.request.allowed_roots,
@@ -5301,6 +5446,29 @@ async fn run_interactive(
                         tool_use_id,
                         response,
                     }) => {
+                        // Persist the web UI's session-scoped approval in the
+                        // same manager used by local TUI approvals. Without
+                        // this, AllowSession only unblocks one call and the
+                        // next identical call prompts again.
+                        if response == clawde_bridge::PermissionResponseKind::AllowSession {
+                            let request = pending_permissions
+                                .lock()
+                                .waiting
+                                .get(&tool_use_id)
+                                .map(|pending| pending.request.clone());
+                            if let Some(request) = request {
+                                if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                    if let Ok(mut manager) = manager.lock() {
+                                        if let Some(path) = request.path.as_deref() {
+                                            manager
+                                                .add_session_allow_path(&request.tool_name, path);
+                                        } else {
+                                            manager.add_session_allow(&request.tool_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // The bridge response must resolve the same oneshot as
                         // the local TUI key path. Previously this only cleared
                         // the visible dialog, leaving the Bash/tool task blocked
@@ -6923,6 +7091,43 @@ mod bare_mode_tests {
             registry.all_mcp_servers().is_empty(),
             "no plugin MCP servers"
         );
+    }
+
+    #[test]
+    fn cli_tool_list_parser_trims_and_ignores_empty_entries() {
+        assert_eq!(
+            super::parse_tool_list(" Read, ,Grep,, Read "),
+            vec!["Read", "Grep", "Read"]
+        );
+    }
+
+    #[test]
+    fn cli_allow_and_deny_lists_filter_runtime_exposure() {
+        let cli = Cli::parse_from([
+            "clawde",
+            "--allowed-tools",
+            "Read, Grep, Bash",
+            "--disallowed-tools",
+            "grep, Bash",
+        ]);
+        let config = Config {
+            allowed_tools: cli
+                .allowed_tools
+                .as_deref()
+                .map(super::parse_tool_list)
+                .unwrap_or_default(),
+            disallowed_tools: cli
+                .disallowed_tools
+                .as_deref()
+                .map(super::parse_tool_list)
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+
+        let tools = build_tools_with_mcp_vec(None, &config);
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Grep"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
     }
 
     #[test]

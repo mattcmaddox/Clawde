@@ -395,23 +395,42 @@ pub enum Approval {
 /// `PermissionMode` × `PermissionLevel`).
 ///
 /// - `BypassPermissions`: everything is allowed.
-/// - `AcceptEdits`: reads and file writes are allowed; execute/network ask.
-/// - `Default` and `Plan`: reads are allowed; everything else asks. (Plan
-///   mode's write gate is enforced separately by the plan progress gate; the
-///   permission surface still asks so the user sees every write.)
+/// - `AcceptEdits`: read-only operations and workspace writes are allowed;
+///   execution and dangerous operations ask; forbidden operations are denied.
+/// - `Default`: read-only operations are allowed; writes and execution ask.
+/// - `Plan`: read-only operations are allowed; all side effects are denied by
+///   the runtime plan policy.
 ///
-/// Command-level refinement (bash/ps risk classifiers) happens downstream of
-/// this matrix in the permission classifiers.
+/// Network reachability is a separate capability bit. A read-only network tool
+/// therefore follows the read-only branch here; isolation policy is enforced
+/// by the capability-aware core evaluator and dispatcher.
 pub fn decide_tool_approval(level: PermissionLevel, mode: PermissionMode) -> Approval {
+    if level == PermissionLevel::Forbidden {
+        return Approval::Denied;
+    }
+
     match mode {
         PermissionMode::BypassPermissions => Approval::Allowed,
         PermissionMode::AcceptEdits => match level {
-            PermissionLevel::Read | PermissionLevel::Write => Approval::Allowed,
-            PermissionLevel::Execute | PermissionLevel::Network => Approval::Ask,
+            PermissionLevel::None | PermissionLevel::ReadOnly | PermissionLevel::Write => {
+                Approval::Allowed
+            }
+            PermissionLevel::Execute | PermissionLevel::Dangerous => Approval::Ask,
+            PermissionLevel::Forbidden => Approval::Denied,
         },
-        PermissionMode::Default | PermissionMode::Plan => match level {
-            PermissionLevel::Read => Approval::Allowed,
-            _ => Approval::Ask,
+        PermissionMode::Default => match level {
+            PermissionLevel::None | PermissionLevel::ReadOnly => Approval::Allowed,
+            PermissionLevel::Write | PermissionLevel::Execute | PermissionLevel::Dangerous => {
+                Approval::Ask
+            }
+            PermissionLevel::Forbidden => Approval::Denied,
+        },
+        PermissionMode::Plan => match level {
+            PermissionLevel::None | PermissionLevel::ReadOnly => Approval::Allowed,
+            PermissionLevel::Write
+            | PermissionLevel::Execute
+            | PermissionLevel::Dangerous
+            | PermissionLevel::Forbidden => Approval::Denied,
         },
     }
 }
@@ -910,8 +929,14 @@ mod tests {
     use clawde_core::PermissionMode as Pm;
 
     #[test]
-    fn approval_bypass_allows_everything() {
-        for level in [Pl::Read, Pl::Write, Pl::Execute, Pl::Network] {
+    fn approval_bypass_allows_non_forbidden_tools() {
+        for level in [
+            Pl::None,
+            Pl::ReadOnly,
+            Pl::Write,
+            Pl::Execute,
+            Pl::Dangerous,
+        ] {
             assert_eq!(
                 decide_tool_approval(level, Pm::BypassPermissions),
                 Approval::Allowed
@@ -922,7 +947,7 @@ mod tests {
     #[test]
     fn approval_accept_edits_allows_read_write() {
         assert_eq!(
-            decide_tool_approval(Pl::Read, Pm::AcceptEdits),
+            decide_tool_approval(Pl::ReadOnly, Pm::AcceptEdits),
             Approval::Allowed
         );
         assert_eq!(
@@ -934,21 +959,24 @@ mod tests {
             Approval::Ask
         );
         assert_eq!(
-            decide_tool_approval(Pl::Network, Pm::AcceptEdits),
+            decide_tool_approval(Pl::Dangerous, Pm::AcceptEdits),
             Approval::Ask
         );
     }
 
     #[test]
-    fn approval_default_and_plan_ask_beyond_read() {
-        for mode in [Pm::Default, Pm::Plan] {
-            assert_eq!(
-                decide_tool_approval(Pl::Read, mode.clone()),
-                Approval::Allowed
-            );
-            for level in [Pl::Write, Pl::Execute, Pl::Network] {
-                assert_eq!(decide_tool_approval(level, mode.clone()), Approval::Ask);
-            }
+    fn approval_default_allows_reads_and_plan_denies_side_effects() {
+        assert_eq!(
+            decide_tool_approval(Pl::ReadOnly, Pm::Default),
+            Approval::Allowed
+        );
+        for level in [Pl::Write, Pl::Execute, Pl::Dangerous] {
+            assert_eq!(decide_tool_approval(level, Pm::Default), Approval::Ask);
+            assert_eq!(decide_tool_approval(level, Pm::Plan), Approval::Denied);
         }
+        assert_eq!(
+            decide_tool_approval(Pl::ReadOnly, Pm::Plan),
+            Approval::Allowed
+        );
     }
 }

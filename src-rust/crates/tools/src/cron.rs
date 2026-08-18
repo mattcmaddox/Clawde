@@ -343,7 +343,7 @@ impl Tool for CronCreateTool {
             cron_to_human(&params.cron),
             prompt_preview
         );
-        if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
+        if let Err(e) = ctx.check_permission_for_tool(self, &reason, false) {
             return ToolResult::error(e.to_string());
         }
 
@@ -424,7 +424,7 @@ impl Tool for CronDeleteTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
+        PermissionLevel::Write
     }
 
     fn input_schema(&self) -> Value {

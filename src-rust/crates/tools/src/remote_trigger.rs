@@ -33,7 +33,7 @@ impl Tool for RemoteTriggerTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
+        PermissionLevel::Execute
     }
 
     fn network_capable(&self) -> bool {

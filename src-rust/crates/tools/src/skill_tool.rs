@@ -104,8 +104,8 @@ impl Tool for SkillTool {
             }
         };
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("Load skill {}", params.skill),
             skill_path,
             true,

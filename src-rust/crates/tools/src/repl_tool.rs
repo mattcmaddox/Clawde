@@ -267,7 +267,7 @@ impl Tool for ReplTool {
             .collect::<String>()
             .replace('\n', " ");
         let reason = format!("REPL ({}): {}", language, preview);
-        if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
+        if let Err(e) = ctx.check_permission_for_tool(self, &reason, false) {
             return ToolResult::error(e.to_string());
         }
 

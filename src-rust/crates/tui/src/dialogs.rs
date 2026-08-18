@@ -61,11 +61,30 @@ pub struct PermissionRequest {
     pub input_preview: Option<String>,
     /// What kind of dialog this is — drives option set and rendering.
     pub kind: PermissionDialogKind,
+    /// Whether the requested operation can reach an external network.
+    pub network_capable: bool,
+    /// Whether the operation mutates session or coordination state.
+    pub stateful: bool,
+    /// Whether the session is using an Ollama network-isolation boundary.
+    pub network_isolated: bool,
     pub options: Vec<PermissionOption>,
     pub selected_option: usize,
 }
 
 impl PermissionRequest {
+    /// Attach the typed capability metadata from the runtime permission request.
+    pub fn with_capabilities(
+        mut self,
+        network_capable: bool,
+        stateful: bool,
+        network_isolated: bool,
+    ) -> Self {
+        self.network_capable = network_capable;
+        self.stateful = stateful;
+        self.network_isolated = network_isolated;
+        self
+    }
+
     /// Create a standard four-option dialog matching the TS dialog options:
     ///   `y` — Yes, allow once
     ///   `Y` — Yes, allow this session
@@ -79,6 +98,9 @@ impl PermissionRequest {
             danger_explanation: String::new(),
             input_preview: None,
             kind: PermissionDialogKind::Generic,
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options: Self::default_options(),
         }
@@ -105,6 +127,9 @@ impl PermissionRequest {
             danger_explanation,
             input_preview,
             kind: PermissionDialogKind::Generic,
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options: Self::default_options(),
         }
@@ -132,6 +157,9 @@ impl PermissionRequest {
             danger_explanation: command_reason_body(reason, &command),
             input_preview: Some(command),
             kind,
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options,
         }
@@ -150,6 +178,9 @@ impl PermissionRequest {
             danger_explanation: command_reason_body(reason, &command),
             input_preview: Some(command.clone()),
             kind: PermissionDialogKind::PowerShell { command },
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options: Self::default_options(),
         }
@@ -173,6 +204,9 @@ impl PermissionRequest {
             danger_explanation,
             input_preview: Some(preview),
             kind,
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options: Self::file_read_options(),
         }
@@ -201,6 +235,9 @@ impl PermissionRequest {
             danger_explanation,
             input_preview: Some(preview),
             kind,
+            network_capable: false,
+            stateful: false,
+            network_isolated: false,
             selected_option: 0,
             options: Self::file_write_options(),
         }
@@ -465,6 +502,15 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         .clamp(40, 80)
         .min(area.width.saturating_sub(4));
     let text_width = (dialog_width as usize).saturating_sub(4); // 2 border + 2 padding
+    let capability_label = match (pr.network_capable, pr.stateful, pr.network_isolated) {
+        (false, false, false) => None,
+        (false, false, true) => Some("isolated sandbox"),
+        (true, false, true) => Some("network-capable · isolated sandbox"),
+        (true, false, false) => Some("network-capable"),
+        (false, true, _) => Some("stateful coordination"),
+        (true, true, true) => Some("network-capable · stateful · isolated sandbox"),
+        (true, true, false) => Some("network-capable · stateful"),
+    };
 
     // Build a command block for Bash / PowerShell dialogs to prominently display the command.
     // The chevron-prefix is only painted on the FIRST wrapped line; continuation
@@ -537,6 +583,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         + desc_lines.len() as u16
         + if !expl_lines.is_empty() { expl_lines.len() as u16 + 1 } else { 0 }
         + preview_line_count
+        + if capability_label.is_some() { 2 } else { 0 }
         + 1 // blank before options
         + pr.options.len() as u16
         + 1; // trailing blank
@@ -561,6 +608,14 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         ),
     ]));
     lines.push(Line::from(""));
+
+    if let Some(label) = capability_label {
+        lines.push(Line::from(vec![
+            Span::raw("  Capability: "),
+            Span::styled(label, Style::default().fg(Color::Magenta)),
+        ]));
+        lines.push(Line::from(""));
+    }
 
     // ---- Bash command block (code-block style, green chevron) ---------------
     if let Some(cmd_lines) = bash_command_lines {
@@ -1369,6 +1424,19 @@ mod tests {
     // -----------------------------------------------------------------------
     // Existing / backward-compat tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn permission_request_preserves_typed_capabilities_for_rendering() {
+        let pr = PermissionRequest::standard(
+            "id1".to_string(),
+            "SendMessage".to_string(),
+            "Send a coordination message".to_string(),
+        )
+        .with_capabilities(true, true, false);
+        assert!(pr.network_capable);
+        assert!(pr.stateful);
+        assert!(!pr.network_isolated);
+    }
 
     #[test]
     fn standard_permission_request_has_five_options() {

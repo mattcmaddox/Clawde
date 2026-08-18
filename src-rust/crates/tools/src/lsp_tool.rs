@@ -84,8 +84,8 @@ impl Tool for LspTool {
                 .into_owned()
         };
 
-        if let Err(e) = ctx.check_permission_for_path(
-            self.name(),
+        if let Err(e) = ctx.check_permission_for_tool_path(
+            self,
             &format!("LSP {} {}", action, file_path),
             std::path::PathBuf::from(&file_path),
             true,
