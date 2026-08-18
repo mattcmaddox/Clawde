@@ -83,6 +83,68 @@ fn looks_like_account_id(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
+/// Provider IDs worth suggesting even before any keys are stored.
+///
+/// Covers the well-known `ProviderId` constants plus credential-backed tools.
+/// Firecrawl is a search backend rather than an LLM provider, so it has no
+/// `ProviderId` constant — but `/keys set firecrawl <key>` is the documented
+/// way to configure it and must autocomplete from a cold store.
+fn known_provider_ids() -> Vec<&'static str> {
+    use clawde_core::ProviderId as P;
+    vec![
+        P::ANTHROPIC,
+        P::OPENAI,
+        P::GOOGLE,
+        P::GOOGLE_VERTEX,
+        P::AMAZON_BEDROCK,
+        P::AZURE,
+        P::GITHUB_COPILOT,
+        P::MISTRAL,
+        P::XAI,
+        P::GROQ,
+        P::DEEPINFRA,
+        P::CEREBRAS,
+        P::COHERE,
+        P::CROF,
+        P::TOGETHER_AI,
+        P::PERPLEXITY,
+        P::OPENROUTER,
+        P::OLLAMA,
+        P::LM_STUDIO,
+        P::LLAMA_CPP,
+        P::DEEPSEEK,
+        P::GITLAB,
+        P::CLOUDFLARE,
+        P::VENICE,
+        P::SAP,
+        P::SAMBANOVA,
+        P::HUGGINGFACE,
+        P::NVIDIA,
+        P::SILICONFLOW,
+        P::MOONSHOT,
+        P::ZHIPU,
+        P::ZAI,
+        P::NEBIUS,
+        P::OVHCLOUD,
+        P::SCALEWAY,
+        P::VULTR,
+        P::BASETEN,
+        P::FRIENDLI,
+        P::UPSTAGE,
+        P::STEPFUN,
+        P::FIREWORKS,
+        P::NOVITA,
+        P::MINIMAX,
+        P::CODEX,
+        P::OPENCODE_GO,
+        P::OPENCODE_ZEN,
+        P::NEURALWATT,
+        P::CLINE,
+        P::FREE,
+        "firecrawl",
+    ]
+}
+
 pub struct KeysCommand;
 
 #[async_trait]
@@ -164,13 +226,20 @@ impl SlashCommand for KeysCommand {
             return completions;
         }
 
-        // Provider IDs are safe to suggest from both credential maps and the
-        // rotation-key map. API key values themselves are never suggested.
+        // Provider IDs are safe to suggest from both credential maps, the
+        // rotation-key map, and the known-provider list. The known list makes
+        // providers like firecrawl autocomplete even before the first key is
+        // stored. API key values themselves are never suggested.
         let store = AuthStore::load();
         let mut providers: Vec<String> = store.credentials.keys().cloned().collect();
         for provider in store.keys.keys() {
             if !providers.contains(provider) {
                 providers.push(provider.clone());
+            }
+        }
+        for provider in known_provider_ids() {
+            if !providers.iter().any(|p| p == provider) {
+                providers.push(provider.to_string());
             }
         }
         providers.sort();
@@ -199,20 +268,19 @@ impl SlashCommand for KeysCommand {
         match subcommand {
             "set" | "add" => {
                 // Keys are sensitive free-form values. Show the next required
-                // argument as a dimmed hint, but never make it selectable or
-                // expose an existing credential in the popup.
+                // argument as a dimmed hint only while it is still empty;
+                // never make it selectable or expose an existing credential in
+                // the popup. Once the user starts typing the key the hint
+                // disappears (the typed text is already visible in the input).
                 let typed_keys = remaining.trim();
-                let value = if typed_keys.is_empty() {
-                    format!("{subcommand} {provider} <api-key>")
-                } else {
-                    format!("{subcommand} {provider} {typed_keys} <api-key>")
-                };
-                completions.push(ArgCompletion {
-                    value,
-                    description: "Type the API key manually; credentials are never suggested"
-                        .into(),
-                    available: false,
-                });
+                if let Some(hint) = crate::free_form_arg_hint(
+                    &format!("{subcommand} {provider}"),
+                    "<api-key>",
+                    "Type the API key manually; credentials are never suggested",
+                    !typed_keys.is_empty(),
+                ) {
+                    completions.push(hint);
+                }
             }
             "remove" => {
                 let count = store.keys_for(provider).map(|keys| keys.len()).unwrap_or(0);
@@ -1927,6 +1995,50 @@ pub(crate) mod tests {
         let completions = crate::get_arg_completions("keys", "d");
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["doctor"], "completions: {values:?}");
+    }
+
+    #[test]
+    fn keys_provider_completions_include_firecrawl_from_cold_store() {
+        let _home = TestHome::new();
+        // No keys stored: known providers must still autocomplete.
+        let completions = crate::keys::KeysCommand.arg_completions("set fire");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(
+            values.contains(&"set firecrawl"),
+            "firecrawl must complete with an empty store: {values:?}"
+        );
+        assert!(
+            values.contains(&"set fireworks"),
+            "known providers must complete: {values:?}"
+        );
+
+        let groq = crate::keys::KeysCommand.arg_completions("set gro");
+        let groq_values: Vec<&str> = groq.iter().map(|c| c.value.as_str()).collect();
+        assert!(
+            groq_values.contains(&"set groq"),
+            "groq must complete: {groq_values:?}"
+        );
+    }
+
+    #[test]
+    fn keys_provider_completions_merge_stored_and_known() {
+        let _home = TestHome::new();
+        let mut store = AuthStore::load();
+        store.set_keys("custom-provider", vec!["cpk-real-key-12345678".into()]);
+        store.save();
+
+        let completions = crate::keys::KeysCommand.arg_completions("set custom");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(
+            values.contains(&"set custom-provider"),
+            "stored providers must complete alongside known ones: {values:?}"
+        );
+
+        // A stored provider that is also known is not duplicated.
+        let completions = crate::keys::KeysCommand.arg_completions("set groq");
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        let matches = values.iter().filter(|v| **v == "set groq").count();
+        assert_eq!(matches, 1, "no duplicate suggestions: {values:?}");
     }
 
     #[test]

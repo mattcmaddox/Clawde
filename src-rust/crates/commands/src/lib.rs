@@ -151,6 +151,33 @@ pub struct ArgCompletion {
     pub available: bool,
 }
 
+/// Build a faded, non-selectable placeholder hint for the next argument when
+/// it is a free-form value that cannot be completed — API keys, file paths,
+/// model IDs, labels.
+///
+/// Commands call this from `arg_completions` when the next required argument
+/// is expected but not yet typed, so the Tab/Space popup tells the user what
+/// goes next instead of showing nothing. The hint is never selectable and is
+/// hidden once the user starts typing the value (`value_already_typed`), so it
+/// reads as temporary guidance rather than an echoed prefix. `prefix` is the
+/// command text typed so far (e.g. `"set firecrawl"`); `placeholder` is the
+/// `<...>` token shown in the popup (e.g. `"<api-key>"`).
+pub(crate) fn free_form_arg_hint(
+    prefix: &str,
+    placeholder: &str,
+    description: &str,
+    value_already_typed: bool,
+) -> Option<ArgCompletion> {
+    if value_already_typed {
+        return None;
+    }
+    Some(ArgCompletion {
+        value: format!("{prefix} {placeholder}"),
+        description: description.to_string(),
+        available: false,
+    })
+}
+
 /// Every slash command implements this trait.
 #[async_trait]
 pub trait SlashCommand: Send + Sync {
@@ -3991,6 +4018,68 @@ fn multi_argument_completions_bridge_to_next_stage() {
     assert!(config_values
         .iter()
         .any(|completion| completion.value == "set theme dark"));
+}
+
+#[test]
+fn free_form_next_argument_shows_placeholder_hint_until_typed() {
+    // /keys: the api-key hint is present while the value is empty, faded and
+    // non-selectable, and disappears once the user starts typing the key.
+    let empty = crate::keys::KeysCommand.arg_completions("set firecrawl ");
+    assert!(empty
+        .iter()
+        .any(|c| { c.value == "set firecrawl <api-key>" && !c.available }));
+    let typed = crate::keys::KeysCommand.arg_completions("set firecrawl sk-abc");
+    assert!(
+        !typed.iter().any(|c| c.value.contains("<api-key>")),
+        "hint must disappear once the key is typed: {:?}",
+        typed.iter().map(|c| c.value.as_str()).collect::<Vec<_>>()
+    );
+
+    // /config set model: free-form model ID gets a dimmed <model> hint.
+    let config_empty = crate::config_cmd::ConfigCommand.arg_completions("set model ");
+    assert!(config_empty
+        .iter()
+        .any(|c| { c.value == "set model <model>" && !c.available }));
+    let config_typed = crate::config_cmd::ConfigCommand.arg_completions("set model claude");
+    assert!(!config_typed.iter().any(|c| c.value.contains("<model>")));
+
+    // /export --output: free-form file path gets a dimmed <file path> hint.
+    let export_empty = crate::export::ExportCommand.arg_completions("--output ");
+    assert!(export_empty
+        .iter()
+        .any(|c| { c.value == "--output <file path>" && !c.available }));
+    let export_typed = crate::export::ExportCommand.arg_completions("--output chat");
+    assert!(!export_typed.iter().any(|c| c.value.contains("<file path>")));
+
+    // /login --label: free-form profile name gets a dimmed <name> hint.
+    let login_empty = crate::accounts::LoginCommand.arg_completions("--label ");
+    assert!(login_empty
+        .iter()
+        .any(|c| { c.value == "--label <name>" && !c.available }));
+}
+
+#[test]
+fn enum_stages_keep_selectable_values_without_placeholder_hint() {
+    // Enum-valued stages complete real values; no faded placeholder appears.
+    let theme = crate::config_cmd::ConfigCommand.arg_completions("set theme ");
+    assert!(theme
+        .iter()
+        .any(|c| c.value == "set theme dark" && c.available));
+    assert!(
+        !theme.iter().any(|c| !c.available),
+        "enum stage must not carry a faded hint: {:?}",
+        theme.iter().map(|c| c.value.as_str()).collect::<Vec<_>>()
+    );
+
+    let format = crate::export::ExportCommand.arg_completions("--format ");
+    assert!(format
+        .iter()
+        .any(|c| c.value == "--format markdown" && c.available));
+    assert!(
+        !format.iter().any(|c| !c.available),
+        "format enum stage must not carry a faded hint: {:?}",
+        format.iter().map(|c| c.value.as_str()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

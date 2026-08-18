@@ -49,6 +49,18 @@ impl SlashCommand for LoginCommand {
                     }
                 }
             }
+            // The label is a free-form name; show a dimmed placeholder hint
+            // while it is still empty so the popup says what goes next.
+            if after.is_empty() {
+                if let Some(hint) = super::free_form_arg_hint(
+                    "--label",
+                    "<name>",
+                    "Name this profile so /switch can find it later",
+                    false,
+                ) {
+                    results.push(hint);
+                }
+            }
             return results;
         }
 
@@ -586,14 +598,20 @@ mod tests {
     }
 
     #[test]
-    fn login_arg_completions_label_no_profiles_returns_empty() {
+    fn login_arg_completions_label_no_profiles_shows_placeholder_hint() {
         let _env = TestAccounts::empty();
         let cmd = LoginCommand;
         let completions = cmd.arg_completions("--label");
-        assert!(
-            completions.is_empty(),
-            "expected no completions when no profiles exist"
+        // No profiles exist, so only the faded free-form hint remains: the
+        // popup must tell the user a name goes next instead of showing nothing.
+        assert_eq!(
+            completions.len(),
+            1,
+            "expected only the placeholder hint: {:?}",
+            completions
         );
+        assert_eq!(completions[0].value, "--label <name>");
+        assert!(!completions[0].available);
     }
 
     // -----------------------------------------------------------------------

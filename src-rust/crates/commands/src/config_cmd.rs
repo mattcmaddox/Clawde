@@ -160,6 +160,20 @@ impl SlashCommand for ConfigCommand {
                 });
             }
         }
+        // `set model` takes a free-form model ID that cannot be completed.
+        // Show a dimmed placeholder hint while the value is still empty so the
+        // popup says what goes next instead of repeating the key.
+        if partial.starts_with("set model ") {
+            let typed_value = partial.strip_prefix("set model").unwrap_or("").trim();
+            if let Some(hint) = super::free_form_arg_hint(
+                "set model",
+                "<model>",
+                "Type a model ID, e.g. claude-sonnet-4-6 or openai/gpt-4o",
+                !typed_value.is_empty(),
+            ) {
+                completions.push(hint);
+            }
+        }
         completions
     }
 

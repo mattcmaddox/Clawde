@@ -238,6 +238,19 @@ impl SlashCommand for ExportCommand {
                 available: true,
             });
         }
+        // `--output` takes a free-form file path. Show a dimmed placeholder
+        // hint while the value is still empty so the popup says what goes next.
+        if partial.starts_with("--output ") {
+            let typed_path = partial.strip_prefix("--output").unwrap_or("").trim();
+            if let Some(hint) = super::free_form_arg_hint(
+                "--output",
+                "<file path>",
+                "Path to write the export to (omit to print to the terminal)",
+                !typed_path.is_empty(),
+            ) {
+                completions.push(hint);
+            }
+        }
         completions
     }
     fn help(&self) -> &str {
