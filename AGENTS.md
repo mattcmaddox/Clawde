@@ -35,7 +35,7 @@ Agent-facing rules for working on Clawde. Mirrors and extends `src-rust/.claude/
 - **Build:** `cd ~/clawde/src-rust && cargo build`
 - **Run after build:** `~/clawde/src-rust/target/debug/clawde`
 - **Dev convenience script** (auto-builds + runs): `bash ~/clawde/scripts/dev-run.sh`
-- **User's alias for rebuilds:** `clauded`
+- **User's alias for rebuilds:** `clawded`
 
 ## Commands
 

@@ -8,8 +8,8 @@
 # All arguments are forwarded to the clawde binary, so you can pass
 # any flag the normal binary accepts.
 #
-# To use this as your everyday `clawde` command, add to ~/.bashrc:
-#   alias clawde="~/clawde/scripts/dev-run.sh"
+# To use this as your rebuild-and-run `clawded` command, add to ~/.bashrc:
+#   alias clawded="~/clawde/scripts/dev-run.sh"
 # or symlink into ~/.local/bin:
 #   ln -sf ~/clawde/scripts/dev-run.sh ~/.local/bin/clawde
 

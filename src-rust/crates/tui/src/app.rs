@@ -6734,7 +6734,7 @@ impl App {
             {
                 self.push_notification(
                     NotificationKind::Info,
-                    "Saved rustle.rs — run `clauded` to rebuild the mascot.".to_string(),
+                    "Saved rustle.rs — run `clawded` to rebuild the mascot.".to_string(),
                     None,
                 );
             }
