@@ -161,7 +161,9 @@ pub struct ArgCompletion {
 /// hidden once the user starts typing the value (`value_already_typed`), so it
 /// reads as temporary guidance rather than an echoed prefix. `prefix` is the
 /// command text typed so far (e.g. `"set firecrawl"`); `placeholder` is the
-/// `<...>` token shown in the popup (e.g. `"<api-key>"`).
+/// `<...>` token shown in the popup (e.g. `"<api-key>"`). When `prefix` is
+/// empty (the free-form value is the first argument, e.g. `/review <git-ref>`),
+/// the hint value is just the placeholder token.
 pub(crate) fn free_form_arg_hint(
     prefix: &str,
     placeholder: &str,
@@ -171,11 +173,49 @@ pub(crate) fn free_form_arg_hint(
     if value_already_typed {
         return None;
     }
+    let value = if prefix.is_empty() {
+        placeholder.to_string()
+    } else {
+        format!("{prefix} {placeholder}")
+    };
     Some(ArgCompletion {
-        value: format!("{prefix} {placeholder}"),
+        value,
         description: description.to_string(),
         available: false,
     })
+}
+
+/// Strip the fully-typed argument path from a completion value so the popup
+/// shows only what the user still needs to type or choose.
+///
+/// Multi-token commands encode the whole path in [`ArgCompletion::value`]
+/// (e.g. `"set firecrawl"` for `/keys set firecrawl`) so the filter in
+/// [`get_arg_completions`] can match it against the typed `partial`. Displaying
+/// that value verbatim repeats the already-typed path on every row. This
+/// removes path tokens that were typed in full (`"set fi"` → `"firecrawl"`),
+/// while a partially-typed last token is left intact so the candidate name
+/// stays visible whole (`"set fi"` → `"firecrawl"`, never `"recrawl"`).
+pub fn strip_typed_path(value: &str, partial: &str) -> String {
+    let mut rest = value;
+    let mut offset = 0usize;
+    for token in partial.split(' ') {
+        if token.is_empty() {
+            // A space (trailing or doubled) means the previous token was
+            // typed in full; nothing to strip at this position.
+            continue;
+        }
+        let Some(after) = rest.strip_prefix(token) else {
+            break;
+        };
+        let token_end = offset + token.len();
+        if !partial[token_end..].starts_with(' ') {
+            // Last token is only a partial match — keep the candidate whole.
+            break;
+        }
+        rest = after.trim_start();
+        offset = token_end + 1;
+    }
+    rest.to_string()
 }
 
 /// Every slash command implements this trait.
@@ -2594,6 +2634,52 @@ mod tests {
     /// lifetime so only one such test runs at a time.
     pub(crate) static CLAWDE_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    #[test]
+    fn strip_typed_path_removes_completed_tokens() {
+        // `/keys set firecrawl` — `set ` already typed in full.
+        assert_eq!(strip_typed_path("set firecrawl", "set "), "firecrawl");
+        // `set fi` partially typed: candidate stays whole, not "recrawl".
+        assert_eq!(strip_typed_path("set firecrawl", "set fi"), "firecrawl");
+        // Fully typed argument keeps its name as the row label.
+        assert_eq!(
+            strip_typed_path("set firecrawl", "set firecrawl"),
+            "firecrawl"
+        );
+    }
+
+    #[test]
+    fn strip_typed_path_reveals_next_placeholder() {
+        // After `set firecrawl ` the faded hint collapses to `<api-key>`.
+        assert_eq!(
+            strip_typed_path("set firecrawl <api-key>", "set firecrawl "),
+            "<api-key>"
+        );
+        // Partial provider: hint keeps the remaining path for context.
+        assert_eq!(
+            strip_typed_path("set firecrawl <api-key>", "set fi"),
+            "firecrawl <api-key>"
+        );
+    }
+
+    #[test]
+    fn strip_typed_path_handles_single_and_multi_token_values() {
+        // Single-token values (e.g. subcommands) are untouched.
+        assert_eq!(strip_typed_path("list", ""), "list");
+        assert_eq!(strip_typed_path("list", "l"), "list");
+        // Index completions: `/keys remove firecrawl 1|2`.
+        assert_eq!(
+            strip_typed_path("remove firecrawl 2", "remove firecrawl "),
+            "2"
+        );
+        // Flag + value: `/export --format markdown`.
+        assert_eq!(
+            strip_typed_path("--format markdown", "--format m"),
+            "markdown"
+        );
+        // Case mismatch on the last token just shows the candidate whole.
+        assert_eq!(strip_typed_path("set firecrawl", "set FI"), "firecrawl");
+    }
+
     fn make_ctx() -> CommandContext {
         CommandContext {
             config: clawde_core::config::Config::default(),
@@ -4056,6 +4142,38 @@ fn free_form_next_argument_shows_placeholder_hint_until_typed() {
     assert!(login_empty
         .iter()
         .any(|c| { c.value == "--label <name>" && !c.available }));
+}
+
+#[test]
+fn first_argument_hints_use_bare_placeholder_value() {
+    // /review <git-ref>: the free-form value is the FIRST argument, so the
+    // hint value is just the placeholder token (no leading prefix).
+    let review = crate::review::ReviewCommand.arg_completions("");
+    assert!(review
+        .iter()
+        .any(|c| { c.value == "<git-ref>" && !c.available && !c.description.is_empty() }));
+    // Once the user starts typing the ref, the hint disappears.
+    let typed = crate::review::ReviewCommand.arg_completions("ma");
+    assert!(
+        typed.is_empty(),
+        "hint must vanish once typing: {:?}",
+        typed
+    );
+
+    // /goal <objective>: hint coexists with the selectable subcommands while
+    // the argument is empty.
+    let goal = crate::goal::GoalCommand.arg_completions("");
+    assert!(goal
+        .iter()
+        .any(|c| c.value == "<objective>" && !c.available));
+    assert!(goal.iter().any(|c| c.value == "status" && c.available));
+
+    // /plan <description>: same pattern.
+    let plan = crate::session::PlanCommand.arg_completions("");
+    assert!(plan
+        .iter()
+        .any(|c| c.value == "<description>" && !c.available));
+    assert!(plan.iter().any(|c| c.value == "open" && c.available));
 }
 
 #[test]

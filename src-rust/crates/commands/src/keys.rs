@@ -272,11 +272,22 @@ impl SlashCommand for KeysCommand {
                 // never make it selectable or expose an existing credential in
                 // the popup. Once the user starts typing the key the hint
                 // disappears (the typed text is already visible in the input).
+                // The description points at the provider's key page so the
+                // user knows what the value is and where to get one.
                 let typed_keys = remaining.trim();
+                let description = match clawde_api::providers::provider_metadata(provider) {
+                    clawde_api::providers::MetaLookup::Meta(m) => format!(
+                        "Type the {provider} API key (get one at {}); credentials are never suggested",
+                        m.key_url
+                    ),
+                    clawde_api::providers::MetaLookup::MissingProvider => {
+                        "Type the API key manually; credentials are never suggested".to_string()
+                    }
+                };
                 if let Some(hint) = crate::free_form_arg_hint(
                     &format!("{subcommand} {provider}"),
                     "<api-key>",
-                    "Type the API key manually; credentials are never suggested",
+                    &description,
                     !typed_keys.is_empty(),
                 ) {
                     completions.push(hint);

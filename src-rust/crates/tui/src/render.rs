@@ -4187,7 +4187,9 @@ fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
     let label_width = area.width.saturating_div(3).max(12) as usize;
 
     for (row, suggestion) in suggestions[start..end].iter().enumerate() {
-        let is_selected = start + row == selected;
+        // Faded rows are never selectable, so they never carry the highlight
+        // marker or accent color — only dimmed placeholder styling.
+        let is_selected = start + row == selected && !suggestion.faded;
         let accent_style = if is_selected {
             Style::default()
                 .fg(CLAUDE_ORANGE)

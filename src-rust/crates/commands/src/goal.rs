@@ -34,8 +34,8 @@ impl SlashCommand for GoalCommand {
     fn description(&self) -> &str {
         "Set or manage a durable long-running goal for autonomous work"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut completions = vec![
             ArgCompletion {
                 value: "status".into(),
                 description: "Show current goal status".into(),
@@ -61,7 +61,22 @@ impl SlashCommand for GoalCommand {
                 description: "Request a completion audit".into(),
                 available: true,
             },
-        ]
+        ];
+        // The main argument is a free-form objective (e.g. `/goal migrate the
+        // API to Fastify`). Show a dimmed placeholder hint while the field is
+        // still empty so the popup says what goes next, mirroring the other
+        // free-form hints (/keys, /config set model, /export --output).
+        if partial.trim().is_empty() {
+            if let Some(hint) = super::free_form_arg_hint(
+                "",
+                "<objective>",
+                "Describe the goal to work toward autonomously",
+                false,
+            ) {
+                completions.push(hint);
+            }
+        }
+        completions
     }
     fn help(&self) -> &str {
         "Usage:\n\

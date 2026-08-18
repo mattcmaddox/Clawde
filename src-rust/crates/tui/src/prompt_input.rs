@@ -3411,22 +3411,63 @@ impl PromptInputState {
     }
 
     /// Accept the selected slash/argument completion and append a separator
-    /// when exactly one selectable option remains. This lets a single Tab
-    /// advance through multi-argument commands without requiring a second
-    /// space keystroke. File references never receive the separator.
+    /// so a single Tab advances through multi-argument commands without a
+    /// second space keystroke. An argument completion is a complete token, so
+    /// it always receives the trailing space — even when several options were
+    /// offered — which exposes the next argument's inline hint (`/keys set
+    /// firecrawl ` then the `<api-key>` ghost). Slash commands only receive it
+    /// when the choice was unambiguous (one selectable option). File
+    /// references and history recalls never receive the separator.
+    ///
+    /// Before committing, a bash-style common-prefix pass runs: when several
+    /// options remain, Tab fills the shared prefix instead of committing an
+    /// arbitrary first choice, keeping the popup open so the remaining
+    /// ambiguity stays visible (`/keys set fi` + Tab → `/keys set fire`). A
+    /// repeated Tab at the prefix boundary falls through to the commit below.
     pub fn accept_suggestion_with_auto_space(&mut self) {
+        let fill = {
+            let selectable: Vec<&TypeaheadSuggestion> =
+                self.suggestions.iter().filter(|s| !s.faded).collect();
+            if selectable.len() > 1
+                && selectable.iter().all(|s| {
+                    matches!(
+                        s.source,
+                        TypeaheadSource::SlashCommand | TypeaheadSource::ArgCompletion
+                    )
+                })
+            {
+                let texts: Vec<&str> = selectable.iter().map(|s| s.text.as_str()).collect();
+                let prefix = longest_common_prefix(&texts);
+                if prefix.len() > self.text.len() && prefix.starts_with(&self.text) {
+                    Some(prefix)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(prefix) = fill {
+            self.text = prefix;
+            self.cursor = self.text.len();
+            self.update_token_estimate();
+            return;
+        }
         let Some(index) = self.suggestion_index else {
             return;
         };
+        let Some(suggestion) = self.suggestions.get(index) else {
+            return;
+        };
+        if suggestion.faded {
+            return; // unavailable options are not selectable
+        }
         let selectable_count = self.suggestions.iter().filter(|s| !s.faded).count();
-        let should_append = selectable_count == 1
-            && self.suggestions.get(index).is_some_and(|suggestion| {
-                !suggestion.faded
-                    && matches!(
-                        suggestion.source,
-                        TypeaheadSource::SlashCommand | TypeaheadSource::ArgCompletion
-                    )
-            });
+        let should_append = match suggestion.source {
+            TypeaheadSource::ArgCompletion => true,
+            TypeaheadSource::SlashCommand => selectable_count == 1,
+            TypeaheadSource::FileRef | TypeaheadSource::History => false,
+        };
         self.accept_suggestion();
         if should_append && !self.text.chars().last().is_some_and(char::is_whitespace) {
             self.insert_char(' ');
@@ -3791,6 +3832,65 @@ pub(crate) fn styled_spans_with_keyword_gradient(
 /// multi-line input rows (one per logical line in the text) plus an accent
 /// underline. Suggestions are rendered by the footer, not as a boxed dropdown
 /// here.
+/// If the typeahead carries a faded free-form argument hint (e.g.
+/// `set firecrawl <api-key>`), return the bare `<...>` placeholder token so
+/// the prompt can render it dimmed right after the cursor. Only faded
+/// (non-selectable) ArgCompletion rows qualify — enum values and other
+/// selectable suggestions never ghost.
+fn free_form_hint_placeholder(suggestions: &[TypeaheadSuggestion]) -> Option<String> {
+    suggestions.iter().find_map(|s| {
+        if !(s.faded && s.source == TypeaheadSource::ArgCompletion) {
+            return None;
+        }
+        let value = s.arg_value.as_deref()?;
+        let start = value.rfind('<')?;
+        let placeholder = &value[start..];
+        placeholder.ends_with('>').then(|| placeholder.to_string())
+    })
+}
+
+/// Longest common prefix of the given strings, cut at a char boundary so the
+/// result is always valid UTF-8 on its own. Returns an empty string when the
+/// slice is empty or the strings share no prefix (used by the Tab common-
+/// prefix pass in [`PromptInputState::accept_suggestion_with_auto_space`]).
+fn longest_common_prefix(texts: &[&str]) -> String {
+    let Some(first) = texts.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for other in &texts[1..] {
+        let mut i = 0usize;
+        while i < end && i < other.len() && first.as_bytes()[i] == other.as_bytes()[i] {
+            i += 1;
+        }
+        end = i;
+        if end == 0 {
+            break;
+        }
+    }
+    while end > 0 && !first.is_char_boundary(end) {
+        end -= 1;
+    }
+    first[..end].to_string()
+}
+
+/// Truncate `s` to at most `max_width` display cells, dropping any trailing
+/// characters that would overflow (used to clip the inline ghost hint to the
+/// prompt row).
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in s.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
+}
+
 pub fn render_prompt_input(
     state: &PromptInputState,
     area: Rect,
@@ -4052,6 +4152,44 @@ pub fn render_prompt_input(
                         let cell = &mut buf[(x, row_y)];
                         cell.set_symbol("\u{2588}");
                         cell.set_style(Style::default().fg(text_style.fg.unwrap_or(Color::White)));
+                    }
+                }
+            }
+        }
+    }
+
+    // Inline ghost hint for the next required free-form argument. When the
+    // typeahead carries a faded placeholder (e.g. `set firecrawl <api-key>`)
+    // and the cursor sits at the end of the input, render the placeholder
+    // dimmed right after the cursor so the user sees exactly what to type
+    // and where it goes in the command — no need to read the popup.
+    if focused && state.cursor == state.text.len() && state.vim_mode == VimMode::Insert {
+        if let Some(placeholder) = free_form_hint_placeholder(&state.suggestions) {
+            if let Some((vi, col_in_row)) = cursor_visual {
+                if vi >= scroll_offset {
+                    let display_idx = vi - scroll_offset;
+                    if display_idx < max_text_rows {
+                        let row_y = text_start_y + display_idx as u16;
+                        let start_x = area.x + prefix_width + col_in_row as u16 + 1;
+                        let avail = area.x + area.width - start_x;
+                        if avail > 0 {
+                            let ghost = truncate_to_width(&placeholder, avail as usize);
+                            Paragraph::new(Line::from(vec![Span::styled(
+                                ghost,
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::DIM),
+                            )]))
+                            .render(
+                                Rect {
+                                    x: start_x,
+                                    y: row_y,
+                                    width: avail,
+                                    height: 1,
+                                },
+                                buf,
+                            );
+                        }
                     }
                 }
             }
@@ -4381,6 +4519,146 @@ mod tests {
         );
 
         assert_eq!(buf[(4, 1)].symbol(), "\u{2588}");
+    }
+
+    // ---- free-form ghost hint ------------------------------------------
+
+    #[test]
+    fn free_form_hint_placeholder_extracts_bare_token() {
+        // The hint's arg_value includes the typed prefix; only the bare
+        // `<...>` token should ghost inline.
+        let s = vec![TypeaheadSuggestion {
+            text: "/keys set firecrawl <api-key>".to_string(),
+            description: "Type the API key manually".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("set firecrawl <api-key>".to_string()),
+        }];
+        assert_eq!(free_form_hint_placeholder(&s).as_deref(), Some("<api-key>"));
+    }
+
+    #[test]
+    fn free_form_hint_placeholder_multitoken_placeholder() {
+        // <file path> contains a space; rfind('<') must not split it.
+        let s = vec![TypeaheadSuggestion {
+            text: "/export --output <file path>".to_string(),
+            description: "Path to write the export to".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("--output <file path>".to_string()),
+        }];
+        assert_eq!(
+            free_form_hint_placeholder(&s).as_deref(),
+            Some("<file path>")
+        );
+    }
+
+    #[test]
+    fn free_form_hint_placeholder_ignores_selectable_suggestions() {
+        let s = vec![TypeaheadSuggestion {
+            text: "/effort medium".to_string(),
+            description: "Balanced approach".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: false,
+            arg_value: Some("medium".to_string()),
+        }];
+        assert_eq!(free_form_hint_placeholder(&s), None);
+    }
+
+    #[test]
+    fn free_form_hint_placeholder_ignores_plain_faded_rows() {
+        // /logout shows dimmed informational rows (profile names) that are
+        // faded but NOT free-form hints — no `<...>` token, no ghost.
+        let s = vec![TypeaheadSuggestion {
+            text: "/logout anthropic-default".to_string(),
+            description: "Active Anthropic profile".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("anthropic-default".to_string()),
+        }];
+        assert_eq!(free_form_hint_placeholder(&s), None);
+    }
+
+    #[test]
+    fn truncate_to_width_clips_at_cell_boundary() {
+        assert_eq!(truncate_to_width("<api-key>", 5), "<api-");
+        assert_eq!(truncate_to_width("<api-key>", 9), "<api-key>");
+        // Wide chars count as 2 cells each.
+        assert_eq!(truncate_to_width("你a", 2), "你");
+        assert_eq!(truncate_to_width("你a", 3), "你a");
+    }
+
+    #[test]
+    fn render_inline_ghost_hint_after_cursor() {
+        let mut s = PromptInputState::new();
+        s.text = "/keys set firecrawl ".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "/keys set firecrawl <api-key>".to_string(),
+            description: "Type the API key manually".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("set firecrawl <api-key>".to_string()),
+        }];
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        render_prompt_input(
+            &s,
+            area,
+            &mut buf,
+            true,
+            InputMode::Default,
+            Color::Blue,
+            false,
+        );
+
+        // Text row: "> /keys set firecrawl " then cursor block then ghost.
+        // prefix is "> " (2 cells); text width is 20; cursor at column 22;
+        // ghost starts at column 2 + 20 + 1 = 23.
+        assert_eq!(buf[(23, 1)].symbol(), "<");
+        assert_eq!(buf[(31, 1)].symbol(), ">");
+        // The cursor block still occupies its own cell before the ghost.
+        assert_eq!(buf[(22, 1)].symbol(), "\u{2588}");
+    }
+
+    #[test]
+    fn render_no_ghost_when_cursor_mid_text() {
+        let mut s = PromptInputState::new();
+        s.text = "/keys set firecrawl ".to_string();
+        s.cursor = 6; // mid-text
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "/keys set firecrawl <api-key>".to_string(),
+            description: "Type the API key manually".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("set firecrawl <api-key>".to_string()),
+        }];
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        render_prompt_input(
+            &s,
+            area,
+            &mut buf,
+            true,
+            InputMode::Default,
+            Color::Blue,
+            false,
+        );
+
+        // No ghost: the '<' of <api-key> must not appear at column 23.
+        assert_ne!(buf[(23, 1)].symbol(), "<");
     }
 
     #[test]
@@ -4926,8 +5204,45 @@ mod tests {
     }
 
     #[test]
-    fn multiple_argument_options_do_not_append_space() {
+    fn tab_fills_common_prefix_instead_of_committing() {
+        // `/keys set fi` + Tab: both options share `/keys set fire`, so Tab
+        // fills the shared prefix and keeps the popup open instead of
+        // committing an arbitrary first provider.
         let mut s = PromptInputState::new();
+        s.text = "/keys set fi".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![
+            TypeaheadSuggestion {
+                text: "/keys set firecrawl".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("firecrawl".to_string()),
+            },
+            TypeaheadSuggestion {
+                text: "/keys set fireworks".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("fireworks".to_string()),
+            },
+        ];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "/keys set fire");
+        assert_eq!(s.cursor, s.text.len());
+        // Popup stays open — no commit happened.
+        assert_eq!(s.suggestions.len(), 2);
+    }
+
+    #[test]
+    fn tab_at_prefix_boundary_commits_with_space() {
+        // Second Tab at the common-prefix boundary falls through to the
+        // normal commit: first option plus the argument separator, which
+        // exposes the next argument's inline hint.
+        let mut s = PromptInputState::new();
+        s.text = "/permissions allow ".to_string();
+        s.cursor = s.text.len();
         s.suggestions = vec![
             TypeaheadSuggestion {
                 text: "/permissions allow Bash".to_string(),
@@ -4946,7 +5261,90 @@ mod tests {
         ];
         s.suggestion_index = Some(0);
         s.accept_suggestion_with_auto_space();
-        assert_eq!(s.text, "/permissions allow Bash");
+        assert_eq!(s.text, "/permissions allow Bash ");
+    }
+
+    #[test]
+    fn tab_common_prefix_ignores_faded_rows() {
+        // Only selectable rows participate in the common-prefix fill — a
+        // faded hint (e.g. `<api-key>`) must not distort the shared prefix.
+        let mut s = PromptInputState::new();
+        s.text = "/keys set fi".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![
+            TypeaheadSuggestion {
+                text: "/keys set firecrawl".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("firecrawl".to_string()),
+            },
+            TypeaheadSuggestion {
+                text: "/keys set fireworks".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("fireworks".to_string()),
+            },
+            TypeaheadSuggestion {
+                text: "/keys set firecrawl <api-key>".to_string(),
+                description: "Type the API key manually".to_string(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: true,
+                arg_value: Some("firecrawl <api-key>".to_string()),
+            },
+        ];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "/keys set fire");
+    }
+
+    #[test]
+    fn longest_common_prefix_basics() {
+        assert_eq!(longest_common_prefix(&[]), "");
+        assert_eq!(longest_common_prefix(&["firecrawl"]), "firecrawl");
+        assert_eq!(longest_common_prefix(&["firecrawl", "fireworks"]), "fire");
+        assert_eq!(longest_common_prefix(&["set", "add"]), "");
+        assert_eq!(
+            longest_common_prefix(&["/keys set firecrawl", "/keys set firecrawl <api-key>"]),
+            "/keys set firecrawl"
+        );
+        // Char-boundary safe: the common prefix never splits a multi-byte char.
+        assert_eq!(
+            longest_common_prefix(&["\u{e9}lan", "\u{e9}cole"]),
+            "\u{e9}"
+        );
+    }
+
+    #[test]
+    fn multiple_slash_command_options_do_not_append_space() {
+        // Several matching slash commands are an ambiguous choice — Tab
+        // commits the first but leaves the text without a trailing space so
+        // the user keeps typing a distinguishing prefix. (The common prefix
+        // of `/effort` and `/export` is `/e`, already fully typed, so the
+        // fill pass leaves the commit untouched.)
+        let mut s = PromptInputState::new();
+        s.text = "/e".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![
+            TypeaheadSuggestion {
+                text: "/effort".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::SlashCommand,
+                faded: false,
+                arg_value: None,
+            },
+            TypeaheadSuggestion {
+                text: "/export".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::SlashCommand,
+                faded: false,
+                arg_value: None,
+            },
+        ];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "/effort");
     }
 
     #[test]

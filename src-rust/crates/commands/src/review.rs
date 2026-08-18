@@ -30,6 +30,21 @@ impl SlashCommand for ReviewCommand {
            /review main       # diff from main..HEAD\n\
            /review origin/main"
     }
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        // The base git ref is a free-form value that cannot be completed.
+        // Show a dimmed placeholder hint while it is still empty so the
+        // popup says what goes next instead of showing nothing.
+        if let Some(hint) = super::free_form_arg_hint(
+            "",
+            "<git-ref>",
+            "Base git ref to diff against (e.g. main); empty = staged changes",
+            !partial.trim().is_empty(),
+        ) {
+            vec![hint]
+        } else {
+            vec![]
+        }
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let base = args.trim();

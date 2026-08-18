@@ -80,8 +80,8 @@ impl SlashCommand for PlanCommand {
     fn description(&self) -> &str {
         "Enter, view, or manage plan mode"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut completions = vec![
             ArgCompletion {
                 value: "open".into(),
                 description: "Open the plan file in your $EDITOR".into(),
@@ -92,7 +92,21 @@ impl SlashCommand for PlanCommand {
                 description: "Leave plan mode and resume normal execution".into(),
                 available: true,
             },
-        ]
+        ];
+        // The main argument is a free-form task description (e.g. `/plan add
+        // a login page`). Show a dimmed placeholder hint while the field is
+        // still empty so the popup says what goes next.
+        if partial.trim().is_empty() {
+            if let Some(hint) = super::free_form_arg_hint(
+                "",
+                "<description>",
+                "Describe the task to plan, or use open/exit",
+                false,
+            ) {
+                completions.push(hint);
+            }
+        }
+        completions
     }
     fn help(&self) -> &str {
         "Usage: /plan [open|<description>|exit]\n\n\

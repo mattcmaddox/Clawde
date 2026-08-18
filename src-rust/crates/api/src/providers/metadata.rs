@@ -122,6 +122,11 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "platform.deepseek.com/api_keys",
     },
     ProviderMetadata {
+        id: "firecrawl",
+        env_var: "FIRECRAWL_API_KEY",
+        key_url: "firecrawl.dev",
+    },
+    ProviderMetadata {
         id: "fireworks",
         env_var: "FIREWORKS_API_KEY",
         key_url: "the provider's website",

@@ -3073,12 +3073,18 @@ async fn run_interactive(
         |cmd_name: &str, partial: &str| -> Vec<clawde_tui::prompt_input::TypeaheadSuggestion> {
             clawde_commands::get_arg_completions(cmd_name, partial)
                 .into_iter()
-                .map(|ac| clawde_tui::prompt_input::TypeaheadSuggestion {
-                    text: format!("/{} {}", cmd_name, ac.value),
-                    description: ac.description,
-                    source: clawde_tui::prompt_input::TypeaheadSource::ArgCompletion,
-                    faded: !ac.available,
-                    arg_value: Some(ac.value),
+                .map(|ac| {
+                    let display = clawde_commands::strip_typed_path(&ac.value, partial);
+                    clawde_tui::prompt_input::TypeaheadSuggestion {
+                        // Insertion keeps the full path (`/keys set firecrawl`).
+                        text: format!("/{} {}", cmd_name, ac.value),
+                        description: ac.description,
+                        source: clawde_tui::prompt_input::TypeaheadSource::ArgCompletion,
+                        faded: !ac.available,
+                        // Display shows only the bare remainder (`firecrawl`),
+                        // not the already-typed `set ` path.
+                        arg_value: Some(display),
+                    }
                 })
                 .collect()
         },
