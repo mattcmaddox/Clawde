@@ -8,7 +8,7 @@
 //   (none)              → DuckDuckGo (fallback, Instant Answers only)
 //
 // Cooldown tracking is used for Firecrawl keys: after a key is exhausted
-// (429/401/403), it is skipped for a cooldown period before being retried.
+// (429/401/403/5xx), it is skipped for a cooldown period before being retried.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -29,43 +29,68 @@ pub struct WebSearchTool;
 /// Persisted cooldown entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FirecrawlCooldownEntry {
-    /// The API key.
-    key: String,
+    /// SHA-256 fingerprint of the API key. The raw credential is never written.
+    #[serde(alias = "key")]
+    key_id: String,
     /// Unix timestamp (seconds since epoch) when this key can be retried.
     cooldown_until_secs: u64,
-    /// Human-readable reason for the cooldown.
-    reason: String,
 }
+
+const FIRECRAWL_COOLDOWN_FILE: &str = "firecrawl_cooldowns.json";
+const FIRECRAWL_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESULT_FIELD_CHARS: usize = 2_000;
+const MAX_SEARCH_OUTPUT_CHARS: usize = 20_000;
 
 /// Returns the path to the Firecrawl cooldown state file.
 fn cooldown_state_path() -> PathBuf {
     let dir = clawde_core::config::Settings::config_dir();
-    dir.join("firecrawl_cooldowns.json")
+    dir.join(FIRECRAWL_COOLDOWN_FILE)
 }
 
-/// Global cooldown tracker for Firecrawl API keys.
-/// Maps key → Instant when the key was exhausted and should be skipped.
+/// Return a stable, non-secret identifier for a Firecrawl API key.
+pub fn firecrawl_key_fingerprint(key: &str) -> String {
+    format!(
+        "sha256:{}",
+        clawde_core::crypto_utils::sha256_hex_str(key.trim())
+    )
+}
+
+/// Return a short non-secret label suitable for CLI/TUI display.
+pub fn firecrawl_key_label(key: &str) -> String {
+    let fingerprint = firecrawl_key_fingerprint(key);
+    format!("fc-{}", &fingerprint["sha256:".len()..][..10])
+}
+
+/// Global cooldown tracker for Firecrawl key fingerprints.
 static FIRECRAWL_COOLDOWNS: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn firecrawl_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
     FIRECRAWL_COOLDOWNS.get_or_init(|| {
         let m = std::sync::Mutex::new(HashMap::new());
-        // Load persisted state on first access.
+        let mut legacy_state = false;
         if let Ok(entries) = load_cooldowns_from_disk() {
             if let Ok(mut guard) = m.lock() {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let now = Instant::now();
                 for entry in entries {
-                    let until = Instant::now()
-                        + Duration::from_secs(
-                            entry.cooldown_until_secs.saturating_sub(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            ),
-                        );
-                    if Instant::now() < until {
-                        guard.insert(entry.key, until);
+                    let key_id = if entry.key_id.starts_with("sha256:") {
+                        entry.key_id
+                    } else {
+                        // Migrate the old plaintext-key format in memory; the
+                        // next persistence pass rewrites it as a fingerprint.
+                        legacy_state = true;
+                        firecrawl_key_fingerprint(&entry.key_id)
+                    };
+                    let remaining = entry.cooldown_until_secs.saturating_sub(now_secs);
+                    if remaining > 0 {
+                        guard.insert(key_id, now + Duration::from_secs(remaining));
                     }
+                }
+                if legacy_state {
+                    persist_cooldowns_snapshot(&guard);
                 }
             }
         }
@@ -73,29 +98,19 @@ fn firecrawl_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Instant>> 
     })
 }
 
-/// Persist current cooldowns to disk.
-fn persist_cooldowns() {
-    let guard = match firecrawl_cooldowns().lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+fn persist_cooldowns_snapshot(cooldowns: &HashMap<String, Instant>) {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let entries: Vec<FirecrawlCooldownEntry> = guard
+    let entries: Vec<FirecrawlCooldownEntry> = cooldowns
         .iter()
-        .map(|(key, until)| {
-            let cooldown_until_secs =
-                now_secs + until.saturating_duration_since(Instant::now()).as_secs();
-            FirecrawlCooldownEntry {
-                key: key.clone(),
-                cooldown_until_secs,
-                reason: String::new(),
-            }
+        .map(|(key_id, until)| FirecrawlCooldownEntry {
+            key_id: key_id.clone(),
+            cooldown_until_secs: now_secs
+                + until.saturating_duration_since(Instant::now()).as_secs(),
         })
         .collect();
-    drop(guard);
 
     if let Ok(json) = serde_json::to_string_pretty(&entries) {
         if let Some(parent) = cooldown_state_path().parent() {
@@ -103,6 +118,14 @@ fn persist_cooldowns() {
         }
         let _ = std::fs::write(cooldown_state_path(), json);
     }
+}
+
+/// Persist current cooldowns to disk.
+fn persist_cooldowns() {
+    let Ok(guard) = firecrawl_cooldowns().lock() else {
+        return;
+    };
+    persist_cooldowns_snapshot(&guard);
 }
 
 /// Load persisted cooldown entries from disk.
@@ -115,26 +138,44 @@ fn load_cooldowns_from_disk() -> Result<Vec<FirecrawlCooldownEntry>, String> {
     serde_json::from_str(&content).map_err(|e| e.to_string())
 }
 
+fn cooldown_until(key_id: &str) -> Option<Instant> {
+    firecrawl_cooldowns()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(key_id).copied())
+}
+
+fn set_cooldown(key_id: String, until: Instant) {
+    if let Ok(mut guard) = firecrawl_cooldowns().lock() {
+        guard.insert(key_id, until);
+    }
+}
+
+fn clear_cooldown(key_id: &str) {
+    if let Ok(mut guard) = firecrawl_cooldowns().lock() {
+        guard.remove(key_id);
+    }
+}
+
 /// Public API: return the health summary for Firecrawl keys.
-/// Each tuple is (key_preview, is_active, cooldown_remaining_secs).
+/// Each tuple is (key_fingerprint, is_active, cooldown_remaining_secs).
 /// Used by /keys health firecrawl.
 pub fn firecrawl_key_health() -> Vec<(String, bool, u64)> {
-    let guard = match firecrawl_cooldowns().lock() {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
+    let Ok(guard) = firecrawl_cooldowns().lock() else {
+        return Vec::new();
     };
     let now = Instant::now();
     let mut results: Vec<(String, bool, u64)> = guard
         .iter()
-        .map(|(key, until)| {
+        .map(|(key_id, until)| {
             if now < *until {
                 (
-                    key.clone(),
+                    key_id.clone(),
                     false,
                     until.saturating_duration_since(now).as_secs(),
                 )
             } else {
-                (key.clone(), true, 0)
+                (key_id.clone(), true, 0)
             }
         })
         .collect();
@@ -148,6 +189,7 @@ mod cooldown {
     pub const RATE_LIMIT: Duration = Duration::from_secs(60);
     pub const AUTH_FAILURE: Duration = Duration::from_secs(300);
     pub const NETWORK_ERROR: Duration = Duration::from_secs(30);
+    pub const SERVER_ERROR: Duration = Duration::from_secs(30);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +260,67 @@ fn parse_comma_separated(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Resolve the backend override. An explicit environment value wins over the
+/// persisted setting, while empty/`auto` values leave automatic fallback on.
+fn preferred_backend_from_values(env_value: Option<&str>, configured: &str) -> Option<String> {
+    env_value
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!configured.trim().is_empty()).then_some(configured))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| value != "auto")
+}
+
+/// Remove terminal control characters, collapse whitespace, and cap remote text.
+fn clean_result_field(value: &str, max_chars: usize) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_control() {
+                matches!(ch, '\n' | '\r' | '\t').then_some(' ')
+            } else {
+                Some(ch)
+            }
+        })
+        .collect();
+    let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&normalized, max_chars)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    }
+}
+
+fn firecrawl_response_error(data: &Value) -> Option<String> {
+    if data.get("success").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let message = data
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("message").and_then(Value::as_str))
+        .unwrap_or("Firecrawl returned an unsuccessful response");
+    Some(clean_result_field(message, MAX_RESULT_FIELD_CHARS))
+}
+
+fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn is_retryable_firecrawl_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
+}
+
 /// Collect Firecrawl API keys from all sources: env var first, then AuthStore.
 pub fn collect_firecrawl_keys() -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
@@ -236,8 +339,9 @@ pub fn collect_firecrawl_keys() -> Vec<String> {
     let store = clawde_core::AuthStore::load();
     if let Some(stored_keys) = store.keys_for("firecrawl") {
         for key in stored_keys {
-            if seen.insert(key.clone()) {
-                keys.push(key.clone());
+            let trimmed = key.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                keys.push(trimmed.to_string());
             }
         }
     }
@@ -295,7 +399,8 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        if let Err(error) = ctx.ensure_network_allowed_for_tool(self.name(), true) {
+        if let Err(error) = ctx.ensure_network_allowed_for_tool(self.name(), self.network_capable())
+        {
             return ToolResult::error(error.to_string());
         }
         let params: WebSearchInput = match serde_json::from_value(input) {
@@ -306,66 +411,85 @@ impl Tool for WebSearchTool {
         let num_results = params.num_results.clamp(1, 10);
         debug!(query = %params.query, num_results, "Web search");
 
-        // Optional: respect PREFERRED_SEARCH_BACKEND env var to pin to a
-        // specific backend. Valid values: "searxng", "firecrawl", "duckduckgo".
-        let preferred = std::env::var("PREFERRED_SEARCH_BACKEND").ok();
+        // An explicit environment override wins over the persisted setting.
+        let configured_backend = clawde_core::config::Settings::load_sync()
+            .ok()
+            .map(|settings| settings.preferred_search_backend)
+            .unwrap_or_default();
+        let preferred = preferred_backend_from_values(
+            std::env::var("PREFERRED_SEARCH_BACKEND").ok().as_deref(),
+            &configured_backend,
+        );
 
-        if let Some(ref pref) = preferred {
-            match pref.as_str() {
+        if let Some(pref) = preferred.as_deref() {
+            match pref {
                 "searxng" => {
-                    if let Ok(env_val) = std::env::var("SEARXNG_URL") {
-                        let urls = parse_comma_separated(&env_val);
-                        if !urls.is_empty() {
-                            return search_searxng(&params.query, num_results, &urls).await;
-                        }
+                    let urls = std::env::var("SEARXNG_URL")
+                        .ok()
+                        .map(|value| parse_comma_separated(&value))
+                        .unwrap_or_default();
+                    if urls.is_empty() {
+                        return ToolResult::error(
+                            "Preferred SearXNG backend has no SEARXNG_URL configured.".to_string(),
+                        );
                     }
-                    return ToolResult::error(
-                        "PREFERRED_SEARCH_BACKEND=searxng but SEARXNG_URL is not set.".to_string(),
-                    );
+                    return search_searxng(&params.query, num_results, &urls).await;
                 }
                 "firecrawl" => {
                     let fc_keys = collect_firecrawl_keys();
-                    if !fc_keys.is_empty() {
-                        let fc_refs: Vec<&str> = fc_keys.iter().map(|s| s.as_str()).collect();
-                        return search_firecrawl(&params.query, num_results, &fc_refs).await;
+                    if fc_keys.is_empty() {
+                        return ToolResult::error(
+                            "Preferred Firecrawl backend has no API keys configured.".to_string(),
+                        );
                     }
-                    return ToolResult::error(
-                        "PREFERRED_SEARCH_BACKEND=firecrawl but no Firecrawl keys configured."
-                            .to_string(),
-                    );
+                    let fc_refs: Vec<&str> = fc_keys.iter().map(String::as_str).collect();
+                    return search_firecrawl(&params.query, num_results, &fc_refs).await;
                 }
-                "duckduckgo" => {
-                    return search_duckduckgo(&params.query, num_results).await;
-                }
+                "duckduckgo" => return search_duckduckgo(&params.query, num_results).await,
                 other => {
-                    debug!(
-                        "Unknown PREFERRED_SEARCH_BACKEND '{}' — falling through to auto",
+                    return ToolResult::error(format!(
+                        "Unknown preferred search backend '{}'. Valid values: auto, searxng, firecrawl, duckduckgo.",
                         other
-                    );
+                    ));
                 }
             }
         }
 
-        // The tool tries SearXNG first, then Firecrawl Search, then DuckDuckGo
-        // as a final fallback.
-        //
-        // SearXNG: supports comma-separated URLs for rotation.
+        // Auto mode tries each configured backend and continues after a
+        // failure. A configured but unavailable SearXNG/Firecrawl instance
+        // must not disable the later fallbacks.
+        let mut backend_errors = Vec::new();
+
         if let Ok(env_val) = std::env::var("SEARXNG_URL") {
             let urls = parse_comma_separated(&env_val);
             if !urls.is_empty() {
-                return search_searxng(&params.query, num_results, &urls).await;
+                let result = search_searxng(&params.query, num_results, &urls).await;
+                if !result.is_error {
+                    return result;
+                }
+                backend_errors.push(format!("SearXNG: {}", result.content));
             }
         }
 
-        // Firecrawl: keys from env var + AuthStore, with cooldown tracking.
         let fc_keys = collect_firecrawl_keys();
         if !fc_keys.is_empty() {
-            let fc_refs: Vec<&str> = fc_keys.iter().map(|s| s.as_str()).collect();
-            return search_firecrawl(&params.query, num_results, &fc_refs).await;
+            let fc_refs: Vec<&str> = fc_keys.iter().map(String::as_str).collect();
+            let result = search_firecrawl(&params.query, num_results, &fc_refs).await;
+            if !result.is_error {
+                return result;
+            }
+            backend_errors.push(format!("Firecrawl: {}", result.content));
         }
 
-        // DuckDuckGo: final fallback.
-        search_duckduckgo(&params.query, num_results).await
+        let result = search_duckduckgo(&params.query, num_results).await;
+        if result.is_error && !backend_errors.is_empty() {
+            return ToolResult::error(format!(
+                "All configured search backends failed.\n{}\nDuckDuckGo: {}",
+                backend_errors.join("\n"),
+                result.content
+            ));
+        }
+        result
     }
 }
 
@@ -419,25 +543,7 @@ async fn search_searxng(query: &str, num_results: usize, urls: &[String]) -> Too
             }
         };
 
-        let mut output = String::new();
-        if let Some(items) = data.get("results").and_then(|r| r.as_array()) {
-            for (i, item) in items.iter().take(num_results).enumerate() {
-                let title = item
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("(No title)");
-                let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                let snippet = item.get("content").and_then(|s| s.as_str()).unwrap_or("");
-                output.push_str(&format!(
-                    "{}. **{}**\n   URL: {}\n   {}\n\n",
-                    i + 1,
-                    title,
-                    url,
-                    snippet
-                ));
-            }
-        }
-
+        let output = format_searxng_results(&data, num_results);
         record_backend("searxng");
         if output.is_empty() {
             return ToolResult::success("No results found.".to_string());
@@ -449,109 +555,140 @@ async fn search_searxng(query: &str, num_results: usize, urls: &[String]) -> Too
     ToolResult::error(msg)
 }
 
+fn format_searxng_results(data: &Value, max: usize) -> String {
+    let mut output = String::new();
+    if let Some(items) = data.get("results").and_then(Value::as_array) {
+        for (i, item) in items.iter().take(max).enumerate() {
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_else(|| "(No title)".to_string());
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
+            let snippet = item
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "{}. **{}**\n   URL: {}\n   {}\n\n",
+                i + 1,
+                title,
+                url,
+                snippet
+            ));
+        }
+    }
+    truncate_chars(&output, MAX_SEARCH_OUTPUT_CHARS)
+}
+
 /// Search using the Firecrawl Search API (v2) with key rotation and cooldown tracking.
 ///
 /// `keys` can contain one or more API keys. The function:
 /// 1. Skips any key currently in cooldown (from a previous exhaustion).
-/// 2. Tries keys in order; on rate-limit (429) or auth-failure (401/403), records
-///    a cooldown and tries the next key.
+/// 2. Tries keys in order; on rate-limit (429), auth-failure (401/403), or
+///    transient server errors (5xx), records a cooldown and tries the next key.
 /// 3. On network errors, also rotates to the next key with a shorter cooldown.
-/// 4. All other errors are returned immediately.
+/// 4. Non-retryable errors are returned immediately.
 ///
 /// API docs: https://docs.firecrawl.dev/api-reference/endpoint/search
 async fn search_firecrawl(query: &str, num_results: usize, keys: &[&str]) -> ToolResult {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(FIRECRAWL_HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let body = json!({
         "query": query,
         "limit": num_results,
     });
 
     let mut last_error: Option<String> = None;
-    let now = Instant::now();
 
     for (idx, api_key) in keys.iter().enumerate() {
-        // Skip keys that are still in cooldown.
-        {
-            let cd_map = firecrawl_cooldowns().lock().unwrap();
-            if let Some(&cooldown_until) = cd_map.get(*api_key) {
-                if now < cooldown_until {
-                    last_error = Some(format!(
-                        "Firecrawl key {} in cooldown for {:?}",
-                        idx + 1,
-                        cooldown_until.saturating_duration_since(now)
-                    ));
-                    continue;
-                }
+        let key_id = firecrawl_key_fingerprint(api_key);
+        let now = Instant::now();
+
+        if let Some(until) = cooldown_until(&key_id) {
+            if now < until {
+                last_error = Some(format!(
+                    "Firecrawl key {} in cooldown for {:?}",
+                    idx + 1,
+                    until.saturating_duration_since(now)
+                ));
+                continue;
             }
         }
 
-        let resp = match client
+        let response = client
             .post("https://api.firecrawl.dev/v2/search")
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = format!("Firecrawl request failed (key {}): {}", idx + 1, e);
-                last_error = Some(msg.clone());
-                // Mark as cooldown for network errors too.
-                firecrawl_cooldowns()
-                    .lock()
-                    .unwrap()
-                    .insert(api_key.to_string(), now + cooldown::NETWORK_ERROR);
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let message = format!("Firecrawl request failed (key {}): {}", idx + 1, error);
+                last_error = Some(message);
+                set_cooldown(key_id, Instant::now() + cooldown::NETWORK_ERROR);
                 continue;
             }
         };
 
-        let status = resp.status().as_u16();
-        if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            let err_msg = format!(
+        let status = response.status().as_u16();
+        let retry_after = retry_after_duration(&response);
+        if !response.status().is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            let message = format!(
                 "Firecrawl API returned status {} (key {}): {}",
                 status,
                 idx + 1,
-                body_text
+                clean_result_field(&body_text, MAX_RESULT_FIELD_CHARS)
             );
-            // Rotate on rate-limit or auth-failure — likely a free-tier key that's exhausted.
-            if status == 429 || status == 401 || status == 403 {
-                let cooldown = if status == 429 {
-                    cooldown::RATE_LIMIT
-                } else {
-                    cooldown::AUTH_FAILURE
-                };
-                firecrawl_cooldowns()
-                    .lock()
-                    .unwrap()
-                    .insert(api_key.to_string(), now + cooldown);
-                last_error = Some(err_msg);
+            if is_retryable_firecrawl_status(status) {
+                let cooldown = retry_after.unwrap_or(match status {
+                    401 | 403 => cooldown::AUTH_FAILURE,
+                    429 => cooldown::RATE_LIMIT,
+                    _ => cooldown::SERVER_ERROR,
+                });
+                set_cooldown(key_id, Instant::now() + cooldown);
+                last_error = Some(message);
                 continue;
             }
-            return ToolResult::error(err_msg);
+            persist_cooldowns();
+            return ToolResult::error(message);
         }
 
-        // Success! Clear any previous cooldown for this key.
-        {
-            firecrawl_cooldowns().lock().unwrap().remove(*api_key);
-        }
+        clear_cooldown(&key_id);
         persist_cooldowns();
 
-        record_backend("firecrawl");
-
-        let data: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolResult::error(format!("Failed to parse Firecrawl response: {}", e))
+        let body_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                return ToolResult::error(format!("Failed to read Firecrawl response: {}", error));
             }
         };
+        let data: Value = match serde_json::from_str(&body_text) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolResult::error(format!("Failed to parse Firecrawl response: {}", error));
+            }
+        };
+        if let Some(error) = firecrawl_response_error(&data) {
+            return ToolResult::error(format!("Firecrawl search failed: {}", error));
+        }
 
+        record_backend("firecrawl");
         let results = format_firecrawl_results(&data, num_results);
         return ToolResult::success(format!("[via Firecrawl]\n{}", results));
     }
 
-    // All keys exhausted — persist final state and include note in error.
     persist_cooldowns();
     let msg = last_error.unwrap_or_else(|| "All Firecrawl API keys exhausted.".to_string());
     ToolResult::error(msg)
@@ -568,13 +705,19 @@ fn format_firecrawl_results(data: &Value, max: usize) -> String {
         for (i, item) in items.iter().take(max).enumerate() {
             let title = item
                 .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("(No title)");
-            let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_else(|| "(No title)".to_string());
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
             let snippet = item
                 .get("description")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
 
             output.push_str(&format!(
                 "{}. **{}**\n   URL: {}\n   {}\n\n",
@@ -589,14 +732,17 @@ fn format_firecrawl_results(data: &Value, max: usize) -> String {
     if output.is_empty() {
         "No results found.".to_string()
     } else {
-        output
+        truncate_chars(&output, MAX_SEARCH_OUTPUT_CHARS)
     }
 }
 
 /// Fallback: DuckDuckGo Instant Answer API.
 /// Note: this doesn't return full search results, only instant answers.
 async fn search_duckduckgo(query: &str, num_results: usize) -> ToolResult {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let url = format!(
         "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
         urlencoding_simple(query)
@@ -636,12 +782,15 @@ fn format_ddg_results(data: &Value, max: usize) -> String {
         if !abstract_text.is_empty() {
             let source = data
                 .get("AbstractSource")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
+            let abstract_text = clean_result_field(abstract_text, MAX_RESULT_FIELD_CHARS);
             let url = data
                 .get("AbstractURL")
-                .and_then(|u| u.as_str())
-                .unwrap_or("");
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_default();
             output.push_str(&format!(
                 "**{}**\n{}\nURL: {}\n\n",
                 source, abstract_text, url
@@ -655,7 +804,12 @@ fn format_ddg_results(data: &Value, max: usize) -> String {
         for topic in topics.iter().take(max.saturating_sub(count)) {
             if let Some(text) = topic.get("Text").and_then(|t| t.as_str()) {
                 if !text.is_empty() {
-                    let url = topic.get("FirstURL").and_then(|u| u.as_str()).unwrap_or("");
+                    let text = clean_result_field(text, MAX_RESULT_FIELD_CHARS);
+                    let url = topic
+                        .get("FirstURL")
+                        .and_then(Value::as_str)
+                        .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                        .unwrap_or_default();
                     output.push_str(&format!("- {}\n  {}\n\n", text, url));
                 }
             }
@@ -667,11 +821,12 @@ fn format_ddg_results(data: &Value, max: usize) -> String {
             "No instant answer found for '{}'. Try using the Firecrawl Search API \
              by setting the FIRECRAWL_API_KEY environment variable for full web search.",
             data.get("QuerySearchQuery")
-                .and_then(|q| q.as_str())
-                .unwrap_or("your query")
+                .and_then(Value::as_str)
+                .map(|value| clean_result_field(value, MAX_RESULT_FIELD_CHARS))
+                .unwrap_or_else(|| "your query".to_string())
         )
     } else {
-        output
+        truncate_chars(&output, MAX_SEARCH_OUTPUT_CHARS)
     }
 }
 
@@ -692,4 +847,144 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_fingerprint_and_label_never_expose_the_key() {
+        let key = "fc-secret-key-123456789";
+        let fingerprint = firecrawl_key_fingerprint(key);
+        let label = firecrawl_key_label(key);
+
+        assert!(fingerprint.starts_with("sha256:"));
+        assert!(!fingerprint.contains(key));
+        assert!(label.starts_with("fc-"));
+        assert!(!label.contains(key));
+        assert_eq!(fingerprint, firecrawl_key_fingerprint(key));
+    }
+
+    #[test]
+    fn preferred_backend_uses_environment_before_config() {
+        assert_eq!(
+            preferred_backend_from_values(Some(" FIRECRAWL "), "duckduckgo"),
+            Some("firecrawl".to_string())
+        );
+        assert_eq!(
+            preferred_backend_from_values(None, "firecrawl"),
+            Some("firecrawl".to_string())
+        );
+        assert_eq!(preferred_backend_from_values(None, "auto"), None);
+        assert_eq!(
+            parse_comma_separated(" https://one.example, ,https://two.example "),
+            vec!["https://one.example", "https://two.example"]
+        );
+    }
+
+    #[test]
+    fn legacy_cooldown_entry_deserializes_without_retaining_plaintext_shape() {
+        let entry: FirecrawlCooldownEntry = serde_json::from_value(json!({
+            "key": "legacy-secret",
+            "cooldown_until_secs": 123,
+            "reason": "rate limited"
+        }))
+        .expect("legacy cooldown entry should remain readable");
+        assert_eq!(entry.key_id, "legacy-secret");
+        assert_eq!(
+            firecrawl_key_fingerprint(&entry.key_id),
+            firecrawl_key_fingerprint("legacy-secret")
+        );
+    }
+
+    #[test]
+    fn unsuccessful_firecrawl_envelope_is_reported() {
+        let response = json!({"success": false, "error": "request timed out"});
+        assert_eq!(
+            firecrawl_response_error(&response).as_deref(),
+            Some("request timed out")
+        );
+        assert!(firecrawl_response_error(&json!({"data": {"web": []}})).is_none());
+    }
+
+    #[test]
+    fn firecrawl_retry_statuses_include_transient_server_errors() {
+        assert!(is_retryable_firecrawl_status(401));
+        assert!(is_retryable_firecrawl_status(429));
+        assert!(is_retryable_firecrawl_status(503));
+        assert!(!is_retryable_firecrawl_status(400));
+    }
+
+    #[test]
+    fn remote_result_text_is_sanitized_and_bounded() {
+        let cleaned = clean_result_field("title\u{1b}[31m\nwith\tcontrol", 30);
+        assert_eq!(cleaned, "title[31m with control");
+        assert_eq!(truncate_chars("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn searxng_results_are_sanitized_and_bounded_control() {
+        let response = json!({
+            "results": [{
+                "title": "A[31m Title\\u{1b}[31m\nTitle",
+                "url": "https://example.com",
+                "content": "Useful\tcontent"
+            }]
+        });
+        let output = format_searxng_results(&response, 5);
+        assert!(output.contains("**A"));
+        assert!(output.contains("Useful"));
+        assert!(!output.contains(char::from_u32(27).unwrap()));
+        assert!(output.chars().count() <= MAX_SEARCH_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn ddg_results_are_sanitized_and_bounded_control() {
+        let response = json!({
+            "Abstract": "Answer with control",
+            "AbstractSource": "Source",
+            "AbstractURL": "https://example.com",
+            "RelatedTopics": []
+        });
+        let output = format_ddg_results(&response, 5);
+        assert!(output.contains("Answer"));
+        assert!(!output.contains(char::from_u32(27).unwrap()));
+        assert!(output.chars().count() <= MAX_SEARCH_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn searxng_results_strip_terminal_controls() {
+        let response = json!({
+            "results": [{
+                "title": format!("A{}[31m\nTitle", char::from_u32(27).unwrap()),
+                "url": "https://example.com",
+                "content": "Useful\tcontent"
+            }]
+        });
+        let output = format_searxng_results(&response, 5);
+        assert!(output.contains("**A[31m Title"));
+        assert!(output.contains("Useful content"));
+        assert!(!output.contains(char::from_u32(27).unwrap()));
+        assert!(output.chars().count() <= MAX_SEARCH_OUTPUT_CHARS);
+    }
+
+    #[test]
+    fn firecrawl_results_match_v2_response_and_are_bounded() {
+        let response = json!({
+            "success": true,
+            "data": {
+                "web": [{
+                    "title": "A\nTitle",
+                    "url": "https://example.com",
+                    "description": "A useful result"
+                }]
+            }
+        });
+        let output = format_firecrawl_results(&response, 5);
+        assert!(output.contains("**A Title**"));
+        assert!(output.contains("https://example.com"));
+        assert!(output.contains("A useful result"));
+        assert!(output.chars().count() <= MAX_SEARCH_OUTPUT_CHARS);
+    }
 }

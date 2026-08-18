@@ -715,7 +715,7 @@ fn cmd_health(
             let exhausted: std::collections::HashMap<&str, u64> = fc_health
                 .iter()
                 .filter(|(_, active, _)| !active)
-                .map(|(k, _, remaining)| (k.as_str(), *remaining))
+                .map(|(key_id, _, remaining)| (key_id.as_str(), *remaining))
                 .collect();
 
             lines.push(format!(
@@ -727,12 +727,9 @@ fn cmd_health(
                 lines.push("  (rotation active)".to_string());
             }
             for (i, key) in fc_keys.iter().enumerate() {
-                let preview = if key.len() > 12 {
-                    format!("{}..{}", &key[..6], &key[key.len() - 4..])
-                } else {
-                    key.clone()
-                };
-                if let Some(&remaining) = exhausted.get(key.as_str()) {
+                let preview = web_search::firecrawl_key_label(key);
+                let key_id = web_search::firecrawl_key_fingerprint(key);
+                if let Some(&remaining) = exhausted.get(key_id.as_str()) {
                     lines.push(format!(
                         "    [{}] {}  EXHAUSTED ({} remaining)",
                         i + 1,

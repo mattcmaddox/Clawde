@@ -339,11 +339,13 @@ Network requests are subject to the host's firewall and proxy settings.
 
 Perform a web search and return a list of results with titles, URLs, and snippets.
 
-The backend is selected by environment, in priority order:
+The backend is selected by an explicit `PREFERRED_SEARCH_BACKEND` environment override, then the persisted `preferredSearchBackend` setting, and otherwise automatic fallback:
 
 1. **SearXNG** — set `SEARXNG_URL` to a self-hosted instance's base URL (its `settings.yml` must have the JSON `format` enabled).
 2. **Firecrawl** — set `FIRECRAWL_API_KEY` (recommended, full web search results).
-3. **DuckDuckGo** — no-config fallback used when neither of the above is set.
+3. **DuckDuckGo** — no-config fallback.
+
+In automatic mode, a configured SearXNG or Firecrawl backend that fails is skipped so the next backend is tried. Explicitly selecting a backend keeps failures visible instead of silently falling through. Firecrawl cooldown state stores key fingerprints rather than API keys.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

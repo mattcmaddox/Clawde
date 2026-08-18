@@ -459,7 +459,7 @@ pub fn render_context_viz(
         let exhausted: std::collections::HashMap<&str, u64> = fc_health
             .iter()
             .filter(|(_, active, _)| !active)
-            .map(|(k, _, remaining)| (k.as_str(), *remaining))
+            .map(|(key_id, _, remaining)| (key_id.as_str(), *remaining))
             .collect();
 
         lines.push(Line::from(vec![Span::styled(
@@ -475,13 +475,10 @@ pub fn render_context_viz(
         )]));
 
         for key in fc_keys.iter() {
-            let preview = if key.len() > 16 {
-                format!("{}..{}", &key[..8], &key[key.len() - 4..])
-            } else {
-                key.clone()
-            };
+            let preview = clawde_tools::web_search::firecrawl_key_label(key);
+            let key_id = clawde_tools::web_search::firecrawl_key_fingerprint(key);
 
-            if let Some(&remaining) = exhausted.get(key.as_str()) {
+            if let Some(&remaining) = exhausted.get(key_id.as_str()) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {:<16}", truncate_name(&preview, 16)),
