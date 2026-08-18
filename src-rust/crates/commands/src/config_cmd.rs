@@ -116,6 +116,50 @@ impl SlashCommand for ConfigCommand {
                 available: true,
             });
         }
+
+        let mut add_values = |prefix: &str, values: &[&str]| {
+            for value in values {
+                completions.push(ArgCompletion {
+                    value: format!("{prefix} {value}"),
+                    description: String::new(),
+                    available: true,
+                });
+            }
+        };
+        if partial == "set theme" || partial.starts_with("set theme ") {
+            add_values("set theme", &["default", "dark", "light"]);
+        }
+        if partial == "set permission-mode" || partial.starts_with("set permission-mode ") {
+            add_values(
+                "set permission-mode",
+                &["default", "accept-edits", "bypass-permissions", "plan"],
+            );
+        }
+        if partial == "set default-effort" || partial.starts_with("set default-effort ") {
+            add_values(
+                "set default-effort",
+                &[
+                    "none",
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultracode",
+                ],
+            );
+        }
+        if partial == "set output-style" || partial.starts_with("set output-style ") {
+            let styles = available_output_style_names();
+            for style in styles {
+                completions.push(ArgCompletion {
+                    value: format!("set output-style {style}"),
+                    description: String::new(),
+                    available: true,
+                });
+            }
+        }
         completions
     }
 

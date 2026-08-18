@@ -3410,6 +3410,29 @@ impl PromptInputState {
         }
     }
 
+    /// Accept the selected slash/argument completion and append a separator
+    /// when exactly one selectable option remains. This lets a single Tab
+    /// advance through multi-argument commands without requiring a second
+    /// space keystroke. File references never receive the separator.
+    pub fn accept_suggestion_with_auto_space(&mut self) {
+        let Some(index) = self.suggestion_index else {
+            return;
+        };
+        let selectable_count = self.suggestions.iter().filter(|s| !s.faded).count();
+        let should_append = selectable_count == 1
+            && self.suggestions.get(index).is_some_and(|suggestion| {
+                !suggestion.faded
+                    && matches!(
+                        suggestion.source,
+                        TypeaheadSource::SlashCommand | TypeaheadSource::ArgCompletion
+                    )
+            });
+        self.accept_suggestion();
+        if should_append && !self.text.chars().last().is_some_and(char::is_whitespace) {
+            self.insert_char(' ');
+        }
+    }
+
     /// Replace the full text buffer and move the cursor to the end.
     pub fn replace_text(&mut self, text: String) {
         self.text = text;
@@ -4884,6 +4907,61 @@ mod tests {
         assert_eq!(s.text, "/help");
         assert_eq!(s.cursor, 5);
         assert!(s.suggestions.is_empty());
+    }
+
+    #[test]
+    fn single_argument_completion_appends_space() {
+        let mut s = PromptInputState::new();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "/keys set firecrawl".to_string(),
+            description: "Stored provider".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: false,
+            arg_value: Some("set firecrawl".to_string()),
+        }];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "/keys set firecrawl ");
+        assert_eq!(s.cursor, s.text.len());
+    }
+
+    #[test]
+    fn multiple_argument_options_do_not_append_space() {
+        let mut s = PromptInputState::new();
+        s.suggestions = vec![
+            TypeaheadSuggestion {
+                text: "/permissions allow Bash".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("allow Bash".to_string()),
+            },
+            TypeaheadSuggestion {
+                text: "/permissions allow Read".to_string(),
+                description: String::new(),
+                source: TypeaheadSource::ArgCompletion,
+                faded: false,
+                arg_value: Some("allow Read".to_string()),
+            },
+        ];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "/permissions allow Bash");
+    }
+
+    #[test]
+    fn faded_completion_does_not_append_space() {
+        let mut s = PromptInputState::new();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "/keys set firecrawl <api-key>".to_string(),
+            description: "Type API keys manually".to_string(),
+            source: TypeaheadSource::ArgCompletion,
+            faded: true,
+            arg_value: Some("set firecrawl <api-key>".to_string()),
+        }];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion_with_auto_space();
+        assert_eq!(s.text, "");
     }
 
     // ---- token estimate -------------------------------------------------

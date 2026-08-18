@@ -2376,6 +2376,8 @@ pub fn render_keybindings_overlay(
             "clearLine" => "Clear input",
             "historyPrev" => "History prev",
             "historyNext" => "History next",
+            "verticalPrev" => "Previous item",
+            "verticalNext" => "Next item",
             "toggleThinkingExpand" => "Expand thinking",
             "previousMessage" => "Previous msg",
             "nextMessage" => "Next msg",

@@ -1157,9 +1157,39 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
         key: normalized_key,
         ctrl,
         alt,
-        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+        // Kitty-protocol terminals may report Shift+J as uppercase J without
+        // a SHIFT modifier. Treat both encodings as the same binding.
+        shift: key.modifiers.contains(KeyModifiers::SHIFT)
+            || matches!(key.code, KeyCode::Char(c) if c.is_ascii_uppercase()),
         meta: key.modifiers.contains(KeyModifiers::SUPER),
     })
+}
+
+/// Convert configured semantic vertical-navigation aliases into ordinary arrow
+/// events before legacy dialog handlers run. This keeps Shift+J/K configurable:
+/// an explicit user unbinding or remap prevents the conversion.
+fn normalize_configured_vertical_navigation(
+    key: KeyEvent,
+    resolver: &KeybindingResolver,
+    context: &KeyContext,
+) -> KeyEvent {
+    let Some(keystroke) = key_event_to_keystroke(&key) else {
+        return key;
+    };
+    let Some(KeybindingResult::Action(action)) = resolver.resolve_single(&keystroke, context)
+    else {
+        return key;
+    };
+    let code = match action.as_str() {
+        "verticalPrev" => KeyCode::Up,
+        "verticalNext" => KeyCode::Down,
+        _ => return key,
+    };
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::NONE,
+        ..key
+    }
 }
 
 /// Rewrite a Ctrl-modified keystroke that carries a non-ASCII character to the
@@ -4857,6 +4887,8 @@ impl App {
         // literal `KeyCode::Char(..)` arms below — including Ctrl+C / Ctrl+D,
         // which are matched here rather than via the keybinding table (issue #47).
         let key = normalize_layout_shortcut_key(key);
+        let key_context = self.current_key_context();
+        let key = normalize_configured_vertical_navigation(key, &self.keybindings, &key_context);
 
         // Dismiss error modal with Esc
         if key.code == KeyCode::Esc && self.notifications.current_is_error() {
@@ -6933,7 +6965,6 @@ impl App {
         }
 
         // ---- Keybinding processor (runs AFTER all dialog checks) ----------
-        let key_context = self.current_key_context();
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
@@ -7331,7 +7362,7 @@ impl App {
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
-                    self.prompt_input.accept_suggestion();
+                    self.prompt_input.accept_suggestion_with_auto_space();
                     self.refresh_prompt_input();
                 } else if !self.is_streaming && self.prompt_input.is_empty() {
                     // Cycle agent mode: build → plan → image → build
@@ -8533,7 +8564,7 @@ impl App {
                         if self.prompt_input.suggestion_index.is_none() {
                             self.prompt_input.suggestion_index = Some(0);
                         }
-                        self.prompt_input.accept_suggestion();
+                        self.prompt_input.accept_suggestion_with_auto_space();
                         self.refresh_prompt_input();
                     } else if self.prompt_input.is_empty() {
                         self.cycle_agent_mode();
@@ -12659,6 +12690,47 @@ mod tests {
         let out =
             normalize_layout_shortcut_key(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(out.code, KeyCode::Char('c'));
+    }
+
+    #[test]
+    fn test_shifted_vertical_aliases_normalize_to_arrows() {
+        let app = make_app();
+        let down = normalize_configured_vertical_navigation(
+            press_key(KeyCode::Char('j'), KeyModifiers::SHIFT),
+            &app.keybindings,
+            &KeyContext::Chat,
+        );
+        assert_eq!(down.code, KeyCode::Down);
+        assert_eq!(down.modifiers, KeyModifiers::NONE);
+
+        // Kitty-style uppercase events without an explicit SHIFT modifier
+        // resolve to the same configured binding.
+        let up = normalize_configured_vertical_navigation(
+            press_key(KeyCode::Char('K'), KeyModifiers::NONE),
+            &app.keybindings,
+            &KeyContext::Chat,
+        );
+        assert_eq!(up.code, KeyCode::Up);
+        assert_eq!(up.modifiers, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn test_unbound_shifted_vertical_alias_remains_text() {
+        let mut app = make_app();
+        let user = clawde_core::keybindings::UserKeybindings {
+            bindings: vec![clawde_core::keybindings::UserBinding {
+                chord: "shift+j".to_string(),
+                action: None,
+                context: Some("Chat".to_string()),
+            }],
+            ..clawde_core::keybindings::UserKeybindings::default()
+        };
+        app.keybindings = KeybindingResolver::new(&user);
+        let key = press_key(KeyCode::Char('j'), KeyModifiers::SHIFT);
+        let out =
+            normalize_configured_vertical_navigation(key, &app.keybindings, &KeyContext::Chat);
+        assert_eq!(out.code, KeyCode::Char('j'));
+        assert_eq!(out.modifiers, KeyModifiers::SHIFT);
     }
 
     #[test]

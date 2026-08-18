@@ -459,6 +459,7 @@ fn render_keybindings_page(frame: &mut Frame, area: Rect) {
         kb("Ctrl+C", "interrupt / cancel"),
         kb("Tab", "cycle mode (build/plan)"),
         kb("\u{2191}\u{2193}", "history"),
+        kb("Shift+J/K", "history and list navigation"),
         Line::from(""),
         Line::from(Span::styled(
             "  Navigation",

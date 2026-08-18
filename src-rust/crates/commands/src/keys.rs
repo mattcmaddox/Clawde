@@ -156,33 +156,76 @@ impl SlashCommand for KeysCommand {
             },
         ];
 
-        // Second-level completions: provider IDs (from both credentials
-        // and the multi-key store so users who only use /keys can tab-complete).
-        if partial.starts_with("list ") || partial.starts_with("set ") {
-            let prefix = partial
-                .trim_start_matches("list ")
-                .trim_start_matches("set ");
-            let store = AuthStore::load();
-            let mut providers: Vec<String> = Vec::new();
-            for pid in store.credentials.keys() {
-                providers.push(pid.clone());
+        let Some((subcommand, rest)) = partial.split_once(' ') else {
+            return completions;
+        };
+        let provider_commands = ["list", "set", "add", "remove", "health"];
+        if !provider_commands.contains(&subcommand) {
+            return completions;
+        }
+
+        // Provider IDs are safe to suggest from both credential maps and the
+        // rotation-key map. API key values themselves are never suggested.
+        let store = AuthStore::load();
+        let mut providers: Vec<String> = store.credentials.keys().cloned().collect();
+        for provider in store.keys.keys() {
+            if !providers.contains(provider) {
+                providers.push(provider.clone());
             }
-            for pid in store.keys.keys() {
-                if !providers.contains(pid) {
-                    providers.push(pid.clone());
-                }
-            }
-            providers.sort();
-            let cmd_part = partial.split_once(' ').map(|(s, _)| s).unwrap_or("");
-            for pid in providers {
-                if pid.starts_with(prefix) {
+        }
+        providers.sort();
+        providers.dedup();
+
+        let trimmed_rest = rest.trim_start();
+        let (provider_prefix, typed_provider, remaining) = match trimmed_rest.split_once(' ') {
+            Some((provider, remaining)) => (provider, Some(provider), Some(remaining)),
+            None => (trimmed_rest, None, None),
+        };
+        if typed_provider.is_none() {
+            for provider in providers {
+                if provider.starts_with(provider_prefix) {
                     completions.push(ArgCompletion {
-                        value: format!("{} {}", cmd_part, pid),
+                        value: format!("{subcommand} {provider}"),
                         description: String::new(),
                         available: true,
                     });
                 }
             }
+            return completions;
+        }
+
+        let provider = typed_provider.unwrap_or_default();
+        let remaining = remaining.unwrap_or_default();
+        match subcommand {
+            "set" | "add" => {
+                // Keys are sensitive free-form values. Show the next required
+                // argument as a dimmed hint, but never make it selectable or
+                // expose an existing credential in the popup.
+                let typed_keys = remaining.trim();
+                let value = if typed_keys.is_empty() {
+                    format!("{subcommand} {provider} <api-key>")
+                } else {
+                    format!("{subcommand} {provider} {typed_keys} <api-key>")
+                };
+                completions.push(ArgCompletion {
+                    value,
+                    description: "Type the API key manually; credentials are never suggested"
+                        .into(),
+                    available: false,
+                });
+            }
+            "remove" => {
+                let count = store.keys_for(provider).map(|keys| keys.len()).unwrap_or(0);
+                for index in 1..=count {
+                    completions.push(ArgCompletion {
+                        value: format!("remove {provider} {index}"),
+                        description: String::new(),
+                        available: true,
+                    });
+                }
+            }
+            "list" | "health" => {}
+            _ => {}
         }
 
         completions

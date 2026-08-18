@@ -253,6 +253,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+l", "clearLine", KeyContext::Chat),
         // History navigation
         ("up", "historyPrev", KeyContext::Chat),
+        // Shift+J/K are case-insensitive vertical-navigation aliases. The TUI
+        // resolves these semantic actions to real Up/Down events so every
+        // widget that already handles arrow navigation gets them consistently.
+        ("shift+k", "verticalPrev", KeyContext::Chat),
+        ("shift+j", "verticalNext", KeyContext::Chat),
         // Ctrl+O expands/collapses all thinking blocks (mirrors the spec's
         // "ctrl+o to expand" convention); history navigation stays on Up.
         ("ctrl+o", "toggleThinkingExpand", KeyContext::Chat),
@@ -302,11 +307,15 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "no", KeyContext::Confirmation),
         ("up", "prevOption", KeyContext::Confirmation),
         ("down", "nextOption", KeyContext::Confirmation),
+        ("shift+k", "verticalPrev", KeyContext::Confirmation),
+        ("shift+j", "verticalNext", KeyContext::Confirmation),
         // ========== HELP OVERLAY ==========
         ("escape", "close", KeyContext::Help),
         ("q", "close", KeyContext::Help),
         ("up", "scrollUp", KeyContext::Help),
         ("down", "scrollDown", KeyContext::Help),
+        ("shift+k", "verticalPrev", KeyContext::Help),
+        ("shift+j", "verticalNext", KeyContext::Help),
         ("k", "scrollUp", KeyContext::Help),
         ("j", "scrollDown", KeyContext::Help),
         ("pageup", "pageUp", KeyContext::Help),
@@ -314,6 +323,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== HISTORY SEARCH ==========
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
+        ("shift+k", "verticalPrev", KeyContext::HistorySearch),
+        ("shift+j", "verticalNext", KeyContext::HistorySearch),
         ("k", "prevResult", KeyContext::HistorySearch),
         ("j", "nextResult", KeyContext::HistorySearch),
         ("enter", "select", KeyContext::HistorySearch),
@@ -322,6 +333,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
+        ("shift+k", "verticalPrev", KeyContext::MessageSelector),
+        ("shift+j", "verticalNext", KeyContext::MessageSelector),
         ("k", "prevMessage", KeyContext::MessageSelector),
         ("j", "nextMessage", KeyContext::MessageSelector),
         ("enter", "select", KeyContext::MessageSelector),
@@ -329,6 +342,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== THEME & MODEL PICKERS ==========
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
+        ("shift+k", "verticalPrev", KeyContext::ThemePicker),
+        ("shift+j", "verticalNext", KeyContext::ThemePicker),
         ("k", "prev", KeyContext::ThemePicker),
         ("j", "next", KeyContext::ThemePicker),
         ("pageup", "pageUp", KeyContext::ThemePicker),
@@ -338,6 +353,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
         ("down", "nextTask", KeyContext::Task),
+        ("shift+k", "verticalPrev", KeyContext::Task),
+        ("shift+j", "verticalNext", KeyContext::Task),
         ("k", "prevTask", KeyContext::Task),
         ("j", "nextTask", KeyContext::Task),
         ("enter", "selectTask", KeyContext::Task),
@@ -346,6 +363,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
+        ("shift+k", "verticalPrev", KeyContext::DiffDialog),
+        ("shift+j", "verticalNext", KeyContext::DiffDialog),
         ("k", "prevDiff", KeyContext::DiffDialog),
         ("j", "nextDiff", KeyContext::DiffDialog),
         ("a", "acceptDiff", KeyContext::DiffDialog),
@@ -357,16 +376,24 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== MODAL SELECT (Generic) ==========
         ("up", "prev", KeyContext::Select),
         ("down", "next", KeyContext::Select),
+        ("shift+k", "verticalPrev", KeyContext::Select),
+        ("shift+j", "verticalNext", KeyContext::Select),
         ("k", "prev", KeyContext::Select),
         ("j", "next", KeyContext::Select),
         ("pageup", "pageUp", KeyContext::Select),
         ("pagedown", "pageDown", KeyContext::Select),
+        ("shift+k", "verticalPrev", KeyContext::Settings),
+        ("shift+j", "verticalNext", KeyContext::Settings),
+        ("shift+k", "verticalPrev", KeyContext::ModelPicker),
+        ("shift+j", "verticalNext", KeyContext::ModelPicker),
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
         ("/", "search", KeyContext::Select),
         // ========== PLUGIN & ATTACHMENTS ==========
         ("up", "prev", KeyContext::Plugin),
         ("down", "next", KeyContext::Plugin),
+        ("shift+k", "verticalPrev", KeyContext::Plugin),
+        ("shift+j", "verticalNext", KeyContext::Plugin),
         ("enter", "select", KeyContext::Plugin),
         ("escape", "cancel", KeyContext::Plugin),
         ("space", "toggle", KeyContext::Attachments),
@@ -733,6 +760,30 @@ impl KeybindingResolver {
         KeybindingResult::Pending
     }
 
+    /// Resolve an exact single-key binding without changing pending chord state.
+    ///
+    /// This is used for semantic aliases that must be translated before a
+    /// widget's legacy arrow-key handler runs. Explicit user unbindings are
+    /// returned as [`KeybindingResult::Unbound`] so they suppress defaults.
+    pub fn resolve_single(
+        &self,
+        keystroke: &ParsedKeystroke,
+        context: &KeyContext,
+    ) -> Option<KeybindingResult> {
+        self.bindings
+            .iter()
+            .filter(|binding| {
+                (binding.context == *context || binding.context == KeyContext::Global)
+                    && binding.chord.len() == 1
+                    && binding.chord[0] == *keystroke
+            })
+            .next_back()
+            .map(|binding| match &binding.action {
+                Some(action) => KeybindingResult::Action(action.clone()),
+                None => KeybindingResult::Unbound,
+            })
+    }
+
     pub fn cancel_chord(&mut self) {
         self.pending_chord.clear();
     }
@@ -889,6 +940,52 @@ mod tests {
             ctrl_k.and_then(|b| b.action.as_deref()),
             Some("openCommandPalette")
         );
+    }
+
+    #[test]
+    fn test_shifted_vertical_navigation_aliases_are_registered() {
+        let bindings = default_bindings();
+        for context in [
+            KeyContext::Chat,
+            KeyContext::Help,
+            KeyContext::HistorySearch,
+            KeyContext::Confirmation,
+            KeyContext::MessageSelector,
+            KeyContext::ThemePicker,
+            KeyContext::Task,
+            KeyContext::DiffDialog,
+            KeyContext::Select,
+            KeyContext::Settings,
+        ] {
+            assert!(bindings.iter().any(|binding| {
+                binding.context == context
+                    && binding.chord == parse_chord("shift+k").unwrap()
+                    && binding.action.as_deref() == Some("verticalPrev")
+            }));
+            assert!(bindings.iter().any(|binding| {
+                binding.context == context
+                    && binding.chord == parse_chord("shift+j").unwrap()
+                    && binding.action.as_deref() == Some("verticalNext")
+            }));
+        }
+    }
+
+    #[test]
+    fn test_resolve_single_preserves_user_unbinding() {
+        let user = UserKeybindings {
+            bindings: vec![UserBinding {
+                chord: "shift+j".to_string(),
+                action: None,
+                context: Some("Chat".to_string()),
+            }],
+            ..UserKeybindings::default()
+        };
+        let resolver = KeybindingResolver::new(&user);
+        let key = parse_keystroke("shift+j").unwrap();
+        assert!(matches!(
+            resolver.resolve_single(&key, &KeyContext::Chat),
+            Some(KeybindingResult::Unbound)
+        ));
     }
 
     #[test]
@@ -1139,6 +1236,7 @@ mod tests {
                 && !b.chord[0].ctrl
                 && !b.chord[0].alt
                 && !b.chord[0].meta
+                && !b.chord[0].shift
                 && b.chord[0].key.len() == 1
                 && b.chord[0]
                     .key

@@ -2295,6 +2295,24 @@ pub fn validate_prompt_commands() -> Result<(), Vec<String>> {
         }
     }
 
+    // The registry must be complete in the other direction too: every
+    // user-visible executable slash command needs a prompt entry. Hidden
+    // implementation aliases (for example /sr and /rr) are intentionally
+    // excluded from autocomplete and help.
+    let prompt_names: std::collections::HashSet<&str> =
+        clawde_core::slash_commands::PROMPT_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect();
+    for command in all_commands() {
+        if !command.hidden() && !prompt_names.contains(command.name()) {
+            errors.push(format!(
+                "executable command '{}' is missing from the prompt registry",
+                command.name()
+            ));
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -3959,6 +3977,19 @@ fn diff_completions_flags() {
     let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
     assert!(values.contains(&"--stat"));
     assert!(values.contains(&"--staged"));
+}
+
+#[test]
+fn multi_argument_completions_bridge_to_next_stage() {
+    let key_hint = crate::keys::KeysCommand.arg_completions("set firecrawl ");
+    assert!(key_hint.iter().any(|completion| {
+        completion.value == "set firecrawl <api-key>" && !completion.available
+    }));
+
+    let config_values = crate::config_cmd::ConfigCommand.arg_completions("set theme d");
+    assert!(config_values
+        .iter()
+        .any(|completion| completion.value == "set theme dark"));
 }
 
 #[test]

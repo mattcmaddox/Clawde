@@ -30,8 +30,10 @@ pub struct PromptCommand {
     pub tui_only: bool,
 }
 
-/// Flat slash commands that are intentionally retained as compatibility
-/// commands while users migrate to the hierarchical families below.
+/// Flat slash commands exposed by the TUI prompt and command palette.
+///
+/// These remain available alongside the hierarchical families below so both
+/// command styles are discoverable and executable.
 pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "advisor", description: "Set or unset the server-side advisor model", category: "Commands", tui_only: false },
     PromptCommand { name: "agent", description: "List available agents or show agent details", category: "Tools", tui_only: false },
@@ -64,6 +66,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "init", description: "Initialize AGENTS.md for this project", category: "Commands", tui_only: false },
     PromptCommand { name: "insights", description: "Generate a session analysis report with conversation statistics", category: "Diagnostics", tui_only: false },
     PromptCommand { name: "keybindings", description: "Show keybinding configuration", category: "Workspace", tui_only: false },
+    PromptCommand { name: "keys", description: "Manage provider API keys and rotation", category: "Auth & Permissions", tui_only: false },
     PromptCommand { name: "links", description: "Open URLs from this session in your browser", category: "Review & History", tui_only: false },
     PromptCommand { name: "login", description: "Log in to Clawde", category: "Commands", tui_only: false },
     PromptCommand { name: "logout", description: "Log out of Clawde", category: "Commands", tui_only: false },
@@ -101,6 +104,64 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "vim", description: "Toggle vim keybindings", category: "Commands", tui_only: false },
     PromptCommand { name: "voice", description: "Toggle voice input mode", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "ollama", description: "Toggle Ollama connectivity mode (auto / isolated)", category: "Model & Provider", tui_only: false },
+    // Keep every visible executable command discoverable. This block is
+    // intentionally explicit so adding a command without adding prompt
+    // metadata fails the commands-crate registry audit.
+    PromptCommand { name: "color", description: "Choose or edit terminal colors", category: "Settings", tui_only: false },
+    PromptCommand { name: "version", description: "Show version information", category: "System", tui_only: false },
+    PromptCommand { name: "reload-plugins", description: "Reload installed plugins", category: "Tools", tui_only: false },
+    PromptCommand { name: "status", description: "Show provider and session status", category: "System", tui_only: false },
+    PromptCommand { name: "usage", description: "Show usage statistics", category: "Usage & Cost", tui_only: false },
+    PromptCommand { name: "accounts", description: "Manage provider accounts", category: "Auth & Permissions", tui_only: false },
+    PromptCommand { name: "switch", description: "Switch the active provider account", category: "Auth & Permissions", tui_only: false },
+    PromptCommand { name: "spec", description: "Create or review an implementation specification", category: "Project", tui_only: false },
+    PromptCommand { name: "spec-mode", description: "Toggle specification mode", category: "Project", tui_only: false },
+    PromptCommand { name: "permissions", description: "Manage tool permission rules", category: "Auth & Permissions", tui_only: false },
+    PromptCommand { name: "plan", description: "Enter or leave plan mode", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "tasks", description: "Browse and manage tasks", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "thinking", description: "Toggle extended thinking", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "auto-compact", description: "Toggle automatic context compaction", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "unload", description: "Unload Ollama models from VRAM", category: "Model & Provider", tui_only: false },
+    PromptCommand { name: "privacy-settings", description: "Open privacy settings", category: "Settings", tui_only: false },
+    PromptCommand { name: "skills", description: "Browse available skills", category: "Tools", tui_only: false },
+    PromptCommand { name: "files", description: "Browse project files", category: "Project", tui_only: false },
+    PromptCommand { name: "summary", description: "Show or create a conversation summary", category: "Conversation", tui_only: false },
+    PromptCommand { name: "commit", description: "Create a commit from current changes", category: "Project", tui_only: false },
+    PromptCommand { name: "add-dir", description: "Add an allowed workspace directory", category: "Project", tui_only: false },
+    PromptCommand { name: "branch", description: "Manage session branches", category: "Conversation", tui_only: false },
+    PromptCommand { name: "tag", description: "Manage git tags", category: "Project", tui_only: false },
+    PromptCommand { name: "passes", description: "Share a free week of Clawde", category: "Tools", tui_only: false },
+    PromptCommand { name: "ide", description: "Manage IDE integrations", category: "Integrations", tui_only: false },
+    PromptCommand { name: "pr-comments", description: "Get comments from a GitHub pull request", category: "Project", tui_only: false },
+    PromptCommand { name: "desktop", description: "Open the Clawde desktop app", category: "Tools", tui_only: false },
+    PromptCommand { name: "mobile", description: "Set up Clawde on mobile", category: "Tools", tui_only: false },
+    PromptCommand { name: "install-github-app", description: "Set up Clawde GitHub Actions", category: "Integrations", tui_only: false },
+    PromptCommand { name: "web-setup", description: "Configure a remote Clawde environment", category: "Integrations", tui_only: false },
+    PromptCommand { name: "stickers", description: "View collected stickers", category: "Tools", tui_only: false },
+    PromptCommand { name: "remote-control", description: "Control a remote Clawde session", category: "Sessions & Remote", tui_only: false },
+    PromptCommand { name: "remote-env", description: "Manage remote environment variables", category: "Sessions & Remote", tui_only: false },
+    PromptCommand { name: "chrome", description: "Manage browser integration", category: "Integrations", tui_only: false },
+    PromptCommand { name: "release-notes", description: "Show release notes", category: "System", tui_only: false },
+    PromptCommand { name: "rate-limit-options", description: "Configure rate-limit handling", category: "Settings", tui_only: false },
+    PromptCommand { name: "statusline", description: "Configure the status line", category: "Settings", tui_only: false },
+    PromptCommand { name: "security-review", description: "Review project security", category: "Project", tui_only: false },
+    PromptCommand { name: "terminal-setup", description: "Configure terminal integration", category: "System", tui_only: false },
+    PromptCommand { name: "extra-usage", description: "Show extra usage information", category: "Usage & Cost", tui_only: false },
+    PromptCommand { name: "think-back", description: "Review prior thinking context", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "thinkback-play", description: "Replay prior thinking context", category: "AI & Thinking", tui_only: false },
+    PromptCommand { name: "teleport", description: "Move a session to another environment", category: "Sessions & Remote", tui_only: false },
+    PromptCommand { name: "btw", description: "Ask a side question without changing the task", category: "Tools", tui_only: false },
+    PromptCommand { name: "ctx-viz", description: "Visualize context usage", category: "Usage & Cost", tui_only: false },
+    PromptCommand { name: "sandbox-toggle", description: "Toggle sandbox mode", category: "Settings", tui_only: false },
+    PromptCommand { name: "verify", description: "Run project verification checks", category: "Project", tui_only: false },
+    PromptCommand { name: "undo", description: "Revert the last assistant turn", category: "Project", tui_only: false },
+    PromptCommand { name: "revert", description: "Revert file changes from an assistant turn", category: "Project", tui_only: false },
+    PromptCommand { name: "checkpoints", description: "List recorded file-change checkpoints", category: "Project", tui_only: false },
+    PromptCommand { name: "snapshot", description: "Show a recorded file-change diff", category: "Project", tui_only: false },
+    PromptCommand { name: "search", description: "Search saved session history", category: "Sessions & Remote", tui_only: false },
+    PromptCommand { name: "limits", description: "Query configured provider limits", category: "Diagnostics", tui_only: false },
+    PromptCommand { name: "routing", description: "Configure free-mode routing strategy", category: "Model & Provider", tui_only: false },
+    PromptCommand { name: "sources", description: "Show the backend used for the last web search", category: "Diagnostics", tui_only: false },
 ];
 
 /// Return the flat registry in the shape consumed by prompt typeahead.
@@ -626,6 +687,8 @@ mod tests {
         assert!(PROMPT_COMMANDS
             .iter()
             .any(|command| command.name == "refresh-models"));
+        assert!(PROMPT_COMMANDS.iter().any(|command| command.name == "keys"));
+        assert_eq!(prompt_command_category("keys"), "Auth & Permissions");
         assert_eq!(
             prompt_command_category("refresh-models"),
             "Model & Provider"
