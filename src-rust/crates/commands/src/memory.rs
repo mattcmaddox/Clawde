@@ -503,4 +503,99 @@ mod tests {
 
         assert!(out.contains("No project memory yet"), "got: {}", out);
     }
+
+    #[tokio::test]
+    async fn memory_show_all_lists_priority_locations() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "project rules here").unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("", &mut ctx).await);
+
+        assert!(out.contains("[project (AGENTS.md)]"), "got: {}", out);
+        assert!(out.contains("project rules here"), "got: {}", out);
+        assert!(out.contains("Path:"), "got: {}", out);
+        // Global location is empty under the temp home, but the project one
+        // shows — and the subcommand footer appears.
+        assert!(out.contains("/memory edit"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_show_all_with_no_files_is_informative() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("", &mut ctx).await);
+
+        assert!(out.contains("No AGENTS.md files found."), "got: {}", out);
+        assert!(out.contains("Use /init to create one"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_clear_empties_project_file() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("AGENTS.md"), "secret stuff").unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("clear", &mut ctx).await);
+
+        assert!(out.contains("Cleared project"), "got: {}", out);
+        let content = std::fs::read_to_string(project.path().join("AGENTS.md")).unwrap();
+        assert_eq!(content, "");
+    }
+
+    #[tokio::test]
+    async fn memory_clear_without_file_is_informative() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("clear", &mut ctx).await);
+
+        assert!(out.contains("nothing to clear"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_edit_creates_file_without_spawning_real_editor() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+
+        // Point EDITOR at a no-op so no interactive editor opens; the test
+        // asserts the file side effect, which is platform-independent.
+        let prev = std::env::var_os("EDITOR");
+        std::env::set_var("EDITOR", if cfg!(windows) { "cmd" } else { "true" });
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let result = MemoryCommand.execute("edit", &mut ctx).await;
+
+        match prev {
+            Some(v) => std::env::set_var("EDITOR", v),
+            None => std::env::remove_var("EDITOR"),
+        }
+
+        // The file must exist (created empty) regardless of whether the
+        // no-op editor launched successfully.
+        let target = project.path().join("AGENTS.md");
+        assert!(target.is_file(), "edit did not create AGENTS.md");
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "");
+        match result {
+            CommandResult::Message(m) => {
+                assert!(
+                    m.contains("Opened") || m.contains("Could not launch"),
+                    "got: {}",
+                    m
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
 }

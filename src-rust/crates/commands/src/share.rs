@@ -280,3 +280,133 @@ impl SlashCommand for LinksCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::types::{ContentBlock, Message};
+    use std::path::PathBuf;
+
+    fn make_ctx(messages: Vec<Message>) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages,
+            working_dir: PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    // ---- extract_session_urls (pure) --------------------------------------
+
+    #[test]
+    fn extract_urls_most_recent_first() {
+        let messages = vec![
+            Message::user("see https://example.com/one for details"),
+            Message::assistant("and https://example.com/two here"),
+        ];
+        let urls = extract_session_urls(&messages);
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/two".to_string(),
+                "https://example.com/one".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_urls_dedupes_and_strips_trailing_punct() {
+        let messages = vec![
+            Message::user("visit https://example.com/doc). and https://example.com/other,"),
+            Message::assistant("revisit https://example.com/doc later"),
+        ];
+        let urls = extract_session_urls(&messages);
+        // Trailing punctuation stripped; repeats collapsed. Order is
+        // first-seen order reversed: doc was seen first (in m1), so it ends
+        // up second after the reversal.
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/other".to_string(),
+                "https://example.com/doc".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_urls_only_text_blocks() {
+        let messages = vec![Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "see https://example.com/blocked".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "Grep".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ])];
+        let urls = extract_session_urls(&messages);
+        assert_eq!(urls, vec!["https://example.com/blocked".to_string()]);
+    }
+
+    // ---- /links execute (hermetic paths only; opening skips the browser) ---
+
+    #[tokio::test]
+    async fn links_list_prints_numbered_urls() {
+        let mut ctx = make_ctx(vec![
+            Message::user("a https://example.com/one"),
+            Message::assistant("b https://example.com/two"),
+        ]);
+        match LinksCommand.execute("list", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("URLs in this session (2):"), "{}", m);
+                assert!(m.contains("1. https://example.com/two"), "{}", m);
+                assert!(m.contains("2. https://example.com/one"), "{}", m);
+                assert!(m.contains("Run /links <N>"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn links_no_urls_is_informative() {
+        let mut ctx = make_ctx(vec![Message::user("no links here")]);
+        match LinksCommand.execute("list", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No URLs found"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn links_out_of_range_index_errors() {
+        let mut ctx = make_ctx(vec![Message::user("https://example.com/only")]);
+        match LinksCommand.execute("5", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("Index out of range"), "{}", e);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn links_non_numeric_arg_errors() {
+        let mut ctx = make_ctx(vec![Message::user("https://example.com/only")]);
+        match LinksCommand.execute("foo", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("Usage: /links"), "{}", e);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+}

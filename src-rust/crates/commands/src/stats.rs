@@ -1506,4 +1506,71 @@ mod tests {
         let err = parse_args(&["--help"]).unwrap_err();
         assert!(err.contains("Subcommands"));
     }
+
+    // ---- run() entry point ------------------------------------------------
+
+    fn run_ctx(working_dir: PathBuf) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir,
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    fn run_message(raw: &[&str], ctx: &CommandContext) -> String {
+        match run(raw, ctx) {
+            CommandResult::Message(m) => m,
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn run_unknown_subcommand_returns_help_message() {
+        let ctx = run_ctx(PathBuf::from("."));
+        let out = run_message(&["bogus"], &ctx);
+        assert!(out.contains("Unknown subcommand"), "got: {}", out);
+    }
+
+    #[test]
+    fn run_help_flag_returns_help_text() {
+        let ctx = run_ctx(PathBuf::from("."));
+        let out = run_message(&["--help"], &ctx);
+        assert!(out.contains("Subcommands"), "got: {}", out);
+    }
+
+    #[test]
+    fn run_session_detail_without_id_errors() {
+        let ctx = run_ctx(PathBuf::from("."));
+        let out = run_message(&["session"], &ctx);
+        assert!(out.contains("session-id"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn run_summary_renders_fixture_session() {
+        // Point CLAWDE_HOME at a temp dir so projects_dir resolves under it.
+        let _home = crate::keys::tests::TestHome::new();
+        let project = TempDir::new().unwrap();
+
+        let encoded = encoded_dir_for_cwd(project.path());
+        let projects = clawde_core::config::Settings::config_dir()
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&projects).unwrap();
+        build_fixture_session(&projects, "sess-a", vec![make_user("2024-01-15T10:00:00Z")]).await;
+
+        let ctx = run_ctx(project.path().to_path_buf());
+        let out = run_message(&[], &ctx);
+        assert!(out.contains("Clawde Session Stats"), "got: {}", out);
+        assert!(out.contains("Sessions:"), "got: {}", out);
+        assert!(out.contains("sess-a"), "got: {}", out);
+    }
 }
