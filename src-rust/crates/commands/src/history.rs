@@ -316,3 +316,163 @@ impl SlashCommand for SnapshotDiffCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::snapshot::Patch;
+    use clawde_core::types::Message;
+    use std::path::PathBuf;
+
+    fn make_ctx(working_dir: PathBuf, messages: Vec<Message>) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages,
+            working_dir,
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    /// Assistant message with a recorded shadow-git patch, as the query loop
+    /// would produce on a turn that modified files.
+    fn assistant_with_patch(uuid: &str, files: &[&str]) -> Message {
+        let mut m = Message::assistant("response text");
+        m.uuid = Some(uuid.to_string());
+        m.snapshot_patch = Some(Patch {
+            hash: uuid.to_string(),
+            files: files.iter().map(PathBuf::from).collect(),
+        });
+        m
+    }
+
+    /// Create a throwaway git repository (needed for the snapshot system to
+    /// be available). No disk writes happen for the paths under test — they
+    /// return before any `revert`/`diff` call touches the shadow gitdir.
+    fn make_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-q"])
+            .output()
+            .expect("git binary available");
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    // ---- /checkpoints (pure message inspection) ---------------------------
+
+    #[tokio::test]
+    async fn checkpoints_empty_conversation() {
+        let mut ctx = make_ctx(PathBuf::from("."), vec![]);
+        match CheckpointsCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No file-change checkpoints"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoints_lists_turns_newest_first() {
+        let messages = vec![
+            assistant_with_patch("aaaaaaaaaaaa", &["old.rs"]),
+            Message::user("do the thing"),
+            assistant_with_patch("bbbbbbbbbbbb", &["new.rs", "other.rs"]),
+        ];
+        let mut ctx = make_ctx(PathBuf::from("."), messages);
+        match CheckpointsCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("2 checkpoint(s):"), "{}", m);
+                // Newest turn first.
+                assert!(
+                    m.contains("[1] bbbbbbbb — 2 file(s): new.rs, other.rs"),
+                    "{}",
+                    m
+                );
+                assert!(m.contains("[2] aaaaaaaa — 1 file(s): old.rs"), "{}", m);
+                assert!(m.contains("Use /revert <n>"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    // ---- /revert and /undo (early-return paths, no shadow-git writes) -----
+
+    #[tokio::test]
+    async fn revert_without_checkpoints_is_informative() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(repo.path().to_path_buf(), vec![]);
+        match RevertCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No revertible turns found"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_out_of_range_errors() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(
+            repo.path().to_path_buf(),
+            vec![assistant_with_patch("aaa", &["a.rs"])],
+        );
+        match RevertCommand.execute("5", &mut ctx).await {
+            CommandResult::Error(e) => assert!(e.contains("out of range"), "{}", e),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_unmatched_uuid_errors() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(
+            repo.path().to_path_buf(),
+            vec![assistant_with_patch("aaa", &["a.rs"])],
+        );
+        match RevertCommand.execute("zzz", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("No turn found matching 'zzz'"), "{}", e);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_delegates_to_revert() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(repo.path().to_path_buf(), vec![]);
+        match UndoCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No revertible turns found"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    // ---- /snapshot ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_without_checkpoints_is_informative() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(repo.path().to_path_buf(), vec![]);
+        match SnapshotDiffCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No snapshot checkpoints recorded yet"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+}

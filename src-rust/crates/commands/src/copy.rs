@@ -88,3 +88,90 @@ impl SlashCommand for CopyCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::types::Message;
+
+    fn make_ctx(messages: Vec<Message>) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages,
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+        }
+    }
+
+    /// The clipboard fallback writes `claude_copy.md` into the process temp
+    /// dir; remove it before/after so no stale file leaks between tests.
+    fn cleanup_clipboard_file() {
+        let _ = std::fs::remove_file(std::env::temp_dir().join("claude_copy.md"));
+    }
+
+    #[tokio::test]
+    async fn copy_without_assistant_messages_is_informative() {
+        let mut ctx = make_ctx(vec![Message::user("hello")]);
+        match CopyCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("No assistant messages found"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_last_assistant_message() {
+        cleanup_clipboard_file();
+        let mut ctx = make_ctx(vec![
+            Message::user("prompt"),
+            Message::assistant("hello world"),
+        ]);
+        match CopyCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                // Both the clipboard path and the file fallback preview the text.
+                assert!(m.contains("hello world"), "{}", m);
+                assert!(m.contains("chars"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+        cleanup_clipboard_file();
+    }
+
+    #[tokio::test]
+    async fn copy_nth_most_recent_message() {
+        cleanup_clipboard_file();
+        let mut ctx = make_ctx(vec![
+            Message::user("prompt"),
+            Message::assistant("first response"),
+            Message::assistant("second response"),
+        ]);
+        match CopyCommand.execute("2", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("first response"), "{}", m);
+                assert!(!m.contains("second response"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+        cleanup_clipboard_file();
+    }
+
+    #[tokio::test]
+    async fn copy_empty_assistant_message_is_informative() {
+        let mut ctx = make_ctx(vec![Message::assistant("")]);
+        match CopyCommand.execute("", &mut ctx).await {
+            CommandResult::Message(m) => {
+                assert!(m.contains("Last assistant message is empty"), "{}", m);
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+}
