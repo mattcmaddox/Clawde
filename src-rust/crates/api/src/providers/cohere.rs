@@ -259,6 +259,7 @@ impl CohereProvider {
             stop_reason,
             usage,
             model: request.model.clone(),
+            rate_limit: None,
         })
     }
 
@@ -410,6 +411,7 @@ impl LlmProvider for CohereProvider {
             let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
+            let mut partial_response = String::new();
             let mut tool_call_buffers: std::collections::HashMap<
                 usize,
                 (String, String, String),
@@ -423,7 +425,8 @@ impl LlmProvider for CohereProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -511,6 +514,7 @@ impl LlmProvider for CohereProvider {
                                 .and_then(|t| t.as_str())
                             {
                                 if !text.is_empty() {
+                                    partial_response.push_str(text);
                                     yield Ok(StreamEvent::TextDelta {
                                         index: 0,
                                         text: text.to_string(),
@@ -594,6 +598,7 @@ impl LlmProvider for CohereProvider {
                                     {
                                         buf.push_str(args_frag);
                                     }
+                                    partial_response.push_str(args_frag);
                                     yield Ok(StreamEvent::InputJsonDelta {
                                         index: block_index,
                                         partial_json: args_frag.to_string(),

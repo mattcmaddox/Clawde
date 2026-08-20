@@ -380,6 +380,35 @@ pub mod types {
         /// Populated by the query loop on `finish-step`; absent on user messages.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub snapshot_patch: Option<crate::snapshot::Patch>,
+        /// Turn-level observability: which composite upstream served the turn,
+        /// and wall-clock start/end of the generation. Populated by the query
+        /// loop on assistant messages; absent on user/system messages. Persisted
+        /// (skip-if-none) so evaluators and session stores can attribute every
+        /// assistant turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub turn_meta: Option<TurnMeta>,
+    }
+
+    /// Per-turn observability attached to an assistant message.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+    pub struct TurnMeta {
+        /// Concrete upstream that served the turn (composite providers such as
+        /// FreeProvider). Native providers leave this unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub upstream_id: Option<String>,
+        /// RFC 3339 millisecond timestamp when the turn's generation started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub started_at: Option<String>,
+        /// RFC 3339 millisecond timestamp when the turn completed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub completed_at: Option<String>,
+    }
+
+    /// Current UTC time as an RFC 3339 string with millisecond precision.
+    /// Used for turn-observability timestamps so evaluators can compute
+    /// first-token and turn latencies from persisted messages.
+    pub fn now_rfc3339_ms() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +427,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -409,6 +439,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -420,6 +451,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -431,6 +463,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -528,6 +561,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -543,6 +577,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -558,6 +593,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -573,6 +609,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -593,6 +630,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
 
@@ -613,6 +651,7 @@ pub mod types {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }
         }
     }
@@ -1916,6 +1955,18 @@ pub mod config {
         /// [`crate::memdir::is_auto_memory_enabled`].
         #[serde(rename = "autoMemoryEnabled", alias = "auto_memory_enabled")]
         pub enabled: Option<bool>,
+        /// AutoDream cadence: minimum hours between consolidations and the
+        /// base backoff unit for failed attempts. `None` (default) = 24.
+        #[serde(rename = "autoDreamMinHours", alias = "auto_dream_min_hours")]
+        pub auto_dream_min_hours: Option<f64>,
+        /// AutoDream work trigger: accumulated transcript importance (KB of
+        /// new activity) that trips a consolidation regardless of the time
+        /// cap. `None` (default) = 150 KB.
+        #[serde(
+            rename = "autoDreamMinImportanceKB",
+            alias = "auto_dream_min_importance_kb"
+        )]
+        pub auto_dream_min_importance_kb: Option<f64>,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -3126,6 +3177,16 @@ pub mod config {
                         .max_tokens
                         .or(base.config.memory.max_tokens),
                     enabled: over.config.memory.enabled.or(base.config.memory.enabled),
+                    auto_dream_min_hours: over
+                        .config
+                        .memory
+                        .auto_dream_min_hours
+                        .or(base.config.memory.auto_dream_min_hours),
+                    auto_dream_min_importance_kb: over
+                        .config
+                        .memory
+                        .auto_dream_min_importance_kb
+                        .or(base.config.memory.auto_dream_min_importance_kb),
                 },
             };
             Self {
@@ -3317,6 +3378,27 @@ pub mod config {
                 DEFAULT_REQUEST_TIMEOUT_SECS
             );
             assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 600);
+        }
+
+        #[test]
+        fn memory_autodream_settings_serde_roundtrip_with_camelcase_keys() {
+            let config = Config {
+                memory: MemoryConfig {
+                    auto_dream_min_hours: Some(48.0),
+                    auto_dream_min_importance_kb: Some(300.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&config).expect("serialise");
+            assert!(
+                json.contains("\"autoDreamMinHours\":48.0")
+                    && json.contains("\"autoDreamMinImportanceKB\":300.0"),
+                "expected camelCase keys in: {json}"
+            );
+            let parsed: Config = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(parsed.memory.auto_dream_min_hours, Some(48.0));
+            assert_eq!(parsed.memory.auto_dream_min_importance_kb, Some(300.0));
         }
 
         #[test]
@@ -3891,6 +3973,7 @@ pub mod constants {
     pub const TOOL_NAME_ENTER_SPEC_MODE: &str = "EnterSpecMode";
     pub const TOOL_NAME_EXIT_SPEC_MODE: &str = "ExitSpecMode";
     pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
+    pub const TOOL_NAME_RESOLVE_MEMORY_CONFLICT: &str = "ResolveMemoryConflict";
     pub const TOOL_NAME_MCP: &str = "mcp";
     pub const TOOL_NAME_NOTEBOOK_EDIT: &str = "NotebookEdit";
     pub const TOOL_NAME_BATCH_EDIT: &str = "BatchEdit";
@@ -5736,6 +5819,22 @@ pub mod hooks {
         pub is_error: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub session_id: Option<String>,
+        /// Turn observability surfaced to hooks: the concrete composite
+        /// upstream that served the turn, the effective model, generation
+        /// wall-clock elapsed, session cost, and fallback/retry signals.
+        /// Populated on Stop hooks; absent on tool hooks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub elapsed_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cost_usd: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub fallback_used: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub retries: Option<u32>,
     }
 
     /// Result of running a hook.

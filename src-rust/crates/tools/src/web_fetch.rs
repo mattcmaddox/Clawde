@@ -495,13 +495,11 @@ mod tests {
 
     // ---- cache + execute paths -------------------------------------------
 
-    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
-    /// `execute` reads and writes the extraction cache under the config dir.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so cache
-    /// reads/writes never touch the real config dir (and never race the
-    /// real home's cache under parallelism).
+    /// reads/writes never touch the real config dir (and never race the real
+    /// home's cache under parallelism). Serializes on the crate-wide
+    /// [`crate::TEST_ENV_LOCK`] so all env-mutating tests in this crate share
+    /// one mutex (AGENTS.md parallel-safe tests).
     #[allow(clippy::await_holding_lock)]
     // The guard must span the whole future: it serialises the CLAWDE_HOME
     // mutation against other env-mutating tests (same std::sync::Mutex
@@ -513,7 +511,9 @@ mod tests {
     {
         // Recover from poisoning so one failing test can't cascade
         // PoisonError failures into every other env-mutating test.
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CLAWDE_HOME", dir.path());
         let out = f(dir.path().to_path_buf()).await;

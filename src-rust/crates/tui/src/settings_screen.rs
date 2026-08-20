@@ -213,6 +213,10 @@ pub struct SettingsScreen {
     pub memory_enabled: bool,
     /// Cap on the `<memory>` injection in tokens (empty = built-in caps).
     pub memory_max_tokens: String,
+    /// AutoDream cadence in hours (empty = default 24).
+    pub memory_autodream_min_hours: String,
+    /// AutoDream work trigger in KB of new transcript activity (empty = 150).
+    pub memory_autodream_min_importance_kb: String,
     /// Project root passed to [`SettingsScreen::open`], used to resolve the
     /// project memory dir for the live-size readout and the Ctrl+O open action.
     pub project_root: std::path::PathBuf,
@@ -282,6 +286,8 @@ impl SettingsScreen {
             verify_container_image: String::new(),
             memory_enabled: true,
             memory_max_tokens: String::new(),
+            memory_autodream_min_hours: String::new(),
+            memory_autodream_min_importance_kb: String::new(),
             project_root: std::path::PathBuf::new(),
             memory_readout: String::new(),
             keybinding_preset: "default".to_string(),
@@ -340,6 +346,18 @@ impl SettingsScreen {
             .config
             .memory
             .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        self.memory_autodream_min_hours = s
+            .config
+            .memory
+            .auto_dream_min_hours
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        self.memory_autodream_min_importance_kb = s
+            .config
+            .memory
+            .auto_dream_min_importance_kb
             .map(|n| n.to_string())
             .unwrap_or_default();
 
@@ -660,6 +678,42 @@ impl SettingsScreen {
                         self.settings_snapshot.config.memory.max_tokens = Some(n);
                         self.memory_max_tokens = trimmed.to_string();
                         refresh_memory = true;
+                    }
+                }
+                "memory_autodream_min_hours" => {
+                    // Empty restores the default cadence (24h); a parse
+                    // failure is ignored (keeps the previous value).
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        config.memory.auto_dream_min_hours = None;
+                        self.settings_snapshot.config.memory.auto_dream_min_hours = None;
+                        self.memory_autodream_min_hours = String::new();
+                    } else if let Ok(n) = trimmed.parse::<f64>() {
+                        if n >= 1.0 {
+                            config.memory.auto_dream_min_hours = Some(n);
+                            self.settings_snapshot.config.memory.auto_dream_min_hours = Some(n);
+                            self.memory_autodream_min_hours = trimmed.to_string();
+                        }
+                    }
+                }
+                "memory_autodream_min_importance_kb" => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        config.memory.auto_dream_min_importance_kb = None;
+                        self.settings_snapshot
+                            .config
+                            .memory
+                            .auto_dream_min_importance_kb = None;
+                        self.memory_autodream_min_importance_kb = String::new();
+                    } else if let Ok(n) = trimmed.parse::<f64>() {
+                        if n >= 1.0 {
+                            config.memory.auto_dream_min_importance_kb = Some(n);
+                            self.settings_snapshot
+                                .config
+                                .memory
+                                .auto_dream_min_importance_kb = Some(n);
+                            self.memory_autodream_min_importance_kb = trimmed.to_string();
+                        }
                     }
                 }
                 "allowed_tools" => {
@@ -1092,6 +1146,16 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
             .max_tokens
             .map(|n| n.to_string())
             .unwrap_or_default(),
+        "memory_autodream_min_hours" => c
+            .memory
+            .auto_dream_min_hours
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        "memory_autodream_min_importance_kb" => c
+            .memory
+            .auto_dream_min_importance_kb
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
         "memory_enabled" => c
             .memory
             .enabled
@@ -1163,7 +1227,9 @@ fn default_value_for(key: &str) -> String {
         | "ollama_default_host"
         | "keybinding_preset"
         | "verify_container_image"
-        | "memory_max_tokens" => String::new(),
+        | "memory_max_tokens"
+        | "memory_autodream_min_hours"
+        | "memory_autodream_min_importance_kb" => String::new(),
         "auto_compact"
         | "notifications"
         | "terminal_progress_bar"
@@ -1790,7 +1856,7 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     // ---- Memory & project ------------------------------------------------
     entries.push(make_entry(
         "memory_enabled",
-        "Project memory",
+        "Mnemosyne",
         "Injects the project's MEMORY.md index + most recent session summary into the system prompt, and auto-consolidates session summaries into the project memory dir. Off disables injection even when memory files exist (env vars still win: CLAURST_DISABLE_AUTO_MEMORY=1 overrides this).",
         SECTION_MEMORY,
         "true".to_string(),
@@ -1807,6 +1873,26 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         SettingEffect::NextSession,
         SettingKind::Number,
         screen.memory_max_tokens.clone(),
+    ));
+    entries.push(make_entry(
+        "memory_autodream_min_hours",
+        "AutoDream cadence (hours)",
+        "Minimum hours between automatic memory consolidations; also the base backoff unit after a failed dream (doubles per failure, capped at 7 days). Empty = default 24h. A dream also fires early once accumulated transcript activity crosses the importance threshold below.",
+        SECTION_MEMORY,
+        String::new(),
+        SettingEffect::NextSession,
+        SettingKind::Number,
+        screen.memory_autodream_min_hours.clone(),
+    ));
+    entries.push(make_entry(
+        "memory_autodream_min_importance_kb",
+        "AutoDream trigger (KB)",
+        "Accumulated new session-transcript activity (KB) that triggers a consolidation regardless of the time cap. A few meaty sessions ≈ 150 KB (default). Empty = default 150 KB.",
+        SECTION_MEMORY,
+        String::new(),
+        SettingEffect::NextSession,
+        SettingKind::Number,
+        screen.memory_autodream_min_importance_kb.clone(),
     ));
 
     entries
@@ -2535,6 +2621,8 @@ fn reset_setting_to_default(screen: &mut SettingsScreen, config: &mut Config, ke
         "verify_container_image" => c.verify.container_image = None,
         "memory_enabled" => c.memory.enabled = None,
         "memory_max_tokens" => c.memory.max_tokens = None,
+        "memory_autodream_min_hours" => c.memory.auto_dream_min_hours = None,
+        "memory_autodream_min_importance_kb" => c.memory.auto_dream_min_importance_kb = None,
         "preferredSearchBackend" => s.preferred_search_backend = "auto".to_string(),
         // Routing entries — remove from the routing JSON.
         "routing_strategy" => {
@@ -2708,6 +2796,14 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         }
         "memory_max_tokens" => {
             screen.memory_max_tokens = String::new();
+            screen.refresh_memory_readout();
+        }
+        "memory_autodream_min_hours" => {
+            screen.memory_autodream_min_hours = String::new();
+            screen.refresh_memory_readout();
+        }
+        "memory_autodream_min_importance_kb" => {
+            screen.memory_autodream_min_importance_kb = String::new();
             screen.refresh_memory_readout();
         }
         "preferredSearchBackend" => screen.preferred_search_backend = "auto".to_string(),
@@ -3531,6 +3627,54 @@ mod tests {
         screen.apply_settings_from_snapshot();
         assert_eq!(screen.memory_max_tokens, "1500");
         assert!(screen.memory_enabled);
+    }
+
+    #[test]
+    fn memory_autodream_settings_roundtrip() {
+        let mut screen = fresh_controlled_screen();
+        // Values surface from the snapshot through value_from_settings.
+        screen.settings_snapshot.config.memory.auto_dream_min_hours = Some(48.0);
+        screen
+            .settings_snapshot
+            .config
+            .memory
+            .auto_dream_min_importance_kb = Some(300.0);
+        assert_eq!(
+            value_from_settings(&screen.settings_snapshot, "memory_autodream_min_hours"),
+            "48"
+        );
+        assert_eq!(
+            value_from_settings(
+                &screen.settings_snapshot,
+                "memory_autodream_min_importance_kb"
+            ),
+            "300"
+        );
+        // Default: absent in the file.
+        assert_eq!(default_value_for("memory_autodream_min_hours"), "");
+        assert_eq!(default_value_for("memory_autodream_min_importance_kb"), "");
+        // apply_settings_from_snapshot reads the *effective* snapshot.
+        screen.effective_snapshot.config.memory.auto_dream_min_hours = Some(12.0);
+        screen
+            .effective_snapshot
+            .config
+            .memory
+            .auto_dream_min_importance_kb = Some(80.0);
+        screen.apply_settings_from_snapshot();
+        assert_eq!(screen.memory_autodream_min_hours, "12");
+        assert_eq!(screen.memory_autodream_min_importance_kb, "80");
+        // The settings entries must exist in the memory section.
+        let all = all_entries(&screen);
+        for key in [
+            "memory_autodream_min_hours",
+            "memory_autodream_min_importance_kb",
+        ] {
+            let entry = all
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("{} entry must exist", key));
+            assert_eq!(entry.section, SECTION_MEMORY);
+        }
     }
 
     #[test]

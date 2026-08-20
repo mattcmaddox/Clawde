@@ -276,6 +276,7 @@ impl LlmProvider for MinimaxProvider {
         // a single ordered pass, instead of appending non-text blocks with
         // usize::MAX. Same-class fix as the Anthropic aggregator. See issue #217.
         let mut blocks = StreamBlockAccumulator::new();
+        let mut partial_response = String::new();
 
         use futures::StreamExt;
         while let Some(result) = stream.next().await {
@@ -305,6 +306,18 @@ impl LlmProvider for MinimaxProvider {
                             }
                         }
                         StreamEvent::MessageStop => break,
+                        StreamEvent::TextDelta { text, .. }
+                        | StreamEvent::ThinkingDelta { thinking: text, .. }
+                        | StreamEvent::ReasoningDelta {
+                            reasoning: text, ..
+                        }
+                        | StreamEvent::InputJsonDelta {
+                            partial_json: text, ..
+                        } => {
+                            if !text.is_empty() {
+                                partial_response.push_str(&text);
+                            }
+                        }
                         StreamEvent::Error {
                             error_type,
                             message,
@@ -312,7 +325,8 @@ impl LlmProvider for MinimaxProvider {
                             return Err(ProviderError::StreamError {
                                 provider: self.id.clone(),
                                 message: format!("[{}] {}", error_type, message),
-                                partial_response: None,
+                                partial_response: (!partial_response.is_empty())
+                                    .then(|| partial_response.clone()),
                             });
                         }
                         _ => {}
@@ -329,6 +343,7 @@ impl LlmProvider for MinimaxProvider {
             stop_reason,
             usage,
             model,
+            rate_limit: None,
         })
     }
 

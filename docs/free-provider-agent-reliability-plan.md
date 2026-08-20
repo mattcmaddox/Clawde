@@ -11,6 +11,8 @@ This plan follows the research review completed on 2026-08-19. It deliberately s
 - Phase 1 typed recovery kernel: implemented in `crates/api/src/provider_error.rs` and consumed by Free Mode.
 - Phase 2 attempt boundary: initial protection implemented; transport metadata no longer commits a stream before generated output is emitted.
 - Phase 3 capacity routing: upstream-level observation, reset/retry timing, native Anthropic/Gemini response capture, exact rotating-key attribution, local estimates, and compact command/TUI status exposure are implemented; richer dedicated visualization remains follow-up work.
+- Phase 6 mock-provider harness: the deterministic local SSE mock (scripted pre-first-byte failures and mid-stream truncation) is implemented in `crates/api/tests/common/mock_provider.rs` and exercised by `crates/api/tests/free_recovery.rs`; learned routing and the remaining injection modes (latency / quota / tool side effects) remain follow-up work.
+- Phase 2 replay-safety hardening: every adapter now accumulates visible output and attaches it as `StreamError::partial_response` (via the shared `StreamEvent::committed_output_text` helper), so a mid-stream failure classifies as `VisibleStreamFailure` (replay-unsafe) for any caller, not just `RetryingFreeStream`'s first-byte watchdog. Covered: openai_compat, openai, azure, anthropic, minimax, google, cohere, copilot, codex, bedrock.
 - Remaining phases: not started in this implementation pass.
 
 ## Design principles
@@ -172,7 +174,7 @@ Only introduce learned routing after Clawde has local evidence.
 
 ### Work
 
-- Build a deterministic local mock-provider harness with configurable latency, quota, failures, stream interruptions, and tool side effects.
+- Build a deterministic local mock-provider harness with configurable latency, quota, failures, stream interruptions, and tool side effects. (Done for failures + stream interruption — `crates/api/tests/common/mock_provider.rs`; latency / quota / tool side-effect injection remain.)
 - Measure pass@1 and repeated-run pass^k reliability.
 - Compare every adaptive policy against the best fixed-provider baseline.
 - Add minimum-sample gates, time decay, confidence thresholds, and a safe fallback when router confidence is low.

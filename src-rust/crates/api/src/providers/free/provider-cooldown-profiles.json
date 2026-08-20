@@ -111,7 +111,7 @@
     "enabled": true,
     "strategy": "hedged",
     "hedging": {
-      "enabled": true,
+      "enabled": false,
       "delay_ms": 100,
       "max_hedges": 1,
       "cancel_on_first_valid": true,

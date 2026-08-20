@@ -552,6 +552,7 @@ impl BedrockProvider {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            rate_limit: None,
         })
     }
 
@@ -672,6 +673,7 @@ impl LlmProvider for BedrockProvider {
             let mut buf: Vec<u8> = Vec::new();
             let mut message_started = false;
             let mut message_stopped = false;
+            let mut partial_response = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -680,7 +682,8 @@ impl LlmProvider for BedrockProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -693,7 +696,29 @@ impl LlmProvider for BedrockProvider {
                     if matches!(ev, Ok(StreamEvent::MessageStop)) {
                         message_stopped = true;
                     }
-                    yield ev;
+                    match ev {
+                        Ok(event) => {
+                            if let Some(text) = event.committed_output_text() {
+                                partial_response.push_str(text);
+                            }
+                            yield Ok(event);
+                        }
+                        Err(mut err) => {
+                            // Attach any already-emitted output so a provider-
+                            // reported mid-stream error (e.g. throttlingException)
+                            // is classified replay-unsafe too.
+                            if let ProviderError::StreamError {
+                                partial_response: slot,
+                                ..
+                            } = &mut err
+                            {
+                                if slot.is_none() && !partial_response.is_empty() {
+                                    *slot = Some(partial_response.clone());
+                                }
+                            }
+                            yield Err(err);
+                        }
+                    }
                 }
             }
 

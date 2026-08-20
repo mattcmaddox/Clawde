@@ -51,6 +51,7 @@ pub mod powershell;
 pub mod pty_bash;
 pub mod remote_trigger;
 pub mod repl_tool;
+pub mod resolve_memory_conflict;
 pub mod run_lints;
 pub mod run_tests;
 pub mod send_message;
@@ -98,6 +99,7 @@ pub use powershell::PowerShellTool;
 pub use pty_bash::PtyBashTool;
 pub use remote_trigger::RemoteTriggerTool;
 pub use repl_tool::ReplTool;
+pub use resolve_memory_conflict::ResolveMemoryConflictTool;
 pub use run_lints::RunLintsTool;
 pub use run_tests::RunTestsTool;
 pub use send_message::{drain_inbox, peek_inbox, SendMessageTool};
@@ -119,6 +121,19 @@ pub use worktree::{EnterWorktreeTool, ExitWorktreeTool};
 // ---------------------------------------------------------------------------
 // AskUser question channel
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Test-only env serialization
+// ---------------------------------------------------------------------------
+
+/// Crate-wide lock for tests that mutate process-global state (env vars like
+/// `CLAWDE_HOME` / `HOME`, or the working directory). `cargo test --workspace`
+/// runs on the default parallel runner, so every env-mutating test must
+/// serialize on THIS lock — per-module `static ENV_LOCK` mutexes are separate
+/// mutexes and do not serialize against each other (AGENTS.md parallel-safe
+/// tests). Test-only; compiled out of production builds.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Event sent through the TUI side-channel when the `AskUserQuestion` tool
 /// needs to pause the query loop and collect a response from the user.
@@ -867,6 +882,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(TaskOutputTool),
         Box::new(TodoWriteTool),
         Box::new(AskUserQuestionTool),
+        Box::new(ResolveMemoryConflictTool),
         Box::new(EnterPlanModeTool),
         Box::new(ExitPlanModeTool),
         Box::new(EnterSpecModeTool),

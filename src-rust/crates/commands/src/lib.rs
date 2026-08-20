@@ -2679,7 +2679,17 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
 
     // First check built-in commands.
     if let Some(cmd) = find_command(name) {
-        return Some(cmd.execute(args, ctx).await);
+        // `/lethesyne` is the memory-conflict alias: with no subcommand it
+        // defaults to the status/conflicts view (the equivalent of
+        // `/memory status`), which is where pending adjudications and the
+        // resolution audit are shown. Any explicit subcommand passes through
+        // unchanged (e.g. `/lethesyne edit`).
+        let effective_args = if name == "lethesyne" && args.trim().is_empty() {
+            "status"
+        } else {
+            args
+        };
+        return Some(cmd.execute(effective_args, ctx).await);
     }
 
     // Check user-defined command templates from settings.
@@ -3112,6 +3122,30 @@ mod tests {
         assert!(find_command("bashes").is_some());
         assert!(find_command("remote").is_some());
         assert!(find_command("remote-setup").is_some());
+    }
+
+    #[test]
+    fn test_memory_aliases_resolve_to_memory_command() {
+        // `/mnemosyne` and `/lethesyne` are themed aliases for `/memory`.
+        for alias in ["mnemosyne", "lethesyne"] {
+            let cmd = find_command(alias);
+            assert!(cmd.is_some(), "alias /{} must resolve", alias);
+            assert_eq!(
+                cmd.unwrap().name(),
+                "memory",
+                "/{} must resolve to the memory command",
+                alias
+            );
+        }
+        // They appear in the shared alias table (feeds TUI autocomplete + /help).
+        let aliases = all_command_aliases();
+        for alias in ["mnemosyne", "lethesyne"] {
+            assert!(
+                aliases.iter().any(|(a, c, _)| a == alias && c == "memory"),
+                "alias /{} missing from all_command_aliases",
+                alias
+            );
+        }
     }
 
     #[test]

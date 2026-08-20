@@ -2112,6 +2112,8 @@ fn stream_provider_attribution_event(
     upstream_id: Option<&str>,
     model: &str,
     context_tokens_est: u64,
+    retries: u32,
+    fallback_used: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "provider_attribution",
@@ -2119,6 +2121,8 @@ fn stream_provider_attribution_event(
         "upstream_id": upstream_id,
         "model": model,
         "context_tokens_est": context_tokens_est,
+        "retries": retries,
+        "fallback_used": fallback_used,
     })
 }
 
@@ -2173,13 +2177,21 @@ mod stream_event_tests {
 
     #[test]
     fn provider_attribution_is_stable_and_secret_free() {
-        let event =
-            stream_provider_attribution_event("free", Some("groq"), "openai/gpt-oss-120b", 512);
+        let event = stream_provider_attribution_event(
+            "free",
+            Some("groq"),
+            "openai/gpt-oss-120b",
+            512,
+            1,
+            true,
+        );
         assert_eq!(event["type"], "provider_attribution");
         assert_eq!(event["provider_id"], "free");
         assert_eq!(event["upstream_id"], "groq");
         assert_eq!(event["model"], "openai/gpt-oss-120b");
         assert_eq!(event["context_tokens_est"], 512);
+        assert_eq!(event["retries"], 1);
+        assert_eq!(event["fallback_used"], true);
         assert!(event.get("api_key").is_none());
         assert!(event.get("result").is_none());
     }
@@ -2456,6 +2468,8 @@ async fn run_headless(
                         obs.upstream_id.as_deref(),
                         &obs.model,
                         obs.context_tokens_est,
+                        obs.retries,
+                        obs.fallback_used,
                     );
                     println!("{}", ev);
                 }
@@ -2678,6 +2692,8 @@ async fn run_headless(
                     "context_tokens_est": turn_observability
                         .as_ref()
                         .map(|o| o.context_tokens_est),
+                    "retries": turn_observability.as_ref().map(|o| o.retries),
+                    "fallback_used": turn_observability.as_ref().map(|o| o.fallback_used),
                     "semantic_verify": semantic_report,
                     "status": status_messages,
                 });
@@ -2704,6 +2720,11 @@ async fn run_headless(
                         "context_tokens_est": turn_observability
                             .as_ref()
                             .map(|o| o.context_tokens_est),
+                        "provider": turn_observability.as_ref().map(|o| o.provider_id.clone()),
+                        "upstream": turn_observability.as_ref().and_then(|o| o.upstream_id.clone()),
+                        "model": turn_observability.as_ref().map(|o| o.model.clone()),
+                        "retries": turn_observability.as_ref().map(|o| o.retries),
+                        "fallback_used": turn_observability.as_ref().map(|o| o.fallback_used),
                     });
                     println!("{}", out);
                 }
@@ -4495,6 +4516,12 @@ async fn run_interactive(
                                 tool_output: Some(input.clone()),
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
+                                upstream_id: None,
+                                model: None,
+                                elapsed_ms: None,
+                                cost_usd: None,
+                                fallback_used: None,
+                                retries: None,
                             };
                             clawde_core::hooks::run_hooks(
                                 &cmd_ctx.config.hooks,
@@ -6222,8 +6249,20 @@ async fn run_interactive(
                                 clawde_core::types::Role::Assistant => "assistant",
                             };
                             let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
-                            let _ =
-                                store.save_message(&session.id, msg_id, role, &content_str, None);
+                            let _ = store.save_message(
+                                &session.id,
+                                msg_id,
+                                role,
+                                &content_str,
+                                msg.cost.as_ref().map(|c| c.cost_usd),
+                                msg.turn_meta
+                                    .as_ref()
+                                    .and_then(|m| m.upstream_id.as_deref()),
+                                msg.turn_meta.as_ref().and_then(|m| m.started_at.as_deref()),
+                                msg.turn_meta
+                                    .as_ref()
+                                    .and_then(|m| m.completed_at.as_deref()),
+                            );
                         }
                     }
                 }

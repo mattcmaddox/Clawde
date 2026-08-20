@@ -124,6 +124,9 @@ mod tests {
                 "assistant",
                 "The callback was updated",
                 None,
+                None,
+                None,
+                None,
             )
             .expect("save message");
 

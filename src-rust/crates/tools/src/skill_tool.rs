@@ -239,13 +239,11 @@ fn strip_frontmatter(content: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Serialises tests that mutate the process-global `CLAWDE_HOME` env var:
-    /// `skill_search_dirs` includes `config_dir()/commands`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Run a future with `CLAWDE_HOME` pointed at a fresh temp dir so skill
     /// discovery never reads real user skills (and never races other
-    /// env-mutating tests under parallelism).
+    /// env-mutating tests under parallelism). Serializes on the crate-wide
+    /// [`crate::TEST_ENV_LOCK`] so all env-mutating tests in this crate share
+    /// one mutex (AGENTS.md parallel-safe tests).
     #[allow(clippy::await_holding_lock)]
     // The guard must span the whole future: it serialises the CLAWDE_HOME
     // mutation against other env-mutating tests (same std::sync::Mutex
@@ -254,7 +252,9 @@ mod tests {
     where
         T: std::future::Future,
     {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("CLAWDE_HOME", dir.path());
         let out = f(dir.path().to_path_buf()).await;

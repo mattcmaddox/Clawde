@@ -4,7 +4,7 @@
 // Shown briefly in the message area when Clawde updates a memory file
 // (e.g. ~/.clawde/AGENTS.md or a project-local AGENTS.md).
 //
-// Displays: "Memory updated in {relative_path} · /memory to edit"
+// Displays: "Mnemosyne updated in {relative_path} · /memory to edit"
 //
 // The surface is a single-row dismissable banner. The caller is responsible
 // for showing it at the right time (e.g. after a memory write tool result).
@@ -162,7 +162,7 @@ pub fn render_memory_update_notification(
     let line = Line::from(vec![
         Span::styled(" ", Style::default()),
         Span::styled("\u{1f9e0} ", Style::default().fg(CLAURST_ACCENT)),
-        Span::styled("Memory updated in ", Style::default().fg(CLAURST_TEXT)),
+        Span::styled("Mnemosyne updated in ", Style::default().fg(CLAURST_TEXT)),
         Span::styled(
             display_path,
             Style::default()
@@ -269,7 +269,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<Vec<_>>()
             .join("");
-        assert!(rendered.contains("Memory updated in"));
+        assert!(rendered.contains("Mnemosyne updated in"));
     }
 
     #[test]
@@ -289,6 +289,6 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<Vec<_>>()
             .join("");
-        assert!(!rendered.contains("Memory updated"));
+        assert!(!rendered.contains("Mnemosyne updated"));
     }
 }

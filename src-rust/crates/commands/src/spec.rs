@@ -516,6 +516,7 @@ mod tests {
                 }],
                 stop_reason: clawde_api::StopReason::EndTurn,
                 usage: Default::default(),
+                rate_limit: None,
             })
         }
 

@@ -1,0 +1,23 @@
+{
+  "name": "clawde-regression",
+  "repeats": 1,
+  "min_evaluable": 1,
+  "gates": {
+    "max_pass_rate_drop": 0.0,
+    "max_score_drop": 0.1
+  },
+  "fixtures": [
+    {
+      "name": "catalog-order",
+      "path": "scripts/eval/fixtures/catalog-order"
+    },
+    {
+      "name": "fallback-behavior",
+      "path": "scripts/eval/fixtures/fallback-behavior"
+    },
+    {
+      "name": "trajectory",
+      "path": "scripts/eval/fixtures/trajectory"
+    }
+  ]
+}

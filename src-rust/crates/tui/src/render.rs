@@ -243,7 +243,7 @@ fn short_relative_secs(secs: u64) -> String {
 /// there are none. Split out from [`render_welcome_box`] so it can be unit
 /// tested from controlled state without the surrounding layout.
 /// Build the compact project-memory status line for the welcome screen
-/// (audit spec §15.3): `⚡ Project memory: N files · updated <age>`, or `None`
+/// (audit spec §15.3): `⚡ Mnemosyne: N files · updated <age>`, or `None`
 /// when the project has no memory files yet.
 ///
 /// Takes the resolved memory dir (not a project path) so tests can point it at
@@ -269,10 +269,10 @@ fn project_memory_line(mem_dir: &std::path::Path) -> Option<Line<'static>> {
         }
     }
     let count = files.len() + usize::from(index_present);
-    Some(Line::from(vec![
+    let mut spans = vec![
         Span::styled("⚡ ", Style::default().fg(Color::Yellow)),
         Span::styled(
-            "Project memory",
+            "Mnemosyne",
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
@@ -285,7 +285,20 @@ fn project_memory_line(mem_dir: &std::path::Path) -> Option<Line<'static>> {
             ),
             Style::default().fg(Color::DarkGray),
         ),
-    ]))
+    ];
+    // Pending adjudications: surface unconfirmed memory conflicts at a glance
+    // so the user knows they exist without running /memory status. Counts
+    // adjudicable *pairs* (shared with the injected block and `/memory
+    // status`), so resolved / dangling / self / superseded-claimant entries
+    // never inflate the number.
+    let pending = clawde_core::memdir::pending_conflict_count(mem_dir);
+    if pending > 0 {
+        spans.push(Span::styled(
+            format!(" · {} Lethesyne", pending),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Some(Line::from(spans))
 }
 
 fn recent_activity_lines(
@@ -1730,7 +1743,11 @@ fn append_turn_items(
     }
 
     if !turn.active {
-        if let Some(meta_line) = render_transcript_assistant_meta(turn.metadata, accent) {
+        if let Some(meta_line) = render_transcript_assistant_meta(
+            turn.metadata,
+            turn.assistant_messages.last().map(|(_, m)| *m),
+            accent,
+        ) {
             if turn.has_visible_assistant_content() {
                 sections.push((
                     SectionContent::Plain(vec![meta_line]),
@@ -2170,10 +2187,10 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    // Project memory status (audit spec §15.3): one compact line when the
-    // project has memory files, so freshness is visible at a glance. Only
-    // rendered on the welcome screen, so the small dir scan is not a per-frame
-    // cost during active conversation.
+    // Mnemosyne status (audit spec §15.3): one compact line when the project
+    // has memory files, so freshness is visible at a glance. Only rendered on
+    // the welcome screen, so the small dir scan is not a per-frame cost during
+    // active conversation.
     if let Some(mem_line) = app
         .config
         .project_dir
@@ -6011,7 +6028,7 @@ mod task_badge_tooltip_tests {
         .unwrap();
         let line = project_memory_line(dir.path()).expect("line should render");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("Project memory"), "got: {text}");
+        assert!(text.contains("Mnemosyne"), "got: {text}");
         // MEMORY.md + the session summary = 2 files.
         assert!(text.contains("2 files"), "got: {text}");
     }
@@ -6020,5 +6037,66 @@ mod task_badge_tooltip_tests {
     fn project_memory_line_none_when_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(project_memory_line(dir.path()).is_none());
+    }
+
+    #[test]
+    fn project_memory_line_counts_pending_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(
+            dir.path().join("prefs.md"),
+            "---\ndescription: Concise\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("verbose-claim.md"),
+            "---\ndescription: Verbose\nconflicts: prefs.md\n---\n",
+        )
+        .unwrap();
+        let line = project_memory_line(dir.path()).expect("line should render");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("1 Lethesyne"), "got: {text}");
+        assert!(text.contains("3 files"), "got: {text}");
+    }
+
+    #[test]
+    fn project_memory_line_counts_pairs_not_claimant_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(dir.path().join("a.md"), "---\ndescription: A\n---\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "---\ndescription: B\n---\n").unwrap();
+        // One claimant with two adjudicable pairs → the indicator shows the
+        // pair count (2), matching the injected block's two lines.
+        std::fs::write(
+            dir.path().join("claim.md"),
+            "---\ndescription: C\nconflicts: a.md, b.md\n---\n",
+        )
+        .unwrap();
+        let line = project_memory_line(dir.path()).expect("line should render");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("2 Lethesyne"), "got: {text}");
+        // A resolved pair is not adjudicable — it must not inflate the count.
+        std::fs::write(
+            dir.path().join("claim2.md"),
+            "---\ndescription: D\nconflicts: a.md\nresolved: a.md\n---\n",
+        )
+        .unwrap();
+        let line = project_memory_line(dir.path()).expect("line should render");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("2 Lethesyne"), "got: {text}");
+    }
+
+    #[test]
+    fn project_memory_line_no_pending_conflicts_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(
+            dir.path().join("prefs.md"),
+            "---\ndescription: Concise\n---\n",
+        )
+        .unwrap();
+        let line = project_memory_line(dir.path()).expect("line should render");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("Lethesyne"), "got: {text}");
     }
 }

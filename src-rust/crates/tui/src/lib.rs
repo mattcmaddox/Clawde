@@ -2064,7 +2064,7 @@ mod tests {
         assert!(app
             .status_message
             .as_deref()
-            .is_some_and(|message| message.starts_with("Project memory updated: ")));
+            .is_some_and(|message| message.starts_with("Mnemosyne updated: ")));
     }
 
     #[test]

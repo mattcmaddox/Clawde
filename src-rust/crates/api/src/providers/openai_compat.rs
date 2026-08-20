@@ -1323,6 +1323,10 @@ impl LlmProvider for OpenAiCompatProvider {
             // instead of hanging forever. Each chunk resets the timer, so
             // slow-but-progressing local models are never cut off.
             let idle_timeout = crate::stream_idle_timeout();
+            // Accumulate visible content as it streams so a mid-stream failure
+            // can be classified as `VisibleStreamFailure` (replay-unsafe) by
+            // ANY caller, not just FreeProvider's first-byte watchdog.
+            let mut partial_response = String::new();
             loop {
                 let chunk_result = match tokio::time::timeout(
                     idle_timeout,
@@ -1341,7 +1345,8 @@ impl LlmProvider for OpenAiCompatProvider {
                                 "Stream stalled: no data received for {}s; aborting to avoid hanging",
                                 idle_timeout.as_secs()
                             ),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -1352,7 +1357,8 @@ impl LlmProvider for OpenAiCompatProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -1362,6 +1368,21 @@ impl LlmProvider for OpenAiCompatProvider {
                     let mut events = Vec::new();
                     let stop = chat_decoder.feed_line(&line, &mut events);
                     for event in events {
+                        // Any committed output (text, thinking, tool-call JSON)
+                        // makes a later failure replay-unsafe.
+                        match &event {
+                            StreamEvent::TextDelta { text, .. }
+                            | StreamEvent::ThinkingDelta { thinking: text, .. }
+                            | StreamEvent::ReasoningDelta { reasoning: text, .. }
+                            | StreamEvent::InputJsonDelta {
+                                partial_json: text, ..
+                            } => {
+                                if !text.is_empty() {
+                                    partial_response.push_str(text);
+                                }
+                            }
+                            _ => {}
+                        }
                         yield Ok(event);
                     }
                     if stop {

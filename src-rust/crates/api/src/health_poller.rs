@@ -1,24 +1,25 @@
 // health_poller.rs — Startup + periodic health poller (spec §6.4).
 //
 // Probes each configured free-upstream key via the existing
-// `validate_upstream_key()` helper (GET `/v1/models`, 5s timeout; for
+// `probe_upstream_key()` helper (GET `/v1/models`, 5s timeout; for
 // upstreams whose models endpoint doesn't check auth — nvidia,
 // huggingface, openrouter, sambanova, cline — a 1-token
 // `chat/completions` confirmation probe) and logs the results so dead
 // keys are surfaced before the first user request hits them.
 //
 // Runs once at startup, then every `health_poll_interval_secs` (default 300s).
-// 0 disables the periodic sweep (startup probe still runs).  Probes are
-// staggered, respect existing cooldowns, and skip providers without keys.
+// 0 disables the periodic sweep (startup probe still runs). Probes use bounded
+// concurrency, preserve ring indexes, and skip providers without keys.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::providers::free::validate_upstream_key;
+use crate::providers::free::{probe_upstream_key, UpstreamKeyProbe};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -35,9 +36,14 @@ pub struct HealthProbeResult {
     pub upstream: String,
     /// Index of the key within the upstream's key pool.
     pub key_idx: usize,
-    /// `true` when the key answered the models endpoint successfully.
+    /// `true` when the key is not definitively invalid. A key that hit a
+    /// transient failure (5xx / connection / rate limit) is still `ok` — the
+    /// upstream accepted the key; it was just busy or unreachable.
     pub ok: bool,
-    /// Validation error message, when `ok` is `false`.
+    /// `true` when the probe could not verify the key because of a transient
+    /// failure. The key is not proven invalid, but it wasn't confirmed either.
+    pub transient: bool,
+    /// Validation error message, when `ok` is `false` or `transient` is `true`.
     pub err: Option<String>,
 }
 
@@ -52,9 +58,21 @@ pub struct ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// `true` when at least one key was probed and none were unhealthy.
+    /// `true` when at least one key was probed, every probe was definitive,
+    /// and none were unhealthy. Transient results are deliberately excluded:
+    /// they are not evidence that a key is healthy.
     pub fn is_all_healthy(&self) -> bool {
-        self.checked > 0 && self.unhealthy == 0
+        self.checked > 0
+            && self.unhealthy == 0
+            && self.results.iter().all(|result| !result.transient)
+    }
+
+    /// Number of probes that could not produce a definitive verdict.
+    pub fn transient_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.transient)
+            .count()
     }
 }
 
@@ -121,7 +139,7 @@ pub async fn run_health_poller(
 /// Run one synchronous probe sweep, returning per-key results.
 ///
 /// Used by the `/health` slash command. The whole sweep runs on a plain OS
-/// thread so the blocking HTTP clients in `validate_upstream_key` are created
+/// thread so the blocking HTTP clients in `probe_upstream_key` are created
 /// and dropped outside any tokio runtime context (mirrors
 /// `fetch_cline_free_model`).
 pub fn probe_sync() -> ProbeOutcome {
@@ -147,9 +165,9 @@ pub fn probe_sync_for(upstream_id: &str) -> ProbeOutcome {
 fn probe_sync_body(filter: Option<&str>) -> ProbeOutcome {
     let auth_store = clawde_core::AuthStore::load();
 
-    // Fan out: spawn one thread per configured upstream so slow upstreams
-    // never block fast ones. Within each upstream thread, keys are still
-    // probed sequentially with a small inter-key delay for rate limiting.
+    // Fan out by upstream. Keys within one upstream remain sequential so a
+    // provider's own rate limits are respected, but there is no unconditional
+    // sleep between keys or unrelated providers.
     let mut handles = Vec::new();
     for upstream in crate::providers::free::FREE_CATALOG {
         if filter.is_some_and(|f| f != upstream.id) {
@@ -158,70 +176,40 @@ fn probe_sync_body(filter: Option<&str>) -> ProbeOutcome {
         let Some(keys) = resolve_keys(&auth_store, upstream.id) else {
             continue;
         };
-        let keys: Vec<String> = keys.iter().filter(|k| k.len() >= 8).cloned().collect();
-        if keys.is_empty() {
-            continue;
-        }
         let upstream_id = upstream.id.to_string();
         handles.push(std::thread::spawn(move || {
-            let mut results = Vec::new();
-            let mut unhealthy = 0usize;
-            let checked = keys.len();
+            let mut outcome = ProbeOutcome::default();
             for (key_idx, key) in keys.iter().enumerate() {
-                match validate_upstream_key(&upstream_id, key) {
-                    Ok(()) => {
-                        debug!(upstream = upstream_id, key_idx, "health poll: key OK");
-                        results.push(HealthProbeResult {
-                            upstream: upstream_id.clone(),
-                            key_idx,
-                            ok: true,
-                            err: None,
-                        });
-                    }
-                    Err(err) => {
-                        warn!(
-                            upstream = upstream_id,
-                            key_idx,
-                            err = %err,
-                            "health poll: key unhealthy"
-                        );
-                        unhealthy += 1;
-                        results.push(HealthProbeResult {
-                            upstream: upstream_id.clone(),
-                            key_idx,
-                            ok: false,
-                            err: Some(err),
-                        });
-                    }
-                }
-                // Small gap between keys within the same upstream to avoid
-                // triggering provider rate limits. Upstream threads run in
-                // parallel, so this doesn't block unrelated providers.
-                std::thread::sleep(Duration::from_millis(200));
+                outcome.checked += 1;
+                let verdict = probe_upstream_key(&upstream_id, key);
+                let _ = record_probe_verdict(&mut outcome, &upstream_id, key_idx, verdict);
             }
-            ProbeOutcome {
-                unhealthy,
-                checked,
-                results,
-            }
+            outcome
         }));
     }
 
-    // Collect results from all upstream threads.
     let mut outcome = ProbeOutcome::default();
     for handle in handles {
         match handle.join() {
             Ok(upstream_outcome) => {
-                outcome.checked += upstream_outcome.checked;
                 outcome.unhealthy += upstream_outcome.unhealthy;
+                outcome.checked += upstream_outcome.checked;
                 outcome.results.extend(upstream_outcome.results);
             }
-            Err(_) => {
-                // Thread panicked — log and continue.
-                warn!("health poll: upstream probe thread panicked");
-            }
+            Err(_) => warn!("health poll: upstream probe thread panicked"),
         }
     }
+    outcome.results.sort_by(|a, b| {
+        let upstream_order = |id: &str| {
+            crate::providers::free::FREE_CATALOG
+                .iter()
+                .position(|entry| entry.id == id)
+                .unwrap_or(usize::MAX)
+        };
+        upstream_order(&a.upstream)
+            .cmp(&upstream_order(&b.upstream))
+            .then(a.key_idx.cmp(&b.key_idx))
+    });
 
     // Only full sweeps update the shared last-sweep slot; targeted probes
     // keep the footer marker / /ctx-viz consistent with the full picture.
@@ -256,102 +244,98 @@ async fn poll_and_log(
     }
 
     info!(count = targets.len(), "health_poller: probing");
+    const MAX_CONCURRENT_PROBES: usize = 8;
+    let semaphore = std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
+    let mut jobs = JoinSet::new();
     let mut outcome = ProbeOutcome::default();
 
-    for upstream_id in &targets {
-        // Re-resolve via the alias-aware helper (matches build_probe_list) so
-        // shared slots like opencode-zen/opencode-go are actually probed.
+    // Submit every key immediately, with bounded blocking-probe concurrency.
+    // This keeps independent providers concurrent without creating an
+    // unbounded number of blocking threads or imposing a fixed delay between
+    // unrelated keys.
+    for (catalog_idx, upstream_id) in targets.iter().enumerate() {
         let Some(keys) = resolve_keys(&auth_store, upstream_id) else {
             continue;
         };
-
-        // Probe EVERY key in the pool — not just key 0 — carrying its real
-        // index so exhaustion lands on the right ring slot.
-        //
-        // No length guard needed here: resolve_free_upstream_keys already
-        // trims and drops <8-char placeholders, so every key in this list is
-        // exactly what a KeyRotatingProvider ring holds (indices align).
         for (key_idx, key) in keys.iter().enumerate() {
             outcome.checked += 1;
-            let upstream_id_owned = upstream_id.clone();
-            let upstream_id_for_log = upstream_id_owned.clone();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = record_probe_verdict(
+                        &mut outcome,
+                        upstream_id,
+                        key_idx,
+                        UpstreamKeyProbe::Transient("probe scheduler closed".to_string()),
+                    );
+                    continue;
+                }
+            };
+            let upstream_id = upstream_id.clone();
+            let probe_upstream_id = upstream_id.clone();
             let key = key.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                validate_upstream_key(&upstream_id_owned, &key)
-            })
-            .await;
-
-            match result {
-                Ok(Ok(())) => {
-                    debug!(
-                        upstream = %upstream_id_for_log,
-                        key_idx,
-                        "health_poller: key OK"
-                    );
-                    // Clear any lingering cooldown injected by a previous
-                    // definitive failure — the key is demonstrably healthy
-                    // right now so the key ring must reflect that.
-                    if let Some(provider) = free_provider {
-                        provider.mark_key_healthy(Some(&upstream_id_for_log), key_idx);
-                    }
-                    outcome.results.push(HealthProbeResult {
-                        upstream: upstream_id_for_log.clone(),
-                        key_idx,
-                        ok: true,
-                        err: None,
-                    });
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        upstream = %upstream_id_for_log,
-                        key_idx,
-                        err = %err,
-                        "health_poller: key unhealthy"
-                    );
-                    outcome.unhealthy += 1;
-                    outcome.results.push(HealthProbeResult {
-                        upstream: upstream_id_for_log.clone(),
-                        key_idx,
-                        ok: false,
-                        err: Some(err.clone()),
-                    });
-                    // Inject exhaustion only for definitive auth failures — a
-                    // transient 5xx / rate limit / network blip must not evict
-                    // a working key from rotation or flip the TUI health
-                    // display red (spec §6.4).
-                    if let Some(provider) = free_provider {
-                        if let Some(cooldown) = classify_health_error(&err) {
-                            provider.mark_key_exhausted(
-                                Some(&upstream_id_for_log),
-                                key_idx,
-                                cooldown,
-                                Some(err.clone()),
-                            );
-                        }
-                    }
-                }
-                Err(join_err) => {
-                    warn!(
-                        upstream = %upstream_id_for_log,
-                        key_idx,
-                        err = %join_err,
-                        "health_poller: spawn_blocking panicked"
-                    );
-                    outcome.unhealthy += 1;
-                    outcome.results.push(HealthProbeResult {
-                        upstream: upstream_id_for_log.clone(),
-                        key_idx,
-                        ok: false,
-                        err: Some(format!("probe task panicked: {}", join_err)),
-                    });
-                }
-            }
-
-            // Small stagger between probes so we don't hammer providers.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            jobs.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    probe_upstream_key(&probe_upstream_id, &key)
+                })
+                .await;
+                drop(permit);
+                (catalog_idx, key_idx, upstream_id, result)
+            });
         }
     }
 
+    while let Some(job) = jobs.join_next().await {
+        match job {
+            Ok((_catalog_idx, key_idx, upstream_id, Ok(verdict))) => {
+                if let Some((cooldown, reason)) =
+                    record_probe_verdict(&mut outcome, &upstream_id, key_idx, verdict)
+                {
+                    if let Some(provider) = free_provider {
+                        provider.mark_key_exhausted(
+                            Some(&upstream_id),
+                            key_idx,
+                            cooldown,
+                            Some(reason),
+                        );
+                    }
+                } else if let Some(provider) = free_provider {
+                    // Only a definitive success clears a prior health-poller
+                    // cooldown. A transient result must leave ring state alone.
+                    if outcome.results.last().is_some_and(|result| {
+                        result.upstream == upstream_id
+                            && result.key_idx == key_idx
+                            && !result.transient
+                    }) {
+                        provider.mark_key_healthy(Some(&upstream_id), key_idx);
+                    }
+                }
+            }
+            Ok((_catalog_idx, key_idx, upstream_id, Err(join_error))) => {
+                let _ = record_probe_verdict(
+                    &mut outcome,
+                    &upstream_id,
+                    key_idx,
+                    UpstreamKeyProbe::Transient(format!("probe task panicked: {}", join_error)),
+                );
+            }
+            Err(join_error) => {
+                warn!(err = %join_error, "health poll: probe task panicked");
+            }
+        }
+    }
+
+    outcome.results.sort_by(|a, b| {
+        let upstream_order = |id: &str| {
+            crate::providers::free::FREE_CATALOG
+                .iter()
+                .position(|entry| entry.id == id)
+                .unwrap_or(usize::MAX)
+        };
+        upstream_order(&a.upstream)
+            .cmp(&upstream_order(&b.upstream))
+            .then(a.key_idx.cmp(&b.key_idx))
+    });
     store_last_sweep(&outcome);
     if let Some(tx) = report_tx {
         let _ = tx.send(outcome.clone());
@@ -362,40 +346,71 @@ async fn poll_and_log(
             healthy = outcome.checked,
             "health_poller: all {} upstream keys healthy", outcome.checked,
         );
-    } else if outcome.unhealthy > 0 {
+    } else if outcome.unhealthy > 0 || outcome.transient_count() > 0 {
         warn!(
-            healthy = outcome.checked.saturating_sub(outcome.unhealthy),
+            healthy = outcome
+                .checked
+                .saturating_sub(outcome.unhealthy)
+                .saturating_sub(outcome.transient_count()),
+            transient = outcome.transient_count(),
             unhealthy = outcome.unhealthy,
-            "health_poller: {}/{} upstream key(s) unhealthy",
+            "health_poller: {} unhealthy and {} transient upstream key probe(s)",
             outcome.unhealthy,
-            outcome.checked,
+            outcome.transient_count(),
         );
     }
 }
 
-/// Classify a health poll error into an optional cooldown (seconds).
-///
-/// Returns `Some(cooldown)` only for **definitive** key failures — auth
-/// rejections mean the key itself is dead and should be pulled from
-/// rotation (and surfaced as unhealthy in the TUI).
-///
-/// Returns `None` for transient conditions (5xx, connection errors, rate
-/// limits): a momentary provider/network hiccup at probe time must not
-/// poison the key ring — the request path already handles those signals
-/// with its own short cooldowns and fallback.
-fn classify_health_error(err: &str) -> Option<u64> {
-    let lower = err.to_lowercase();
-    let definitive = lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("invalid api key")
-        || lower.contains("invalid key")
-        || lower.contains("key is invalid");
-    if definitive {
-        Some(300) // 5 min for auth failures
-    } else {
-        None
+/// Record a typed probe verdict and return `(cooldown, reason)` only when
+/// the key is definitively invalid. This keeps health display, ring mutation,
+/// and persistence decisions on the same verdict instead of reparsing error
+/// strings in multiple places.
+fn record_probe_verdict(
+    outcome: &mut ProbeOutcome,
+    upstream_id: &str,
+    key_idx: usize,
+    verdict: UpstreamKeyProbe,
+) -> Option<(u64, String)> {
+    match verdict {
+        UpstreamKeyProbe::Valid => {
+            debug!(upstream = upstream_id, key_idx, "health poll: key OK");
+            outcome.results.push(HealthProbeResult {
+                upstream: upstream_id.to_string(),
+                key_idx,
+                ok: true,
+                transient: false,
+                err: None,
+            });
+            None
+        }
+        UpstreamKeyProbe::Invalid(reason) => {
+            warn!(upstream = upstream_id, key_idx, err = %reason, "health poll: key unhealthy");
+            outcome.unhealthy += 1;
+            outcome.results.push(HealthProbeResult {
+                upstream: upstream_id.to_string(),
+                key_idx,
+                ok: false,
+                transient: false,
+                err: Some(reason.clone()),
+            });
+            Some((300, reason))
+        }
+        UpstreamKeyProbe::Transient(reason) => {
+            warn!(
+                upstream = upstream_id,
+                key_idx,
+                err = %reason,
+                "health poll: transient failure (key not proven invalid)"
+            );
+            outcome.results.push(HealthProbeResult {
+                upstream: upstream_id.to_string(),
+                key_idx,
+                ok: true,
+                transient: true,
+                err: Some(reason),
+            });
+            None
+        }
     }
 }
 
@@ -423,61 +438,39 @@ fn build_probe_list(auth_store: &clawde_core::AuthStore) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::resolve_keys;
-    use super::{build_probe_list, classify_health_error, last_sweep_generation, probe_sync_for};
+    use super::{
+        build_probe_list, last_sweep_generation, probe_sync_for, record_probe_verdict, ProbeOutcome,
+    };
     use crate::providers::free::resolve_free_upstream_keys;
+    use crate::providers::free::UpstreamKeyProbe;
 
     #[test]
-    fn auth_failures_are_definitive() {
-        // 401/403 and their textual equivalents mean the key itself is dead.
-        assert_eq!(
-            classify_health_error("Invalid API key (HTTP 401)"),
-            Some(300)
+    fn typed_probe_results_distinguish_invalid_and_transient() {
+        let mut outcome = ProbeOutcome {
+            checked: 2,
+            ..Default::default()
+        };
+        let invalid = record_probe_verdict(
+            &mut outcome,
+            "groq",
+            0,
+            UpstreamKeyProbe::Invalid("Invalid API key (HTTP 401)".to_string()),
         );
-        assert_eq!(
-            classify_health_error("Invalid API key (HTTP 403)"),
-            Some(300)
-        );
-        assert_eq!(classify_health_error("401 Unauthorized"), Some(300));
-        assert_eq!(classify_health_error("403 Forbidden"), Some(300));
-        assert_eq!(
-            classify_health_error("Unauthorized: invalid key"),
-            Some(300)
-        );
-        assert_eq!(
-            classify_health_error("the provided API key is invalid"),
-            Some(300)
-        );
-        assert_eq!(classify_health_error("Invalid API Key provided"), Some(300));
-    }
+        assert_eq!(invalid.map(|(cooldown, _)| cooldown), Some(300));
+        assert_eq!(outcome.unhealthy, 1);
+        assert!(!outcome.results[0].ok);
 
-    #[test]
-    fn transient_failures_are_not_definitive() {
-        // A momentary provider/network/rate blip must not poison the ring.
-        assert_eq!(
-            classify_health_error("HTTP 500 — unexpected response"),
-            None
+        let transient = record_probe_verdict(
+            &mut outcome,
+            "nvidia",
+            1,
+            UpstreamKeyProbe::Transient("Server error (HTTP 503)".to_string()),
         );
-        assert_eq!(classify_health_error("HTTP 502 — bad gateway"), None);
-        assert_eq!(classify_health_error("Connection failed: timed out"), None);
-        assert_eq!(
-            classify_health_error("Rate limited — try again later"),
-            None
-        );
-        assert_eq!(classify_health_error("HTTP 429 — too many requests"), None);
-        assert_eq!(
-            classify_health_error("Key too short (min 8 characters)"),
-            None
-        );
-    }
-
-    #[test]
-    fn status_code_substrings_do_not_false_positive() {
-        // "502" must not match the old blanket "50" rule; "invalid key"
-        // phrases that are NOT auth rejections (e.g. a config error) must
-        // not be treated as definitive either.
-        assert_eq!(classify_health_error("HTTP 502"), None);
-        assert_eq!(classify_health_error("no validation endpoint"), None);
-        assert_eq!(classify_health_error("unknown upstream"), None);
+        assert_eq!(transient, None);
+        assert_eq!(outcome.unhealthy, 1);
+        assert!(outcome.results[1].ok);
+        assert!(outcome.results[1].transient);
+        assert!(!outcome.is_all_healthy());
     }
 
     #[test]

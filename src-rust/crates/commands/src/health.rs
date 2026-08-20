@@ -110,7 +110,15 @@ fn format_health_report(outcome: &clawde_api::health_poller::ProbeOutcome) -> St
         outcome.checked, outcome.unhealthy
     ));
     for r in &outcome.results {
-        let mark = if r.ok { "\u{2713}" } else { "\u{2717}" }; // ✓ / ✗
+        // ✓ healthy, ~ transient (key not proven invalid, upstream busy),
+        // ✗ dead (definitive auth rejection).
+        let mark = if !r.ok {
+            "\u{2717}" // ✗
+        } else if r.transient {
+            "~"
+        } else {
+            "\u{2713}" // ✓
+        };
         let detail = match &r.err {
             Some(e) => format!(" — {}", e),
             None => String::new(),
@@ -140,12 +148,14 @@ mod tests {
                     upstream: "groq".to_string(),
                     key_idx: 0,
                     ok: true,
+                    transient: false,
                     err: None,
                 },
                 clawde_api::health_poller::HealthProbeResult {
                     upstream: "nvidia".to_string(),
                     key_idx: 1,
                     ok: false,
+                    transient: false,
                     err: Some("Invalid API key (HTTP 401)".to_string()),
                 },
             ],
@@ -156,6 +166,31 @@ mod tests {
         assert!(text.contains("\u{2717} nvidia"));
         assert!(text.contains("key #2"));
         assert!(text.contains("Invalid API key (HTTP 401)"));
+    }
+
+    /// A transient failure (5xx / connection / rate limit) is not a dead key:
+    /// it renders with a `~` marker, not `✗`, and is not counted unhealthy.
+    #[test]
+    fn format_health_report_marks_transient_distinctly() {
+        let outcome = clawde_api::health_poller::ProbeOutcome {
+            checked: 1,
+            unhealthy: 0,
+            results: vec![clawde_api::health_poller::HealthProbeResult {
+                upstream: "nvidia".to_string(),
+                key_idx: 0,
+                ok: true,
+                transient: true,
+                err: Some("Connection failed: timed out".to_string()),
+            }],
+        };
+        let text = format_health_report(&outcome);
+        assert!(text.contains("1 key(s) probed, 0 unhealthy"));
+        assert!(text.contains("~ nvidia"));
+        assert!(
+            !text.contains("\u{2717} nvidia"),
+            "transient is not a dead key"
+        );
+        assert!(text.contains("Connection failed: timed out"));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "threshold": 0.8,
+  "assert": [
+    {"type": "min-length", "value": 200, "weight": 2},
+    {"type": "icontains", "value": "should_fallback", "weight": 2},
+    {"type": "icontains", "value": "InvalidRequest", "weight": 1},
+    {"type": "upstream-present", "weight": 2},
+    {"type": "no-error", "weight": 2},
+    {"type": "similar", "value": "should_fallback decides whether the free provider retries another upstream. It falls through on transient errors but refuses InvalidRequest and ContentFiltered because they are user errors that would fail identically on every upstream.", "threshold": 0.3, "weight": 1}
+  ]
+}

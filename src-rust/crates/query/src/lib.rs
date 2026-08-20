@@ -129,6 +129,11 @@ pub struct QueryConfig {
     /// `Config::memory.enabled`; `Some(false)` disables injection even when a
     /// memory dir exists, `None` defers to env vars / defaults.
     pub memory_enabled: Option<bool>,
+    /// AutoDream cadence (hours); mirrors `Config.memory.auto_dream_min_hours`.
+    pub memory_autodream_min_hours: Option<f64>,
+    /// AutoDream work trigger (KB); mirrors
+    /// `Config.memory.auto_dream_min_importance_kb`.
+    pub memory_autodream_min_importance_kb: Option<f64>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
@@ -224,6 +229,8 @@ impl Default for QueryConfig {
             thinking_budget: None,
             memory_max_tokens: None,
             memory_enabled: None,
+            memory_autodream_min_hours: None,
+            memory_autodream_min_importance_kb: None,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -256,6 +263,8 @@ impl QueryConfig {
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
+            memory_autodream_min_hours: cfg.memory.auto_dream_min_hours,
+            memory_autodream_min_importance_kb: cfg.memory.auto_dream_min_importance_kb,
             effort_level: cfg.default_effort,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
@@ -278,6 +287,8 @@ impl QueryConfig {
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
+            memory_autodream_min_hours: cfg.memory.auto_dream_min_hours,
+            memory_autodream_min_importance_kb: cfg.memory.auto_dream_min_importance_kb,
             effort_level: cfg.default_effort,
             managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
@@ -3294,22 +3305,50 @@ pub async fn run_query_loop(
                         // so consolidation and injection can never target
                         // different dirs. Falls back to the legacy global
                         // `memory/` dir when neither is a real project path.
-                        let memory_dir = {
+                        let (memory_dir, conversations_dir) = {
                             let project = config
                                 .working_directory
                                 .as_deref()
                                 .filter(|d| !d.is_empty())
                                 .map(std::path::PathBuf::from)
                                 .unwrap_or_else(|| tool_ctx.working_dir.clone());
-                            if project.is_dir() {
+                            // Session transcripts are written per-project (git
+                            // repo root, or the cwd when not in a repo) by
+                            // `sync_transcript_to_disk` in the CLI — dream from
+                            // the exact same directory so the session gate and
+                            // transcript greps see the real sessions instead of
+                            // the legacy (now-unused) `~/.clawde/conversations`.
+                            let transcript_root = clawde_core::git_utils::get_repo_root(&project)
+                                .unwrap_or_else(|| project.clone());
+                            let memory = if project.is_dir() {
                                 Some(clawde_core::memdir::auto_memory_path(&project))
                             } else {
                                 Some(clawde_home.join("memory"))
-                            }
+                            };
+                            let conversations = Some(clawde_core::session_storage::transcript_dir(
+                                &transcript_root,
+                            ));
+                            (memory, conversations)
                         };
-                        let conversations_dir = Some(clawde_home.join("conversations"));
                         if let (Some(mem), Some(conv)) = (memory_dir, conversations_dir) {
-                            let dreamer = crate::auto_dream::AutoDream::new(mem, conv);
+                            // Surface the AutoDream gates from settings
+                            // (`memory.autoDreamMinHours` /
+                            // `memory.autoDreamMinImportanceKB` in the settings
+                            // screen), falling back to the built-in defaults.
+                            let default_dream = crate::auto_dream::AutoDreamConfig::default();
+                            let dream_config = crate::auto_dream::AutoDreamConfig {
+                                min_hours: config
+                                    .memory_autodream_min_hours
+                                    .filter(|n| n.is_finite() && *n >= 1.0)
+                                    .unwrap_or(default_dream.min_hours),
+                                min_importance: config
+                                    .memory_autodream_min_importance_kb
+                                    .filter(|n| n.is_finite() && *n >= 1.0)
+                                    .map(|kb| kb * 1000.0)
+                                    .unwrap_or(default_dream.min_importance),
+                            };
+                            let dreamer =
+                                crate::auto_dream::AutoDream::with_config(dream_config, mem, conv);
                             if let Ok(Some(task)) = dreamer.maybe_trigger().await {
                                 // Run the consolidation subagent in a background Tokio
                                 // task so the parent query loop stays responsive. The
@@ -3320,7 +3359,26 @@ pub async fn run_query_loop(
                                     "description": "memory consolidation",
                                     "prompt": task.prompt,
                                     "max_turns": 20,
-                                    "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
+                                    // Enforced capability sandbox: no shell
+                                    // (Bash/PowerShell), no network tools, no
+                                    // AgentTool (always excluded), and no task/
+                                    // cron/sleep tools. The agent can read and
+                                    // search anywhere (memory dir + transcripts)
+                                    // and Write only via the file-write tool,
+                                    // which the prompt confines to the memory
+                                    // dir. This replaces the old prompt-prose
+                                    // "read-only Bash" constraint with an
+                                    // actual allowlist.
+                                    "tools": [
+                                        clawde_core::constants::TOOL_NAME_FILE_READ,
+                                        clawde_core::constants::TOOL_NAME_GLOB,
+                                        clawde_core::constants::TOOL_NAME_GREP,
+                                        clawde_core::constants::TOOL_NAME_FILE_WRITE,
+                                    ],
+                                    "system_prompt": "You are performing automatic memory consolidation. \
+                                     You have no shell access: use Read, Glob, and Grep to inspect \
+                                     memory files and transcripts, and Write only inside the memory \
+                                     directory named in your task. Complete the task and return a brief summary.",
                                     // The outer tokio task already makes this
                                     // non-blocking for the parent query loop. The
                                     // nested agent must run synchronously here so
@@ -3335,20 +3393,45 @@ pub async fn run_query_loop(
                                     task.memory_dir.join(clawde_core::memdir::MEMORY_ENTRYPOINT);
                                 tokio::spawn(async move {
                                     let agent = crate::agent_tool::AgentTool::default();
-                                    let result = clawde_tools::Tool::execute(
-                                        &agent,
-                                        agent_input,
-                                        &ctx_for_dream,
+                                    // Wall-clock budget (Phase 1c): a dream is a
+                                    // background subagent run; bound it so a
+                                    // runaway consolidation cannot burn tokens
+                                    // indefinitely. A timeout counts as a
+                                    // failure, so the backoff gate prevents an
+                                    // immediate retry.
+                                    let timeout = std::time::Duration::from_secs(
+                                        crate::auto_dream::DREAM_TIMEOUT_SECS,
+                                    );
+                                    let result = tokio::time::timeout(
+                                        timeout,
+                                        clawde_tools::Tool::execute(
+                                            &agent,
+                                            agent_input,
+                                            &ctx_for_dream,
+                                        ),
                                     )
                                     .await;
-                                    if !result.is_error {
+                                    let success = match result {
+                                        Ok(r) => !r.is_error,
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                "AutoDream consolidation timed out after {}s",
+                                                crate::auto_dream::DREAM_TIMEOUT_SECS
+                                            );
+                                            false
+                                        }
+                                    };
+                                    if success {
                                         if let Some(tx) = event_tx_for_dream {
                                             let _ = tx.send(QueryEvent::MemoryUpdated(
                                                 memory_entrypoint.display().to_string(),
                                             ));
                                         }
                                     }
-                                    crate::auto_dream::AutoDream::finish_consolidation(&task).await;
+                                    crate::auto_dream::AutoDream::finish_consolidation(
+                                        &task, success,
+                                    )
+                                    .await;
                                 });
                             }
                         }
@@ -3977,6 +4060,8 @@ mod tests {
             network_blocked: false,
             memory_max_tokens: None,
             memory_enabled: None,
+            memory_autodream_min_hours: None,
+            memory_autodream_min_importance_kb: None,
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,

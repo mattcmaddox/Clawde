@@ -227,6 +227,31 @@ pub enum StreamEvent {
     },
 }
 
+impl StreamEvent {
+    /// The committed output carried by this event, when any.
+    ///
+    /// Committed output is generated content the caller may already have shown
+    /// or acted on (visible text, thinking, or a tool-call argument). Adapters
+    /// accumulate it so a mid-stream failure can be classified as
+    /// `VisibleStreamFailure` (replay-unsafe) instead of a generic transient
+    /// error. Transport metadata (`MessageStart`, rate-limit headers) is
+    /// deliberately excluded: a failure after metadata but before output can
+    /// still safely fall through to another upstream.
+    pub(crate) fn committed_output_text(&self) -> Option<&str> {
+        match self {
+            StreamEvent::TextDelta { text, .. }
+            | StreamEvent::ThinkingDelta { thinking: text, .. }
+            | StreamEvent::ReasoningDelta {
+                reasoning: text, ..
+            }
+            | StreamEvent::InputJsonDelta {
+                partial_json: text, ..
+            } => (!text.is_empty()).then_some(text.as_str()),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // StreamBlockAccumulator
 // ---------------------------------------------------------------------------
@@ -520,6 +545,54 @@ pub enum ApiKeyHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `committed_output_text` is the replay-safety signal every adapter uses
+    /// to classify a mid-stream failure as `VisibleStreamFailure`. It must
+    /// cover all content that a caller may already have shown or acted on, and
+    /// exclude transport metadata that is safe to replay.
+    #[test]
+    fn committed_output_text_covers_content_and_excludes_metadata() {
+        let content_cases: [StreamEvent; 4] = [
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "visible".into(),
+            },
+            StreamEvent::ThinkingDelta {
+                index: 0,
+                thinking: "thought".into(),
+            },
+            StreamEvent::ReasoningDelta {
+                index: 0,
+                reasoning: "reason".into(),
+            },
+            StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{\"q\":1}".into(),
+            },
+        ];
+        for event in &content_cases {
+            assert!(
+                event.committed_output_text().is_some(),
+                "{event:?} must commit output"
+            );
+        }
+
+        // Empty deltas and lifecycle/metadata events commit nothing.
+        assert!(StreamEvent::TextDelta {
+            index: 0,
+            text: String::new(),
+        }
+        .committed_output_text()
+        .is_none());
+        assert!(StreamEvent::MessageStart {
+            id: "m".into(),
+            model: "m".into(),
+            usage: UsageInfo::default(),
+        }
+        .committed_output_text()
+        .is_none());
+        assert!(StreamEvent::MessageStop.committed_output_text().is_none());
+    }
 
     /// Regression test for issue #217. The non-streaming aggregators used by
     /// the Anthropic and MiniMax providers delegate to `StreamBlockAccumulator`.

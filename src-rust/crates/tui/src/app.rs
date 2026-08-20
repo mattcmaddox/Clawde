@@ -777,8 +777,9 @@ pub struct SystemAnnotation {
 /// `system_annotations`.
 #[derive(Debug, Clone)]
 pub enum DisplayMessage {
-    /// A real conversation turn.
-    Conversation(Message),
+    /// A real conversation turn. Boxed to keep the enum small — `Message`
+    /// carries optional turn metadata (upstream attribution, timestamps).
+    Conversation(Box<Message>),
     /// An injected system notice (e.g. compact boundary).
     System {
         text: String,
@@ -10031,7 +10032,7 @@ impl App {
                 observability,
             } => {
                 debug!(turn, stop_reason, "Turn complete");
-                if let Some(metrics) = observability {
+                if let Some(ref metrics) = observability {
                     self.stats_dialog.record_provider_activity(
                         &metrics.provider_id,
                         metrics.upstream_id.as_deref(),
@@ -10059,6 +10060,22 @@ impl App {
                 self.last_turn_elapsed = Some(elapsed.unwrap_or_else(|| "0s".to_string()));
                 self.last_turn_verb = Some(sample_completion_verb(seed));
                 self.flush_streamed_assistant_message();
+                // The flushed message was rebuilt from stream text and lost the
+                // per-turn attribution the query loop attached. Restore it from
+                // the observability event so the transcript badge renders.
+                if let Some(metrics) = observability.as_ref() {
+                    if let Some(meta) = &metrics.turn_meta {
+                        if let Some(last) = self.messages.last_mut() {
+                            if last.role == clawde_core::types::Role::Assistant {
+                                last.turn_meta = Some(meta.clone());
+                                if let Some(cost_usd) = metrics.cost_usd {
+                                    let cost = last.cost.get_or_insert_with(Default::default);
+                                    cost.cost_usd = cost_usd;
+                                }
+                            }
+                        }
+                    }
+                }
                 self.tool_use_blocks
                     .retain(|b| b.status != ToolStatus::Running);
                 self.complete_current_turn_snapshot(
@@ -10142,7 +10159,7 @@ impl App {
             QueryEvent::MemoryUpdated(path) => {
                 self.memory_update_notification.show(&path);
                 self.status_message = Some(format!(
-                    "Project memory updated: {}",
+                    "Mnemosyne updated: {}",
                     crate::memory_update_notification::get_relative_memory_path(&path)
                 ));
             }

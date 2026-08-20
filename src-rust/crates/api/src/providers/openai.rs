@@ -852,6 +852,7 @@ impl LlmProvider for OpenAiProvider {
             let mut message_started = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
+            let mut partial_response = String::new();
             // Track accumulating tool call argument buffers: index -> (id, name, buf)
             let mut tool_call_buffers: std::collections::HashMap<
                 usize,
@@ -881,7 +882,8 @@ impl LlmProvider for OpenAiProvider {
                                 "Stream stalled: no data received for {}s; aborting to avoid hanging",
                                 idle_timeout.as_secs()
                             ),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -892,7 +894,8 @@ impl LlmProvider for OpenAiProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -996,6 +999,7 @@ impl LlmProvider for OpenAiProvider {
                     };
                     if let Some(content) = content {
                         if !content.is_empty() {
+                            partial_response.push_str(&content);
                             yield Ok(StreamEvent::TextDelta {
                                 index: 0,
                                 text: content,
@@ -1052,6 +1056,7 @@ impl LlmProvider for OpenAiProvider {
                                     {
                                         buf.push_str(args_frag);
                                     }
+                                    partial_response.push_str(args_frag);
                                     yield Ok(StreamEvent::InputJsonDelta {
                                         index: block_index,
                                         partial_json: args_frag.to_string(),

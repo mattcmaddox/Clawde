@@ -12,6 +12,73 @@ use std::fmt;
 // ProviderError
 // ---------------------------------------------------------------------------
 
+/// The operational class that determines how an error may be recovered.
+///
+/// This is intentionally separate from [`ProviderError`]'s wire/provider
+/// details. Routing, key rotation, and the agent loop can make policy decisions
+/// from one stable taxonomy without matching provider-specific strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryClass {
+    InvalidCredential,
+    RateLimited,
+    QuotaExhausted,
+    TransientProvider,
+    ContextOverflow,
+    UnsupportedCapability,
+    MalformedRequest,
+    ContentFiltered,
+    ModelUnavailable,
+    VisibleStreamFailure,
+    Unknown,
+}
+
+impl RecoveryClass {
+    /// Stable machine-readable name for logs, diagnostics, and tests.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCredential => "invalid_credential",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::TransientProvider => "transient_provider",
+            Self::ContextOverflow => "context_overflow",
+            Self::UnsupportedCapability => "unsupported_capability",
+            Self::MalformedRequest => "malformed_request",
+            Self::ContentFiltered => "content_filtered",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::VisibleStreamFailure => "visible_stream_failure",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the same logical request may be sent to another upstream.
+    pub const fn may_fallback(self) -> bool {
+        !matches!(
+            self,
+            Self::MalformedRequest | Self::ContentFiltered | Self::VisibleStreamFailure
+        )
+    }
+
+    /// Whether retrying the same provider can be useful. Key rotation may
+    /// still choose a different key for credential/quota classes.
+    pub const fn may_retry_same_provider(self) -> bool {
+        matches!(self, Self::RateLimited | Self::TransientProvider)
+    }
+
+    /// Whether the failure should cool down a credential slot. Provider-wide
+    /// outages and request-shape failures must not evict individual keys.
+    pub const fn cools_key(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidCredential | Self::RateLimited | Self::QuotaExhausted
+        )
+    }
+
+    /// Whether it is safe to replay the request when no output was committed.
+    pub const fn replay_safe(self) -> bool {
+        !matches!(self, Self::VisibleStreamFailure)
+    }
+}
+
 /// A structured error produced by any provider adapter.
 #[derive(Debug, Clone)]
 pub enum ProviderError {
@@ -96,6 +163,56 @@ pub enum ProviderError {
 // ---------------------------------------------------------------------------
 
 impl ProviderError {
+    /// Classify this error for routing, key rotation, and agent recovery.
+    pub fn recovery_class(&self) -> RecoveryClass {
+        match self {
+            Self::ContextOverflow { .. } => RecoveryClass::ContextOverflow,
+            Self::RateLimited { .. } => RecoveryClass::RateLimited,
+            Self::AuthFailed { .. } => RecoveryClass::InvalidCredential,
+            Self::QuotaExceeded { .. } => RecoveryClass::QuotaExhausted,
+            Self::ModelNotFound { .. } => RecoveryClass::ModelUnavailable,
+            Self::ServerError { .. } => RecoveryClass::TransientProvider,
+            Self::InvalidRequest { message, .. } => {
+                if crate::error_handling::is_context_overflow(message) {
+                    RecoveryClass::ContextOverflow
+                } else {
+                    RecoveryClass::MalformedRequest
+                }
+            }
+            Self::ContentFiltered { .. } => RecoveryClass::ContentFiltered,
+            Self::StreamError {
+                partial_response: Some(_),
+                ..
+            } => RecoveryClass::VisibleStreamFailure,
+            Self::StreamError {
+                partial_response: None,
+                ..
+            } => RecoveryClass::TransientProvider,
+            Self::Other {
+                status,
+                message,
+                body,
+                ..
+            } => {
+                let body_text = body.as_deref().unwrap_or("");
+                if crate::error_handling::is_context_overflow(message)
+                    || crate::error_handling::is_context_overflow(body_text)
+                {
+                    RecoveryClass::ContextOverflow
+                } else {
+                    match status {
+                        Some(401 | 403) => RecoveryClass::InvalidCredential,
+                        Some(402) => RecoveryClass::QuotaExhausted,
+                        Some(413) => RecoveryClass::ContextOverflow,
+                        Some(429) => RecoveryClass::RateLimited,
+                        Some(408 | 425 | 500..=599) => RecoveryClass::TransientProvider,
+                        _ => RecoveryClass::Unknown,
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns `true` if the caller should retry the request after a delay.
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -104,6 +221,16 @@ impl ProviderError {
             ProviderError::StreamError { .. } => true,
             _ => false,
         }
+    }
+
+    /// Whether another upstream may receive this logical request.
+    pub fn may_fallback(&self) -> bool {
+        self.recovery_class().may_fallback()
+    }
+
+    /// Whether replaying this request is safe after this error.
+    pub fn replay_safe(&self) -> bool {
+        self.recovery_class().replay_safe()
     }
 
     /// Returns the `ProviderId` of the provider that produced this error.
@@ -226,6 +353,119 @@ impl From<ProviderError> for ClaudeError {
                 message: message.clone(),
             },
             _ => ClaudeError::Api(err.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderError, RecoveryClass};
+    use clawde_core::provider_id::ProviderId;
+
+    fn provider() -> ProviderId {
+        ProviderId::new("test")
+    }
+
+    #[test]
+    fn recovery_classes_have_stable_policy() {
+        let cases = [
+            (
+                ProviderError::AuthFailed {
+                    provider: provider(),
+                    message: "invalid".into(),
+                },
+                RecoveryClass::InvalidCredential,
+                true,
+                true,
+            ),
+            (
+                ProviderError::QuotaExceeded {
+                    provider: provider(),
+                    message: "quota".into(),
+                },
+                RecoveryClass::QuotaExhausted,
+                true,
+                true,
+            ),
+            (
+                ProviderError::ServerError {
+                    provider: provider(),
+                    status: Some(503),
+                    message: "busy".into(),
+                    is_retryable: true,
+                },
+                RecoveryClass::TransientProvider,
+                true,
+                false,
+            ),
+            (
+                ProviderError::InvalidRequest {
+                    provider: provider(),
+                    message: "bad parameter".into(),
+                },
+                RecoveryClass::MalformedRequest,
+                false,
+                false,
+            ),
+            (
+                ProviderError::ContentFiltered {
+                    provider: provider(),
+                    message: "blocked".into(),
+                },
+                RecoveryClass::ContentFiltered,
+                false,
+                false,
+            ),
+        ];
+
+        for (error, class, may_fallback, cools_key) in cases {
+            assert_eq!(error.recovery_class(), class);
+            assert_eq!(error.may_fallback(), may_fallback);
+            assert_eq!(class.cools_key(), cools_key);
+            assert!(!class.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn context_overflow_is_distinct_from_malformed_request() {
+        let error = ProviderError::InvalidRequest {
+            provider: provider(),
+            message: "maximum context length exceeded".into(),
+        };
+        assert_eq!(error.recovery_class(), RecoveryClass::ContextOverflow);
+        assert!(error.may_fallback());
+        assert!(error.replay_safe());
+    }
+
+    #[test]
+    fn visible_stream_failure_is_not_replay_safe() {
+        let error = ProviderError::StreamError {
+            provider: provider(),
+            message: "connection closed".into(),
+            partial_response: Some("already visible".into()),
+        };
+        assert_eq!(error.recovery_class(), RecoveryClass::VisibleStreamFailure);
+        assert!(!error.may_fallback());
+        assert!(!error.replay_safe());
+    }
+
+    #[test]
+    fn status_based_other_errors_are_classified() {
+        let cases = [
+            (401, RecoveryClass::InvalidCredential),
+            (402, RecoveryClass::QuotaExhausted),
+            (413, RecoveryClass::ContextOverflow),
+            (429, RecoveryClass::RateLimited),
+            (503, RecoveryClass::TransientProvider),
+        ];
+        for (status, expected) in cases {
+            let error = ProviderError::Other {
+                provider: provider(),
+                message: "provider response".into(),
+                status: Some(status),
+                body: None,
+            };
+            assert_eq!(error.recovery_class(), expected);
         }
     }
 }

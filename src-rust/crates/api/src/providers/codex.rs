@@ -540,6 +540,7 @@ impl CodexProvider {
             stop_reason,
             usage,
             model,
+            rate_limit: None,
         })
     }
 }
@@ -583,6 +584,7 @@ impl LlmProvider for CodexProvider {
             let mut model_name = String::from(DEFAULT_CODEX_MODEL);
             let mut saw_tool_call = false;
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut partial_response = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -591,7 +593,8 @@ impl LlmProvider for CodexProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -770,6 +773,7 @@ impl LlmProvider for CodexProvider {
                                     });
                                 }
                                 if !delta.is_empty() {
+                                    partial_response.push_str(delta);
                                     yield Ok(StreamEvent::TextDelta {
                                         index: output_index,
                                         text: delta.to_string(),
@@ -786,6 +790,7 @@ impl LlmProvider for CodexProvider {
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("");
                                 if !delta.is_empty() {
+                                    partial_response.push_str(delta);
                                     yield Ok(StreamEvent::InputJsonDelta {
                                         index: output_index,
                                         partial_json: delta.to_string(),
@@ -897,7 +902,7 @@ impl LlmProvider for CodexProvider {
             yield Err(ProviderError::StreamError {
                 provider: provider_id,
                 message: "Codex stream ended before response.completed".to_string(),
-                partial_response: None,
+                partial_response: (!partial_response.is_empty()).then(|| partial_response.clone()),
             });
         };
 

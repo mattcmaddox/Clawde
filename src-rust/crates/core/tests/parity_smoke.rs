@@ -61,6 +61,7 @@ fn get_message_text_user() {
         uuid: None,
         cost: None,
         snapshot_patch: None,
+        turn_meta: None,
     };
     assert_eq!(get_message_text(&msg), "hello world");
 }
@@ -73,6 +74,7 @@ fn is_tool_use_message_false_for_user() {
         uuid: None,
         cost: None,
         snapshot_patch: None,
+        turn_meta: None,
     };
     assert!(!is_tool_use_message(&msg));
 }

@@ -14,6 +14,13 @@ impl SlashCommand for MemoryCommand {
     fn name(&self) -> &str {
         "memory"
     }
+    fn aliases(&self) -> Vec<&str> {
+        // Themed aliases: `/mnemosyne` is a drop-in for `/memory`;
+        // `/lethesyne` (memory conflicts) defaults to the status/conflicts
+        // view when invoked without a subcommand (dispatcher translates the
+        // empty-args call to `status`).
+        vec!["mnemosyne", "lethesyne"]
+    }
     fn description(&self) -> &str {
         "View, edit, or clear memory files (AGENTS.md + project memory)"
     }
@@ -39,10 +46,15 @@ impl SlashCommand for MemoryCommand {
                 description: "Seed project memory templates".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "undo".into(),
+                description: "Reverse the most recent conflict resolution".into(),
+                available: true,
+            },
         ]
     }
     fn help(&self) -> &str {
-        "Usage: /memory [edit|clear|status|init] [global]\n\n\
+        "Usage: /memory [edit|clear|status|init|undo] [global]\n\n\
          Shows the content of AGENTS.md files that provide project context to Clawde.\n\
          Clawde reads these files automatically at session start.\n\n\
          Subcommands:\n\
@@ -52,7 +64,8 @@ impl SlashCommand for MemoryCommand {
            /memory clear        — clear the project AGENTS.md\n\
            /memory clear global — clear the global ~/.clawde/AGENTS.md\n\
            /memory status       — show project memory dir, index, and session summaries\n\
-           /memory init         — seed architecture/conventions/decisions/tasks + MEMORY.md\n\n\
+           /memory init         — seed architecture/conventions/decisions/tasks + MEMORY.md\n\
+           /memory undo         — reverse the most recent conflict resolution\n\n\
          Locations checked (in priority order):\n\
            1. <project>/.claurst/AGENTS.md\n\
            2. <project>/AGENTS.md\n\
@@ -236,7 +249,7 @@ impl SlashCommand for MemoryCommand {
                 kept.push(MEMORY_ENTRYPOINT.to_string());
             }
 
-            let mut out = String::from("Project memory initialized\n═══════════════════════════\n");
+            let mut out = String::from("Mnemosyne initialized\n═══════════════════════════\n");
             out.push_str(&format!("Directory: {}\n", mem_dir.display()));
             if created.is_empty() {
                 out.push_str("All memory files already exist — nothing was created.\n");
@@ -253,14 +266,36 @@ impl SlashCommand for MemoryCommand {
             return CommandResult::Message(out);
         }
 
+        // ---- /memory undo ------------------------------------------------------
+        if cmd == "undo" {
+            use clawde_core::memdir::{auto_memory_path, undo_last_resolution};
+            let mem_dir = auto_memory_path(&ctx.working_dir);
+            if !mem_dir.is_dir() {
+                return CommandResult::Error(format!(
+                    "No project memory directory at {} — nothing to undo",
+                    mem_dir.display()
+                ));
+            }
+            return match undo_last_resolution(&mem_dir) {
+                Ok(report) => CommandResult::Message(format!(
+                    "Undid the most recent resolution ({} vs {} → {}):\n  {}",
+                    report.record.claimant,
+                    report.record.target,
+                    report.record.decision,
+                    report.summary
+                )),
+                Err(e) => CommandResult::Error(e),
+            };
+        }
+
         // ---- /memory status ----------------------------------------------------
         if cmd == "status" {
             use clawde_core::memdir::{
                 auto_memory_path, load_memory_index, most_recent_session_summary, scan_memory_dir,
+                sweep_dangling_memory_refs,
             };
             let mem_dir = auto_memory_path(&ctx.working_dir);
-            let mut out =
-                String::from("Project Memory (auto-memory)\n══════════════════════════════\n");
+            let mut out = String::from("Mnemosyne (auto-memory)\n══════════════════════════════\n");
             out.push_str(&format!("Directory: {}\n", mem_dir.display()));
             if !mem_dir.is_dir() {
                 out.push_str(
@@ -268,6 +303,19 @@ impl SlashCommand for MemoryCommand {
                      first writes a memory file (auto-dream consolidation or the memory tools).",
                 );
                 return CommandResult::Message(out);
+            }
+            // Hygiene pass: drop conflicts/supersedes/asked/resolved entries
+            // pointing at deleted files so the report below reflects the
+            // clean state.
+            let sweep = sweep_dangling_memory_refs(&mem_dir);
+            if !sweep.is_empty() {
+                out.push_str(&format!(
+                    "Cleaned dangling memory refs: {} conflicts, {} supersedes, {} asked, {} resolved\n",
+                    sweep.removed_conflicts.len(),
+                    sweep.removed_supersedes.len(),
+                    sweep.removed_asked.len(),
+                    sweep.removed_resolved.len()
+                ));
             }
             match load_memory_index(&mem_dir) {
                 Some(index) => {
@@ -302,6 +350,56 @@ impl SlashCommand for MemoryCommand {
                     clawde_core::memdir::memory_age(newest.modified_secs)
                 ));
             }
+            // Unconfirmed contradictions the user has not adjudicated. These
+            // are resolved conversationally (AskUserQuestion) when a session
+            // touches the subject — this line is purely informational. The
+            // count is the shared pending-conflict *pair* count (same source
+            // as the injected block and the TUI indicator), so resolved /
+            // dangling / self / superseded-claimant entries never inflate it.
+            let pending_pairs = clawde_core::memdir::pending_conflict_pairs(&mem_dir);
+            out.push_str(&format!("Lethesyne: {}\n", pending_pairs.len()));
+            if !pending_pairs.is_empty() {
+                // One claimant may have several pending pairs — list each
+                // claimant once (the count above is per-pair).
+                let mut claimants: Vec<&str> = pending_pairs
+                    .iter()
+                    .map(|(claimant, _)| claimant.as_str())
+                    .collect();
+                claimants.sort_unstable();
+                claimants.dedup();
+                out.push_str(&format!(
+                    "  ({} — resolved in conversation when the topic comes up)\n",
+                    claimants.join(", ")
+                ));
+            }
+            // Recent conflict resolutions (audit trail + undo source). The
+            // `.resolutions.jsonl` log is written by `resolve_memory_conflict`
+            // whenever the user adjudicates a pending conflict.
+            let resolutions = clawde_core::memdir::recent_resolutions(&mem_dir, 5);
+            if !resolutions.is_empty() {
+                out.push_str(&format!(
+                    "Resolved conflicts (last {}):\n",
+                    resolutions.len()
+                ));
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for record in &resolutions {
+                    let age_secs = now_secs.saturating_sub(record.ts);
+                    let age = if age_secs < 60 {
+                        format!("{}s ago", age_secs)
+                    } else if age_secs < 3600 {
+                        format!("{} min ago", age_secs / 60)
+                    } else {
+                        format!("{}h ago", age_secs / 3600)
+                    };
+                    out.push_str(&format!(
+                        "  {}: {} vs {} → {}\n",
+                        age, record.claimant, record.target, record.decision
+                    ));
+                }
+            }
             let sessions_dir = mem_dir.join("sessions");
             let session_count = std::fs::read_dir(&sessions_dir)
                 .map(|entries| {
@@ -323,6 +421,68 @@ impl SlashCommand for MemoryCommand {
                     "Most recent summary: {} chars (injected into system prompt)\n",
                     summary.len()
                 ));
+            }
+
+            // ---- AutoDream consolidation state (observability) -------------
+            // The state file is written by the auto-dream daemon in
+            // clawde-query; surface it here so a user can audit when the last
+            // consolidation ran, whether attempts are failing, and how much
+            // work is pending before the next trigger.
+            let state_path = mem_dir.join(".consolidation_state.json");
+            if state_path.exists() {
+                if let Ok(raw) = std::fs::read_to_string(&state_path) {
+                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let age_of = |key: &str| -> String {
+                            state
+                                .get(key)
+                                .and_then(|v| v.as_u64())
+                                .map(|secs| {
+                                    let age_secs = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs().saturating_sub(secs))
+                                        .unwrap_or(0);
+                                    if age_secs < 3600 {
+                                        format!("{} min ago", age_secs / 60)
+                                    } else {
+                                        format!("{}h ago", age_secs / 3600)
+                                    }
+                                })
+                                .unwrap_or_else(|| "never".to_string())
+                        };
+                        let importance_kb = state
+                            .get("importance")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                            / 1000.0;
+                        let failures = state
+                            .get("consecutive_failures")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let threshold_kb = ctx
+                            .config
+                            .memory
+                            .auto_dream_min_importance_kb
+                            .unwrap_or(150.0);
+                        out.push_str(&format!(
+                            "AutoDream: last consolidation {}, last attempt {}\n",
+                            age_of("last_consolidated_at"),
+                            age_of("last_attempt_at")
+                        ));
+                        out.push_str(&format!(
+                            "  Pending work: {:.0} KB / {} KB threshold\n",
+                            importance_kb, threshold_kb
+                        ));
+                        out.push_str(&format!(
+                            "  Consecutive failed dreams: {} (backoff doubles per failure)\n",
+                            failures
+                        ));
+                    }
+                }
+            } else {
+                out.push_str(
+                    "AutoDream: never run (no consolidation state — needs a project \
+                     memory dir and accumulated session activity)\n",
+                );
             }
             return CommandResult::Message(out);
         }
@@ -438,7 +598,7 @@ mod tests {
         ctx.working_dir = project.path().to_path_buf();
         let out = message_text(MemoryCommand.execute("status", &mut ctx).await);
 
-        assert!(out.contains("Project Memory (auto-memory)"), "got: {}", out);
+        assert!(out.contains("Mnemosyne (auto-memory)"), "got: {}", out);
         assert!(out.contains("Index (MEMORY.md): 1 lines"), "got: {}", out);
         // The session summary is a `.md` file, so scan_memory_dir counts it.
         assert!(out.contains("Memory files: 1"), "got: {}", out);
@@ -560,6 +720,184 @@ mod tests {
         let out = message_text(MemoryCommand.execute("clear", &mut ctx).await);
 
         assert!(out.contains("nothing to clear"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn memory_status_shows_resolution_audit() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("auth-flow-v1.md"),
+            "---\ndescription: JWT\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem_dir.join("auth-flow-v2.md"),
+            "---\ndescription: OAuth\nconflicts: auth-flow-v1.md\n---\n",
+        )
+        .unwrap();
+        // Resolve through the real core state machine so the audit log is
+        // written by the same path the tool uses.
+        clawde_core::memdir::resolve_memory_conflict(
+            &mem_dir,
+            "auth-flow-v2.md",
+            "auth-flow-v1.md",
+            clawde_core::memdir::ConflictDecision::KeepNew,
+        )
+        .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("status", &mut ctx).await);
+        assert!(out.contains("Resolved conflicts (last 1)"), "got: {}", out);
+        assert!(
+            out.contains("auth-flow-v2.md vs auth-flow-v1.md → keep_new"),
+            "got: {}",
+            out
+        );
+        // The resolved pair is no longer pending.
+        assert!(out.contains("Lethesyne: 0"), "got: {}", out);
+    }
+
+    #[tokio::test]
+    async fn lethesyne_alias_defaults_to_conflicts_view() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(mem_dir.join("prefs.md"), "---\ndescription: Concise\n---\n").unwrap();
+        std::fs::write(
+            mem_dir.join("verbose-claim.md"),
+            "---\ndescription: Verbose\nconflicts: prefs.md\n---\n",
+        )
+        .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+
+        // `/lethesyne` with no subcommand defaults to the conflicts/status view.
+        let out = match execute_command("/lethesyne", &mut ctx).await {
+            Some(CommandResult::Message(text)) => text,
+            other => panic!("expected Message, got {:?}", other),
+        };
+        assert!(out.contains("Mnemosyne (auto-memory)"), "got: {}", out);
+        assert!(out.contains("Lethesyne: 1"), "got: {}", out);
+
+        // `/mnemosyne` with an explicit subcommand behaves like `/memory`.
+        let out2 = match execute_command("/mnemosyne status", &mut ctx).await {
+            Some(CommandResult::Message(text)) => text,
+            other => panic!("expected Message, got {:?}", other),
+        };
+        assert!(out2.contains("Mnemosyne (auto-memory)"), "got: {}", out2);
+        assert!(out2.contains("Lethesyne: 1"), "got: {}", out2);
+
+        // `/mnemosyne` with no args matches `/memory` (the AGENTS.md listing).
+        std::fs::write(project.path().join("AGENTS.md"), "project rules\n").unwrap();
+        let out3 = match execute_command("/mnemosyne", &mut ctx).await {
+            Some(CommandResult::Message(text)) => text,
+            other => panic!("expected Message, got {:?}", other),
+        };
+        assert!(out3.contains("AGENTS.md Memory Files"), "got: {}", out3);
+    }
+
+    #[tokio::test]
+    async fn memory_undo_reverses_last_resolution() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("auth-flow-v1.md"),
+            "---\ndescription: JWT\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mem_dir.join("auth-flow-v2.md"),
+            "---\ndescription: OAuth\nconflicts: auth-flow-v1.md\n---\n",
+        )
+        .unwrap();
+        // Resolve through the real state machine, then reverse it.
+        clawde_core::memdir::resolve_memory_conflict(
+            &mem_dir,
+            "auth-flow-v2.md",
+            "auth-flow-v1.md",
+            clawde_core::memdir::ConflictDecision::KeepNew,
+        )
+        .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("undo", &mut ctx).await);
+        assert!(
+            out.contains("Undid the most recent resolution"),
+            "got: {}",
+            out
+        );
+        assert!(out.contains("keep_new"), "got: {}", out);
+
+        // The frontmatter is back to the pending-conflict state.
+        let content = std::fs::read_to_string(mem_dir.join("auth-flow-v2.md")).unwrap();
+        assert!(
+            content.contains("conflicts: auth-flow-v1.md"),
+            "got: {}",
+            content
+        );
+        assert!(!content.contains("supersedes:"), "got: {}", content);
+        // The log is drained, so a second undo is an error.
+        let err = match MemoryCommand.execute("undo", &mut ctx).await {
+            CommandResult::Error(e) => e,
+            other => panic!("expected Error, got {:?}", other),
+        };
+        assert!(err.contains("no resolutions to undo"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn memory_undo_without_log_is_informative() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let err = match MemoryCommand.execute("undo", &mut ctx).await {
+            CommandResult::Error(e) => e,
+            other => panic!("expected Error, got {:?}", other),
+        };
+        assert!(err.contains("no resolutions to undo"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn memory_status_reports_cleaned_dangling_refs() {
+        let _home = crate::keys::tests::TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let mem_dir = clawde_core::memdir::auto_memory_path(project.path());
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("MEMORY.md"), "# Index\n").unwrap();
+        std::fs::write(mem_dir.join("alive.md"), "---\ndescription: alive\n---\n").unwrap();
+        // One dangling conflict + one dangling supersedes.
+        std::fs::write(
+            mem_dir.join("claim.md"),
+            "---\ndescription: claim\nconflicts: alive.md, deleted.md\nsupersedes: gone.md\n---\nbody",
+        )
+        .unwrap();
+
+        let mut ctx = test_ctx();
+        ctx.working_dir = project.path().to_path_buf();
+        let out = message_text(MemoryCommand.execute("status", &mut ctx).await);
+        assert!(
+            out.contains("Cleaned dangling memory refs: 1 conflicts, 1 supersedes"),
+            "got: {}",
+            out
+        );
+        // The live conflict survives the sweep.
+        assert!(out.contains("Lethesyne: 1"), "got: {}", out);
+        // Second status run reports a clean sweep.
+        let out2 = message_text(MemoryCommand.execute("status", &mut ctx).await);
+        assert!(!out2.contains("Cleaned dangling"), "got: {}", out2);
     }
 
     #[tokio::test]

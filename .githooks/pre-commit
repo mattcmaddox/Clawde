@@ -12,12 +12,19 @@
 #      a shortened window (5s warmup / 6s idle) to stay quick; Linux-only, and
 #      skipped when the debug binary is missing or older than the staged Rust
 #      sources (a stale binary would silently test the previous code).
+#   4. Live eval gate (`scripts/eval/run_eval.py`, catalog-order fixture) —
+#      runs the real free-provider chain and blocks the commit if the model
+#      stops enumerating the FREE_CATALOG order (answer-quality regression).
+#      Same binary staleness skip as the probe; skips when no free keys are
+#      configured; exit 2 (provider error / timeout) warns without blocking.
 #
 # Skip for a single commit:  SKIP_CLAWDE_HOOK=1 git commit ...
 # Skip only the slower cargo check + probe (keep the instant fmt check):
 #   CLAWDE_HOOK_SKIP_TESTS=1 git commit ...
 # Skip only the idle-CPU probe:
 #   CLAWDE_HOOK_SKIP_IDLE_CPU=1 git commit ...
+# Skip the live eval gate (catalog-order fixture, runs the free provider):
+#   CLAWDE_HOOK_SKIP_EVAL=1 git commit ...
 set -u
 
 if [ "${SKIP_CLAWDE_HOOK:-0}" = "1" ]; then
@@ -98,4 +105,51 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-exit 0
+# ---- Live eval gate (answer-quality regression) -------------------------
+# Runs the catalog-order fixture through the real free-provider chain and
+# fails the commit if the model stops enumerating the fallback order (e.g. an
+# upstream routing/prompting regression). Exit code contract of run_eval.py:
+#   0 = assertions passed
+#   1 = ran but assertions failed  → BLOCK the commit
+#   2 = could not be evaluated (provider error / timeout / no keys) → warn only
+# Skips are identical to the idle-CPU probe: no binary, stale binary, or
+# CLAWDE_HOOK_SKIP_EVAL=1. Costs ~$0.1 of free-tier tokens per run.
+if [ "${CLAWDE_HOOK_SKIP_EVAL:-0}" = "1" ]; then
+    exit 0
+fi
+if [ ! -x "$BINARY" ]; then
+    echo "pre-commit: skipping eval gate — debug binary not built"
+    exit 0
+fi
+if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
+    echo "pre-commit: skipping eval gate — debug binary is stale"
+    echo "  (run 'cargo build' in src-rust/ so the gate tests the staged code)."
+    exit 0
+fi
+# Free-provider keys must exist; without them the gate cannot run.
+AUTH_STORE="$HOME/.clawde/auth.json"
+if [ ! -f "$AUTH_STORE" ] || ! python3 -c "import json,sys; d=json.load(open('$AUTH_STORE')); sys.exit(0 if d.get('keys') else 1)" 2>/dev/null; then
+    echo "pre-commit: skipping eval gate — no free-provider keys in $AUTH_STORE"
+    exit 0
+fi
+
+EVAL_OUT=$(mktemp)
+python3 "$ROOT/scripts/eval/run_eval.py" \
+    --fixture "$ROOT/scripts/eval/fixtures/catalog-order" \
+    --quiet --timeout 240 --tag precommit >"$EVAL_OUT" 2>&1
+eval_status=$?
+if [ "$eval_status" -eq 0 ]; then
+    rm -f "$EVAL_OUT"
+    exit 0
+fi
+cat "$EVAL_OUT"
+rm -f "$EVAL_OUT"
+if [ "$eval_status" -eq 2 ]; then
+    echo "pre-commit: eval gate could not run (provider/timeout) — not blocking."
+    echo "  Run it manually: python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order"
+    exit 0
+fi
+echo "pre-commit: eval gate FAILED — the model no longer enumerates the"
+echo "  FREE_CATALOG order (catalog-order fixture). Investigate routing/prompt"
+echo "  changes before committing; see scripts/eval/README.md."
+exit 1

@@ -1379,6 +1379,8 @@ impl Tool for AgentTool {
             thinking_budget: None,
             memory_max_tokens: None,
             memory_enabled: None,
+            memory_autodream_min_hours: None,
+            memory_autodream_min_importance_kb: None,
             temperature: None,
             tool_result_budget: 50_000,
             // Sub-agents inherit the parent session's thinking-effort override

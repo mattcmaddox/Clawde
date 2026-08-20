@@ -36,7 +36,10 @@ impl SqliteSessionStore {
                 role        TEXT NOT NULL,
                 content     TEXT NOT NULL,
                 created_at  TEXT NOT NULL,
-                cost_usd    REAL
+                cost_usd    REAL,
+                upstream_id TEXT,
+                started_at  TEXT,
+                completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id);
@@ -44,6 +47,27 @@ impl SqliteSessionStore {
                 ON sessions(updated_at);
             ",
         )?;
+
+        // Migrate older databases that predate the turn-observability columns.
+        // `ALTER TABLE ADD COLUMN` is idempotent per missing column; `PRAGMA
+        // table_info` guards so re-opens never error on already-migrated DBs.
+        let existing_columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+            let cols = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            cols
+        };
+        for (col, decl) in [
+            ("upstream_id", "TEXT"),
+            ("started_at", "TEXT"),
+            ("completed_at", "TEXT"),
+        ] {
+            if !existing_columns.iter().any(|c| c == col) {
+                conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {col} {decl}"))?;
+            }
+        }
 
         Ok(Self { conn })
     }
@@ -71,6 +95,11 @@ impl SqliteSessionStore {
 
     /// Append a message to the given session (idempotent on `msg_id`).
     /// Also bumps `sessions.message_count` and `sessions.updated_at`.
+    ///
+    /// `cost_usd`, `upstream_id`, `started_at`, and `completed_at` are
+    /// turn-observability fields populated from the assistant message's
+    /// `MessageCost` / `TurnMeta` by the session save path.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_message(
         &self,
         session_id: &str,
@@ -78,14 +107,28 @@ impl SqliteSessionStore {
         role: &str,
         content: &str,
         cost_usd: Option<f64>,
+        upstream_id: Option<&str>,
+        started_at: Option<&str>,
+        completed_at: Option<&str>,
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         // Insert the message; ignore if already stored.
         let inserted = self.conn.execute(
             "INSERT OR IGNORE INTO messages
-             (id, session_id, role, content, created_at, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![msg_id, session_id, role, content, now, cost_usd],
+             (id, session_id, role, content, created_at, cost_usd,
+              upstream_id, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                msg_id,
+                session_id,
+                role,
+                content,
+                now,
+                cost_usd,
+                upstream_id,
+                started_at,
+                completed_at
+            ],
         )?;
         // Only bump count when we actually inserted a new row.
         if inserted > 0 {
@@ -191,7 +234,16 @@ mod tests {
             .save_session("title-match", Some("Authentication refactor"), "model-a")
             .expect("save title session");
         store
-            .save_message("title-match", "title-msg", "user", "unrelated text", None)
+            .save_message(
+                "title-match",
+                "title-msg",
+                "user",
+                "unrelated text",
+                None,
+                None,
+                None,
+                None,
+            )
             .expect("save title message");
 
         store
@@ -204,6 +256,9 @@ mod tests {
                 "assistant",
                 "The OAuth callback needs a regression test",
                 None,
+                Some("huggingface"),
+                Some("2026-08-19T00:00:00.000Z"),
+                Some("2026-08-19T00:01:00.000Z"),
             )
             .expect("save content message");
 
@@ -222,6 +277,72 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_legacy_databases_with_turn_observability_columns() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let db_path = dir.path().join("sessions.db");
+        // Create a pre-observability schema (no upstream_id / started_at /
+        // completed_at) and a message row, exactly as older Clawde versions
+        // left it on disk.
+        let conn = rusqlite::Connection::open(&db_path).expect("open legacy db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id          TEXT PRIMARY KEY,
+                 title       TEXT,
+                 model       TEXT NOT NULL DEFAULT '',
+                 created_at  TEXT NOT NULL,
+                 updated_at  TEXT NOT NULL,
+                 message_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+                 id          TEXT PRIMARY KEY,
+                 session_id  TEXT NOT NULL REFERENCES sessions(id),
+                 role        TEXT NOT NULL,
+                 content     TEXT NOT NULL,
+                 created_at  TEXT NOT NULL,
+                 cost_usd    REAL
+             );",
+        )
+        .expect("create legacy schema");
+        drop(conn);
+
+        let store = SqliteSessionStore::open(&db_path).expect("open migrates schema");
+        store
+            .save_session("legacy-session", Some("Legacy"), "model")
+            .expect("save session");
+        store
+            .save_message(
+                "legacy-session",
+                "legacy-msg",
+                "assistant",
+                "old content",
+                Some(0.25),
+                Some("nvidia"),
+                Some("2026-08-19T00:00:00.000Z"),
+                Some("2026-08-19T00:00:30.000Z"),
+            )
+            .expect("save message with observability");
+
+        let (upstream, started, completed, cost): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+        ) = store
+            .conn
+            .query_row(
+                "SELECT upstream_id, started_at, completed_at, cost_usd
+                 FROM messages WHERE id = 'legacy-msg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read observability columns");
+        assert_eq!(upstream.as_deref(), Some("nvidia"));
+        assert_eq!(started.as_deref(), Some("2026-08-19T00:00:00.000Z"));
+        assert_eq!(completed.as_deref(), Some("2026-08-19T00:00:30.000Z"));
+        assert_eq!(cost, Some(0.25));
+    }
+
+    #[test]
     fn search_sessions_returns_recent_matches_first_and_empty_for_misses() {
         let dir = tempfile::tempdir().expect("temp directory");
         let store =
@@ -235,7 +356,16 @@ mod tests {
                 .save_session(id, Some(title), "model")
                 .expect("save session");
             store
-                .save_message(id, &format!("{id}-message"), "user", "same keyword", None)
+                .save_message(
+                    id,
+                    &format!("{id}-message"),
+                    "user",
+                    "same keyword",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .expect("save message");
         }
         // `save_session` uses second-resolution timestamps; set deterministic

@@ -282,6 +282,7 @@ mod tests {
             uuid: None,
             cost: None,
             snapshot_patch: None,
+            turn_meta: None,
         }
     }
 

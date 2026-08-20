@@ -179,7 +179,20 @@ impl OpenAiChatDecoder {
         }
 
         // Text content delta.
-        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+        //
+        // Cloudflare's OpenAI-compat layer streams digit-only tokens as JSON
+        // *numbers* (`"content": 4`) rather than strings (`"content": "4"`).
+        // A bare `.as_str()` returns None for a number, silently dropping every
+        // digit and corrupting any numeral in the reply (e.g.
+        // `gpt-4o-2024-11-20` -> `gpt-o--`). Accept both string and numeric
+        // scalars: a `Number` is formatted back to its literal text so the
+        // visible answer is reconstructed intact.
+        let content: Option<String> = match delta.get("content") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        if let Some(content) = content {
             if !content.is_empty() {
                 // Close any open thinking block before visible text starts
                 // streaming, so the blocks land in order in the final message:
@@ -192,7 +205,7 @@ impl OpenAiChatDecoder {
                 }
                 out.push(StreamEvent::TextDelta {
                     index: 0,
-                    text: content.to_string(),
+                    text: content,
                 });
             }
         }
@@ -374,6 +387,32 @@ mod tests {
         let mut tail = Vec::new();
         d.finish(&mut tail);
         assert!(matches!(tail.as_slice(), [StreamEvent::MessageStop]));
+    }
+
+    /// Cloudflare's OpenAI-compat layer streams digit-only tokens as JSON
+    /// *numbers* (`"content": 4`) rather than strings (`"content": "4"`). They
+    /// must be emitted as text, not silently dropped — otherwise any numeral in
+    /// a reply is corrupted (`gpt-4o` becomes `gpt-o`).
+    #[test]
+    fn numeric_content_delta_is_preserved() {
+        let mut d = OpenAiChatDecoder::new(None);
+        let (events, _done) = drain(
+            &mut d,
+            &[
+                r#"data: {"id":"c","model":"m","choices":[{"delta":{"content":"gpt-"}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":4}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"o"}}]}"#,
+                r#"data: {"choices":[{"delta":{"content":2024}}]}"#,
+            ],
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { index: 0, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "gpt-4o2024");
     }
 
     #[test]

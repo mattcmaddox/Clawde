@@ -527,6 +527,7 @@ const GUIDELINE_TOOLS: &[&str] = &[
     "NotebookEdit",
     "Skill",
     "AskUserQuestion",
+    "ResolveMemoryConflict",
 ];
 
 /// The per-tool guidance line for `tool`, or `None` if we ship no block for it.
@@ -545,6 +546,7 @@ fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
         "NotebookEdit" => "- Use NotebookEdit to modify Jupyter (.ipynb) cells instead of editing raw JSON.",
         "Skill" => "- Invoke Skill to run a matching skill/slash-command instead of reimplementing it.",
         "AskUserQuestion" => "- Use AskUserQuestion when the user must choose between options or clarify intent.",
+        "ResolveMemoryConflict" => "- After the user answers a pending memory conflict, apply their verdict with ResolveMemoryConflict — never edit memory frontmatter by hand.",
         _ => return None,
     })
 }

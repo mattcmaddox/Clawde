@@ -631,6 +631,7 @@ impl CopilotProvider {
             stop_reason,
             usage,
             model,
+            rate_limit: None,
         })
     }
 
@@ -976,6 +977,7 @@ impl LlmProvider for CopilotProvider {
             let mut message_started = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
+            let mut partial_response = String::new();
             let mut tool_call_buffers: std::collections::HashMap<
                 usize,
                 (String, String, String),
@@ -988,7 +990,8 @@ impl LlmProvider for CopilotProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id.clone(),
                             message: format!("Stream read error: {}", e),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -1067,6 +1070,7 @@ impl LlmProvider for CopilotProvider {
                     for field in &["reasoning_text", "reasoning_content", "reasoning"] {
                         if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
                             if !reasoning.is_empty() {
+                                partial_response.push_str(reasoning);
                                 yield Ok(StreamEvent::ReasoningDelta {
                                     index: 0,
                                     reasoning: reasoning.to_string(),
@@ -1078,6 +1082,7 @@ impl LlmProvider for CopilotProvider {
 
                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                         if !content.is_empty() {
+                            partial_response.push_str(content);
                             yield Ok(StreamEvent::TextDelta {
                                 index: 0,
                                 text: content.to_string(),
@@ -1127,6 +1132,7 @@ impl LlmProvider for CopilotProvider {
                                     {
                                         buf.push_str(args_frag);
                                     }
+                                    partial_response.push_str(args_frag);
                                     yield Ok(StreamEvent::InputJsonDelta {
                                         index: block_index,
                                         partial_json: args_frag.to_string(),

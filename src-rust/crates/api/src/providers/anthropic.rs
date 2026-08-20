@@ -206,6 +206,7 @@ impl LlmProvider for AnthropicProvider {
         // the previous `_ => {}` arm silently dropped) and preserves interleave
         // order via a single ordered pass. See issue #217.
         let mut blocks = StreamBlockAccumulator::new();
+        let mut partial_response = String::new();
 
         use futures::StreamExt;
         while let Some(result) = stream.next().await {
@@ -252,6 +253,18 @@ impl LlmProvider for AnthropicProvider {
                             }
                         }
                         StreamEvent::MessageStop => break,
+                        StreamEvent::TextDelta { text, .. }
+                        | StreamEvent::ThinkingDelta { thinking: text, .. }
+                        | StreamEvent::ReasoningDelta {
+                            reasoning: text, ..
+                        }
+                        | StreamEvent::InputJsonDelta {
+                            partial_json: text, ..
+                        } => {
+                            if !text.is_empty() {
+                                partial_response.push_str(&text);
+                            }
+                        }
                         StreamEvent::Error {
                             error_type,
                             message,
@@ -259,7 +272,8 @@ impl LlmProvider for AnthropicProvider {
                             return Err(ProviderError::StreamError {
                                 provider: self.id.clone(),
                                 message: format!("[{}] {}", error_type, message),
-                                partial_response: None,
+                                partial_response: (!partial_response.is_empty())
+                                    .then(|| partial_response.clone()),
                             });
                         }
                         _ => {}

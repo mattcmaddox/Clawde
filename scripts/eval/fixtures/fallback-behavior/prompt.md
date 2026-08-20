@@ -1,0 +1,1 @@
+Explain in two or three sentences what the `should_fallback` function in crates/api/src/providers/free/impls.rs does and which error classes it refuses to fall through on. Then give one example of a real-world situation where falling through to another upstream would help a user.

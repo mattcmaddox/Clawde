@@ -1,0 +1,1 @@
+Use Grep to locate the definition of `resolve_route` in crates/api/src/providers/free/impls.rs, then Read the file around that location. Report the exact Rust signature of `resolve_route` (parameter names and types, plus the return type), and state what route the `free/auto` model id resolves to.

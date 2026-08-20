@@ -1,0 +1,11 @@
+{
+  "threshold": 0.7,
+  "assert": [
+    {"type": "tool-order", "value": ["Grep", "Read"], "weight": 2},
+    {"type": "max-tool-calls", "value": 8, "weight": 2},
+    {"type": "min-tool-calls", "value": 1, "weight": 1},
+    {"type": "contains", "value": "resolve_route", "weight": 2},
+    {"type": "contains", "value": "Route", "weight": 1},
+    {"type": "no-error", "weight": 2}
+  ]
+}

@@ -788,6 +788,7 @@ impl LlmProvider for GoogleProvider {
             let mut decoder = crate::SseByteDecoder::new();
             let mut tool_name_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
+            let mut partial_response = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk: Bytes = match chunk_result {
@@ -796,7 +797,8 @@ impl LlmProvider for GoogleProvider {
                         yield Err(ProviderError::StreamError {
                             provider: provider_id_for_stream.clone(),
                             message: e.to_string(),
-                            partial_response: None,
+                            partial_response: (!partial_response.is_empty())
+                                .then(|| partial_response.clone()),
                         });
                         return;
                     }
@@ -831,7 +833,8 @@ impl LlmProvider for GoogleProvider {
                             yield Err(ProviderError::StreamError {
                                 provider: provider_id_for_stream.clone(),
                                 message: msg,
-                                partial_response: None,
+                                partial_response: (!partial_response.is_empty())
+                                    .then(|| partial_response.clone()),
                             });
                             return;
                         }
@@ -899,11 +902,13 @@ impl LlmProvider for GoogleProvider {
                                                     },
                                                 });
                                             }
+                                            partial_response.push_str(text);
                                             yield Ok(StreamEvent::ThinkingDelta {
                                                 index,
                                                 thinking: text.to_string(),
                                             });
                                         } else {
+                                            partial_response.push_str(text);
                                             yield Ok(StreamEvent::TextDelta {
                                                 index: text_block_index,
                                                 text: text.to_string(),
@@ -947,6 +952,7 @@ impl LlmProvider for GoogleProvider {
                                             idx
                                         };
 
+                                        partial_response.push_str(&args_str);
                                         yield Ok(StreamEvent::InputJsonDelta {
                                             index: idx,
                                             partial_json: args_str,

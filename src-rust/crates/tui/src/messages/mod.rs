@@ -239,24 +239,48 @@ fn user_metadata_line(_meta: Option<&TurnMetadata>) -> Option<Line<'static>> {
 
 pub fn render_transcript_assistant_meta(
     meta: Option<&TurnMetadata>,
+    last_assistant: Option<&Message>,
     accent: Color,
 ) -> Option<Line<'static>> {
-    let meta = meta?;
+    let mut spans: Vec<Span<'static>> = Vec::new();
 
-    // Only show interrupted status — mode, model, and duration are already
-    // displayed in the status line above the prompt.
-    if !meta.interrupted {
-        return None;
-    }
-
-    let spans = vec![
-        Span::styled(
+    // Interrupted status — mode, model, and duration are already displayed in
+    // the status line above the prompt.
+    if meta.is_some_and(|m| m.interrupted) {
+        spans.push(Span::styled(
             "   \u{25a3} ",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("interrupted", Style::default().fg(TRANSCRIPT_MUTED)),
-    ];
+        ));
+        spans.push(Span::styled(
+            "interrupted",
+            Style::default().fg(TRANSCRIPT_MUTED),
+        ));
+    }
 
+    // Turn observability badge for composite-provider turns: which upstream
+    // actually served the answer and what it cost (free providers price at
+    // $0.00, so the cost segment is omitted there). Persisted per message via
+    // `Message::turn_meta` / `Message::cost`.
+    if let Some(msg) = last_assistant {
+        let upstream = msg.turn_meta.as_ref().and_then(|t| t.upstream_id.clone());
+        if let Some(up) = upstream {
+            let mut parts = vec![up];
+            if let Some(cost) = msg.cost.as_ref().map(|c| c.cost_usd).filter(|c| *c > 0.0) {
+                parts.push(format!("${cost:.4}"));
+            }
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("   \u{2937} {}", parts.join(" \u{b7} ")),
+                Style::default().fg(TRANSCRIPT_MUTED),
+            ));
+        }
+    }
+
+    if spans.is_empty() {
+        return None;
+    }
     Some(Line::from(spans))
 }
 
@@ -2498,6 +2522,52 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect::<String>()
+    }
+
+    #[test]
+    fn assistant_meta_renders_upstream_and_cost_badge() {
+        let mut msg = Message::assistant("hello");
+        msg.turn_meta = Some(clawde_core::types::TurnMeta {
+            upstream_id: Some("groq".to_string()),
+            started_at: Some("2026-08-19T00:00:00.000Z".to_string()),
+            completed_at: Some("2026-08-19T00:00:05.000Z".to_string()),
+        });
+        msg.cost = Some(clawde_core::types::MessageCost {
+            cost_usd: 0.0123,
+            ..Default::default()
+        });
+
+        let line = render_transcript_assistant_meta(None, Some(&msg), Color::White)
+            .expect("badge renders for a turn with upstream attribution");
+        let text = line_text(&line);
+        assert!(text.contains("groq"), "badge names the upstream: {text}");
+        assert!(text.contains("$0.0123"), "badge shows the cost: {text}");
+
+        // A message without attribution renders nothing (no stray meta line).
+        let plain = Message::assistant("hello");
+        assert!(render_transcript_assistant_meta(None, Some(&plain), Color::White).is_none());
+    }
+
+    #[test]
+    fn assistant_meta_omits_cost_for_free_provider_zero_pricing() {
+        let mut msg = Message::assistant("hello");
+        msg.turn_meta = Some(clawde_core::types::TurnMeta {
+            upstream_id: Some("huggingface".to_string()),
+            ..Default::default()
+        });
+        msg.cost = Some(clawde_core::types::MessageCost {
+            cost_usd: 0.0,
+            ..Default::default()
+        });
+
+        let line = render_transcript_assistant_meta(None, Some(&msg), Color::White)
+            .expect("badge renders with upstream even at zero cost");
+        let text = line_text(&line);
+        assert!(text.contains("huggingface"));
+        assert!(
+            !text.contains("$"),
+            "zero-cost free turn shows no price: {text}"
+        );
     }
 
     #[test]
