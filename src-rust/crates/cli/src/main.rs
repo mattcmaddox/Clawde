@@ -215,6 +215,12 @@ struct Cli {
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,
 
+    /// Dedicated model for tool-requiring turns. When the primary model
+    /// lacks tool calling support, the loop switches to this model for
+    /// turns that need tools (coding, file edits, etc.).
+    #[arg(long = "tool-model")]
+    tool_model: Option<String>,
+
     /// LLM provider to use (default: free — free-mode auto routing across your
     /// configured upstreams). Examples: free, openai, google, ollama
     #[arg(long, env = "CLAWDE_PROVIDER")]
@@ -1146,6 +1152,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
+    }
+    if let Some(ref tm) = cli.tool_model {
+        query_config.tool_model = Some(tm.clone());
     }
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);

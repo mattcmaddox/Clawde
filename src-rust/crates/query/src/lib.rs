@@ -164,6 +164,11 @@ pub struct QueryConfig {
     /// Fallback model name. Used when the primary model returns overloaded /
     /// rate-limit errors (mirrors TS `--fallback-model`).
     pub fallback_model: Option<String>,
+    /// Dedicated model for tool-requiring turns. When set and the primary
+    /// model lacks tool_calling, the loop transparently switches to this
+    /// model so tools execute correctly. The primary model handles text-only
+    /// turns (cheaper/faster). Mirrors TS `--tool-model`.
+    pub tool_model: Option<String>,
     /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
     /// When `config.provider` is set to something other than "anthropic" and
     /// this registry contains that provider, the registry's provider is used
@@ -238,6 +243,7 @@ impl Default for QueryConfig {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            tool_model: None,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,
@@ -1913,7 +1919,7 @@ pub async fn run_query_loop(
             build_system_prompt(&patched)
         };
 
-        let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
+        let mut system_for_provider = system.clone(); // used by non-Anthropic dispatch below
         let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
             .system(system)
@@ -2174,7 +2180,7 @@ pub async fn run_query_loop(
                         provider = Some(overridden);
                     }
                 }
-                if let Some(provider) = provider {
+                if let Some(mut provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
                     // Notify TUI that we're calling the provider using a random spinner verb
@@ -2205,6 +2211,143 @@ pub async fn run_query_loop(
                     // entries in the static model registry.
                     if let Some(tc) = provider.tool_calling_for(&model_id_str) {
                         caps.tool_calling = tc;
+                    }
+                    // Tool-capable model switch: when the current model lacks
+                    // tool_calling and we have tools to send, transparently
+                    // swap so the user gets working tool execution instead of
+                    // a text-only refusal.
+                    //
+                    // Priority order:
+                    //   1. Explicit --tool-model (user-controlled tiered routing)
+                    //   2. Reactive auto-discovery on the same provider
+                    if !caps.tool_calling && !tools.is_empty() && !degradation_turn {
+                        let alt_model = config
+                            .tool_model
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(String::from)
+                            .or_else(|| {
+                                config.model_registry.as_ref().and_then(|reg| {
+                                    reg.best_tool_capable_model_for_provider(&provider_id_str)
+                                })
+                            });
+                        if let Some(alt_model) = alt_model {
+                            let old_model = model_id_str.clone();
+                            let old_provider = provider_id_str.clone();
+                            // When --tool-model contains a provider prefix
+                            // (e.g. "openai/gpt-4"), switch providers too.
+                            if config.tool_model.is_some() {
+                                if let Some((p, m)) = alt_model.split_once('/') {
+                                    let known = [
+                                        "anthropic",
+                                        "free",
+                                        "openai",
+                                        "google",
+                                        "azure",
+                                        "amazon-bedrock",
+                                        "github-copilot",
+                                        "codex",
+                                        "openai-codex",
+                                        "cohere",
+                                        "minimax",
+                                        "ollama",
+                                        "groq",
+                                        "mistral",
+                                        "deepseek",
+                                        "xai",
+                                        "perplexity",
+                                        "cerebras",
+                                        "openrouter",
+                                        "togetherai",
+                                        "together-ai",
+                                        "deepinfra",
+                                        "venice",
+                                        "huggingface",
+                                        "nvidia",
+                                        "cloudflare",
+                                        "fireworks",
+                                        "sambanova",
+                                        "qwen",
+                                        "alibaba",
+                                        "siliconflow",
+                                        "moonshot",
+                                        "moonshotai",
+                                        "zhipu",
+                                        "zhipuai",
+                                        "zai",
+                                        "nebius",
+                                        "novita",
+                                    ];
+                                    if known.contains(&p) {
+                                        provider_id_str = p.to_string();
+                                        model_id_str = m.to_string();
+                                    } else {
+                                        model_id_str = alt_model;
+                                    }
+                                } else {
+                                    model_id_str = alt_model;
+                                }
+                            } else {
+                                model_id_str = alt_model;
+                            }
+                            // Re-resolve the provider for the new model.
+                            let pid = clawde_core::provider_id::ProviderId::new(&provider_id_str);
+                            let new_provider =
+                                clawde_api::registry::runtime_provider_for(&provider_id_str)
+                                    .or_else(|| registry.get(&pid).cloned())
+                                    .or_else(|| {
+                                        clawde_api::registry::provider_from_config(
+                                            &tool_ctx.config,
+                                            &provider_id_str,
+                                        )
+                                    });
+                            if let Some(new_p) = new_provider {
+                                provider = new_p;
+                            }
+                            // Re-check capabilities for the new model.
+                            caps = provider.capabilities();
+                            if let Some(ref model_registry) = config.model_registry {
+                                if let Some(entry) =
+                                    model_registry.get(&provider_id_str, &model_id_str)
+                                {
+                                    caps.image_input = entry.vision();
+                                    caps.tool_calling = entry.tool_calling;
+                                    caps.thinking = entry.reasoning;
+                                }
+                            }
+                            if let Some(tc) = provider.tool_calling_for(&model_id_str) {
+                                caps.tool_calling = tc;
+                            }
+                            if let Some(ref tx) = event_tx {
+                                let note = if provider_id_str != old_provider {
+                                    format!(
+                                        "Model '{}/{}' doesn't support tools — switched to '{}/{}'",
+                                        old_provider, old_model, provider_id_str, model_id_str
+                                    )
+                                } else {
+                                    format!(
+                                        "Model '{}' doesn't support tools — switched to '{}'",
+                                        old_model, model_id_str
+                                    )
+                                };
+                                let _ = tx.send(QueryEvent::Status(note));
+                            }
+                            debug!(
+                                old_model = %old_model,
+                                new_model = %model_id_str,
+                                "Auto-switched to tool-capable model"
+                            );
+                        }
+                    }
+                    // When tools were stripped because the model lacks
+                    // tool_calling (and no switch was possible), rebuild the
+                    // system prompt so it doesn't claim tools are available.
+                    // This prevents the model from attempting text-form tool
+                    // calls that would fail silently.
+                    if !caps.tool_calling && !tools.is_empty() && !degradation_turn {
+                        let mut patched_sys = config.clone();
+                        patched_sys.enabled_tools = Some(vec![]);
+                        system_for_provider = build_system_prompt(&patched_sys);
                     }
                     let effective_max_tokens = provider
                         .max_tokens_cap_for(&model_id_str)
@@ -4178,6 +4321,7 @@ mod tests {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            tool_model: None,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,

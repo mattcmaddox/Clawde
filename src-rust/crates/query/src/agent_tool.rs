@@ -1390,6 +1390,7 @@ impl Tool for AgentTool {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
+            tool_model: None,
             provider_registry: Some(Arc::new(provider_registry)),
             agent_name: None,
             agent_definition: None,

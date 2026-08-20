@@ -1160,6 +1160,50 @@ impl ModelRegistry {
         models.first().map(|e| e.info.id.to_string())
     }
 
+    /// Pick the best tool-capable model for a provider.
+    /// Filters to models with `tool_calling == true`, then applies flagship
+    /// priority ordering (most capable first). Returns the model ID string.
+    pub fn best_tool_capable_model_for_provider(&self, provider_id: &str) -> Option<String> {
+        let provider_id = canonical_snapshot_key(provider_id);
+        let mut models: Vec<&ModelEntry> = self
+            .list_visible_by_provider(provider_id)
+            .into_iter()
+            .filter(|m| m.tool_calling)
+            .collect();
+        if models.is_empty() {
+            models = self
+                .list_by_provider(provider_id)
+                .into_iter()
+                .filter(|m| m.tool_calling)
+                .collect();
+        }
+        if models.is_empty() {
+            return None;
+        }
+
+        let priority_patterns = flagship_patterns_for(provider_id);
+
+        models.sort_by(|a, b| {
+            let id_a: &str = &a.info.id;
+            let id_b: &str = &b.info.id;
+
+            let prio_a = priority_patterns
+                .iter()
+                .position(|pat| id_a.contains(pat))
+                .unwrap_or(usize::MAX);
+            let prio_b = priority_patterns
+                .iter()
+                .position(|pat| id_b.contains(pat))
+                .unwrap_or(usize::MAX);
+
+            prio_a
+                .cmp(&prio_b)
+                .then_with(|| cmp_ids_newest_first(id_a, id_b))
+        });
+
+        models.first().map(|e| e.info.id.to_string())
+    }
+
     /// Pick the best "small" (fast/cheap) model for a provider.
     pub fn best_small_model_for_provider(&self, provider_id: &str) -> Option<String> {
         let provider_id = canonical_snapshot_key(provider_id);
@@ -2472,6 +2516,37 @@ mod tests {
             "malformed/empty overrides must not add entries"
         );
         assert!(reg.get("custom-openai", "noop").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // best_tool_capable_model_for_provider
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn best_tool_capable_model_for_provider_returns_known_tool_model() {
+        let reg = ModelRegistry::new();
+        // Anthropic models are known to support tool calling.
+        let result = reg.best_tool_capable_model_for_provider("anthropic");
+        assert!(result.is_some(), "anthropic must have tool-capable models");
+        let model_id = result.unwrap();
+        let entry = reg
+            .get("anthropic", &model_id)
+            .expect("returned model must exist in registry");
+        assert!(
+            entry.tool_calling,
+            "returned model '{}' must have tool_calling == true",
+            model_id
+        );
+    }
+
+    #[test]
+    fn best_tool_capable_model_for_provider_unknown_returns_none() {
+        let reg = ModelRegistry::new();
+        assert_eq!(
+            reg.best_tool_capable_model_for_provider("nonexistent-provider-xyz"),
+            None,
+            "unknown provider must return None"
+        );
     }
 
     // -----------------------------------------------------------------------
