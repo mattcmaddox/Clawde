@@ -79,12 +79,14 @@ pub use streaming::{AnthropicStreamEvent, StreamHandler};
 pub use types::*;
 
 // Phase 1A re-exports — provider-agnostic layer.
-pub use provider_error::ProviderError;
+pub use provider_error::{ProviderError, RecoveryClass};
 pub use provider_types::*;
 
 // Phase 1B re-exports — provider abstraction traits.
 pub use auth::{AuthProvider, LoginFlow};
-pub use provider::{LlmProvider, ModelInfo};
+pub use provider::{
+    CapacityStatusSource, LlmProvider, ModelInfo, UpstreamCapacityStatus, UpstreamCapacitySummaries,
+};
 pub use stream_parser::{JsonLinesStreamParser, SseByteDecoder, SseStreamParser, StreamParser};
 pub use transform::MessageTransformer;
 
@@ -408,6 +410,10 @@ pub mod streaming {
             tokens_pct_used: f32,
             /// Fraction of the requests budget used (0.0–1.0).
             requests_pct_used: f32,
+            /// Delta from `Retry-After`, when present.
+            retry_after_secs: Option<u64>,
+            /// Normalized reset time, when present.
+            reset_at_unix: Option<u64>,
         },
     }
 
@@ -573,6 +579,42 @@ pub mod client {
         } else {
             None
         }
+    }
+
+    /// Extract retry/reset timing metadata from rate-limit headers.
+    ///
+    /// `Retry-After` is returned as a delta in seconds. Reset headers are
+    /// normalized to Unix seconds: large numeric values are treated as epoch
+    /// timestamps, small numeric values as seconds from now, and date strings
+    /// are parsed using the shared RFC/ISO helpers.
+    pub fn extract_rate_limit_timing(
+        headers: &wreq::header::HeaderMap,
+        reset_keys: &[&str],
+    ) -> (Option<u64>, Option<u64>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let retry_after_secs = headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::time_extract::extract_retry_after_header);
+        let reset_at_unix = reset_keys.iter().find_map(|key| {
+            let raw = headers.get(*key)?.to_str().ok()?.trim();
+            if let Ok(value) = raw.parse::<u64>() {
+                return Some(if value >= 1_000_000_000 {
+                    value
+                } else {
+                    now.saturating_add(value)
+                });
+            }
+            crate::time_extract::extract_retry_after_header(raw)
+                .map(|seconds| now.saturating_add(seconds))
+                .or_else(|| {
+                    crate::time_extract::extract_reset_timestamp(&format!("resets at {raw}"))
+                })
+        });
+        (retry_after_secs, reset_at_unix)
     }
 
     /// The main Anthropic API client.
@@ -1247,12 +1289,27 @@ pub mod client {
                     "anthropic-ratelimit-requests-remaining",
                     "anthropic-ratelimit-requests-limit",
                 );
-                if tokens_pct.is_some() || requests_pct.is_some() {
+                let (retry_after_secs, reset_at_unix) = crate::client::extract_rate_limit_timing(
+                    headers,
+                    &[
+                        "anthropic-ratelimit-tokens-reset",
+                        "anthropic-ratelimit-requests-reset",
+                        "x-ratelimit-reset-tokens",
+                        "x-ratelimit-reset-requests",
+                    ],
+                );
+                if tokens_pct.is_some()
+                    || requests_pct.is_some()
+                    || retry_after_secs.is_some()
+                    || reset_at_unix.is_some()
+                {
                     let _ = tx
                         .send(streaming::AnthropicStreamEvent::RateLimitHeaders {
                             provider_id: provider_id.to_string(),
                             tokens_pct_used: tokens_pct.unwrap_or(0.0),
                             requests_pct_used: requests_pct.unwrap_or(0.0),
+                            retry_after_secs,
+                            reset_at_unix,
                         })
                         .await;
                 }
@@ -1666,6 +1723,32 @@ mod tests {
         // and fails if any `pub fn` / `pub async fn` declared in this crate has
         // no reference anywhere except its own declaration.
         clawde_core::dead_code_guard::assert_no_dead_pub_functions(env!("CARGO_MANIFEST_DIR"));
+    }
+
+    #[test]
+    fn rate_limit_timing_headers_normalize_retry_and_reset() {
+        let mut headers = wreq::header::HeaderMap::new();
+        headers.insert("retry-after", wreq::header::HeaderValue::from_static("12"));
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            wreq::header::HeaderValue::from_static("34"),
+        );
+        let (retry_after, reset_at) =
+            client::extract_rate_limit_timing(&headers, &["x-ratelimit-reset-tokens"]);
+        assert_eq!(retry_after, Some(12));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(reset_at.is_some_and(|reset| reset >= now + 34));
+
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            wreq::header::HeaderValue::from_static("4102444800"),
+        );
+        let (_, epoch_reset) =
+            client::extract_rate_limit_timing(&headers, &["x-ratelimit-reset-tokens"]);
+        assert_eq!(epoch_reset, Some(4_102_444_800));
     }
 
     #[test]

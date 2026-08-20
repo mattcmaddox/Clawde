@@ -9,7 +9,7 @@ use std::sync::Arc;
 use clawde_core::ProviderId;
 
 use crate::client::ClientConfig;
-use crate::provider::LlmProvider;
+use crate::provider::{LlmProvider, UpstreamCapacitySummaries};
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
@@ -662,6 +662,21 @@ impl ProviderRegistry {
         let mut summaries = Vec::new();
         for (id, provider) in &self.providers {
             let entries = provider.upstream_key_health();
+            if !entries.is_empty() {
+                summaries.push((id.to_string(), entries));
+            }
+        }
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
+    /// Collect read-only capacity status from registered composite providers.
+    /// Providers with no fresh header or explicit local estimate contribute no
+    /// rows, keeping command output compact and avoiding false "0%" signals.
+    pub fn upstream_capacity_summaries(&self) -> UpstreamCapacitySummaries {
+        let mut summaries = Vec::new();
+        for (id, provider) in &self.providers {
+            let entries = provider.upstream_capacity();
             if !entries.is_empty() {
                 summaries.push((id.to_string(), entries));
             }

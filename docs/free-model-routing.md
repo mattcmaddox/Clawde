@@ -1,7 +1,7 @@
 # Free-mode routing: architecture analysis, prior art, and scoped improvements
 
-Status: research + design only — no code changes yet.
-Date: 2026-08-10.
+Status: architecture audit and implementation record.
+Date: 2026-08-10; implementation update: 2026-08-19.
 Scope: `FreeProvider` auto-routing (`crates/api/src/providers/free/`), the
 `KeyRotatingProvider` layer (`crates/api/src/providers/key_rotating.rs`), and
 the header/quota plumbing that feeds both.
@@ -21,13 +21,13 @@ The setup is thoughtfully built — Retry-After is honored as a cooldown floor
 (`time_extract.rs`), validation errors are deliberately excluded from fallback
 (`impls.rs:680-687`, matching the industry rule "never fall back on provider
 validation errors"), and capability gating (vision / context window) is done
-up-front. The two big gaps versus the industry consensus in 2026 are:
+up-front. The two focus areas versus the industry consensus in 2026 are:
 
-1. **No proactive quota awareness.** Rate-limit headers are parsed on every
-   response (`openai_compat.rs:986-1010`, `lib.rs:1237-1259`) and surfaced to
-   the TUI as a usage display, but the parsed values are **never consulted at
-   dispatch time**. The chain happily dispatches into a key it already knows
-   is depleted, waits for the 429, then fails over.
+1. **Capacity awareness is deliberately conservative.** Fresh rate-limit
+   headers are consulted at dispatch time as a soft demotion signal. Providers
+   without usable headers use local sliding-window estimates only when an
+   explicit catalog limit is known; ambiguous limits remain neutral, and
+   estimates never hard-skip or invalidate a credential.
 2. **Mid-stream failures duplicate output.** Content is forwarded as it
    arrives (`impls.rs:1312`). If an upstream emits text then dies, the partial
    text is already visible and the retry replays the whole prompt — the user
@@ -37,8 +37,19 @@ Both are known hard problems in this space; nobody in the ecosystem has solved
 #2 cleanly, and #1 exists only as small-scope experiments and well-argued
 feature requests. Nothing "greatly improves" on Clawde's overall design
 (agent + multi-key rotation + streaming + failure telemetry all in one
-binary); the improvements below would be differentiating rather than
-catch-up.
+binary); the improvements below would be differentiating rather than catch-up.
+
+### Implementation update
+
+The following audit fixes are now implemented: exact key-slot attribution under
+concurrent rotation, bounded key-rotation health checks, persisted health-poller
+exhaustion, typed valid/invalid/transient probe verdicts, empty/5xx probe-body
+handling, bounded-concurrent health polling, private atomic key-ring snapshots, context-overflow fallback, no replay after visible stream output, and
+out-of-band empty-completion retries (retry notices no longer become assistant
+text). Conservative header-aware and locally estimated capacity routing is now
+implemented; configurable hedge policy and telemetry retention remain open
+design work.
+
 
 ---
 
@@ -156,13 +167,14 @@ explicitly punt on it.
 
 ## 4. Flaws found (evidence, ordered by impact)
 
-### F1. Dispatch-time quota blindness (HIGH)
-The chain cannot distinguish a key with 1 request left from one with full
-headroom. It fires into a depleted key, burns a round-trip, and only then
-fails over. The header data is already collected (`section 2.4`) and never
-used. Upstream free tiers are *small* budgets (Groq 1K req/day, Cloudflare
-10K neurons/day, catalog `catalog.rs:159-284`), so the reactive penalty is
-felt constantly.
+### F1. Dispatch-time quota awareness is intentionally bounded (RESOLVED)
+The chain now consults fresh server observations before dispatch and keeps
+local sliding-window estimates for the small set of explicit catalog limits:
+Groq 1K requests/day, Cerebras 5 RPM/30K TPM, and SambaNova 20 RPM/200K TPD.
+Providers with ranges, model-specific limits, or non-token units such as
+Cloudflare neurons/day remain neutral until authoritative response metadata is
+available. The estimate is a soft ordering signal, not a hard eligibility gate,
+so stale local state cannot strand a provider permanently.
 
 ### F2. Mid-stream failure duplicates output (HIGH)
 Events are forwarded as produced (`impls.rs:1312`). Any failure after the
@@ -232,11 +244,11 @@ value/effort.
   dispatching and waiting for the 429. Update the cached state on every
   response, not just errors (`section 2.4` plumbing already carries it).
 - **Opaque providers.** Free tiers that expose no headers (per recompose #44
-  and QuotaRouter) get **declared daily caps in the catalog plus local token
-  counting** (~4 chars/token estimate, already used at `impls.rs:284`),
-  deducted per request and persisted with a window reset. Catalog rows gain a
-  `daily_quota: Option<u64>` (mirror of the `usage` strings at
-  `catalog.rs:159-284`).
+  and QuotaRouter) get only explicitly declared request/token windows plus
+  local accounting (~4 chars/token estimate, already used by the request
+  planner). The estimate is deducted at dispatch, persisted with independent
+  window resets, and remains neutral for providers whose limits are unknown or
+  expressed in incompatible units.
 - **Selection policy.** Start with threshold-drain (route normally until a
   key crosses e.g. 80% or a configurable floor, then let the next key /
   upstream take over), matching recompose #44's simplest policy. Make it

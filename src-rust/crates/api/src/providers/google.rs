@@ -26,8 +26,8 @@ use crate::error_handling::parse_error_response as parse_http_error;
 use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPrompt, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
+    StopReason, StreamEvent, SystemPrompt, SystemPromptStyle,
 };
 
 use super::request_options::merge_google_options;
@@ -500,6 +500,41 @@ impl GoogleProvider {
         parse_http_error(status, body, &self.id)
     }
 
+    /// Extract standard rate-limit metadata from a Gemini response.
+    ///
+    /// Gemini does not promise these headers on every endpoint, so absence is
+    /// normal and never represents zero capacity. The generic names cover
+    /// gateways and quota proxies that sit in front of the native endpoint.
+    fn rate_limit_observation(
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<RateLimitObservation> {
+        let tokens = crate::client::extract_rate_limit_pct(
+            headers,
+            "x-ratelimit-remaining-tokens",
+            "x-ratelimit-limit-tokens",
+        );
+        let requests = crate::client::extract_rate_limit_pct(
+            headers,
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-limit-requests",
+        );
+        let (retry_after_secs, reset_at_unix) = crate::client::extract_rate_limit_timing(
+            headers,
+            &["x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"],
+        );
+        (tokens.is_some()
+            || requests.is_some()
+            || retry_after_secs.is_some()
+            || reset_at_unix.is_some())
+        .then_some(RateLimitObservation {
+            key_idx: None,
+            tokens_pct_used: tokens,
+            requests_pct_used: requests,
+            retry_after_secs,
+            reset_at_unix,
+        })
+    }
+
     /// Extract content blocks and usage from a completed Gemini response body.
     fn parse_response_body(
         &self,
@@ -591,6 +626,7 @@ impl GoogleProvider {
             stop_reason,
             usage,
             model: model.to_string(),
+            rate_limit: None,
         })
     }
 
@@ -652,6 +688,7 @@ impl LlmProvider for GoogleProvider {
             })?;
 
         let status = resp.status().as_u16();
+        let rate_limit = Self::rate_limit_observation(resp.headers());
         let resp_body = resp.text().await.map_err(|e| ProviderError::ServerError {
             provider: self.id.clone(),
             status: Some(status),
@@ -671,7 +708,9 @@ impl LlmProvider for GoogleProvider {
                 body: Some(resp_body.clone()),
             })?;
 
-        self.parse_response_body(&json_body, &model)
+        let mut response = self.parse_response_body(&json_body, &model)?;
+        response.rate_limit = rate_limit;
+        Ok(response)
     }
 
     async fn create_message_stream(
@@ -709,8 +748,19 @@ impl LlmProvider for GoogleProvider {
             return Err(self.parse_error_response(status, &resp_body));
         }
 
-        // Wrap the byte stream in a line-based SSE parser.
+        // Extract response headers before consuming the body stream. Gemini
+        // may omit these headers, so this is an optional routing observation.
         let provider_id_for_stream = self.id.clone();
+        let rate_limit_event = Self::rate_limit_observation(resp.headers()).map(|observation| {
+            StreamEvent::RateLimitHeaders {
+                provider_id: provider_id_for_stream.to_string(),
+                tokens_pct_used: observation.tokens_pct_used.unwrap_or(0.0),
+                requests_pct_used: observation.requests_pct_used.unwrap_or(0.0),
+                retry_after_secs: observation.retry_after_secs,
+                reset_at_unix: observation.reset_at_unix,
+                key_idx: None,
+            }
+        });
         let model_clone = model.clone();
         let byte_stream = resp.bytes_stream();
 
@@ -719,6 +769,9 @@ impl LlmProvider for GoogleProvider {
         // OpenAI-Chat and AnthropicMessages protocols.
         let stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
+            if let Some(event) = rate_limit_event {
+                yield Ok(event);
+            }
             let text_block_index: usize = 0;
             let mut tool_block_index: usize = 1000;
             let mut thinking_block_index: usize = 2000;
@@ -1320,6 +1373,48 @@ mod tests {
             part.get("thoughtSignature").is_none(),
             "absent signature must not emit a thoughtSignature key"
         );
+    }
+
+    #[test]
+    fn rate_limit_observation_captures_utilization_and_timing_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            reqwest::header::HeaderValue::from_static("25"),
+        );
+        headers.insert(
+            "x-ratelimit-limit-tokens",
+            reqwest::header::HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            reqwest::header::HeaderValue::from_static("8"),
+        );
+        headers.insert(
+            "x-ratelimit-limit-requests",
+            reqwest::header::HeaderValue::from_static("10"),
+        );
+        headers.insert(
+            "retry-after",
+            reqwest::header::HeaderValue::from_static("9"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            reqwest::header::HeaderValue::from_static("1893456000"),
+        );
+
+        let observation = GoogleProvider::rate_limit_observation(&headers)
+            .expect("standard quota headers should produce an observation");
+        assert!((observation.tokens_pct_used.unwrap_or_default() - 0.75).abs() < f32::EPSILON);
+        assert!((observation.requests_pct_used.unwrap_or_default() - 0.2).abs() < 0.0001);
+        assert_eq!(observation.retry_after_secs, Some(9));
+        assert_eq!(observation.reset_at_unix, Some(1_893_456_000));
+    }
+
+    #[test]
+    fn rate_limit_observation_is_optional_when_headers_are_absent() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(GoogleProvider::rate_limit_observation(&headers).is_none());
     }
 
     #[test]

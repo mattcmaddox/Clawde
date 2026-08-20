@@ -128,6 +128,12 @@ impl SlashCommand for RoutingCommand {
                     "\nOverride per task in settings.json:\n  providers.free.options.routing.task_preferences",
                 );
             }
+            if let Some(registry) = ctx.provider_registry.as_deref() {
+                if let Some(capacity) = format_capacity_status_section(registry, None) {
+                    msg.push_str("\n\n");
+                    msg.push_str(&capacity);
+                }
+            }
             return CommandResult::Message(msg);
         }
 

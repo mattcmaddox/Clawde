@@ -29,8 +29,8 @@ use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::SystemPrompt;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
+    StopReason, StreamEvent, SystemPromptStyle,
 };
 
 use super::request_options::merge_openai_compatible_options;
@@ -392,8 +392,36 @@ impl OpenAiProvider {
             })?;
 
         let status = resp.status().as_u16();
-        // Extract Retry-After header before consuming the response
+        // Extract both retry timing and utilization before consuming the body.
         let retry_after = crate::error_handling::extract_retry_after(&resp);
+        let rate_limit = {
+            let headers = resp.headers();
+            let tokens = crate::client::extract_rate_limit_pct(
+                headers,
+                "x-ratelimit-remaining-tokens",
+                "x-ratelimit-limit-tokens",
+            );
+            let requests = crate::client::extract_rate_limit_pct(
+                headers,
+                "x-ratelimit-remaining-requests",
+                "x-ratelimit-limit-requests",
+            );
+            let (retry_after_secs, reset_at_unix) = crate::client::extract_rate_limit_timing(
+                headers,
+                &["x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"],
+            );
+            (tokens.is_some()
+                || requests.is_some()
+                || retry_after_secs.is_some()
+                || reset_at_unix.is_some())
+            .then_some(RateLimitObservation {
+                key_idx: None,
+                tokens_pct_used: tokens,
+                requests_pct_used: requests,
+                retry_after_secs,
+                reset_at_unix,
+            })
+        };
         let text = resp.text().await.map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
             message: format!("Failed to read response body: {}", e),
@@ -417,7 +445,9 @@ impl OpenAiProvider {
             body: Some(text.clone()),
         })?;
 
-        Self::parse_non_streaming_response(&json, &self.id)
+        let mut response = Self::parse_non_streaming_response(&json, &self.id)?;
+        response.rate_limit = rate_limit;
+        Ok(response)
     }
 
     fn parse_non_streaming_response(
@@ -455,12 +485,17 @@ impl OpenAiProvider {
 
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-        // Text content
-        if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+        // Text content. Some OpenAI-compatible backends (Cloudflare Workers AI)
+        // encode digit-only tokens as JSON numbers; accept those too so numerals
+        // are not dropped from the reply.
+        let text: Option<String> = match message.get("content") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        if let Some(text) = text {
             if !text.is_empty() {
-                content_blocks.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
+                content_blocks.push(ContentBlock::Text { text });
             }
         }
 
@@ -507,6 +542,7 @@ impl OpenAiProvider {
             stop_reason,
             usage,
             model,
+            rate_limit: None,
         })
     }
 
@@ -951,12 +987,18 @@ impl LlmProvider for OpenAiProvider {
                         None => continue,
                     };
 
-                    // Text content delta
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    // Text content delta. Accept numeric scalars too — Cloudflare
+                    // streams digit-only tokens as JSON numbers.
+                    let content: Option<String> = match delta.get("content") {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(Value::Number(n)) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    if let Some(content) = content {
                         if !content.is_empty() {
                             yield Ok(StreamEvent::TextDelta {
                                 index: 0,
-                                text: content.to_string(),
+                                text: content,
                             });
                         }
                     }

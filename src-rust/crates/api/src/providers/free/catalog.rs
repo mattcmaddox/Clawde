@@ -6,6 +6,72 @@
 
 use std::sync::{Mutex, OnceLock};
 
+/// One locally declared quota window. These values are used only when a
+/// provider does not expose usable response headers; unknown limits remain
+/// unestimated rather than being guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalQuotaWindow {
+    pub limit: u64,
+    pub window_secs: u64,
+}
+
+/// Explicit local quota metadata for an upstream. Request and token windows
+/// are independent because providers commonly use different reset periods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalQuota {
+    pub requests: Option<LocalQuotaWindow>,
+    pub tokens: Option<LocalQuotaWindow>,
+}
+
+impl LocalQuota {
+    pub const fn requests(limit: u64, window_secs: u64) -> Self {
+        Self {
+            requests: Some(LocalQuotaWindow { limit, window_secs }),
+            tokens: None,
+        }
+    }
+
+    pub const fn windows(
+        requests: Option<LocalQuotaWindow>,
+        tokens: Option<LocalQuotaWindow>,
+    ) -> Self {
+        Self { requests, tokens }
+    }
+}
+
+/// Return only limits that are explicit enough to support conservative local
+/// accounting. Ranges, provider-specific units, and unverified limits stay
+/// out of this estimator.
+pub(crate) fn local_quota_for(id: &str) -> Option<LocalQuota> {
+    match id {
+        // Catalog usage hint: 1K requests/day.
+        "groq" => Some(LocalQuota::requests(1_000, 24 * 60 * 60)),
+        // Profile metadata: 5 RPM and 30K TPM.
+        "cerebras" => Some(LocalQuota::windows(
+            Some(LocalQuotaWindow {
+                limit: 5,
+                window_secs: 60,
+            }),
+            Some(LocalQuotaWindow {
+                limit: 30_000,
+                window_secs: 60,
+            }),
+        )),
+        // Profile metadata: 20 RPM and 200K tokens/day.
+        "sambanova" => Some(LocalQuota::windows(
+            Some(LocalQuotaWindow {
+                limit: 20,
+                window_secs: 60,
+            }),
+            Some(LocalQuotaWindow {
+                limit: 200_000,
+                window_secs: 24 * 60 * 60,
+            }),
+        )),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Catalog
 // ---------------------------------------------------------------------------

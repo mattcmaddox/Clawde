@@ -15,6 +15,81 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
+// Shared provider telemetry formatting
+// ---------------------------------------------------------------------------
+
+/// Render the compact capacity surface shared by `/keys health` and
+/// `/routing`. The registry is the live source of truth; rows are omitted when
+/// no fresh header or explicit local estimate exists, so missing data never
+/// looks like a healthy `0%` reading.
+pub(crate) fn format_capacity_status_section(
+    registry: &clawde_api::ProviderRegistry,
+    provider_filter: Option<&str>,
+) -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut rows = Vec::new();
+    for (provider, statuses) in registry.upstream_capacity_summaries() {
+        for status in statuses {
+            let matches_filter = match provider_filter {
+                None => true,
+                Some("free") => provider == "free",
+                Some(filter) => provider == filter || status.upstream_id == filter,
+            };
+            if !matches_filter {
+                continue;
+            }
+            let reset = status
+                .reset_at_unix
+                .filter(|reset| *reset > now)
+                .map(|reset| format!("reset in {}", format_capacity_duration(reset - now)))
+                .or_else(|| {
+                    status
+                        .retry_after_secs
+                        .map(|retry| format!("reset in {}", format_capacity_duration(retry)))
+                })
+                .unwrap_or_default();
+            let mut row = format!(
+                "  {} · {}  {:>3.0}% used · {}",
+                provider,
+                status.upstream_id,
+                status.utilization_pct,
+                status.source.label(),
+            );
+            if !reset.is_empty() {
+                row.push_str(" · ");
+                row.push_str(&reset);
+            }
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        rows.sort();
+        Some(format!("Capacity\n{}\n{}", "━━━━━━━━", rows.join("\n")))
+    }
+}
+
+fn format_capacity_duration(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core trait
 // ---------------------------------------------------------------------------
 
@@ -2790,6 +2865,7 @@ mod tests {
                 }],
                 stop_reason: clawde_api::StopReason::EndTurn,
                 usage: Default::default(),
+                rate_limit: None,
             })
         }
 
@@ -2861,6 +2937,7 @@ mod tests {
                 }],
                 stop_reason: clawde_api::StopReason::EndTurn,
                 usage: Default::default(),
+                rate_limit: None,
             })
         }
 

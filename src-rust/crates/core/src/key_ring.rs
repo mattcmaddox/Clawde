@@ -10,8 +10,8 @@
 // callers are responsible for external synchronisation.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // KeyRing
@@ -131,20 +131,39 @@ impl KeyRing {
     /// Returns `Some((index, key_str))` if any key is available, or `None`
     /// if all keys are in cooldown.
     pub fn next_available(&mut self) -> Option<(usize, &str)> {
+        self.next_available_by(|_| 0)
+    }
+
+    /// Get the available key with the lowest caller-provided rank.
+    ///
+    /// Keys with equal rank are selected in the same round-robin order as
+    /// [`next_available`](Self::next_available). This lets API-layer routing
+    /// demote a key using provider metadata without bypassing the ring's
+    /// cooldown state or making equal-ranked keys sticky.
+    pub fn next_available_by<F>(&mut self, mut rank: F) -> Option<(usize, &str)>
+    where
+        F: FnMut(usize) -> u8,
+    {
         self.prune_expired();
         if self.entries.is_empty() {
             return None;
         }
 
         let n = self.entries.len();
+        let mut selected: Option<(usize, u8)> = None;
         for offset in 0..n {
             let idx = (self.cursor + offset) % n;
-            if self.entries[idx].cooldown_until.is_none() {
-                self.cursor = (idx + 1) % n; // advance for next call
-                return Some((idx, self.entries[idx].key.as_str()));
+            if self.entries[idx].cooldown_until.is_some() {
+                continue;
+            }
+            let candidate_rank = rank(idx);
+            if selected.is_none_or(|(_, best_rank)| candidate_rank < best_rank) {
+                selected = Some((idx, candidate_rank));
             }
         }
-        None
+        let (idx, _) = selected?;
+        self.cursor = (idx + 1) % n;
+        Some((idx, self.entries[idx].key.as_str()))
     }
 
     /// Mark the key at `index` as exhausted for `cooldown_secs` seconds.
@@ -296,6 +315,80 @@ pub struct ProviderKeyRingSnapshot {
     pub saved_at_unix: Option<u64>,
 }
 
+const KEY_RING_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const KEY_RING_STALE_LOCK_AGE: Duration = Duration::from_secs(30);
+
+struct KeyRingFileLock {
+    path: PathBuf,
+}
+
+impl KeyRingFileLock {
+    fn acquire(path: &Path) -> Option<Self> {
+        let file_name = path.file_name()?.to_str()?;
+        let lock_path = path.with_file_name(format!(".{file_name}.lock"));
+        let deadline = Instant::now() + KEY_RING_LOCK_TIMEOUT;
+
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => {
+                    let _ = std::fs::write(&lock_path, format!("pid={}\\n", std::process::id()));
+                    crate::accounts::set_user_only_perms(&lock_path);
+                    return Some(Self { path: lock_path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock_path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= KEY_RING_STALE_LOCK_AGE);
+                    if stale && key_ring_lock_can_be_reclaimed(&lock_path) {
+                        let _ = std::fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for KeyRingFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn key_ring_lock_can_be_reclaimed(path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Some(pid) = contents
+        .strip_prefix("pid=")
+        .and_then(|value| value.lines().next())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+    !Path::new("/proc")
+        .join(pid.to_string())
+        .try_exists()
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn key_ring_lock_can_be_reclaimed(_path: &Path) -> bool {
+    true
+}
+
 impl KeyRing {
     /// Produce a snapshot of current cooldown state for persistence.
     /// Cooldowns are stored as *remaining seconds* so the snapshot is
@@ -366,24 +459,35 @@ impl KeyRing {
 
     /// Persist current cooldown state to a JSON file at `path`.
     ///
-    /// Uses atomic write (temp file + rename) so a crash mid-write
-    /// can never corrupt the saved state.
+    /// Uses a per-file lock, owner-only permissions, and an atomic temp-file
+    /// rename. Cooldown snapshots contain key identities, so they must receive
+    /// the same protection as `auth.json` and must not race another process.
     pub fn save_to_file(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
         }
+        crate::accounts::set_user_only_dir_perms(parent);
+        let Some(_lock) = KeyRingFileLock::acquire(path) else {
+            return;
+        };
         let snapshot = self.to_snapshot();
         let json = match serde_json::to_string_pretty(&snapshot) {
             Ok(j) => j,
             Err(_) => return,
         };
-        let tmp = path.with_file_name(format!(
-            ".{}.tmp-{}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id(),
-        ));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("key-ring-state");
+        let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
         if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+            crate::accounts::set_user_only_perms(&tmp);
+            if std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 
@@ -458,6 +562,31 @@ mod tests {
         // Wraps around
         let (idx4, _) = ring.next_available().unwrap();
         assert_eq!(idx4, 0);
+    }
+
+    #[test]
+    fn ranked_selection_prefers_lowest_rank_and_round_robins_ties() {
+        let mut ring = make_ring(&["k1", "k2", "k3"]);
+        let ranks = [2, 0, 1];
+
+        let (first, _) = ring
+            .next_available_by(|idx| ranks[idx])
+            .expect("ranked key");
+        assert_eq!(first, 1, "lowest-ranked key should win");
+
+        let (second, _) = ring
+            .next_available_by(|idx| ranks[idx])
+            .expect("ranked key");
+        assert_eq!(second, 1, "single best key remains preferred");
+
+        let equal_ranks = [1, 1, 2];
+        let (third, _) = ring
+            .next_available_by(|idx| equal_ranks[idx])
+            .expect("ranked key");
+        let (fourth, _) = ring
+            .next_available_by(|idx| equal_ranks[idx])
+            .expect("ranked key");
+        assert_eq!((third, fourth), (0, 1), "equal ranks stay round-robin");
     }
 
     #[test]
@@ -737,6 +866,16 @@ mod tests {
             ring.mark_exhausted(1, 60, Some("rate limited".into()));
             ring.save_to_file(&path);
             assert!(path.exists(), "state file should exist after save");
+            assert!(
+                !path.with_file_name(".groq.json.lock").exists(),
+                "lock file must be removed after saving"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "key-ring state must be owner-readable only");
+            }
         }
 
         // Fresh ring, load from file

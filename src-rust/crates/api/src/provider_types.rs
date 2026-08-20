@@ -102,6 +102,28 @@ pub struct ProviderRequest {
 // ProviderResponse
 // ---------------------------------------------------------------------------
 
+/// Rate-limit utilization observed on a completed provider response.
+///
+/// These are optional because providers expose different headers and some
+/// protocols do not expose capacity at all. The values are fractions in the
+/// inclusive range `0.0..=1.0` and are used by Free Mode only as a soft
+/// demotion signal.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitObservation {
+    /// Exact rotating-key slot that produced the observation, when known.
+    /// `None` means the provider has no key-ring attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_idx: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_pct_used: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_pct_used: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at_unix: Option<u64>,
+}
+
 /// A normalised response returned by any provider adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderResponse {
@@ -119,6 +141,10 @@ pub struct ProviderResponse {
 
     /// The model that produced this response (as reported by the provider).
     pub model: String,
+
+    /// Optional rate-limit utilization captured from the response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitObservation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +218,12 @@ pub enum StreamEvent {
         tokens_pct_used: f32,
         /// Fraction of the requests budget used (0.0–1.0).
         requests_pct_used: f32,
+        /// Delta from `Retry-After`, when present.
+        retry_after_secs: Option<u64>,
+        /// Normalized reset time, when present.
+        reset_at_unix: Option<u64>,
+        /// Exact rotating-key slot that produced the headers, when known.
+        key_idx: Option<usize>,
     },
 }
 

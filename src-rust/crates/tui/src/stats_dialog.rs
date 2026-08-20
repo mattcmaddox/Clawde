@@ -190,6 +190,10 @@ struct ProviderHealthRow {
     /// Sliding-window average dispatch latency in seconds (`None` = no
     /// samples yet).
     avg_latency: Option<f64>,
+    /// Fresh capacity telemetry, when headers or an explicit local estimate
+    /// exists. Missing and expired capacity remains absent rather than
+    /// rendering as a misleading zero.
+    capacity: Option<clawde_api::UpstreamCapacityStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +287,16 @@ impl StatsDialogState {
                 latency_by_label.insert(format!("{provider}/{upstream}"), avg);
             }
         }
+        let capacity_by_label: HashMap<String, clawde_api::UpstreamCapacityStatus> = registry
+            .upstream_capacity_summaries()
+            .into_iter()
+            .flat_map(|(provider, statuses)| {
+                statuses
+                    .into_iter()
+                    .map(move |status| (format!("{provider}/{}", status.upstream_id), status))
+            })
+            .collect();
+        let capacity_for = |label: &str| capacity_by_label.get(label).cloned();
         let snapshot_for = |label: &str| {
             (
                 success_by_label.get(label).copied().flatten(),
@@ -292,6 +306,7 @@ impl StatsDialogState {
 
         for (provider, active, total, retry) in registry.key_ring_summaries() {
             let (success_rate, avg_latency) = snapshot_for(&provider);
+            let capacity = capacity_for(&provider);
             rows.push(ProviderHealthRow {
                 cooldowns: cooldown_counts.get(&provider).copied().unwrap_or(0),
                 label: provider,
@@ -300,12 +315,14 @@ impl StatsDialogState {
                 retry_secs: retry,
                 success_rate,
                 avg_latency,
+                capacity,
             });
         }
         for (provider, entries) in registry.upstream_key_health_summaries() {
             for (upstream, active, total, retry) in entries {
                 let label = format!("{provider}/{upstream}");
                 let (success_rate, avg_latency) = snapshot_for(&label);
+                let capacity = capacity_for(&label);
                 rows.push(ProviderHealthRow {
                     cooldowns: cooldown_counts.get(&label).copied().unwrap_or(0),
                     label,
@@ -314,6 +331,7 @@ impl StatsDialogState {
                     retry_secs: retry,
                     success_rate,
                     avg_latency,
+                    capacity,
                 });
             }
         }
@@ -342,6 +360,7 @@ impl StatsDialogState {
                     continue;
                 }
                 let avg_latency = latency_by_label.get(&label).copied().flatten();
+                let capacity = capacity_for(&label);
                 rows.push(ProviderHealthRow {
                     cooldowns: cooldown_counts.get(&label).copied().unwrap_or(0),
                     label,
@@ -350,8 +369,29 @@ impl StatsDialogState {
                     retry_secs: None,
                     success_rate: rate,
                     avg_latency,
+                    capacity,
                 });
             }
+        }
+
+        // Capacity may be the only telemetry available for a configured
+        // upstream (for example, before its first completed request). Keep it
+        // visible in the existing health view without inventing key-health or
+        // performance values.
+        for (label, capacity) in capacity_by_label {
+            if rows.iter().any(|row| row.label == label) {
+                continue;
+            }
+            rows.push(ProviderHealthRow {
+                label,
+                active_keys: 0,
+                total_keys: 0,
+                retry_secs: None,
+                cooldowns: 0,
+                success_rate: None,
+                avg_latency: None,
+                capacity: Some(capacity),
+            });
         }
         rows.sort_by(|a, b| a.label.cmp(&b.label));
         self.live_provider_health = rows;
@@ -665,6 +705,55 @@ fn tab_span(label: &str, active: bool) -> Span<'static> {
     }
 }
 
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn format_capacity_badge(status: &clawde_api::UpstreamCapacityStatus, now: u64) -> (String, Color) {
+    let color = if status.utilization_pct >= 95.0 {
+        Color::Red
+    } else if status.utilization_pct >= 80.0 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let reset = status
+        .reset_at_unix
+        .filter(|reset| *reset > now)
+        .map(|reset| compact_duration(reset - now))
+        .or_else(|| status.retry_after_secs.map(compact_duration))
+        .map(|remaining| format!(" · {}", remaining))
+        .unwrap_or_default();
+    (
+        format!(
+            "  cap {:>3.0}% {}{}",
+            status.utilization_pct,
+            status.source.label(),
+            reset
+        ),
+        color,
+    )
+}
+
+fn compact_duration(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3_600;
+    let minutes = (total_secs % 3_600) / 60;
+    let seconds = total_secs % 60;
+    if days > 0 {
+        format!("{}d", days)
+    } else if hours > 0 {
+        format!("{}h", hours)
+    } else if minutes > 0 {
+        format!("{}m", minutes)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Overview tab
 // ---------------------------------------------------------------------------
@@ -787,6 +876,7 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
             "Live key health:",
             Style::default().fg(Color::DarkGray),
         )]));
+        let now = current_unix_secs();
         for row in state.live_provider_health.iter().take(8) {
             // Rows without a key ring (single-key upstreams) carry no
             // active/total dots — their dot follows the success rate instead,
@@ -842,6 +932,14 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
             } else {
                 String::new()
             };
+            let capacity = row
+                .capacity
+                .as_ref()
+                .map(|status| {
+                    let (text, color) = format_capacity_badge(status, now);
+                    Span::styled(text, Style::default().fg(color))
+                })
+                .unwrap_or_else(|| Span::raw(""));
             lines.push(Line::from(vec![
                 Span::styled("  ● ", Style::default().fg(color)),
                 Span::styled(
@@ -853,6 +951,7 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
                 Span::styled(cooldowns, Style::default().fg(Color::DarkGray)),
                 Span::styled(success, Style::default().fg(success_color)),
                 Span::styled(latency, Style::default().fg(Color::White)),
+                capacity,
             ]));
         }
     }
@@ -1360,6 +1459,7 @@ mod tests {
             cooldowns: 1,
             success_rate: None,
             avg_latency: None,
+            capacity: None,
         });
         let area = Rect::new(0, 0, 110, 24);
         let mut buf = Buffer::empty(area);
@@ -1394,6 +1494,35 @@ mod tests {
     }
 
     #[test]
+    fn live_provider_health_renders_capacity_source_and_reset() {
+        let mut state = free_state();
+        state.live_provider_health.push(ProviderHealthRow {
+            label: "free/groq".into(),
+            active_keys: 0,
+            total_keys: 0,
+            retry_secs: None,
+            cooldowns: 0,
+            success_rate: None,
+            avg_latency: None,
+            capacity: Some(clawde_api::UpstreamCapacityStatus {
+                upstream_id: "groq".into(),
+                source: clawde_api::CapacityStatusSource::Headers,
+                utilization_pct: 72.0,
+                tokens_pct_used: Some(0.72),
+                requests_pct_used: None,
+                retry_after_secs: Some(90),
+                reset_at_unix: Some(current_unix_secs().saturating_add(90)),
+            }),
+        });
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buf = Buffer::empty(area);
+        render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
+        let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(content.contains("cap  72% headers"), "got: {content}");
+        assert!(content.contains("1m"), "reset timing missing: {content}");
+    }
+
+    #[test]
     fn live_provider_health_renders_success_rate_and_latency() {
         let mut state = free_state();
         state.live_provider_health.push(ProviderHealthRow {
@@ -1404,6 +1533,7 @@ mod tests {
             cooldowns: 0,
             success_rate: Some(0.25),
             avg_latency: Some(9.4),
+            capacity: None,
         });
         state.live_provider_health.push(ProviderHealthRow {
             label: "free/groq".into(),
@@ -1413,6 +1543,7 @@ mod tests {
             cooldowns: 0,
             success_rate: Some(1.0),
             avg_latency: Some(2.1),
+            capacity: None,
         });
         let area = Rect::new(0, 0, 110, 24);
         let mut buf = Buffer::empty(area);

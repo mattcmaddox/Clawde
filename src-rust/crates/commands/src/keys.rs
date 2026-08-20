@@ -917,6 +917,9 @@ fn cmd_health(
         // CLI health view matches the /routing edit dashboard. Only visible
         // when a provider registry is available.
         render_free_upstream_performance(&mut lines, reg, provider_filter);
+        if let Some(capacity) = format_capacity_status_section(reg, provider_filter) {
+            lines.push(format!("\n{capacity}"));
+        }
     }
 
     if provider_filter.is_none() {
@@ -1365,6 +1368,7 @@ pub(crate) mod tests {
         latencies: Vec<(String, Option<f64>)>,
         task_rates: clawde_api::provider::UpstreamTaskSuccessRates,
         last_failures: Vec<(String, Option<String>)>,
+        capacity: Vec<clawde_api::UpstreamCapacityStatus>,
     }
 
     #[async_trait]
@@ -1442,6 +1446,10 @@ pub(crate) mod tests {
         fn upstream_last_failures(&self) -> Vec<(String, Option<String>)> {
             self.last_failures.clone()
         }
+
+        fn upstream_capacity(&self) -> Vec<clawde_api::UpstreamCapacityStatus> {
+            self.capacity.clone()
+        }
     }
 
     /// Seed the auth store (inside the `CLAWDE_HOME` temp dir) with keys so
@@ -1490,6 +1498,26 @@ pub(crate) mod tests {
                     "cerebras".to_string(),
                     Some("cerebras: [cerebras] Server error 500".into()),
                 ),
+            ],
+            capacity: vec![
+                clawde_api::UpstreamCapacityStatus {
+                    upstream_id: "groq".to_string(),
+                    source: clawde_api::CapacityStatusSource::Headers,
+                    utilization_pct: 72.0,
+                    tokens_pct_used: Some(0.72),
+                    requests_pct_used: None,
+                    retry_after_secs: Some(90),
+                    reset_at_unix: None,
+                },
+                clawde_api::UpstreamCapacityStatus {
+                    upstream_id: "cerebras".to_string(),
+                    source: clawde_api::CapacityStatusSource::LocalEstimate,
+                    utilization_pct: 81.0,
+                    tokens_pct_used: None,
+                    requests_pct_used: Some(0.81),
+                    retry_after_secs: None,
+                    reset_at_unix: None,
+                },
             ],
         };
         let mut registry = ProviderRegistry::new();
@@ -1667,6 +1695,51 @@ pub(crate) mod tests {
         assert!(
             !out.contains("cerebras"),
             "upstream filter must exclude other upstreams: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn health_capacity_section_shows_source_and_filter() {
+        let (registry, _home) = test_registry();
+        let out = message_text(cmd_health(Some("groq"), Some(&registry)));
+        assert!(
+            out.contains("Capacity"),
+            "capacity section missing: {}",
+            out
+        );
+        assert!(
+            out.contains("free · groq   72% used · headers · reset in 1m 30s"),
+            "header capacity status missing: {}",
+            out
+        );
+        assert!(
+            !out.contains("cerebras   81% used"),
+            "filter leaked: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn health_capacity_section_is_omitted_without_capacity_data() {
+        let _home = TestHome::new();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(CooldownStubProvider {
+            id: ProviderId::new("free"),
+            cooldowns: Vec::new(),
+            success_rates: Vec::new(),
+            latencies: Vec::new(),
+            task_rates: Vec::new(),
+            last_failures: Vec::new(),
+            capacity: Vec::new(),
+        }));
+        let mut store = AuthStore::load();
+        store.set_keys("groq", vec!["gsk_test_key_1".into()]);
+        store.save();
+        let out = message_text(cmd_health(None, Some(&registry)));
+        assert!(
+            !out.contains("\nCapacity\n"),
+            "missing data should stay quiet: {}",
             out
         );
     }

@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
-    SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
+    StreamEvent, SystemPromptStyle,
 };
 
 // Re-use the message transformation helpers from openai.rs.
@@ -663,6 +663,34 @@ impl OpenAiCompatProvider {
             })?;
 
         let status = resp.status().as_u16();
+        let rate_limit = {
+            let headers = resp.headers();
+            let tokens = crate::client::extract_rate_limit_pct(
+                headers,
+                "x-ratelimit-remaining-tokens",
+                "x-ratelimit-limit-tokens",
+            );
+            let requests = crate::client::extract_rate_limit_pct(
+                headers,
+                "x-ratelimit-remaining-requests",
+                "x-ratelimit-limit-requests",
+            );
+            let (retry_after_secs, reset_at_unix) = crate::client::extract_rate_limit_timing(
+                headers,
+                &["x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"],
+            );
+            (tokens.is_some()
+                || requests.is_some()
+                || retry_after_secs.is_some()
+                || reset_at_unix.is_some())
+            .then_some(RateLimitObservation {
+                key_idx: None,
+                tokens_pct_used: tokens,
+                requests_pct_used: requests,
+                retry_after_secs,
+                reset_at_unix,
+            })
+        };
         let text = resp.text().await.map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
             message: format!("Failed to read response body: {}", e),
@@ -737,7 +765,9 @@ impl OpenAiCompatProvider {
             body: Some(text.clone()),
         })?;
 
-        OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
+        let mut response = OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)?;
+        response.rate_limit = rate_limit;
+        Ok(response)
     }
 
     /// Retry one transient Ollama 404 when the remote daemon still advertises
@@ -1247,11 +1277,22 @@ impl LlmProvider for OpenAiCompatProvider {
                 "x-ratelimit-remaining-requests",
                 "x-ratelimit-limit-requests",
             );
-            if tokens.is_some() || requests.is_some() {
+            let (retry_after_secs, reset_at_unix) = crate::client::extract_rate_limit_timing(
+                headers,
+                &["x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"],
+            );
+            if tokens.is_some()
+                || requests.is_some()
+                || retry_after_secs.is_some()
+                || reset_at_unix.is_some()
+            {
                 Some(StreamEvent::RateLimitHeaders {
                     provider_id: provider_id.to_string(),
                     tokens_pct_used: tokens.unwrap_or(0.0),
                     requests_pct_used: requests.unwrap_or(0.0),
+                    retry_after_secs,
+                    reset_at_unix,
+                    key_idx: None,
                 })
             } else {
                 None
@@ -1521,6 +1562,7 @@ mod tests {
             uuid: None,
             cost: None,
             snapshot_patch: None,
+            turn_meta: None,
         };
 
         let request = ProviderRequest {
@@ -1671,6 +1713,7 @@ mod tests {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }],
             system_prompt: Some(SystemPrompt::Text(system)),
             tools: vec![ToolDefinition {
@@ -1755,6 +1798,7 @@ mod tests {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }],
             system_prompt: Some(SystemPrompt::Text(system)),
             tools: vec![ToolDefinition {
@@ -1825,6 +1869,7 @@ mod tests {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }],
             system_prompt: None,
             tools: vec![],
@@ -1869,6 +1914,7 @@ mod tests {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }],
             system_prompt: None,
             tools: vec![],
@@ -1911,6 +1957,7 @@ mod tests {
                 uuid: None,
                 cost: None,
                 snapshot_patch: None,
+                turn_meta: None,
             }],
             system_prompt: None,
             tools: vec![],

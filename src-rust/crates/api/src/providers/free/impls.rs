@@ -54,6 +54,7 @@ impl FreeProvider {
 
     pub fn new(chain: Vec<FreeEntry>) -> Self {
         let n = chain.len();
+        let upstream_ids: Vec<String> = chain.iter().map(|e| e.upstream.id.to_string()).collect();
         Self {
             id: ProviderId::new(ProviderId::FREE),
             chain,
@@ -64,6 +65,9 @@ impl FreeProvider {
             ))),
             profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(LatencyState::new(n))),
+            capacity: Arc::new(Mutex::new(
+                CapacityState::new(n).with_persistence(upstream_ids, None),
+            )),
         }
     }
 
@@ -101,8 +105,21 @@ impl FreeProvider {
             None
         };
         let max_samples = routing.latency.as_ref().map_or(0, |l| l.max_samples);
-        let latencies =
-            LatencyState::new(n).with_persistence(upstream_ids, telemetry_path, max_samples);
+        let latencies = LatencyState::new(n).with_persistence(
+            upstream_ids.clone(),
+            telemetry_path,
+            max_samples,
+        );
+        let capacity_path = if persist {
+            Some(
+                clawde_core::config::Settings::config_dir()
+                    .join("capacity-state")
+                    .join("free.json"),
+            )
+        } else {
+            None
+        };
+        let capacity = CapacityState::new(n).with_persistence(upstream_ids, capacity_path);
         Self {
             id: ProviderId::new(ProviderId::FREE),
             chain,
@@ -110,6 +127,7 @@ impl FreeProvider {
             cooldown,
             profiles: Arc::new(ProviderProfiles::load()),
             latencies: Arc::new(Mutex::new(latencies)),
+            capacity: Arc::new(Mutex::new(capacity)),
         }
     }
 
@@ -286,7 +304,7 @@ impl FreeProvider {
         route: &Route,
         request: Option<&ProviderRequest>,
     ) -> Vec<(usize, String)> {
-        let plan = match self.routing.strategy {
+        let mut plan = match self.routing.strategy {
             // Auto is the smart default — it routes by task just like the
             // explicit TaskBased strategy (audit spec §8.4).
             RoutingStrategy::Auto | RoutingStrategy::TaskBased => {
@@ -309,10 +327,24 @@ impl FreeProvider {
         // whole message history 14 times.
         let has_images = request.map(Self::request_has_images).unwrap_or(false);
         let estimate = request.map(Self::estimate_request_tokens).unwrap_or(0);
-        plan.into_iter()
+        plan = plan
+            .into_iter()
             .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
             .filter(|(idx, _)| self.entry_fits_request(*idx, has_images, estimate))
-            .collect()
+            .collect();
+
+        // Capacity observations are a soft ordering signal. Preserve an
+        // explicit provider pin, but for automatic/family routes stably move
+        // highly utilized upstreams behind healthier ones. Stable sorting keeps
+        // task preference and catalog order intact within each capacity tier,
+        // including adjacent primary/fallback model rows.
+        if !matches!(route, Route::Pinned { .. }) {
+            let capacity = self.capacity.lock().unwrap();
+            plan.sort_by_key(|(idx, _)| {
+                capacity.rank(*idx, local_quota_for(self.chain[*idx].upstream.id))
+            });
+        }
+        plan
     }
 
     fn is_disabled_upstream(&self, idx: usize) -> bool {
@@ -764,13 +796,13 @@ impl FreeProvider {
         }
     }
 
+    /// Decide whether another upstream may receive this logical request.
+    ///
+    /// The policy lives on [`ProviderError::recovery_class`] so key rotation,
+    /// Free Mode, and the agent loop cannot drift into different string-based
+    /// interpretations of the same provider failure.
     fn should_fallback(err: &ProviderError) -> bool {
-        // Don't fall back on user-fixable problems — they would behave the
-        // same on every upstream.
-        !matches!(
-            err,
-            ProviderError::InvalidRequest { .. } | ProviderError::ContentFiltered { .. }
-        )
+        err.may_fallback()
     }
 
     /// Expose the current [`RoutingConfig`] for introspection (e.g. TUI
@@ -920,6 +952,33 @@ type BoxedProviderStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, Provide
 /// the first [`MAX_LISTED`] are listed, the count of omitted entries is
 /// noted, and the LAST error is always appended — the final fallback's
 /// failure is usually the most relevant to the user.
+fn format_upstream_error(upstream_id: &str, error: &ProviderError) -> String {
+    format!(
+        "{} [{}]: {}",
+        upstream_id,
+        error.recovery_class().as_str(),
+        error
+    )
+}
+
+/// Return whether a provider event has exposed generated content or a tool
+/// argument. Transport metadata such as `MessageStart` and rate-limit headers
+/// must not commit the attempt: a failure after metadata but before output can
+/// still safely fall through to another upstream.
+fn event_commits_output(event: &StreamEvent) -> bool {
+    match event {
+        StreamEvent::TextDelta { text, .. }
+        | StreamEvent::ThinkingDelta { thinking: text, .. }
+        | StreamEvent::ReasoningDelta {
+            reasoning: text, ..
+        }
+        | StreamEvent::InputJsonDelta {
+            partial_json: text, ..
+        } => !text.is_empty(),
+        _ => false,
+    }
+}
+
 fn join_capped_upstream_errors(errors: &[String]) -> String {
     const MAX_LISTED: usize = 5;
     let mut deduped: Vec<&str> = errors.iter().map(String::as_str).collect();
@@ -962,6 +1021,7 @@ struct RetryingFreeStream {
     chain: Vec<FreeEntry>,
     cooldown: Arc<Mutex<CooldownState>>,
     latencies: Arc<Mutex<LatencyState>>,
+    capacity: Arc<Mutex<CapacityState>>,
     routing: RoutingConfig,
     profiles: Arc<ProviderProfiles>,
     request: ProviderRequest,
@@ -1019,6 +1079,7 @@ impl RetryingFreeStream {
         chain: Vec<FreeEntry>,
         cooldown: Arc<Mutex<CooldownState>>,
         latencies: Arc<Mutex<LatencyState>>,
+        capacity: Arc<Mutex<CapacityState>>,
         routing: RoutingConfig,
         profiles: Arc<ProviderProfiles>,
         request: ProviderRequest,
@@ -1034,6 +1095,7 @@ impl RetryingFreeStream {
             chain,
             cooldown,
             latencies,
+            capacity,
             routing,
             profiles,
             request,
@@ -1226,6 +1288,16 @@ impl RetryingFreeStream {
         let mut cd = self.cooldown.lock().unwrap();
         cd.record_success(idx);
         drop(cd);
+        let output_tokens = ((self.attempt_text.chars().count()
+            + self.attempt_thinking.chars().count())
+        .saturating_add(3)
+            / 4) as u64;
+        self.capacity.lock().unwrap().record_local_usage(
+            idx,
+            local_quota_for(self.chain[idx].upstream.id),
+            0,
+            output_tokens,
+        );
         let max_samples = self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
         let snapshot = {
             let mut lat = self.latencies.lock().unwrap();
@@ -1358,6 +1430,13 @@ impl RetryingFreeStream {
             req.model = model.clone();
             clamp_max_tokens_for(&mut req, entry);
             shape_thinking_for_upstream(&mut req, entry);
+            let input_tokens = FreeProvider::estimate_request_tokens(&self.request);
+            self.capacity.lock().unwrap().record_local_usage(
+                idx,
+                local_quota_for(entry.upstream.id),
+                1,
+                input_tokens,
+            );
             let timeout = self.adaptive_timeout(idx);
             let provider = entry.provider.clone();
 
@@ -1434,7 +1513,7 @@ impl Stream for RetryingFreeStream {
                             self.record_failure(self.current_idx);
                             self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                             let uid = self.chain[self.current_idx].upstream.id;
-                            let reason = format!("{}: {}", uid, err);
+                            let reason = format_upstream_error(uid, &err);
                             self.latencies
                                 .lock()
                                 .unwrap()
@@ -1562,10 +1641,10 @@ impl Stream for RetryingFreeStream {
                         self.record_failure(self.parallel_idx);
                         self.maybe_cooldown_upstream_for_5xx(self.parallel_idx, &err);
                         let uid = self.chain[self.parallel_idx].upstream.id;
-                        self.latencies
-                            .lock()
-                            .unwrap()
-                            .record_failure_reason(self.parallel_idx, format!("{}: {}", uid, err));
+                        self.latencies.lock().unwrap().record_failure_reason(
+                            self.parallel_idx,
+                            format_upstream_error(uid, &err),
+                        );
                     }
                     Poll::Ready(Err(_)) => {
                         self.parallel_starting = None;
@@ -1600,7 +1679,7 @@ impl Stream for RetryingFreeStream {
 
             match current.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(evt))) => {
-                    if !self.first_byte_received {
+                    if !self.first_byte_received && event_commits_output(&evt) {
                         self.first_byte_received = true;
                     }
                     match &evt {
@@ -1622,6 +1701,23 @@ impl Stream for RetryingFreeStream {
                         } => {
                             self.attempt_stop_reason = Some("end_turn".to_string());
                         }
+                        StreamEvent::RateLimitHeaders {
+                            tokens_pct_used,
+                            requests_pct_used,
+                            retry_after_secs,
+                            reset_at_unix,
+                            key_idx,
+                            ..
+                        } => {
+                            self.capacity.lock().unwrap().observe_for_key(
+                                self.current_idx,
+                                *key_idx,
+                                Some(*tokens_pct_used),
+                                Some(*requests_pct_used),
+                                *retry_after_secs,
+                                *reset_at_unix,
+                            );
+                        }
                         _ => {}
                     }
                     // Interactive consumers break on MessageStop and drop the
@@ -1637,11 +1733,20 @@ impl Stream for RetryingFreeStream {
                     return Poll::Ready(Some(Ok(evt)));
                 }
                 Poll::Ready(Some(Err(err))) => {
+                    // Once any content has been exposed, replaying the full
+                    // request on another upstream would duplicate visible
+                    // assistant output. Record the failure but surface it to
+                    // the caller instead of silently switching streams.
+                    if self.first_byte_received {
+                        self.record_failure(self.current_idx);
+                        self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
+                        return Poll::Ready(Some(Err(err)));
+                    }
                     if FreeProvider::should_fallback(&err) {
                         self.record_failure(self.current_idx);
                         self.maybe_cooldown_upstream_for_5xx(self.current_idx, &err);
                         let uid = self.chain[self.current_idx].upstream.id;
-                        let reason = format!("{}: {}", uid, err);
+                        let reason = format_upstream_error(uid, &err);
                         self.latencies
                             .lock()
                             .unwrap()
@@ -1672,19 +1777,18 @@ impl Stream for RetryingFreeStream {
                     if was_empty {
                         let uid = self.chain[self.current_idx].upstream.id;
                         let model = self.current_model.clone();
-                        let placeholder = format!(
-                            "(no response from {}/{} — retrying with next upstream)",
-                            uid, model,
-                        );
                         let has_next = self.advance_after_empty();
-
-                        // Emit the placeholder event for the query loop.
-                        let evt = StreamEvent::TextDelta {
-                            index: 0,
-                            text: placeholder,
-                        };
+                        tracing::debug!(
+                            upstream = uid,
+                            model = %model,
+                            has_next,
+                            "free-mode upstream returned an empty completion"
+                        );
                         if has_next {
-                            return Poll::Ready(Some(Ok(evt)));
+                            // Keep retry notices out of assistant text and
+                            // conversation history. Provider attribution on
+                            // the next attempt remains the out-of-band signal.
+                            continue;
                         }
                         // All exhausted.
                         let msg = format!(
@@ -1837,6 +1941,25 @@ impl LlmProvider for FreeProvider {
 
             match result {
                 Ok(Ok(resp)) => {
+                    let estimated_input = Self::estimate_request_tokens(&request);
+                    let observed_input = resp.usage.total_input();
+                    let additional_input = observed_input.saturating_sub(estimated_input);
+                    self.capacity.lock().unwrap().record_local_usage(
+                        idx,
+                        local_quota_for(entry.upstream.id),
+                        0,
+                        additional_input.saturating_add(resp.usage.output_tokens),
+                    );
+                    if let Some(observation) = resp.rate_limit {
+                        self.capacity.lock().unwrap().observe_for_key(
+                            idx,
+                            observation.key_idx,
+                            observation.tokens_pct_used,
+                            observation.requests_pct_used,
+                            observation.retry_after_secs,
+                            observation.reset_at_unix,
+                        );
+                    }
                     self.record_success(idx, task, start.elapsed());
                     persist_env_key_if_unstored(entry.upstream.id);
                     return Ok(resp);
@@ -1849,9 +1972,9 @@ impl LlmProvider for FreeProvider {
                         err,
                     );
                     self.record_failure(idx, task);
-                    self.record_failure_reason(idx, format!("{}: {}", entry.upstream.id, err));
+                    self.record_failure_reason(idx, format_upstream_error(entry.upstream.id, &err));
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
-                    upstream_errors.push(format!("{}: {}", entry.upstream.id, err));
+                    upstream_errors.push(format_upstream_error(entry.upstream.id, &err));
                     continue;
                 }
                 Ok(Err(err)) => {
@@ -1936,6 +2059,13 @@ impl LlmProvider for FreeProvider {
             self.clamp_max_tokens(&mut req, idx);
             shape_thinking_for_upstream(&mut req, entry);
 
+            let input_tokens = Self::estimate_request_tokens(&request);
+            self.capacity.lock().unwrap().record_local_usage(
+                idx,
+                local_quota_for(entry.upstream.id),
+                1,
+                input_tokens,
+            );
             let _start = Instant::now();
             let timeout = self.adaptive_timeout(idx);
             let result =
@@ -1956,6 +2086,7 @@ impl LlmProvider for FreeProvider {
                         self.chain.clone(),
                         self.cooldown.clone(),
                         self.latencies.clone(),
+                        self.capacity.clone(),
                         self.routing.clone(),
                         self.profiles.clone(),
                         request,
@@ -1975,9 +2106,9 @@ impl LlmProvider for FreeProvider {
                         err,
                     );
                     self.record_failure(idx, task);
-                    self.record_failure_reason(idx, format!("{}: {}", entry.upstream.id, err));
+                    self.record_failure_reason(idx, format_upstream_error(entry.upstream.id, &err));
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
-                    upstream_errors.push(format!("{}: {}", entry.upstream.id, err));
+                    upstream_errors.push(format_upstream_error(entry.upstream.id, &err));
                     continue;
                 }
                 Ok(Err(err)) => {
@@ -2178,6 +2309,15 @@ impl LlmProvider for FreeProvider {
                         (entry.upstream.id.to_string(), active, total, retry)
                     })
             })
+            .collect()
+    }
+
+    fn upstream_capacity(&self) -> Vec<crate::provider::UpstreamCapacityStatus> {
+        let capacity = self.capacity.lock().unwrap();
+        self.chain
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| capacity.status(idx, local_quota_for(entry.upstream.id)))
             .collect()
     }
 
@@ -2481,6 +2621,40 @@ mod tests {
     }
 
     #[test]
+    fn chat_probe_verdicts_preserve_transient_capacity_failures() {
+        assert!(matches!(
+            classify_chat_probe(401, "{\"error\":\"bad key\"}", "API key"),
+            UpstreamKeyProbe::Invalid(message) if message.contains("401")
+        ));
+        assert!(matches!(
+            classify_chat_probe(429, "rate limited", "API key"),
+            UpstreamKeyProbe::Transient(message) if message.contains("Rate limited")
+        ));
+        assert!(matches!(
+            classify_chat_probe(503, "ResourceExhausted", "API key"),
+            UpstreamKeyProbe::Transient(message) if message.contains("503")
+        ));
+        assert!(matches!(
+            classify_chat_probe(
+                200,
+                "{\"choices\":[{\"message\":{\"content\":\"pong\"}}]}",
+                "API key"
+            ),
+            UpstreamKeyProbe::Valid
+        ));
+        assert!(matches!(
+            classify_chat_probe(200, "empty response content", "API key"),
+            UpstreamKeyProbe::Transient(message) if message.contains("empty response content")
+        ));
+        // A non-auth model error still proves the credential reached the
+        // model layer, so it remains usable for the real request path.
+        assert_eq!(
+            classify_chat_probe(404, "model not found", "API key"),
+            UpstreamKeyProbe::Valid
+        );
+    }
+
+    #[test]
     fn free_upstream_base_url_override_reads_env_var() {
         // Dev-only override: CLAWDE_FREE_BASE_URL_<ID> points an upstream at
         // a local mock so 5xx / empty-completion cooldown paths are testable
@@ -2637,6 +2811,8 @@ mod tests {
         /// this message — lets tests distinguish upstream failures (e.g.
         /// "rate limited" vs "model not found") in the exhaustion error.
         fail_msg: Option<&'static str>,
+        /// Optional completed-response capacity metadata for routing tests.
+        rate_limit: Option<crate::provider_types::RateLimitObservation>,
     }
 
     #[async_trait]
@@ -2675,6 +2851,7 @@ mod tests {
                     content: Vec::new(),
                     stop_reason: StopReason::EndTurn,
                     usage: UsageInfo::default(),
+                    rate_limit: self.rate_limit,
                 })
             } else if let Some(msg) = self.fail_msg {
                 Err(ProviderError::ServerError {
@@ -2753,6 +2930,7 @@ mod tests {
         id: ProviderId,
         stream_ok: bool,
         text: Option<&'static str>,
+        fail_after_text: bool,
     }
 
     #[async_trait]
@@ -2799,6 +2977,15 @@ mod tests {
                     text: text.into(),
                 }));
             }
+            if self.fail_after_text {
+                events.push(Err(ProviderError::ServerError {
+                    provider: self.id.clone(),
+                    status: Some(503),
+                    message: "stream failed after first byte".into(),
+                    is_retryable: true,
+                }));
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
             events.extend([
                 Ok(StreamEvent::MessageDelta {
                     stop_reason: Some(StopReason::EndTurn),
@@ -2841,6 +3028,21 @@ mod tests {
                 id: ProviderId::new(id),
                 stream_ok,
                 text,
+                fail_after_text: false,
+            }),
+            effective_model: None,
+        }
+    }
+
+    fn stream_error_entry(id: &'static str, text: &'static str) -> FreeEntry {
+        let upstream = *catalog_entry(id).expect("catalog entry");
+        FreeEntry {
+            upstream,
+            provider: Arc::new(StreamStubProvider {
+                id: ProviderId::new(id),
+                stream_ok: true,
+                text: Some(text),
+                fail_after_text: true,
             }),
             effective_model: None,
         }
@@ -2859,6 +3061,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: None,
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2879,6 +3082,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: None,
                 fail_msg: Some(fail_msg),
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2897,6 +3101,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: Some(log),
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2920,6 +3125,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: None,
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2942,6 +3148,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: None,
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2960,6 +3167,7 @@ mod tests {
                 exhaustion: Some(recorder),
                 attempt_log: None,
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -2978,6 +3186,7 @@ mod tests {
                 exhaustion: None,
                 attempt_log: None,
                 fail_msg: None,
+                rate_limit: None,
             }),
             effective_model: None,
         }
@@ -3124,6 +3333,105 @@ mod tests {
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
         assert_eq!(order, vec!["mistral", "zai", "cohere"]);
+    }
+
+    #[test]
+    fn capacity_observations_demote_without_invalidating_upstreams() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("groq", true), entry("cerebras", true)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        {
+            let mut capacity = provider.capacity.lock().unwrap();
+            capacity.observe_for_key(0, None, None, Some(0.98), None, None);
+        }
+
+        let plan = provider.attempt_plan(&Route::Auto, None);
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(order, vec!["cerebras", "groq"]);
+
+        // The high-utilization upstream is still present in the plan. Capacity
+        // is a soft demotion signal, not a credential-invalid or hard-skip
+        // decision.
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn local_quota_estimate_softly_demotes_known_upstream() {
+        let provider = FreeProvider::with_routing(
+            vec![entry("sambanova", true), entry("nvidia", true)],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        {
+            let mut capacity = provider.capacity.lock().unwrap();
+            let quota = local_quota_for("sambanova").expect("declared SambaNova quota");
+            capacity.record_local_usage(0, Some(quota), 20, 200_000);
+        }
+
+        let plan = provider.attempt_plan(&Route::Auto, None);
+        let order: Vec<&str> = plan
+            .iter()
+            .map(|(idx, _)| provider.chain[*idx].upstream.id)
+            .collect();
+        assert_eq!(order, vec!["nvidia", "nvidia", "sambanova"]);
+        assert_eq!(plan.len(), 3, "local capacity is a soft demotion only");
+    }
+
+    #[tokio::test]
+    async fn completed_response_capacity_metadata_is_recorded() {
+        let upstream = *catalog_entry("groq").expect("groq catalog entry");
+        let provider = FreeProvider::with_routing(
+            vec![FreeEntry {
+                upstream,
+                provider: Arc::new(StubProvider {
+                    id: ProviderId::new("groq"),
+                    ok: true,
+                    seen_max_tokens: None,
+                    seen_request: None,
+                    ring_status: None,
+                    exhaustion: None,
+                    attempt_log: None,
+                    fail_msg: None,
+                    rate_limit: Some(crate::provider_types::RateLimitObservation {
+                        key_idx: None,
+                        tokens_pct_used: Some(0.96),
+                        requests_pct_used: None,
+                        retry_after_secs: Some(12),
+                        reset_at_unix: None,
+                    }),
+                }),
+                effective_model: None,
+            }],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+
+        provider
+            .create_message(dummy_request("free/auto"))
+            .await
+            .expect("stub response");
+        assert_eq!(
+            provider
+                .capacity
+                .lock()
+                .unwrap()
+                .rank(0, local_quota_for(provider.chain[0].upstream.id),),
+            3
+        );
     }
 
     #[test]
@@ -3755,6 +4063,29 @@ mod tests {
     }
 
     #[test]
+    fn context_overflow_invalid_requests_fall_through() {
+        let pid = ProviderId::new("groq");
+        assert!(FreeProvider::should_fallback(
+            &ProviderError::InvalidRequest {
+                provider: pid.clone(),
+                message: "maximum context length is 8192 tokens".into(),
+            }
+        ));
+        assert!(FreeProvider::should_fallback(
+            &ProviderError::InvalidRequest {
+                provider: pid.clone(),
+                message: "prompt is too long".into(),
+            }
+        ));
+        assert!(!FreeProvider::should_fallback(
+            &ProviderError::InvalidRequest {
+                provider: pid,
+                message: "tool arguments are malformed".into(),
+            }
+        ));
+    }
+
+    #[test]
     fn should_fallback_on_transient_errors() {
         let pid = ProviderId::new("groq");
         assert!(FreeProvider::should_fallback(&ProviderError::RateLimited {
@@ -3825,6 +4156,31 @@ mod tests {
             }
             other => panic!("expected ServerError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn metadata_does_not_commit_stream_attempt() {
+        assert!(!event_commits_output(&StreamEvent::MessageStart {
+            id: "message".into(),
+            model: "model".into(),
+            usage: UsageInfo::default(),
+        }));
+        assert!(!event_commits_output(&StreamEvent::RateLimitHeaders {
+            provider_id: "groq".into(),
+            tokens_pct_used: 0.5,
+            requests_pct_used: 0.5,
+            retry_after_secs: None,
+            reset_at_unix: None,
+            key_idx: None,
+        }));
+        assert!(event_commits_output(&StreamEvent::TextDelta {
+            index: 0,
+            text: "generated".into(),
+        }));
+        assert!(event_commits_output(&StreamEvent::InputJsonDelta {
+            index: 0,
+            partial_json: "{}".into(),
+        }));
     }
 
     #[test]
@@ -3968,6 +4324,53 @@ mod tests {
                     catalog_entry("cerebras").unwrap().default_model.to_string(),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_failure_does_not_replay_on_next_upstream() {
+        use futures::StreamExt;
+
+        let provider = FreeProvider::with_routing(
+            vec![
+                stream_error_entry("huggingface", "partial answer"),
+                stream_entry("groq", true, Some("replacement answer")),
+            ],
+            RoutingConfig {
+                strategy: RoutingStrategy::Sequential,
+                ..Default::default()
+            },
+            false,
+        );
+        let mut stream = provider
+            .create_message_stream(dummy_request("free/auto"))
+            .await
+            .expect("stream should start");
+        let mut saw_partial = false;
+        let mut saw_error = false;
+        let mut saw_second_attribution = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta { text, .. }) if text == "partial answer" => {
+                    saw_partial = true;
+                }
+                Ok(StreamEvent::ProviderAttribution { upstream_id, .. })
+                    if upstream_id == "groq" =>
+                {
+                    saw_second_attribution = true;
+                }
+                Err(error) => {
+                    saw_error = error.to_string().contains("stream failed after first byte");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_partial, "the first upstream must emit partial content");
+        assert!(saw_error, "the mid-stream error must reach the caller");
+        assert!(
+            !saw_second_attribution,
+            "a post-first-byte failure must not replay on another upstream"
         );
     }
 

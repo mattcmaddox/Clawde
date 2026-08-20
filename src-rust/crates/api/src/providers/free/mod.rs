@@ -36,15 +36,20 @@ use serde::{Deserialize, Serialize}; // Sub-modules split out of this file to ke
                                      // `crate::providers::free::X` and `providers::free::X` paths continue to
                                      // work unchanged. Re-exports are explicit (not globs) so internal items
                                      // like `CLOUDFLARE_PROBE_MODEL` don't leak into the public API.
+mod capacity;
 mod catalog;
 mod discovery;
 
+use capacity::CapacityState;
+
 // Internal const shared with the catalog's cloudflare entry and the
 // cloudflare chat probe below.
+use catalog::local_quota_for;
 use catalog::CLOUDFLARE_PROBE_MODEL;
 
 pub use catalog::{
-    catalog_entry, store_free_model_defaults, take_free_model_defaults, FreeUpstream, FREE_CATALOG,
+    catalog_entry, store_free_model_defaults, take_free_model_defaults, FreeUpstream, LocalQuota,
+    LocalQuotaWindow, FREE_CATALOG,
 };
 pub use discovery::{
     discovery_for, fetch_cline_free_model, fetch_cline_free_models, fetch_gemini_models,
@@ -1781,6 +1786,27 @@ pub struct RateLimitInfo {
     pub headers_found: bool,
 }
 
+/// Verdict from a free-upstream key probe.
+///
+/// `Transient` means the request reached the upstream but did not provide
+/// enough evidence to judge the key (for example 429, 5xx, or an empty
+/// completion). Callers must not evict a key for that verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamKeyProbe {
+    Valid,
+    Invalid(String),
+    Transient(String),
+}
+
+impl UpstreamKeyProbe {
+    fn into_result(self) -> Result<(), String> {
+        match self {
+            Self::Valid => Ok(()),
+            Self::Invalid(message) | Self::Transient(message) => Err(message),
+        }
+    }
+}
+
 /// Resolve the key list for a free upstream, handling the OpenCode Zen/Go
 /// alias (both slots share the same key).  Used by the health poller and
 /// `build_free_provider` in registry.rs.
@@ -1788,11 +1814,12 @@ pub struct RateLimitInfo {
 ///
 /// This is the **single source of truth** for the key list a
 /// [`KeyRotatingProvider`] ring is built from, so it must stay **exactly
-/// aligned** with [`crate::registry`]'s ring construction: `keys_for` only
-/// (no single credential), the OpenCode Zen/Go shared slots collapsed to a
-/// single slot (zen first, go as fallback), and each key trimmed with
-/// placeholders shorter than 8 chars dropped — the same filtering the
-/// registry applies before wrapping a pool in a ring.
+/// aligned** with [`crate::registry`]'s ring construction: stored `keys`
+/// slots are preferred (with environment/OpenCode CLI fallback for Zen when
+/// no slot exists), the OpenCode Zen/Go shared slots are collapsed to a single
+/// slot (Zen first, Go as fallback), and each key is trimmed with placeholders
+/// shorter than 8 chars dropped — the same filtering the registry applies
+/// before wrapping a pool in a ring.
 ///
 /// The health poller probes this exact list by index and forwards `key_idx`
 /// into the rings, so a key's position here is its ring slot. Any divergence
@@ -2034,9 +2061,7 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
             let headers = if models_endpoint_validates_auth(upstream_id) {
                 response.headers().clone()
             } else {
-                validate_key_via_chat(upstream_id, key, &client)?
-                    .headers()
-                    .clone()
+                validate_key_via_chat(upstream_id, key, &client)?.headers
             };
 
             Ok(parse_rate_limit_headers(&headers))
@@ -2122,12 +2147,13 @@ fn classify_probe_status(upstream_id: &str, status: u16) -> Result<(), String> {
 ///
 /// Used only for upstreams whose models endpoint doesn't check auth. Providers
 /// validate the key *before* model validation, so 401/403 unambiguously means
-/// an invalid key; any other response (200, or a model-not-found 4xx, 429)
-/// means the key was accepted.
+/// an invalid key. 429, 5xx, connection failures, and empty completion bodies
+/// are transient: they do not prove the key is invalid or fully healthy.
 ///
-/// Returns the chat response on success so callers (e.g. [`query_rate_limits`])
-/// can read rate-limit headers from the endpoint that actually enforces them.
-/// Send a 1-token `chat/completions` probe to Cloudflare's account-scoped
+/// The response body is consumed so empty/server-error content can be
+/// classified, while headers are retained for [`query_rate_limits`].
+///
+/// Sends a 1-token `chat/completions` probe to Cloudflare's account-scoped
 /// OpenAI-compatible endpoint.
 ///
 /// The key is the composite `ACCOUNT_ID:API_TOKEN`; the account ID is used to
@@ -2249,11 +2275,18 @@ fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {
     Some((base_url, model))
 }
 
+#[derive(Debug)]
+struct ChatProbeResponse {
+    status: u16,
+    headers: reqwest::header::HeaderMap,
+    body: String,
+}
+
 fn validate_key_via_chat(
     upstream_id: &str,
     key: &str,
     client: &reqwest::blocking::Client,
-) -> Result<reqwest::blocking::Response, String> {
+) -> Result<ChatProbeResponse, String> {
     let (base_url, model) = match chat_probe_for(upstream_id) {
         Some(v) => v,
         None => return Err(format!("No chat probe for '{}'", upstream_id)),
@@ -2266,64 +2299,89 @@ fn validate_key_via_chat(
         "max_tokens": 1,
     });
 
-    match client
+    let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", key))
         .json(&body)
         .send()
-    {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            if status == 401 || status == 403 {
-                Err(format!("Invalid API key (HTTP {})", status))
-            } else if status >= 500 {
-                // Server-side outage — read the body for diagnostic clues
-                // so the health probe doesn't treat a real key as healthy
-                // (e.g. Cline's "empty response content" upstream failure).
-                let body = response.text().unwrap_or_default();
-                let detail = if body.contains("empty response content") {
-                    "upstream provider returned empty response"
-                } else if !body.is_empty() {
-                    &body[..body.len().min(120)]
-                } else {
-                    "—"
-                };
-                Err(format!("Server error (HTTP {}): {}", status, detail))
-            } else {
-                Ok(response)
-            }
-        }
-        Err(e) => Err(format!("Connection failed: {}", e)),
-    }
+        .map_err(|e| format!("Connection failed: {}", e))?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response
+        .text()
+        .map_err(|e| format!("Failed to read probe response (HTTP {}): {}", status, e))?;
+    Ok(ChatProbeResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
-/// Validate an API key for a given upstream by making a lightweight request
-/// to the provider's models endpoint. Returns `Ok(())` if the key is valid.
-///
-/// For upstreams whose models endpoint doesn't check auth (nvidia,
-/// huggingface, openrouter, sambanova, cline — it returns 200 even for a
-/// garbage key), a 2xx response is confirmed with a minimal 1-token
-/// `chat/completions` probe so dead keys are actually caught.
-pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String> {
+fn classify_chat_probe(status: u16, body: &str, label: &str) -> UpstreamKeyProbe {
+    let lower = body.to_ascii_lowercase();
+    if status == 401 || status == 403 {
+        return UpstreamKeyProbe::Invalid(format!("Invalid {} (HTTP {})", label, status));
+    }
+    if status == 429 {
+        return UpstreamKeyProbe::Transient("Rate limited — try again later".to_string());
+    }
+    if lower.contains("empty response content") {
+        return UpstreamKeyProbe::Transient(format!(
+            "Server error (HTTP {}): empty response content",
+            status
+        ));
+    }
+    if status >= 500 {
+        let detail = if lower.contains("empty response content") || body.trim().is_empty() {
+            "empty response content".to_string()
+        } else {
+            body.chars().take(160).collect()
+        };
+        return UpstreamKeyProbe::Transient(format!("Server error (HTTP {}): {}", status, detail));
+    }
+    if (200..300).contains(&status)
+        && (body.trim().is_empty() || lower.contains("empty response content"))
+    {
+        return UpstreamKeyProbe::Transient(format!(
+            "Server error (HTTP {}): empty response content",
+            status
+        ));
+    }
+    // A non-auth 4xx can mean the probe model is unavailable while auth has
+    // already passed. Keep that key usable and let the request path decide.
+    UpstreamKeyProbe::Valid
+}
+
+/// Probe an API key and preserve the distinction between invalid credentials
+/// and transient upstream failures. This is the health poller's source of
+/// truth; `validate_upstream_key` below keeps the older `Result` API for the
+/// TUI and other callers.
+pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
     if key.trim().len() < 8 {
-        return Err("Key too short (min 8 characters)".to_string());
+        return UpstreamKeyProbe::Invalid("Key too short (min 8 characters)".to_string());
     }
 
-    // Cloudflare's models endpoint does not support GET, so auth is proven
-    // with the chat probe directly (account-scoped URL from the composite key).
     if upstream_id == "cloudflare" {
-        let response = probe_cloudflare_chat(key)?;
+        let response = match probe_cloudflare_chat(key) {
+            Ok(response) => response,
+            Err(error) => return UpstreamKeyProbe::Transient(error),
+        };
         let status = response.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(format!("Invalid API token (HTTP {})", status));
-        }
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(error) => {
+                return UpstreamKeyProbe::Transient(format!(
+                    "Failed to read probe response (HTTP {}): {}",
+                    status, error
+                ));
+            }
+        };
         if status == 404 {
-            return Err("Invalid Cloudflare account ID (HTTP 404)".to_string());
+            return UpstreamKeyProbe::Invalid(
+                "Invalid Cloudflare account ID (HTTP 404)".to_string(),
+            );
         }
-        if status == 429 {
-            return Err("Rate limited — try again later".to_string());
-        }
-        return Ok(());
+        return classify_chat_probe(status, &body, "API token");
     }
 
     let native: &str = match upstream_id {
@@ -2340,7 +2398,12 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
         "github-copilot" => "https://api.githubcopilot.com/models",
-        _ => return Err(format!("No validation endpoint for '{}'", upstream_id)),
+        _ => {
+            return UpstreamKeyProbe::Transient(format!(
+                "No validation endpoint for '{}'",
+                upstream_id
+            ))
+        }
     };
     let base_url = match free_upstream_base_url_override(upstream_id) {
         Some(override_base) => format!("{}/models", override_base.trim_end_matches('/')),
@@ -2351,12 +2414,13 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
-        Ok(c) => c,
-        Err(e) => return Err(format!("Failed to create HTTP client: {}", e)),
+        Ok(client) => client,
+        Err(error) => {
+            return UpstreamKeyProbe::Transient(format!("Failed to create HTTP client: {}", error))
+        }
     };
 
-    let is_google = upstream_id == "google";
-    let request = if is_google {
+    let request = if upstream_id == "google" {
         client.get(base_url).query(&[("key", key)])
     } else {
         client
@@ -2364,20 +2428,31 @@ pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String>
             .header("Authorization", format!("Bearer {}", key))
     };
 
-    match request.send() {
-        Ok(response) => {
-            let status = response.status();
-            if status.is_success() {
-                if models_endpoint_validates_auth(upstream_id) {
-                    return Ok(());
-                }
-                // Auth-lax models endpoint: confirm the key via chat/completions.
-                return validate_key_via_chat(upstream_id, key, &client).map(|_| ());
-            }
-            classify_probe_status(upstream_id, status.as_u16())
-        }
-        Err(e) => Err(format!("Connection failed: {}", e)),
+    let response = match request.send() {
+        Ok(response) => response,
+        Err(error) => return UpstreamKeyProbe::Transient(format!("Connection failed: {}", error)),
+    };
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return match classify_probe_status(upstream_id, status) {
+            Ok(()) => UpstreamKeyProbe::Valid,
+            Err(error) if error.contains("Invalid API key") => UpstreamKeyProbe::Invalid(error),
+            Err(error) => UpstreamKeyProbe::Transient(error),
+        };
     }
+    if models_endpoint_validates_auth(upstream_id) {
+        return UpstreamKeyProbe::Valid;
+    }
+
+    match validate_key_via_chat(upstream_id, key, &client) {
+        Ok(response) => classify_chat_probe(response.status, &response.body, "API key"),
+        Err(error) => UpstreamKeyProbe::Transient(error),
+    }
+}
+
+/// Validate an API key for existing callers that only need a pass/fail result.
+pub fn validate_upstream_key(upstream_id: &str, key: &str) -> Result<(), String> {
+    probe_upstream_key(upstream_id, key).into_result()
 }
 
 /// Composite provider that stacks free-tier upstreams behind a single
@@ -2392,6 +2467,9 @@ pub struct FreeProvider {
     /// Provider-specific cooldown profiles (research-based).
     profiles: Arc<ProviderProfiles>,
     latencies: Arc<Mutex<LatencyState>>,
+    /// Fresh rate-limit observations used only to demote near-exhausted
+    /// upstreams. Kept separate from credential health and cooldown state.
+    capacity: Arc<Mutex<CapacityState>>,
 }
 
 #[derive(Debug)]

@@ -26,13 +26,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use clawde_core::key_ring::{KeyRing, KeyStatus};
 use clawde_core::provider_id::ProviderId;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
-    SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
+    StreamEvent, SystemPromptStyle,
 };
 use crate::time_extract::estimate_cooldown;
 
@@ -110,6 +110,100 @@ const MAX_COOLDOWN_WAIT: u64 = 10;
 /// new value is used on the next wait.
 const MAX_COOLDOWN_RETRIES: u32 = 3;
 
+const KEY_CAPACITY_TTL_SECS: u64 = 15 * 60;
+
+#[derive(Debug, Clone, Copy)]
+struct KeyCapacityObservation {
+    tokens_pct_used: Option<f32>,
+    requests_pct_used: Option<f32>,
+    retry_after_secs: Option<u64>,
+    reset_at_unix: Option<u64>,
+    observed_at_unix: u64,
+}
+
+impl KeyCapacityObservation {
+    fn from_rate_limit(observation: RateLimitObservation) -> Option<Self> {
+        let valid = |value: Option<f32>| {
+            value.and_then(|value| {
+                (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+            })
+        };
+        let tokens_pct_used = valid(observation.tokens_pct_used);
+        let requests_pct_used = valid(observation.requests_pct_used);
+        (tokens_pct_used.is_some()
+            || requests_pct_used.is_some()
+            || observation.retry_after_secs.is_some()
+            || observation.reset_at_unix.is_some())
+        .then_some(Self {
+            tokens_pct_used,
+            requests_pct_used,
+            retry_after_secs: observation.retry_after_secs,
+            reset_at_unix: observation.reset_at_unix,
+            observed_at_unix: current_unix_secs(),
+        })
+    }
+
+    fn utilization(self) -> f32 {
+        self.tokens_pct_used
+            .into_iter()
+            .chain(self.requests_pct_used)
+            .fold(0.0, f32::max)
+    }
+
+    fn is_fresh(self) -> bool {
+        let now = current_unix_secs();
+        now.saturating_sub(self.observed_at_unix) <= KEY_CAPACITY_TTL_SECS
+            && self.reset_at_unix.is_none_or(|reset| reset > now)
+            && self
+                .retry_after_secs
+                .is_none_or(|retry| now < self.observed_at_unix.saturating_add(retry))
+    }
+}
+
+#[derive(Debug)]
+struct KeyCapacityState {
+    observations: Vec<Option<KeyCapacityObservation>>,
+}
+
+impl KeyCapacityState {
+    fn new(key_count: usize) -> Self {
+        Self {
+            observations: vec![None; key_count],
+        }
+    }
+
+    fn observe(&mut self, key_idx: usize, observation: RateLimitObservation) {
+        if let Some(observation) = KeyCapacityObservation::from_rate_limit(observation) {
+            if let Some(slot) = self.observations.get_mut(key_idx) {
+                *slot = Some(observation);
+            }
+        }
+    }
+
+    fn rank(&self, key_idx: usize) -> u8 {
+        let used = self
+            .observations
+            .get(key_idx)
+            .copied()
+            .flatten()
+            .filter(|observation| observation.is_fresh())
+            .map_or(0.0, KeyCapacityObservation::utilization);
+        match used {
+            used if used >= 0.95 => 3,
+            used if used >= 0.80 => 2,
+            used if used >= 0.60 => 1,
+            _ => 0,
+        }
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // KeyRotatingProvider
 // ---------------------------------------------------------------------------
@@ -128,6 +222,7 @@ pub struct KeyRotatingProvider {
     provider_id: ProviderId,
     provider_name: String,
     ring: Arc<Mutex<KeyRing>>,
+    key_capacity: Arc<Mutex<KeyCapacityState>>,
     build_provider: ProviderFactory,
     /// Path to persisted cooldown state file. `None` = no persistence.
     state_path: Option<PathBuf>,
@@ -152,10 +247,12 @@ impl KeyRotatingProvider {
         build_provider: impl Fn(&str) -> Arc<dyn LlmProvider> + Send + Sync + 'static,
     ) -> Self {
         let pid = provider_id.into();
+        let key_count = keys.len();
         Self {
             provider_id: ProviderId::new(&pid),
             provider_name: provider_name.into(),
             ring: Arc::new(Mutex::new(KeyRing::new(pid, keys))),
+            key_capacity: Arc::new(Mutex::new(KeyCapacityState::new(key_count))),
             build_provider: Arc::new(build_provider),
             state_path: None,
             skip_recovery_loop: false,
@@ -175,6 +272,7 @@ impl KeyRotatingProvider {
         build_provider: impl Fn(&str) -> Arc<dyn LlmProvider> + Send + Sync + 'static,
     ) -> Self {
         let pid: String = provider_id.into();
+        let key_count = keys.len();
         let state_path = KeyRing::default_state_path(&pid);
         let ring = Arc::new(Mutex::new(KeyRing::new(pid.clone(), keys)));
         // Restore persisted cooldown state so that a 12-hour cooldown
@@ -185,6 +283,7 @@ impl KeyRotatingProvider {
             provider_id: ProviderId::new(&pid),
             provider_name: provider_name.into(),
             ring,
+            key_capacity: Arc::new(Mutex::new(KeyCapacityState::new(key_count))),
             build_provider: Arc::new(build_provider),
             state_path: Some(state_path),
             skip_recovery_loop: false,
@@ -225,6 +324,21 @@ impl KeyRotatingProvider {
     // Core retry loop
     // -----------------------------------------------------------------------
 
+    fn next_available_provider(&self) -> Option<(usize, Arc<dyn LlmProvider>)> {
+        let ranks = self
+            .key_capacity
+            .lock()
+            .map(|state| {
+                (0..state.observations.len())
+                    .map(|idx| state.rank(idx))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut ring = self.ring.lock().ok()?;
+        ring.next_available_by(|idx| ranks.get(idx).copied().unwrap_or(0))
+            .map(|(idx, key)| (idx, (self.build_provider)(key)))
+    }
+
     /// Get the next available key, build a provider, and call `try_provider`.
     /// On exhaustible errors, marks the key and loops. On non-exhaustible
     /// errors, returns immediately. When all keys are exhausted, returns
@@ -232,7 +346,7 @@ impl KeyRotatingProvider {
     /// failures instead of masking them as a synthetic rate limit.
     async fn try_with_rotation<F, Fut, T>(&self, try_provider: F) -> Result<T, ProviderError>
     where
-        F: Fn(Arc<dyn LlmProvider>) -> Fut,
+        F: Fn(usize, Arc<dyn LlmProvider>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ProviderError>>,
     {
         let mut retry_count: u32 = 0;
@@ -240,14 +354,10 @@ impl KeyRotatingProvider {
 
         loop {
             // Get the next available key (lock scope ends before any .await).
-            let provider = {
-                let mut ring = self.ring.lock().unwrap();
-                ring.next_available()
-                    .map(|(_idx, key)| (self.build_provider)(key))
-            };
+            let provider = self.next_available_provider();
 
-            let provider = match provider {
-                Some(p) => p,
+            let (active_idx, provider) = match provider {
+                Some(selection) => selection,
                 None => {
                     // All keys exhausted. Read the current shortest cooldown
                     // fresh from the key ring each cycle (cooldowns can change
@@ -301,7 +411,7 @@ impl KeyRotatingProvider {
                 }
             };
 
-            match try_provider(provider).await {
+            match try_provider(active_idx, provider).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     let Some(signal) = classify_exhaust(&err) else {
@@ -338,16 +448,17 @@ impl KeyRotatingProvider {
                             extracted.or_secs(cooldown)
                         });
 
-                        let active_idx = ring.statuses().iter().find(|s| s.active).map(|s| s.index);
+                        // Mark the exact slot selected before the await. A
+                        // concurrent request may have advanced or changed the
+                        // ring while this provider call was in flight; picking
+                        // the first currently-active slot would exhaust the
+                        // wrong credential.
+                        ring.mark_exhausted(active_idx, final_cooldown, Some(msg.to_string()));
 
-                        if let Some(idx) = active_idx {
-                            ring.mark_exhausted(idx, final_cooldown, Some(msg.to_string()));
-
-                            // Persist cooldown state immediately so a 12-hour
-                            // cooldown survives an app restart 10 hours in.
-                            if let Some(ref persist_path) = self.state_path {
-                                ring.save_to_file(persist_path);
-                            }
+                        // Persist cooldown state immediately so a 12-hour
+                        // cooldown survives an app restart 10 hours in.
+                        if let Some(ref persist_path) = self.state_path {
+                            ring.save_to_file(persist_path);
                         }
 
                         tracing::info!(
@@ -379,9 +490,21 @@ impl LlmProvider for KeyRotatingProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        self.try_with_rotation(|provider| {
+        let key_capacity = Arc::clone(&self.key_capacity);
+        self.try_with_rotation(|key_idx, provider| {
             let req = request.clone();
-            async move { provider.create_message(req).await }
+            let key_capacity = Arc::clone(&key_capacity);
+            async move {
+                let mut response = provider.create_message(req).await?;
+                if let Some(mut observation) = response.rate_limit {
+                    observation.key_idx = Some(key_idx);
+                    if let Ok(mut state) = key_capacity.lock() {
+                        state.observe(key_idx, observation);
+                    }
+                    response.rate_limit = Some(observation);
+                }
+                Ok(response)
+            }
         })
         .await
     }
@@ -391,9 +514,49 @@ impl LlmProvider for KeyRotatingProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        self.try_with_rotation(|provider| {
+        let key_capacity = Arc::clone(&self.key_capacity);
+        self.try_with_rotation(|key_idx, provider| {
             let req = request.clone();
-            async move { provider.create_message_stream(req).await }
+            let key_capacity = Arc::clone(&key_capacity);
+            async move {
+                let stream = provider.create_message_stream(req).await?;
+                let stream = stream.map(move |result| {
+                    result.map(|event| match event {
+                        StreamEvent::RateLimitHeaders {
+                            provider_id,
+                            tokens_pct_used,
+                            requests_pct_used,
+                            retry_after_secs,
+                            reset_at_unix,
+                            ..
+                        } => {
+                            let observation = RateLimitObservation {
+                                key_idx: Some(key_idx),
+                                tokens_pct_used: Some(tokens_pct_used),
+                                requests_pct_used: Some(requests_pct_used),
+                                retry_after_secs,
+                                reset_at_unix,
+                            };
+                            if let Ok(mut state) = key_capacity.lock() {
+                                state.observe(key_idx, observation);
+                            }
+                            StreamEvent::RateLimitHeaders {
+                                provider_id,
+                                tokens_pct_used,
+                                requests_pct_used,
+                                retry_after_secs,
+                                reset_at_unix,
+                                key_idx: Some(key_idx),
+                            }
+                        }
+                        other => other,
+                    })
+                });
+                Ok(Box::pin(stream)
+                    as Pin<
+                        Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>,
+                    >)
+            }
         })
         .await
     }
@@ -413,41 +576,50 @@ impl LlmProvider for KeyRotatingProvider {
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
-        // Try each active key until one reports healthy.
+        // Snapshot each currently-available key once. `next_available()`
+        // round-robins and never removes a key on a health-check failure, so
+        // looping until it returns None would cycle forever when all keys are
+        // reachable but unhealthy.
+        let keys = match self.ring.lock() {
+            Ok(mut ring) => {
+                let active = ring.active_count();
+                let mut keys = Vec::with_capacity(active);
+                for _ in 0..active {
+                    if let Some((_, key)) = ring.next_available() {
+                        keys.push(key.to_string());
+                    } else {
+                        break;
+                    }
+                }
+                keys
+            }
+            Err(_) => Vec::new(),
+        };
         let mut last_status: Result<ProviderStatus, ProviderError> =
             Ok(ProviderStatus::Unavailable {
                 reason: "no keys configured".to_string(),
             });
-
-        loop {
-            let key = {
-                let mut ring = self.ring.lock().unwrap();
-                ring.next_available().map(|(_, k)| k.to_string())
-            };
-            let Some(k) = key else {
-                break;
-            };
-
-            let provider = (self.build_provider)(&k);
+        for key in keys {
+            let provider = (self.build_provider)(&key);
             match provider.health_check().await {
                 Ok(ProviderStatus::Healthy) => return Ok(ProviderStatus::Healthy),
                 Ok(other) => last_status = Ok(other),
-                Err(e) => last_status = Err(e),
+                Err(error) => last_status = Err(error),
             }
         }
-
         last_status
     }
 
     fn key_ring_status(&self) -> Option<(usize, usize, Option<u64>)> {
-        // Every key is either active or in cooldown, so the total is the sum of
-        // the two public counters (both poison-safe).
-        let active = self.active_key_count();
-        let total = active + self.exhausted_key_count();
-        match self.ring.lock() {
-            Ok(ring) => Some((active, total, ring.earliest_retry_secs())),
-            Err(_) => None,
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.prune_expired();
+        } else {
+            return None;
         }
+        let active = self.active_key_count();
+        let exhausted = self.exhausted_key_count();
+        let retry = self.ring.lock().ok()?.earliest_retry_secs();
+        Some((active, active + exhausted, retry))
     }
 
     fn mark_key_healthy(&self, _upstream_id: Option<&str>, key_idx: usize) -> bool {
@@ -479,7 +651,15 @@ impl LlmProvider for KeyRotatingProvider {
         reason: Option<String>,
     ) -> bool {
         match self.ring.lock() {
-            Ok(mut ring) => ring.mark_exhausted(key_idx, cooldown_secs, reason),
+            Ok(mut ring) => {
+                let changed = ring.mark_exhausted(key_idx, cooldown_secs, reason);
+                if changed {
+                    if let Some(ref persist_path) = self.state_path {
+                        ring.save_to_file(persist_path);
+                    }
+                }
+                changed
+            }
             Err(_) => false,
         }
     }
@@ -539,7 +719,7 @@ impl LlmProvider for KeyRotatingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider_types::StopReason;
+    use crate::provider_types::{RateLimitObservation, StopReason};
     use clawde_core::types::{Message, UsageInfo};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -549,6 +729,8 @@ mod tests {
         name: String,
         fail_with: Option<ProviderError>,
         call_count: Arc<AtomicUsize>,
+        delay: Duration,
+        rate_limit: Option<RateLimitObservation>,
     }
 
     #[async_trait]
@@ -565,6 +747,9 @@ mod tests {
             request: ProviderRequest,
         ) -> Result<ProviderResponse, ProviderError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             if let Some(ref err) = self.fail_with {
                 return Err(err.clone());
             }
@@ -574,6 +759,7 @@ mod tests {
                 content: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: UsageInfo::default(),
+                rate_limit: self.rate_limit,
             })
         }
 
@@ -585,10 +771,26 @@ mod tests {
             ProviderError,
         > {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             if let Some(ref err) = self.fail_with {
                 return Err(err.clone());
             }
-            let stream = futures::stream::iter(vec![]);
+            let events = self
+                .rate_limit
+                .map(|observation| {
+                    vec![Ok(StreamEvent::RateLimitHeaders {
+                        provider_id: "mock".into(),
+                        tokens_pct_used: observation.tokens_pct_used.unwrap_or(0.0),
+                        requests_pct_used: observation.requests_pct_used.unwrap_or(0.0),
+                        retry_after_secs: observation.retry_after_secs,
+                        reset_at_unix: observation.reset_at_unix,
+                        key_idx: observation.key_idx,
+                    })]
+                })
+                .unwrap_or_default();
+            let stream = futures::stream::iter(events);
             Ok(Box::pin(stream))
         }
 
@@ -640,6 +842,15 @@ mod tests {
         fail: Option<ProviderError>,
         counters: &Arc<Vec<Arc<AtomicUsize>>>,
     ) -> Arc<dyn LlmProvider> {
+        build_mock_provider_with_observation(key, fail, counters, None)
+    }
+
+    fn build_mock_provider_with_observation(
+        key: &str,
+        fail: Option<ProviderError>,
+        counters: &Arc<Vec<Arc<AtomicUsize>>>,
+        rate_limit: Option<RateLimitObservation>,
+    ) -> Arc<dyn LlmProvider> {
         let idx: usize = key
             .chars()
             .last()
@@ -656,6 +867,8 @@ mod tests {
             name: format!("mock-{}", key),
             fail_with: fail,
             call_count: counter,
+            delay: Duration::ZERO,
+            rate_limit,
         })
     }
 
@@ -672,6 +885,117 @@ mod tests {
         let result = provider.create_message(dummy_request()).await;
         assert!(result.is_ok());
         assert_eq!(counters[0].load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn key_slot_attribution_is_added_to_completed_and_streaming_metadata() {
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+        let observation = RateLimitObservation {
+            key_idx: None,
+            tokens_pct_used: Some(0.91),
+            requests_pct_used: None,
+            retry_after_secs: Some(7),
+            reset_at_unix: None,
+        };
+        let build = {
+            let counters = counters.clone();
+            move |key: &str| {
+                build_mock_provider_with_observation(key, None, &counters, Some(observation))
+            }
+        };
+        let provider =
+            KeyRotatingProvider::new("mock", "Mock", vec!["key0".into(), "key1".into()], build);
+
+        let response = provider
+            .create_message(dummy_request())
+            .await
+            .expect("completed response");
+        assert_eq!(response.rate_limit.and_then(|value| value.key_idx), Some(0));
+
+        let mut stream = provider
+            .create_message_stream(dummy_request())
+            .await
+            .expect("stream response");
+        let event = stream
+            .next()
+            .await
+            .expect("rate-limit event")
+            .expect("successful event");
+        assert!(matches!(
+            event,
+            StreamEvent::RateLimitHeaders {
+                key_idx: Some(1),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn key_capacity_demotes_recently_used_key_without_starving_it() {
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+        let high = RateLimitObservation {
+            key_idx: None,
+            tokens_pct_used: Some(0.96),
+            requests_pct_used: None,
+            retry_after_secs: None,
+            reset_at_unix: None,
+        };
+        let low = RateLimitObservation {
+            key_idx: None,
+            tokens_pct_used: Some(0.10),
+            requests_pct_used: None,
+            retry_after_secs: None,
+            reset_at_unix: None,
+        };
+        let build = {
+            let counters = counters.clone();
+            move |key: &str| {
+                let observation = if key == "key0" { high } else { low };
+                build_mock_provider_with_observation(key, None, &counters, Some(observation))
+            }
+        };
+        let provider =
+            KeyRotatingProvider::new("mock", "Mock", vec!["key0".into(), "key1".into()], build);
+
+        // First call records key0 as critically utilized. The next two calls
+        // should prefer key1, but key0 remains eligible rather than skipped.
+        provider
+            .create_message(dummy_request())
+            .await
+            .expect("first response");
+        provider
+            .create_message(dummy_request())
+            .await
+            .expect("second response");
+        provider
+            .create_message(dummy_request())
+            .await
+            .expect("third response");
+
+        assert_eq!(counters[0].load(Ordering::SeqCst), 1);
+        assert_eq!(counters[1].load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn key_capacity_reset_expiry_restores_normal_rank() {
+        let mut state = KeyCapacityState::new(1);
+        state.observe(
+            0,
+            RateLimitObservation {
+                key_idx: Some(0),
+                tokens_pct_used: Some(0.99),
+                requests_pct_used: None,
+                retry_after_secs: None,
+                reset_at_unix: Some(current_unix_secs().saturating_sub(1)),
+            },
+        );
+        assert_eq!(state.rank(0), 0, "expired reset must not demote the key");
     }
 
     #[tokio::test]
@@ -841,6 +1165,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_check_terminates_when_all_active_keys_are_unhealthy() {
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+        let fail = ProviderError::Other {
+            provider: ProviderId::new("mock"),
+            message: "unavailable".into(),
+            status: None,
+            body: None,
+        };
+        let build = {
+            let counters = counters.clone();
+            move |key: &str| build_mock_provider(key, Some(fail.clone()), &counters)
+        };
+        let provider =
+            KeyRotatingProvider::new("mock", "Mock", vec!["key0".into(), "key1".into()], build);
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), provider.health_check()).await;
+        assert!(result.is_ok(), "health check must make one bounded pass");
+        assert!(
+            result.unwrap().is_ok(),
+            "unhealthy status is still a completed check"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_poll_exhaustion_persists_across_restart() {
+        let _home = crate::test_support::TestHome::new();
+        let counters = Arc::new(vec![Arc::new(AtomicUsize::new(0))]);
+        let build = {
+            let counters = counters.clone();
+            move |key: &str| build_mock_provider(key, None, &counters)
+        };
+        let provider = KeyRotatingProvider::new_with_persistence(
+            "mock-health",
+            "Mock",
+            vec!["key0".into()],
+            build,
+        );
+        assert!(provider.mark_key_exhausted(
+            None,
+            0,
+            60,
+            Some("Invalid API key (HTTP 401)".into())
+        ));
+        let restored = KeyRotatingProvider::new_with_persistence(
+            "mock-health",
+            "Mock",
+            vec!["key0".into()],
+            {
+                let counters = counters.clone();
+                move |key: &str| build_mock_provider(key, None, &counters)
+            },
+        );
+        let statuses = restored.key_statuses();
+        assert!(!statuses[0].active);
+        assert_eq!(
+            statuses[0].last_error.as_deref(),
+            Some("Invalid API key (HTTP 401)")
+        );
+    }
+
+    #[tokio::test]
     async fn health_check_skips_exhausted_keys() {
         let counters = Arc::new(vec![
             Arc::new(AtomicUsize::new(0)),
@@ -1001,6 +1389,88 @@ mod tests {
         assert_eq!(counters[0].load(Ordering::SeqCst), 1);
         let statuses = provider.key_statuses();
         assert!(statuses[0].active, "key should still be active");
+    }
+
+    fn build_delayed_mock_provider(
+        key: &str,
+        fail: Option<ProviderError>,
+        counters: &Arc<Vec<Arc<AtomicUsize>>>,
+        delay: Duration,
+    ) -> Arc<dyn LlmProvider> {
+        let idx = key
+            .chars()
+            .last()
+            .and_then(|c| c.to_digit(10))
+            .map(|d| d as usize)
+            .unwrap_or(0);
+        let counter = counters
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        Arc::new(MockProvider {
+            id: ProviderId::new("mock"),
+            name: format!("mock-{}", key),
+            fail_with: fail,
+            call_count: counter,
+            delay,
+            rate_limit: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_failures_mark_the_selected_key() {
+        // key0 is selected first but fails slowly; key1 is selected second
+        // and fails immediately. The error reason must remain attached to the
+        // slot that actually served it, not whichever slot is first active
+        // when the error arrives.
+        let counters = Arc::new(vec![
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ]);
+        let build = {
+            let counters = counters.clone();
+            move |key: &str| {
+                let (error, delay) = if key == "key0" {
+                    (
+                        ProviderError::QuotaExceeded {
+                            provider: ProviderId::new("mock"),
+                            message: "key0 quota".into(),
+                        },
+                        Duration::from_millis(40),
+                    )
+                } else {
+                    (
+                        ProviderError::AuthFailed {
+                            provider: ProviderId::new("mock"),
+                            message: "key1 invalid".into(),
+                        },
+                        Duration::ZERO,
+                    )
+                };
+                build_delayed_mock_provider(key, Some(error), &counters, delay)
+            }
+        };
+        let provider = Arc::new(KeyRotatingProvider::new(
+            "mock",
+            "Mock",
+            vec!["key0".into(), "key1".into()],
+            build,
+        ));
+
+        let first = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.create_message(dummy_request()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = {
+            let provider = provider.clone();
+            tokio::spawn(async move { provider.create_message(dummy_request()).await })
+        };
+        let _ = tokio::join!(first, second);
+
+        let statuses = provider.key_statuses();
+        assert_eq!(statuses[0].last_error.as_deref(), Some("key0 quota"));
+        assert_eq!(statuses[1].last_error.as_deref(), Some("key1 invalid"));
     }
 
     #[tokio::test]

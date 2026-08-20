@@ -291,7 +291,7 @@ impl QueryConfig {
 /// not change the bridge wire protocol. `provider_id` and `model` identify the
 /// effective provider dispatch (for example, `free`); composite-provider
 /// upstream health remains represented by the live key-health snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnObservability {
     pub provider_id: String,
     /// Concrete upstream for composite providers such as FreeProvider.
@@ -309,6 +309,14 @@ pub struct TurnObservability {
     /// independent — the signal `decide_memory` budgets on (free providers
     /// report `input_tokens: 0`, so this is the only truthful measurement).
     pub context_tokens_est: u64,
+    /// The per-turn observability attached to the assistant message
+    /// (upstream id, started/completed wall timestamps). Mirrors the message
+    /// so stream consumers — the TUI badge, the eval harness — can render
+    /// attribution without re-reading the session store.
+    pub turn_meta: Option<clawde_core::types::TurnMeta>,
+    /// Cost of this logical turn in USD (all provider rounds). Free providers
+    /// price at $0.00, so this is populated on the paid path only.
+    pub cost_usd: Option<f64>,
 }
 
 /// F1 (free-mode audit fix): decide whether a `provider/model` dispatch to a
@@ -1123,6 +1131,42 @@ pub async fn run_query_loop(
     // Measure one complete logical completion, including provider retries and
     // tool rounds. Reset when a continuation starts a new completion below.
     let mut observability_started_at = std::time::Instant::now();
+    // Wall-clock start and cost snapshot for the logical completion, persisted
+    // on the assistant message (TurnMeta / MessageCost) and exposed via Stop
+    // hooks. Reset alongside `observability_started_at`.
+    let mut turn_started_wall = clawde_core::types::now_rfc3339_ms();
+    let mut turn_start_cost: f64 = cost_tracker.total_cost_usd();
+
+    // Fire the configured Stop hooks for a completed turn. Defined at function
+    // scope so both the streaming path (free/composite providers) and the
+    // accumulator path (Anthropic) use the same enriched context: upstream
+    // attribution, model, wall-clock elapsed, session cost, and retry/fallback
+    // signals ride on HookContext for downstream feedback recorders.
+    macro_rules! fire_stop_hook {
+        ($msg:expr) => {{
+            let stop_ctx = clawde_core::hooks::HookContext {
+                event: "Stop".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: Some($msg.get_all_text()),
+                is_error: None,
+                session_id: Some(tool_ctx.session_id.clone()),
+                upstream_id: $msg.turn_meta.as_ref().and_then(|m| m.upstream_id.clone()),
+                model: Some(effective_model.clone()),
+                elapsed_ms: Some(observability_started_at.elapsed().as_millis() as u64),
+                cost_usd: Some(cost_tracker.total_cost_usd()),
+                fallback_used: Some(used_fallback),
+                retries: Some(request_retries),
+            };
+            clawde_core::hooks::run_hooks(
+                &tool_ctx.config.hooks,
+                clawde_core::config::HookEvent::Stop,
+                &stop_ctx,
+                &tool_ctx.working_dir,
+            )
+            .await;
+        }};
+    }
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
     let effective_max_turns = config
@@ -1530,6 +1574,8 @@ pub async fn run_query_loop(
                         used_fallback = false;
                         goal_turn_start = std::time::Instant::now();
                         observability_started_at = std::time::Instant::now();
+                        turn_started_wall = clawde_core::types::now_rfc3339_ms();
+                        turn_start_cost = cost_tracker.total_cost_usd();
                         continue;
                     }
                     crate::continuation::ContinuationDecision::Stop { note } => {
@@ -2217,7 +2263,7 @@ pub async fn run_query_loop(
                                                 actual_upstream_id = Some(upstream_id.clone());
                                                 actual_model = model.clone();
                                             }
-                                            clawde_api::StreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
+                                            clawde_api::StreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used, .. } => {
                                                 if let Some(ref tx) = event_tx {
                                                     let _ = tx.send(QueryEvent::RateLimitUpdate {
                                                         provider_id: provider_id.clone(),
@@ -2561,6 +2607,11 @@ pub async fn run_query_loop(
                         uuid: Some(msg_id),
                         cost: None,
                         snapshot_patch: None,
+                        turn_meta: Some(clawde_core::types::TurnMeta {
+                            upstream_id: actual_upstream_id.clone(),
+                            started_at: Some(turn_started_wall.clone()),
+                            completed_at: Some(clawde_core::types::now_rfc3339_ms()),
+                        }),
                     };
 
                     cost_tracker.add_usage(
@@ -2569,6 +2620,16 @@ pub async fn run_query_loop(
                         usage.cache_creation_input_tokens,
                         usage.cache_read_input_tokens,
                     );
+                    // Attribute this logical turn's cost delta (all provider
+                    // rounds) to the assistant message. Free providers price at
+                    // $0.00, so this is the paid-provider path.
+                    assistant_msg.cost = Some(clawde_core::types::MessageCost {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                        cache_read_input_tokens: usage.cache_read_input_tokens,
+                        cost_usd: cost_tracker.total_cost_usd() - turn_start_cost,
+                    });
 
                     messages.push(assistant_msg.clone());
 
@@ -2659,6 +2720,7 @@ pub async fn run_query_loop(
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
+                            turn_meta: None,
                         });
                         continue; // loop for next tool round
                     }
@@ -2714,6 +2776,8 @@ pub async fn run_query_loop(
                                     messages,
                                     (usage.total_input() > 0).then_some(usage.total_input()),
                                 ),
+                                turn_meta: assistant_msg.turn_meta.clone(),
+                                cost_usd: assistant_msg.cost.as_ref().map(|c| c.cost_usd),
                             }),
                         });
                     }
@@ -2726,6 +2790,19 @@ pub async fn run_query_loop(
                         turn_diff = turn_change_diff;
                         assistant_msg.snapshot_patch = Some(patch);
                     }
+
+                    // Fire Stop hooks on streaming turns too — the free / OSS
+                    // provider path (the accumulator path fires them below on
+                    // `end_turn`). Reached only when this round ended without
+                    // tool calls; the enriched context carries the upstream that
+                    // actually served the turn. Mirrors the accumulator arm so
+                    // Stop hooks behave identically for every provider.
+                    fire_stop_hook!(assistant_msg);
+                    let _bg = stop_hooks_with_full_behavior(
+                        &assistant_msg,
+                        &tool_ctx.config,
+                        tool_ctx.working_dir.clone(),
+                    );
 
                     continue_or_end!(assistant_msg, usage, stop_str.as_str());
                 } else if provider_id_str != "anthropic" {
@@ -2831,7 +2908,7 @@ pub async fn run_query_loop(
                     match event {
                         Some(evt) => {
                             accumulator.on_event(&evt);
-                            match &evt {AnthropicStreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used } => {
+                            match &evt {AnthropicStreamEvent::RateLimitHeaders { provider_id, tokens_pct_used, requests_pct_used, .. } => {
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::RateLimitUpdate {
                             provider_id: provider_id.clone(),
@@ -2879,6 +2956,21 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        // Persist turn observability: the accumulator path has no composite
+        // upstream attribution (single native provider), so upstream stays
+        // unset; timing and cost are still recorded.
+        assistant_msg.cost = Some(clawde_core::types::MessageCost {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cost_usd: cost_tracker.total_cost_usd() - turn_start_cost,
+        });
+        assistant_msg.turn_meta = Some(clawde_core::types::TurnMeta {
+            upstream_id: None,
+            started_at: Some(turn_started_wall.clone()),
+            completed_at: Some(clawde_core::types::now_rfc3339_ms()),
+        });
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -3103,30 +3195,11 @@ pub async fn run_query_loop(
                         // Reuses the exact context estimate the compaction
                         // logic already computed for this turn (line above).
                         context_tokens_est: context_tokens,
+                        turn_meta: assistant_msg.turn_meta.clone(),
+                        cost_usd: assistant_msg.cost.as_ref().map(|c| c.cost_usd),
                     }),
                 });
             }
-            // Helper closure for firing the Stop hook.
-            macro_rules! fire_stop_hook {
-                ($msg:expr) => {{
-                    let stop_ctx = clawde_core::hooks::HookContext {
-                        event: "Stop".to_string(),
-                        tool_name: None,
-                        tool_input: None,
-                        tool_output: Some($msg.get_all_text()),
-                        is_error: None,
-                        session_id: Some(tool_ctx.session_id.clone()),
-                    };
-                    clawde_core::hooks::run_hooks(
-                        &tool_ctx.config.hooks,
-                        clawde_core::config::HookEvent::Stop,
-                        &stop_ctx,
-                        &tool_ctx.working_dir,
-                    )
-                    .await;
-                }};
-            }
-
             match stop {
                 "end_turn" => {
                     fire_stop_hook!(assistant_msg);
@@ -3396,6 +3469,12 @@ pub async fn run_query_loop(
                                 tool_output: None,
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
+                                upstream_id: None,
+                                model: None,
+                                elapsed_ms: None,
+                                cost_usd: None,
+                                fallback_used: None,
+                                retries: None,
                             };
                             let pre_outcome = clawde_core::hooks::run_hooks(
                                 hooks,
@@ -3499,6 +3578,12 @@ pub async fn run_query_loop(
                                 tool_output: Some(result.content.clone()),
                                 is_error: Some(result.is_error),
                                 session_id: Some(tool_ctx.session_id.clone()),
+                                upstream_id: None,
+                                model: None,
+                                elapsed_ms: None,
+                                cost_usd: None,
+                                fallback_used: None,
+                                retries: None,
                             };
                             clawde_core::hooks::run_hooks(
                                 hooks,
@@ -3634,6 +3719,7 @@ mod tests {
             uuid: None,
             cost: None,
             snapshot_patch: None,
+            turn_meta: None,
         };
         assert_eq!(guard_blocked_message(&[tool_result]), None);
     }

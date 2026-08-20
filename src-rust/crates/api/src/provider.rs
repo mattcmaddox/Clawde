@@ -70,15 +70,54 @@ impl Default for ModelInfo {
 // LlmProvider
 // ---------------------------------------------------------------------------
 
-/// The core trait every LLM provider adapter must implement.
+/// Which source produced an upstream capacity status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityStatusSource {
+    /// Fresh provider response headers.
+    Headers,
+    /// Conservative local accounting from an explicitly declared quota.
+    LocalEstimate,
+}
+
+impl CapacityStatusSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::LocalEstimate => "local",
+        }
+    }
+}
+
+/// Compact, read-only capacity status for one multiplexed upstream.
 ///
-/// Implementors are required to be `Send + Sync` so they can be held behind an
-/// `Arc<dyn LlmProvider>` and shared across async tasks.
+/// This is intentionally telemetry only: consumers must not use it as a hard
+/// eligibility decision. Missing status means no usable capacity signal is
+/// available, not that the upstream is unhealthy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpstreamCapacityStatus {
+    pub upstream_id: String,
+    pub source: CapacityStatusSource,
+    /// Effective utilization as a percentage in the range `0.0..=100.0`.
+    pub utilization_pct: f32,
+    pub tokens_pct_used: Option<f32>,
+    pub requests_pct_used: Option<f32>,
+    pub retry_after_secs: Option<u64>,
+    pub reset_at_unix: Option<u64>,
+}
+
+/// Per-upstream capacity status summaries returned by a provider registry.
+pub type UpstreamCapacitySummaries = Vec<(String, Vec<UpstreamCapacityStatus>)>;
+
 /// Per-upstream per-task dispatch success rates (spec §8.6):
 /// `(upstream_id, [(task_key, rate)])` — only tasks with recorded dispatches.
 /// Type-aliased so the trait method, provider overrides, and TUI dialog agree
 /// on one shape without tripping clippy::type_complexity.
 pub type UpstreamTaskSuccessRates = Vec<(String, Vec<(String, Option<f64>)>)>;
+
+/// The core trait every LLM provider adapter must implement.
+///
+/// Implementors are required to be `Send + Sync` so they can be held behind an
+/// `Arc<dyn LlmProvider>` and shared across async tasks.
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -217,6 +256,14 @@ pub trait LlmProvider: Send + Sync {
     /// in the cooldown. The default implementation returns an empty vector
     /// — only composite providers that multiplex upstreams override this.
     fn upstream_cooldowns(&self) -> Vec<(String, String, Option<u64>)> {
+        Vec::new()
+    }
+
+    /// Report read-only capacity telemetry for multiplexed upstreams.
+    /// Missing entries mean that neither fresh response headers nor an
+    /// explicitly declared local quota is available. This never changes
+    /// provider eligibility by itself.
+    fn upstream_capacity(&self) -> Vec<UpstreamCapacityStatus> {
         Vec::new()
     }
 

@@ -18,8 +18,8 @@ use crate::client::{AnthropicClient, ClientConfig};
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitObservation,
+    StopReason, StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
 use crate::streaming::{AnthropicStreamEvent, ContentDelta, NullStreamHandler};
 use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
@@ -160,10 +160,15 @@ impl AnthropicProvider {
                 provider_id,
                 tokens_pct_used,
                 requests_pct_used,
+                retry_after_secs,
+                reset_at_unix,
             } => Some(StreamEvent::RateLimitHeaders {
                 provider_id,
                 tokens_pct_used,
                 requests_pct_used,
+                retry_after_secs,
+                reset_at_unix,
+                key_idx: None,
             }),
         }
     }
@@ -194,6 +199,7 @@ impl LlmProvider for AnthropicProvider {
         let mut model = String::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = UsageInfo::default();
+        let mut rate_limit = None;
 
         // Accumulate every content block (text, thinking, tool_use, …) keyed by
         // its stream index. Captures thinking/signature/reasoning deltas (which
@@ -218,6 +224,21 @@ impl LlmProvider for AnthropicProvider {
                             id = msg_id;
                             model = msg_model;
                             usage = msg_usage;
+                        }
+                        StreamEvent::RateLimitHeaders {
+                            tokens_pct_used,
+                            requests_pct_used,
+                            retry_after_secs,
+                            reset_at_unix,
+                            ..
+                        } => {
+                            rate_limit = Some(RateLimitObservation {
+                                key_idx: None,
+                                tokens_pct_used: Some(tokens_pct_used),
+                                requests_pct_used: Some(requests_pct_used),
+                                retry_after_secs,
+                                reset_at_unix,
+                            });
                         }
                         StreamEvent::MessageDelta {
                             stop_reason: sr,
@@ -258,6 +279,7 @@ impl LlmProvider for AnthropicProvider {
             stop_reason,
             usage,
             model,
+            rate_limit,
         })
     }
 

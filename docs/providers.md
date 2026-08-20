@@ -92,9 +92,10 @@ the rotation rings, and the Connect Free dialog all agree on which keys exist
 and in what order:
 
 - **`resolve_free_upstream_keys`** — the ring-aligned list used to build
-  `KeyRotatingProvider` rings *and* to probe health. It reads the multi-key
-  store only (credentials are excluded so `key_idx` stays in sync with ring
-  slots), trims whitespace, and drops <8-char placeholder keys.
+  `KeyRotatingProvider` rings *and* to probe health. It prefers the multi-key
+  store (credentials are excluded so `key_idx` stays in sync with ring slots),
+  trims whitespace, drops <8-char placeholder keys, and uses the documented
+  environment/OpenCode CLI fallback when no stored slot exists.
 - **`first_free_upstream_key`** — the single-key chain path: first valid ring
   slot, else the stored credential (incl. OAuth tokens), else the provider's
   env var.
@@ -104,6 +105,55 @@ and in what order:
 OpenCode Zen reads the `opencode-go` key slots as a fallback in all three
 resolvers.
 
+Health probes distinguish invalid credentials from transient provider trouble:
+401/403-style failures mark a key unhealthy, while 429, 5xx, connection, and
+empty-response failures are shown as transient and do not evict the key. Health
+polling is bounded-concurrent across configured upstreams, and its key indexes
+remain aligned with the rotation rings.
+
+Provider failures also carry a shared recovery class (`invalid_credential`,
+`rate_limited`, `quota_exhausted`, `transient_provider`, `context_overflow`,
+`malformed_request`, `content_filtered`, and related classes). Free Mode uses
+that classification for fallback decisions: context overflow may move to a
+larger upstream, while malformed requests and content-filter decisions do not
+fan out to every provider. A streamed attempt is considered committed only
+when generated text, reasoning, or tool arguments have been emitted; transport
+metadata alone does not prevent pre-output fallback, and visible output is
+never silently replayed.
+
+Free Mode also records fresh rate-limit utilization headers separately from
+credential health. OpenAI-compatible completed responses and streaming
+responses contribute when they expose those headers; native Anthropic and Gemini
+responses do the same on their completed and streaming paths. Automatic and
+family routes softly demote an upstream when reported request or token
+utilization reaches 60%, 80%, or 95%; the upstream
+remains eligible and can recover when the observation expires after 15 minutes
+or when the provider-reported reset time arrives. `Retry-After` and common
+request/token reset headers are retained as timing metadata rather than being
+used to invalidate credentials. When a rotating provider can identify the
+serving slot, the observation is also retained against that exact key index;
+the upstream aggregate remains available for routing while key data stays
+separate from credential health. During a live process, key rotation prefers
+lower-utilization active keys and keeps round-robin order for equal ranks;
+missing or expired key observations remain neutral.
+Missing or stale headers do not mean zero capacity or an invalid key, and an
+explicit provider pin remains first. When persistence is enabled, these
+observations are stored privately in `capacity-state/free.json`, separate from
+`auth.json` and key cooldown state. For providers without usable headers, Free
+Mode also keeps a conservative local sliding-window estimate only where an
+explicit catalog limit is known: Groq (1K requests/day), Cerebras (5 RPM / 30K
+TPM), and SambaNova (20 RPM / 200K TPD). Dispatches count estimated input
+usage and successful completions add known output usage; each window resets on
+its own schedule. Providers with ambiguous limits remain neutral, and fresh
+server metadata always takes precedence over the local estimate.
+
+Capacity status is intentionally compact and read-only. `/keys health`,
+`/routing`, and the `/stats` live key-health view show rows such as
+`free · groq  72% used · headers · reset in 1m 30s` when a fresh signal exists.
+`headers` means the value came from the provider; `local` means it came from an
+explicit local quota estimate. Missing or expired capacity data is omitted
+rather than displayed as `0%`, and it never marks a credential invalid.
+
 ### Managing routing with `/routing`
 
 Use the `/routing` slash command to view or change how the free-mode router
@@ -111,7 +161,7 @@ selects upstream providers:
 
 | Command | Description |
 |---|---|
-| `/routing` | Show the current routing strategy (and per-task assignments when auto/task-based) |
+| `/routing` | Show the current routing strategy, per-task assignments, and available capacity status |
 | `/routing auto` | **Default.** Classify each request by task and dispatch to the upstreams best suited to it first, ordered by historical latency within the task-preferred group (spec §8.4 — no user config needed) |
 | `/routing sequential` | Try upstreams in catalog priority order |
 | `/routing random` | Randomize upstream order each request |
