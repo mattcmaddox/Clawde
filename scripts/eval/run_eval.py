@@ -69,6 +69,7 @@ MAX_RECORDED_RESPONSE_CHARS = 20_000
 
 KNOWN_ASSERTION_TYPES = {
     "contains",
+    "count",
     "icontains",
     "not-contains",
     "regex",
@@ -109,6 +110,36 @@ ASSERTION_DEFAULTS = {
         f"matches {v!r}" if re.search(v, out, re.IGNORECASE) else f"no match for {v!r}",
     ),
 }
+
+
+def load_fixture_turns(fixture: Path | None, prompt: str) -> list[str] | None:
+    """Return the ordered list of user turns for a fixture run.
+
+    A fixture may ship `turns.json` (a non-empty list of prompt strings) to
+    exercise a multi-turn conversation: each turn runs against the SAME
+    session, so later turns resume the earlier context (instruction
+    retention). Without it the fixture is a single turn (prompt.md). Returns
+    `None` (after printing an error) when turns.json is malformed.
+    """
+    if fixture is None:
+        return [prompt]
+    turns_file = fixture / "turns.json"
+    if not turns_file.exists():
+        return [prompt]
+    try:
+        turns = json.loads(turns_file.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"error: could not load {turns_file}: {error}", file=sys.stderr)
+        return None
+    if not isinstance(turns, list) or not turns or not all(
+        isinstance(t, str) and t.strip() for t in turns
+    ):
+        print(
+            f"error: {turns_file} must be a non-empty list of non-empty strings",
+            file=sys.stderr,
+        )
+        return None
+    return turns
 
 
 def load_catalog_facts() -> dict:
@@ -183,6 +214,12 @@ def validate_expected(expected: dict) -> list[str]:
             similarity_threshold = assertion.get("threshold", 0.6)
             if not isinstance(similarity_threshold, (int, float)) or not 0 <= similarity_threshold <= 1:
                 errors.append(f"assert[{index}].threshold must be between 0 and 1")
+        if atype == "count":
+            for bound in ("min", "max"):
+                if bound in assertion and (
+                    not isinstance(assertion[bound], int) or assertion[bound] < 0
+                ):
+                    errors.append(f"assert[{index}].{bound} must be a non-negative integer")
     judge = expected.get("judge")
     if judge is not None:
         if not isinstance(judge, dict):
@@ -341,6 +378,23 @@ def run_assertions(
             passed = run.get("error") is None
             results.append(
                 {"type": atype, "passed": passed, "weight": weight, "detail": run.get("error") or "no error"}
+            )
+        elif atype == "count":
+            # Regex-count assertion (IFEval-style verifiable constraint):
+            # `value` is a regex; the response must contain between `min`
+            # (default 1) and `max` (default unbounded) matches. `finditer`
+            # counts whole matches regardless of capture groups.
+            n = len(list(re.finditer(value, output)))
+            lo = int(a.get("min", 1))
+            hi = int(a.get("max", 10**9))
+            passed = lo <= n <= hi
+            results.append(
+                {
+                    "type": atype,
+                    "passed": passed,
+                    "weight": weight,
+                    "detail": f"{n} matches of {value!r} (need {lo}..{hi})",
+                }
             )
         elif atype == "similar":
             # Semantic-similarity assertion (promptfoo-style): cosine of the
@@ -649,6 +703,7 @@ def run_headless(
     timeout: float,
     session_id: str,
     permission_mode: str | None = None,
+    resume: bool = False,
 ) -> tuple[dict, list[tuple[float, str]]]:
     cmd = [
         str(binary),
@@ -661,6 +716,12 @@ def run_headless(
         "--no-auto-compact",
         "--cwd", str(cwd),
     ]
+    if resume:
+        # Continue the persisted conversation: the CLI loads the session's
+        # prior messages only when `--resume` is present (--session-id alone
+        # just names the session). Same id on both flags — the CLI validates
+        # they match.
+        cmd.extend(["--resume", session_id])
     if permission_mode:
         cmd.extend(["--permission-mode", permission_mode])
     env = dict(os.environ)
@@ -823,11 +884,17 @@ def main() -> int:
         fixture = args.fixture.resolve()
         prompt_file = fixture / "prompt.md"
         expected_file = fixture / "expected.json"
-        if not prompt_file.exists() or not expected_file.exists():
-            print(f"error: fixture {fixture} needs prompt.md and expected.json", file=sys.stderr)
+        turns_file = fixture / "turns.json"
+        # A conversation fixture (turns.json) needs expected.json only;
+        # prompt.md is required for single-turn fixtures.
+        if not expected_file.exists() or (not prompt_file.exists() and not turns_file.exists()):
+            print(
+                f"error: fixture {fixture} needs expected.json plus prompt.md or turns.json",
+                file=sys.stderr,
+            )
             return 1
         try:
-            prompt = prompt_file.read_text().strip()
+            prompt = prompt_file.read_text().strip() if prompt_file.exists() else ""
             expected = json.loads(expected_file.read_text())
         except (OSError, json.JSONDecodeError) as error:
             print(f"error: could not load fixture {fixture}: {error}", file=sys.stderr)
@@ -839,6 +906,11 @@ def main() -> int:
         ap.print_usage()
         print("error: provide --fixture DIR or --prompt TEXT", file=sys.stderr)
         return 1
+
+    turns = load_fixture_turns(args.fixture, prompt)
+    if turns is None:
+        return 1
+    prompt = turns[0]
 
     schema_errors = validate_expected(expected)
     if schema_errors:
@@ -875,17 +947,55 @@ def main() -> int:
         # embedder (built after cleanup) can still reach the inference API.
         seeded_hf_token = hf_token_from_auth(str(home / "auth.json"))
         workdir = (args.cwd or SRC_RUST).resolve()
-        run, _ = run_headless(
-            prompt,
-            binary=args.binary,
-            model=args.model,
-            cwd=workdir,
-            home=home,
-            max_turns=args.max_turns,
-            timeout=args.timeout,
-            session_id=session_id,
-            permission_mode=args.permission_mode,
-        )
+        # Conversation fixtures (turns.json): each turn runs against the same
+        # isolated home + session id, resuming the previous context, so a
+        # later turn must still honor constraints stated in an earlier one.
+        # The last turn's response is what the assertions and judge evaluate.
+        runs = []
+        for turn_index, turn_prompt in enumerate(turns):
+            run, _ = run_headless(
+                turn_prompt,
+                binary=args.binary,
+                model=args.model,
+                cwd=workdir,
+                home=home,
+                max_turns=args.max_turns,
+                timeout=args.timeout,
+                session_id=session_id,
+                permission_mode=args.permission_mode,
+                resume=turn_index > 0,
+            )
+            run["turn_index"] = turn_index
+            run["turn_prompt"] = turn_prompt[:200]
+            runs.append(run)
+        run = runs[-1]
+        run["turn_count"] = len(runs)
+        # Lightweight per-turn ledger so reports show whether every turn ran
+        # (e.g. that turn 1 actually investigated before turn 2 answered).
+        run["turns"] = [
+            {
+                "turn_index": r.get("turn_index", index),
+                "error": r.get("error"),
+                "tools_used": len(r.get("tool_sequence", [])),
+                "text_deltas": r.get("text_deltas", 0),
+                "response_chars": r.get("response_chars", 0),
+            }
+            for index, r in enumerate(runs)
+        ]
+        if len(runs) > 1:
+            run["prior_turn_errors"] = [
+                r.get("error") for r in runs[:-1] if r.get("error")
+            ]
+            # A conversation fixture measures retention ACROSS turns: if an
+            # earlier turn failed (provider timeout, crash), the session the
+            # final turn resumed may be incomplete, so the measurement is
+            # invalid. Fail the run instead of letting a partial conversation
+            # go green on a lucky answer.
+            if run["prior_turn_errors"]:
+                run["error"] = (
+                    "conversation turn(s) failed: "
+                    + "; ".join(run["prior_turn_errors"])
+                )
         # LLM-as-judge tier (G-Eval style): grade the response with a second
         # headless run inside the same isolated home. Advisory only — the
         # deterministic assertions remain the authoritative gate.

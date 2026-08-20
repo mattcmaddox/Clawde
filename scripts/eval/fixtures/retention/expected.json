@@ -1,0 +1,14 @@
+{
+  "threshold": 0.75,
+  "judge": {
+    "rubric": "Assess factual correctness ONLY: does the answer accurately describe the capacity/routing behavior from crates/api/src/providers/free/capacity.rs? The deterministic asserts enforce the retention constraints (starts with CAPACITY REPORT:, exactly 3 bullets, no 'quota') — do NOT score those. The key thing being measured is that constraints stated in turn 1 are still honored in turn 2's answer, after the session resumed. Penalize fabricated claims.",
+    "min_score": 0.5
+  },
+  "assert": [
+    {"type": "starts-with", "value": "CAPACITY REPORT:", "weight": 3},
+    {"type": "count", "value": "(^|\\n)- ", "min": 3, "max": 3, "weight": 3},
+    {"type": "not-contains", "value": "quota", "weight": 3},
+    {"type": "min-length", "value": 200, "weight": 1},
+    {"type": "no-error", "weight": 2}
+  ]
+}

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from derive_catalog_facts import CATALOG_RS, parse_catalog  # noqa: E402
 from run_eval import (  # noqa: E402
+    load_fixture_turns,
     append_result,
     fixture_label,
     load_catalog_facts,
@@ -47,6 +48,43 @@ class EvalHarnessTests(unittest.TestCase):
             expected = json.loads((fixture / "expected.json").read_text())
             self.assertEqual(validate_expected(expected), [], fixture.name)
         self.assertTrue(validate_expected({"assert": [{"type": "unknown"}]}))
+
+    def test_count_assertion_bounds_regex_matches(self):
+        run = {"tools_used": []}
+        catalog = {}
+        output = "- a\n- b\n- c\n- d"
+        exact = [{"type": "count", "value": "(^|\\n)- ", "min": 4, "max": 4}]
+        self.assertTrue(run_assertions(exact, output, run, catalog)[0]["passed"])
+        too_few = [{"type": "count", "value": "(^|\\n)- ", "min": 5}]
+        self.assertFalse(run_assertions(too_few, output, run, catalog)[0]["passed"])
+        at_least = [{"type": "count", "value": "rate_limited", "min": 2}]
+        self.assertTrue(
+            run_assertions(at_least, "rate_limited here and rate_limited there", run, catalog)[0]["passed"]
+        )
+        # Counted as whole matches, not capture groups.
+        self.assertEqual(
+            len(list(__import__("re").finditer("(^|\\n)- ", output))), 4
+        )
+
+    def test_load_fixture_turns_supports_conversation_fixtures(self):
+        root = Path(__file__).resolve().parent / "fixtures"
+        # Single-turn fixture: turns.json absent -> [prompt].
+        single = load_fixture_turns(root / "catalog-order", "prompt text")
+        self.assertEqual(single, ["prompt text"])
+        # Conversation fixture: turns.json drives the sequence.
+        multi = load_fixture_turns(root / "retention", "")
+        self.assertEqual(len(multi), 2)
+        self.assertEqual(multi[1], "Now answer.")
+        # Bare --prompt: always a single turn.
+        self.assertEqual(load_fixture_turns(None, "hi"), ["hi"])
+        # Malformed turns.json -> None (error printed, run aborted).
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "bad"
+            bad.mkdir()
+            (bad / "turns.json").write_text('[]')  # empty list
+            self.assertIsNone(load_fixture_turns(bad, ""))
+            (bad / "turns.json").write_text('"not a list"')
+            self.assertIsNone(load_fixture_turns(bad, ""))
 
     def test_mentions_upstreams_uses_identifier_boundaries(self):
         assertions = [{"type": "mentions-upstreams", "min": 1}]

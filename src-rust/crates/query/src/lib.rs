@@ -1018,6 +1018,93 @@ fn accepted_task_id_from_messages(messages: &[Message]) -> Option<String> {
     })
 }
 
+/// Maximum characters of the latest instruction kept in the per-turn pin.
+const INSTRUCTION_PIN_MAX_CHARS: usize = 600;
+
+/// Truncate pin text to [`INSTRUCTION_PIN_MAX_CHARS`], cutting at the last
+/// sentence boundary within the cap (clamped to a char boundary so a
+/// multi-byte character is never split).
+fn truncate_instruction_pin(text: &str) -> String {
+    if text.len() <= INSTRUCTION_PIN_MAX_CHARS {
+        return text.to_string();
+    }
+    let cut = text.floor_char_boundary(INSTRUCTION_PIN_MAX_CHARS);
+    let boundary = text[..cut]
+        .rfind(['.', '?', '!'])
+        .map(|i| i + 1)
+        .unwrap_or(cut);
+    format!("{}…", &text[..boundary])
+}
+
+/// The current-task instruction pin for this turn, if the turn is mid-task.
+///
+/// Returns `None` when the history ends in a user message (a fresh
+/// instruction — or a goal-continuation message that already restates the
+/// task — so no pin is needed). Otherwise returns a compact restatement of
+/// the most recent substantive user instruction, truncated to
+/// [`INSTRUCTION_PIN_MAX_CHARS`], so compaction or a long tool trail cannot
+/// silently drop the user's request mid-task. The pin is injected at the END
+/// of the request context (Lost in the Middle: the position models attend to
+/// best); it is request-only, never persisted into the conversation history.
+///
+/// Tool results are user-role messages carrying `ToolResult` blocks — they
+/// are skipped, as is the synthetic max-steps degradation message. When the
+/// most recent user message is the synthetic `<compact-summary>`, the pin is
+/// the `Current instruction:` line the summarizer is instructed to preserve
+/// verbatim; a missing line yields `None` (safe degradation — the recent
+/// tail is still in context).
+fn build_instruction_pin(messages: &[Message]) -> Option<String> {
+    // A fresh instruction turn (history ends in a user TEXT message) needs no
+    // pin — the instruction is right there in context. Tool rounds end in a
+    // user-role `ToolResult` block message, which IS mid-task and gets a pin.
+    // The synthetic max-steps degradation message is not a fresh instruction.
+    if let Some(last) = messages.last() {
+        let is_degradation = last.role == Role::User
+            && matches!(
+                &last.content,
+                clawde_core::types::MessageContent::Text(t) if t == MAX_STEPS_DEGRADATION_MSG
+            );
+        if !is_degradation
+            && last.role == Role::User
+            && matches!(last.content, clawde_core::types::MessageContent::Text(_))
+        {
+            return None;
+        }
+    }
+    let mut latest_user: Option<&str> = None;
+    for message in messages.iter().rev() {
+        if message.role != Role::User {
+            continue;
+        }
+        let text = match &message.content {
+            clawde_core::types::MessageContent::Text(text) => text.as_str(),
+            clawde_core::types::MessageContent::Blocks(_) => continue,
+        };
+        if text == MAX_STEPS_DEGRADATION_MSG {
+            continue;
+        }
+        latest_user = Some(text);
+        break;
+    }
+    let text = latest_user?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.contains("<compact-summary>") {
+        let preserved = text
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Current instruction:")
+                    .map(str::trim)
+            })
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)?;
+        return Some(truncate_instruction_pin(&preserved));
+    }
+    Some(truncate_instruction_pin(text))
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1673,8 +1760,23 @@ pub async fn run_query_loop(
         // sanitize_history is idempotent, so a well-formed history is untouched.
         *messages = sanitize::sanitize_history(std::mem::take(messages));
 
+        // Current-task instruction pin (instruction-following): when this turn
+        // continues an in-flight task, restate the latest substantive user
+        // instruction at the END of the request context — the position models
+        // attend to best — so compaction or a long tool trail cannot silently
+        // drop the user's request. Request-only: appended to the derived
+        // api/provider message vectors below, never to `messages`, so history
+        // and the compact summary stay clean.
+        let instruction_pin = build_instruction_pin(messages);
+
         // Build API request
-        let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+        let mut api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+        if let Some(ref pin) = instruction_pin {
+            api_messages.push(ApiMessage::from(&Message::user(format!(
+                "## Current task\n{}\n\nThis is the user's latest instruction — stay on it. If a later user message changes it, the later message wins.",
+                pin
+            ))));
+        }
         // Max-steps degradation: the final summary turn is dispatched with NO
         // tool definitions so the model can only produce text (issue #230).
         let api_tools: Vec<ApiToolDefinition> = if degradation_turn {
@@ -2117,7 +2219,7 @@ pub async fn run_query_loop(
                         } else {
                             Vec::new()
                         };
-                    let provider_messages: Vec<clawde_core::types::Message> = messages
+                    let mut provider_messages: Vec<clawde_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
@@ -2149,6 +2251,12 @@ pub async fn run_query_loop(
                             msg
                         })
                         .collect();
+                    if let Some(ref pin) = instruction_pin {
+                        provider_messages.push(Message::user(format!(
+                            "## Current task\n{}\n\nThis is the user's latest instruction — stay on it. If a later user message changes it, the later message wins.",
+                            pin
+                        )));
+                    }
 
                     let provider_request = clawde_api::ProviderRequest {
                         model: provider_request_model(&provider_id_str, &model_id_str),
@@ -7241,5 +7349,113 @@ mod tests {
             statuses.iter().any(|s| s.contains("No progress detected")),
             "expected a no-progress Status event, got: {statuses:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod instruction_pin_tests {
+    use super::*;
+
+    fn user(text: &str) -> Message {
+        Message::user(text.to_string())
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::assistant(text.to_string())
+    }
+
+    /// A user-role message carrying a tool result block (what tool rounds
+    /// look like in the history).
+    fn tool_result_block(text: &str) -> Message {
+        Message::user_blocks(vec![clawde_core::types::ContentBlock::ToolResult {
+            tool_use_id: "id".to_string(),
+            content: clawde_core::types::ToolResultContent::Text(text.to_string()),
+            is_error: Some(false),
+        }])
+    }
+
+    #[test]
+    fn fresh_turn_has_no_pin() {
+        // The history ends in a user message: a fresh instruction, no pin.
+        let messages = vec![user("refactor the auth flow")];
+        assert_eq!(build_instruction_pin(&messages), None);
+        // A follow-up instruction supersedes: the turn is fresh again.
+        let messages = vec![
+            user("old task"),
+            assistant("done"),
+            tool_result_block("ok"),
+            user("now do the new task instead"),
+        ];
+        assert_eq!(build_instruction_pin(&messages), None);
+    }
+
+    #[test]
+    fn mid_task_pins_the_latest_user_instruction() {
+        // Assistant tool work came after the instruction — mid-task.
+        let messages = vec![
+            user("Refactor the auth flow and keep the public API stable."),
+            assistant("Reading the files..."),
+            tool_result_block("ok"),
+            assistant("editing"),
+        ];
+        let pin = build_instruction_pin(&messages).expect("mid-task pin");
+        assert!(
+            pin.contains("Refactor the auth flow and keep the public API stable."),
+            "got: {}",
+            pin
+        );
+        // Tool-result blocks are skipped; the instruction text is the pin.
+        assert!(!pin.contains("ok"), "got: {}", pin);
+    }
+
+    #[test]
+    fn compact_summary_pin_uses_preserved_current_instruction() {
+        let summary = user(
+            "<compact-summary>\n1. Primary Request and Intent:\n\n   [description]\n\n\
+              Current instruction: Refactor the auth flow, keep the public API stable.\n\
+              Constraints:\n              - never touch legacy-notes.md\n\
+            7. Pending Tasks: ...\n</compact-summary>",
+        );
+        let messages = vec![summary, assistant("done"), tool_result_block("ok")];
+        let pin = build_instruction_pin(&messages).expect("summary pin");
+        assert!(
+            pin.contains("Refactor the auth flow, keep the public API stable."),
+            "got: {}",
+            pin
+        );
+    }
+
+    #[test]
+    fn compact_summary_without_current_instruction_yields_no_pin() {
+        let summary = user("<compact-summary>\n1. Primary Request and Intent:\n\n   [description]\n</compact-summary>");
+        let messages = vec![summary, assistant("done"), tool_result_block("ok")];
+        assert_eq!(build_instruction_pin(&messages), None);
+    }
+
+    #[test]
+    fn degradation_message_is_skipped() {
+        // The synthetic max-steps wrap-up message must not become the pin.
+        let messages = vec![
+            user("Do the real task."),
+            assistant("working"),
+            tool_result_block("ok"),
+            user(MAX_STEPS_DEGRADATION_MSG),
+        ];
+        let pin = build_instruction_pin(&messages).expect("pin from earlier instruction");
+        assert!(pin.contains("Do the real task."), "got: {}", pin);
+        assert!(!pin.contains("maximum number of steps"), "got: {}", pin);
+    }
+
+    #[test]
+    fn long_instruction_is_truncated_at_sentence_boundary() {
+        let long = format!("Start with a detailed plan. {}", "x".repeat(1200));
+        let messages = vec![user(&long), assistant("working")];
+        let pin = build_instruction_pin(&messages).expect("pin");
+        assert!(
+            pin.len() <= INSTRUCTION_PIN_MAX_CHARS + 1,
+            "len={}",
+            pin.len()
+        );
+        assert!(pin.ends_with('…'), "got: {}", pin);
     }
 }

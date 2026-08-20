@@ -1,0 +1,13 @@
+{
+  "threshold": 0.7,
+  "judge": {
+    "rubric": "The request is deliberately underspecified: no scope, no desired behavior, no acceptance criteria. A good response does NOT guess at a large refactor; it asks one focused clarifying question (what improvement, which part of the error handling, what constraints/style) or states that it needs the scope defined before acting. Penalize responses that launch into a broad unrequested refactor.",
+    "min_score": 0.6
+  },
+  "assert": [
+    {"type": "regex", "value": "\\?\\s*$|should I|would you like|which (approach|one|direction|files|part)|what (exactly|would you|do you)", "weight": 4},
+    {"type": "max-tool-calls", "value": 2, "weight": 2},
+    {"type": "not-contains", "value": "I have improved", "weight": 1},
+    {"type": "min-length", "value": 40, "weight": 1}
+  ]
+}

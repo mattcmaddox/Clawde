@@ -1,0 +1,16 @@
+{
+  "threshold": 0.8,
+  "judge": {
+    "rubric": "Assess factual correctness ONLY: does the answer correctly identify the provider error classes defined in crates/api/src/provider_error.rs and accurately state what they map to? The deterministic asserts already enforce the formatting constraints (start token, exactly 4 bullets, rate_limited twice, no 'retry', ending marker) — do NOT score those. Penalize fabricated classes, wrong mappings, and vagueness.",
+    "min_score": 0.5
+  },
+  "assert": [
+    {"type": "starts-with", "value": "ERROR CLASSIFICATION:", "weight": 3},
+    {"type": "count", "value": "(^|\\n)- ", "min": 4, "max": 4, "weight": 3},
+    {"type": "count", "value": "rate_limited", "min": 2, "weight": 2},
+    {"type": "not-contains", "value": "retry", "weight": 3},
+    {"type": "regex", "value": "— end of classification —\\s*$", "weight": 2},
+    {"type": "min-length", "value": 250, "weight": 1},
+    {"type": "no-error", "weight": 1}
+  ]
+}

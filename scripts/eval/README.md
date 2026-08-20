@@ -14,6 +14,19 @@ and answer quality — not a mocked adapter.
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/fallback-behavior
 
+# Instruction-following: a code-analysis question with verifiable constraints
+# (exact start, exactly 4 bullets, a token repeated twice, a forbidden word,
+# an exact ending marker) plus an underspecified-request variant that must
+# elicit a clarifying question instead of a guessed refactor:
+python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/instruction-following
+python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/underspecified
+
+# Conversation fixture (fixture dir with turns.json): each turn runs against
+# the SAME session (resumed via --resume), so a later turn must still honor
+# constraints stated in an earlier one — measures instruction retention
+# across user turns and tool trails:
+python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/retention
+
 # Force the free chain to fall through (first configured upstream's keys are
 # replaced with invalid placeholders; the chain must recover via a later one):
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/fallback-behavior \

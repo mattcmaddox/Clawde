@@ -1,0 +1,4 @@
+[
+  "Before anything else, read crates/api/src/providers/free/capacity.rs thoroughly. Do NOT answer yet — I will tell you when. When I finally ask, your answer must honor ALL of these constraints: (1) start with exactly the line: CAPACITY REPORT:; (2) contain exactly 3 bullet points, each starting with \"- \"; (3) never contain the word \"quota\". For now, just investigate.",
+  "Now answer."
+]

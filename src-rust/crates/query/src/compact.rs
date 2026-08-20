@@ -436,6 +436,14 @@ were already completed without confirming with the user first.\n\
 conversation showing exactly what task you were working on and where you left off. This should \
 be verbatim to ensure there's no drift in task interpretation.\n\
 \n\
+THE MOST IMPORTANT REQUIREMENT — the user's latest instruction must survive this summary.\n\
+In section 1, after the description, add a \"Current instruction:\" line containing the user's\n\
+most recent substantive (non-tool-result, non-continuation) request VERBATIM, followed by a\n\
+\"Constraints:\" bullet list capturing every explicit constraint (do/don't/never/keep/only/\n\
+unless/at least/at most). If the user gave a newer instruction that supersedes an earlier one,\n\
+the latest is authoritative. A later turn reads this line to stay on task: losing or\n\
+paraphrasing it causes instruction drift.\n\
+\
 Format your output as:\n\
 \n\
 <analysis>\n\
@@ -445,6 +453,9 @@ Format your output as:\n\
 <summary>\n\
 1. Primary Request and Intent:\n\
    [Detailed description]\n\
+   Current instruction: [the user's most recent substantive request, VERBATIM]\n\
+   Constraints:\n\
+   - [every explicit constraint: do/don't/never/keep/only/unless/at least/at most]\n\
 \n\
 2. Key Technical Concepts:\n\
    - [Concept 1]\n\
@@ -489,8 +500,7 @@ the new activity since it was written. The previous summary is provided in <prev
 messages to incorporate are in the <conversation_to_summarize> block.\n\
 \n\
 Do NOT re-summarise from scratch. Instead:\n\
-- PRESERVE all still-relevant information from the previous summary verbatim (file names, code snippets, \
-function signatures, decisions, user messages, error fixes).\n\
+- PRESERVE all still-relevant information from the previous summary verbatim (file names, code snippets, \\nfunction signatures, decisions, user messages, error fixes).\\n\n- ALWAYS preserve the previous summary's \"Current instruction:\" line and its Constraints bullet \\nlist verbatim; refresh them ONLY when the new activity contains a newer substantive user \\ninstruction (then restate that one verbatim with its constraints).\\n\
 - ADD new progress, decisions, files, errors, and user messages from the new activity.\n\
 - UPDATE the state: move finished items out of Pending Tasks / Current Work; refresh Optional Next Step to \
 reflect what is happening NOW.\n\
@@ -524,6 +534,9 @@ Format your output as:\n\
 <summary>\n\
 1. Primary Request and Intent:\n\
    [Detailed description]\n\
+   Current instruction: [the user's most recent substantive request, VERBATIM]\n\
+   Constraints:\n\
+   - [every explicit constraint: do/don't/never/keep/only/unless/at least/at most]\n\
 \n\
 2. Key Technical Concepts:\n\
    - [Concept 1]\n\
@@ -2303,6 +2316,25 @@ mod tests {
 
         // No summary block ⇒ None.
         assert!(extract_previous_summary(&[make_user("hello"), make_assistant("hi")]).is_none());
+    }
+
+    /// Both compaction variants must preserve the user's latest instruction
+    /// and constraints: the `Current instruction:` line is what a later turn's
+    /// instruction pin reads after compaction, so losing it would silently
+    /// drop the active task.
+    #[test]
+    fn both_prompts_preserve_current_instruction() {
+        let base = get_compact_prompt(None, None);
+        let update = get_compact_prompt(None, Some("Summary:\n1. Primary Request: build X"));
+        for p in [&base, &update] {
+            assert!(p.contains("Current instruction:"), "missing in: {}", p);
+            assert!(p.contains("Constraints:"), "missing in: {}", p);
+            assert!(
+                p.contains("VERBATIM"),
+                "instruction must be preserved verbatim in: {}",
+                p
+            );
+        }
     }
 
     #[test]

@@ -595,6 +595,14 @@ that are hard to reverse, affect shared systems, or could be risky or
 destructive, check with the user before proceeding. Authorization stands for
 the scope specified, not beyond. Match the scope of your actions to what was
 actually requested.
+
+Follow the user's instruction exactly, including its constraints: do not
+silently expand the scope, skip a stated "don't", or guess at an ambiguous
+requirement. When an instruction is underspecified and the choice is
+hard to reverse, ask one clarifying question (AskUserQuestion) before acting
+instead of assuming. Before declaring a task done, re-read the instruction
+and state which of its requirements you satisfied and which (if any) you did
+not.
 "#;
 
 const SAFETY_GUIDELINES: &str = r#"
@@ -660,6 +668,20 @@ mod tests {
         assert!(prompt.starts_with("Custom only."));
         assert!(!prompt.contains("Capabilities"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+    }
+
+    #[test]
+    fn test_actions_section_has_instruction_following_rules() {
+        let opts = SystemPromptOptions::default();
+        let prompt = build_system_prompt(&opts);
+        assert!(
+            prompt.contains("ask one clarifying question"),
+            "missing ask-don't-guess rule"
+        );
+        assert!(
+            prompt.contains("state which of its requirements you satisfied"),
+            "missing acceptance-check rule"
+        );
     }
 
     #[test]
