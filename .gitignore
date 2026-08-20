@@ -4,6 +4,13 @@ src-rust/target/
 # OS
 .DS_Store
 
+# Python
+__pycache__/
+*.pyc
+
+# Eval harness run outputs (generated, not versioned)
+scripts/eval/results/
+
 # Refs
 refs/
 
