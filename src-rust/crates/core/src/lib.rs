@@ -5493,11 +5493,48 @@ pub mod history {
 
     /// Delete a session by ID.
     pub async fn delete_session(id: &str) -> anyhow::Result<()> {
+        // 1. Remove the session JSON from ~/.clawde/sessions/
         let path = sessions_dir().join(format!("{}.json", id));
         if path.exists() {
             tokio::fs::remove_file(&path).await?;
         }
+        // 2. Remove JSONL transcripts from ~/.clawde/projects/<dir>/*.jsonl
+        //    that match this session ID.
+        let projects_dir = crate::session_storage::projects_dir();
+        if let Ok(mut project_entries) = tokio::fs::read_dir(&projects_dir).await {
+            while let Ok(Some(project_entry)) = project_entries.next_entry().await {
+                if !project_entry.path().is_dir() {
+                    continue;
+                }
+                let transcript = project_entry.path().join(format!("{}.jsonl", id));
+                if transcript.exists() {
+                    let _ = tokio::fs::remove_file(&transcript).await;
+                }
+            }
+        }
+        // 3. Remove from SQLite session index if the DB exists.
+        let db_path = crate::config::Settings::config_dir().join("sessions.db");
+        if db_path.exists() {
+            if let Ok(store) = crate::SqliteSessionStore::open(&db_path) {
+                let _ = store.delete_session(id);
+            }
+        }
         Ok(())
+    }
+
+    /// Delete sessions older than the given age threshold.
+    /// Returns the number of sessions deleted.
+    pub async fn prune_sessions(older_than: chrono::Duration) -> anyhow::Result<usize> {
+        let cutoff = chrono::Utc::now() - older_than;
+        let sessions = list_sessions().await;
+        let mut deleted = 0;
+        for session in &sessions {
+            if session.updated_at < cutoff {
+                delete_session(&session.id).await?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Rename (set the title of) a session.

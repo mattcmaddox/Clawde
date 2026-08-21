@@ -258,102 +258,164 @@ impl SlashCommand for SessionCommand {
     fn description(&self) -> &str {
         "Show or manage conversation sessions"
     }
-    fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
-        vec![ArgCompletion {
-            value: "list".into(),
-            description: "List all saved sessions".into(),
-            available: true,
-        }]
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let completions = vec!["list", "delete", "prune"];
+        completions
+            .into_iter()
+            .filter(|c| c.starts_with(partial))
+            .map(|c| ArgCompletion {
+                value: c.to_string(),
+                description: match c {
+                    "list" => "List all saved sessions".to_string(),
+                    "delete" => "Delete a session by ID".to_string(),
+                    "prune" => "Delete sessions older than N days (default: 30)".to_string(),
+                    _ => String::new(),
+                },
+                available: true,
+            })
+            .collect()
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        match args.trim() {
-            "list" => {
-                let sessions = clawde_core::history::list_sessions().await;
-                if sessions.is_empty() {
-                    CommandResult::Message("No saved sessions found.".to_string())
+        let trimmed = args.trim();
+        if trimmed == "list" {
+            let sessions = clawde_core::history::list_sessions().await;
+            if sessions.is_empty() {
+                CommandResult::Message("No saved sessions found.".to_string())
+            } else {
+                let mut output = String::from("Recent sessions:\n\n");
+                for sess in sessions.iter().take(10) {
+                    let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
+                    let id_short = &sess.id[..sess.id.len().min(8)];
+                    output.push_str(&format!(
+                        "  {} | {} | {} messages | {}\n",
+                        id_short,
+                        updated,
+                        sess.messages.len(),
+                        sess.title.as_deref().unwrap_or("(untitled)")
+                    ));
+                }
+                output.push_str("\nUse /resume <id> to resume a session.");
+                CommandResult::Message(output)
+            }
+        } else if trimmed.is_empty() {
+            // If a bridge remote URL is active, show it prominently.
+            if let Some(ref url) = ctx.remote_session_url {
+                let border = "\u{2500}".repeat(url.len().min(60) + 4);
+                let display_url = if url.len() > 60 {
+                    format!("{}\u{2026}", &url[..60])
                 } else {
-                    let mut output = String::from("Recent sessions:\n\n");
-                    for sess in sessions.iter().take(10) {
+                    url.clone()
+                };
+                CommandResult::Message(format!(
+                    "Remote session active\n\
+                     \u{250C}{border}\u{2510}\n\
+                     \u{2502}  {display_url}  \u{2502}\n\
+                     \u{2514}{border}\u{2518}\n\n\
+                     Open the URL above on any device to connect remotely.\n\
+                     Session ID: {}",
+                    ctx.session_id,
+                ))
+            } else {
+                // Show current session info + recent sessions list.
+                let sessions = clawde_core::history::list_sessions().await;
+                let mut output = format!(
+                    "Current session\n\
+                     \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                     ID:       {}\n\
+                     Title:    {}\n\
+                     Messages: {}\n\
+                     Model:    {}\n",
+                    ctx.session_id,
+                    ctx.session_title.as_deref().unwrap_or("(untitled)"),
+                    ctx.messages.len(),
+                    ctx.config.effective_model()
+                );
+
+                if !sessions.is_empty() {
+                    output.push_str("\nRecent sessions:\n\n");
+                    for sess in sessions.iter().take(5) {
                         let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
                         let id_short = &sess.id[..sess.id.len().min(8)];
+                        let marker = if sess.id == ctx.session_id {
+                            " \u{25C0} current"
+                        } else {
+                            ""
+                        };
                         output.push_str(&format!(
-                            "  {} | {} | {} messages | {}\n",
+                            "  {} | {} | {} messages | {}{}\n",
                             id_short,
                             updated,
                             sess.messages.len(),
-                            sess.title.as_deref().unwrap_or("(untitled)")
+                            sess.title.as_deref().unwrap_or("(untitled)"),
+                            marker,
                         ));
                     }
-                    output.push_str("\nUse /resume <id> to resume a session.");
-                    CommandResult::Message(output)
+                    output
+                        .push_str("\nUse /session list for all sessions, /resume <id> to switch.");
+                }
+
+                CommandResult::Message(output)
+            }
+        } else if trimmed == "delete" || trimmed.starts_with("delete ") {
+            let session_id = trimmed.strip_prefix("delete").unwrap_or("").trim();
+            if session_id.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /session delete <session-id>\n\n\
+                     Delete a session and all its transcripts.\n\
+                     Use /session list to find session IDs."
+                        .to_string(),
+                );
+            }
+            if session_id == ctx.session_id {
+                return CommandResult::Error(
+                    "Cannot delete the active session. Use /clear to reset it first.".to_string(),
+                );
+            }
+            match clawde_core::history::delete_session(session_id).await {
+                Ok(()) => CommandResult::Message(format!(
+                    "Deleted session {}.",
+                    &session_id[..session_id.len().min(12)]
+                )),
+                Err(e) => CommandResult::Error(format!("Failed to delete session: {e}")),
+            }
+        } else if trimmed.starts_with("prune ") {
+            let rest = trimmed.strip_prefix("prune ").unwrap_or("").trim();
+            let days: u64 = rest.parse().unwrap_or(30);
+            if days == 0 {
+                return CommandResult::Error("Days must be at least 1.".to_string());
+            }
+            let sessions = clawde_core::history::list_sessions().await;
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            let stale: Vec<_> = sessions
+                .iter()
+                .filter(|s| s.updated_at < cutoff && s.id != ctx.session_id)
+                .collect();
+            if stale.is_empty() {
+                return CommandResult::Message(format!(
+                    "No sessions older than {days} day{} found.",
+                    if days == 1 { "" } else { "s" }
+                ));
+            }
+            let mut deleted = 0;
+            for session in &stale {
+                if clawde_core::history::delete_session(&session.id)
+                    .await
+                    .is_ok()
+                {
+                    deleted += 1;
                 }
             }
-            "" => {
-                // If a bridge remote URL is active, show it prominently.
-                if let Some(ref url) = ctx.remote_session_url {
-                    let border = "\u{2500}".repeat(url.len().min(60) + 4);
-                    let display_url = if url.len() > 60 {
-                        format!("{}\u{2026}", &url[..60])
-                    } else {
-                        url.clone()
-                    };
-                    CommandResult::Message(format!(
-                        "Remote session active\n\
-                         \u{250C}{border}\u{2510}\n\
-                         \u{2502}  {display_url}  \u{2502}\n\
-                         \u{2514}{border}\u{2518}\n\n\
-                         Open the URL above on any device to connect remotely.\n\
-                         Session ID: {}",
-                        ctx.session_id,
-                    ))
-                } else {
-                    // Show current session info + recent sessions list.
-                    let sessions = clawde_core::history::list_sessions().await;
-                    let mut output = format!(
-                        "Current session\n\
-                         \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
-                         ID:       {}\n\
-                         Title:    {}\n\
-                         Messages: {}\n\
-                         Model:    {}\n",
-                        ctx.session_id,
-                        ctx.session_title.as_deref().unwrap_or("(untitled)"),
-                        ctx.messages.len(),
-                        ctx.config.effective_model()
-                    );
-
-                    if !sessions.is_empty() {
-                        output.push_str("\nRecent sessions:\n\n");
-                        for sess in sessions.iter().take(5) {
-                            let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
-                            let id_short = &sess.id[..sess.id.len().min(8)];
-                            let marker = if sess.id == ctx.session_id {
-                                " \u{25C0} current"
-                            } else {
-                                ""
-                            };
-                            output.push_str(&format!(
-                                "  {} | {} | {} messages | {}{}\n",
-                                id_short,
-                                updated,
-                                sess.messages.len(),
-                                sess.title.as_deref().unwrap_or("(untitled)"),
-                                marker,
-                            ));
-                        }
-                        output.push_str(
-                            "\nUse /session list for all sessions, /resume <id> to switch.",
-                        );
-                    }
-
-                    CommandResult::Message(output)
-                }
-            }
-            _ => CommandResult::Error(format!(
-                "Unknown subcommand: {}\n\nUsage: /session [list]",
+            CommandResult::Message(format!(
+                "Pruned {deleted} session{} older than {days} day{}.",
+                if deleted == 1 { "" } else { "s" },
+                if days == 1 { "" } else { "s" }
+            ))
+        } else {
+            CommandResult::Error(format!(
+                "Unknown subcommand: {}\n\nUsage: /session [list|delete|prune]",
                 args
-            )),
+            ))
         }
     }
 }
@@ -492,6 +554,105 @@ impl SlashCommand for ForkCommand {
                 fork_at, new_id, new_id
             )),
             Err(e) => CommandResult::Error(format!("Failed to save forked session: {}", e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_ctx(session_id: &str) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir: PathBuf::from("."),
+            session_id: session_id.to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+            tool_use_tracker: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_delete_requires_id() {
+        let mut ctx = test_ctx("active-sess");
+        let result = SessionCommand.execute("delete ", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Usage: /session delete"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_delete_rejects_active_session() {
+        let mut ctx = test_ctx("active-sess");
+        let result = SessionCommand.execute("delete active-sess", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Cannot delete the active session"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_delete_removes_session() {
+        let mut session = clawde_core::history::ConversationSession::new("test-model".to_string());
+        session.title = Some("to-delete".to_string());
+        let id = session.id.clone();
+        clawde_core::history::save_session(&session).await.unwrap();
+
+        // Verify it exists.
+        assert!(clawde_core::history::load_session(&id).await.is_ok());
+
+        // Delete it.
+        let mut ctx = test_ctx("other-session");
+        let result = SessionCommand
+            .execute(&format!("delete {id}"), &mut ctx)
+            .await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Deleted session"));
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+
+        // Verify it's gone.
+        assert!(clawde_core::history::load_session(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_prune_no_old_sessions() {
+        let mut ctx = test_ctx("active-sess");
+        let result = SessionCommand.execute("prune 365", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("No sessions older than"));
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_unknown_subcommand() {
+        let mut ctx = test_ctx("active-sess");
+        let result = SessionCommand.execute("bogus", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("Unknown subcommand"));
+                assert!(msg.contains("list|delete|prune"));
+            }
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 }
