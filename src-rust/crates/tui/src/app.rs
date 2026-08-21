@@ -10061,6 +10061,28 @@ impl App {
                 self.is_verifying = false;
             }
 
+            QueryEvent::ModelInfo {
+                original_model,
+                switched_model,
+                reason,
+                provider,
+            } => {
+                tracing::info!(
+                    original = %original_model,
+                    switched = %switched_model,
+                    reason = %reason,
+                    provider = %provider,
+                    "model_info: auto-switch occurred"
+                );
+                // Surface the auto-switch decision to the user in the status bar.
+                if original_model != switched_model {
+                    self.status_message = Some(format!(
+                        "Auto-switched from {} to {}/{} ({})",
+                        original_model, provider, switched_model, reason
+                    ));
+                }
+            }
+
             QueryEvent::VerifyStarted => {
                 // Checks are about to spawn (potentially slow) — surface a
                 // spinner in the status row until the round's report lands.

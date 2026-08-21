@@ -303,13 +303,13 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 | Issue | Severity | Effort | Research Basis | Priority | Status |
 |---|---|---|---|---|---|
 | 8: Capability gate | High | Low | LiteLLM, OpenRouter, Portkey all filter by capabilities | **P0** | ✅ DONE |
-| 3: tool_calling accuracy | High | Medium | RouteLLM discovers capabilities from usage data | **P0** | Pending |
-| 6: Model doesn't use tools | High | Medium | RouteLLM/OpenRouter use success rates for routing | **P1** | Pending |
-| 1: --tool-model override | Medium | Low | LiteLLM uses explicit fallback mappings | **P1** | Pending |
-| 4: Hardcoded provider list | Medium | Low | LiteLLM uses config-driven lists | **P2** | Pending |
-| 5: Rebuild path untested | Medium | Low | LiteLLM uses mock flags for testing | **P2** | Pending |
-| 2: Per-turn performance | Low | Low | LiteLLM/OpenRouter use session caching | **P3** | Pending |
-| 7: Attribution visibility | Low | Low | OpenRouter returns model field; Portkey logs | **P3** | Pending |
+| 3: tool_calling accuracy | High | Medium | RouteLLM discovers capabilities from usage data | **P0** | ✅ DONE (runtime tracker) |
+| 6: Model doesn't use tools | High | Medium | RouteLLM/OpenRouter use success rates for routing | **P1** | ✅ DONE (ToolUseTracker) |
+| 1: --tool-model override | Medium | Low | LiteLLM uses explicit fallback mappings | **P1** | ✅ DONE (Route::Strict) |
+| 4: Hardcoded provider list | Medium | Low | LiteLLM uses config-driven lists | **P2** | ✅ DONE (is_known_provider_id) |
+| 5: Rebuild path untested | Medium | Low | LiteLLM uses mock flags for testing | **P2** | ✅ DONE (--force-no-tools) |
+| 2: Per-turn performance | Low | Low | LiteLLM/OpenRouter use session caching | **P3** | ✅ DONE (session cache) |
+| 7: Attribution visibility | Low | Low | OpenRouter returns model field; Portkey logs | **P3** | ✅ DONE (ModelInfo event) |
 
 ## Research Sources
 
@@ -323,10 +323,65 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 ## Implementation Order
 
 1. **P0**: Add `tool_calling` to FreeProvider capability gate (Issue 8) — ✅ DONE
-2. **P0**: Add startup capability probe (Issue 3) — Next
-3. **P1**: Add tool-use success rate tracking (Issue 6)
-4. **P1**: Add `Route::Strict` for `--tool-model` (Issue 1)
-5. **P2**: Replace hardcoded provider list (Issue 4)
+2. **P0**: Add runtime capability detection via ToolUseTracker (Issue 3) — ✅ DONE
+3. **P1**: Add tool-use success rate tracking (Issue 6) — ✅ DONE
+4. **P1**: Add `Route::Strict` for `--tool-model` (Issue 1) — ✅ DONE
+5. **P2**: Replace hardcoded provider list (Issue 4) — ✅ DONE
+6. **P2**: Add `--force-no-tools` test flag (Issue 5) — ✅ DONE
+7. **P3**: Add session-level switch cache (Issue 2) — ✅ DONE
+8. **P3**: Add `ModelInfo` event to query stream (Issue 7) — ✅ DONE
+
+## Audit Fixes (Post-Implementation)
+
+### Bug 1: Cache doesn't update `caps` after applying cached model
+**Severity**: High | **Status**: ✅ FIXED
+When the session cache applied a cached model, it set `provider_id_str` and
+`model_id_str` but didn't re-compute `caps`. The auto-switch block then saw
+stale `caps.tool_calling` and fired every turn.
+**Fix**: Re-compute `caps` from model registry and `tool_calling_for()` after
+applying the cached model.
+
+### Bug 2: ModelInfo event only fires for `--tool-model`
+**Severity**: Medium | **Status**: ✅ FIXED
+`QueryEvent::ModelInfo` was gated by `if config.tool_model.is_some()`, so
+reactive auto-switches (no `--tool-model`) produced no event.
+**Fix**: Moved `ModelInfo` emission outside the `tool_model` gate.
+
+### Bug 3: `--force-no-tools` doesn't trigger system prompt rebuild
+**Severity**: Medium | **Status**: ✅ FIXED
+The rebuild condition was `!caps.tool_calling`, ignoring `force_no_tools`.
+**Fix**: Changed to `(!caps.tool_calling || config.force_no_tools)`.
+
+### Bug 4: ToolUseTracker never initialized
+**Severity**: High | **Status**: ✅ FIXED
+The tracker was added to `QueryConfig` but never created or wired in `main.rs`.
+**Fix**: Create and wire `ToolUseTracker::new()` in `main.rs`.
+
+### Bug 5: Cache doesn't re-resolve provider
+**Severity**: High | **Status**: ✅ FIXED
+When the cache applied a cached model on a different provider, the `provider`
+object was the original provider, not the cached model's provider.
+**Fix**: Re-resolve provider via registry when `provider_id_str` differs.
+
+### Bug 6: `model_is_unreliable` not recomputed after cache apply
+**Severity**: Medium | **Status**: ✅ FIXED
+`model_is_unreliable` was computed for the original model before the cache
+applied. After applying the cached model, the reliability check was stale.
+**Fix**: Recompute `model_is_unreliable` after cache applies cached model.
+
+### Bug 7: Cache written when no alt_model found
+**Severity**: Medium | **Status**: ✅ FIXED
+`cached_tool_model = Some(...)` was outside `if let Some(alt_model)`, so
+when no tool-capable alternative existed, the broken model was cached,
+creating a no-op loop.
+**Fix**: Moved cache update inside the `if let Some(alt_model)` block.
+
+### Bug 8: Cache not invalidated on /model change
+**Severity**: Medium | **Status**: ✅ FIXED
+When the user ran `/model` to change models, `cached_tool_model` was never
+invalidated, so the old auto-switch result kept being applied.
+**Fix**: Invalidate cache when `provider_id_str` or `model_id_str` differs
+from cached values (indicating user changed model).
 6. **P2**: Add `--force-no-tools` test flag (Issue 5)
 7. **P3**: Add session-level switch cache (Issue 2)
 8. **P3**: Add `ModelInfo` event to query stream (Issue 7)

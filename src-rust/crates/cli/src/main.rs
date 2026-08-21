@@ -221,6 +221,10 @@ struct Cli {
     #[arg(long = "tool-model")]
     tool_model: Option<String>,
 
+    /// Dev flag: bypass auto-switch and fire system prompt rebuild path
+    #[arg(long = "force-no-tools")]
+    force_no_tools: bool,
+
     /// LLM provider to use (default: free — free-mode auto routing across your
     /// configured upstreams). Examples: free, openai, google, ollama
     #[arg(long, env = "CLAWDE_PROVIDER")]
@@ -1156,6 +1160,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref tm) = cli.tool_model {
         query_config.tool_model = Some(tm.clone());
     }
+    query_config.force_no_tools = cli.force_no_tools;
+    // Initialize the tool-use success rate tracker (Issue 6).
+    let tool_use_tracker = clawde_query::tool_use_tracker::ToolUseTracker::new();
+    query_config.tool_use_tracker = Some(tool_use_tracker);
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());

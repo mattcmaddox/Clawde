@@ -19,24 +19,49 @@ pub struct ModelKey {
     pub model: String,
 }
 
-/// Aggregate stats for one model.
-#[derive(Debug, Clone, Default)]
+/// Aggregate stats for one model, using exponential moving average (EMA)
+/// so recent turns weight more heavily than old ones. This ensures a model
+/// that was unreliable early but has since improved can recover.
+#[derive(Debug, Clone)]
 pub struct ModelToolStats {
     /// Number of turns where tools were available (sent in the request).
     pub attempts: u32,
     /// Number of turns where the model emitted at least one `tool_use` block.
     pub successes: u32,
+    /// EMA-smoothed success rate in `[0.0, 1.0]`. Updated on each turn
+    /// with `alpha` weighting the latest observation.
+    pub ema_rate: f64,
+}
+
+impl Default for ModelToolStats {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            successes: 0,
+            ema_rate: 0.5, // neutral prior until data arrives
+        }
+    }
 }
 
 impl ModelToolStats {
+    /// EMA smoothing factor. Higher = more weight on recent turns.
+    /// 0.4 means the latest turn contributes 40% to the smoothed rate.
+    const EMA_ALPHA: f64 = 0.4;
+
+    /// Update the EMA with a new observation (0.0 or 1.0).
+    pub fn update_ema(&mut self, success: bool) {
+        let obs = if success { 1.0 } else { 0.0 };
+        self.ema_rate = Self::EMA_ALPHA * obs + (1.0 - Self::EMA_ALPHA) * self.ema_rate;
+    }
+
     /// Success rate as a fraction `[0.0, 1.0]`. Returns `None` when there is
     /// not enough data (fewer than `MIN_ATTEMPTS` turns) to form a
-    /// trustworthy signal.
+    /// trustworthy signal. Uses the EMA-smoothed rate for stability.
     pub fn success_rate(&self, min_attempts: u32) -> Option<f64> {
         if self.attempts < min_attempts {
             return None;
         }
-        Some(self.successes as f64 / self.attempts as f64)
+        Some(self.ema_rate)
     }
 
     /// Whether the model has a poor track record of using tools when they
@@ -101,6 +126,7 @@ impl ToolUseTracker {
         if tools_were_used {
             stats.successes += 1;
         }
+        stats.update_ema(tools_were_used);
     }
 
     /// Whether the given model is flagged as tool-use unreliable (low success
@@ -171,23 +197,25 @@ mod tests {
             .unwrap();
         assert_eq!(stats.attempts, 3);
         assert_eq!(stats.successes, 2);
-        // 2/3 = 0.666... > 0.3 threshold → not unreliable
+        // EMA rate should be above 0.3 threshold → not unreliable
         assert!(!tracker.is_unreliable("free", "deepseek"));
+        // EMA with alpha=0.4: 0.5 → 0.7 → 0.42 → 0.652
+        let rate = tracker.success_rate("free", "deepseek").unwrap();
+        assert!(rate > 0.3, "expected EMA rate > 0.3, got {rate}");
     }
 
     #[test]
     fn low_success_rate_is_unreliable() {
         let tracker = ToolUseTracker::new();
 
-        // 5 turns, model only used tools once (20% < 30% threshold)
-        for _ in 0..5 {
+        // 6 turns with all failures — EMA should be well below 0.3
+        for _ in 0..6 {
             tracker.record_turn("free", "tiny-llama", true, false);
         }
-        tracker.record_turn("free", "tiny-llama", true, true);
 
         assert!(tracker.is_unreliable("free", "tiny-llama"));
         let rate = tracker.success_rate("free", "tiny-llama").unwrap();
-        assert!((rate - 1.0 / 6.0).abs() < 0.001);
+        assert!(rate < 0.3, "expected EMA rate < 0.3, got {rate}");
     }
 
     #[test]
@@ -231,6 +259,34 @@ mod tests {
         assert_eq!(
             tracker.success_rate("openai", "gpt-4o"),
             tracker2.success_rate("openai", "gpt-4o")
+        );
+    }
+
+    #[test]
+    fn ema_recovers_after_sustained_success() {
+        let tracker = ToolUseTracker::new();
+
+        // Phase 1: model is unreliable (5 failures)
+        for _ in 0..5 {
+            tracker.record_turn("groq", "llama-3.1", true, false);
+        }
+        assert!(tracker.is_unreliable("groq", "llama-3.1"));
+        let bad_rate = tracker.success_rate("groq", "llama-3.1").unwrap();
+        assert!(
+            bad_rate < 0.3,
+            "expected bad EMA rate < 0.3, got {bad_rate}"
+        );
+
+        // Phase 2: model starts using tools consistently (10 successes)
+        for _ in 0..10 {
+            tracker.record_turn("groq", "llama-3.1", true, true);
+        }
+        // EMA should have recovered above 0.3
+        assert!(!tracker.is_unreliable("groq", "llama-3.1"));
+        let recovered_rate = tracker.success_rate("groq", "llama-3.1").unwrap();
+        assert!(
+            recovered_rate > 0.3,
+            "expected recovered EMA rate > 0.3, got {recovered_rate}"
         );
     }
 }

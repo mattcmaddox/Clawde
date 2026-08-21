@@ -1392,6 +1392,7 @@ impl Tool for AgentTool {
             fallback_model: None,
             tool_model: None,
             tool_use_tracker: None,
+            force_no_tools: false,
             provider_registry: Some(Arc::new(provider_registry)),
             agent_name: None,
             agent_definition: None,

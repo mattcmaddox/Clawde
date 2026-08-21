@@ -175,6 +175,9 @@ pub struct QueryConfig {
     /// exposes success rates so the auto-switch can deprioritize models
     /// that claim tool support but rarely use tools in practice.
     pub tool_use_tracker: Option<tool_use_tracker::ToolUseTracker>,
+    /// Dev flag: bypass auto-switch and always fire system prompt rebuild path.
+    /// Useful for testing the rebuild path without needing a non-tool provider.
+    pub force_no_tools: bool,
     /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
     /// When `config.provider` is set to something other than "anthropic" and
     /// this registry contains that provider, the registry's provider is used
@@ -251,6 +254,7 @@ impl Default for QueryConfig {
             fallback_model: None,
             tool_model: None,
             tool_use_tracker: None,
+            force_no_tools: false,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,
@@ -438,6 +442,13 @@ pub enum QueryEvent {
     /// intentionally separate from deterministic `Verify`, so clients never
     /// mistake a model opinion for executable test evidence.
     SemanticVerify(crate::continuation::SemanticVerifyReport),
+    /// Auto-switch decision: model was swapped for tool-capable alternative.
+    ModelInfo {
+        original_model: String,
+        switched_model: String,
+        reason: String,
+        provider: String,
+    },
     /// A spec was generated this turn and should be surfaced for review
     /// (spec-driven development, audit spec §10.2). Carries the path to the
     /// spec JSON. Emitted by the spec-mode continuation policy after a
@@ -1366,6 +1377,10 @@ pub async fn run_query_loop(
         }
     };
 
+    // Session-level model cache (Issue 1b): after auto-switch picks a model,
+    // remember it for subsequent turns so we don't re-evaluate every turn.
+    let mut cached_tool_model: Option<(String, String)> = None;
+
     loop {
         turn += 1;
         tool_ctx
@@ -2162,6 +2177,69 @@ pub async fn run_query_loop(
                     // Track whether --tool-model triggered an auto-switch so
                     // FreeProvider can use strict routing (Issue 1).
                     let mut tool_model_switched = false;
+                    // Check if the current model is unreliable for tool use (Issue 6).
+                    // Mutable: recomputed after cache apply if the model changes.
+                    let mut model_is_unreliable = config
+                        .tool_use_tracker
+                        .as_ref()
+                        .is_some_and(|t| t.is_unreliable(&provider_id_str, &model_id_str));
+                    // Session-level model cache (Issue 1b): when the cached model
+                    // still needs switching, apply it directly and re-check
+                    // capabilities so the auto-switch sees the correct state.
+                    if let Some((ref cached_pid, ref cached_mid)) = cached_tool_model {
+                        // Invalidate cache when the user switched models via
+                        // /model (provider or model changed outside the cache).
+                        if *cached_pid != provider_id_str || *cached_mid != model_id_str {
+                            cached_tool_model = None;
+                        } else if (!caps.tool_calling || model_is_unreliable)
+                            && !tools.is_empty()
+                            && !degradation_turn
+                        {
+                            let old_provider_id = provider_id_str.clone();
+                            provider_id_str = cached_pid.clone();
+                            model_id_str = cached_mid.clone();
+                            // Re-resolve the provider for the cached model
+                            // when it differs from the original.
+                            if provider_id_str != old_provider_id {
+                                let pid =
+                                    clawde_core::provider_id::ProviderId::new(&provider_id_str);
+                                if let Some(new_p) =
+                                    clawde_api::registry::runtime_provider_for(&provider_id_str)
+                                        .or_else(|| registry.get(&pid).cloned())
+                                        .or_else(|| {
+                                            clawde_api::registry::provider_from_config(
+                                                &tool_ctx.config,
+                                                &provider_id_str,
+                                            )
+                                        })
+                                {
+                                    provider = new_p;
+                                }
+                            }
+                            // Re-compute caps for the cached model so the
+                            // auto-switch block below sees correct tool_calling.
+                            caps = provider.capabilities();
+                            if let Some(entry) = config
+                                .model_registry
+                                .as_ref()
+                                .and_then(|reg| reg.get(&provider_id_str, &model_id_str))
+                            {
+                                caps.image_input = entry.vision();
+                                caps.tool_calling = entry.tool_calling;
+                                caps.thinking = entry.reasoning;
+                            }
+                            if let Some(tc) = provider.tool_calling_for(&model_id_str) {
+                                caps.tool_calling = tc;
+                            }
+                            // Re-check unreliability for the CACHED model.
+                            model_is_unreliable = config
+                                .tool_use_tracker
+                                .as_ref()
+                                .is_some_and(|t| t.is_unreliable(&provider_id_str, &model_id_str));
+                        } else {
+                            cached_tool_model = None;
+                        }
+                    }
                     // Tool-capable model switch: when the current model lacks
                     // tool_calling and we have tools to send, transparently
                     // swap so the user gets working tool execution instead of
@@ -2175,11 +2253,9 @@ pub async fn run_query_loop(
                     // Priority order:
                     //   1. Explicit --tool-model (user-controlled tiered routing)
                     //   2. Reactive auto-discovery on the same provider
-                    let model_is_unreliable = config
-                        .tool_use_tracker
-                        .as_ref()
-                        .is_some_and(|t| t.is_unreliable(&provider_id_str, &model_id_str));
-                    if (!caps.tool_calling || model_is_unreliable)
+                    if config.force_no_tools {
+                        // Dev flag: skip auto-switch to test system prompt rebuild path
+                    } else if (!caps.tool_calling || model_is_unreliable)
                         && !tools.is_empty()
                         && !degradation_turn
                     {
@@ -2256,11 +2332,52 @@ pub async fn run_query_loop(
                                 };
                                 let _ = tx.send(QueryEvent::Status(note));
                             }
+                            // Emit ModelInfo for ALL auto-switch events (Issue 7).
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::ModelInfo {
+                                    original_model: old_model.clone(),
+                                    switched_model: model_id_str.clone(),
+                                    reason: if model_is_unreliable {
+                                        "model unreliable for tool use".to_string()
+                                    } else {
+                                        "model lacks tool calling capability".to_string()
+                                    },
+                                    provider: provider_id_str.clone(),
+                                });
+                            }
+                            // Emit routing telemetry when --tool-model was overridden (Issue 1c).
+                            if config.tool_model.is_some() {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(format!(
+                                        "Requested '{}', routed to '{}/{}' (reason: {})",
+                                        config.tool_model.as_deref().unwrap_or("?"),
+                                        provider_id_str,
+                                        model_id_str,
+                                        if model_is_unreliable {
+                                            "model unreliable for tool use"
+                                        } else {
+                                            "model lacks tool calling capability"
+                                        }
+                                    )));
+                                }
+                            }
+                            tracing::info!(
+                                requested = ?config.tool_model,
+                                routed_provider = %provider_id_str,
+                                routed_model = %model_id_str,
+                                reason = if model_is_unreliable { "unreliable" } else { "no_tool_calling" },
+                                "auto_switch: switched to tool-capable model"
+                            );
                             debug!(
                                 old_model = %old_model,
                                 new_model = %model_id_str,
                                 "Auto-switched to tool-capable model"
                             );
+                            // Cache the auto-switch result for subsequent turns (Issue 1b).
+                            // Only inside the alt_model block to avoid caching the
+                            // broken model when no tool-capable alternative exists.
+                            cached_tool_model =
+                                Some((provider_id_str.clone(), model_id_str.clone()));
                         }
                     }
                     // When tools were stripped because the model lacks
@@ -2268,7 +2385,11 @@ pub async fn run_query_loop(
                     // system prompt so it doesn't claim tools are available.
                     // This prevents the model from attempting text-form tool
                     // calls that would fail silently.
-                    if !caps.tool_calling && !tools.is_empty() && !degradation_turn {
+                    // Also fires when --force-no-tools is set (dev flag).
+                    if (!caps.tool_calling || config.force_no_tools)
+                        && !tools.is_empty()
+                        && !degradation_turn
+                    {
                         let mut patched_sys = config.clone();
                         patched_sys.enabled_tools = Some(vec![]);
                         system_for_provider = build_system_prompt(&patched_sys);
@@ -4265,6 +4386,7 @@ mod tests {
             fallback_model: None,
             tool_model: None,
             tool_use_tracker: None,
+            force_no_tools: false,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,
