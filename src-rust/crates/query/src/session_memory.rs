@@ -32,6 +32,9 @@ use tracing::{debug, info, warn};
 /// Minimum messages before extraction is attempted.
 const MIN_MESSAGES_TO_EXTRACT: usize = 20;
 
+/// Minimum messages before extraction is attempted on compact.
+const MIN_MESSAGES_TO_EXTRACT_ON_COMPACT: usize = 10;
+
 /// Minimum tool calls since last extraction before we run again.
 const MIN_TOOL_CALLS_BETWEEN_EXTRACTIONS: usize = 3;
 
@@ -342,6 +345,81 @@ impl SessionMemoryExtractor {
         fs::write(target_path, updated).await?;
         info!(path = %target_path.display(), count = memories.len(), "Memories persisted");
         Ok(())
+    }
+
+    /// Extract memories before compaction.
+    /// This is called before compacting to preserve important facts.
+    /// Based on Aider's ChatSummary pattern of extracting key facts before summarization.
+    #[allow(dead_code)]
+    pub async fn extract_before_compact(
+        &self,
+        messages: &[Message],
+        _working_dir: &Path,
+        _api_client: &clawde_api::AnthropicClient,
+    ) -> anyhow::Result<Vec<ExtractedMemory>> {
+        // Only extract if we have enough messages
+        if messages.len() < MIN_MESSAGES_TO_EXTRACT_ON_COMPACT {
+            return Ok(vec![]);
+        }
+
+        // Extract key facts from the conversation
+        let facts = self.extract_key_facts(messages);
+
+        if facts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Convert facts to memories
+        let mut memories = Vec::new();
+        for fact in facts {
+            memories.push(ExtractedMemory {
+                content: fact,
+                category: MemoryCategory::ProjectFact,
+                confidence: 0.8,
+            });
+        }
+
+        info!(
+            count = memories.len(),
+            "Extracted memories before compaction"
+        );
+        Ok(memories)
+    }
+
+    /// Extract key facts from messages.
+    /// This is a lightweight extraction that doesn't require an API call.
+    fn extract_key_facts(&self, messages: &[Message]) -> Vec<String> {
+        let mut facts = Vec::new();
+
+        for msg in messages {
+            let text = msg.get_all_text();
+
+            // User preferences
+            if text.to_lowercase().contains("i prefer") || text.to_lowercase().contains("i like") {
+                facts.push(format!("User preference: {}", text));
+            }
+
+            // Project facts
+            if text.to_lowercase().contains("the project uses")
+                || text.to_lowercase().contains("we use")
+            {
+                facts.push(format!("Project fact: {}", text));
+            }
+
+            // Decisions
+            if text.to_lowercase().contains("we decided")
+                || text.to_lowercase().contains("let's use")
+            {
+                facts.push(format!("Decision: {}", text));
+            }
+
+            // Constraints
+            if text.to_lowercase().contains("must not") || text.to_lowercase().contains("cannot") {
+                facts.push(format!("Constraint: {}", text));
+            }
+        }
+
+        facts
     }
 }
 

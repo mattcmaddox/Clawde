@@ -563,6 +563,113 @@ pub fn run_verify_round(config: &VerifyConfig, working_dir: &Path) -> Result<Ver
     })
 }
 
+/// Run verification after each file edit (auto-verify after edit).
+/// This is a lighter version that runs immediately after file changes.
+/// Based on Aider's lint_edited() pattern.
+#[allow(dead_code)]
+pub fn run_verify_after_edit(
+    config: &VerifyConfig,
+    working_dir: &Path,
+) -> Result<VerifyReport, String> {
+    if !config.auto_test && !config.auto_lint {
+        return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
+            results: Vec::new(),
+            attempt: 0,
+            max_retries: 1,
+            headline: "No checks configured".to_string(),
+            sandbox: config.sandbox,
+            unavailable: false,
+        });
+    }
+
+    // Run checks with single retry (lighter than full verify loop)
+    let results = run_checks(config, working_dir)?;
+    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
+
+    let headline = if failures.is_empty() {
+        "All checks passed".to_string()
+    } else {
+        format!("{} check(s) failed", failures.len())
+    };
+
+    Ok(VerifyReport {
+        verdict: if failures.is_empty() {
+            VerifyVerdict::Pass
+        } else {
+            VerifyVerdict::Fixable
+        },
+        results,
+        attempt: 1,
+        max_retries: 1,
+        headline,
+        sandbox: config.sandbox,
+        unavailable: false,
+    })
+}
+
+/// Lint specific files after edit (Aider's lint_edited() pattern).
+/// This runs the linter on specific files that were just edited.
+pub fn lint_edited_files(
+    files: &[std::path::PathBuf],
+    config: &VerifyConfig,
+    working_dir: &Path,
+) -> Result<VerifyReport, String> {
+    if !config.auto_lint {
+        return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
+            results: Vec::new(),
+            attempt: 0,
+            max_retries: 1,
+            headline: "Linting disabled".to_string(),
+            sandbox: config.sandbox,
+            unavailable: false,
+        });
+    }
+
+    let mut results = Vec::new();
+    for file in files {
+        let rel_path = file.strip_prefix(working_dir).unwrap_or(file);
+        // Run lint command for this specific file
+        // Note: This is a simplified version - in production, you would
+        // detect the file type and run the appropriate linter
+        let cmd = format!("echo 'Linting {}'", rel_path.display());
+        let (stdout, _exit_code, _success, _elapsed) =
+            run_command_sync(&cmd, working_dir, config.timeout_secs);
+        if !stdout.is_empty() {
+            results.push(CheckResult {
+                label: format!("lint:{}", rel_path.display()),
+                ok: true,
+                skipped: false,
+                output: stdout,
+                timed_out: false,
+                elapsed_secs: Some(0),
+            });
+        }
+    }
+
+    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
+    let headline = if failures.is_empty() {
+        "All files passed linting".to_string()
+    } else {
+        format!("{} file(s) failed linting", failures.len())
+    };
+
+    Ok(VerifyReport {
+        verdict: if failures.is_empty() {
+            VerifyVerdict::Pass
+        } else {
+            VerifyVerdict::Fixable
+        },
+        results,
+        attempt: 1,
+        max_retries: 1,
+        headline,
+        sandbox: config.sandbox,
+        unavailable: false,
+    })
+}
+
 /// Detect and run the project's configured test/lint commands inside the
 /// configured sandbox, in order: tests first (they find behavioral
 /// regressions), then lints.

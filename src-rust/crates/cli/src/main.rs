@@ -44,6 +44,7 @@ use clawde_core::{
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
+    types::Message,
 };
 use clawde_tools::ToolContext;
 use parking_lot::Mutex as ParkingMutex;
@@ -3001,6 +3002,10 @@ async fn run_interactive(
                     }
                 }
                 tool_ctx.session_id = session.id.clone();
+
+                // Auto-compact on resume if session is stale or large
+                // Note: Actual compaction happens after provider_registry is available
+
                 session
             }
             Err(e) => {
@@ -3038,6 +3043,44 @@ async fn run_interactive(
     let mut transcript_written_id = session.id.clone();
     // Extract provider_registry before query_config is moved below.
     let provider_registry = query_config.provider_registry.clone();
+
+    // Auto-compact on resume if session is stale or large
+    if resume_id.is_some() && clawde_core::history::should_auto_compact_on_resume(&session, 128_000)
+    {
+        let provider_id = config.selected_provider_id();
+        if let Some(provider) = provider_registry
+            .as_ref()
+            .and_then(|r| r.get(&clawde_core::ProviderId::new(provider_id)))
+        {
+            println!("Auto-compacting stale session...");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            match clawde_query::compact::compact_on_resume(
+                provider.as_ref(),
+                &session.messages,
+                &session.model,
+                128_000,
+                None,
+                &cancel,
+            )
+            .await
+            {
+                Ok(compacted) => {
+                    let original = session.messages.len();
+                    session.messages = compacted;
+                    println!(
+                        "Session compacted: {} -> {} messages.",
+                        original,
+                        session.messages.len()
+                    );
+                }
+                Err(e) => {
+                    println!("Auto-compaction failed: {}. Consider running /compact.", e);
+                }
+            }
+        } else {
+            println!("Note: Session is stale or large. Consider running /compact to save tokens.");
+        }
+    }
 
     let mut base_query_config = query_config;
     // Continuation mode (goal autonomy / spec mode / execute-and-verify) is
@@ -4759,6 +4802,27 @@ async fn run_interactive(
                             // Use a truncated version of the first user message
                             let topic: String = input.chars().take(60).collect();
                             clawde_tui::update_terminal_title(Some(&topic));
+
+                            // Auto-title after first prompt: generate AI title if this is the first message
+                            if session.messages.is_empty() && session.title.is_none() {
+                                let first_msg = Message::user(input.clone());
+                                let title_config =
+                                    clawde_query::session_title::SessionTitleConfig::default();
+                                let cancel_token = CancellationToken::new();
+                                if let Some(title) =
+                                    clawde_query::session_title::generate_title_after_first_prompt(
+                                        &first_msg,
+                                        client.as_ref(),
+                                        &title_config,
+                                        cancel_token,
+                                    )
+                                    .await
+                                {
+                                    session.title = Some(title.clone());
+                                    cmd_ctx.session_title = Some(title.clone());
+                                    clawde_tui::update_terminal_title(Some(&title));
+                                }
+                            }
                         }
 
                         // Start async query

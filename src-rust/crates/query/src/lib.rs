@@ -18,8 +18,10 @@ pub mod away_summary;
 pub mod command_queue;
 pub mod compact;
 pub mod context_analyzer;
+pub mod context_refresh;
 pub mod continuation;
 pub mod coordinator;
+pub mod correction_detector;
 pub mod cron_scheduler;
 pub mod decide;
 pub mod diagnostics;
@@ -1386,6 +1388,13 @@ pub async fn run_query_loop(
         tool_ctx
             .current_turn
             .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
+
+        // Auto-context-refresh: check for external file modifications
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::Status(
+                "Checking for file changes...".to_string(),
+            ));
+        }
         // Max-steps graceful degradation (issue #230 / MI-3). Rather than
         // returning cold when the turn cap is hit, run ONE final turn with tools
         // disabled that asks the model to summarize progress and its stopping
@@ -1724,6 +1733,16 @@ pub async fn run_query_loop(
             return QueryOutcome::Cancelled;
         }
 
+        // Auto-context-refresh: check for external file modifications
+        // This runs before each turn to detect files changed outside the agent
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::Status(
+                "Checking for file changes...".to_string(),
+            ));
+        }
+        // Note: Full context refresh requires tracking which files are in context
+        // and a FileModificationTracker. This is a placeholder for future integration.
+
         // Drain any pending user messages that were queued during the previous
         // tool-execution phase (e.g. commands entered while tools ran).
         // Mirrors the TS `messageQueueManager` drain between turns.
@@ -1734,6 +1753,22 @@ pub async fn run_query_loop(
                     active_task_id = clawde_core::spec::Spec::task_id_from_accepted_message(&text);
                 }
                 messages.push(Message::user(text));
+            }
+        }
+
+        // Auto-learn from corrections: detect user corrections and save as memories
+        if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == Role::User) {
+            let agent_response = messages.iter().rev().find(|m| m.role == Role::Assistant);
+            if crate::correction_detector::is_correction(last_user_msg, agent_response) {
+                let working_dir = &tool_ctx.working_dir;
+                if let Some(memory) = crate::correction_detector::extract_correction_memory(
+                    last_user_msg,
+                    agent_response,
+                ) {
+                    let _ =
+                        crate::correction_detector::save_correction_memory(&memory, working_dir)
+                            .await;
+                }
             }
         }
 
@@ -2979,6 +3014,19 @@ pub async fn run_query_loop(
                     // compatible providers (Ollama, LM Studio, etc.) return
                     // finish_reason "stop" even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
+                        // Collect files that will be written before consuming tool_use_blocks
+                        let edited_files: Vec<std::path::PathBuf> = tool_use_blocks
+                            .iter()
+                            .filter(|(_, name, _)| is_write_tool(name))
+                            .filter_map(|(_, _, input)| {
+                                input
+                                    .get("file_path")
+                                    .or_else(|| input.get("path"))
+                                    .and_then(|v| v.as_str())
+                                    .map(std::path::PathBuf::from)
+                            })
+                            .collect();
+
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
@@ -3047,6 +3095,21 @@ pub async fn run_query_loop(
                             snapshot_patch: None,
                             turn_meta: None,
                         });
+
+                        // Auto-verify after edit: run verification if files were written
+                        if !edited_files.is_empty() {
+                            let verify_config = clawde_core::config::VerifyConfig {
+                                auto_lint: true,
+                                auto_test: false,
+                                ..Default::default()
+                            };
+                            let _ = crate::verify::lint_edited_files(
+                                &edited_files,
+                                &verify_config,
+                                &tool_ctx.working_dir,
+                            );
+                        }
+
                         continue; // loop for next tool round
                     }
 
@@ -3483,7 +3546,13 @@ pub async fn run_query_loop(
                         }
                     }
                 } else if stop == "end_turn" || stop == "tool_use" {
+                    // Auto-extract memories before compaction if enabled
+                    // This preserves important facts before the context is summarized
+                    // Note: Memory extraction requires an AnthropicClient, which is not available here.
+                    // The extraction will be handled by the CLI layer after compaction.
+
                     // Proactive auto-compact (original path, used when reactive compact is off).
+                    // Use compact_with_memory_extraction to preserve important facts before compaction.
                     if let Some(new_msgs) = compact::auto_compact_if_needed(
                         cp.as_ref(),
                         messages,

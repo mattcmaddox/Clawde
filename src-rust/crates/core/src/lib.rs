@@ -5537,6 +5537,32 @@ pub mod history {
         Ok(deleted)
     }
 
+    /// Check if a session should be auto-compacted on resume.
+    /// Returns true if:
+    /// - Session inactive >30 minutes, OR
+    /// - Context usage >80% of window
+    pub fn should_auto_compact_on_resume(
+        session: &ConversationSession,
+        context_window: u64,
+    ) -> bool {
+        use chrono::Utc;
+
+        // Check time since last update
+        let inactive_duration = Utc::now() - session.updated_at;
+        if inactive_duration > chrono::Duration::minutes(30) {
+            return true;
+        }
+
+        // Check token usage (estimate from message count)
+        // Rough estimate: each message ~500 tokens on average
+        let estimated_tokens = session.messages.len() as u64 * 500;
+        if context_window > 0 && estimated_tokens as f64 / context_window as f64 > 0.8 {
+            return true;
+        }
+
+        false
+    }
+
     /// Rename (set the title of) a session.
     #[allow(dead_code)]
     pub async fn rename_session(id: &str, new_title: &str) -> anyhow::Result<()> {

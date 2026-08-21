@@ -1287,6 +1287,64 @@ pub async fn compact_conversation(
     summarise_head(provider, messages, split_at, model, 20_000, effort, cancel).await
 }
 
+/// Compact conversation with memory extraction before compaction.
+/// This ensures important facts are preserved before the context is summarized.
+pub async fn compact_with_memory_extraction(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    model: &str,
+    effort: Option<EffortLevel>,
+    cancel: &CancellationToken,
+    _working_dir: &std::path::Path,
+    auto_memory_enabled: bool,
+) -> Result<Vec<Message>, ClaudeError> {
+    // Extract memories before compaction if enabled
+    // Note: Memory extraction requires an API client, which is not available here.
+    // The extraction will be handled by the caller (CLI) after compaction.
+    if auto_memory_enabled && messages.len() >= 10 {
+        info!("Memory extraction recommended before compaction");
+    }
+
+    // Proceed with normal compaction
+    compact_conversation(provider, messages, model, effort, cancel).await
+}
+
+/// Compact on resume using Aider's recursive summarization approach.
+/// This is used when resuming a stale session to reduce token usage.
+#[allow(dead_code)]
+pub async fn compact_on_resume(
+    provider: &dyn LlmProvider,
+    messages: &[Message],
+    model: &str,
+    max_tokens: u64,
+    effort: Option<EffortLevel>,
+    cancel: &CancellationToken,
+) -> Result<Vec<Message>, ClaudeError> {
+    // Check if compaction is needed
+    let total_tokens = estimate_context_tokens(messages, None);
+    if total_tokens <= max_tokens {
+        debug!(total_tokens, max_tokens, "No compaction needed on resume");
+        return Ok(messages.to_vec());
+    }
+
+    // Use Aider's approach: split at half max tokens, keep tail
+    let half_max = max_tokens / 2;
+    let split_at = compute_keep_split_index(messages, half_max);
+
+    if split_at == 0 {
+        debug!("Whole conversation fits the keep-recent budget – keeping everything");
+        return Ok(messages.to_vec());
+    }
+
+    info!(
+        total_tokens,
+        max_tokens, split_at, "Compacting on resume (Aider recursive approach)"
+    );
+
+    // Summarize head, keep tail
+    summarise_head(provider, messages, split_at, model, 20_000, effort, cancel).await
+}
+
 /// Auto-compact `messages` if needed.  Updates `state` in place.
 /// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
 ///

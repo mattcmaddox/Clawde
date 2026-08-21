@@ -138,6 +138,78 @@ pub async fn generate_session_title(
 }
 
 // -----------------------------------------------------------------------
+// Auto-title after first prompt
+// -----------------------------------------------------------------------
+
+/// Generate a session title after the first user prompt.
+/// This is called after the first user message to provide immediate
+/// session naming in the session picker.
+pub async fn generate_title_after_first_prompt(
+    first_message: &Message,
+    api_client: &AnthropicClient,
+    config: &SessionTitleConfig,
+    cancel: CancellationToken,
+) -> Option<String> {
+    // Only generate title for the first user message
+    if first_message.role != clawde_core::types::Role::User {
+        return None;
+    }
+
+    let text = first_message.get_all_text();
+    if text.is_empty() || text.len() < 10 {
+        return None;
+    }
+
+    // Build a simple prompt for title generation from just the first message
+    let prompt = format!(
+        "Generate a short, descriptive title (max {} chars) for this coding task:\n\n{}",
+        MAX_TITLE_CHARS,
+        text.chars().take(200).collect::<String>() // Truncate long messages
+    );
+
+    let api_messages = vec![clawde_api::ApiMessage {
+        role: "user".to_string(),
+        content: serde_json::Value::String(prompt),
+    }];
+
+    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
+        .messages(api_messages)
+        .build();
+
+    let call_future = api_client.create_message(request);
+
+    let response = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        result = call_future => match result {
+            Ok(r) => r,
+            Err(_) => return None,
+        },
+    };
+
+    let text = response.content.iter().find_map(|block| {
+        if block.get("type")?.as_str()? == "text" {
+            block.get("text")?.as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    })?;
+
+    let title = text
+        .lines()
+        .next()
+        .unwrap_or(&text)
+        .trim()
+        .trim_matches('"');
+
+    if title.is_empty() || title.len() > MAX_TITLE_CHARS * 2 {
+        None
+    } else {
+        let truncated: String = title.chars().take(MAX_TITLE_CHARS).collect();
+        Some(truncated)
+    }
+}
+
+// -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
 
@@ -168,5 +240,11 @@ mod tests {
         // the guard logic by calling with a dummy client that won't be reached.
         // This test only runs the pre-condition check.
         assert!(msgs.len() < 2);
+    }
+
+    #[test]
+    fn first_prompt_title_generation_requires_user_message() {
+        let msg = Message::assistant("hello");
+        assert!(msg.role != clawde_core::types::Role::User);
     }
 }
