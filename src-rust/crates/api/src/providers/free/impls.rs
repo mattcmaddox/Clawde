@@ -326,11 +326,12 @@ impl FreeProvider {
         // here (not per chain entry) so a 14-upstream chain does not scan the
         // whole message history 14 times.
         let has_images = request.map(Self::request_has_images).unwrap_or(false);
+        let has_tools = request.map(Self::request_has_tools).unwrap_or(false);
         let estimate = request.map(Self::estimate_request_tokens).unwrap_or(0);
         plan = plan
             .into_iter()
             .filter(|(idx, _)| !self.is_disabled_upstream(*idx))
-            .filter(|(idx, _)| self.entry_fits_request(*idx, has_images, estimate))
+            .filter(|(idx, _)| self.entry_fits_request(*idx, has_images, has_tools, estimate))
             .collect();
 
         // Capacity observations are a soft ordering signal. Preserve an
@@ -359,14 +360,19 @@ impl FreeProvider {
     /// Capability gate (audit spec §8.4 "capability match"): drop upstreams
     /// whose capabilities cannot serve the request's content before dispatch.
     ///
-    /// `has_images` and `estimate` are precomputed once in [`Self::attempt_plan`]
-    /// so this check stays O(1) per chain entry.
+    /// `has_images`, `has_tools`, and `estimate` are precomputed once in
+    /// [`Self::attempt_plan`] so this check stays O(1) per chain entry.
     ///
     /// - Image-bearing requests skip non-vision upstreams: a text-only
     ///   provider rejects the image with a 400 `InvalidRequest`, which
     ///   [`Self::should_fallback`] deliberately does NOT retry — without this
     ///   gate the whole request would hard-fail on the first text-only
     ///   upstream instead of reaching a vision-capable one.
+    /// - Tool-bearing requests skip non-tool-calling upstreams: a provider
+    ///   that doesn't support function calling would ignore the tools array
+    ///   and produce a text-only response, wasting a round-trip. The query
+    ///   loop's auto-switch catches this reactively, but the capability gate
+    ///   prevents the wasted round-trip proactively.
     /// - Requests whose estimated input-token count exceeds an upstream's
     ///   documented context window are skipped, so the plan does not burn a
     ///   guaranteed-overflow round-trip (e.g. Copilot's 16K serving cap).
@@ -374,11 +380,20 @@ impl FreeProvider {
     ///   NOT reserved (the chars/4 estimate under-counts code, and reserving
     ///   full `max_tokens` would over-filter upstreams that usually emit far
     ///   less). This is a "definitely won't fit" gate, not a "might not fit".
-    fn entry_fits_request(&self, idx: usize, has_images: bool, estimate: u64) -> bool {
+    fn entry_fits_request(
+        &self,
+        idx: usize,
+        has_images: bool,
+        has_tools: bool,
+        estimate: u64,
+    ) -> bool {
         let Some(entry) = self.chain.get(idx) else {
             return true;
         };
         if has_images && !entry.upstream.vision {
+            return false;
+        }
+        if has_tools && !entry.upstream.tool_calling {
             return false;
         }
         if estimate > 0 && estimate > u64::from(entry.upstream.context_window) {
@@ -396,6 +411,12 @@ impl FreeProvider {
                 .any(|b| matches!(b, ContentBlock::Image { .. })),
             _ => false,
         })
+    }
+
+    /// Whether the request carries tools (function definitions). Tool-bearing
+    /// requests are routed only to upstreams that support function calling.
+    fn request_has_tools(request: &ProviderRequest) -> bool {
+        !request.tools.is_empty()
     }
 
     /// Estimated input-token size of the request (heuristic from
@@ -417,6 +438,16 @@ impl FreeProvider {
         {
             return Some(
                 "no enabled upstream supports image input — add a vision-capable provider via /connect (e.g. google or github-copilot)"
+                    .to_string(),
+            );
+        }
+        if Self::request_has_tools(request)
+            && !available
+                .iter()
+                .any(|idx| self.chain[*idx].upstream.tool_calling)
+        {
+            return Some(
+                "no enabled upstream supports tool calling — the auto-switch will handle this at the query loop level"
                     .to_string(),
             );
         }

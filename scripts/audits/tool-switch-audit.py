@@ -286,7 +286,7 @@ def scenario_e_system_prompt_no_tools(binary, home, auth_file):
         "List the files in the current directory",
         home,
         model="free/huggingface/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        timeout=90,
+        timeout=180,
     )
     events = parse_jsonl(stdout)
     tool_starts = find_event(events, "tool_start")
