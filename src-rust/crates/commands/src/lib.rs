@@ -120,6 +120,9 @@ pub struct CommandContext {
     /// Populated by the CLI runtime so auxiliary requests (spec/review/compact/
     /// summary/rename) inherit the same effort as the main loop.
     pub effort: Option<clawde_core::effort::EffortLevel>,
+    /// Live tool-use tracker for the current session. Exposes per-model
+    /// tool-use success rates so `/stats` can surface reliability data.
+    pub tool_use_tracker: Option<clawde_query::tool_use_tracker::ToolUseTracker>,
 }
 
 /// Session-scoped action requested by `/thinking`.
@@ -2821,6 +2824,7 @@ mod tests {
             provider_registry: None,
             test_provider: None,
             effort: None,
+            tool_use_tracker: None,
         }
     }
 

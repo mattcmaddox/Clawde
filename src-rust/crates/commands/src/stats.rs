@@ -760,6 +760,49 @@ fn render_summary(agg: &Aggregated, ctx: &CommandContext) -> String {
         }
     }
 
+    // Live tool-use reliability (from in-session tracker)
+    if let Some(ref tracker) = ctx.tool_use_tracker {
+        let snap = tracker.snapshot();
+        if !snap.is_empty() {
+            out.push_str(
+                "\nTool-use reliability (this session)\n───────────────────────────────────\n",
+            );
+            out.push_str(&format!(
+                "  {:<24} {:>8} {:>10} {:>8}\n",
+                "Model", "Turns", "EMA Rate", "Status"
+            ));
+            out.push_str(&format!(
+                "  {}  {}  {}  {}\n",
+                "─".repeat(24),
+                "─".repeat(8),
+                "─".repeat(10),
+                "─".repeat(8),
+            ));
+            let mut entries: Vec<_> = snap.iter().collect();
+            entries.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+            for (key, stats) in &entries {
+                let model_label = format!("{}/{}", key.provider, key.model);
+                let rate_str = format!("{:.0}%", stats.ema_rate * 100.0);
+                let status = if stats.attempts < 3 {
+                    "collecting"
+                } else if stats.ema_rate < 0.3 {
+                    "unreliable"
+                } else if stats.ema_rate < 0.7 {
+                    "ok"
+                } else {
+                    "good"
+                };
+                out.push_str(&format!(
+                    "  {:<24} {:>8} {:>10} {:>8}\n",
+                    truncate(&model_label, 24),
+                    stats.attempts,
+                    rate_str,
+                    status,
+                ));
+            }
+        }
+    }
+
     // Recent sessions
     let mut recent: Vec<&SessionStats> = agg.sessions.iter().collect();
     recent.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then(b.mtime.cmp(&a.mtime)));
@@ -1524,6 +1567,7 @@ mod tests {
             provider_registry: None,
             test_provider: None,
             effort: None,
+            tool_use_tracker: None,
         }
     }
 

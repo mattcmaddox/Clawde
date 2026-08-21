@@ -608,6 +608,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_auth_runner: None,
                     provider_registry: None,
                     test_provider: None,
+                    tool_use_tracker: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -3392,6 +3393,7 @@ async fn run_interactive(
         // `current_effort` is declared just below (initialised to `session.effort`),
         // so seed the context with the same value and keep it in sync per turn.
         effort: session.effort,
+        tool_use_tracker: base_query_config.tool_use_tracker.clone(),
     };
 
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so

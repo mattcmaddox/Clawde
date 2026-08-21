@@ -1293,6 +1293,7 @@ mod tests {
             provider_registry: None,
             test_provider: None,
             effort: None,
+            tool_use_tracker: None,
         }
     }
 
