@@ -382,6 +382,43 @@ When the user ran `/model` to change models, `cached_tool_model` was never
 invalidated, so the old auto-switch result kept being applied.
 **Fix**: Invalidate cache when `provider_id_str` or `model_id_str` differs
 from cached values (indicating user changed model).
-6. **P2**: Add `--force-no-tools` test flag (Issue 5)
-7. **P3**: Add session-level switch cache (Issue 2)
-8. **P3**: Add `ModelInfo` event to query stream (Issue 7)
+
+## Additional Features
+
+### Feature: TUI status bar notification
+**Status**: ✅ DONE
+When auto-switch fires, the TUI status bar now surfaces the decision to
+the user via `QueryEvent::ModelInfo`. The user sees which model was
+switched to and why.
+**Files**: `crates/tui/src/app.rs`, `crates/query/src/lib.rs`
+
+### Feature: ToolUseTracker EMA decay
+**Status**: ✅ DONE
+Replaced simple counter with exponential moving average (alpha=0.4) so
+models that were unreliable early but improved can recover. Verified by
+`ema_recovers_after_sustained_success` test.
+**Files**: `crates/query/src/tool_use_tracker.rs`
+
+### Feature: ToolUseTracker wired into /stats
+**Status**: ✅ DONE
+Added `tool_use_tracker` field to `CommandContext` so `/stats` surfaces
+per-model tool-use success rates from the current session. New section
+"Tool-use reliability (this session)" shows EMA rates and status.
+**Files**: `crates/commands/src/lib.rs`, `crates/commands/src/stats.rs`,
+`crates/cli/src/main.rs`
+
+## Audit Verification (All 11 Scenarios PASS)
+
+| Scenario | Status | Details |
+|---|---|---|
+| A: Baseline | ✅ PASS | Tool-capable model sends tools |
+| B: Auto-switch | ✅ PASS | TinyLlama switches to capable model |
+| C: --tool-model | ✅ PASS | Cross-provider switch works |
+| D: Context preservation | ✅ PASS | Seamless continuation after switch |
+| E: System prompt | ✅ PASS | Rebuild fires correctly |
+| F: Bare --tool-model | ✅ PASS | Name-only model ID works |
+| G: Tool-capable (no switch) | ✅ PASS | No unnecessary switch |
+| H: Empty --tool-model | ✅ PASS | Reactive fallback works |
+| I: Unknown provider | ✅ PASS | Graceful fallback |
+| J: Custom prompt survives | ✅ PASS | Prompt preserved across rebuild |
+| TUI: Status bar | ✅ PASS | Attribution badge shows switched model |
