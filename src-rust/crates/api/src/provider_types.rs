@@ -96,6 +96,13 @@ pub struct ProviderRequest {
     /// Defaults to an empty JSON object `{}`.
     #[serde(default)]
     pub provider_options: Value,
+
+    /// When `true`, the FreeProvider should use only the exact pinned model
+    /// with no fallback, no task-based reordering, and no upstream
+    /// reselection. Set by the query loop when `--tool-model` explicitly
+    /// specifies a provider/model pair.
+    #[serde(default)]
+    pub strict_route: bool,
 }
 
 // ---------------------------------------------------------------------------

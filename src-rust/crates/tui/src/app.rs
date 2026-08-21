@@ -2750,40 +2750,7 @@ impl App {
             return Some("free".to_string());
         }
         if let Some((provider, _)) = model.split_once('/') {
-            let known = [
-                "anthropic",
-                "openai",
-                "google",
-                "groq",
-                "cerebras",
-                "cline",
-                "cloudflare",
-                "deepseek",
-                "huggingface",
-                "mistral",
-                "nvidia",
-                "sambanova",
-                "xai",
-                "openrouter",
-                "github-copilot",
-                "codex",
-                "cohere",
-                "perplexity",
-                "togetherai",
-                "together-ai",
-                "deepinfra",
-                "venice",
-                "zai",
-                "minimax",
-                "ollama",
-                "lmstudio",
-                "llamacpp",
-                "azure",
-                "amazon-bedrock",
-                "free",
-                "opencode-zen",
-            ];
-            if known.contains(&provider) {
+            if clawde_core::provider_id::ProviderId::is_known_provider_id(provider) {
                 return Some(provider.to_string());
             }
         }

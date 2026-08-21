@@ -30,6 +30,7 @@ pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
+pub mod tool_use_tracker;
 pub mod verify;
 mod verify_container;
 mod verify_sandbox;
@@ -169,6 +170,11 @@ pub struct QueryConfig {
     /// model so tools execute correctly. The primary model handles text-only
     /// turns (cheaper/faster). Mirrors TS `--tool-model`.
     pub tool_model: Option<String>,
+    /// Shared per-model tool-use success rate tracker (Issue 6). When set,
+    /// the query loop records whether each turn's model used tools and
+    /// exposes success rates so the auto-switch can deprioritize models
+    /// that claim tool support but rarely use tools in practice.
+    pub tool_use_tracker: Option<tool_use_tracker::ToolUseTracker>,
     /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
     /// When `config.provider` is set to something other than "anthropic" and
     /// this registry contains that provider, the registry's provider is used
@@ -244,6 +250,7 @@ impl Default for QueryConfig {
             max_budget_usd: None,
             fallback_model: None,
             tool_model: None,
+            tool_use_tracker: None,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,
@@ -1993,67 +2000,7 @@ pub async fn run_query_loop(
                 // No explicit provider but model has "provider/model" format.
                 // Check whether `p` is a known provider or just a model
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    // Native (non-OpenAI-compat) providers
-                    "anthropic",
-                    // Composite free provider: `free/auto` must dispatch through
-                    // the registry's FreeProvider even when `config.provider` is
-                    // unset (default/headless), never fall through to anthropic.
-                    "free",
-                    "openai",
-                    "google",
-                    "azure",
-                    "amazon-bedrock",
-                    "github-copilot",
-                    "codex",
-                    "openai-codex",
-                    "cohere",
-                    "minimax",
-                    // Local / self-hosted
-                    "ollama",
-                    "lmstudio",
-                    "lm-studio",
-                    "llamacpp",
-                    "llama-cpp",
-                    "llama-server",
-                    // OpenAI-compat cloud providers
-                    "groq",
-                    "mistral",
-                    "deepseek",
-                    "xai",
-                    "perplexity",
-                    "cerebras",
-                    "openrouter",
-                    "togetherai",
-                    "together-ai",
-                    "deepinfra",
-                    "venice",
-                    "huggingface",
-                    "nvidia",
-                    "cloudflare",
-                    "fireworks",
-                    "sambanova",
-                    // Additional OpenAI-compat providers
-                    "qwen",
-                    "alibaba",
-                    "siliconflow",
-                    "moonshot",
-                    "moonshotai",
-                    "zhipu",
-                    "zhipuai",
-                    "zai",
-                    "nebius",
-                    "novita",
-                    "ovhcloud",
-                    "scaleway",
-                    "vultr",
-                    "vultr-ai",
-                    "baseten",
-                    "friendli",
-                    "upstage",
-                    "stepfun",
-                ];
-                if known_providers.contains(&p) {
+                if clawde_core::provider_id::ProviderId::is_known_provider_id(p) {
                     (p.to_string(), m.to_string())
                 } else {
                     // Treat the whole string as the model ID, fall through
@@ -2212,15 +2159,30 @@ pub async fn run_query_loop(
                     if let Some(tc) = provider.tool_calling_for(&model_id_str) {
                         caps.tool_calling = tc;
                     }
+                    // Track whether --tool-model triggered an auto-switch so
+                    // FreeProvider can use strict routing (Issue 1).
+                    let mut tool_model_switched = false;
                     // Tool-capable model switch: when the current model lacks
                     // tool_calling and we have tools to send, transparently
                     // swap so the user gets working tool execution instead of
                     // a text-only refusal.
                     //
+                    // Also triggers when the model claims tool support but the
+                    // tracker flags it as unreliable (Issue 6) — models that
+                    // consistently ignore tools get auto-switched even if they
+                    // advertise the capability.
+                    //
                     // Priority order:
                     //   1. Explicit --tool-model (user-controlled tiered routing)
                     //   2. Reactive auto-discovery on the same provider
-                    if !caps.tool_calling && !tools.is_empty() && !degradation_turn {
+                    let model_is_unreliable = config
+                        .tool_use_tracker
+                        .as_ref()
+                        .is_some_and(|t| t.is_unreliable(&provider_id_str, &model_id_str));
+                    if (!caps.tool_calling || model_is_unreliable)
+                        && !tools.is_empty()
+                        && !degradation_turn
+                    {
                         let alt_model = config
                             .tool_model
                             .as_deref()
@@ -2237,48 +2199,10 @@ pub async fn run_query_loop(
                             // When --tool-model contains a provider prefix
                             // (e.g. "openai/gpt-4"), switch providers too.
                             if config.tool_model.is_some() {
+                                tool_model_switched = true;
                                 if let Some((p, m)) = alt_model.split_once('/') {
-                                    let known = [
-                                        "anthropic",
-                                        "free",
-                                        "openai",
-                                        "google",
-                                        "azure",
-                                        "amazon-bedrock",
-                                        "github-copilot",
-                                        "codex",
-                                        "openai-codex",
-                                        "cohere",
-                                        "minimax",
-                                        "ollama",
-                                        "groq",
-                                        "mistral",
-                                        "deepseek",
-                                        "xai",
-                                        "perplexity",
-                                        "cerebras",
-                                        "openrouter",
-                                        "togetherai",
-                                        "together-ai",
-                                        "deepinfra",
-                                        "venice",
-                                        "huggingface",
-                                        "nvidia",
-                                        "cloudflare",
-                                        "fireworks",
-                                        "sambanova",
-                                        "qwen",
-                                        "alibaba",
-                                        "siliconflow",
-                                        "moonshot",
-                                        "moonshotai",
-                                        "zhipu",
-                                        "zhipuai",
-                                        "zai",
-                                        "nebius",
-                                        "novita",
-                                    ];
-                                    if known.contains(&p) {
+                                    if clawde_core::provider_id::ProviderId::is_known_provider_id(p)
+                                    {
                                         provider_id_str = p.to_string();
                                         model_id_str = m.to_string();
                                     } else {
@@ -2362,6 +2286,8 @@ pub async fn run_query_loop(
                         } else {
                             Vec::new()
                         };
+                    // Capture before provider_tools is moved into ProviderRequest.
+                    let had_tools_for_turn = !provider_tools.is_empty();
                     let mut provider_messages: Vec<clawde_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
@@ -2430,6 +2356,10 @@ pub async fn run_query_loop(
                         // Carried for the composite FreeProvider, which re-shapes
                         // per-upstream thinking parameters at dispatch time.
                         effort_level: effective_effort_level,
+                        // When --tool-model explicitly selected a specific model,
+                        // tell FreeProvider to skip task-based reordering and
+                        // use ONLY that upstream+model (Issue 1).
+                        strict_route: tool_model_switched && provider_id_str == "free",
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -2909,6 +2839,18 @@ pub async fn run_query_loop(
                             }
                         })
                         .collect();
+
+                    // Track tool-use success rate per model (Issue 6).
+                    // Records whether tools were available and whether the model
+                    // actually used them — feeds into auto-switch ranking.
+                    if let Some(ref tracker) = config.tool_use_tracker {
+                        tracker.record_turn(
+                            &provider_id_str,
+                            &model_id_str,
+                            had_tools_for_turn,
+                            !tool_use_blocks.is_empty(),
+                        );
+                    }
 
                     // Execute tools if any tool_use blocks were returned.
                     // Note: we check the blocks themselves rather than relying
@@ -4322,6 +4264,7 @@ mod tests {
             max_budget_usd: None,
             fallback_model: None,
             tool_model: None,
+            tool_use_tracker: None,
             provider_registry: None,
             agent_name: None,
             agent_definition: None,

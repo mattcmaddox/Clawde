@@ -120,6 +120,75 @@ impl PartialEq<&str> for ProviderId {
     }
 }
 
+impl ProviderId {
+    /// Whether `s` is a well-known provider identifier (including common
+    /// aliases that predate the canonical constants). Used by `--tool-model`
+    /// parsing to decide whether `openai/gpt-4` means provider `openai` +
+    /// model `gpt-4` versus a namespaced model id like `meta-llama/llama-3`.
+    pub fn is_known_provider_id(s: &str) -> bool {
+        matches!(
+            s,
+            Self::ANTHROPIC
+                | Self::FREE
+                | Self::OPENAI
+                | Self::GOOGLE
+                | Self::GOOGLE_VERTEX
+                | Self::AMAZON_BEDROCK
+                | Self::AZURE
+                | Self::GITHUB_COPILOT
+                | Self::CODEX
+                | Self::MISTRAL
+                | Self::XAI
+                | Self::GROQ
+                | Self::DEEPINFRA
+                | Self::CEREBRAS
+                | Self::COHERE
+                | Self::TOGETHER_AI
+                | Self::PERPLEXITY
+                | Self::OPENROUTER
+                | Self::OLLAMA
+                | Self::LM_STUDIO
+                | Self::LLAMA_CPP
+                | Self::DEEPSEEK
+                | Self::GITLAB
+                | Self::CLOUDFLARE
+                | Self::VENICE
+                | Self::SAP
+                | Self::SAMBANOVA
+                | Self::HUGGINGFACE
+                | Self::NVIDIA
+                | Self::SILICONFLOW
+                | Self::MOONSHOT
+                | Self::ZHIPU
+                | Self::ZAI
+                | Self::NEBIUS
+                | Self::OVHCLOUD
+                | Self::SCALEWAY
+                | Self::VULTR
+                | Self::BASETEN
+                | Self::FRIENDLI
+                | Self::UPSTAGE
+                | Self::STEPFUN
+                | Self::FIREWORKS
+                | Self::NOVITA
+                | Self::MINIMAX
+                | Self::CROF
+                | Self::OPENCODE_GO
+                | Self::OPENCODE_ZEN
+                | Self::CLINE
+                // Legacy aliases that predate canonical constants
+                | "openai-codex"
+                | "togetherai"
+                | "lmstudio"
+                | "llamacpp"
+                | "llama-server"
+                | "moonshot"
+                | "zhipu"
+                | "vultr-ai"
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ModelId
 // ---------------------------------------------------------------------------
@@ -173,5 +242,40 @@ impl PartialEq<str> for ModelId {
 impl PartialEq<&str> for ModelId {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_known_provider_id_covers_canonical_constants() {
+        assert!(ProviderId::is_known_provider_id(ProviderId::ANTHROPIC));
+        assert!(ProviderId::is_known_provider_id(ProviderId::FREE));
+        assert!(ProviderId::is_known_provider_id(ProviderId::OPENAI));
+        assert!(ProviderId::is_known_provider_id(ProviderId::GOOGLE));
+        assert!(ProviderId::is_known_provider_id(ProviderId::GROQ));
+        assert!(ProviderId::is_known_provider_id(ProviderId::OLLAMA));
+        assert!(ProviderId::is_known_provider_id(ProviderId::LM_STUDIO));
+        assert!(ProviderId::is_known_provider_id(ProviderId::DEEPSEEK));
+        assert!(ProviderId::is_known_provider_id(ProviderId::CLINE));
+    }
+
+    #[test]
+    fn is_known_provider_id_covers_legacy_aliases() {
+        assert!(ProviderId::is_known_provider_id("openai-codex"));
+        assert!(ProviderId::is_known_provider_id("togetherai"));
+        assert!(ProviderId::is_known_provider_id("lmstudio"));
+        assert!(ProviderId::is_known_provider_id("llamacpp"));
+        assert!(ProviderId::is_known_provider_id("moonshot"));
+        assert!(ProviderId::is_known_provider_id("zhipu"));
+    }
+
+    #[test]
+    fn is_known_provider_id_rejects_model_names() {
+        assert!(!ProviderId::is_known_provider_id("gpt-4o"));
+        assert!(!ProviderId::is_known_provider_id("meta-llama/llama-3"));
+        assert!(!ProviderId::is_known_provider_id("tiny-llama"));
     }
 }

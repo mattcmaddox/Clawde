@@ -388,6 +388,7 @@ impl SlashCommand for RenameCommand {
             thinking: None,
             effort_level: ctx.effort,
             provider_options: serde_json::Value::Object(Default::default()),
+            strict_route: false,
         };
 
         match provider.create_message(request).await {
@@ -620,6 +621,7 @@ impl SlashCommand for SummaryCommand {
             thinking: None,
             effort_level: ctx.effort,
             provider_options: serde_json::Value::Object(Default::default()),
+            strict_route: false,
         };
 
         match provider.create_message(request).await {

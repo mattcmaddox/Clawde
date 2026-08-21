@@ -304,6 +304,19 @@ impl FreeProvider {
         route: &Route,
         request: Option<&ProviderRequest>,
     ) -> Vec<(usize, String)> {
+        // Strict route: bypass all strategy reordering. The user explicitly
+        // specified this model via --tool-model and wants it used exactly.
+        let Route::Strict { idx, model } = route else {
+            return self.attempt_plan_inner(route, request);
+        };
+        vec![(*idx, model.clone())]
+    }
+
+    fn attempt_plan_inner(
+        &self,
+        route: &Route,
+        request: Option<&ProviderRequest>,
+    ) -> Vec<(usize, String)> {
         let mut plan = match self.routing.strategy {
             // Auto is the smart default — it routes by task just like the
             // explicit TaskBased strategy (audit spec §8.4).
@@ -522,6 +535,8 @@ impl FreeProvider {
                 }
             }
             Route::Auto => {}
+            // Strict is handled in attempt_plan() before this function.
+            Route::Strict { .. } => {}
         }
 
         // Task-preferred upstreams first, then every remaining upstream in
@@ -654,6 +669,8 @@ impl FreeProvider {
                 }
                 plan
             }
+            // Strict is handled in attempt_plan() before this function.
+            Route::Strict { .. } => vec![],
         }
     }
 
@@ -734,6 +751,8 @@ impl FreeProvider {
                     .flatten()
                     .collect()
             }
+            // Strict is handled in attempt_plan() before this function.
+            Route::Strict { .. } => vec![],
         }
     }
 
@@ -824,6 +843,8 @@ impl FreeProvider {
                 family.extend(rest);
                 family
             }
+            // Strict is handled in attempt_plan() before this function.
+            Route::Strict { .. } => vec![],
         }
     }
 
@@ -2063,7 +2084,21 @@ impl LlmProvider for FreeProvider {
             });
         }
 
-        let route = self.resolve_route(&request.model);
+        let route = if request.strict_route {
+            // Strict route: find the exact upstream and model, no fallback.
+            if let Some((idx, _)) = self.resolve_route(&request.model).into_pinned() {
+                Route::Strict {
+                    idx,
+                    model: request.model.clone(),
+                }
+            } else {
+                // Fall back to normal routing if the model doesn't pin to
+                // a specific upstream.
+                self.resolve_route(&request.model)
+            }
+        } else {
+            self.resolve_route(&request.model)
+        };
         let plan_vec = self.attempt_plan(&route, Some(&request));
         // Every failed upstream is recorded with its upstream id so the
         // exhaustion error surfaces the ORIGINAL failures (e.g. a groq rate
@@ -2509,6 +2544,7 @@ impl LlmProvider for FreeProvider {
                     .position(|e| e.upstream.model_family == model_family)?;
                 (idx, self.chain.get(idx)?)
             }
+            Route::Strict { idx, .. } => (idx, self.chain.get(idx)?),
         };
         Some(self.chain[idx].upstream.tool_calling)
     }
@@ -2525,6 +2561,7 @@ impl LlmProvider for FreeProvider {
                     .position(|e| e.upstream.model_family == model_family)?;
                 (idx, self.chain.get(idx)?)
             }
+            Route::Strict { idx, .. } => (idx, self.chain.get(idx)?),
         };
         self.chain[idx].upstream.max_tokens_cap
     }
@@ -3237,6 +3274,7 @@ mod tests {
             thinking: None,
             effort_level: None,
             provider_options: serde_json::Value::Null,
+            strict_route: false,
         }
     }
 

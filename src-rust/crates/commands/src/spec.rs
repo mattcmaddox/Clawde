@@ -171,6 +171,7 @@ impl SlashCommand for SpecCommand {
             thinking: None,
             effort_level: ctx.effort,
             provider_options: serde_json::Value::Object(Default::default()),
+            strict_route: false,
         };
 
         let spec_json = match provider.create_message(request).await {

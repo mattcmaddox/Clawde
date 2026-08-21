@@ -1610,6 +1610,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -1676,6 +1677,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -1756,6 +1758,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -1835,6 +1838,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         // Sanity-check the fixture really overflows: tools bytes must exceed
@@ -1902,6 +1906,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -1947,6 +1952,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -1990,6 +1996,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);
@@ -2025,6 +2032,7 @@ mod tests {
             effort_level: None,
             stop_sequences: vec![],
             provider_options: Default::default(),
+            strict_route: false,
         };
 
         let messages = provider.build_messages(&request);

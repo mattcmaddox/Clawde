@@ -1391,6 +1391,7 @@ impl Tool for AgentTool {
             max_budget_usd: None,
             fallback_model: None,
             tool_model: None,
+            tool_use_tracker: None,
             provider_registry: Some(Arc::new(provider_registry)),
             agent_name: None,
             agent_definition: None,

@@ -1011,6 +1011,7 @@ async fn try_compact(
         thinking: None,
         effort_level: effort,
         provider_options: serde_json::Value::Object(Default::default()),
+        strict_route: false,
     };
 
     let response =

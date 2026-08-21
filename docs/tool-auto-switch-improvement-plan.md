@@ -20,6 +20,7 @@ improvement plan.
 | `crates/query/src/lib.rs:2212` | Auto-switch logic — `!caps.tool_calling && !tools.is_empty()` |
 | `crates/query/src/lib.rs:2340` | System prompt rebuild — `enabled_tools = Some(vec![])` |
 | `crates/api/src/provider_types.rs` | `ProviderCapabilities.tool_calling` — per-provider capability |
+| `crates/api/src/health_poller.rs` | Startup + periodic health probe (key validity only) |
 
 ### Key Finding: All 13 FreeCatalog Upstreams Have `tool_calling: true`
 
@@ -114,6 +115,9 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 - No runtime verification exists — the flag is trusted blindly
 - `ProviderCapabilities.tool_calling` is the runtime capability
   (provider_types.rs:440)
+- The health poller (`health_poller.rs`) only validates key authenticity,
+  not capability — it probes `/v1/models` or a 1-token chat, neither of
+  which verifies tool calling
 
 **Research**:
 - **RouteLLM**: Trained routers learn which models handle which tasks from
@@ -122,6 +126,8 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 - **OpenRouter**: Uses aggregate spend data as a proxy — if developers spend
   on a model for code tasks, it supports tools.
 - **LiteLLM**: Per-provider health checks probe actual capabilities at startup.
+  Their health check endpoint (`GET /health`) verifies that models can serve
+  requests, though not specifically tool calling.
 
 **Improvement Plan**:
 
@@ -263,12 +269,12 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 
 ### Issue 8: Capability Gate Missing `tool_calling`
 
-**Severity**: High | **Effort**: Low | **Priority**: P0
+**Severity**: High | **Effort**: Low | **Priority**: P0 (COMPLETED)
 
 **Codebase Evidence**:
-- `entry_fits_request()` (impls.rs:371) only checks `vision` and `context_window`
-- `FreeUpstream.tool_calling` exists in the catalog but is unused by the gate
-- `capability_block_reason()` (impls.rs:404) only reports vision/context blocks
+- `entry_fits_request()` (impls.rs:371) only checked `vision` and `context_window`
+- `FreeUpstream.tool_calling` exists in the catalog but was unused by the gate
+- `capability_block_reason()` (impls.rs:404) only reported vision/context blocks
 - All current upstreams have `tool_calling: true`, so this is a correctness fix
 
 **Research**:
@@ -279,53 +285,48 @@ Every entry in `FREE_CATALOG` has `tool_calling: true`. This means:
 - **Portkey**: Routing rules can filter by model metadata including
   capability flags.
 
-**Improvement Plan**:
+**Implementation (DONE)**:
 
-1. **Add `has_tools` parameter to `entry_fits_request()`.** Check
+1. ✅ Added `has_tools` parameter to `entry_fits_request()`. Check
    `entry.upstream.tool_calling` when the request has tools. Skip upstreams
    that don't support tool calling.
 
-2. **Update `capability_block_reason()`** to report when no tool-capable
+2. ✅ Updated `capability_block_reason()` to report when no tool-capable
    upstream is available.
 
-3. **Add `tool_calling` to `ProviderRequest`** so the gate can check it
-   without inspecting the tools array.
-
-**Files**: `free/impls.rs`, `provider_types.rs`
+**Files**: `free/impls.rs`
 
 ---
 
 ## Priority Matrix
 
-| Issue | Severity | Effort | Research Basis | Priority |
-|---|---|---|---|---|
-| 8: Capability gate | High | Low | LiteLLM, OpenRouter, Portkey all filter by capabilities | **P0** |
-| 3: tool_calling accuracy | High | Medium | RouteLLM discovers capabilities from usage data | **P0** |
-| 6: Model doesn't use tools | High | Medium | RouteLLM/OpenRouter use success rates for routing | **P1** |
-| 1: --tool-model override | Medium | Low | LiteLLM uses explicit fallback mappings | **P1** |
-| 4: Hardcoded provider list | Medium | Low | LiteLLM uses config-driven lists | **P2** |
-| 5: Rebuild path untested | Medium | Low | LiteLLM uses mock flags for testing | **P2** |
-| 2: Per-turn performance | Low | Low | LiteLLM/OpenRouter use session caching | **P3** |
-| 7: Attribution visibility | Low | Low | OpenRouter returns model field; Portkey logs | **P3** |
+| Issue | Severity | Effort | Research Basis | Priority | Status |
+|---|---|---|---|---|---|
+| 8: Capability gate | High | Low | LiteLLM, OpenRouter, Portkey all filter by capabilities | **P0** | ✅ DONE |
+| 3: tool_calling accuracy | High | Medium | RouteLLM discovers capabilities from usage data | **P0** | Pending |
+| 6: Model doesn't use tools | High | Medium | RouteLLM/OpenRouter use success rates for routing | **P1** | Pending |
+| 1: --tool-model override | Medium | Low | LiteLLM uses explicit fallback mappings | **P1** | Pending |
+| 4: Hardcoded provider list | Medium | Low | LiteLLM uses config-driven lists | **P2** | Pending |
+| 5: Rebuild path untested | Medium | Low | LiteLLM uses mock flags for testing | **P2** | Pending |
+| 2: Per-turn performance | Low | Low | LiteLLM/OpenRouter use session caching | **P3** | Pending |
+| 7: Attribution visibility | Low | Low | OpenRouter returns model field; Portkey logs | **P3** | Pending |
 
 ## Research Sources
 
 | Source | Type | Key Insight |
 |---|---|---|
-| RouteLLM (arXiv:2406.18665) | Whitepaper | Trained routers reduce costs 85% at 95% quality |
-| OpenRouter Auto Router | Production | Market-based routing + session stickiness |
-| LiteLLM Router | OSS (9K+ stars) | Config-driven fallbacks + capability filtering |
-| Portkey Gateway | OSS (10K+ stars) | 1600+ models, guardrails, retry/fallback |
-| Cline | OSS | Free-model API with auto-discovery |
-| models.dev | Data source | Model capabilities metadata for 4500+ models |
+| RouteLLM (arXiv:2406.18665) | Whitepaper | Trained routers reduce costs 85% at 95% quality via preference data |
+| OpenRouter Auto Router | Production | Market-based routing + session stickiness + ~30 task types |
+| LiteLLM Router | OSS (9K+ stars) | Config-driven fallbacks, capability filtering, mock testing flags |
+| Portkey Gateway | OSS (10K+ stars) | 1600+ models, guardrails, retry/fallback, <1ms latency |
 
 ## Implementation Order
 
-1. **P0**: Add `tool_calling` to FreeProvider capability gate (Issue 8)
-2. **P0**: Add startup capability probe (Issue 3)
+1. **P0**: Add `tool_calling` to FreeProvider capability gate (Issue 8) — ✅ DONE
+2. **P0**: Add startup capability probe (Issue 3) — Next
 3. **P1**: Add tool-use success rate tracking (Issue 6)
 4. **P1**: Add `Route::Strict` for `--tool-model` (Issue 1)
-5. **P2**: Replace hardcoded provider list with registry lookup (Issue 4)
+5. **P2**: Replace hardcoded provider list (Issue 4)
 6. **P2**: Add `--force-no-tools` test flag (Issue 5)
 7. **P3**: Add session-level switch cache (Issue 2)
 8. **P3**: Add `ModelInfo` event to query stream (Issue 7)

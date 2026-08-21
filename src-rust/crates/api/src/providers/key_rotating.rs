@@ -834,6 +834,7 @@ mod tests {
             thinking: None,
             effort_level: None,
             provider_options: serde_json::Value::Null,
+            strict_route: false,
         }
     }
 

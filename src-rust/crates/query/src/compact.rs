@@ -1149,6 +1149,7 @@ async fn summarise_head(
         thinking: None,
         effort_level: effort,
         provider_options: Default::default(),
+        strict_route: false,
     };
 
     let response = tokio::select! {
@@ -1695,6 +1696,7 @@ pub async fn context_collapse(
         thinking: None,
         effort_level: config.effort_level,
         provider_options: Default::default(),
+        strict_route: false,
     };
 
     let response = tokio::select! {

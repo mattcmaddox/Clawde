@@ -376,6 +376,7 @@ fn make_live_runner(
                 thinking: None,
                 effort_level: None,
                 provider_options: serde_json::Value::Null,
+                strict_route: false,
             };
 
             let started = Instant::now();

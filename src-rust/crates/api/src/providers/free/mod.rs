@@ -2489,6 +2489,25 @@ enum Route {
     /// e.g. `free/family/llama-3.3-70b` round-robins across Hugging Face,
     /// NVIDIA and SambaNova before trying other model families.
     Family { model_family: &'static str },
+    /// Strict pin: try ONLY the exact (idx, model) pair. No fallback,
+    /// no task-based reordering. Used by `--tool-model` when the user
+    /// explicitly specifies a provider/model pair — the intent is
+    /// "use THIS model, period".
+    Strict { idx: usize, model: String },
+}
+
+impl Route {
+    /// If this is a `Pinned` route, return `(start_idx, pinned_model)`.
+    /// Used by the strict-route path to extract the upstream index.
+    fn into_pinned(self) -> Option<(usize, String)> {
+        match self {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => Some((start_idx, pinned_model)),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

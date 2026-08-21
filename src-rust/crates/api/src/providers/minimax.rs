@@ -493,6 +493,7 @@ mod tests {
             thinking: thinking.then(|| ThinkingConfig::enabled(4096)),
             effort_level: None,
             provider_options: serde_json::json!({}),
+            strict_route: false,
         }
     }
 
