@@ -162,7 +162,7 @@ Cohere, MiniMax, Ollama, LM Studio, llama.cpp, Free tier, Codex, Copilot, and mo
 
 ### 3. `cli` (5,000+ lines) — Entry Point
 
-**Files:** `src-rust/crates/cli/src/main.rs`, `oauth_flow.rs`, `codex_oauth_flow.rs`, `upgrade.rs`
+**Files:** `src-rust/crates/cli/src/main.rs`, `build.rs`, `oauth_flow.rs`, `codex_oauth_flow.rs`, `diagnostics.rs`, `upgrade.rs`
 
 The binary entry point. Uses `clap` for argument parsing.
 
@@ -172,6 +172,7 @@ The binary entry point. Uses `clap` for argument parsing.
 - **ACP mode (`acp` subcommand):** JSON-RPC 2.0 over stdio for editor integration
 - **Auth commands:** `auth login`, `auth logout`
 - **Upgrade:** Self-updating via GitHub releases
+- **Build (`build` / `--build`):** Rebuild from the local source checkout and replace the running binary
 
 **Key flow:**
 1. Parse CLI args (clap)
@@ -815,6 +816,12 @@ cargo fmt --all                      # Format
 cargo test --workspace                              # Test (parallel-safe, env mutations lock-guarded)
 cargo test --package clawde-core                        # Single crate
 cargo build --release --package clawde-cli              # Release build
+
+# Release flow (single source of truth — see docs/build-release-refactor-spec.md):
+scripts/build.sh build-one linux-aarch64             # cross-build one platform leg
+scripts/build.sh build-all                           # build every leg this machine can
+scripts/build.sh package                             # assemble dist/ archives + SHA256SUMS
+scripts/build.sh release --version vX.Y.Z --dry-run  # full release, preview only
 ```
 
 ---
