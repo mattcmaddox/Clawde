@@ -1,5 +1,5 @@
 // cc-core: Core types, error handling, configuration, settings, and constants
-// for Claurst.
+// for Clawde.
 //
 // All sub-modules are defined inline below.
 
@@ -152,7 +152,7 @@ pub use skill_discovery::{discover_skills, parse_skill_file, DiscoveredSkill};
 pub mod error {
     use thiserror::Error;
 
-    /// The unified error type for Claurst.
+    /// The unified error type for Clawde.
     #[derive(Error, Debug)]
     pub enum ClaudeError {
         #[error("API error: {0}")]
@@ -1631,7 +1631,7 @@ pub mod config {
         )]
         pub request_timeout_secs: Option<u64>,
         /// Whether app-level mouse capture is enabled. `None` (default) or
-        /// `Some(true)` means claurst captures the mouse for scroll / right-click
+        /// `Some(true)` means clawde captures the mouse for scroll / right-click
         /// context menu / middle-click paste / drag text-selection. Set
         /// `"mouseCapture": false` to release the mouse to the terminal so native
         /// click-drag selection and copy/paste work without lag (issue #104).
@@ -2620,17 +2620,15 @@ pub mod config {
     }
 
     impl Settings {
-        /// The canonical per-user claurst home directory — the single source of
-        /// truth for where claurst keeps everything (settings, sessions,
+        /// The canonical per-user clawde home directory — the single source of
+        /// truth for where clawde keeps everything (settings, sessions,
         /// accounts, skills, …). Every subdirectory (`config_dir().join("sessions")`,
         /// `.join("accounts")`, …) lives under this one root.
         ///
-        /// Resolution precedence (see issue #207 — XDG Base Directory support,
-        /// kept fully back-compatible so existing installs are untouched):
+        /// Resolution precedence (see issue #207 — XDG Base Directory support):
         ///
         /// 1. **`$CLAWDE_HOME`** — if set and non-empty, used verbatim.
-        /// 2. **Legacy `~/.clawde`** — if that directory already exists, it is
-        ///    reused so existing users need no migration.
+        /// 2. **`~/.clawde`** — if that directory already exists, it is used.
         /// 3. **XDG** — `$XDG_CONFIG_HOME/clawde` when `$XDG_CONFIG_HOME` is set
         ///    (and absolute, per the spec), otherwise `~/.config/clawde`. Fresh
         ///    installs land here.
@@ -2644,37 +2642,11 @@ pub mod config {
 
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
-            // 2. New default: an existing `~/.clawde` is used verbatim.
+            // 2. An existing `~/.clawde` is used verbatim.
             let new_dir = home.join(".clawde");
             if new_dir.is_dir() {
                 return new_dir;
             }
-            // 2b. Auto-migration: if `~/.clawde` doesn't exist but legacy
-            // `~/.claurst` does (pre-rename install), rename it to `~/.clawde`
-            // so the transition happens seamlessly on first run.
-            let legacy = home.join(".claurst");
-            if legacy.is_dir() {
-                match std::fs::rename(&legacy, &new_dir) {
-                    Ok(()) => {
-                        tracing::info!(
-                            "Migrated legacy config dir {} -> {}",
-                            legacy.display(),
-                            new_dir.display()
-                        );
-                        return new_dir;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Could not migrate legacy config dir {} -> {}: {}. Using legacy path.",
-                            legacy.display(),
-                            new_dir.display(),
-                            e
-                        );
-                        return legacy;
-                    }
-                }
-            }
-
             // 3. XDG config location for fresh installs.
             if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
                 let xdg = PathBuf::from(xdg);
@@ -2955,38 +2927,36 @@ pub mod config {
         }
 
         /// Walk up from `cwd` looking for `.clawde/settings.json` or
-        /// `.clawde/settings.jsonc` (falls back to `.claurst/` for legacy projects).
+        /// `.clawde/settings.jsonc`.
         async fn find_project_settings(cwd: &std::path::Path) -> Option<Self> {
             let global_path = Self::global_settings_path();
             let mut dir = cwd;
             loop {
-                // Try .json first, then .jsonc; check new .clawde first, then legacy .claurst.
+                // Try .json first, then .jsonc.
                 for name in &["settings.json", "settings.jsonc"] {
-                    for dir_name in &[".clawde", ".claurst"] {
-                        let candidate = dir.join(dir_name).join(name);
-                        if candidate.exists() && candidate != global_path {
-                            if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
-                                let stripped = strip_jsonc_comments(&content);
-                                if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
-                                    // SECURITY: tag every server defined by this
-                                    // repository as project-origin so it gets gated
-                                    // behind explicit approval before launching.
-                                    // `origin` is `#[serde(skip)]`, so the file can
-                                    // never set it itself — we always assign here.
-                                    for server in &mut s.config.mcp_servers {
+                    let candidate = dir.join(".clawde").join(name);
+                    if candidate.exists() && candidate != global_path {
+                        if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
+                            let stripped = strip_jsonc_comments(&content);
+                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                // SECURITY: tag every server defined by this
+                                // repository as project-origin so it gets gated
+                                // behind explicit approval before launching.
+                                // `origin` is `#[serde(skip)]`, so the file can
+                                // never set it itself — we always assign here.
+                                for server in &mut s.config.mcp_servers {
+                                    server.origin = McpServerOrigin::Project;
+                                }
+                                for ps in s.projects.values_mut() {
+                                    for server in &mut ps.mcp_servers {
                                         server.origin = McpServerOrigin::Project;
                                     }
-                                    for ps in s.projects.values_mut() {
-                                        for server in &mut ps.mcp_servers {
-                                            server.origin = McpServerOrigin::Project;
-                                        }
-                                    }
-                                    return Some(s);
                                 }
+                                return Some(s);
                             }
-                            // Found a file but couldn't parse — stop here, don't go up.
-                            return None;
                         }
+                        // Found a file but couldn't parse — stop here, don't go up.
+                        return None;
                     }
                 }
                 match dir.parent() {
@@ -2999,9 +2969,8 @@ pub mod config {
 
         /// Load project-level settings for `cwd` (synchronous twin of
         /// [`Self::find_project_settings`]). Walks up from `cwd` looking for
-        /// `.clawde/settings.json` / `.clawde/settings.jsonc` (with a legacy
-        /// `.claurst/` fallback). Returns `None` when no project file exists
-        /// or the nearest candidate fails to parse.
+        /// `.clawde/settings.json` / `.clawde/settings.jsonc`. Returns `None`
+        /// when no project file exists or the nearest candidate fails to parse.
         ///
         /// Used by the TUI settings screen to tag per-entry origin (global vs
         /// project) so the user can see *where* an effective value comes from.
@@ -3010,29 +2979,27 @@ pub mod config {
             let mut dir = cwd;
             loop {
                 for name in &["settings.json", "settings.jsonc"] {
-                    for dir_name in &[".clawde", ".claurst"] {
-                        let candidate = dir.join(dir_name).join(name);
-                        if candidate.exists() && candidate != global_path {
-                            if let Ok(content) = std::fs::read_to_string(&candidate) {
-                                let stripped = strip_jsonc_comments(&content);
-                                if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
-                                    // SECURITY: mirror find_project_settings — tag
-                                    // every server defined by this repository as
-                                    // project-origin so it is gated behind approval.
-                                    for server in &mut s.config.mcp_servers {
+                    let candidate = dir.join(".clawde").join(name);
+                    if candidate.exists() && candidate != global_path {
+                        if let Ok(content) = std::fs::read_to_string(&candidate) {
+                            let stripped = strip_jsonc_comments(&content);
+                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                // SECURITY: mirror find_project_settings — tag
+                                // every server defined by this repository as
+                                // project-origin so it is gated behind approval.
+                                for server in &mut s.config.mcp_servers {
+                                    server.origin = McpServerOrigin::Project;
+                                }
+                                for ps in s.projects.values_mut() {
+                                    for server in &mut ps.mcp_servers {
                                         server.origin = McpServerOrigin::Project;
                                     }
-                                    for ps in s.projects.values_mut() {
-                                        for server in &mut ps.mcp_servers {
-                                            server.origin = McpServerOrigin::Project;
-                                        }
-                                    }
-                                    return Some(s);
                                 }
+                                return Some(s);
                             }
-                            // Found a file but couldn't parse — stop here, don't go up.
-                            return None;
                         }
+                        // Found a file but couldn't parse — stop here, don't go up.
+                        return None;
                     }
                 }
                 match dir.parent() {
@@ -4191,7 +4158,7 @@ pub mod context {
         async fn find_and_read_claude_md(&self) -> Option<String> {
             let mut claude_mds = vec![];
 
-            // Global <claurst home>/AGENTS.md
+            // Global <clawde home>/AGENTS.md
             {
                 let global_claude_md = crate::config::Settings::config_dir()
                     .join(crate::constants::CLAUDE_MD_FILENAME);
@@ -7789,53 +7756,6 @@ mod tests {
             registry.get(&id).unwrap().status,
             tasks::TaskStatus::Cancelled
         );
-    }
-
-    #[test]
-    fn test_legacy_claurst_fallback() {
-        // Verify that config_dir() falls back to ~/.claurst/ when
-        // ~/.clawde/ does not exist (backward compat for pre-rename installs).
-        let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join(".claurst");
-        std::fs::create_dir_all(&legacy).unwrap();
-
-        let _lock = crate::paths::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", dir.path());
-
-        // Clear CLAWDE_HOME / XDG_CONFIG_HOME so they don't interfere
-        let saved_clawde_home = std::env::var_os("CLAWDE_HOME");
-        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::remove_var("CLAWDE_HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-
-        let result = Settings::config_dir();
-        let migrated = dir.path().join(".clawde");
-
-        // After auto-migration, the legacy dir is renamed to ~/.clawde.
-        assert!(
-            result == migrated,
-            "Expected config_dir() to migrate .claurst -> .clawde, got {}",
-            result.display()
-        );
-        assert!(migrated.is_dir(), "~/.clawde must exist after migration");
-        match saved_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match saved_clawde_home {
-            Some(v) => std::env::set_var("CLAWDE_HOME", v),
-            None => std::env::remove_var("CLAWDE_HOME"),
-        }
-        match saved_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-
-        // Legacy dir is now renamed to .clawde by auto-migration.
-        assert!(!legacy.exists(), ".claurst must not exist after migration");
     }
 
     // ---- Settings store robustness (settings.json corrupt handling) ---------

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub enum PluginSource {
     /// `~/.clawde/plugins/`
     User,
-    /// `<project>/.claurst/plugins/`
+    /// `<project>/.clawde/plugins/`
     Project,
     /// An extra path provided at runtime (e.g. `--plugin-dir` CLI flag).
     Extra(String),

@@ -26,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::cell::Cell;
 
-use crate::overlays::{centered_rect, CLAURST_PANEL_BG};
+use crate::overlays::{centered_rect, CLAWDE_PANEL_BG};
 
 const BORDER_FG: Color = Color::Rgb(120, 120, 170);
 const TITLE_FG: Color = Color::Rgb(200, 160, 255);
@@ -245,13 +245,13 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         for x in modal_area.left()..modal_area.right() {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.set_char(' ');
-                cell.set_bg(CLAURST_PANEL_BG);
+                cell.set_bg(CLAWDE_PANEL_BG);
             }
         }
     }
 
     // ---- border ----
-    let border_style = Style::default().fg(BORDER_FG).bg(CLAURST_PANEL_BG);
+    let border_style = Style::default().fg(BORDER_FG).bg(CLAWDE_PANEL_BG);
     let inner_w = modal_area.width.saturating_sub(2) as usize;
     for y in modal_area.top()..modal_area.bottom() {
         let is_top = y == modal_area.top();
@@ -280,7 +280,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
     let title_x = modal_area.left() + 2;
     let title_style = Style::default()
         .fg(TITLE_FG)
-        .bg(CLAURST_PANEL_BG)
+        .bg(CLAWDE_PANEL_BG)
         .add_modifier(Modifier::BOLD);
     for (i, ch) in title.chars().enumerate() {
         let x = title_x + i as u16;
@@ -323,7 +323,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             row,
             Line::from(Span::styled(
                 wrap_line,
-                Style::default().fg(QUESTION_FG).bg(CLAURST_PANEL_BG)
+                Style::default().fg(QUESTION_FG).bg(CLAWDE_PANEL_BG)
             ))
         );
         row += 1;
@@ -348,7 +348,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
                     format!("   \u{2191} {} more above", state.scroll_offset),
                     Style::default()
                         .fg(Color::Rgb(90, 90, 110))
-                        .bg(CLAURST_PANEL_BG),
+                        .bg(CLAWDE_PANEL_BG),
                 ))
             );
             row += 1;
@@ -367,11 +367,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             let prefix = if is_sel { "▶ " } else { "  " };
             let num_str = format!("{}", i + 1);
             let label = format!(" {}", opt);
-            let style_bg = if is_sel {
-                SELECTED_BG
-            } else {
-                CLAURST_PANEL_BG
-            };
+            let style_bg = if is_sel { SELECTED_BG } else { CLAWDE_PANEL_BG };
             write_line!(
                 row,
                 Line::from(vec![
@@ -407,7 +403,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
                     format!("   \u{2193} {} more below", remaining),
                     Style::default()
                         .fg(Color::Rgb(90, 90, 110))
-                        .bg(CLAURST_PANEL_BG),
+                        .bg(CLAWDE_PANEL_BG),
                 ))
             );
             row += 1;
@@ -421,11 +417,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
         let is_sel = state.in_custom_input || state.options.is_none();
         let prefix = if is_sel { "❯ " } else { "  " };
         let cursor = if is_sel { "█" } else { "" };
-        let style_bg = if is_sel {
-            SELECTED_BG
-        } else {
-            CLAURST_PANEL_BG
-        };
+        let style_bg = if is_sel { SELECTED_BG } else { CLAWDE_PANEL_BG };
         let mut spans = vec![Span::styled(
             prefix,
             Style::default()
@@ -461,7 +453,7 @@ pub fn render_ask_user_dialog(state: &AskUserDialogState, area: Rect, buf: &mut 
             row,
             Line::from(Span::styled(
                 hint,
-                Style::default().fg(HINT_FG).bg(CLAURST_PANEL_BG)
+                Style::default().fg(HINT_FG).bg(CLAWDE_PANEL_BG)
             ))
         );
     }

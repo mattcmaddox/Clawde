@@ -17,7 +17,7 @@ use clawde_tools::web_search::{collect_firecrawl_keys, firecrawl_key_health};
 
 use crate::overlays::{
     begin_modal_frame, modal_header_line_area, render_modal_title_frame, render_scrollbar,
-    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG,
+    CLAWDE_ACCENT, CLAWDE_MUTED, CLAWDE_PANEL_BG,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ pub fn render_context_viz(
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " Token window, key health, and session cost.",
-                Style::default().fg(CLAURST_MUTED),
+                Style::default().fg(CLAWDE_MUTED),
             )])),
             subtitle_area,
         );
@@ -183,16 +183,16 @@ pub fn render_context_viz(
     lines.push(Line::from(vec![Span::styled(
         " Context window",
         Style::default()
-            .fg(CLAURST_ACCENT)
+            .fg(CLAWDE_ACCENT)
             .add_modifier(Modifier::BOLD),
     )]));
 
     let filled = ((ctx_pct * bar_width as f32) as usize).min(bar_width);
     let empty = bar_width - filled;
     lines.push(Line::from(vec![
-        Span::styled(" [", Style::default().fg(CLAURST_MUTED)),
+        Span::styled(" [", Style::default().fg(CLAWDE_MUTED)),
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(ctx_color)),
-        Span::styled("\u{2591}".repeat(empty), Style::default().fg(CLAURST_MUTED)),
+        Span::styled("\u{2591}".repeat(empty), Style::default().fg(CLAWDE_MUTED)),
         Span::styled(
             format!(
                 "]  {:.0}%  ({} / {})",
@@ -216,7 +216,7 @@ pub fn render_context_viz(
         lines.push(Line::from(vec![Span::styled(
             " Free models",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )]));
 
@@ -313,7 +313,7 @@ pub fn render_context_viz(
             }
             lines.push(Line::from(vec![Span::styled(
                 detail,
-                Style::default().fg(CLAURST_MUTED),
+                Style::default().fg(CLAWDE_MUTED),
             )]));
         }
 
@@ -325,7 +325,7 @@ pub fn render_context_viz(
         lines.push(Line::from(vec![Span::styled(
             " Key health",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )]));
 
@@ -335,12 +335,12 @@ pub fn render_context_viz(
                 "  {:<16} {:>5} {:>5} {:>5} {:>7}",
                 "Provider", "Keys", "Tok%", "Req%", "Retry"
             ),
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         )]));
 
         for row in &key_ring_rows {
             let keys_color = if row.total == 0 {
-                CLAURST_MUTED
+                CLAWDE_MUTED
             } else if row.active == 0 {
                 Color::Red
             } else if row.active < row.total {
@@ -373,7 +373,7 @@ pub fn render_context_viz(
             };
 
             let row_style = if row.total == 0 {
-                Style::default().fg(CLAURST_MUTED)
+                Style::default().fg(CLAWDE_MUTED)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -399,7 +399,7 @@ pub fn render_context_viz(
         lines.push(Line::from(vec![Span::styled(
             " Free model sort",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )]));
         lines.push(Line::from(vec![
@@ -412,7 +412,7 @@ pub fn render_context_viz(
             ),
             Span::styled(
                 "  (rows pre-sorted; 1-7 jumps in /models)",
-                Style::default().fg(CLAURST_MUTED),
+                Style::default().fg(CLAWDE_MUTED),
             ),
         ]));
         lines.push(Line::from(""));
@@ -423,7 +423,7 @@ pub fn render_context_viz(
         lines.push(Line::from(vec![Span::styled(
             " GitHub API",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )]));
 
@@ -445,7 +445,7 @@ pub fn render_context_viz(
             ),
             Span::styled(
                 format!("  ({reset_text})"),
-                Style::default().fg(CLAURST_MUTED),
+                Style::default().fg(CLAWDE_MUTED),
             ),
         ]));
 
@@ -465,13 +465,13 @@ pub fn render_context_viz(
         lines.push(Line::from(vec![Span::styled(
             " Firecrawl keys",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )]));
 
         lines.push(Line::from(vec![Span::styled(
             format!("  {:<16} {:>5} {:>7}", "Key", "Status", "Retry"),
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         )]));
 
         for key in fc_keys.iter() {
@@ -499,7 +499,7 @@ pub fn render_context_viz(
                     Span::styled(" ACTIVE", Style::default().fg(Color::Green)),
                     Span::styled(
                         format!(" {:>6}", "\u{2014}"),
-                        Style::default().fg(CLAURST_MUTED),
+                        Style::default().fg(CLAWDE_MUTED),
                     ),
                 ]));
             }
@@ -511,7 +511,7 @@ pub fn render_context_viz(
     lines.push(Line::from(vec![Span::styled(
         " Messages",
         Style::default()
-            .fg(CLAURST_ACCENT)
+            .fg(CLAWDE_ACCENT)
             .add_modifier(Modifier::BOLD),
     )]));
 
@@ -541,7 +541,7 @@ pub fn render_context_viz(
             Span::styled(
                 format!("${:.4}", cost_usd),
                 Style::default()
-                    .fg(CLAURST_ACCENT)
+                    .fg(CLAWDE_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -571,7 +571,7 @@ pub fn render_context_viz(
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0))
-        .style(Style::default().bg(CLAURST_PANEL_BG))
+        .style(Style::default().bg(CLAWDE_PANEL_BG))
         .render(inner, frame.buffer_mut());
 
     // Thin vertical scrollbar along the body's right edge when content
@@ -600,7 +600,7 @@ pub fn render_context_viz(
         Paragraph::new(Line::from(vec![Span::styled(
             footer_hint,
             Style::default()
-                .fg(CLAURST_MUTED)
+                .fg(CLAWDE_MUTED)
                 .add_modifier(Modifier::ITALIC),
         )])),
         layout.footer_area,
@@ -648,7 +648,7 @@ fn pct_color(pct: Option<f32>) -> Color {
         Some(p) if p > 0.90 => Color::Red,
         Some(p) if p > 0.70 => Color::Yellow,
         Some(_) => Color::Green,
-        None => CLAURST_MUTED,
+        None => CLAWDE_MUTED,
     }
 }
 

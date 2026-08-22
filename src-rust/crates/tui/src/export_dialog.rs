@@ -10,8 +10,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::overlays::{
-    begin_modal_frame, modal_header_line_area, render_modal_title_frame, CLAURST_ACCENT,
-    CLAURST_MUTED, CLAURST_PANEL_BG, CLAURST_TEXT,
+    begin_modal_frame, modal_header_line_area, render_modal_title_frame, CLAWDE_ACCENT,
+    CLAWDE_MUTED, CLAWDE_PANEL_BG, CLAWDE_TEXT,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 " Choose a format to export this session.",
-                Style::default().fg(CLAURST_MUTED),
+                Style::default().fg(CLAWDE_MUTED),
             )])),
             subtitle_area,
         );
@@ -114,21 +114,21 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         Line::from(""),
         Line::from(vec![Span::styled(
             " Saved to ./claude-export-<timestamp>.<ext>  or  copy to clipboard",
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         )]),
     ];
 
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(CLAURST_PANEL_BG)),
+            .style(Style::default().bg(CLAWDE_PANEL_BG)),
         layout.body_area,
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             " tab/←/→ switch  ·  enter export  ·  1/2/3/4 choose",
             Style::default()
-                .fg(CLAURST_MUTED)
+                .fg(CLAWDE_MUTED)
                 .add_modifier(Modifier::ITALIC),
         )])),
         layout.footer_area,
@@ -143,15 +143,15 @@ fn export_option_row(
     width: u16,
 ) -> Line<'static> {
     let bg = if selected {
-        CLAURST_ACCENT
+        CLAWDE_ACCENT
     } else {
-        CLAURST_PANEL_BG
+        CLAWDE_PANEL_BG
     };
-    let fg = if selected { Color::White } else { CLAURST_TEXT };
+    let fg = if selected { Color::White } else { CLAWDE_TEXT };
     let desc_fg = if selected {
         Color::Rgb(245, 220, 232)
     } else {
-        CLAURST_MUTED
+        CLAWDE_MUTED
     };
     let mut spans = vec![
         Span::styled(format!(" [{}] ", key), Style::default().fg(desc_fg).bg(bg)),

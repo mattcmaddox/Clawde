@@ -2146,11 +2146,11 @@ mod tests {
     fn test_auth_state_uses_token_expiry_datetime() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Redirect the on-disk token store into a tempdir so this test never
-        // touches (or requires a writable) ~/.claurst. Sandboxed builds run
+        // touches (or requires a writable) ~/.clawde. Sandboxed builds run
         // with no HOME and disallow writes outside the build tree.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
-        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+        let prev = std::env::var_os("CLAWDE_MCP_TOKENS_DIR");
+        std::env::set_var("CLAWDE_MCP_TOKENS_DIR", tmp.path());
 
         let mut mgr = McpManager::new();
         mgr.server_configs.insert(
@@ -2190,8 +2190,8 @@ mod tests {
         oauth::remove_mcp_token("remote").ok();
 
         match prev {
-            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
-            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
+            Some(v) => std::env::set_var("CLAWDE_MCP_TOKENS_DIR", v),
+            None => std::env::remove_var("CLAWDE_MCP_TOKENS_DIR"),
         }
     }
 }

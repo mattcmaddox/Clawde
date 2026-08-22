@@ -174,19 +174,19 @@ pub struct OAuthConfig {
 // ---------------------------------------------------------------------------
 
 // Claude Code OAuth client ID, used in stealth-impersonation mode so that
-// Anthropic's auth server accepts Claude Pro/Max tokens through Claurst.
+// Anthropic's auth server accepts Claude Pro/Max tokens through Clawde.
 // The matching request-time impersonation (user-agent, x-app, anthropic-beta,
 // and the Claude Code system-prompt prefix) is wired up in
 // `clawde_api::client::AnthropicClient` and is required for these tokens to
 // be honoured by the API.
 //
 // Billing note (verified live 2026-06-03, Claude Pro account, extra-usage
-// disabled): a Pro/Max subscription token used through Claurst's impersonation
+// disabled): a Pro/Max subscription token used through Clawde's impersonation
 // IS served and DRAWS FROM THE INTERACTIVE SUBSCRIPTION QUOTA — `oauth/usage`
 // `five_hour`/`seven_day` utilisation climbed (percentage, 0-100 scale) with
 // extra-usage off and `seven_day_oauth_apps` staying null. A side-by-side run of
 // the official `claude -p` (same token via CLAUDE_CODE_OAUTH_TOKEN) hit the same
-// buckets, i.e. Claurst is billed exactly like the official interactive client.
+// buckets, i.e. Clawde is billed exactly like the official interactive client.
 // This CONTRADICTS the earlier assumption that third-party usage falls back to
 // the "extra usage" pool. The CCH was not even required (requests succeeded
 // without it). Caveats: (1) tested before Anthropic's 2026-06-15 dual-bucket
@@ -409,7 +409,7 @@ pub fn build_auth_url(
 // Codex (OpenAI) OAuth Token Storage
 // ---------------------------------------------------------------------------
 
-/// OpenAI Codex OAuth tokens, persisted to ~/.claurst/codex_tokens.json
+/// OpenAI Codex OAuth tokens, persisted to ~/.clawde/codex_tokens.json
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CodexTokens {
     pub access_token: String,
@@ -422,14 +422,14 @@ pub struct CodexTokens {
     pub expires_at: Option<u64>,
 }
 
-/// Legacy single-file path: `~/.claurst/codex_tokens.json`. Kept for
+/// Legacy single-file path: `~/.clawde/codex_tokens.json`. Kept for
 /// backward-compat reads when no account registry exists.
 fn codex_tokens_path() -> Option<std::path::PathBuf> {
     Some(crate::config::Settings::config_dir().join("codex_tokens.json"))
 }
 
 /// Save Codex OAuth tokens for a named profile under
-/// `~/.claurst/accounts/codex/<profile_id>/codex_tokens.json`.
+/// `~/.clawde/accounts/codex/<profile_id>/codex_tokens.json`.
 pub fn save_codex_tokens_for_profile(tokens: &CodexTokens, profile_id: &str) -> anyhow::Result<()> {
     let path = crate::accounts::codex_token_path(profile_id);
     if let Some(parent) = path.parent() {
@@ -561,7 +561,7 @@ pub fn clear_codex_tokens() -> anyhow::Result<()> {
 
 /// Returns true if the user has a valid Codex access token.
 /// Tokens are obtained via `/connect → OpenAI Codex` (browser OAuth flow)
-/// or by setting `CLAURST_USE_OPENAI=1` with a manually stored token.
+/// or by setting `CLAWDE_USE_OPENAI=1` with a manually stored token.
 #[allow(dead_code)]
 pub fn is_codex_subscriber() -> bool {
     get_codex_tokens()

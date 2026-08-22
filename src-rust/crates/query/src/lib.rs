@@ -3737,7 +3737,7 @@ pub async fn run_query_loop(
         // compact / context-collapse instead. This fires on every streaming turn
         // so it can act before a prompt-too-long error is returned by the API.
         //
-        // Feature gate check: requires BOTH the CLAURST_FEATURE_REACTIVE_COMPACT=1
+        // Feature gate check: requires BOTH the CLAWDE_FEATURE_REACTIVE_COMPACT=1
         // env var AND the user-facing auto_compact config toggle.  The config
         // gate appears again in the outer `if tool_ctx.config.auto_compact` guard
         // below (which also protects the else-if proactive path).  The AND here
@@ -3973,7 +3973,7 @@ pub async fn run_query_loop(
                                         {
                                             Ok(memories) if !memories.is_empty() => {
                                                 let target = working_dir_clone
-                                                    .join(".claurst")
+                                                    .join(".clawde")
                                                     .join("AGENTS.md");
                                                 if let Err(e) =
                                                     session_memory::SessionMemoryExtractor::persist(

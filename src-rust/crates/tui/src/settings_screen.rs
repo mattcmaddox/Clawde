@@ -6,7 +6,7 @@
 
 use crate::overlays::{
     centered_rect, modal_search_line_with_insert, render_dark_overlay, render_dialog_bg,
-    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG,
+    CLAWDE_ACCENT, CLAWDE_MUTED, CLAWDE_PANEL_BG,
 };
 use std::cell::Cell;
 
@@ -536,7 +536,7 @@ impl SettingsScreen {
             auto_memory_path, build_memory_prompt_content_with_budget, is_auto_memory_enabled,
         };
         // The displayed toggle state drives the readout; env vars still win
-        // inside is_auto_memory_enabled (e.g. CLAURST_DISABLE_AUTO_MEMORY).
+        // inside is_auto_memory_enabled (e.g. CLAWDE_DISABLE_AUTO_MEMORY).
         if !is_auto_memory_enabled(Some(self.memory_enabled)) {
             self.memory_readout = "memory injection disabled".to_string();
             return;
@@ -1857,7 +1857,7 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     entries.push(make_entry(
         "memory_enabled",
         "Mnemosyne",
-        "Injects the project's MEMORY.md index + most recent session summary into the system prompt, and auto-consolidates session summaries into the project memory dir. Off disables injection even when memory files exist (env vars still win: CLAURST_DISABLE_AUTO_MEMORY=1 overrides this).",
+        "Injects the project's MEMORY.md index + most recent session summary into the system prompt, and auto-consolidates session summaries into the project memory dir. Off disables injection even when memory files exist (env vars still win: CLAWDE_DISABLE_AUTO_MEMORY=1 overrides this).",
         SECTION_MEMORY,
         "true".to_string(),
         SettingEffect::NextSession,
@@ -2000,10 +2000,10 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         Span::styled(
             " Settings",
             Style::default()
-                .fg(CLAURST_ACCENT)
+                .fg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" — Clawde", Style::default().fg(CLAURST_MUTED)),
+        Span::styled(" — Clawde", Style::default().fg(CLAWDE_MUTED)),
         Span::styled(
             format!("  ·  model {}", model_disp),
             Style::default()
@@ -2013,11 +2013,11 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         dirty_span,
         Span::styled(
             format!("{:>width$}", "Esc close", width = esc_w),
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         ),
     ]);
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().bg(CLAURST_PANEL_BG)),
+        Paragraph::new(title).style(Style::default().bg(CLAWDE_PANEL_BG)),
         header_area,
     );
 
@@ -2026,11 +2026,11 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
         &screen.search_query,
         "Type to search settings...",
         Color::DarkGray,
-        CLAURST_ACCENT,
+        CLAWDE_ACCENT,
         screen.vim_search.insert,
     );
     frame.render_widget(
-        Paragraph::new(search_line).style(Style::default().bg(CLAURST_PANEL_BG)),
+        Paragraph::new(search_line).style(Style::default().bg(CLAWDE_PANEL_BG)),
         search_area,
     );
 
@@ -2158,7 +2158,7 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             Span::styled(
                 " Enter ",
                 Style::default()
-                    .fg(CLAURST_ACCENT)
+                    .fg(CLAWDE_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("save  "),
@@ -2175,14 +2175,14 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             Span::styled(
                 " ↑↓ ",
                 Style::default()
-                    .fg(CLAURST_ACCENT)
+                    .fg(CLAWDE_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("navigate  "),
             Span::styled(
                 " Enter ",
                 Style::default()
-                    .fg(CLAURST_ACCENT)
+                    .fg(CLAWDE_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("toggle/edit  "),
@@ -2219,7 +2219,7 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             .add_modifier(Modifier::DIM),
     )]));
     let footer_para = Paragraph::new(footer)
-        .style(Style::default().fg(CLAURST_MUTED).bg(CLAURST_PANEL_BG))
+        .style(Style::default().fg(CLAWDE_MUTED).bg(CLAWDE_PANEL_BG))
         .alignment(Alignment::Center);
     frame.render_widget(footer_para, footer_area);
 }
@@ -2278,7 +2278,7 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
         let row_style = if is_selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(CLAURST_ACCENT)
+                .bg(CLAWDE_ACCENT)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()

@@ -2,7 +2,7 @@
 
 <h1>CLAWDE</h1>
 <h2><em>Agentic Coding for Builders who Ship</em></h2>
-<img src="public/Ship.png" alt="Rustle on the ship" width="350" />
+<img src="public/Ship.png" alt="Rustail on the ship" width="350" />
 
 <p>
     <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
@@ -17,7 +17,7 @@
 
 ---
 
-Clawde is an **open-source, multi-provider terminal coding agent** built from the ground up in Rust. It started as a clean-room reimplementation of Claude Code's behavior (from [spec](https://github.com/mattcmaddox/Clawde/tree/main/spec)) and has since evolved into an amazing TUI pair programmer with multi-provider support, a rich UI, plugin system, a companion named Rustle, chat forking, memory consolidation, and much more.
+Clawde is an **open-source, multi-provider terminal coding agent** built from the ground up in Rust. It started as a clean-room reimplementation of Claude Code's behavior (from [spec](https://github.com/mattcmaddox/Clawde/tree/main/spec)) and has since evolved into an amazing TUI pair programmer with multi-provider support, a rich UI, plugin system, a companion named Rustail, chat forking, memory consolidation, and much more.
 
 It's fast, it's memory-efficient, it's yours to run however you want, and there's no tracking or telemetry.
 
@@ -198,7 +198,7 @@ The [Agent Client Protocol registry](https://github.com/agentclientprotocol/regi
 
 1. Fork [`agentclientprotocol/registry`](https://github.com/agentclientprotocol/registry).
 2. Create a `clawde/` folder at the repo root and drop in the prepared manifest from this repo: [`src-rust/crates/acp/registry-template/agent.json`](src-rust/crates/acp/registry-template/agent.json). Bump the `version` and release-archive URLs to match the latest GitHub release.
-3. Add `clawde/icon.svg` (16×16 recommended) — the Rustle logo from [`public/`](public/) is a fine starting point.
+3. Add `clawde/icon.svg` (16×16 recommended) — the Rustail logo from [`public/`](public/) is a fine starting point.
 4. Open a PR to the registry. The registry CI validates `agent.json` against [the schema](https://github.com/agentclientprotocol/registry/blob/main/agent.schema.json) before merge.
 
 After merge, Zed and other ACP-aware editors will pick up Clawde on their next registry refresh.
@@ -237,7 +237,7 @@ This mirrors the legal precedent established by Phoenix Technologies v. IBM (198
 
 ## Acknowledgements
 
-Clawde is a **fork of [claurst](https://github.com/Kuberwastaken/claurst)** by
+Clawde is a **fork of [clawde](https://github.com/Kuberwastaken/clawde)** by
 [Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
 agentic coding agent whose repository history and early codebase this project
 builds on. This repository carries the upstream project's git history; the

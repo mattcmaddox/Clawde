@@ -19,7 +19,7 @@ use crate::overlays::{
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
-use crate::rustle_editor::{RustleEditAction, RustleEditor};
+use crate::rustail_editor::{RustailEditAction, RustailEditor};
 use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
@@ -1415,8 +1415,8 @@ pub struct App {
     // ---- Session timing ---------------------------------------------------
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
-    /// Current Rustle pose for rendering (updated each frame).
-    pub rustle_current_pose: crate::rustle::RustlePose,
+    /// Current Rustail pose for rendering (updated each frame).
+    pub rustail_current_pose: crate::rustail::RustailPose,
 
     /// Instant the current turn's streaming began (reset each time streaming starts).
     pub turn_start: Option<std::time::Instant>,
@@ -1482,7 +1482,7 @@ pub struct App {
     pub settings_screen: SettingsScreen,
     /// Theme quick-pick overlay (/theme).
     pub theme_screen: ThemeScreen,
-    pub rustle_editor: RustleEditor,
+    pub rustail_editor: RustailEditor,
     /// Interactive theme creator + CRUD manager (/theme create).
     pub theme_creator: ThemeCreator,
     /// Current colour palette derived from the active theme.
@@ -2099,7 +2099,7 @@ impl App {
             new_messages_while_scrolled: 0,
             token_warning_threshold_shown: 0,
             session_start: std::time::Instant::now(),
-            rustle_current_pose: crate::rustle::RustlePose::Default,
+            rustail_current_pose: crate::rustail::RustailPose::Default,
 
             turn_start: None,
             last_turn_elapsed: None,
@@ -2134,7 +2134,7 @@ impl App {
             stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
-            rustle_editor: RustleEditor::new(),
+            rustail_editor: RustailEditor::new(),
             theme_creator: ThemeCreator::new(),
             palette: ColorPalette::for_theme("default"),
             stats_dialog: StatsDialogState::new(),
@@ -2238,8 +2238,8 @@ impl App {
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.clawde/ui-settings.json).  We also accept
-                // CLAURST_VOICE_ENABLED=1 as an override for easier testing.
-                let voice_on = std::env::var("CLAURST_VOICE_ENABLED")
+                // CLAWDE_VOICE_ENABLED=1 as an override for easier testing.
+                let voice_on = std::env::var("CLAWDE_VOICE_ENABLED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                     || {
@@ -2322,8 +2322,8 @@ impl App {
     /// Only enabled when the `token_budget` feature flag is active.
     #[cfg(feature = "token_budget")]
     fn load_token_budget() -> Option<u32> {
-        // First check CLAURST_TOKEN_BUDGET env var
-        if let Ok(budget_str) = std::env::var("CLAURST_TOKEN_BUDGET") {
+        // First check CLAWDE_TOKEN_BUDGET env var
+        if let Ok(budget_str) = std::env::var("CLAWDE_TOKEN_BUDGET") {
             if let Ok(budget) = budget_str.parse::<u32>() {
                 return Some(budget);
             }
@@ -2917,21 +2917,21 @@ impl App {
         self.status_message = Some(format!("Task sort: {}.", task.label()));
     }
 
-    /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
+    /// Update the Rustail pose for this frame — handles temporary poses, random blinks,
     /// and the loading spinner while streaming.
     /// Call once per frame before rendering.
     ///
     /// On the welcome screen (empty transcript) the loading animation cycles
     /// through the 6-frame mascot sequence; once a conversation starts the
     /// mascot sits in the default rest pose.
-    pub fn tick_rustle_pose(&mut self) {
+    pub fn tick_rustail_pose(&mut self) {
         if self.messages.is_empty() {
-            let anim_frame = crate::rustle::loading_frame_for_elapsed(
+            let anim_frame = crate::rustail::loading_frame_for_elapsed(
                 self.session_start.elapsed().as_millis() as u64,
             );
-            self.rustle_current_pose = crate::rustle::RustlePose::Loading { frame: anim_frame };
+            self.rustail_current_pose = crate::rustail::RustailPose::Loading { frame: anim_frame };
         } else {
-            self.rustle_current_pose = crate::rustle::RustlePose::Default;
+            self.rustail_current_pose = crate::rustail::RustailPose::Default;
         }
     }
 
@@ -3554,10 +3554,10 @@ impl App {
                 self.theme_screen.open(current);
                 true
             }
-            "rustle" => {
+            "rustail" => {
                 // In-TUI editor for the mascot animation frames; saves back
-                // into rustle.rs (rebuild required to see the change).
-                self.rustle_editor.open();
+                // into rustail.rs (rebuild required to see the change).
+                self.rustail_editor.open();
                 true
             }
             "stats" => {
@@ -3965,7 +3965,7 @@ impl App {
         self.settings_screen.close();
         self.theme_screen.close();
         self.theme_creator.close();
-        self.rustle_editor.close();
+        self.rustail_editor.close();
     }
 
     pub fn any_modal_open(&self) -> bool {
@@ -3980,7 +3980,7 @@ impl App {
             || self.settings_screen.visible
             || self.theme_screen.visible
             || self.theme_creator.visible
-            || self.rustle_editor.visible
+            || self.rustail_editor.visible
             || self.stats_dialog.visible
             || self.mcp_view.visible
             || self.agents_menu.visible
@@ -7076,14 +7076,14 @@ impl App {
             return false;
         }
 
-        // Rustle editor intercepts keys
-        if self.rustle_editor.visible {
-            if let Some(RustleEditAction::Saved) =
-                crate::rustle_editor::handle_rustle_editor_key(&mut self.rustle_editor, key)
+        // Rustail editor intercepts keys
+        if self.rustail_editor.visible {
+            if let Some(RustailEditAction::Saved) =
+                crate::rustail_editor::handle_rustail_editor_key(&mut self.rustail_editor, key)
             {
                 self.push_notification(
                     NotificationKind::Info,
-                    "Saved rustle.rs — run `clawded` to rebuild the mascot.".to_string(),
+                    "Saved rustail.rs — run `clawded` to rebuild the mascot.".to_string(),
                     None,
                 );
             }
@@ -9455,7 +9455,7 @@ impl App {
             && !self.settings_screen.visible
             && !self.theme_screen.visible
             && !self.theme_creator.visible
-            && !self.rustle_editor.visible
+            && !self.rustail_editor.visible
             && !self.free_mode_dialog.visible
             && !self.key_input_dialog.visible
             && !self.custom_provider_dialog.visible
@@ -9766,7 +9766,7 @@ impl App {
         let any_dialog = self.settings_screen.visible
             || self.theme_screen.visible
             || self.theme_creator.visible
-            || self.rustle_editor.visible
+            || self.rustail_editor.visible
             || self.stats_dialog.visible
             || self.mcp_view.visible
             || self.agents_menu.visible

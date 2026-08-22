@@ -213,7 +213,7 @@ Example:
 
 Project memory lives under `~/.clawde/projects/<project>/memory/` (the memdir
 convention; `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` overrides the whole path, and
-`CLAURST_DISABLE_AUTO_MEMORY` disables the injection). When present, the
+`CLAWDE_DISABLE_AUTO_MEMORY` disables the injection). When present, the
 `MEMORY.md` index plus the most recent `sessions/*.md` summary are injected
 into the system prompt's `<memory>` block every turn, so each session starts
 already knowing the project's architecture, conventions, and recent work.
@@ -228,7 +228,7 @@ verify without re-discovery.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory.autoMemoryEnabled` | boolean \| null | enabled | Master switch for the project-memory system (injection + auto-dream consolidation + conventions recording). `false` disables injection even when memory files exist. `null` (unset) defers to the env vars and defaults in `is_auto_memory_enabled` — note `CLAURST_DISABLE_AUTO_MEMORY=1` always wins over this setting. |
+| `memory.autoMemoryEnabled` | boolean \| null | enabled | Master switch for the project-memory system (injection + auto-dream consolidation + conventions recording). `false` disables injection even when memory files exist. `null` (unset) defers to the env vars and defaults in `is_auto_memory_enabled` — note `CLAWDE_DISABLE_AUTO_MEMORY=1` always wins over this setting. |
 | `memory.maxTokens` | integer | unset | Cap on the combined `<memory>` injection in tokens (~4 bytes per token). When the index + session summary exceed it, the summary is dropped first, then the index is clamped at a line boundary. Unset uses the built-in per-file caps (25 KB index / 4 KB summary). Snake_case keys (`auto_memory_enabled`, `max_tokens`) are also accepted. |
 
 Example:
@@ -529,9 +529,9 @@ and `api_base` override the corresponding environment variables.
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key. Checked after the `config.api_key` setting. |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL. |
-| `CLAURST_PROVIDER` | Active provider. Equivalent to `--provider`. |
-| `CLAURST_API_BASE` | Override the API base URL for the active provider. Equivalent to `--api_base`. |
-| `CLAURST_GOALS` | Set to `0` to disable the goal system (`/goal` command and `GoalCompleteTool`). |
+| `CLAWDE_PROVIDER` | Active provider. Equivalent to `--provider`. |
+| `CLAWDE_API_BASE` | Override the API base URL for the active provider. Equivalent to `--api_base`. |
+| `CLAWDE_GOALS` | Set to `0` to disable the goal system (`/goal` command and `GoalCompleteTool`). |
 | `OPENAI_API_KEY` | API key for the `openai` provider. |
 | `GOOGLE_API_KEY` | API key for the `google` provider. |
 | `GROQ_API_KEY` | API key for the `groq` provider. |
@@ -546,8 +546,8 @@ and `api_base` override the corresponding environment variables.
 | `AZURE_API_KEY` | API key for the `azure` provider. |
 | `HF_TOKEN` | Token for the `huggingface` provider. |
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
-| `CLAURST_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
-| `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
+| `CLAWDE_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
+| `CLAWDE_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
 | `RUST_LOG` | Tracing filter (e.g. `debug`, `clawde_core=trace`). |
 
 ---

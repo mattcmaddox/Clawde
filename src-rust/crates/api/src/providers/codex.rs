@@ -4,7 +4,7 @@
 //   https://chatgpt.com/backend-api/codex/responses
 //
 // Auth: Bearer token obtained via the Codex OAuth flow stored in
-//   ~/.claurst/codex_tokens.json (`CodexTokens` struct).
+//   ~/.clawde/codex_tokens.json (`CodexTokens` struct).
 //
 // Token refresh: if `expires_at` is in the past we POST to the OpenAI token
 //   endpoint with `grant_type=refresh_token` before making the request.
@@ -226,7 +226,7 @@ impl CodexProvider {
     ) -> reqwest::RequestBuilder {
         let builder = builder
             .bearer_auth(token)
-            .header("User-Agent", concat!("claurst/", env!("CARGO_PKG_VERSION")));
+            .header("User-Agent", concat!("clawde/", env!("CARGO_PKG_VERSION")));
 
         if let Some(id) = account_id {
             builder.header("ChatGPT-Account-Id", id)

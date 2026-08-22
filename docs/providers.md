@@ -828,7 +828,7 @@ OpenAI-compatible API with Mistral-specific protocol quirks (tool call ID format
 
 ### OpenRouter
 
-Unified API gateway to many models. Sends `HTTP-Referer: https://clawde.ai/` and `X-Title: Clawde` headers automatically.
+Unified API gateway to many models. Sends `HTTP-Referer: https://mattcmaddox.github.io/Clawde/` and `X-Title: Clawde` headers automatically.
 
 **Authentication:** `OPENROUTER_API_KEY` environment variable.
 

@@ -1,7 +1,7 @@
 # Refresh the bundled models.dev snapshot.
 #
 # Run this when models.dev publishes new models / pricing and you want the
-# default Claurst install to ship with the latest catalog without forcing
+# default Clawde install to ship with the latest catalog without forcing
 # every user to wait for the background network refresh.
 #
 #   pwsh scripts/sync-models.ps1
@@ -9,7 +9,7 @@
 # After running, commit the updated assets/models-snapshot.json.
 
 param(
-    [string]$Url = $env:CLAURST_MODELS_URL,
+    [string]$Url = $env:CLAWDE_MODELS_URL,
     [switch]$Force
 )
 

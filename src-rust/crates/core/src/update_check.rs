@@ -19,7 +19,7 @@ pub struct UpdateInfo {
     pub has_update: bool,
 }
 
-/// Check for a newer version of Claurst in the background.
+/// Check for a newer version of Clawde in the background.
 ///
 /// Returns `Some(UpdateInfo)` when a newer release exists on GitHub.
 /// The result is cached for `CHECK_INTERVAL_HOURS` hours so repeated

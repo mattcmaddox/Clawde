@@ -241,10 +241,10 @@ Clawde displays both to the user before marking the goal complete. The model is 
 ### Disabling the goal system
 
 ```bash
-CLAURST_GOALS=0 clawde
+CLAWDE_GOALS=0 clawde
 ```
 
-Set `CLAURST_GOALS=0` in the environment to completely disable goal-related commands and the `GoalCompleteTool`. Useful in environments where autonomous multi-turn execution is undesirable.
+Set `CLAWDE_GOALS=0` in the environment to completely disable goal-related commands and the `GoalCompleteTool`. Useful in environments where autonomous multi-turn execution is undesirable.
 
 ---
 

@@ -64,17 +64,17 @@ impl SkillIndex {
 /// Shared handle to the skill index (populated in the background).
 pub type SharedSkillIndex = Arc<RwLock<SkillIndex>>;
 
-/// Scan `project_root` for skill definitions in `.claurst/skills/` and the bundled
+/// Scan `project_root` for skill definitions in `.clawde/skills/` and the bundled
 /// skill list, build the index, and store it in `index`.
 ///
 /// This runs as a `tokio::task::spawn` parallel to model streaming.
 pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
     let mut local = SkillIndex::default();
 
-    // 1. User-defined skills: <claurst home>/skills/*.md + {project_root}/.claurst/skills/*.md
+    // 1. User-defined skills: <clawde home>/skills/*.md + {project_root}/.clawde/skills/*.md
     let search_dirs: Vec<std::path::PathBuf> = vec![
         clawde_core::config::Settings::config_dir().join("skills"),
-        project_root.join(".claurst").join("skills"),
+        project_root.join(".clawde").join("skills"),
     ];
 
     for dir in &search_dirs {

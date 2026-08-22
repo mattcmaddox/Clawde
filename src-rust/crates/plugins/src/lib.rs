@@ -190,7 +190,7 @@ pub fn run_global_post_tool_hook(
 ///
 /// Search order:
 /// 1. `~/.clawde/plugins/`  (user-global)
-/// 2. `<project_dir>/.claurst/plugins/`  (project-local)
+/// 2. `<project_dir>/.clawde/plugins/`  (project-local)
 /// 3. Any paths listed in `extra_paths`
 ///
 /// Returns a fully populated `PluginRegistry`.  Errors encountered during
@@ -660,7 +660,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let plugin_dir = tmp
             .path()
-            .join(".claurst")
+            .join(".clawde")
             .join("plugins")
             .join("test-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();

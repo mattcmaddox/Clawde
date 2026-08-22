@@ -172,8 +172,8 @@ $ARGUMENTS
 
 Settings files are in:
 - User:    ~/.clawde/settings.json
-- Project: .claurst/settings.json
-- Local:   .claurst/settings.local.json
+- Project: .clawde/settings.json
+- Local:   .clawde/settings.local.json
 
 Read the relevant files before making any changes."#,
         allowed_tools: Some(&["Read", "Grep", "Glob"]),
@@ -276,21 +276,21 @@ a status table. When all agents have reported, print a final summary."#,
     // -----------------------------------------------------------------------
     BundledSkill {
         name: "update-config",
-        description: "Configure Claurst settings (hooks, permissions, env vars, behaviours) via settings.json.",
+        description: "Configure Clawde settings (hooks, permissions, env vars, behaviours) via settings.json.",
         aliases: &["config-update", "settings"],
         when_to_use: Some("When the user wants to configure automated behaviours, permissions, or settings."),
         argument_hint: Some("<what to configure>"),
         prompt_template: r#"# Update Config Skill
 
-Modify Claurst configuration by updating settings.json files.
+Modify Clawde configuration by updating settings.json files.
 
 ## Settings File Locations
 
 | File | Scope | Use For |
 |------|-------|---------|
 | `~/.clawde/settings.json` | Global | Personal preferences for all projects |
-| `.claurst/settings.json` | Project | Team-wide hooks, permissions, plugins |
-| `.claurst/settings.local.json` | Project (local) | Personal overrides for this project |
+| `.clawde/settings.json` | Project | Team-wide hooks, permissions, plugins |
+| `.clawde/settings.local.json` | Project (local) | Personal overrides for this project |
 
 Settings load in order: user → project → local (later overrides earlier).
 

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAURST_MUTED};
+use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAWDE_MUTED};
 use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
@@ -301,7 +301,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         let search_line = modal_search_line_with_insert(
             &state.search_query,
             "Type to filter sessions...",
-            CLAURST_MUTED,
+            CLAWDE_MUTED,
             Color::Cyan,
             state.vim_search.insert,
         );

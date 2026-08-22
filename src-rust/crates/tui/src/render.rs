@@ -41,8 +41,8 @@ use crate::overlays::{
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::prompt_input::{input_height, render_prompt_input, InputMode, TypeaheadSource, VimMode};
-use crate::rustle::rustle_lines;
-use crate::rustle_editor::render_rustle_editor;
+use crate::rustail::rustail_lines;
+use crate::rustail_editor::render_rustail_editor;
 use crate::session_branching::render_session_branching;
 use crate::session_browser::render_session_browser;
 use crate::settings_screen::render_settings_screen;
@@ -654,7 +654,7 @@ fn reset_render_caches() {
 
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
-    // Sync the thread-local palette so all CLAURST_* constants resolve to
+    // Sync the thread-local palette so all CLAWDE_* constants resolve to
     // the active theme without threading `app` through every sub-function.
     // While the theme creator's editor is open, the whole UI (creator modal
     // included) is themed by the work-in-progress palette so colour
@@ -820,9 +820,9 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_theme_creator(frame, &app.theme_creator, size);
     }
 
-    // Rustle mascot editor overlay
-    if app.rustle_editor.visible {
-        render_rustle_editor(frame, &app.rustle_editor, size);
+    // Rustail mascot editor overlay
+    if app.rustail_editor.visible {
+        render_rustail_editor(frame, &app.rustail_editor, size);
     }
 
     if app.stats_dialog.visible {
@@ -2131,7 +2131,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Welcome back!".to_string()
     };
-    let rustle = rustle_lines(&app.rustle_current_pose);
+    let rustail = rustail_lines(&app.rustail_current_pose);
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(
         welcome_msg,
@@ -2145,7 +2145,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // Center mascot in left column
     let mascot_indent = left_w.saturating_sub(29) / 2;
     let pad = " ".repeat(mascot_indent as usize);
-    for cl in &rustle {
+    for cl in &rustail {
         let mut spans = vec![Span::raw(pad.clone())];
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));

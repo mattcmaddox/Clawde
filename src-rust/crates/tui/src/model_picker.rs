@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAURST_PANEL_BG};
+use crate::overlays::{centered_rect, modal_search_line_with_insert, CLAWDE_PANEL_BG};
 use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
@@ -1390,7 +1390,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     let _pink = Color::Rgb(233, 30, 99);
     let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = CLAURST_PANEL_BG;
+    let dialog_bg = CLAWDE_PANEL_BG;
     let highlight_bg = Color::Rgb(233, 30, 99);
     let highlight_fg = Color::White;
 

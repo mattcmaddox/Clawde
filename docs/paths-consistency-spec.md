@@ -214,7 +214,7 @@ Clawde has two distinct memory systems with different storage locations and purp
 
 | Aspect | Details |
 |--------|---------|
-| **Location** | `{project_root}/.claurst/AGENTS.md` (local) or `{project_root}/AGENTS.md` (project) |
+| **Location** | `{project_root}/.clawde/AGENTS.md` (local) or `{project_root}/AGENTS.md` (project) |
 | **Purpose** | Project-specific instructions, team-shared knowledge |
 | **Committed to git?** | Yes (or gitignored) |
 | **Keyed on** | Project root (git root or cwd) |
@@ -363,7 +363,7 @@ This is the root cause of the stats/transcripts divergence: transcripts use git 
    │ (local)        │  │ (global)        │  │ (global)         │
    │                │  │                 │  │                  │
    │ {project_root} │  │ ~/.clawde/      │  │ ~/.clawde/       │
-   │ /.claurst/     │  │ projects/<enc>  │  │ projects/<enc>/  │
+   │ /.clawde/     │  │ projects/<enc>  │  │ projects/<enc>/  │
    │ AGENTS.md      │  │ /memory/        │  │ {session}.jsonl  │
    └────────────────┘  └─────────────────┘  └──────────────────┘
             │                    │                     │

@@ -3,7 +3,7 @@
 // Port of src/services/remoteManagedSettings/index.ts
 //
 // Fetches enterprise-managed settings from Anthropic's API, caches them to
-// ~/.claurst/remote-settings.json, and polls every hour in the background.
+// ~/.clawde/remote-settings.json, and polls every hour in the background.
 // Fails open — if the fetch fails, the app continues without remote settings.
 //
 // Eligibility:
@@ -58,7 +58,7 @@ impl Default for RemoteSettingsConfig {
     }
 }
 
-/// On-disk cache structure stored in ~/.claurst/remote-settings.json.
+/// On-disk cache structure stored in ~/.clawde/remote-settings.json.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RemoteSettingsCache {
     /// The cached settings object (may be empty `{}`).
@@ -382,7 +382,7 @@ pub fn merge_remote_into_local(local: &Value, remote: &Value) -> Value {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the canonical claurst home directory.
+/// Return the canonical clawde home directory.
 fn claude_config_dir() -> PathBuf {
     crate::config::Settings::config_dir()
 }

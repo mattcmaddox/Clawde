@@ -15,12 +15,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::theme_colors::current_palette;
 use crate::vim_search::VimSearch;
 
-pub const CLAURST_ACCENT: Color = Color::Rgb(233, 30, 99);
-pub const CLAURST_PANEL_BG: Color = Color::Rgb(20, 20, 28);
-pub const CLAURST_PANEL_BORDER: Color = Color::Rgb(72, 72, 80);
-pub const CLAURST_TEXT: Color = Color::Rgb(235, 235, 240);
-pub const CLAURST_MUTED: Color = Color::Rgb(110, 110, 118);
-pub const CLAURST_OVERLAY_BG: Color = Color::Rgb(10, 10, 14);
+pub const CLAWDE_ACCENT: Color = Color::Rgb(233, 30, 99);
+pub const CLAWDE_PANEL_BG: Color = Color::Rgb(20, 20, 28);
+pub const CLAWDE_PANEL_BORDER: Color = Color::Rgb(72, 72, 80);
+pub const CLAWDE_TEXT: Color = Color::Rgb(235, 235, 240);
+pub const CLAWDE_MUTED: Color = Color::Rgb(110, 110, 118);
+pub const CLAWDE_OVERLAY_BG: Color = Color::Rgb(10, 10, 14);
 
 // ---------------------------------------------------------------------------
 // Geometry helper (shared)
@@ -53,7 +53,7 @@ pub fn render_dark_overlay_buf(buf: &mut Buffer, area: Rect) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(CLAURST_OVERLAY_BG);
+                cell.set_bg(CLAWDE_OVERLAY_BG);
                 cell.set_fg(p.disabled);
             }
         }
@@ -166,12 +166,12 @@ pub fn modal_title_line(title: &str, right_hint: &str) -> Line<'static> {
         Span::styled(
             format!(" {}", title),
             Style::default()
-                .fg(CLAURST_TEXT)
+                .fg(CLAWDE_TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  {}", right_hint),
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         ),
     ])
 }
@@ -2282,8 +2282,8 @@ pub fn render_keybindings_overlay(
     let search_line = modal_search_line_with_insert(
         &state.filter,
         "Filter keybindings...",
-        CLAURST_MUTED,
-        CLAURST_TEXT,
+        CLAWDE_MUTED,
+        CLAWDE_TEXT,
         state.vim_search.insert,
     );
     if let Some(search_area) = modal_header_line_area(layout.header_area, 2) {
@@ -2442,10 +2442,10 @@ pub fn render_keybindings_overlay(
                 Span::styled(
                     format!("{:<25}", chord),
                     Style::default()
-                        .fg(CLAURST_TEXT)
+                        .fg(CLAWDE_TEXT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(label.to_string(), Style::default().fg(CLAURST_MUTED)),
+                Span::styled(label.to_string(), Style::default().fg(CLAWDE_MUTED)),
             ]));
         }
     }
@@ -2454,7 +2454,7 @@ pub fn render_keybindings_overlay(
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  No matching keybindings.",
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         )));
     }
 
@@ -2476,7 +2476,7 @@ pub fn render_keybindings_overlay(
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((scroll, 0))
-            .style(Style::default().bg(CLAURST_PANEL_BG)),
+            .style(Style::default().bg(CLAWDE_PANEL_BG)),
         content_area,
     );
 
@@ -2489,7 +2489,7 @@ pub fn render_keybindings_overlay(
         Paragraph::new(Line::from(Span::styled(
             footer_text,
             Style::default()
-                .fg(CLAURST_MUTED)
+                .fg(CLAWDE_MUTED)
                 .add_modifier(Modifier::ITALIC),
         ))),
         layout.footer_area,
@@ -2540,7 +2540,7 @@ mod tests {
 
     #[test]
     fn modal_search_line_separates_leading_space_from_cursor() {
-        let line = modal_search_line("", "Search", CLAURST_MUTED, CLAURST_TEXT);
+        let line = modal_search_line("", "Search", CLAWDE_MUTED, CLAWDE_TEXT);
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[0].content.as_ref(), " ");
         assert_eq!(line.spans[1].content.as_ref(), "S");

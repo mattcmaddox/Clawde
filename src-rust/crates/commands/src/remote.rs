@@ -65,10 +65,10 @@ impl SlashCommand for RemoteControlCommand {
                     .map(|h| h.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "(unknown host)".to_string());
 
-                let bridge_url = std::env::var("CLAURST_BRIDGE_URL")
+                let bridge_url = std::env::var("CLAWDE_BRIDGE_URL")
                     .unwrap_or_else(|_| "https://claude.ai".to_string());
 
-                let token_status = if std::env::var("CLAURST_BRIDGE_TOKEN").is_ok()
+                let token_status = if std::env::var("CLAWDE_BRIDGE_TOKEN").is_ok()
                     || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
                 {
                     "configured via environment variable"
@@ -121,7 +121,7 @@ impl SlashCommand for RemoteControlCommand {
                      How to connect\n\
                      ──────────────\n\
                      1. Obtain a session token from claude.ai (Settings → Remote Control)\n\
-                     2. Set it:  export CLAURST_BRIDGE_TOKEN=<your-token>\n\
+                     2. Set it:  export CLAWDE_BRIDGE_TOKEN=<your-token>\n\
                      3. Enable:  /remote-control start\n\
                      4. Restart Clawde — the bridge will connect automatically\n\
                      5. Open {bridge_url}/claude-code in your browser\n\
@@ -144,9 +144,9 @@ impl SlashCommand for RemoteControlCommand {
                 if let Err(e) = save_settings_mutation(|s| s.remote_control_at_startup = true) {
                     return CommandResult::Error(format!("Failed to save settings: {}", e));
                 }
-                let bridge_url = std::env::var("CLAURST_BRIDGE_URL")
+                let bridge_url = std::env::var("CLAWDE_BRIDGE_URL")
                     .unwrap_or_else(|_| "https://claude.ai".to_string());
-                let token_note = if std::env::var("CLAURST_BRIDGE_TOKEN").is_ok()
+                let token_note = if std::env::var("CLAWDE_BRIDGE_TOKEN").is_ok()
                     || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
                 {
                     "Session token detected in environment — bridge will connect on next start."
@@ -155,7 +155,7 @@ impl SlashCommand for RemoteControlCommand {
                     format!(
                         "No session token found.\n\
                          Get a token from {bridge_url} (Settings → Remote Control)\n\
-                         then run:  export CLAURST_BRIDGE_TOKEN=<token>",
+                         then run:  export CLAWDE_BRIDGE_TOKEN=<token>",
                         bridge_url = bridge_url
                     )
                 };

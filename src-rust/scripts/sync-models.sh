@@ -2,7 +2,7 @@
 # Refresh the bundled models.dev snapshot.
 #
 # Run this when models.dev publishes new models / pricing and you want the
-# default Claurst install to ship with the latest catalog without forcing
+# default clawde install to ship with the latest catalog without forcing
 # every user to wait for the background network refresh.
 #
 #   ./scripts/sync-models.sh
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-URL="${CLAURST_MODELS_URL:-${MODELS_DEV_URL:-https://models.dev/api.json}}"
+URL="${CLAWDE_MODELS_URL:-${MODELS_DEV_URL:-https://models.dev/api.json}}"
 FORCE="${FORCE:-0}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

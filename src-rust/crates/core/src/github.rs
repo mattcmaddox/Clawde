@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Canonical GitHub repository ("owner/repo"). The single source of truth —
-/// call sites that used the pre-rename `kuberwastaken/claurst` path are
+/// call sites that used the pre-rename `kuberwastaken/clawde` path are
 /// migrated here so update checks hit the renamed repo.
 pub const GITHUB_REPO: &str = "mattcmaddox/Clawde";
 

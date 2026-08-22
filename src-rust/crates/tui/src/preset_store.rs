@@ -1,7 +1,7 @@
 // preset_store.rs — Read/write named animation presets to disk so the
-// /rustle editor can manage multiple animation variants.
+// /rustail editor can manage multiple animation variants.
 //
-// Each preset lives as `<name>.json` in `$CLAWDE_HOME/rustle-presets/`.  The
+// Each preset lives as `<name>.json` in `$CLAWDE_HOME/rustail-presets/`.  The
 // active preset name is tracked in `_active` (a plain-text file containing
 // just the name).
 
@@ -10,12 +10,12 @@ use std::path::PathBuf;
 
 use clawde_core::paths::clawde_home;
 
-use crate::rustle;
+use crate::rustail;
 
 /// Filename of the active-preset marker.
 const ACTIVE_FILE: &str = "_active";
 
-/// Default preset name used when seeding from rustle.rs.
+/// Default preset name used when seeding from rustail.rs.
 const DEFAULT_NAME: &str = "default";
 
 /// On-disk shape of a single frame.
@@ -43,9 +43,9 @@ pub fn ensure_seed() {
         let _ = fs::create_dir_all(&dir);
     }
     let active = active_preset();
-    // Seed "default" from the current rustle.rs frames if nothing exists.
+    // Seed "default" from the current rustail.rs frames if nothing exists.
     if !preset_exists(&active) {
-        let frames = rustle::rustle_frames_owned();
+        let frames = rustail::rustail_frames_owned();
         let _ = write_preset_inner(&active, &frames);
     }
 }
@@ -137,7 +137,7 @@ pub fn set_active(name: &str) {
 
 /// Root of the preset store on disk.
 fn presets_dir() -> PathBuf {
-    clawde_home().join("rustle-presets")
+    clawde_home().join("rustail-presets")
 }
 
 fn preset_path(name: &str) -> PathBuf {

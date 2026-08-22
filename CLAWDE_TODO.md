@@ -10,14 +10,11 @@
 
 ## 🔴 P0 — Critical
 
-### [legacy] Legacy ~/.claurst/ backward compat tested
-- [x] Test that existing users with `~/.claurst/` dirs are properly detected
-- [x] Test that `$CLAURST_HOME` env var still works (or document that it was renamed to `$CLAWDE_HOME`)
-- [x] Auto-migration: `config_dir()` now renames `~/.claurst/` to `~/.clawde/` on first run when the legacy dir exists but the new dir doesn't.
-  - Implemented in `Settings::config_dir()` (lib.rs:1749-1775)
-  - `std::fs::rename` is atomic on same filesystem; graceful fallback to legacy path on error
-  - Test: `clawde_home_migrates_legacy_claurst_dir` verifies the rename + file content survival
-  - Test: `test_legacy_claurst_fallback` updated to reflect auto-migration behavior
+### [legacy] Legacy `~/.claurst/` backward compat REMOVED
+- [x] Legacy `~/.claurst/` auto-migration and fallback were removed entirely (full rename, no backward compat)
+  - `Settings::config_dir()` no longer renames or falls back to any legacy dir
+  - Project-level settings scan checks `.clawde/` only
+  - Migration tests (`clawde_home_migrates_legacy_clawde_dir`, `test_legacy_clawde_fallback`) deleted
 
 ### [tools] Grep tool UTF-8 safety
 - [x] The `grep_tool.rs` `content` field — verified intentional, used in `content_lines` Display impl
@@ -26,7 +23,7 @@
 ### [tests] Env guard discipline
 - [x] Audited all env-mutating test sites across the workspace (see report below)
 - [x] Made `ENV_LOCK` in `paths.rs` `pub(crate)` and re-exported at module level
-- [x] Fixed `core/src/lib.rs`: added ENV_LOCK to 4 test functions (3 ANTHROPIC_API_KEY tests + test_legacy_claurst_fallback)
+- [x] Fixed `core/src/lib.rs`: added ENV_LOCK to 4 test functions (3 ANTHROPIC_API_KEY tests + test_legacy_clawde_fallback)
 - [x] Fixed `core/src/accounts.rs`: switched from local `HOME_LOCK` to shared `ENV_LOCK`
 - [x] Fixed `core/src/share_export/mod.rs`: added ENV_LOCK to `viewer_url_default_and_override`
 - [x] Fixed `mcp/src/lib.rs`: added local `ENV_LOCK` + locks to 5 env-mutating tests
@@ -104,7 +101,7 @@ All six gaps identified in the auto-compact research have been implemented and t
 
 ### [docs] Create Cargo.toml descriptions
 - [x] Added descriptions to all 10 crates: api, bridge, buddy, cli, commands, core, mcp, query, tools, tui
-- [x] Fixed "Claurst" -> "Clawde" in acp and plugins crate descriptions
+- [x] Fixed "Clawde" -> "Clawde" in acp and plugins crate descriptions
 
 ### [docs] Spec/documentation drift
 - [x] Added historical reference banner to `spec/INDEX.md` noting specs describe the original TypeScript codebase
@@ -120,14 +117,14 @@ All six gaps identified in the auto-compact research have been implemented and t
 - [x] Added `--test-threads=1` with comment about env var mutation races
 - [x] Restored clippy (Linux only, -D warnings) and rustfmt (advisory, continue-on-error)
 
-### [branding] Claurst -> Clawde rename completeness
-- [x] Renamed config directory from `~/.claurst/` to `~/.clawde/` with backward compat fallback
-- [x] Renamed env var from `$CLAURST_HOME` to `$CLAWDE_HOME`
+### [branding] claurst -> clawde rename completeness
+- [x] Config directory `~/.clawde/`, env vars `$CLAWDE_HOME`, `CLAWDE_GOALS`, `CLAWDE_COORDINATOR_MODE`
+- [x] Project-level `.clawde/` directory is now the only location (AGENTS.md, skills, commands, settings.local.json)
 - [x] Updated all `docs/*.md`, `index.html`, `session/index.html`, `.devcontainer`, install scripts
 - [x] Updated `scripts/bump-version.py`, `.github/workflows/*.yml`
 - [x] Updated `npm/install.js`, `npm/package.json`
 - [x] Updated all Cargo.toml references (crate names, dependencies)
-- [x] Updated project-level settings scanner to check `.clawde/settings.json` first with `.claurst/` fallback
+- [x] Removed legacy `.clawde/` fallback from project-level settings scanner
 - [x] Updated `AGENTS.md` tmux session names, crate test commands, etc.
 - [x] Renamed .deb references in CLAWDE_TODO.md
 
@@ -416,11 +413,11 @@ Marked as `[EXPERIMENTAL]` in the README. May be unstable or incomplete:
 
 2. **Large monorepo compilation:** The workspace has many crates depending on each other, causing long compilation times even for small changes. The `Cargo.lock` has 1000+ entries.
 
-3. **Cargo.lock churn:** The lockfile has been modified extensively during the claurst->clawde rename. A fresh `cargo update` and `cargo generate-lockfile` may be needed to stabilize it.
+3. **Cargo.lock churn:** The lockfile has been modified extensively during the clawde->clawde rename. A fresh `cargo update` and `cargo generate-lockfile` may be needed to stabilize it.
 
 4. **CI workflow restored:** The `.github/workflows/ci.yml` was restored from a single-Ubuntu check back to a 3-platform matrix (Ubuntu, macOS, Windows) with clippy + fmt checks and serial test execution (`--test-threads=1`). The original simplification lost the multi-platform coverage.
 
-5. **Cargo.toml descriptions added:** All 10 workspace crates now have `description` fields. Updated "Claurst" -> "Clawde" in acp and plugins crate descriptions.
+5. **Cargo.toml descriptions added:** All 10 workspace crates now have `description` fields. Updated "Clawde" -> "Clawde" in acp and plugins crate descriptions.
 
 6. **Untracked files cleaned up:**
    - `CLAWDE_REFERENCE.md` — tracked, comprehensive architecture reference

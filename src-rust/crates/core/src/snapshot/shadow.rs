@@ -19,7 +19,7 @@ struct GitResult {
 
 /// A shadow git repository that stores worktree state as git tree objects
 /// (no commits, no branches).  Stored outside the user's repo at
-/// `~/.claurst/data/snapshot/<project_hash>/<worktree_hash>/`.
+/// `~/.clawde/data/snapshot/<project_hash>/<worktree_hash>/`.
 pub struct ShadowSnapshot {
     /// Path to the shadow bare gitdir.
     gitdir: PathBuf,
@@ -33,14 +33,14 @@ impl ShadowSnapshot {
     /// Create a `ShadowSnapshot` for `working_dir`, or return `None` when
     /// git is not on PATH or the directory is not inside a git repository.
     pub fn for_session(working_dir: &Path) -> Option<Self> {
-        let data_root = dirs::data_dir()?.join("claurst").join("snapshot");
+        let data_root = dirs::data_dir()?.join("clawde").join("snapshot");
         Self::for_session_in(working_dir, &data_root)
     }
 
     /// Like `for_session` but roots the shadow gitdir under an explicit
     /// `data_root` instead of the user's data directory. Lets tests (and
     /// sandboxed builds with no writable HOME) stage a hermetic snapshot
-    /// store in a tempdir rather than writing under `~/.claurst`.
+    /// store in a tempdir rather than writing under `~/.clawde`.
     pub fn for_session_in(working_dir: &Path, data_root: &Path) -> Option<Self> {
         if which::which("git").is_err() {
             warn!("snapshot: git not on PATH, disabled");

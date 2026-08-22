@@ -2,9 +2,9 @@
 //! on disk and (optionally) from git URLs.
 //!
 //! Search priority (first match wins for a given skill name):
-//!   1. Project `.claurst/skills/` — walk up from `cwd`
+//!   1. Project `.clawde/skills/` — walk up from `cwd`
 //!   2. Project `.agents/skills/`  — walk up from `cwd`
-//!   3. Global `~/.claurst/skills/`
+//!   3. Global `~/.clawde/skills/`
 //!   4. Configured extra paths from `SkillsConfig.paths`
 //!   5. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
 
@@ -162,7 +162,7 @@ pub fn discover_skills(
     {
         let mut dir: &Path = cwd;
         loop {
-            add(scan_dir(&dir.join(".claurst").join("skills")));
+            add(scan_dir(&dir.join(".clawde").join("skills")));
             add(scan_dir(&dir.join(".agents").join("skills")));
             match dir.parent() {
                 Some(parent) if parent != dir => dir = parent,
@@ -171,7 +171,7 @@ pub fn discover_skills(
         }
     }
 
-    // ---- 2. Global skills: <claurst home>/skills/ ---------------------------
+    // ---- 2. Global skills: <clawde home>/skills/ ---------------------------
     add(scan_dir(
         &crate::config::Settings::config_dir().join("skills"),
     ));
@@ -208,11 +208,11 @@ pub fn discover_skills(
 
 /// Clone or reuse a cached git repo and return skills found in it.
 ///
-/// Cache location: `<system-cache>/claurst/skills/<repo-name>/`
+/// Cache location: `<system-cache>/clawde/skills/<repo-name>/`
 /// On first access the repo is cloned with `--depth=1`.
 /// Subsequent calls use the already-cloned cache directory as-is.
 fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
-    let cache_dir = dirs::cache_dir()?.join("claurst").join("skills");
+    let cache_dir = dirs::cache_dir()?.join("clawde").join("skills");
 
     // Use the last path segment of the URL as the local directory name.
     let repo_name = url.split('/').next_back()?.trim_end_matches(".git");
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn test_discover_from_project_dir() {
         let tmp = make_temp_dir();
-        let skills_dir = tmp.path().join(".claurst").join("skills");
+        let skills_dir = tmp.path().join(".clawde").join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
         write_file(
             &skills_dir,
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn test_discover_deduplicates_first_wins() {
         let tmp = make_temp_dir();
-        let proj_skills = tmp.path().join(".claurst").join("skills");
+        let proj_skills = tmp.path().join(".clawde").join("skills");
         std::fs::create_dir_all(&proj_skills).unwrap();
         write_file(
             &proj_skills,

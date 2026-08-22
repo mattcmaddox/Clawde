@@ -1,6 +1,6 @@
-//! Canonical filesystem locations for claurst.
+//! Canonical filesystem locations for Clawde.
 //!
-//! Everything claurst persists lives under a single root directory. This module
+//! Everything Clawde persists lives under a single root directory. This module
 //! exposes the one resolver ([`clawde_home`]) that the whole workspace routes
 //! through, so the home-dir precedence (see [`crate::config::Settings::config_dir`])
 //! is defined in exactly one place.
@@ -15,15 +15,14 @@ use std::path::PathBuf;
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The canonical claurst home directory — the single source of truth for where
-/// claurst keeps its data. Thin wrapper over
+/// The canonical Clawde home directory — the single source of truth for where
+/// Clawde keeps its data. Thin wrapper over
 /// [`crate::config::Settings::config_dir`]; prefer this at call sites that only
 /// need the root path.
 ///
-/// Resolution precedence (issue #207 — XDG support, back-compatible):
+/// Resolution precedence (issue #207 — XDG support):
 /// 1. `$CLAWDE_HOME` if set and non-empty (verbatim).
-/// 2. Legacy `~/.clawde` if it already exists.
-/// 3. `$XDG_CONFIG_HOME/clawde` (when absolute) else `~/.config/clawde`.
+/// 2. `$XDG_CONFIG_HOME/clawde` (when absolute) else `~/.config/clawde`.
 pub fn clawde_home() -> PathBuf {
     crate::config::Settings::config_dir()
 }
@@ -160,45 +159,5 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
         assert_eq!(super::clawde_home(), Settings::config_dir());
         assert_eq!(super::clawde_home(), PathBuf::from(tmp.path()));
-    }
-
-    /// Auto-migration: when `~/.clawde` doesn't exist but `~/.claurst` does,
-    /// `config_dir()` renames the legacy dir to the new name on first run.
-    #[test]
-    fn clawde_home_migrates_legacy_claurst_dir() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvGuard::new();
-        let home = tempfile::tempdir().unwrap();
-
-        // Create legacy dir with a settings file.
-        let legacy = home.path().join(".claurst");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("settings.json"), "{\"auto_compact\":true}").unwrap();
-
-        std::env::set_var("HOME", home.path());
-
-        let new = home.path().join(".clawde");
-        assert!(!new.exists(), "~/.clawde must not exist before migration");
-
-        let resolved = Settings::config_dir();
-
-        // After migration, ~/.clawde exists and contains the settings file.
-        assert!(new.is_dir(), "~/.clawde must exist after migration");
-        assert!(
-            new.join("settings.json").exists(),
-            "settings.json must be in the migrated dir"
-        );
-        assert_eq!(resolved, new, "config_dir must return the migrated path");
-        assert!(
-            !legacy.exists(),
-            "~/.claurst must not exist after migration"
-        );
-
-        // Verify file content survived the rename.
-        let content = std::fs::read_to_string(new.join("settings.json")).unwrap();
-        assert_eq!(
-            content, "{\"auto_compact\":true}",
-            "file content must survive migration"
-        );
     }
 }

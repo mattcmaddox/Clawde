@@ -1,24 +1,92 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "f5680254d43a29872384fe2f8b69b962622bd4390403c4c203299c86fe41e825",
+  "source_sha256": "1433c37827159498b47805209044f99bf584214f3f5550a7b10f352f14e7d99c",
   "upstreams": [
-    {"id": "github-copilot", "title": "GitHub Copilot", "default_model": "gpt-4o-2024-11-20"},
-    {"id": "huggingface", "title": "Hugging Face", "default_model": "meta-llama/Llama-3.3-70B-Instruct"},
-    {"id": "nvidia", "title": "NVIDIA NIM", "default_model": "meta/llama-3.3-70b-instruct"},
-    {"id": "cerebras", "title": "Cerebras", "default_model": "gpt-oss-120b"},
-    {"id": "google", "title": "Google Gemini", "default_model": "gemini-2.5-flash"},
-    {"id": "cloudflare", "title": "Cloudflare Workers AI", "default_model": "@cf/qwen/qwen3-30b-a3b-fp8"},
-    {"id": "groq", "title": "Groq", "default_model": "openai/gpt-oss-120b"},
-    {"id": "sambanova", "title": "SambaNova", "default_model": "Meta-Llama-3.3-70B-Instruct"},
-    {"id": "cline", "title": "Cline", "default_model": "deepseek/deepseek-v4-flash"},
-    {"id": "mistral", "title": "Mistral", "default_model": "labs-devstral-small-2512"},
-    {"id": "cohere", "title": "Cohere", "default_model": "north-mini-code-1-0"},
-    {"id": "opencode-zen", "title": "OpenCode Zen", "default_model": "deepseek-v4-flash-free"},
-    {"id": "zai", "title": "Z.AI", "default_model": "glm-4.7"},
-    {"id": "openrouter", "title": "OpenRouter", "default_model": "openrouter/free"}
+    {
+      "id": "github-copilot",
+      "title": "GitHub Copilot",
+      "default_model": "gpt-4o-2024-11-20"
+    },
+    {
+      "id": "huggingface",
+      "title": "Hugging Face",
+      "default_model": "meta-llama/Llama-3.3-70B-Instruct"
+    },
+    {
+      "id": "nvidia",
+      "title": "NVIDIA NIM",
+      "default_model": "meta/llama-3.3-70b-instruct"
+    },
+    {
+      "id": "cerebras",
+      "title": "Cerebras",
+      "default_model": "gpt-oss-120b"
+    },
+    {
+      "id": "google",
+      "title": "Google Gemini",
+      "default_model": "gemini-2.5-flash"
+    },
+    {
+      "id": "cloudflare",
+      "title": "Cloudflare Workers AI",
+      "default_model": "@cf/qwen/qwen3-30b-a3b-fp8"
+    },
+    {
+      "id": "groq",
+      "title": "Groq",
+      "default_model": "openai/gpt-oss-120b"
+    },
+    {
+      "id": "sambanova",
+      "title": "SambaNova",
+      "default_model": "Meta-Llama-3.3-70B-Instruct"
+    },
+    {
+      "id": "cline",
+      "title": "Cline",
+      "default_model": "deepseek/deepseek-v4-flash"
+    },
+    {
+      "id": "mistral",
+      "title": "Mistral",
+      "default_model": "labs-devstral-small-2512"
+    },
+    {
+      "id": "cohere",
+      "title": "Cohere",
+      "default_model": "north-mini-code-1-0"
+    },
+    {
+      "id": "opencode-zen",
+      "title": "OpenCode Zen",
+      "default_model": "deepseek-v4-flash-free"
+    },
+    {
+      "id": "zai",
+      "title": "Z.AI",
+      "default_model": "glm-4.7"
+    },
+    {
+      "id": "openrouter",
+      "title": "OpenRouter",
+      "default_model": "openrouter/free"
+    }
   ],
   "ids": [
-    "github-copilot", "huggingface", "nvidia", "cerebras", "google", "cloudflare", "groq",
-    "sambanova", "cline", "mistral", "cohere", "opencode-zen", "zai", "openrouter"
+    "github-copilot",
+    "huggingface",
+    "nvidia",
+    "cerebras",
+    "google",
+    "cloudflare",
+    "groq",
+    "sambanova",
+    "cline",
+    "mistral",
+    "cohere",
+    "opencode-zen",
+    "zai",
+    "openrouter"
   ]
 }

@@ -14,7 +14,7 @@
 //! Layout:
 //!
 //! ```text
-//! ~/.claurst/
+//! ~/.clawde/
 //!   accounts.json                              # registry (this module)
 //!   accounts/
 //!     anthropic/<profile-id>/oauth_tokens.json
@@ -84,7 +84,7 @@ pub struct ProviderAccounts {
     pub profiles: BTreeMap<String, AccountProfile>,
 }
 
-/// On-disk shape of `~/.claurst/accounts.json`.
+/// On-disk shape of `~/.clawde/accounts.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountRegistry {
     /// Schema version (current: 1).
@@ -100,9 +100,9 @@ fn default_version() -> u32 {
 }
 
 impl AccountRegistry {
-    /// Path to `~/.claurst/accounts.json`.
+    /// Path to `~/.clawde/accounts.json`.
     pub fn path() -> PathBuf {
-        claurst_dir().join("accounts.json")
+        clawde_dir().join("accounts.json")
     }
 
     /// Load the registry. Returns an empty registry if the file is missing or
@@ -254,14 +254,14 @@ pub fn ensure_unique_profile_id(registry: &AccountRegistry, provider: &str, base
     }
 }
 
-/// The canonical claurst home directory.
-pub fn claurst_dir() -> PathBuf {
+/// The canonical clawde home directory.
+pub fn clawde_dir() -> PathBuf {
     crate::config::Settings::config_dir()
 }
 
-/// `~/.claurst/accounts/<provider>/<id>/`.
+/// `~/.clawde/accounts/<provider>/<id>/`.
 pub fn account_dir(provider: &str, id: &str) -> PathBuf {
-    claurst_dir().join("accounts").join(provider).join(id)
+    clawde_dir().join("accounts").join(provider).join(id)
 }
 
 /// File where the per-account Anthropic OAuth tokens live.
@@ -277,7 +277,7 @@ pub fn codex_token_path(profile_id: &str) -> PathBuf {
 /// Backup directory for the previous live token file (rotated on each switch).
 #[allow(dead_code)]
 pub fn backup_dir(provider: &str) -> PathBuf {
-    claurst_dir()
+    clawde_dir()
         .join("accounts")
         .join(provider)
         .join(".backups")
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn account_paths_are_under_claurst_dir() {
+    fn account_paths_are_under_clawde_dir() {
         let p = anthropic_token_path("work");
         assert!(p.ends_with("accounts/anthropic/work/oauth_tokens.json"));
         let c = codex_token_path("personal");

@@ -1,4 +1,4 @@
-/// clawde-buddy: Tamagotchi/Buddy companion system for Claurst.
+/// clawde-buddy: Tamagotchi/Buddy companion system for Clawde.
 ///
 /// Ported from src/buddy/ (TypeScript). All bones (species, rarity, stats,
 /// eye, hat, shiny) are deterministically derived from the user-ID via a

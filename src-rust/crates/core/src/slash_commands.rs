@@ -91,7 +91,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "resume", description: "Resume a previous session", category: "Session", tui_only: false },
     PromptCommand { name: "review", description: "Review changes (git diff)", category: "Review & History", tui_only: false },
     PromptCommand { name: "rewind", description: "Rewind to an earlier turn", category: "Review & History", tui_only: false },
-    PromptCommand { name: "rustle", description: "Edit the Rustle mascot animation frames", category: "Tools", tui_only: true },
+    PromptCommand { name: "rustail", description: "Edit the Rustail mascot animation frames", category: "Tools", tui_only: true },
     PromptCommand { name: "session", description: "Browse and manage sessions", category: "Session", tui_only: false },
     PromptCommand { name: "settings", description: "Open settings", category: "Workspace", tui_only: false },
     PromptCommand { name: "share", description: "Upload the current session as a secret gist and get a shareable URL", category: "Review & History", tui_only: false },

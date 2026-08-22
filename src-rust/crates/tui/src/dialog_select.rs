@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 
 use crate::overlays::{
     centered_rect, modal_search_line_with_insert, render_dark_overlay, render_dialog_bg,
-    CLAURST_PANEL_BG,
+    CLAWDE_PANEL_BG,
 };
 use crate::vim_search::VimSearch;
 
@@ -200,7 +200,7 @@ pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: 
     }
 
     let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = CLAURST_PANEL_BG;
+    let dialog_bg = CLAWDE_PANEL_BG;
     let highlight_bg = Color::Rgb(233, 30, 99); // pink highlight bar
     let highlight_fg = Color::White;
     let category_fg = Color::Rgb(233, 30, 99); // pink category names

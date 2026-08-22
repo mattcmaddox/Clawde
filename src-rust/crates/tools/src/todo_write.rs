@@ -389,7 +389,7 @@ mod tests {
             "todos_path should embed the session id"
         );
         // Route the assertion through the same canonical resolver instead of
-        // hardcoding `.claurst`: the todos file must live under the resolved
+        // hardcoding `.clawde`: the todos file must live under the resolved
         // Clawde home (which may be ~/.clawde, $CLAWDE_HOME, or the XDG dir).
         let home = clawde_core::config::Settings::config_dir();
         assert!(

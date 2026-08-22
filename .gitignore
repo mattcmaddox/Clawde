@@ -28,7 +28,6 @@ src-rust/crates/api/tests/fixtures/
 
 # VSCode / unsolicited devcontainers mounts
 .vscode/
-.claurst/
 .clawde/
 *.deb
 

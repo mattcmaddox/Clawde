@@ -67,19 +67,19 @@ impl SlashCommand for MemoryCommand {
            /memory init         — seed architecture/conventions/decisions/tasks + MEMORY.md\n\
            /memory undo         — reverse the most recent conflict resolution\n\n\
          Locations checked (in priority order):\n\
-           1. <project>/.claurst/AGENTS.md\n\
+           1. <project>/.clawde/AGENTS.md\n\
            2. <project>/AGENTS.md\n\
            3. ~/.clawde/AGENTS.md  (global)\n\n\
          Use /init to create a new AGENTS.md from a template."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let project_claude_dir = ctx.working_dir.join(".claurst").join("AGENTS.md");
+        let project_claude_dir = ctx.working_dir.join(".clawde").join("AGENTS.md");
         let project_root = ctx.working_dir.join("AGENTS.md");
         let global_path = clawde_core::config::Settings::config_dir().join("AGENTS.md");
 
         let locations = [
-            ("project (.claurst/AGENTS.md)", project_claude_dir.clone()),
+            ("project (.clawde/AGENTS.md)", project_claude_dir.clone()),
             ("project (AGENTS.md)", project_root.clone()),
             ("global (~/.clawde/AGENTS.md)", global_path.clone()),
         ];
@@ -162,7 +162,7 @@ impl SlashCommand for MemoryCommand {
                 "global" => ("global (~/.clawde/AGENTS.md)", global_path.clone()),
                 _ => {
                     if project_claude_dir.exists() {
-                        ("project (.claurst/AGENTS.md)", project_claude_dir.clone())
+                        ("project (.clawde/AGENTS.md)", project_claude_dir.clone())
                     } else {
                         ("project (AGENTS.md)", project_root.clone())
                     }

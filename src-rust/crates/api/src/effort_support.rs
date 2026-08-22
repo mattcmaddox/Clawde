@@ -10,7 +10,7 @@
 //! module resolves the fields opencode keys off — the provider's npm SDK
 //! package, the model's catalog id, its `release_date`, its provider id, and its
 //! `reasoning` capability — from the [`ModelRegistry`] and hands them to the
-//! port. `Ultracode`, claurst's always-last workflow overlay (not an opencode
+//! port. `Ultracode`, clawde's always-last workflow overlay (not an opencode
 //! tier), is appended by [`supported_efforts`].
 
 use crate::model_registry::canonical_snapshot_key;
@@ -23,7 +23,7 @@ const DEFAULT_NPM: &str = "@ai-sdk/openai-compatible";
 
 /// The reasoning-effort tiers a model exposes, ascending (weakest→strongest),
 /// exactly as opencode's `variants()` would — with **no** `Ultracode` appended
-/// and **no** claurst base augmentation.
+/// and **no** clawde base augmentation.
 ///
 /// This is the raw ladder the /model picker cycles through: empty for a
 /// non-reasoning model (no effort selector), otherwise the model's real tiers.
@@ -97,8 +97,8 @@ fn family_variant_ladder(
 ///   tiers for that model (e.g. an Opus 4.7+ gets `Low, Medium, High, XHigh,
 ///   Max`; a plain older `gpt-5` gets `Minimal, Low, Medium, High`; `gpt-5-pro`
 ///   gets just `High`).
-/// - **Non-reasoning models** (opencode `variants()` == `{}`) still get claurst's
-///   temperature-differentiated base ladder `Low, Medium, High`, because claurst
+/// - **Non-reasoning models** (opencode `variants()` == `{}`) still get clawde's
+///   temperature-differentiated base ladder `Low, Medium, High`, because clawde
 ///   also uses the effort level to drive temperature / prompt shaping.
 /// - `Ultracode` is appended in every case — it is a workflow overlay on top of
 ///   whatever top reasoning the model can do.
@@ -386,10 +386,8 @@ mod tests {
         // reasoning=true still gets a non-empty raw ladder.
         let mut registry = ModelRegistry::new();
         let json = r#"{"acme":{"id":"acme","name":"Acme","npm":"@ai-sdk/openai-compatible","models":{"reasoner-x":{"id":"reasoner-x","name":"Reasoner X","reasoning":true,"limit":{"context":200000,"output":64000}},"plain-y":{"id":"plain-y","name":"Plain Y","reasoning":false,"limit":{"context":128000,"output":32000}}}}}"#;
-        let path = std::env::temp_dir().join(format!(
-            "claurst_effort_support_{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("clawde_effort_support_{}.json", std::process::id()));
         std::fs::write(&path, json).expect("write temp catalog");
         registry.load_cache(&path);
         let _ = std::fs::remove_file(&path);

@@ -2,7 +2,7 @@
 
 # Clawde
 
-<img src="../public/Ship.png" alt="Rustle on the ship" width="350" />
+<img src="../public/Ship.png" alt="Rustail on the ship" width="350" />
 
 Clawde is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
@@ -205,7 +205,7 @@ See [Slash Commands](commands) for the complete reference.
 
 ## Acknowledgements
 
-Clawde is a fork of [claurst](https://github.com/Kuberwastaken/claurst) by
+Clawde is a fork of [clawde](https://github.com/Kuberwastaken/clawde) by
 [Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
 project whose repository history and early codebase this repository builds on.
 The current Rust implementation was written from the behavioral specification

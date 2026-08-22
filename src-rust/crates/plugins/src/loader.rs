@@ -2,7 +2,7 @@
 ///
 /// Scan order (matches TS precedence):
 /// 1. `~/.clawde/plugins/<name>/`  — user-global plugins
-/// 2. `<project>/.claurst/plugins/<name>/`  — project-local plugins
+/// 2. `<project>/.clawde/plugins/<name>/`  — project-local plugins
 /// 3. Extra paths from `settings.plugin_paths` (if the field exists)
 ///
 /// Each plugin directory must contain a `plugin.json` or `plugin.toml`
@@ -21,9 +21,9 @@ pub fn default_user_plugins_dir() -> Option<PathBuf> {
     Some(clawde_core::config::Settings::config_dir().join("plugins"))
 }
 
-/// Return the project-level plugins directory: `<project>/.claurst/plugins`.
+/// Return the project-level plugins directory: `<project>/.clawde/plugins`.
 pub fn project_plugins_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".claurst").join("plugins")
+    project_dir.join(".clawde").join("plugins")
 }
 
 // ---------------------------------------------------------------------------

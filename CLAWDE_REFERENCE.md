@@ -10,9 +10,9 @@ chat forking, memory consolidation, sub-agent delegation, and much more.
 **Version:** 0.1.8  
 **License:** GPL-3.0  
 **Repository:** https://github.com/mattcmaddox/Clawde  
-**Binary:** `clawde` (formerly `claurst`)  
+**Binary:** `clawde` (formerly `clawde`)  
 **Derived from:** [Kuberwastaken/claurst](https://github.com/Kuberwastaken/claurst) (fork; upstream history + early codebase)  
-**Config directory:** `~/.clawde/` (legacy: `~/.claurst/` fallback)
+**Config directory:** `~/.clawde/`
 
 ---
 
@@ -78,7 +78,7 @@ authentication, and utility infrastructure.
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Central re-export hub. Re-exports `Settings`, `Config`, `Message`, `ContentBlock`, `Role`, `ProviderId`, `PermissionManager`, `CostTracker`, etc. |
-| `paths.rs` | Config directory resolution. `clawde_home()` -> `Settings::config_dir()`. Precedence: `$CLAWDE_HOME` > `~/.clawde/` > `~/.claurst/` (legacy) > XDG |
+| `paths.rs` | Config directory resolution. `clawde_home()` -> `Settings::config_dir()`. Precedence: `$CLAWDE_HOME` > `~/.clawde/` > `$XDG_CONFIG_HOME/clawde/` |
 | `provider_id.rs` | ~50 `ProviderId` constants (`ANTHROPIC`, `OPENAI`, `GOOGLE`, etc.) as branded string newtypes |
 | `settings_sync.rs` | Settings sync with claude.ai: keys `SYNC_KEY_USER_SETTINGS`, `SYNC_KEY_USER_MEMORY` |
 | `keybindings.rs` | Configurable keybinding system. `KeyContext`, `ParsedKeystroke`, `Chord`, `ParsedBinding` |
@@ -501,7 +501,7 @@ Ratatui-based terminal user interface.
 | `effort_picker.rs` | Effort level selector |
 | `session_browser.rs` | Session history browser |
 | `theme_colors.rs` | Theme/color system |
-| `rustle.rs` | Rustle companion character |
+| `rustail.rs` | Rustail companion character |
 | `voice_capture.rs` | Voice recording UI |
 | `session_branching.rs` | Chat fork/branch UI |
 | `mcp_view.rs` | MCP server management view |
@@ -595,8 +595,7 @@ custom approval UIs. `PermissionManager` stores rules persistently.
 ```rust
 $CLAWDE_HOME (if set)
   -> ~/.clawde/ (if exists)
-    -> ~/.claurst/ (legacy, if exists)
-      -> $XDG_CONFIG_HOME/clawde/ or ~/.config/clawde/
+    -> $XDG_CONFIG_HOME/clawde/ or ~/.config/clawde/
 ```
 
 ### 6. Effort Levels
@@ -798,7 +797,7 @@ repeating the same warning level.
 ### Naming
 - Crates: `clawde-core`, `clawde-api`, `clawde-cli`, etc.
 - Provider IDs: `pub const ANTHROPIC: &str = "anthropic";`
-- Config dir: `$CLAWDE_HOME`, `~/.clawde/`, legacy `~/.claurst/`
+- Config dir: `$CLAWDE_HOME`, `~/.clawde/`, `$XDG_CONFIG_HOME/clawde/`
 - Binary: `clawde`
 
 ### Testing Patterns

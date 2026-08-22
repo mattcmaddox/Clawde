@@ -45,7 +45,7 @@ use ratatui::Frame;
 
 use clawde_api::{FreeUpstream, FREE_CATALOG};
 
-use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_PANEL_BG};
 use crate::vim_search::VimSearch;
 use std::cell::Cell;
 
@@ -922,7 +922,7 @@ pub fn render_free_mode_dialog(
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let tip = Color::Rgb(120, 210, 150);
-    let dialog_bg = CLAURST_PANEL_BG;
+    let dialog_bg = CLAWDE_PANEL_BG;
 
     render_dark_overlay(frame, area);
 
@@ -1356,7 +1356,7 @@ fn render_delete_confirm(frame: &mut Frame, state: &FreeModeDialogState, area: R
         ]),
     ];
 
-    let para = Paragraph::new(lines).bg(CLAURST_PANEL_BG);
+    let para = Paragraph::new(lines).bg(CLAWDE_PANEL_BG);
     frame.render_widget(para, inner);
 }
 

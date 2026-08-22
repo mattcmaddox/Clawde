@@ -1,4 +1,4 @@
-// clawde-api: Anthropic API client with streaming SSE support for Claurst
+// clawde-api: Anthropic API client with streaming SSE support for Clawde
 // Rust port.
 //
 // Handles:
@@ -673,7 +673,7 @@ pub mod client {
         /// Make an OAuth request look like Claude Code: prepend the
         /// `x-anthropic-billing-header` block (`system[0]`) then the
         /// `"You are Claude Code…"` identity block (`system[1]`), and strip
-        /// Claurst's own attribution so the official identity is the only one the
+        /// Clawde's own attribution so the official identity is the only one the
         /// server sees. No-op for API-key auth.
         fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
             if !self.is_oauth() {
@@ -692,11 +692,11 @@ pub mod client {
             let identity_block =
                 text_block(clawde_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
 
-            // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
+            // Drop a leading "You are Clawde…" / "You are a Claude agent…" line:
             // the injected official identity must be the only one the server sees.
             let strip_attr = |text: &str| -> String {
                 let t = text.trim_start();
-                if t.starts_with("You are Claurst") || t.starts_with("You are a Claude agent") {
+                if t.starts_with("You are Clawde") || t.starts_with("You are a Claude agent") {
                     if let Some(i) = t.find("\n\n") {
                         return t[i + 2..].to_string();
                     }

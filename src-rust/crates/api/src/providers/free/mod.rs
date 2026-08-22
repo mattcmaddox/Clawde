@@ -9,7 +9,7 @@
 //
 // Inspired by https://github.com/tashfeenahmed/freellmapi — the same
 // "aggregate the free tiers from many providers behind one OpenAI-
-// compatible endpoint" idea, ported into claurst's native provider
+// compatible endpoint" idea, ported into clawde's native provider
 // trait.
 //
 // Routing:

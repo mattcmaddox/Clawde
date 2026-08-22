@@ -99,8 +99,7 @@ impl SlashCommand for GoalCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if !clawde_core::goals_enabled() {
             return CommandResult::Message(
-                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable."
-                    .to_string(),
+                "Goals are disabled. Unset CLAWDE_GOALS=0 (or remove it) to re-enable.".to_string(),
             );
         }
 

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::overlays::{CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BORDER, CLAURST_TEXT};
+use crate::overlays::{CLAWDE_ACCENT, CLAWDE_MUTED, CLAWDE_PANEL_BORDER, CLAWDE_TEXT};
 use unicode_width::UnicodeWidthStr;
 
 /// Severity / visual style of a notification.
@@ -115,7 +115,7 @@ use ratatui::Frame;
 impl NotificationKind {
     pub fn color(&self) -> Color {
         match self {
-            NotificationKind::Info => CLAURST_ACCENT,
+            NotificationKind::Info => CLAWDE_ACCENT,
             NotificationKind::Warning => Color::Yellow,
             NotificationKind::Error => Color::Red,
             NotificationKind::Success => Color::Rgb(80, 200, 120),
@@ -208,12 +208,12 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
             icon_with_spaces.clone(),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(message, Style::default().fg(CLAURST_TEXT)),
+        Span::styled(message, Style::default().fg(CLAWDE_TEXT)),
     ];
     if notif.dismissible {
         row0_spans.push(Span::styled(
             esc_hint.to_string(),
-            Style::default().fg(CLAURST_MUTED),
+            Style::default().fg(CLAWDE_MUTED),
         ));
     }
 
@@ -233,13 +233,13 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
         let empty: String = " ".repeat(inner_w.saturating_sub(bar_w));
         Line::from(vec![
             Span::styled(format!(" {}", filled), Style::default().fg(color)),
-            Span::styled(empty, Style::default().fg(CLAURST_MUTED)),
+            Span::styled(empty, Style::default().fg(CLAWDE_MUTED)),
             Span::raw(" "),
         ])
     } else {
         Line::from(Span::styled(
             format!(" {}", "─".repeat(inner_w)),
-            Style::default().fg(CLAURST_PANEL_BORDER),
+            Style::default().fg(CLAWDE_PANEL_BORDER),
         ))
     };
 
@@ -285,7 +285,7 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
                 if toast_area.y + row < buf.area().bottom() {
                     if let Some(cell) = buf.cell_mut((right_x, toast_area.y + row)) {
                         cell.set_bg(bg);
-                        cell.set_fg(CLAURST_PANEL_BORDER);
+                        cell.set_fg(CLAWDE_PANEL_BORDER);
                         cell.set_char('▐');
                     }
                 }

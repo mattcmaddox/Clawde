@@ -17,13 +17,13 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryScope {
-    /// `~/.claurst/rules/*.md` — global managed policy.
+    /// `~/.clawde/rules/*.md` — global managed policy.
     Managed,
-    /// `~/.claurst/AGENTS.md` — user-level memory.
+    /// `~/.clawde/AGENTS.md` — user-level memory.
     User,
     /// `{project_root}/AGENTS.md` — project-level memory.
     Project,
-    /// `{project_root}/.claurst/AGENTS.md` — local override.
+    /// `{project_root}/.clawde/AGENTS.md` — local override.
     Local,
 }
 
@@ -240,10 +240,10 @@ fn load_scope_files(dir: &Path, scope: MemoryScope, files: &mut Vec<MemoryFileIn
 pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
     let mut files = Vec::new();
 
-    // 1. Managed: <claurst home>/rules/*.md
+    // 1. Managed: <clawde home>/rules/*.md
     {
-        let claurst = crate::config::Settings::config_dir();
-        let rules_dir = claurst.join("rules");
+        let clawde = crate::config::Settings::config_dir();
+        let rules_dir = clawde.join("rules");
         if let Ok(entries) = std::fs::read_dir(&rules_dir) {
             let mut paths: Vec<PathBuf> = entries
                 .flatten()
@@ -264,16 +264,16 @@ pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
             }
         }
 
-        // 2. User: <claurst home>/AGENTS.md then <claurst home>/CLAUDE.md
-        load_scope_files(&claurst, MemoryScope::User, &mut files);
+        // 2. User: <clawde home>/AGENTS.md then <clawde home>/CLAUDE.md
+        load_scope_files(&clawde, MemoryScope::User, &mut files);
     }
 
     // 3. Project: {project_root}/AGENTS.md then {project_root}/CLAUDE.md
     load_scope_files(project_root, MemoryScope::Project, &mut files);
 
-    // 4. Local: {project_root}/.claurst/AGENTS.md then {project_root}/.claurst/CLAUDE.md
+    // 4. Local: {project_root}/.clawde/AGENTS.md then {project_root}/.clawde/CLAUDE.md
     load_scope_files(
-        &project_root.join(".claurst"),
+        &project_root.join(".clawde"),
         MemoryScope::Local,
         &mut files,
     );

@@ -2607,7 +2607,7 @@ pub fn commands_from_settings(config: &Config) -> Vec<Box<dyn SlashCommand>> {
 }
 
 // ---------------------------------------------------------------------------
-// Discovered skill commands (from .claurst/skills/ and git URLs)
+// Discovered skill commands (from .clawde/skills/ and git URLs)
 // ---------------------------------------------------------------------------
 
 /// A slash command backed by a discovered skill markdown file.
@@ -2706,7 +2706,7 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
         return Some(tc.execute(args, ctx).await);
     }
 
-    // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
+    // Check discovered skill commands (from .clawde/skills/, git URLs, etc.).
     {
         let discovered = clawde_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
         if let Some(skill) = discovered.get(cmd_name) {

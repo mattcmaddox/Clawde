@@ -25,13 +25,13 @@ impl SlashCommand for SkillsCommand {
         vec!["skill"]
     }
     fn description(&self) -> &str {
-        "List available skills in .claurst/commands/"
+        "List available skills in .clawde/commands/"
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut found: Vec<String> = Vec::new();
         let dirs = [
-            ctx.working_dir.join(".claurst").join("commands"),
+            ctx.working_dir.join(".clawde").join("commands"),
             clawde_core::config::Settings::config_dir().join("commands"),
         ];
 
@@ -80,13 +80,13 @@ impl SlashCommand for SkillsCommand {
             }
         }
 
-        // Include discovered skills from .claurst/skills/ and configured paths/URLs.
+        // Include discovered skills from .clawde/skills/ and configured paths/URLs.
         let discovered = clawde_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
 
         let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
-                "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
-                 Example: .claurst/commands/review.md"
+                "No skills found.\nCreate .md files in .clawde/commands/ to define skills.\n\
+                 Example: .clawde/commands/review.md"
                     .to_string(),
             );
         } else if found.is_empty() {

@@ -557,7 +557,7 @@ clawde --provider openai --model gpt-4o "your prompt"
 OLLAMA_HOST=http://gpu-host.example:11434 clawde --provider ollama --model llama3.2 "your prompt"
 
 # Or via environment variable
-CLAURST_PROVIDER=google clawde "your prompt"
+CLAWDE_PROVIDER=google clawde "your prompt"
 ```
 
 ---

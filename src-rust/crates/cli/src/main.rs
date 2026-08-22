@@ -3581,8 +3581,8 @@ async fn run_interactive(
         }
 
         app.frame_count = app.frame_count.wrapping_add(1);
-        app.tick_rustle_pose();
-        app.rustle_editor.tick_blink();
+        app.tick_rustail_pose();
+        app.rustail_editor.tick_blink();
         app.notifications.tick();
 
         // Process file injection dialog outcome (if any)
@@ -7699,7 +7699,7 @@ mod continuation_mode_tests {
     //! verify events were ever emitted (verified across all 40 Phase 1 trials).
     use super::*;
 
-    // goals_enabled() reads the CLAURST_GOALS env var, so tests that flip it
+    // goals_enabled() reads the CLAWDE_GOALS env var, so tests that flip it
     // must serialize on a local mutex to avoid racing other env-dependent
     // tests in the same binary.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -7708,12 +7708,12 @@ mod continuation_mode_tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var_os("CLAURST_GOALS");
-        std::env::set_var("CLAURST_GOALS", if goals { "1" } else { "0" });
+        let prev = std::env::var_os("CLAWDE_GOALS");
+        std::env::set_var("CLAWDE_GOALS", if goals { "1" } else { "0" });
         f();
         match prev {
-            Some(value) => std::env::set_var("CLAURST_GOALS", value),
-            None => std::env::remove_var("CLAURST_GOALS"),
+            Some(value) => std::env::set_var("CLAWDE_GOALS", value),
+            None => std::env::remove_var("CLAWDE_GOALS"),
         }
     }
 

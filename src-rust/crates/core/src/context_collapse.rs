@@ -150,7 +150,7 @@ fn summarize_messages(messages: Vec<Message>, _max_tokens: u64) -> (Vec<Message>
     (result, dropped)
 }
 
-/// Persist collapse state to ~/.claurst/context_collapse_state.json
+/// Persist collapse state to ~/.clawde/context_collapse_state.json
 #[cfg(feature = "cached_microcompact")]
 #[allow(dead_code)]
 pub fn save_collapse_state(_session_id: &str, state: &CollapseState) -> anyhow::Result<()> {
@@ -162,7 +162,7 @@ pub fn save_collapse_state(_session_id: &str, state: &CollapseState) -> anyhow::
     Ok(())
 }
 
-/// Load collapse state from ~/.claurst/context_collapse_state.json
+/// Load collapse state from ~/.clawde/context_collapse_state.json
 #[cfg(feature = "cached_microcompact")]
 #[allow(dead_code)]
 pub fn load_collapse_state(_session_id: &str) -> Option<CollapseState> {

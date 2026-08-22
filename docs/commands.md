@@ -841,7 +841,7 @@ Manage memory files: the AGENTS.md instruction files that provide project contex
 
 AGENTS.md locations checked (in priority order):
 
-1. `<project>/.claurst/AGENTS.md`
+1. `<project>/.clawde/AGENTS.md`
 2. `<project>/AGENTS.md`
 3. `~/.clawde/AGENTS.md`  (global)
 
@@ -851,7 +851,7 @@ session summary are injected into the system prompt's `<memory>` block each
 turn, so the model starts every session already knowing the project's
 architecture, conventions, and recent work. The auto-dream consolidation
 pass maintains these files automatically; `/memory status` shows their
-state. Disable the injection with the `CLAURST_DISABLE_AUTO_MEMORY` env var.
+state. Disable the injection with the `CLAWDE_DISABLE_AUTO_MEMORY` env var.
 
 ---
 
@@ -973,7 +973,7 @@ Set a durable multi-turn autonomous goal. When a goal is active, Clawde continue
 /goal complete                       — request a completion audit
 ```
 
-When the model believes the goal has been achieved, it calls the `GoalComplete` tool with an audit summary and evidence. Goals can be disabled globally by setting `CLAURST_GOALS=0` in your environment.
+When the model believes the goal has been achieved, it calls the `GoalComplete` tool with an audit summary and evidence. Goals can be disabled globally by setting `CLAWDE_GOALS=0` in your environment.
 
 See [Goal System](./advanced.md#goal-system) in the advanced guide.
 

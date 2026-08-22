@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::cell::Cell;
 
-use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAURST_PANEL_BG};
+use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_PANEL_BG};
 use crate::vim_search::VimSearch;
 
 // ---------------------------------------------------------------------------
@@ -165,7 +165,7 @@ pub fn render_key_input_dialog(
 
     let pink = Color::Rgb(233, 30, 99);
     let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = CLAURST_PANEL_BG;
+    let dialog_bg = CLAWDE_PANEL_BG;
 
     // ── Darken the entire background ──
     render_dark_overlay(frame, area);

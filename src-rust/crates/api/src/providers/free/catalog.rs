@@ -78,7 +78,7 @@ pub(crate) fn local_quota_for(id: &str) -> Option<LocalQuota> {
 
 /// One upstream provider in the free-mode chain.
 ///
-/// `id` is the canonical claurst `ProviderId` string — the auth store key the
+/// `id` is the canonical clawde `ProviderId` string — the auth store key the
 /// dialog writes to, and the prefix the user types for `<id>/<model>` pinning.
 #[derive(Debug, Clone, Copy)]
 pub struct FreeUpstream {

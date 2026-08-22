@@ -155,7 +155,7 @@ pub mod overlays;
 pub mod paste_viewer;
 /// Plugin hint/recommendation UI.
 pub mod plugin_views;
-/// Named animation preset store ($CLAWDE_HOME/rustle-presets/).
+/// Named animation preset store ($CLAWDE_HOME/rustail-presets/).
 pub mod preset_store;
 /// Complete prompt input with vim mode, history, typeahead, and paste handling.
 pub mod prompt_input;
@@ -163,10 +163,10 @@ pub mod prompt_input;
 pub mod render;
 /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
 pub mod routing_dialog;
-/// Rustle mascot rendering.
-pub mod rustle;
-/// In-TUI pixel editor for the Rustle mascot animation (/rustle).
-pub mod rustle_editor;
+/// Rustail mascot rendering.
+pub mod rustail;
+/// In-TUI pixel editor for the Rustail mascot animation (/rustail).
+pub mod rustail_editor;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 /// Session browser overlay (/session, /resume, /rename, /export).
