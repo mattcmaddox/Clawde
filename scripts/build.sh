@@ -347,7 +347,10 @@ release() {
     command -v gh >/dev/null 2>&1 || die "gh CLI is required for releases."
     local files=() name
     for f in "$DIST_DIR"/*; do
-        [[ -f "$f" ]] && files+=("$(basename "$f")")
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        [[ "$name" == "RELEASE_NOTES.md" ]] && continue  # used as the body, not an asset
+        files+=("$name")
     done
     echo ":: Creating GitHub release $version ..."
     (cd "$DIST_DIR" && gh release create "$version" --repo "$REPO" \
