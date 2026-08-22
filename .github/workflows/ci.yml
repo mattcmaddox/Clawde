@@ -40,8 +40,8 @@ jobs:
           components: clippy, rustfmt
 
       # ALSA headers for the voice feature's cpal dependency (same setup as
-      # release.yml). cmake — required by btls-sys/BoringSSL via wreq — is
-      # preinstalled on all GitHub-hosted runners.
+      # the release build in scripts/build.sh). cmake — required by
+      # btls-sys/BoringSSL via wreq — is preinstalled on all GitHub-hosted runners.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -104,7 +104,7 @@ jobs:
       - name: Build debug binary for TUI probe
         if: runner.os == 'Linux'
         working-directory: src-rust
-        run: cargo build --locked --package clawde
+        run: cargo build --locked --package clawde-cli
 
       - name: TUI permission smoke probe
         if: runner.os == 'Linux'

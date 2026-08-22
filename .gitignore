@@ -32,3 +32,6 @@ src-rust/crates/api/tests/fixtures/
 .clawde/
 *.deb
 
+
+# Release packaging output (scripts/build.sh package/release)
+dist/

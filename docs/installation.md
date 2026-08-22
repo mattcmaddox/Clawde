@@ -208,10 +208,10 @@ git clone https://github.com/mattcmaddox/Clawde.git
 cd clawde/src-rust
 
 # Debug build (fast to compile, larger binary, extra runtime checks)
-cargo build --package clawde
+cargo build --package clawde-cli
 
 # Release build (optimised, smaller, suitable for everyday use)
-cargo build --release --package clawde
+cargo build --release --package clawde-cli
 ```
 
 The release binary is placed at:
@@ -250,22 +250,28 @@ sudo pacman -S alsa-lib openssl
 To enable a feature:
 
 ```bash
-cargo build --release --package clawde --features voice
-cargo build --release --package clawde --features dev_full
+cargo build --release --package clawde-cli --features voice
+cargo build --release --package clawde-cli --features dev_full
 ```
 
 ### Cross-compiling for Linux aarch64
 
-The release workflow uses [cross](https://github.com/cross-rs/cross) for
-aarch64 Linux builds. To reproduce it locally:
+Use `scripts/build.sh`, the single source of truth for building and
+releasing clawde (see `docs/build-release-refactor-spec.md`). It builds
+ARM64 Linux via [cross](https://github.com/cross-rs/cross) under Docker,
+which manages the sysroot, OpenSSL, and ALSA headers automatically:
 
 ```bash
+# one-time cross install
 cargo install cross --git https://github.com/cross-rs/cross
-cd src-rust
-cross build --release --locked --package clawde --target aarch64-unknown-linux-gnu
-```
 
-`cross` manages the Docker sysroot, OpenSSL, and ALSA headers automatically.
+# build the ARM64 Linux leg
+scripts/build.sh build-one linux-aarch64
+
+# build every leg this machine can, or package + publish a release
+scripts/build.sh build-all
+scripts/build.sh release --version vX.Y.Z --dry-run
+```
 
 ---
 

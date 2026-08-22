@@ -7,44 +7,26 @@ on:
         description: 'Version to publish (e.g., v0.1.1). Must already exist as a GitHub Release.'
         required: true
         type: string
-  workflow_run:
-    workflows: ['Release']
-    types: [completed]
 
 permissions:
   contents: read
   id-token: write
 
-# Belt-and-suspenders: release.yml dispatches us explicitly because
-# `workflow_run` is unreliable when the upstream `Release` run was itself
-# triggered by a GITHUB_TOKEN workflow_dispatch. If both paths happen to
-# fire for the same release, this static concurrency group serializes them
-# — the first one publishes, the second waits and then no-ops (or errors
-# benignly at `npm publish` because the version is already on the registry).
-# Releases are version-monotonic so blanket serialisation is safe; there
-# isn't a scenario where two concurrent publishes should both succeed.
+# Dispatched by `scripts/build.sh release` (via `gh workflow run`) after the
+# GitHub Release exists; can also be run manually from the Actions UI. The
+# static concurrency group serializes any accidental double-dispatch — the
+# second run no-ops benignly because the version is already on the registry.
 concurrency:
   group: npm-publish
   cancel-in-progress: false
 
 jobs:
   npm-publish:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     name: Publish clawde to npm
 
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'workflow_dispatch'
-
-      - uses: actions/checkout@v4
-        if: github.event_name == 'workflow_run'
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v6

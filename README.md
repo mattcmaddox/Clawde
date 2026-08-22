@@ -113,7 +113,7 @@ Each archive contains a single `clawde` (or `clawde.exe`) binary. Extract it and
 ```bash
 git clone https://github.com/mattcmaddox/Clawde.git
 cd clawde/src-rust
-cargo build --release --package clawde
+cargo build --release --package clawde-cli
 
 # Binary is at target/release/clawde
 ```
@@ -122,7 +122,7 @@ cargo build --release --package clawde
 
 ```bash
 # Build without voice/microphone support — no libasound2-dev required
-cargo build --release --package clawde --no-default-features
+cargo build --release --package clawde-cli --no-default-features
 ```
 
 ## First run

@@ -180,7 +180,15 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ## Releasing
 
-Clawde uses a **single workspace version** stamped across every surface (Cargo workspace, Cargo.lock entries for the 12 `clawde*` crates, `npm/package.json`, README badge, docs, ACP registry template). Versioning is forward-only — the release workflow refuses to ship a tag less than or equal to the highest existing tag.
+Clawde uses a **single workspace version** stamped across every surface (Cargo workspace, Cargo.lock entries for the 12 `clawde*` crates, `npm/package.json`, README badge, docs, ACP registry template). Versioning is forward-only — every fix cuts a new version; tags are never force-moved.
+
+Releases are driven from the local machine by `scripts/build.sh` (the single source of truth — see `docs/build-release-refactor-spec.md`):
+
+```bash
+scripts/build.sh release --version vX.Y.Z
+```
+
+This stamps the version (`scripts/bump-version.py`), commits + pushes the bump, builds every platform leg this machine can (native + cross via Docker; macOS/Windows legs are built by running the same script on those machines and copying `dist/` artifacts in), packages archives + `SHA256SUMS` into `dist/`, publishes a GitHub Release via `gh release create`, and dispatches the npm publish workflow. Use `--dry-run` to preview without side effects.
 
 ## **CRITICAL** Git Rules for Parallel Agents
 
@@ -206,7 +214,8 @@ These can destroy other agents' work:
 - `git stash` — stashes ALL changes including other agents' work
 - `git add -A` / `git add .` — stages other agents' uncommitted work
 - `git commit --no-verify` — bypasses required checks; never allowed
-- Force-push to `main` — never allowed; the patch-release workflow is the only thing that may force-move tags, and it does so via the workflow runner, not from your shell
+- Force-push to `main` — never allowed
+- Force-moving a git tag — never allowed; every fix cuts a new version via `scripts/build.sh release --version vX.Y.Z`
 
 ### Safe Workflow
 
