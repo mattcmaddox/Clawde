@@ -1143,6 +1143,20 @@ pub mod config {
         if !matches!(parsed.scheme(), "http" | "https") {
             return None;
         }
+        // Ollama's native API and OpenAI-compatible API use sibling paths
+        // (`/api/...` and `/v1/...`). Arbitrary prefixes would require a
+        // structured endpoint type so each path can be joined correctly; the
+        // supported proxy configuration forwards Ollama at the root instead.
+        if !parsed.path().is_empty() && parsed.path() != "/" {
+            return None;
+        }
+        if parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return None;
+        }
         let hostname = parsed.host_str()?.to_ascii_lowercase();
         if !allow_local && matches!(hostname.as_str(), "localhost" | "localhost.localdomain") {
             return None;
@@ -3806,6 +3820,22 @@ pub mod config {
                 base
             );
             assert_eq!(normalize_ollama_host("http://gpu.example.test:11434"), base);
+        }
+
+        #[test]
+        fn normalize_ollama_rejects_unsupported_path_and_url_components() {
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/proxy"),
+                None
+            );
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434?token=secret"),
+                None
+            );
+            assert_eq!(
+                normalize_ollama_host("http://user:pass@gpu.example.test:11434"),
+                None
+            );
         }
 
         #[test]

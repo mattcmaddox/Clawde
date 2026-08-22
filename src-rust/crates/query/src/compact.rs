@@ -1817,10 +1817,7 @@ const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 ///
 /// When the same file is read more than once in the conversation, replaces
 /// all but the last read with `[Content shown N time(s); showing last occurrence only]`.
-#[allow(dead_code)]
-pub fn collapse_read_tool_results(
-    messages: Vec<clawde_core::types::Message>,
-) -> Vec<clawde_core::types::Message> {
+pub fn collapse_read_tool_results(messages: &mut [clawde_core::types::Message]) {
     use clawde_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashMap;
 
@@ -1834,7 +1831,7 @@ pub fn collapse_read_tool_results(
 
     // First pass: find all file-read tool results and count by fingerprint.
     let mut read_counts: HashMap<String, usize> = HashMap::new();
-    for msg in &messages {
+    for msg in messages.iter() {
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 if let ContentBlock::ToolResult { content, .. } = block {
@@ -1848,42 +1845,35 @@ pub fn collapse_read_tool_results(
 
     // Second pass: replace intermediate (non-last) occurrences.
     let mut seen: HashMap<String, usize> = HashMap::new();
-    messages
-        .into_iter()
-        .map(|mut msg| {
-            if let MessageContent::Blocks(ref mut blocks) = msg.content {
-                for block in blocks.iter_mut() {
-                    if let ContentBlock::ToolResult { content, .. } = block {
-                        if let Some(key) = fingerprint(content) {
-                            let count = read_counts.get(&key).copied().unwrap_or(1);
-                            if count > 1 {
-                                let seen_count = seen.entry(key.clone()).or_insert(0);
-                                *seen_count += 1;
-                                if *seen_count < count {
-                                    // Replace intermediate occurrences.
-                                    *content = ToolResultContent::Text(format!(
-                                        "[Content shown {} time(s); showing last occurrence only]",
-                                        count
-                                    ));
-                                }
+    for msg in messages.iter_mut() {
+        if let MessageContent::Blocks(ref mut blocks) = msg.content {
+            for block in blocks.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if let Some(key) = fingerprint(content) {
+                        let count = read_counts.get(&key).copied().unwrap_or(1);
+                        if count > 1 {
+                            let seen_count = seen.entry(key).or_insert(0);
+                            *seen_count += 1;
+                            if *seen_count < count {
+                                // Replace intermediate occurrences.
+                                *content = ToolResultContent::Text(format!(
+                                    "[Content shown {} time(s); showing last occurrence only]",
+                                    count
+                                ));
                             }
                         }
                     }
                 }
             }
-            msg
-        })
-        .collect()
+        }
+    }
 }
 
 /// Deduplicate grep/glob search results that appear multiple times.
 ///
 /// If the same search was run more than once (same query), keep only the
 /// most recent result; replace earlier results with a truncation notice.
-#[allow(dead_code)]
-pub fn collapse_search_results(
-    messages: Vec<clawde_core::types::Message>,
-) -> Vec<clawde_core::types::Message> {
+pub fn collapse_search_results(messages: &mut [clawde_core::types::Message]) {
     use clawde_core::types::{ContentBlock, MessageContent, ToolResultContent};
     use std::collections::HashSet;
 
@@ -1896,31 +1886,165 @@ pub fn collapse_search_results(
 
     let mut seen_results: HashSet<String> = HashSet::new();
 
-    // Iterate in reverse to keep the latest occurrence.
-    let mut result: Vec<clawde_core::types::Message> = messages
-        .into_iter()
-        .rev()
-        .map(|mut msg| {
-            if let MessageContent::Blocks(ref mut blocks) = msg.content {
-                for block in blocks.iter_mut() {
-                    if let ContentBlock::ToolResult { content, .. } = block {
-                        if let Some(fp) = fingerprint(content) {
-                            if !seen_results.insert(fp) {
-                                *content = ToolResultContent::Text(
-                                    "[Duplicate search result; content shown in a later turn]"
-                                        .to_string(),
-                                );
-                            }
+    // Iterate in reverse to keep the latest occurrence; replace earlier ones.
+    for msg in messages.iter_mut().rev() {
+        if let MessageContent::Blocks(ref mut blocks) = msg.content {
+            for block in blocks.iter_mut() {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    if let Some(fp) = fingerprint(content) {
+                        if !seen_results.insert(fp) {
+                            *content = ToolResultContent::Text(
+                                "[Duplicate search result; content shown in a later turn]"
+                                    .to_string(),
+                            );
                         }
                     }
                 }
             }
-            msg
-        })
-        .collect();
+        }
+    }
+}
 
-    result.reverse();
-    result
+// ---------------------------------------------------------------------------
+// T6: Model-free head/tail tool-result pruner
+//
+// Inspired by deepseek-harness's ToolResultPruner.  Before resorting to an
+// expensive LLM-based summarisation call, deterministically truncate oversized
+// tool results using head/tail slicing.  This is instant (no API call) and can
+// often bring the context below the compaction threshold on its own.
+//
+// Strategy:
+//   - Measure each ToolResult content in Unicode code points.
+//   - If it exceeds `max_chars`, keep the first `head_chars` and last
+//     `tail_chars`, replacing the middle with a `[pruned N chars]` marker.
+//   - Only prune Text content; Blocks content (images, etc.) is left intact.
+// ---------------------------------------------------------------------------
+
+/// Default threshold above which a single tool result is pruned (20K chars).
+const PRUNE_THRESHOLD_CHARS: usize = 20_000;
+
+/// How many characters to keep from the head and tail when pruning.
+const PRUNE_HEAD_CHARS: usize = 8_000;
+const PRUNE_TAIL_CHARS: usize = 8_000;
+
+/// Pruner configuration.
+#[derive(Debug, Clone)]
+pub struct ToolResultPrunerConfig {
+    /// Prune tool results whose text content exceeds this many characters.
+    pub max_chars: usize,
+    /// Characters to retain from the beginning.
+    pub head_chars: usize,
+    /// Characters to retain from the end.
+    pub tail_chars: usize,
+}
+
+impl Default for ToolResultPrunerConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: PRUNE_THRESHOLD_CHARS,
+            head_chars: PRUNE_HEAD_CHARS,
+            tail_chars: PRUNE_TAIL_CHARS,
+        }
+    }
+}
+
+/// Result of pruning — tracks whether any content was modified and how many
+/// characters were freed, so the caller can decide whether to re-check token
+/// pressure before attempting LLM-based compaction.
+#[derive(Debug, Clone, Default)]
+pub struct PruneOutcome {
+    /// Whether any tool result was pruned.
+    pub pruned_any: bool,
+    /// Total characters removed across all tool results.
+    pub chars_removed: usize,
+    /// Number of tool results that were pruned.
+    pub pruned_count: usize,
+}
+
+/// Truncate a single text string using head/tail slicing with a marker.
+///
+/// Returns `None` when the text is below the threshold or when head+tail
+/// would exceed the text length (no useful pruning possible).
+fn prune_text(text: &str, config: &ToolResultPrunerConfig) -> Option<String> {
+    let char_count = text.chars().count();
+    if char_count <= config.max_chars {
+        return None;
+    }
+
+    // Guard against misconfiguration where head+tail >= text length.
+    if config.head_chars + config.tail_chars >= char_count {
+        return None;
+    }
+
+    let head: String = text.chars().take(config.head_chars).collect();
+    let tail: String = text.chars().skip(char_count - config.tail_chars).collect();
+    let removed = char_count - config.head_chars - config.tail_chars;
+    Some(format!(
+        "{head}
+
+[... pruned {removed} characters ...]
+
+{tail}"
+    ))
+}
+
+/// Prune oversized tool results in-place.  Returns an outcome describing how
+/// much was freed, so the caller can re-check token pressure.
+pub fn prune_oversized_tool_results(
+    messages: &mut [clawde_core::types::Message],
+    config: &ToolResultPrunerConfig,
+) -> PruneOutcome {
+    use clawde_core::types::{ContentBlock, MessageContent, ToolResultContent};
+
+    let mut outcome = PruneOutcome::default();
+
+    for msg in messages.iter_mut() {
+        let blocks = match &mut msg.content {
+            MessageContent::Blocks(b) => b,
+            _ => continue,
+        };
+
+        for block in blocks.iter_mut() {
+            let content = match block {
+                ContentBlock::ToolResult { content, .. } => content,
+                _ => continue,
+            };
+
+            // Borrow the text, compute pruned version, only write back if
+            // pruning actually happened (avoids mem::take + restore dance).
+            let pruned = match content {
+                ToolResultContent::Text(t) => prune_text(t, config),
+                ToolResultContent::Blocks(_) => continue, // non-text blocks left intact
+            };
+
+            if let Some(pruned) = pruned {
+                let original_len = match content {
+                    ToolResultContent::Text(t) => t.chars().count(),
+                    _ => 0,
+                };
+                let new_len = pruned.chars().count();
+                outcome.chars_removed += original_len.saturating_sub(new_len);
+                outcome.pruned_count += 1;
+                outcome.pruned_any = true;
+                *content = ToolResultContent::Text(pruned);
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Whether pruning should fire given current token usage.
+///
+/// We prune when the context is above the micro-compact trigger threshold
+/// (default 75%), so that oversized tool results are truncated *before* the
+/// more expensive LLM-based summarisation is attempted.
+pub fn should_prune(input_tokens: u64, context_window: u64) -> bool {
+    if context_window == 0 {
+        return false;
+    }
+    let threshold = (context_window as f64 * 0.75) as u64;
+    input_tokens >= threshold
 }
 
 // ---------------------------------------------------------------------------
@@ -2818,5 +2942,129 @@ mod tests {
         assert!(result.is_none());
         assert_eq!(failures, 0, "cancellation is not a provider failure");
         assert_eq!(turns_since, 10, "cancellation must not consume a turn");
+    }
+
+    // ---- Tool-result pruner -----------------------------------------------
+
+    #[test]
+    fn prune_text_under_threshold_is_noop() {
+        let config = ToolResultPrunerConfig::default();
+        let text = "x".repeat(config.max_chars);
+        assert!(prune_text(&text, &config).is_none());
+    }
+
+    #[test]
+    fn prune_text_over_threshold_keeps_head_and_tail() {
+        let config = ToolResultPrunerConfig {
+            max_chars: 100,
+            head_chars: 20,
+            tail_chars: 20,
+        };
+        // 200 chars: 'H' (head) x 50 + 'M' (middle) x 100 + 'T' (tail) x 50.
+        // The pruner keeps first 20 and last 20 chars.
+        let text = format!("{}{}{}", "H".repeat(50), "M".repeat(100), "T".repeat(50),);
+        let pruned = prune_text(&text, &config).expect("should prune");
+        assert!(pruned.starts_with(&"H".repeat(20))); // head
+        assert!(pruned.ends_with(&"T".repeat(20))); // tail
+        assert!(pruned.contains("pruned 160 characters"));
+        assert!(!pruned.contains('M')); // middle fully removed
+    }
+
+    #[test]
+    fn prune_text_with_small_text_and_large_head_tail_returns_none() {
+        // If head + tail >= text length, pruning makes no sense.
+        let config = ToolResultPrunerConfig {
+            max_chars: 10,
+            head_chars: 100,
+            tail_chars: 100,
+        };
+        let text = "x".repeat(11); // just over threshold
+        assert!(prune_text(&text, &config).is_none());
+    }
+
+    #[test]
+    fn prune_oversized_tool_results_truncates_text_content() {
+        use clawde_core::types::{ContentBlock, ToolResultContent};
+
+        let config = ToolResultPrunerConfig {
+            max_chars: 100,
+            head_chars: 10,
+            tail_chars: 10,
+        };
+        let big_text = "A".repeat(200);
+        let small_text = "small".to_string();
+
+        let messages = vec![Message::user_blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "big".to_string(),
+                content: ToolResultContent::Text(big_text),
+                is_error: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "small".to_string(),
+                content: ToolResultContent::Text(small_text),
+                is_error: None,
+            },
+        ])];
+
+        let mut msgs = messages;
+        let outcome = prune_oversized_tool_results(&mut msgs, &config);
+        assert!(outcome.pruned_any);
+        assert_eq!(outcome.pruned_count, 1);
+        assert!(outcome.chars_removed > 0);
+
+        // Verify the big result was pruned and the small one is untouched.
+        let blocks = match &msgs[0].content {
+            clawde_core::types::MessageContent::Blocks(b) => b,
+            _ => panic!("expected blocks"),
+        };
+        let big_result = match &blocks[0] {
+            ContentBlock::ToolResult { content, .. } => match content {
+                ToolResultContent::Text(t) => t,
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected tool result"),
+        };
+        assert!(big_result.contains("pruned"));
+        assert!(big_result.len() < 200);
+
+        let small_result = match &blocks[1] {
+            ContentBlock::ToolResult { content, .. } => match content {
+                ToolResultContent::Text(t) => t,
+                _ => panic!("expected text"),
+            },
+            _ => panic!("expected tool result"),
+        };
+        assert_eq!(small_result, "small");
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        use clawde_core::types::{ContentBlock, ToolResultContent};
+
+        let config = ToolResultPrunerConfig::default();
+        let big_text = "B".repeat(config.max_chars + 1000);
+        let mut msgs = vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "t".to_string(),
+            content: ToolResultContent::Text(big_text),
+            is_error: None,
+        }])];
+
+        // First prune.
+        let outcome1 = prune_oversized_tool_results(&mut msgs, &config);
+        assert!(outcome1.pruned_any);
+
+        // Second prune — already below threshold, no-op.
+        let outcome2 = prune_oversized_tool_results(&mut msgs, &config);
+        assert!(!outcome2.pruned_any);
+        assert_eq!(outcome2.chars_removed, 0);
+    }
+
+    #[test]
+    fn should_prune_fires_above_75_percent() {
+        assert!(should_prune(150_000, 200_000)); // 75%
+        assert!(!should_prune(149_999, 200_000)); // below 75%
+        assert!(should_prune(200_000, 200_000)); // 100%
+        assert!(!should_prune(0, 0)); // no context window
     }
 }

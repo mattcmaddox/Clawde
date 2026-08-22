@@ -42,12 +42,14 @@ pub use agent_tool::{init_team_swarm_runner, AgentTool};
 pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
 pub use compact::{
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
-    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
-    group_messages_for_compact, micro_compact_if_needed, reactive_compact, resolve_context_window,
-    should_auto_compact, should_auto_compact_for_window, should_compact, should_context_collapse,
-    snip_compact, AutoCompactState, CompactResult, CompactTrigger, MessageGroup,
-    MicroCompactConfig, TokenWarningState,
+    calculate_token_warning_state_for_window, collapse_read_tool_results, collapse_search_results,
+    compact_conversation, context_collapse, context_window_for_model, estimate_context_tokens,
+    format_compact_summary, get_compact_prompt, group_messages_for_compact,
+    micro_compact_if_needed, prune_oversized_tool_results, reactive_compact,
+    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
+    should_context_collapse, should_prune, snip_compact, AutoCompactState, CompactResult,
+    CompactTrigger, MessageGroup, MicroCompactConfig, PruneOutcome, TokenWarningState,
+    ToolResultPrunerConfig,
 };
 pub use continuation::{
     parse_semantic_verify_response, semantic_read_only_tool_names, ContinuationDecision,
@@ -1271,6 +1273,12 @@ pub async fn run_query_loop(
     // (decide_recover changes approach on a repeat). Survives stream
     // retry attempts within a logical turn; reset with the other counters.
     let mut last_recovery_error: Option<crate::decide::OrchestrationError> = None;
+    // Bounded context-overflow recovery (deepseek-harness pattern):
+    // when the API returns a context-overflow error, trigger compaction
+    // and retry.  Reset on a successful response so a single recovery
+    // doesn't cascade.  Max 3 retries before surfacing the error.
+    let mut overflow_retries: u32 = 0;
+    const MAX_OVERFLOW_RETRIES: u32 = 3;
 
     // Measure one complete logical completion, including provider retries and
     // tool rounds. Reset when a continuation starts a new completion below.
@@ -2565,6 +2573,45 @@ pub async fn run_query_loop(
                     let mut stream = match provider.create_message_stream(provider_request).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // T6: Context-overflow recovery. When the API
+                            // rejects the request because the conversation
+                            // exceeds the context window, attempt compaction
+                            // and retry with a bounded counter.
+                            let err_str = e.to_string();
+                            if clawde_api::is_context_overflow(&err_str)
+                                && overflow_retries < MAX_OVERFLOW_RETRIES
+                            {
+                                if let Some(ref cp) = compact_provider {
+                                    overflow_retries += 1;
+                                    warn!(
+                                        retry = overflow_retries,
+                                        "Context overflow from provider — compacting and retrying"
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx.send(QueryEvent::Status(
+                                            "Context overflow — compacting and retrying..."
+                                                .to_string(),
+                                        ));
+                                    }
+                                    let outcome = compact::reactive_compact(
+                                        messages.clone(),
+                                        cp.as_ref(),
+                                        config,
+                                        cancel_token.clone(),
+                                        &[],
+                                    )
+                                    .await;
+                                    if let Err(inner_err) = apply_compact_result(messages, outcome)
+                                    {
+                                        warn!(error = %inner_err, "Overflow compaction failed");
+                                        return QueryOutcome::Error(
+                                            clawde_core::error::ClaudeError::Api(e.to_string()),
+                                        );
+                                    }
+                                    turn -= 1; // don't count this attempt
+                                    continue;
+                                }
+                            }
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
                             return QueryOutcome::Error(clawde_core::error::ClaudeError::Api(
                                 e.to_string(),
@@ -2865,6 +2912,43 @@ pub async fn run_query_loop(
                     // the budget lasts; auth/config-class errors escalate
                     // immediately — never burn retries blindly on a bad key.
                     if let Some(err) = provider_stream_error {
+                        // T6: Context-overflow recovery for mid-stream errors.
+                        // A ContextOverflow during streaming means the
+                        // cumulative context exceeded the model's limit. Compact
+                        // and retry with a bounded counter.
+                        let err_str = err.to_string();
+                        if clawde_api::is_context_overflow(&err_str)
+                            && overflow_retries < MAX_OVERFLOW_RETRIES
+                        {
+                            if let Some(ref cp) = compact_provider {
+                                overflow_retries += 1;
+                                warn!(
+                                    retry = overflow_retries,
+                                    "Context overflow mid-stream — compacting and retrying"
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(
+                                        "Context overflow — compacting and retrying...".to_string(),
+                                    ));
+                                }
+                                let outcome = compact::reactive_compact(
+                                    messages.clone(),
+                                    cp.as_ref(),
+                                    config,
+                                    cancel_token.clone(),
+                                    &[],
+                                )
+                                .await;
+                                if let Err(inner_err) = apply_compact_result(messages, outcome) {
+                                    warn!(error = %inner_err, "Overflow compaction failed");
+                                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                                        "Context overflow and compaction failed: {err}"
+                                    )));
+                                }
+                                turn -= 1; // don't count this attempt
+                                continue;
+                            }
+                        }
                         let classified = crate::decide::classify_provider_error(&err);
                         let recovery = crate::decide::decide_recover(
                             classified,
@@ -3308,8 +3392,44 @@ pub async fn run_query_loop(
         let mut stream_rx = match client.create_message_stream(request, handler).await {
             Ok(rx) => rx,
             Err(e) => {
+                // T6: Context-overflow recovery (deepseek-harness pattern).
+                // When the conversation exceeds the context window, trigger
+                // compaction and retry with a bounded counter that resets on
+                // a successful response.
+                let err_str_full = e.to_string();
+                let err_str = err_str_full.to_lowercase();
+                if (matches!(e, clawde_core::error::ClaudeError::ContextWindowExceeded)
+                    || clawde_api::is_context_overflow(&err_str_full))
+                    && overflow_retries < MAX_OVERFLOW_RETRIES
+                {
+                    if let Some(ref cp) = compact_provider {
+                        overflow_retries += 1;
+                        warn!(
+                            retry = overflow_retries,
+                            "Context overflow — compacting and retrying"
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(
+                                "Context overflow — compacting and retrying...".to_string(),
+                            ));
+                        }
+                        let outcome = compact::reactive_compact(
+                            messages.clone(),
+                            cp.as_ref(),
+                            config,
+                            cancel_token.clone(),
+                            &[],
+                        )
+                        .await;
+                        if let Err(inner_err) = apply_compact_result(messages, outcome) {
+                            warn!(error = %inner_err, "Overflow compaction failed");
+                            return QueryOutcome::Error(e);
+                        }
+                        turn -= 1; // don't count this attempt
+                        continue;
+                    }
+                }
                 // On overloaded/rate-limit errors, attempt one switch to the fallback model.
-                let err_str = e.to_string().to_lowercase();
                 if !used_fallback
                     && (err_str.contains("overloaded")
                         || err_str.contains("529")
@@ -3402,6 +3522,10 @@ pub async fn run_query_loop(
         }
 
         let (mut assistant_msg, usage, stop_reason) = accumulator.finish();
+
+        // T6: Reset the overflow retry counter on a successful response so a
+        // single compaction recovery doesn't cascade across subsequent turns.
+        overflow_retries = 0;
 
         // Track costs
         cost_tracker.add_usage(
@@ -3516,7 +3640,7 @@ pub async fn run_query_loop(
         // caching the bare `input_tokens` field undercounts badly. Fall back to
         // the estimate only before the first response / when usage is absent. (#231)
         let real_usage = usage.total_input();
-        let context_tokens =
+        let mut context_tokens =
             compact::estimate_context_tokens(messages, (real_usage > 0).then_some(real_usage));
 
         // Emit token warning events when approaching context limits.
@@ -3551,6 +3675,56 @@ pub async fn run_query_loop(
         let reactive_compact_enabled =
             clawde_core::feature_gates::is_feature_enabled("reactive_compact")
                 && tool_ctx.config.auto_compact;
+
+        // T4-5: Collapse repeated tool results in-place.  These are
+        // deterministic, model-free passes that deduplicate repeated file reads
+        // and search results before the pruner or LLM-based compaction runs.
+        let before_collapse = context_tokens;
+        compact::collapse_read_tool_results(messages);
+        compact::collapse_search_results(messages);
+        let collapse_freed =
+            before_collapse.saturating_sub(compact::estimate_context_tokens(messages, None));
+        if collapse_freed > 0 {
+            context_tokens = before_collapse.saturating_sub(collapse_freed);
+            info!(
+                tokens_freed = collapse_freed,
+                "Collapsed repeated tool results"
+            );
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "Collapsed repeated tool results (freed ~{} tokens).",
+                    collapse_freed
+                )));
+            }
+        }
+
+        // T6: Model-free tool-result pruning.  Before any LLM-based
+        // compaction, deterministically truncate oversized tool results using
+        // head/tail slicing.  This is instant (no API call) and can often bring
+        // the context below the compaction threshold on its own, avoiding an
+        // expensive summarisation round-trip.
+        if compact::should_prune(context_tokens, context_window) {
+            let outcome = compact::prune_oversized_tool_results(
+                messages,
+                &compact::ToolResultPrunerConfig::default(),
+            );
+            if outcome.pruned_any {
+                // Re-estimate tokens after pruning — the pruned characters
+                // are gone from the live conversation.
+                context_tokens = context_tokens.saturating_sub((outcome.chars_removed / 4) as u64);
+                info!(
+                    pruned = outcome.pruned_count,
+                    chars_removed = outcome.chars_removed,
+                    "Pruned oversized tool results (model-free)"
+                );
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Pruned {} oversized tool result(s).",
+                        outcome.pruned_count
+                    )));
+                }
+            }
+        }
 
         // Guard: only compact when a provider is available (prevents panic if
         // no API key is configured at the start of a session).
