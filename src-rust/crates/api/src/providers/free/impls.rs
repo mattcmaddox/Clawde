@@ -6,6 +6,7 @@
 // and the trait impl), so they live in a single module where Rust privacy
 // allows them to share internals.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,21 @@ use clawde_core::types::{ContentBlock, MessageContent};
 use rand::seq::SliceRandom;
 
 use super::*;
+
+/// Exponential backoff delay for same-upstream retries (500ms base, 2x,
+/// capped at 8s). Mirrors sub2api's `sameAccountRetryDelayFor` pattern:
+/// transient errors get a short backoff on the same upstream before the
+/// chain advances to the next provider.
+fn same_upstream_retry_delay_ms(retry_count: u32) -> u64 {
+    const BASE_MS: u64 = 500;
+    const MAX_MS: u64 = 8_000;
+    if retry_count == 0 {
+        return BASE_MS;
+    }
+    // 500ms * 2^retry_count, capped at 8s.
+    let shift = retry_count.min(4); // 2^4 = 16, 500ms * 16 = 8s
+    BASE_MS.saturating_mul(1_u64 << shift).min(MAX_MS)
+}
 
 impl FreeProvider {
     /// Minimum dispatch count before an upstream's success rate is trusted
@@ -589,7 +605,7 @@ impl FreeProvider {
     /// - Rank 1: a couple of samples — rates not yet trustworthy, sort by
     ///   latency alone.
     /// - Rank 2: no history — group tail, keeping preference order.
-    fn preferred_order_key(lat: &LatencyState, idx: usize, task: TaskType) -> (u8, f64, f64) {
+    fn preferred_order_key(lat: &LatencyState, idx: usize, task: TaskType) -> (u8, f64, f64, f64) {
         let task_dispatches = lat.task_dispatches(idx, task);
         let (dispatches, success_rate) = if task_dispatches > 0 {
             (task_dispatches, lat.task_success_rate(idx, task))
@@ -600,10 +616,14 @@ impl FreeProvider {
             (lat.dispatches(idx), lat.success_rate(idx))
         };
         let avg = lat.avg_latency(idx);
+        // TTFT as a secondary routing signal: among equally reliable
+        // upstreams with similar total latency, prefer the one that starts
+        // producing faster. Falls back to total avg when no TTFT data.
+        let ttft = lat.avg_ttft(idx);
         match (dispatches, success_rate) {
-            (n, Some(rate)) if n >= Self::MIN_SUCCESS_RATE_SAMPLES => (0, -rate, avg),
-            (n, _) if n > 0 => (1, 0.0, avg),
-            _ => (2, 0.0, avg),
+            (n, Some(rate)) if n >= Self::MIN_SUCCESS_RATE_SAMPLES => (0, -rate, avg, ttft),
+            (n, _) if n > 0 => (1, 0.0, avg, ttft),
+            _ => (2, 0.0, avg, ttft),
         }
     }
 
@@ -1106,6 +1126,14 @@ struct RetryingFreeStream {
     upstream_errors: Vec<String>,
     /// Hedged request state
     hedge_state: HedgeState,
+    /// Per-upstream same-upstream retry counts. Transient errors before
+    /// first byte retry the same upstream with exponential backoff.
+    same_upstream_retries: HashMap<usize, u32>,
+    /// Active backoff timer for same-upstream retry. When set, poll_next
+    /// returns Poll::Pending until the timer fires, then launches the retry.
+    retry_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// The upstream to retry after the delay fires: (chain_idx, model).
+    retry_target: Option<(usize, String)>,
 }
 
 impl RetryingFreeStream {
@@ -1174,6 +1202,9 @@ impl RetryingFreeStream {
             // the ones observed after the first stream started.
             upstream_errors,
             hedge_state: HedgeState::default(),
+            same_upstream_retries: HashMap::new(),
+            retry_sleep: None,
+            retry_target: None,
         }
     }
 
@@ -1334,6 +1365,76 @@ impl RetryingFreeStream {
             })
             .copied()
             .unwrap_or(samples[0])
+    }
+
+    /// Whether the upstream at `idx` has retries remaining.
+    fn can_retry_same_upstream(&self, idx: usize) -> bool {
+        let count = self.same_upstream_retries.get(&idx).copied().unwrap_or(0);
+        self.routing.fallback_retries > 0 && count < self.routing.fallback_retries
+    }
+
+    /// Schedule a same-upstream retry after an exponential backoff delay.
+    /// Called when a transient failure occurs before first byte and retries
+    /// remain. The sleep future is polled at the top of `poll_next` and
+    /// launches the retry when it fires.
+    fn schedule_same_upstream_retry(&mut self, idx: usize, model: String) {
+        let retry_count = self.same_upstream_retries.get(&idx).copied().unwrap_or(0);
+        self.same_upstream_retries.insert(idx, retry_count + 1);
+        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+        let uid = self.chain[idx].upstream.id;
+        tracing::warn!(
+            "FreeProvider: {} failed — same-upstream retry ({}/{}) in {}ms",
+            uid,
+            retry_count + 1,
+            self.routing.fallback_retries,
+            delay_ms,
+        );
+        self.retry_sleep = Some(Box::pin(tokio::time::sleep(
+            std::time::Duration::from_millis(delay_ms),
+        )));
+        self.retry_target = Some((idx, model));
+    }
+
+    /// Launch the retry after the backoff timer fires. Consumes
+    /// `retry_target` and spawns a `create_message_stream` into
+    /// `self.starting`, the same path `start_next_plan_entry` uses.
+    fn start_retry(&mut self) {
+        let Some((idx, model)) = self.retry_target.take() else {
+            return;
+        };
+        let entry = &self.chain[idx];
+        let mut req = self.request.clone();
+        req.model = model.clone();
+        clamp_max_tokens_for(&mut req, entry);
+        shape_thinking_for_upstream(&mut req, entry);
+        let input_tokens = FreeProvider::estimate_request_tokens(&self.request);
+        self.capacity.lock().unwrap().record_local_usage(
+            idx,
+            local_quota_for(entry.upstream.id),
+            1,
+            input_tokens,
+        );
+        let timeout = self.adaptive_timeout(idx);
+        let provider = entry.provider.clone();
+
+        self.current_idx = idx;
+        self.current_model = model;
+        self.current = None;
+        self.reset_attempt();
+        // Cancel any in-flight hedge — the retry is a new primary attempt.
+        self.cancel_hedge();
+
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(timeout, provider.create_message_stream(req)).await {
+                Ok(Ok(stream)) => Ok(stream),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(ProviderError::RateLimited {
+                    provider: ProviderId::new("free"),
+                    retry_after: None,
+                }),
+            }
+        });
+        self.starting = Some(handle);
     }
 
     fn record_success(&self, idx: usize, elapsed: std::time::Duration) {
@@ -1533,12 +1634,32 @@ impl Stream for RetryingFreeStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             // Check for hedge response first (hedged requests pattern).
+            // Runs even during retry backoff — a hedge to a different
+            // upstream is strictly better than waiting for the same one.
             if let Some(hedge_stream) = self.poll_hedge() {
                 self.current = Some(hedge_stream);
                 self.pending_attribution = true;
                 // Cancel any in-flight hedge
                 self.cancel_hedge();
+                // Cancel pending same-upstream retry — the hedge
+                // provides a better upstream immediately.
+                self.retry_sleep = None;
+                self.retry_target = None;
                 continue;
+            }
+
+            // Same-upstream retry backoff: when a retry is scheduled, poll
+            // the sleep timer. While pending, yield control back to the
+            // executor. When the timer fires, launch the retry.
+            if let Some(ref mut sleep) = self.retry_sleep {
+                match Pin::new(sleep).poll(cx) {
+                    Poll::Ready(()) => {
+                        self.retry_sleep = None;
+                        self.start_retry();
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
             }
 
             // Start hedge if conditions are met
@@ -1570,6 +1691,18 @@ impl Stream for RetryingFreeStream {
                                 .lock()
                                 .unwrap()
                                 .record_failure_reason(self.current_idx, reason.clone());
+                            // Same-upstream retry before advancing: transient
+                            // errors (5xx, rate limits) often resolve with a
+                            // short backoff. Don't push to upstream_errors
+                            // yet — only push when the upstream is abandoned.
+                            if self.can_retry_same_upstream(self.current_idx)
+                                && err.recovery_class().may_retry_same_provider()
+                            {
+                                let model = self.current_model.clone();
+                                let idx = self.current_idx;
+                                self.schedule_same_upstream_retry(idx, model);
+                                continue;
+                            }
                             self.upstream_errors.push(reason);
                             if !self.start_next_plan_entry() {
                                 let msg = format!(
@@ -1596,6 +1729,15 @@ impl Stream for RetryingFreeStream {
                             .lock()
                             .unwrap()
                             .record_failure_reason(self.current_idx, reason.clone());
+                        // Timeouts are transient — retry same upstream
+                        // before advancing. Don't push to upstream_errors
+                        // yet — only push when the upstream is abandoned.
+                        if self.can_retry_same_upstream(self.current_idx) {
+                            let model = self.current_model.clone();
+                            let idx = self.current_idx;
+                            self.schedule_same_upstream_retry(idx, model);
+                            continue;
+                        }
                         self.upstream_errors.push(reason);
                         if !self.start_next_plan_entry() {
                             let msg = format!(
@@ -1733,6 +1875,19 @@ impl Stream for RetryingFreeStream {
                 Poll::Ready(Some(Ok(evt))) => {
                     if !self.first_byte_received && event_commits_output(&evt) {
                         self.first_byte_received = true;
+                        // Record time-to-first-token for routing.
+                        if let Some(start) = self.attempt_start {
+                            let max_samples =
+                                self.routing.latency.as_ref().map_or(0, |l| l.max_samples);
+                            if max_samples > 0 {
+                                let ttft = start.elapsed().as_secs_f64();
+                                self.latencies.lock().unwrap().record_ttft(
+                                    self.current_idx,
+                                    ttft,
+                                    max_samples,
+                                );
+                            }
+                        }
                     }
                     match &evt {
                         StreamEvent::TextDelta { text, .. } => {
@@ -1803,8 +1958,19 @@ impl Stream for RetryingFreeStream {
                             .lock()
                             .unwrap()
                             .record_failure_reason(self.current_idx, reason.clone());
-                        self.upstream_errors.push(reason);
                         self.current = None;
+                        // Same-upstream retry before advancing: no content
+                        // was exposed, so replaying is safe. Don't push to
+                        // upstream_errors yet — only when abandoned.
+                        if self.can_retry_same_upstream(self.current_idx)
+                            && err.recovery_class().may_retry_same_provider()
+                        {
+                            let model = self.current_model.clone();
+                            let idx = self.current_idx;
+                            self.schedule_same_upstream_retry(idx, model);
+                            continue;
+                        }
+                        self.upstream_errors.push(reason);
                         if !self.start_next_plan_entry() {
                             let msg = format!(
                                 "all free-mode upstreams exhausted: {}",
@@ -1970,8 +2136,15 @@ impl LlmProvider for FreeProvider {
         // The request's task tags every dispatch's success/failure counters
         // (spec §8.6 per-task success-rate view).
         let task = classify_request(&request);
+        // Per-upstream same-upstream retry counts. Transient errors (5xx,
+        // rate limits, timeouts) retry the same upstream with exponential
+        // backoff before the chain advances, up to `fallback_retries`.
+        let max_same_retries = self.routing.fallback_retries;
+        let mut same_upstream_retries: HashMap<usize, u32> = HashMap::new();
+        let mut plan_deque: std::collections::VecDeque<(usize, String)> =
+            plan.into_iter().collect();
 
-        for (idx, upstream_model) in plan {
+        while let Some((idx, upstream_model)) = plan_deque.pop_front() {
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
@@ -1983,7 +2156,7 @@ impl LlmProvider for FreeProvider {
 
             let entry = &self.chain[idx];
             let mut req = request.clone();
-            req.model = upstream_model;
+            req.model = upstream_model.clone();
             self.clamp_max_tokens(&mut req, idx);
             shape_thinking_for_upstream(&mut req, entry);
 
@@ -2017,6 +2190,37 @@ impl LlmProvider for FreeProvider {
                     return Ok(resp);
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
+                    // Same-upstream retry for transient errors (5xx, rate
+                    // limits) before advancing to the next plan entry.
+                    // Mirrors sub2api's RetryableOnSameAccount pattern:
+                    // exponential backoff (500ms base, 2x, capped at 8s).
+                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
+                    let can_retry_same = max_same_retries > 0
+                        && retry_count < max_same_retries
+                        && err.recovery_class().may_retry_same_provider();
+                    if can_retry_same {
+                        same_upstream_retries.insert(idx, retry_count + 1);
+                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        tracing::warn!(
+                            "FreeProvider: {} failed ({}s): {} — retrying same upstream ({}/{})",
+                            entry.upstream.id,
+                            self.routing.upstream_timeout_secs,
+                            err,
+                            retry_count + 1,
+                            max_same_retries,
+                        );
+                        self.record_failure_reason(
+                            idx,
+                            format_upstream_error(entry.upstream.id, &err),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        // Re-queue the same entry at the front of the plan.
+                        // Note: don't push to upstream_errors here — the
+                        // error is only counted once when the upstream is
+                        // abandoned (retries exhausted) below.
+                        plan_deque.push_front((idx, upstream_model));
+                        continue;
+                    }
                     tracing::warn!(
                         "FreeProvider: {} failed ({}s): {} — trying next upstream",
                         entry.upstream.id,
@@ -2034,6 +2238,29 @@ impl LlmProvider for FreeProvider {
                     return Err(err);
                 }
                 Err(_elapsed) => {
+                    // Timeouts are transient — retry same upstream when
+                    // retries remain, same as 5xx errors.
+                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
+                    let can_retry_same = max_same_retries > 0 && retry_count < max_same_retries;
+                    if can_retry_same {
+                        same_upstream_retries.insert(idx, retry_count + 1);
+                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        tracing::warn!(
+                            "FreeProvider: upstream {} timed out after {}s — retrying same upstream ({}/{})",
+                            entry.upstream.id,
+                            self.routing.upstream_timeout_secs,
+                            retry_count + 1,
+                            max_same_retries,
+                        );
+                        let reason = format!(
+                            "{}: timed out after {}s",
+                            entry.upstream.id, self.routing.upstream_timeout_secs
+                        );
+                        self.record_failure_reason(idx, reason);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        plan_deque.push_front((idx, upstream_model));
+                        continue;
+                    }
                     tracing::warn!(
                         "FreeProvider: upstream {} timed out after {}s — trying next upstream",
                         entry.upstream.id,
@@ -2108,14 +2335,22 @@ impl LlmProvider for FreeProvider {
         // The request's task tags every dispatch's success/failure counters
         // (spec §8.6 per-task success-rate view).
         let task = classify_request(&request);
+        // Per-upstream same-upstream retry counts for transient pre-stream
+        // failures. Mirrors the non-streaming path's retry logic.
+        let max_same_retries = self.routing.fallback_retries;
+        let mut same_upstream_retries: HashMap<usize, u32> = HashMap::new();
+        let mut plan_deque: std::collections::VecDeque<(usize, String)> =
+            plan_vec.into_iter().collect();
+        let mut pos = 0usize;
 
-        for (pos, (idx, upstream_model)) in plan_vec.into_iter().enumerate() {
+        while let Some((idx, upstream_model)) = plan_deque.pop_front() {
             // Circuit breaker: skip upstreams in cooldown.
             if self.is_in_cooldown(idx) {
                 tracing::debug!("FreeProvider: skipping upstream {} (in cooldown)", idx,);
                 let uid = self.chain[idx].upstream.id.to_string();
                 self.record_failure_reason(idx, format!("{}: (skipped — in cooldown)", uid));
                 upstream_errors.push(format!("{}: (skipped — in cooldown)", uid));
+                pos += 1;
                 continue;
             }
 
@@ -2165,6 +2400,31 @@ impl LlmProvider for FreeProvider {
                     )));
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {
+                    // Same-upstream retry for transient errors before
+                    // advancing, matching the non-streaming path.
+                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
+                    let can_retry_same = max_same_retries > 0
+                        && retry_count < max_same_retries
+                        && err.recovery_class().may_retry_same_provider();
+                    if can_retry_same {
+                        same_upstream_retries.insert(idx, retry_count + 1);
+                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        tracing::warn!(
+                            "FreeProvider: {} stream failed ({}s): {} — retrying same upstream ({}/{})",
+                            entry.upstream.id,
+                            self.routing.upstream_timeout_secs,
+                            err,
+                            retry_count + 1,
+                            max_same_retries,
+                        );
+                        self.record_failure_reason(
+                            idx,
+                            format_upstream_error(entry.upstream.id, &err),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        plan_deque.push_front((idx, upstream_model));
+                        continue;
+                    }
                     tracing::warn!(
                         "FreeProvider: {} stream failed ({}s): {} — trying next upstream",
                         entry.upstream.id,
@@ -2175,6 +2435,7 @@ impl LlmProvider for FreeProvider {
                     self.record_failure_reason(idx, format_upstream_error(entry.upstream.id, &err));
                     self.maybe_cooldown_upstream_for_5xx(idx, &err);
                     upstream_errors.push(format_upstream_error(entry.upstream.id, &err));
+                    pos += 1;
                     continue;
                 }
                 Ok(Err(err)) => {
@@ -2182,6 +2443,27 @@ impl LlmProvider for FreeProvider {
                     return Err(err);
                 }
                 Err(_elapsed) => {
+                    let retry_count = same_upstream_retries.get(&idx).copied().unwrap_or(0);
+                    let can_retry_same = max_same_retries > 0 && retry_count < max_same_retries;
+                    if can_retry_same {
+                        same_upstream_retries.insert(idx, retry_count + 1);
+                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        tracing::warn!(
+                            "FreeProvider: upstream {} stream timed out after {}s — retrying same upstream ({}/{})",
+                            entry.upstream.id,
+                            self.routing.upstream_timeout_secs,
+                            retry_count + 1,
+                            max_same_retries,
+                        );
+                        let reason = format!(
+                            "{}: timed out after {}s",
+                            entry.upstream.id, self.routing.upstream_timeout_secs
+                        );
+                        self.record_failure_reason(idx, reason);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        plan_deque.push_front((idx, upstream_model));
+                        continue;
+                    }
                     tracing::warn!(
                         "FreeProvider: upstream {} stream timed out after {}s — trying next upstream",
                         entry.upstream.id,
@@ -2194,6 +2476,7 @@ impl LlmProvider for FreeProvider {
                     );
                     self.record_failure_reason(idx, reason.clone());
                     upstream_errors.push(reason);
+                    pos += 1;
                     continue;
                 }
             }
@@ -4047,7 +4330,7 @@ mod tests {
         let json = serde_json::to_string(&rng).unwrap();
         assert_eq!(
             json,
-            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45,"fallback_retries":1}"#
+            r#"{"strategy":"random_failover","upstream_timeout_secs":30,"upstream_5xx_cooldown_secs":45}"#
         );
         let deserialized: RoutingConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(

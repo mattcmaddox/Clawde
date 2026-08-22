@@ -574,6 +574,11 @@ fn merge_telemetry_snapshot(path: &std::path::Path, incoming: &str) -> Option<St
         {
             existing_entry.samples = incoming_entry.samples;
         }
+        if incoming_timestamp >= existing_timestamp
+            || incoming_entry.ttft_samples.len() > existing_entry.ttft_samples.len()
+        {
+            existing_entry.ttft_samples = incoming_entry.ttft_samples;
+        }
         // The incoming snapshot is the fresher write — its failure reason (if
         // any) reflects the most recent dispatch. A None never overwrites a
         // recorded reason; a Some always does.
@@ -932,7 +937,7 @@ const fn default_poll_interval() -> u64 {
 }
 
 const fn default_fallback_retries() -> u32 {
-    1
+    0
 }
 
 impl Default for RoutingConfig {
@@ -1408,6 +1413,11 @@ impl CooldownState {
 struct LatencyState {
     /// Sliding window of request durations (seconds) per upstream index.
     samples: Vec<VecDeque<f64>>,
+    /// Sliding window of time-to-first-token durations (seconds) per upstream
+    /// index. TTFT is a better UX proxy than total latency: users feel
+    /// responsiveness, not total wall time. Tracked separately so routing
+    /// can prefer upstreams that start producing quickly.
+    ttft_samples: Vec<VecDeque<f64>>,
     /// Successful dispatches per upstream index.
     successes: Vec<u32>,
     /// Failed dispatches per upstream index.
@@ -1432,6 +1442,7 @@ struct LatencyState {
 impl LatencyState {
     fn new(n: usize) -> Self {
         let mut samples = Vec::with_capacity(n);
+        let mut ttft_samples = Vec::with_capacity(n);
         let mut successes = Vec::with_capacity(n);
         let mut failures = Vec::with_capacity(n);
         let mut task_successes = Vec::with_capacity(n);
@@ -1439,6 +1450,7 @@ impl LatencyState {
         let mut last_failure_reasons = Vec::with_capacity(n);
         for _ in 0..n {
             samples.push(VecDeque::with_capacity(10));
+            ttft_samples.push(VecDeque::with_capacity(10));
             successes.push(0);
             failures.push(0);
             task_successes.push(HashMap::new());
@@ -1447,6 +1459,7 @@ impl LatencyState {
         }
         Self {
             samples,
+            ttft_samples,
             successes,
             failures,
             task_successes,
@@ -1481,6 +1494,20 @@ impl LatencyState {
             q.pop_front();
         }
         q.push_back(duration_secs);
+    }
+
+    /// Record a time-to-first-token sample at `idx`. TTFT is tracked
+    /// separately from total latency so routing can prefer upstreams that
+    /// start producing quickly even if their total time is longer.
+    fn record_ttft(&mut self, idx: usize, ttft_secs: f64, max_samples: usize) {
+        if idx >= self.ttft_samples.len() || max_samples == 0 {
+            return;
+        }
+        let q = &mut self.ttft_samples[idx];
+        if q.len() >= max_samples {
+            q.pop_front();
+        }
+        q.push_back(ttft_secs);
     }
 
     /// Record a successful dispatch at `idx` (success-rate view).
@@ -1581,6 +1608,37 @@ impl LatencyState {
         sorted[idx]
     }
 
+    /// Average time-to-first-token for upstream `idx`, or `f64::MAX` if no
+    /// TTFT samples. TTFT is a better routing signal than total latency for
+    /// user-perceived responsiveness.
+    fn avg_ttft(&self, idx: usize) -> f64 {
+        if idx >= self.ttft_samples.len() {
+            return f64::MAX;
+        }
+        let q = &self.ttft_samples[idx];
+        if q.is_empty() {
+            return f64::MAX;
+        }
+        let sum: f64 = q.iter().sum();
+        sum / q.len() as f64
+    }
+
+    /// Percentile time-to-first-token for upstream `idx`.
+    #[allow(dead_code)]
+    fn percentile_ttft(&self, idx: usize, percentile: f64) -> f64 {
+        if idx >= self.ttft_samples.len() {
+            return f64::MAX;
+        }
+        let q = &self.ttft_samples[idx];
+        if q.is_empty() {
+            return f64::MAX;
+        }
+        let mut sorted: Vec<f64> = q.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((sorted.len() as f64) * percentile).min((sorted.len() - 1) as f64) as usize;
+        sorted[idx]
+    }
+
     /// Dispatch success rate (0.0–1.0) for upstream `idx`, or `None` when
     /// no dispatch has been recorded yet.
     fn success_rate(&self, idx: usize) -> Option<f64> {
@@ -1627,12 +1685,19 @@ impl LatencyState {
             .enumerate()
             .filter_map(|(idx, upstream)| {
                 let samples = self.samples.get(idx)?.iter().copied().collect::<Vec<_>>();
+                let ttft_samples = self
+                    .ttft_samples
+                    .get(idx)?
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
                 let successes = self.successes.get(idx).copied().unwrap_or(0);
                 let failures = self.failures.get(idx).copied().unwrap_or(0);
                 let task_successes = self.task_successes.get(idx).cloned().unwrap_or_default();
                 let task_failures = self.task_failures.get(idx).cloned().unwrap_or_default();
                 let last_failure_reason = self.last_failure_reasons.get(idx).cloned().flatten();
                 if samples.is_empty()
+                    && ttft_samples.is_empty()
                     && successes == 0
                     && failures == 0
                     && task_successes.is_empty()
@@ -1644,6 +1709,7 @@ impl LatencyState {
                 Some(UpstreamTelemetrySnapshot {
                     upstream: upstream.clone(),
                     samples,
+                    ttft_samples,
                     successes,
                     failures,
                     task_successes,
@@ -1705,6 +1771,7 @@ impl LatencyState {
                 }
                 if age > TELEMETRY_HALF_LIFE_SECS {
                     entry.samples.clear();
+                    entry.ttft_samples.clear();
                     // The counters that motivated a failure reason have decayed
                     // to noise — drop the reason too so /keys health does not
                     // show a stale failure after the window passes.
@@ -1716,6 +1783,7 @@ impl LatencyState {
                 && entry.task_successes.values().all(|count| *count == 0)
                 && entry.task_failures.values().all(|count| *count == 0)
                 && entry.samples.is_empty()
+                && entry.ttft_samples.is_empty()
                 && entry.last_failure_reason.is_none()
             {
                 continue;
@@ -1732,6 +1800,11 @@ impl LatencyState {
                 samples.pop_front();
             }
             self.samples[idx] = samples;
+            let mut ttft_samples = VecDeque::from(entry.ttft_samples);
+            while ttft_samples.len() > max_samples {
+                ttft_samples.pop_front();
+            }
+            self.ttft_samples[idx] = ttft_samples;
             self.successes[idx] = entry.successes;
             self.failures[idx] = entry.failures;
             self.task_successes[idx] = entry.task_successes;
@@ -1750,6 +1823,10 @@ struct UpstreamTelemetrySnapshot {
     upstream: String,
     #[serde(default)]
     samples: Vec<f64>,
+    /// Time-to-first-token samples. `#[serde(default)]` so telemetry files
+    /// written by older builds (without TTFT tracking) still parse.
+    #[serde(default)]
+    ttft_samples: Vec<f64>,
     #[serde(default)]
     successes: u32,
     #[serde(default)]

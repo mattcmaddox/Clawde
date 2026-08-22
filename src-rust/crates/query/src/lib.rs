@@ -3105,6 +3105,9 @@ pub async fn run_query_loop(
                         cost_usd: cost_tracker.total_cost_usd() - turn_start_cost,
                     });
 
+                    // T6: Reset overflow retry counter on successful response.
+                    overflow_retries = 0;
+
                     messages.push(assistant_msg.clone());
 
                     // Handle tool-use turn: execute tools and loop.
