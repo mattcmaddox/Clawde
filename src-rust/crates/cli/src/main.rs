@@ -6192,6 +6192,17 @@ async fn run_interactive(
             }
         }
 
+        // ---- Ollama ping: spawn background task when pending ----
+        if app.ollama_ping_pending {
+            app.ollama_ping_pending = false;
+            let host_url = app.ollama_config_dialog.host_url_input.clone();
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let result = ping_ollama_and_fetch_models(&host_url).await;
+                let _ = tx.send(QueryEvent::OllamaPingResult(result));
+            });
+        }
+
         // ---- Drain device auth events from the background task ----
         while let Ok(evt) = device_auth_rx.try_recv() {
             match evt {
@@ -7216,6 +7227,65 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
         Some(s) => serde_json::Value::String(s.clone()),
         None => serde_json::Value::Null,
     }
+}
+
+/// Ping an Ollama server and fetch available models.
+/// Returns the list of models on success, or an error message on failure.
+async fn ping_ollama_and_fetch_models(
+    host_url: &str,
+) -> Result<Vec<clawde_query::OllamaPingModel>, String> {
+    // Normalize the host URL (strip /v1, /api, etc.)
+    let normalized = clawde_core::config::normalize_ollama_host(host_url)
+        .ok_or_else(|| "Invalid URL: could not normalize host".to_string())?;
+
+    let tags_url = format!("{}/api/tags", normalized);
+    let response = reqwest::Client::new()
+        .get(&tags_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                "Connection timed out".to_string()
+            } else if e.is_connect() {
+                format!("Connection refused: {}", e)
+            } else {
+                format!("Request failed: {}", e)
+            }
+        })?;
+
+    if !response.status().is_success() {
+        return Err(format!("Server returned status: {}", response.status()));
+    }
+
+    let data: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    let models = data["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(clawde_query::OllamaPingModel {
+                        name: m["name"].as_str()?.to_string(),
+                        size: m["size"].as_u64().unwrap_or(0),
+                        quantization: m["details"]["quantization_level"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_string(),
+                        parameter_size: m["details"]["parameter_size"]
+                            .as_str()
+                            .unwrap_or("?")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(models)
 }
 
 #[cfg(test)]

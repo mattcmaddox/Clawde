@@ -1130,9 +1130,14 @@ pub mod config {
     /// [`normalize_ollama_host`] and remains fail-closed.
     fn normalize_ollama_host_with_local(raw: &str, allow_local: bool) -> Option<String> {
         let mut host = raw.trim().trim_end_matches('/').to_string();
-        if host.ends_with("/v1") {
-            host.truncate(host.len().saturating_sub(3));
-            host = host.trim_end_matches('/').to_string();
+        // Strip common API path variants that users may accidentally include.
+        // Order matters: check longer suffixes first to avoid partial matches.
+        for suffix in &["/v1/api", "/api/v1", "/api", "/v1"] {
+            if host.ends_with(suffix) {
+                host.truncate(host.len() - suffix.len());
+                host = host.trim_end_matches('/').to_string();
+                break;
+            }
         }
         let parsed = url::Url::parse(&host).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -1180,19 +1185,17 @@ pub mod config {
             })
     }
 
-    /// Look up the Ollama `api_base` from either storage location.
+    /// Look up the Ollama `api_base` from the embedded config's
+    /// `provider_configs` (the `/settings` UI write target). This is the
+    /// single source of truth for the Ollama endpoint URL. The `providers`
+    /// map's `api_base` is NOT checked here — users who configure via
+    /// `providers` should use `options.default_host` instead.
     fn ollama_api_base(settings: &Settings) -> Option<String> {
         settings
             .config
             .provider_configs
             .get("ollama")
             .and_then(|c| c.api_base.clone())
-            .or_else(|| {
-                settings
-                    .providers
-                    .get("ollama")
-                    .and_then(|c| c.api_base.clone())
-            })
     }
 
     #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -3703,8 +3706,11 @@ pub mod config {
         #[test]
         fn resolve_ollama_host_prefers_api_base_over_default_host() {
             let mut settings = Settings::default();
+            // api_base lives in config.provider_configs (the UI write target);
+            // it wins over default_host even when both are set.
             settings
-                .providers
+                .config
+                .provider_configs
                 .entry("ollama".to_string())
                 .or_default()
                 .api_base = Some("http://remote:11434/v1".to_string());
@@ -3754,6 +3760,33 @@ pub mod config {
                 normalize_ollama_host("http://gpu.example.test:11434/v1"),
                 Some("http://gpu.example.test:11434".to_string())
             );
+        }
+
+        #[test]
+        fn normalize_ollama_strips_common_api_path_suffixes() {
+            // All of these should resolve to the same base URL
+            let base = Some("http://gpu.example.test:11434".to_string());
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/v1"),
+                base
+            );
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/api"),
+                base
+            );
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/v1/api"),
+                base
+            );
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/api/v1"),
+                base
+            );
+            assert_eq!(
+                normalize_ollama_host("http://gpu.example.test:11434/"),
+                base
+            );
+            assert_eq!(normalize_ollama_host("http://gpu.example.test:11434"), base);
         }
 
         #[test]
@@ -5524,6 +5557,7 @@ pub mod history {
 
     /// Delete sessions older than the given age threshold.
     /// Returns the number of sessions deleted.
+    #[allow(dead_code)]
     pub async fn prune_sessions(older_than: chrono::Duration) -> anyhow::Result<usize> {
         let cutoff = chrono::Utc::now() - older_than;
         let sessions = list_sessions().await;

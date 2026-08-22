@@ -141,6 +141,8 @@ pub mod messages;
 pub mod model_picker;
 /// Notification / banner system.
 pub mod notifications;
+/// Modal dialog for configuring Ollama connection (host URL + model picker).
+pub mod ollama_config_dialog;
 /// First-launch onboarding / welcome dialog.
 pub mod onboarding_dialog;
 /// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
@@ -239,6 +241,10 @@ pub use model_picker::{
     model_supports_effort, render_model_picker, EffortLevel, ModelEntry, ModelPickerState,
 };
 pub use notifications::NotificationKind;
+pub use ollama_config_dialog::{
+    render_ollama_config_dialog, OllamaConfigDialogState, OllamaConfigField, OllamaConfigPhase,
+    OllamaModel, OllamaModelExt,
+};
 pub use onboarding_dialog::{render_onboarding_dialog, OnboardingDialogState};
 pub use overage_upsell::{render_overage_upsell, OverageCreditUpsellState};
 pub use prompt_input::{

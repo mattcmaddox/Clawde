@@ -32,6 +32,7 @@ use crate::messages::{
 };
 use crate::model_picker::render_model_picker;
 use crate::notifications::{render_notification_banner, Notification, NotificationKind};
+use crate::ollama_config_dialog::render_ollama_config_dialog;
 use crate::onboarding_dialog::render_onboarding_dialog;
 use crate::overage_upsell::render_overage_upsell;
 use crate::overlays::{
@@ -973,6 +974,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_custom_provider_dialog(
             frame,
             &app.custom_provider_dialog,
+            app.prompt_input.vim_enabled,
+            size,
+        );
+    }
+
+    // Ollama config dialog (host URL + model picker).
+    if app.ollama_config_dialog.visible {
+        render_ollama_config_dialog(
+            frame,
+            &app.ollama_config_dialog,
             app.prompt_input.vim_enabled,
             size,
         );

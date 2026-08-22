@@ -1289,6 +1289,7 @@ pub async fn compact_conversation(
 
 /// Compact conversation with memory extraction before compaction.
 /// This ensures important facts are preserved before the context is summarized.
+#[allow(dead_code)]
 pub async fn compact_with_memory_extraction(
     provider: &dyn LlmProvider,
     messages: &[Message],

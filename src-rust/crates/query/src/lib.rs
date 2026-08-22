@@ -472,6 +472,19 @@ pub enum QueryEvent {
     /// Outcome of a background `/compact` request (interactive path only;
     /// headless runs execute compaction inline through the command registry).
     Compact(CompactOutcome),
+    /// Result of an Ollama server ping. Carries either the list of available
+    /// models on success, or an error message on failure.
+    OllamaPingResult(Result<Vec<OllamaPingModel>, String>),
+}
+
+/// A model returned by Ollama's `/api/tags` endpoint.
+/// Defined here (not in TUI) so QueryEvent can reference it.
+#[derive(Debug, Clone)]
+pub struct OllamaPingModel {
+    pub name: String,
+    pub size: u64,
+    pub quantization: String,
+    pub parameter_size: String,
 }
 
 /// Result of a background `/compact` request, delivered via
@@ -1201,6 +1214,9 @@ pub async fn run_query_loop(
     // executed a file-writing tool, so the verify continuation policy can skip
     // pure read/search turns.
     let mut wrote_files = false;
+    // Auto-context-refresh: tracks file modification times for change detection.
+    let mut file_tracker = context_refresh::FileModificationTracker::new();
+    let mut context_files: Vec<std::path::PathBuf> = Vec::new();
     // Loop-health no-progress detector: the signature of the previous turn's
     // tool calls and how many consecutive turns revisited a recently seen
     // no-progress signature (identical call or a small alternating cycle) with
@@ -1735,13 +1751,35 @@ pub async fn run_query_loop(
 
         // Auto-context-refresh: check for external file modifications
         // This runs before each turn to detect files changed outside the agent
-        if let Some(ref tx) = event_tx {
-            let _ = tx.send(QueryEvent::Status(
-                "Checking for file changes...".to_string(),
-            ));
+        if !context_files.is_empty() {
+            let modified =
+                context_refresh::check_for_external_modifications(&file_tracker, &context_files);
+            if !modified.is_empty() {
+                info!(
+                    count = modified.len(),
+                    "Detected external file modifications, refreshing context"
+                );
+                for path in &modified {
+                    if let Ok(content) = context_refresh::refresh_file_in_context(path).await {
+                        // Log the change so the agent knows files were updated
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "File changed externally: {}",
+                                path.display()
+                            )));
+                        }
+                        // Update the tracker to avoid re-notifying
+                        file_tracker.update_file(path);
+                        // Inject a system message about the change
+                        messages.push(Message::user(format!(
+                            "[System: File '{}' was modified externally. Current content ({} chars) was refreshed into context.]",
+                            path.display(),
+                            content.len()
+                        )));
+                    }
+                }
+            }
         }
-        // Note: Full context refresh requires tracking which files are in context
-        // and a FileModificationTracker. This is a placeholder for future integration.
 
         // Drain any pending user messages that were queued during the previous
         // tool-execution phase (e.g. commands entered while tools ran).
@@ -3027,6 +3065,12 @@ pub async fn run_query_loop(
                             })
                             .collect();
 
+                        // Save a copy for context-refresh tracking after execution
+                        let tool_use_blocks_back: Vec<_> = tool_use_blocks
+                            .iter()
+                            .map(|(id, name, input)| (id.clone(), name.clone(), input.clone()))
+                            .collect();
+
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
@@ -3108,6 +3152,24 @@ pub async fn run_query_loop(
                                 &verify_config,
                                 &tool_ctx.working_dir,
                             );
+                        }
+
+                        // Auto-context-refresh: track files that were read by tools
+                        // so we can detect external modifications on subsequent turns
+                        for (_, tool_name, tool_input) in &tool_use_blocks_back {
+                            if tool_name == "file_read" || tool_name == "read_file" {
+                                if let Some(path) = tool_input
+                                    .get("file_path")
+                                    .or_else(|| tool_input.get("path"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    let path_buf = std::path::PathBuf::from(path);
+                                    if !context_files.contains(&path_buf) {
+                                        file_tracker.record_file(&path_buf);
+                                        context_files.push(path_buf);
+                                    }
+                                }
+                            }
                         }
 
                         continue; // loop for next tool round
@@ -3546,13 +3608,37 @@ pub async fn run_query_loop(
                         }
                     }
                 } else if stop == "end_turn" || stop == "tool_use" {
-                    // Auto-extract memories before compaction if enabled
-                    // This preserves important facts before the context is summarized
-                    // Note: Memory extraction requires an AnthropicClient, which is not available here.
-                    // The extraction will be handled by the CLI layer after compaction.
+                    // Auto-extract memories before compaction to preserve important facts.
+                    // Based on Aider's ChatSummary pattern of extracting key facts before summarization.
+                    let extractor =
+                        crate::session_memory::SessionMemoryExtractor::new(&config.model);
+                    if crate::session_memory::SessionMemoryExtractor::should_extract(messages) {
+                        if let Ok(extracted) = extractor
+                            .extract_before_compact(messages, &tool_ctx.working_dir, client)
+                            .await
+                        {
+                            if !extracted.is_empty() {
+                                info!(
+                                    count = extracted.len(),
+                                    "Extracted memories before auto-compaction"
+                                );
+                                // Persist extracted memories to AGENTS.md
+                                let agents_path = tool_ctx.working_dir.join("AGENTS.md");
+                                if let Err(e) =
+                                    crate::session_memory::SessionMemoryExtractor::persist(
+                                        &extracted,
+                                        &agents_path,
+                                    )
+                                    .await
+                                {
+                                    warn!(error = %e, "Failed to persist extracted memories");
+                                }
+                            }
+                        }
+                    }
 
                     // Proactive auto-compact (original path, used when reactive compact is off).
-                    // Use compact_with_memory_extraction to preserve important facts before compaction.
+                    // Memories have been extracted above; now compact the context.
                     if let Some(new_msgs) = compact::auto_compact_if_needed(
                         cp.as_ref(),
                         messages,
