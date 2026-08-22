@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Rustle Animation Studio</title>
+<title>Rustail Animation Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -654,7 +654,7 @@
 
 <header>
   <div>
-    <h1>Rustle Animation Studio <span class="sub">Frame Editor</span></h1>
+    <h1>Rustail Animation Studio <span class="sub">Frame Editor</span></h1>
   </div>
   <div class="header-controls">
     <div class="ctrl">
@@ -793,7 +793,7 @@
 
 <script>
 // ═══════════════════════════════════════════════════════════════════
-//  FRAME DATA — the 6 Rustle mascot animation frames
+//  FRAME DATA — the 6 Rustail mascot animation frames
 // ═══════════════════════════════════════════════════════════════════
 const DEFAULT_FRAMES = [
   { // Frame 1 — Rest claw (claws drawn in, feet on the ground)
@@ -946,7 +946,7 @@ const $tuiEditorRows = document.getElementById('tuiEditorRows');
 const $tuiEditorCols = document.getElementById('tuiEditorCols');
 
 // ─── PERSISTENCE ────────────────────────────────────────────────
-const STORAGE_KEY = 'rustle-studio-data';
+const STORAGE_KEY = 'rustail-studio-data';
 const STORAGE_VERSION = 5;  // bump when DEFAULT_FRAMES changes
 
 function saveState() {
@@ -1787,7 +1787,7 @@ function updateExport() {
 
   const durations = frames.map(f => (f.dur && f.dur > 0) ? Math.round(f.dur) : 1000).join(', ');
 
-  // The TUI's rustle.rs also defines CYCLE_MS as the sum of all frame
+  // The TUI's rustail.rs also defines CYCLE_MS as the sum of all frame
   // durations — emit it too so the exported snippet compiles verbatim.
   const cycleLines = frames.map((_, i) => `FRAME_DURATIONS_MS[${i}]`);
   const cycleMs = 'const CYCLE_MS: u64 = ' + cycleLines.join('\n    + ') + ';';
