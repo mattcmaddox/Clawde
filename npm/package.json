@@ -21,6 +21,13 @@
     "rust"
   ],
   "author": "Matt Maddox",
+  "contributors": [
+    "Kuber Mehta (https://github.com/Kuberwastaken)",
+    "Jonathan Hult",
+    "k99k5",
+    "Adam Bajger",
+    "Sovereign"
+  ],
   "bin": {
     "clawde": "bin/clawde"
   },

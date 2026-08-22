@@ -235,3 +235,20 @@ This mirrors the legal precedent established by Phoenix Technologies v. IBM (198
 
 ---
 
+## Acknowledgements
+
+Clawde is a **fork of [claurst](https://github.com/Kuberwastaken/claurst)** by
+[Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
+agentic coding agent whose repository history and early codebase this project
+builds on. This repository carries the upstream project's git history; the
+current Rust implementation was written from the behavioral specification in
+[`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec) (see the
+Important Notice above).
+
+Contributors to the upstream project and this fork, as recorded in this
+repository's git history: Kuber Mehta (Kuberwastaken), Jonathan Hult, k99k5,
+Adam Bajger, Sovereign, Sporkley, and the other contributors listed in the
+[contributors graph](https://github.com/mattcmaddox/Clawde/graphs/contributors).
+
+---
+

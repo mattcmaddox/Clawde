@@ -200,3 +200,15 @@ See [Slash Commands](commands) for the complete reference.
 - [Agents](agents) — multi-agent orchestration
 - [Hooks](hooks) — event-driven automation
 - [Advanced Features](advanced) — extended thinking, sessions, and more
+
+---
+
+## Acknowledgements
+
+Clawde is a fork of [claurst](https://github.com/Kuberwastaken/claurst) by
+[Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
+project whose repository history and early codebase this repository builds on.
+The current Rust implementation was written from the behavioral specification
+in [`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec).
+[Contributors](https://github.com/mattcmaddox/Clawde/graphs/contributors) are
+credited in this repository's git history.

@@ -11,6 +11,7 @@ chat forking, memory consolidation, sub-agent delegation, and much more.
 **License:** GPL-3.0  
 **Repository:** https://github.com/mattcmaddox/Clawde  
 **Binary:** `clawde` (formerly `claurst`)  
+**Derived from:** [Kuberwastaken/claurst](https://github.com/Kuberwastaken/claurst) (fork; upstream history + early codebase)  
 **Config directory:** `~/.clawde/` (legacy: `~/.claurst/` fallback)
 
 ---
