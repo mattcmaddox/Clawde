@@ -28,6 +28,7 @@ pub mod diagnostics;
 pub mod goal_loop;
 pub mod live_smoke;
 pub mod managed_orchestrator;
+pub(crate) mod repeat_guard;
 pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
@@ -1239,6 +1240,9 @@ pub async fn run_query_loop(
     // Count tool failures for the current logical turn without retaining raw
     // tool output in the durable plan artifact.
     let mut turn_tool_error_count: u32 = 0;
+    // Repeat-tool-reminder guard: detects consecutive identical tool calls
+    // and injects escalating reminders to break infinite loops.
+    let mut repeat_detector = repeat_guard::RepeatCallDetector::new();
     // Direct RunTests/RunLints outcomes are deterministic plan evidence even
     // when the separate end-of-turn verifier policy is disabled.
     let mut turn_deterministic_check_run = false;
@@ -1720,6 +1724,9 @@ pub async fn run_query_loop(
                         wrote_files = false;
                         turn_diff = None;
                         turn_tool_error_count = 0;
+                        // Reset repeat-tool-reminder: a user message changes the
+                        // context; repetition across it is not a loop.
+                        repeat_detector.reset();
                         turn_deterministic_check_run = false;
                         turn_deterministic_check_failed = false;
                         turn_snapshot = if let Some(ref snap) = shadow_snap {
@@ -3162,9 +3169,27 @@ pub async fn run_query_loop(
                             .map(|(id, name, input)| (id.clone(), name.clone(), input.clone()))
                             .collect();
 
-                        let mut tool_results = Vec::new();
-                        for (tool_id, tool_name, tool_input) in tool_use_blocks {
-                            // Notify TUI that a tool is starting (matches Anthropic path).
+                        // -----------------------------------------------------------------
+                        // Parallel tool executor: concurrent dispatch.
+                        //
+                        // Phase 1: Emit ToolStart events, record side effects, and
+                        //          build execution futures (or pre-computed errors for
+                        //          malformed tool calls).
+                        // Phase 2: Run all tool futures concurrently via join_all,
+                        //          racing against the cancel token.
+                        // Phase 3: Emit ToolEnd events, collect result blocks, run
+                        //          deterministic checks, and observe the repeat detector.
+                        // -----------------------------------------------------------------
+                        struct PreparedProviderTool {
+                            id: String,
+                            name: String,
+                            input: Value,
+                            result: Option<ToolResult>,
+                        }
+
+                        let mut prepared: Vec<PreparedProviderTool> =
+                            Vec::with_capacity(tool_use_blocks.len());
+                        for (tool_id, tool_name, tool_input) in &tool_use_blocks {
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolStart {
                                     tool_name: tool_name.clone(),
@@ -3172,32 +3197,64 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
-                            wrote_files |= is_write_tool(&tool_name);
+                            wrote_files |= is_write_tool(tool_name);
                             turn_tool_signatures.push(format!(
                                 "{}:{}",
                                 tool_name,
-                                serde_json::to_string(&tool_input).unwrap_or_default()
+                                serde_json::to_string(tool_input).unwrap_or_default()
                             ));
-                            let result = if malformed_tool_calls.contains(&tool_id) {
-                                // Never execute a tool whose arguments could not
-                                // be parsed — return an error the model can see
-                                // and recover from (issue #215).
-                                ToolResult::error(format!(
-                                    "Tool call '{}' was not executed: its arguments were malformed or truncated JSON. Retry the tool call with complete, valid JSON arguments.",
+                            let blocked = if malformed_tool_calls.contains(tool_id) {
+                                Some(ToolResult::error(format!(
+                                    "Tool call '{}' was not executed: its arguments were \
+                                     malformed or truncated JSON. Retry the tool call with \
+                                     complete, valid JSON arguments.",
                                     tool_name
-                                ))
+                                )))
                             } else {
-                                execute_tool_for_task(
-                                    &tool_name,
-                                    &tool_input,
-                                    tools,
-                                    tool_ctx,
-                                    active_task_id.as_deref(),
-                                )
-                                .await
+                                None
                             };
+                            prepared.push(PreparedProviderTool {
+                                id: tool_id.clone(),
+                                name: tool_name.clone(),
+                                input: tool_input.clone(),
+                                result: blocked,
+                            });
+                        }
+
+                        // Phase 2: build execution futures for non-blocked tools.
+                        let exec_task_id = active_task_id.clone();
+                        let exec_futures: Vec<_> = prepared
+                            .iter()
+                            .map(|p| {
+                                let task_id = exec_task_id.clone();
+                                if let Some(ref r) = p.result {
+                                    let r = r.clone();
+                                    futures::future::Either::Left(async move { r })
+                                } else {
+                                    let name = p.name.clone();
+                                    let input = p.input.clone();
+                                    futures::future::Either::Right(async move {
+                                        execute_tool_for_task(
+                                            &name,
+                                            &input,
+                                            tools,
+                                            tool_ctx,
+                                            task_id.as_deref(),
+                                        )
+                                        .await
+                                    })
+                                }
+                            })
+                            .collect();
+
+                        let (exec_results, batch_cancelled) =
+                            run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
+
+                        // Phase 3: post-processing — events, results, checks.
+                        let mut tool_results = Vec::new();
+                        for (p, result) in prepared.iter().zip(exec_results) {
                             let (check_run, check_failed) =
-                                deterministic_check_observation(&tool_name, &result);
+                                deterministic_check_observation(&p.name, &result);
                             turn_deterministic_check_run |= check_run;
                             turn_deterministic_check_failed |= check_failed;
                             if result.is_error {
@@ -3205,8 +3262,8 @@ pub async fn run_query_loop(
                             }
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
+                                    tool_name: p.name.clone(),
+                                    tool_id: p.id.clone(),
                                     result: result.content.clone(),
                                     is_error: result.is_error,
                                     error_code: result
@@ -3215,12 +3272,25 @@ pub async fn run_query_loop(
                                 });
                             }
                             tool_results.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_id,
+                                tool_use_id: p.id.clone(),
                                 content: clawde_core::types::ToolResultContent::Text(
                                     result.content,
                                 ),
                                 is_error: Some(result.is_error),
                             });
+                            if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
+                                tool_results.push(ContentBlock::ToolResult {
+                                    tool_use_id: p.id.clone(),
+                                    content: clawde_core::types::ToolResultContent::Text(format!(
+                                        "[SYSTEM NOTICE: {}]",
+                                        reminder
+                                    )),
+                                    is_error: Some(false),
+                                });
+                            }
+                        }
+                        if batch_cancelled {
+                            return QueryOutcome::Cancelled;
                         }
                         messages.push(Message {
                             role: clawde_core::types::Role::User,
@@ -3679,41 +3749,40 @@ pub async fn run_query_loop(
             clawde_core::feature_gates::is_feature_enabled("reactive_compact")
                 && tool_ctx.config.auto_compact;
 
-        // T4-5: Collapse repeated tool results in-place.  These are
-        // deterministic, model-free passes that deduplicate repeated file reads
-        // and search results before the pruner or LLM-based compaction runs.
-        let before_collapse = context_tokens;
-        compact::collapse_read_tool_results(messages);
-        compact::collapse_search_results(messages);
-        let collapse_freed =
-            before_collapse.saturating_sub(compact::estimate_context_tokens(messages, None));
-        if collapse_freed > 0 {
-            context_tokens = before_collapse.saturating_sub(collapse_freed);
-            info!(
-                tokens_freed = collapse_freed,
-                "Collapsed repeated tool results"
-            );
-            if let Some(ref tx) = event_tx {
-                let _ = tx.send(QueryEvent::Status(format!(
-                    "Collapsed repeated tool results (freed ~{} tokens).",
-                    collapse_freed
-                )));
-            }
-        }
-
-        // T6: Model-free tool-result pruning.  Before any LLM-based
-        // compaction, deterministically truncate oversized tool results using
-        // head/tail slicing.  This is instant (no API call) and can often bring
-        // the context below the compaction threshold on its own, avoiding an
-        // expensive summarisation round-trip.
+        // T4-6: Model-free context pressure reduction.  When context
+        // usage is below 75% of the window, skip the deterministic passes
+        // entirely — deduplication and pruning are only useful under pressure.
         if compact::should_prune(context_tokens, context_window) {
+            // T4-5: Collapse repeated tool results in-place.  Deduplicate
+            // repeated file reads and search results before the pruner or
+            // LLM-based compaction runs.
+            let before_collapse = context_tokens;
+            compact::collapse_read_tool_results(messages);
+            compact::collapse_search_results(messages);
+            let collapse_freed =
+                before_collapse.saturating_sub(compact::estimate_context_tokens(messages, None));
+            if collapse_freed > 0 {
+                context_tokens = before_collapse.saturating_sub(collapse_freed);
+                info!(
+                    tokens_freed = collapse_freed,
+                    "Collapsed repeated tool results"
+                );
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Status(format!(
+                        "Collapsed repeated tool results (freed ~{} tokens).",
+                        collapse_freed
+                    )));
+                }
+            }
+
+            // T6: Model-free tool-result pruning.  Truncate oversized tool
+            // results using head/tail slicing.  Instant (no API call) and can
+            // bring context below the compaction threshold on its own.
             let outcome = compact::prune_oversized_tool_results(
                 messages,
                 &compact::ToolResultPrunerConfig::default(),
             );
             if outcome.pruned_any {
-                // Re-estimate tokens after pruning — the pruned characters
-                // are gone from the live conversation.
                 context_tokens = context_tokens.saturating_sub((outcome.chars_removed / 4) as u64);
                 info!(
                     pruned = outcome.pruned_count,
@@ -4349,6 +4418,18 @@ pub async fn run_query_loop(
                             content: ToolResultContent::Text(result.content),
                             is_error: if result.is_error { Some(true) } else { None },
                         });
+                        // Repeat-tool-reminder: detect consecutive identical
+                        // tool calls and inject a warning to break loops.
+                        if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
+                            result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: p.id.clone(),
+                                content: ToolResultContent::Text(format!(
+                                    "[SYSTEM NOTICE: {}]",
+                                    reminder
+                                )),
+                                is_error: Some(false),
+                            });
+                        }
                     }
 
                     // Append tool results as a user message so the history remains

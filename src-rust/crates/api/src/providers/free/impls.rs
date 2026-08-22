@@ -1623,6 +1623,13 @@ impl RetryingFreeStream {
             .lock()
             .unwrap()
             .record_failure_reason(prev_chain_idx, reason.clone());
+        // Empty completions are transient — retry same upstream before
+        // advancing to the next provider.
+        if self.can_retry_same_upstream(prev_chain_idx) {
+            let model = self.current_model.clone();
+            self.schedule_same_upstream_retry(prev_chain_idx, model);
+            return true;
+        }
         self.upstream_errors.push(reason);
         self.start_next_plan_entry()
     }
