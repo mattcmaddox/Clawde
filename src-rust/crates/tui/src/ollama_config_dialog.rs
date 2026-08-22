@@ -41,6 +41,8 @@ pub enum OllamaConfigPhase {
     Pinging,
     /// Ping failed, showing error.
     PingFailed(String),
+    /// The server responded successfully but has no installed models.
+    NoModels,
     /// Ping succeeded, showing model list.
     SelectModel,
 }
@@ -319,6 +321,11 @@ impl OllamaConfigDialogState {
     pub fn ping_success(&mut self, models: Vec<OllamaModel>) {
         self.models = models;
         self.selected_model_idx = 0;
+        if self.models.is_empty() {
+            self.health = HealthStatus::Healthy;
+            self.phase = OllamaConfigPhase::NoModels;
+            return;
+        }
         // Pre-select the current model if it's in the list
         if !self.model_input.is_empty() {
             if let Some(idx) = self.models.iter().position(|m| m.name == self.model_input) {
@@ -385,12 +392,8 @@ impl OllamaConfigDialogState {
         (host, model)
     }
 
-    /// Go back from PingFailed to the previous phase.
-    pub fn retry_from_failure(&mut self) {
-        self.phase = OllamaConfigPhase::Default;
-    }
-
-    /// Go back from SelectModel to Default view (without closing the dialog).
+    /// Go back from SelectModel or NoModels to Default view (without closing
+    /// the dialog).
     pub fn back_to_default(&mut self) {
         self.phase = OllamaConfigPhase::Default;
     }
@@ -402,6 +405,7 @@ impl OllamaConfigDialogState {
             OllamaConfigPhase::EditField(_)
                 | OllamaConfigPhase::Pinging
                 | OllamaConfigPhase::PingFailed(_)
+                | OllamaConfigPhase::NoModels
                 | OllamaConfigPhase::SelectModel
         )
     }
@@ -428,6 +432,7 @@ pub fn render_ollama_config_dialog(
         }
         OllamaConfigPhase::Pinging => render_pinging(frame, state, area),
         OllamaConfigPhase::PingFailed(err) => render_ping_failed(frame, state, err, area),
+        OllamaConfigPhase::NoModels => render_no_models(frame, state, area),
         OllamaConfigPhase::SelectModel => render_model_picker(frame, state, area),
     }
 }
@@ -786,6 +791,63 @@ fn render_ping_failed(frame: &mut Frame, state: &OllamaConfigDialogState, error:
     frame.render_widget(para, inner);
 }
 
+fn render_no_models(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
+    let pink = Color::Rgb(233, 30, 99);
+    let dim = Color::Rgb(90, 90, 90);
+    let muted = Color::Rgb(180, 180, 180);
+    let dialog_bg = CLAURST_PANEL_BG;
+
+    render_dark_overlay(frame, area);
+
+    let width = 62u16.min(area.width.saturating_sub(4));
+    let height = 9u16;
+    let dialog_area = centered_rect(width, height, area);
+    state.last_rect.set(dialog_area);
+    render_dialog_bg(frame, dialog_area);
+
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " Ollama Connected",
+                Style::default().fg(pink).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{:>width$}",
+                    "esc ",
+                    width = inner.width.saturating_sub(14) as usize
+                ),
+                Style::default().fg(dim),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            " No models are installed on this server.",
+            Style::default().fg(muted),
+        )]),
+        Line::from(vec![Span::styled(
+            " Pull one with: ollama pull <model>",
+            Style::default().fg(muted),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("enter", Style::default().fg(dim)),
+            Span::styled(" retry  ", Style::default().fg(dim)),
+            Span::styled("esc", Style::default().fg(dim)),
+            Span::styled(" back", Style::default().fg(dim)),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).bg(dialog_bg), inner);
+}
+
 fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
     let pink = Color::Rgb(233, 30, 99);
     let dim = Color::Rgb(90, 90, 90);
@@ -1117,6 +1179,16 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_model_list_is_actionable() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.ping_success(vec![]);
+        assert_eq!(state.health, HealthStatus::Healthy);
+        assert_eq!(state.phase, OllamaConfigPhase::NoModels);
+        assert!(state.selected_model().is_none());
+    }
+
+    #[test]
     fn test_health_status() {
         let mut state = OllamaConfigDialogState::new();
         state.open(None, None);
@@ -1143,17 +1215,6 @@ mod tests {
 
         state.start_ping();
         assert!(state.is_modal());
-    }
-
-    #[test]
-    fn test_retry_from_failure() {
-        let mut state = OllamaConfigDialogState::new();
-        state.open(None, None);
-        state.ping_failed("Connection refused".to_string());
-        assert!(matches!(state.phase, OllamaConfigPhase::PingFailed(_)));
-
-        state.retry_from_failure();
-        assert_eq!(state.phase, OllamaConfigPhase::Default);
     }
 
     #[test]
@@ -1216,9 +1277,9 @@ mod tests {
         let mut state = OllamaConfigDialogState::new();
         state.open(None, None);
 
-        // Go to select model phase
+        // An empty successful response is an explicit no-models state.
         state.ping_success(vec![]);
-        assert_eq!(state.phase, OllamaConfigPhase::SelectModel);
+        assert_eq!(state.phase, OllamaConfigPhase::NoModels);
 
         // Go back to default
         state.back_to_default();

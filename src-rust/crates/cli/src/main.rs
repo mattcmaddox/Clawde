@@ -7235,19 +7235,77 @@ fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
     }
 }
 
+/// Ollama's `/api/tags` response envelope.
+#[derive(Debug, serde::Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OllamaTagModel {
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    details: OllamaTagDetails,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OllamaTagDetails {
+    #[serde(default)]
+    quantization_level: Option<String>,
+    #[serde(default)]
+    parameter_size: Option<String>,
+}
+
+/// Parse a successful Ollama `/api/tags` payload.
+fn parse_ollama_tags(body: &str) -> Result<Vec<clawde_query::OllamaPingModel>, String> {
+    let response: OllamaTagsResponse =
+        serde_json::from_str(body).map_err(|e| format!("Invalid Ollama model response: {}", e))?;
+
+    Ok(response
+        .models
+        .into_iter()
+        .map(|model| clawde_query::OllamaPingModel {
+            name: model.name,
+            size: model.size,
+            quantization: model
+                .details
+                .quantization_level
+                .unwrap_or_else(|| "?".to_string()),
+            parameter_size: model
+                .details
+                .parameter_size
+                .unwrap_or_else(|| "?".to_string()),
+        })
+        .collect())
+}
+
 /// Ping an Ollama server and fetch available models.
 /// Returns the list of models on success, or an error message on failure.
 async fn ping_ollama_and_fetch_models(
     host_url: &str,
 ) -> Result<Vec<clawde_query::OllamaPingModel>, String> {
-    // Normalize the host URL (strip /v1, /api, etc.)
     let normalized = clawde_core::config::normalize_ollama_host(host_url)
         .ok_or_else(|| "Invalid URL: could not normalize host".to_string())?;
+    let client = reqwest::Client::new();
+    fetch_ollama_models_at(&client, &normalized, std::time::Duration::from_secs(5)).await
+}
 
-    let tags_url = format!("{}/api/tags", normalized);
-    let response = reqwest::Client::new()
+/// Fetch models from an already-normalized Ollama host.
+///
+/// Keeping transport separate from URL validation makes the parser and HTTP
+/// behavior testable against an ephemeral local server without allowing
+/// loopback URLs through the user-facing remote-host validation.
+async fn fetch_ollama_models_at(
+    client: &reqwest::Client,
+    normalized_host: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<clawde_query::OllamaPingModel>, String> {
+    let tags_url = format!("{}/api/tags", normalized_host);
+    let response = client
         .get(&tags_url)
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| {
@@ -7264,34 +7322,118 @@ async fn ping_ollama_and_fetch_models(
         return Err(format!("Server returned status: {}", response.status()));
     }
 
-    let data: serde_json::Value = response
-        .json()
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("Invalid response: {}", e))?;
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+    parse_ollama_tags(&body)
+}
 
-    let models = data["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    Some(clawde_query::OllamaPingModel {
-                        name: m["name"].as_str()?.to_string(),
-                        size: m["size"].as_u64().unwrap_or(0),
-                        quantization: m["details"]["quantization_level"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .to_string(),
-                        parameter_size: m["details"]["parameter_size"]
-                            .as_str()
-                            .unwrap_or("?")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+#[cfg(test)]
+mod ollama_discovery_tests {
+    use super::{fetch_ollama_models_at, parse_ollama_tags};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    Ok(models)
+    #[test]
+    fn parses_model_metadata_and_namespaced_names() {
+        let models = parse_ollama_tags(
+            r#"{
+                "models": [
+                    {
+                        "name": "example/qwen:7b",
+                        "size": 4700000000,
+                        "details": {
+                            "parameter_size": "7B",
+                            "quantization_level": "Q4_K_M"
+                        }
+                    },
+                    { "name": "minimal" }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "example/qwen:7b");
+        assert_eq!(models[0].size, 4_700_000_000);
+        assert_eq!(models[0].parameter_size, "7B");
+        assert_eq!(models[0].quantization, "Q4_K_M");
+        assert_eq!(models[1].quantization, "?");
+        assert_eq!(models[1].parameter_size, "?");
+    }
+
+    #[test]
+    fn rejects_malformed_or_missing_model_envelope() {
+        assert!(parse_ollama_tags("not json").is_err());
+        assert!(parse_ollama_tags(r#"{"status":"ok"}"#).is_err());
+    }
+
+    async fn mock_tags_server(
+        status: &'static str,
+        body: &'static str,
+        delay: Option<Duration>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("GET /api/tags "));
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (format!("http://{}", address), task)
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetches_empty_model_list_without_treating_it_as_malformed() {
+        let (base_url, task) = mock_tags_server("200 OK", r#"{"models":[]}"#, None).await;
+        let models = fetch_ollama_models_at(&test_client(), &base_url, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(models.is_empty());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_http_failures() {
+        let (base_url, task) =
+            mock_tags_server("500 Internal Server Error", r#"{"error":"offline"}"#, None).await;
+        let error = fetch_ollama_models_at(&test_client(), &base_url, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("500"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_request_timeouts() {
+        let (base_url, task) = mock_tags_server(
+            "200 OK",
+            r#"{"models":[]}"#,
+            Some(Duration::from_millis(100)),
+        )
+        .await;
+        let error = fetch_ollama_models_at(&test_client(), &base_url, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Connection timed out");
+        task.await.unwrap();
+    }
 }
 
 #[cfg(test)]

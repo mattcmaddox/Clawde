@@ -6060,6 +6060,15 @@ impl App {
                     }
                     _ => {}
                 },
+                crate::ollama_config_dialog::OllamaConfigPhase::NoModels => match key.code {
+                    KeyCode::Esc => {
+                        self.ollama_config_dialog.back_to_default();
+                    }
+                    KeyCode::Enter => {
+                        self.start_ollama_ping(true);
+                    }
+                    _ => {}
+                },
                 crate::ollama_config_dialog::OllamaConfigPhase::SelectModel => {
                     match key.code {
                         KeyCode::Esc => {
@@ -6178,20 +6187,29 @@ impl App {
                         match selected.id.as_str() {
                             // Ollama — open config dialog for host URL + model
                             "ollama" => {
-                                let current_url = Settings::load_sync().ok().and_then(|s| {
-                                    s.config
-                                        .provider_configs
-                                        .get("ollama")
-                                        .and_then(|c| c.api_base.clone())
-                                });
-                                let current_model = Settings::load_sync().ok().and_then(|s| {
-                                    s.config
-                                        .provider_configs
-                                        .get("ollama")
-                                        .and_then(|c| c.options.get("model"))
-                                        .and_then(|v| v.as_str())
-                                        .map(String::from)
-                                });
+                                // Use the same merged settings view as runtime provider
+                                // resolution so both the documented top-level `providers`
+                                // location and the TUI's nested `config.provider_configs`
+                                // location populate this dialog consistently.
+                                let effective_config = Settings::load_sync()
+                                    .ok()
+                                    .map(|settings| settings.effective_config())
+                                    .unwrap_or_else(|| self.config.clone());
+                                let ollama_config = effective_config.provider_configs.get("ollama");
+                                let current_url =
+                                    ollama_config.and_then(|config| config.api_base.clone());
+                                let current_model = if effective_config.provider.as_deref()
+                                    == Some("ollama")
+                                {
+                                    effective_config.model.as_deref().map(|model| {
+                                        model.strip_prefix("ollama/").unwrap_or(model).to_string()
+                                    })
+                                } else {
+                                    ollama_config
+                                        .and_then(|config| config.options.get("model"))
+                                        .and_then(|value| value.as_str())
+                                        .map(str::to_owned)
+                                };
                                 let has_saved_host = current_url.is_some();
                                 self.ollama_config_dialog.open(current_url, current_model);
                                 if has_saved_host {
@@ -10592,6 +10610,7 @@ impl App {
                 } else if matches!(
                     self.ollama_config_dialog.phase,
                     crate::ollama_config_dialog::OllamaConfigPhase::Default
+                        | crate::ollama_config_dialog::OllamaConfigPhase::NoModels
                 ) {
                     match result {
                         Ok(_) => self.ollama_config_dialog.health_check_succeeded(),
@@ -12635,6 +12654,62 @@ mod tests {
     }
 
     #[test]
+    fn ollama_dialog_loads_top_level_providers_config() {
+        // When Ollama is configured only under the documented top-level
+        // `providers` map (not nested under `config.provider_configs`),
+        // the dialog must still populate the host URL via
+        // `Settings::effective_config()` merge semantics.
+        let _home = TestHome::acquire();
+        let mut settings = Settings::default();
+        settings.providers.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                api_base: Some("http://gpu.example.test:11434".to_string()),
+                ..Default::default()
+            },
+        );
+        settings.save_sync().unwrap();
+        let effective = Settings::load_sync().unwrap().effective_config();
+        let ollama = effective
+            .provider_configs
+            .get("ollama")
+            .expect("top-level providers.ollama must merge into effective config");
+        assert_eq!(
+            ollama.api_base.as_deref(),
+            Some("http://gpu.example.test:11434")
+        );
+    }
+
+    #[test]
+    fn ollama_dialog_prefers_config_model_over_options() {
+        // When the active provider is ollama and config.model is set (e.g.
+        // "ollama/qwen2.5-coder:7b"), the dialog should display the runtime
+        // model — not a stale value from options["model"].
+        let mut config = Config {
+            provider: Some("ollama".to_string()),
+            model: Some("ollama/qwen2.5-coder:7b".to_string()),
+            ..Default::default()
+        };
+        let effective_url = "http://gpu.example.test:11434";
+        config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                api_base: Some(format!("{effective_url}/v1")),
+                options: [("model".to_string(), serde_json::json!("stale-model:0b"))]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let model = config
+            .model
+            .as_deref()
+            .map(|m| m.strip_prefix("ollama/").unwrap_or(m).to_string());
+        assert_eq!(model.as_deref(), Some("qwen2.5-coder:7b"));
+        assert_ne!(model.as_deref(), Some("stale-model:0b"));
+    }
+
+    #[test]
     fn ollama_first_connect_requires_model_discovery() {
         let mut app = make_app();
         app.ollama_config_dialog
@@ -12659,6 +12734,57 @@ mod tests {
         assert_eq!(
             app.ollama_config_dialog.phase,
             crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+    }
+
+    #[test]
+    fn ollama_empty_model_list_enter_retries() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.ping_success(vec![]);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::NoModels
+        );
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.ollama_ping_pending);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+    }
+
+    #[test]
+    fn ollama_no_models_background_health_check_updates_dot() {
+        // A background health ping (for_model_picker=false) that arrives
+        // while the dialog is in NoModels must still update the health dot.
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.ping_success(vec![]);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::NoModels
+        );
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Healthy
+        );
+        // Server goes down while user is viewing NoModels.
+        app.ollama_ping_request_id = 7;
+        app.handle_query_event(QueryEvent::OllamaPingResult {
+            request_id: 7,
+            for_model_picker: false,
+            result: Err("connection refused".to_string()),
+        });
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Unhealthy
+        );
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::NoModels
         );
     }
 

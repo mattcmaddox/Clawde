@@ -59,6 +59,25 @@ without opening the model picker. Editing the host resets the health state.
 write target. The documented top-level `providers.ollama.api_base` remains a
 compatibility fallback and now also retains native Ollama discovery behavior.
 
+### Fixed: empty model response
+
+A healthy server with an empty `/api/tags` model list now enters an explicit
+no-models state. The user can retry or return to the configuration view, but
+cannot accidentally activate an unusable model.
+
+### Fixed: endpoint shape validation
+
+After recognized `/v1` and `/api` suffixes are removed, Ollama endpoints must
+point at the server root. Unsupported path prefixes, query strings, fragments,
+and embedded credentials are rejected because the native and OpenAI-compatible
+endpoints use sibling paths and are not safely joined through arbitrary prefixes.
+
+### Fixed: discovery testability
+
+Transport and JSON parsing are separated. Typed parser, empty-list, HTTP error,
+and timeout tests use an ephemeral local TCP server without adding a mocking
+dependency.
+
 ## Remaining limitations
 
 - The health result is held in the dialog state and is not persisted with a
@@ -69,9 +88,6 @@ compatibility fallback and now also retains native Ollama discovery behavior.
   Ollama server.
 - Ping verifies `/api/tags`; it does not perform a generation request, so model
   loading and inference readiness are not fully verified until the first request.
-- The model discovery path is covered by state and event tests, but a mocked HTTP
-  fixture for `ping_ollama_and_fetch_models` would provide stronger parser and
-  timeout coverage.
 
 ## Validation
 
