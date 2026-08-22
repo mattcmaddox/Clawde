@@ -60,6 +60,8 @@ pub enum HealthStatus {
 /// Re-export from the query crate where `QueryEvent` lives.
 pub use clawde_query::OllamaPingModel as OllamaModel;
 
+const MODEL_PICKER_VISIBLE_ROWS: usize = 10;
+
 /// Extension trait for display helpers.
 pub trait OllamaModelExt {
     fn size_display(&self) -> String;
@@ -94,6 +96,7 @@ pub struct OllamaConfigDialogState {
     pub phase: OllamaConfigPhase,
     pub models: Vec<OllamaModel>,
     pub selected_model_idx: usize,
+    pub model_scroll_offset: usize,
     pub health: HealthStatus,
     /// Vim-modal insert state (only used when vim is enabled).
     pub vim_search: VimSearch,
@@ -117,6 +120,7 @@ impl OllamaConfigDialogState {
             phase: OllamaConfigPhase::Default,
             models: Vec::new(),
             selected_model_idx: 0,
+            model_scroll_offset: 0,
             health: HealthStatus::Untested,
             vim_search: VimSearch::new(),
         }
@@ -132,6 +136,7 @@ impl OllamaConfigDialogState {
         self.phase = OllamaConfigPhase::Default;
         self.models.clear();
         self.selected_model_idx = 0;
+        self.model_scroll_offset = 0;
         self.health = HealthStatus::Untested;
         self.vim_search.reset();
     }
@@ -144,6 +149,7 @@ impl OllamaConfigDialogState {
         self.phase = OllamaConfigPhase::Default;
         self.models.clear();
         self.selected_model_idx = 0;
+        self.model_scroll_offset = 0;
         self.health = HealthStatus::Untested;
         self.vim_search.reset();
     }
@@ -319,6 +325,7 @@ impl OllamaConfigDialogState {
                 self.selected_model_idx = idx;
             }
         }
+        self.ensure_model_visible();
         self.health = HealthStatus::Healthy;
         self.phase = OllamaConfigPhase::SelectModel;
     }
@@ -329,10 +336,31 @@ impl OllamaConfigDialogState {
         self.phase = OllamaConfigPhase::PingFailed(error);
     }
 
+    /// Record a background health-check success without opening the model picker.
+    pub fn health_check_succeeded(&mut self) {
+        self.health = HealthStatus::Healthy;
+    }
+
+    /// Record a background health-check failure without changing the dialog phase.
+    pub fn health_check_failed(&mut self) {
+        self.health = HealthStatus::Unhealthy;
+    }
+
+    fn ensure_model_visible(&mut self) {
+        if self.selected_model_idx < self.model_scroll_offset {
+            self.model_scroll_offset = self.selected_model_idx;
+        } else if self.selected_model_idx >= self.model_scroll_offset + MODEL_PICKER_VISIBLE_ROWS {
+            self.model_scroll_offset = self
+                .selected_model_idx
+                .saturating_sub(MODEL_PICKER_VISIBLE_ROWS - 1);
+        }
+    }
+
     /// Navigate to the previous model in the list.
     pub fn move_model_up(&mut self) {
         if self.selected_model_idx > 0 {
             self.selected_model_idx -= 1;
+            self.ensure_model_visible();
         }
     }
 
@@ -340,6 +368,7 @@ impl OllamaConfigDialogState {
     pub fn move_model_down(&mut self) {
         if self.selected_model_idx + 1 < self.models.len() {
             self.selected_model_idx += 1;
+            self.ensure_model_visible();
         }
     }
 
@@ -637,7 +666,9 @@ fn render_edit_mode(
         Span::styled("tab", Style::default().fg(dim)),
         Span::styled(" switch field  ", Style::default().fg(dim)),
         Span::styled("enter", Style::default().fg(dim)),
-        Span::styled(" confirm", Style::default().fg(dim)),
+        Span::styled(" confirm  ", Style::default().fg(dim)),
+        Span::styled("ctrl-p", Style::default().fg(dim)),
+        Span::styled(" ping", Style::default().fg(dim)),
     ];
     if _vim_enabled && state.vim_search.insert {
         hint_spans.push(Span::styled(
@@ -766,7 +797,7 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
     render_dark_overlay(frame, area);
 
     let width = 65u16.min(area.width.saturating_sub(4));
-    let model_rows = state.models.len().min(10) as u16;
+    let model_rows = state.models.len().min(MODEL_PICKER_VISIBLE_ROWS) as u16;
     let height = (5 + model_rows + 2).max(9);
     let dialog_area = centered_rect(width, height, area);
     state.last_rect.set(dialog_area);
@@ -808,7 +839,13 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
             Style::default().fg(muted),
         )]));
     } else {
-        for (i, model) in state.models.iter().enumerate() {
+        for (i, model) in state
+            .models
+            .iter()
+            .enumerate()
+            .skip(state.model_scroll_offset)
+            .take(MODEL_PICKER_VISIBLE_ROWS)
+        {
             let is_selected = i == state.selected_model_idx;
             let indicator = if is_selected { "▸" } else { " " };
 
@@ -1003,6 +1040,47 @@ mod tests {
         // Can't go below 0
         state.move_model_up();
         assert_eq!(state.selected_model_idx, 0);
+    }
+
+    #[test]
+    fn test_model_navigation_scrolls_large_lists() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        let models = (0..15)
+            .map(|index| OllamaModel {
+                name: format!("model-{index}"),
+                size: 1_000_000_000,
+                quantization: "Q4_K_M".to_string(),
+                parameter_size: "7B".to_string(),
+            })
+            .collect();
+
+        state.ping_success(models);
+        assert_eq!(state.model_scroll_offset, 0);
+        for _ in 0..10 {
+            state.move_model_down();
+        }
+        assert_eq!(state.selected_model_idx, 10);
+        assert_eq!(state.model_scroll_offset, 1);
+        state.move_model_down();
+        assert_eq!(state.model_scroll_offset, 2);
+        for _ in 0..11 {
+            state.move_model_up();
+        }
+        assert_eq!(state.selected_model_idx, 0);
+        assert_eq!(state.model_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_background_health_check_does_not_change_phase() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.health_check_succeeded();
+        assert_eq!(state.health, HealthStatus::Healthy);
+        assert_eq!(state.phase, OllamaConfigPhase::Default);
+        state.health_check_failed();
+        assert_eq!(state.health, HealthStatus::Unhealthy);
+        assert_eq!(state.phase, OllamaConfigPhase::Default);
     }
 
     #[test]

@@ -6195,11 +6195,17 @@ async fn run_interactive(
         // ---- Ollama ping: spawn background task when pending ----
         if app.ollama_ping_pending {
             app.ollama_ping_pending = false;
+            let request_id = app.ollama_ping_request_id;
+            let for_model_picker = app.ollama_ping_for_models;
             let host_url = app.ollama_config_dialog.host_url_input.clone();
             let tx = event_tx.clone();
             tokio::spawn(async move {
                 let result = ping_ollama_and_fetch_models(&host_url).await;
-                let _ = tx.send(QueryEvent::OllamaPingResult(result));
+                let _ = tx.send(QueryEvent::OllamaPingResult {
+                    request_id,
+                    for_model_picker,
+                    result,
+                });
             });
         }
 

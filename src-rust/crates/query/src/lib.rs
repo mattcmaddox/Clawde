@@ -472,9 +472,13 @@ pub enum QueryEvent {
     /// Outcome of a background `/compact` request (interactive path only;
     /// headless runs execute compaction inline through the command registry).
     Compact(CompactOutcome),
-    /// Result of an Ollama server ping. Carries either the list of available
-    /// models on success, or an error message on failure.
-    OllamaPingResult(Result<Vec<OllamaPingModel>, String>),
+    /// Result of an Ollama server ping. Carries the request identity and
+    /// whether the ping was intended to populate the model picker.
+    OllamaPingResult {
+        request_id: u64,
+        for_model_picker: bool,
+        result: Result<Vec<OllamaPingModel>, String>,
+    },
 }
 
 /// A model returned by Ollama's `/api/tags` endpoint.

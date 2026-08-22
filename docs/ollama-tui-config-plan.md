@@ -1,5 +1,10 @@
 # Plan: Ollama TUI Configuration Dialog
 
+> Implemented and audited. The final behavior includes fast reconnect, explicit
+> model propagation, background health checks, request-scoped model discovery,
+> retry handling, and a scrolling model picker. See
+> `docs/ollama-dialog-audit.md` for the current audit and remaining limitations.
+
 ## Existing Patterns (Analyzed)
 
 | Pattern | File | Fields | Use Case |

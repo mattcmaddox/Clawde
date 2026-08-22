@@ -1185,17 +1185,22 @@ pub mod config {
             })
     }
 
-    /// Look up the Ollama `api_base` from the embedded config's
-    /// `provider_configs` (the `/settings` UI write target). This is the
-    /// single source of truth for the Ollama endpoint URL. The `providers`
-    /// map's `api_base` is NOT checked here — users who configure via
-    /// `providers` should use `options.default_host` instead.
+    /// Look up the Ollama `api_base`, preferring the embedded config's
+    /// `provider_configs` (the `/settings` UI write target) and retaining the
+    /// documented top-level `providers` location as a compatibility fallback.
+    /// Both paths feed the same normalized native host resolver.
     fn ollama_api_base(settings: &Settings) -> Option<String> {
         settings
             .config
             .provider_configs
             .get("ollama")
             .and_then(|c| c.api_base.clone())
+            .or_else(|| {
+                settings
+                    .providers
+                    .get("ollama")
+                    .and_then(|c| c.api_base.clone())
+            })
     }
 
     #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -3697,6 +3702,20 @@ pub mod config {
                     "default_host".to_string(),
                     serde_json::json!("http://gpu:11434"),
                 );
+            assert_eq!(
+                resolve_ollama_host_from(&settings),
+                Some("http://gpu:11434".to_string())
+            );
+        }
+
+        #[test]
+        fn resolve_ollama_host_reads_top_level_api_base() {
+            let mut settings = Settings::default();
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .api_base = Some("http://gpu:11434/v1".to_string());
             assert_eq!(
                 resolve_ollama_host_from(&settings),
                 Some("http://gpu:11434".to_string())

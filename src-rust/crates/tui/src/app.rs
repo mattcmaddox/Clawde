@@ -1577,6 +1577,11 @@ pub struct App {
     /// When `true`, the main loop should spawn an async task to ping the
     /// Ollama server and fetch available models.
     pub ollama_ping_pending: bool,
+    /// Monotonically changing identity for the active Ollama ping request.
+    pub ollama_ping_request_id: u64,
+    /// Whether the active ping should populate the model picker. A background
+    /// health refresh leaves the dialog in its current Default phase.
+    pub ollama_ping_for_models: bool,
     /// "Free" composite-provider setup dialog (multi-key health dots).
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
@@ -2177,6 +2182,8 @@ impl App {
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             ollama_config_dialog: crate::ollama_config_dialog::OllamaConfigDialogState::new(),
             ollama_ping_pending: false,
+            ollama_ping_request_id: 0,
+            ollama_ping_for_models: false,
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
@@ -2662,12 +2669,22 @@ impl App {
         provider_name: String,
         status_prefix: &str,
     ) {
+        self.activate_provider_with_model(provider_id, provider_name, status_prefix, None);
+    }
+
+    fn activate_provider_with_model(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        status_prefix: &str,
+        model_override: Option<String>,
+    ) {
         let picker_title = provider_name.clone();
         self.fast_mode = false;
         if provider_id == "cline" {
             crate::model_picker::refresh_cline_model_cache();
         }
-        self.set_provider_default(provider_id.clone());
+        self.set_provider_default_with_model(provider_id.clone(), model_override);
         self.persist_provider_and_model();
         self.has_credentials = true;
         self.status_message = Some(format!("{} {}.", status_prefix, provider_name));
@@ -2722,6 +2739,16 @@ impl App {
         entry.api_base = Some(base_url.to_string());
         entry.enabled = true;
         let _ = settings.save_sync();
+    }
+
+    /// Start an asynchronous Ollama request and invalidate older results.
+    fn start_ollama_ping(&mut self, for_model_picker: bool) {
+        self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
+        self.ollama_ping_for_models = for_model_picker;
+        if for_model_picker {
+            self.ollama_config_dialog.start_ping();
+        }
+        self.ollama_ping_pending = true;
     }
 
     /// Persist Ollama host URL and model to settings.json.
@@ -2815,9 +2842,21 @@ impl App {
 
     /// Switch the active provider while clearing any explicit model override.
     fn set_provider_default(&mut self, provider_id: String) {
+        self.set_provider_default_with_model(provider_id, None);
+    }
+
+    /// Switch the active provider and optionally preserve an explicit model.
+    fn set_provider_default_with_model(
+        &mut self,
+        provider_id: String,
+        model_override: Option<String>,
+    ) {
         let old_provider = self.config.selected_provider_id().to_string();
         let old_model = self.model_name.clone();
-        let model = self.display_default_model_for_provider(&provider_id);
+        let model = model_override
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.display_default_model_for_provider(&provider_id));
         let old_bare = old_model.strip_prefix("ollama/").unwrap_or(&old_model);
         let new_bare = model.strip_prefix("ollama/").unwrap_or(&model);
 
@@ -2835,7 +2874,7 @@ impl App {
         }
 
         self.config.provider = Some(provider_id.clone());
-        self.config.model = None;
+        self.config.model = model_override;
         self.cost_tracker.set_model(&model);
         self.model_name = model;
         self.refresh_context_window_size();
@@ -3084,6 +3123,8 @@ impl App {
             crate::custom_provider_dialog::CustomProviderDialogState::new();
         self.ollama_config_dialog = crate::ollama_config_dialog::OllamaConfigDialogState::new();
         self.ollama_ping_pending = false;
+        self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
+        self.ollama_ping_for_models = false;
         self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
@@ -5877,9 +5918,10 @@ impl App {
                             self.ollama_config_dialog.close();
                         }
                         KeyCode::Enter => {
-                            // Fast path: connect with current config
+                            // Fast path: connect with an existing model. A first-time
+                            // setup must discover a real server model instead of
+                            // silently selecting a hardcoded tag that may not exist.
                             if self.ollama_config_dialog.can_connect() {
-                                // Validate host URL
                                 let host_url = match self.ollama_config_dialog.validate_host_url() {
                                     Ok(url) => url,
                                     Err(e) => {
@@ -5887,31 +5929,31 @@ impl App {
                                         return false;
                                     }
                                 };
-                                // Validate model name (use default if empty)
-                                let model =
-                                    if self.ollama_config_dialog.model_input.trim().is_empty() {
-                                        "qwen2.5-coder:3b".to_string()
-                                    } else {
-                                        match self.ollama_config_dialog.validate_model_name() {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                self.status_message =
-                                                    Some(format!("Invalid model: {}", e));
-                                                return false;
-                                            }
-                                        }
-                                    };
+                                if self.ollama_config_dialog.model_input.trim().is_empty() {
+                                    self.start_ollama_ping(true);
+                                    return false;
+                                }
+                                let model = match self.ollama_config_dialog.validate_model_name() {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        self.status_message = Some(format!("Invalid model: {}", e));
+                                        return false;
+                                    }
+                                };
                                 self.ollama_config_dialog.close();
                                 if let Err(e) = self.persist_ollama_config(&host_url, &model) {
                                     self.status_message =
                                         Some(format!("Failed to save config: {}", e));
                                     return false;
                                 }
-                                self.activate_provider(
+                                self.activate_provider_with_model(
                                     "ollama".to_string(),
                                     "Ollama".to_string(),
                                     "Connected to",
+                                    Some(model),
                                 );
+                            } else {
+                                self.status_message = Some("Host URL is required.".to_string());
                             }
                         }
                         KeyCode::Down => {
@@ -5933,8 +5975,7 @@ impl App {
                         KeyCode::Char('m') => {
                             // Trigger ping + model picker
                             if self.ollama_config_dialog.can_connect() {
-                                self.ollama_config_dialog.start_ping();
-                                self.ollama_ping_pending = true;
+                                self.start_ollama_ping(true);
                             }
                         }
                         _ => {}
@@ -5990,13 +6031,12 @@ impl App {
                         KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                             self.ollama_config_dialog.backspace();
                         }
-                        KeyCode::Char('p') if self.prompt_input.vim_enabled => {
-                            // P2 #11: Ping shortcut from edit mode (vim 'p' for ping)
+                        KeyCode::Char('p')
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && self.ollama_config_dialog.can_connect() =>
+                        {
                             self.ollama_config_dialog.cancel_edit();
-                            if self.ollama_config_dialog.can_connect() {
-                                self.ollama_config_dialog.start_ping();
-                                self.ollama_ping_pending = true;
-                            }
+                            self.start_ollama_ping(true);
                         }
                         KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                             let c = self.shift_normalize(c, key.modifiers);
@@ -6006,14 +6046,17 @@ impl App {
                     }
                 }
                 crate::ollama_config_dialog::OllamaConfigPhase::Pinging => {
-                    // No input while pinging
+                    if key.code == KeyCode::Esc {
+                        self.ollama_config_dialog.close();
+                        self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
+                    }
                 }
                 crate::ollama_config_dialog::OllamaConfigPhase::PingFailed(_) => match key.code {
                     KeyCode::Esc => {
                         self.ollama_config_dialog.close();
                     }
                     KeyCode::Enter => {
-                        self.ollama_config_dialog.retry_from_failure();
+                        self.start_ollama_ping(true);
                     }
                     _ => {}
                 },
@@ -6046,10 +6089,11 @@ impl App {
                                         Some(format!("Failed to save config: {}", e));
                                     return false;
                                 }
-                                self.activate_provider(
+                                self.activate_provider_with_model(
                                     "ollama".to_string(),
                                     "Ollama".to_string(),
                                     "Connected to",
+                                    Some(model_name),
                                 );
                             }
                         }
@@ -6148,7 +6192,13 @@ impl App {
                                         .and_then(|v| v.as_str())
                                         .map(String::from)
                                 });
+                                let has_saved_host = current_url.is_some();
                                 self.ollama_config_dialog.open(current_url, current_model);
+                                if has_saved_host {
+                                    // Refresh the health dot in the background while
+                                    // keeping the fast Enter-to-connect view available.
+                                    self.start_ollama_ping(false);
+                                }
                             }
                             // Other local providers — activate immediately, no key needed
                             "lmstudio" | "llamacpp" => {
@@ -10507,24 +10557,48 @@ impl App {
                     .insert(provider_id, (tokens_pct_used, requests_pct_used));
             }
 
-            QueryEvent::OllamaPingResult(result) => match result {
-                Ok(models) => {
-                    self.ollama_config_dialog.ping_success(
-                        models
-                            .into_iter()
-                            .map(|m| crate::ollama_config_dialog::OllamaModel {
-                                name: m.name,
-                                size: m.size,
-                                quantization: m.quantization,
-                                parameter_size: m.parameter_size,
-                            })
-                            .collect(),
-                    );
+            QueryEvent::OllamaPingResult {
+                request_id,
+                for_model_picker,
+                result,
+            } => {
+                if request_id != self.ollama_ping_request_id || !self.ollama_config_dialog.visible {
+                    return;
                 }
-                Err(e) => {
-                    self.ollama_config_dialog.ping_failed(e);
+                if for_model_picker
+                    && matches!(
+                        self.ollama_config_dialog.phase,
+                        crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+                    )
+                {
+                    match result {
+                        Ok(models) => {
+                            self.ollama_config_dialog.ping_success(
+                                models
+                                    .into_iter()
+                                    .map(|m| crate::ollama_config_dialog::OllamaModel {
+                                        name: m.name,
+                                        size: m.size,
+                                        quantization: m.quantization,
+                                        parameter_size: m.parameter_size,
+                                    })
+                                    .collect(),
+                            );
+                        }
+                        Err(e) => {
+                            self.ollama_config_dialog.ping_failed(e);
+                        }
+                    }
+                } else if matches!(
+                    self.ollama_config_dialog.phase,
+                    crate::ollama_config_dialog::OllamaConfigPhase::Default
+                ) {
+                    match result {
+                        Ok(_) => self.ollama_config_dialog.health_check_succeeded(),
+                        Err(_) => self.ollama_config_dialog.health_check_failed(),
+                    }
                 }
-            },
+            }
         }
 
         // Update token count from tracker.
@@ -12541,6 +12615,107 @@ mod tests {
                 .map(|m| m.starts_with("ollama/"))
                 .unwrap_or(false),
             "/model must store the selection as ollama/<model>"
+        );
+    }
+
+    #[test]
+    fn ollama_activation_preserves_selected_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        let model = "qwen2.5-coder:7b".to_string();
+        app.activate_provider_with_model(
+            "ollama".to_string(),
+            "Ollama".to_string(),
+            "Connected to",
+            Some(model.clone()),
+        );
+        assert_eq!(app.config.provider.as_deref(), Some("ollama"));
+        assert_eq!(app.config.model.as_deref(), Some(model.as_str()));
+        assert_eq!(app.model_name, model);
+    }
+
+    #[test]
+    fn ollama_first_connect_requires_model_discovery() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.ollama_ping_pending);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+    }
+
+    #[test]
+    fn ollama_ping_failure_enter_retries() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog
+            .ping_failed("connection refused".to_string());
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.ollama_ping_pending);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+    }
+
+    #[test]
+    fn stale_ollama_ping_result_is_ignored() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_ping_request_id = 4;
+        app.handle_query_event(QueryEvent::OllamaPingResult {
+            request_id: 3,
+            for_model_picker: true,
+            result: Ok(vec![]),
+        });
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
+        );
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Untested
+        );
+    }
+
+    #[test]
+    fn ollama_ctrl_p_pings_from_vim_edit_mode() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_config_dialog.start_edit();
+        app.handle_key_event(press_key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.ollama_ping_pending);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
+    }
+
+    #[test]
+    fn ollama_health_ping_updates_dot_without_opening_picker() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        app.ollama_ping_request_id = 9;
+        app.handle_query_event(QueryEvent::OllamaPingResult {
+            request_id: 9,
+            for_model_picker: false,
+            result: Ok(vec![]),
+        });
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
+        );
+        assert_eq!(
+            app.ollama_config_dialog.health,
+            crate::ollama_config_dialog::HealthStatus::Healthy
         );
     }
 

@@ -1,162 +1,86 @@
-# Audit: Ollama Config Dialog Feature
+# Ollama TUI Audit
 
-## Critical Bugs (P0)
+## Scope
 
-### 1. Async ping is not implemented
-**Location**: `app.rs:5869-5872`
-**Impact**: Health dot is always "Untested", model picker can never be populated from server
+This audit covers the remote Ollama configuration dialog, model discovery,
+endpoint resolution, persistence, provider activation, and asynchronous ping
+handling.
 
-The ping is stubbed with `// TODO: Spawn async ping task`. Without this:
-- Health dot never changes from gray
-- User can never reach the model picker (SelectModel phase)
-- No server connectivity verification
+## Findings and status
 
-**Fix**: Implement `tokio::spawn` that sends `QueryEvent::OllamaPingResult` back to the TUI event loop.
+### Fixed: selected model propagation
 
-### 2. Model picker unreachable in Default view
-**Location**: `app.rs:5858-5888`
-**Impact**: User cannot select a model from the server
+The dialog previously saved the selected model only in
+`config.provider_configs.ollama.options.model`, while provider activation cleared
+`config.model`. The runtime therefore fell back to `ollama/llama3.2` regardless
+of the model selected in the picker.
 
-In Default phase, there's no way to reach the model picker. The only way to get to `SelectModel` is through `ping_success()`, which requires the async ping to be implemented.
+The activation path now accepts an explicit model override and stores it in
+`Config.model`. Bare Ollama tags such as `qwen2.5-coder:7b` are preserved and are
+converted to the correct request model by the Ollama provider path.
 
-**Fix**: Once async ping is implemented, add a keybinding (e.g., `m`) in Default view to trigger ping + model picker.
+### Fixed: first-use model selection
 
-### 3. `activate_provider` opens model picker after Ollama dialog
-**Location**: `app.rs:5868-5876` + `app.rs:2670`
-**Impact**: Redundant model picker opens after user already selected model
+If no model was saved, pressing Enter previously selected the hardcoded
+`qwen2.5-coder:3b` tag without checking the server. Enter now starts model
+discovery, so the user must select a model actually returned by Ollama.
 
-When Enter is pressed in Default view:
-1. `take_values()` returns (host, model)
-2. `persist_ollama_config()` saves the model
-3. `activate_provider()` calls `open_model_picker_for_provider()` which opens the model picker again
+### Fixed: retry behavior
 
-This is confusing — user just picked a model, now they see another picker.
+The PingFailed screen advertised Enter as retry, but Enter only returned to the
+default screen. Enter now starts a new model-discovery ping.
 
-**Fix**: Either skip `activate_provider` for Ollama (use a custom activation path) or set the model before opening the picker so it's pre-selected.
+### Fixed: stale asynchronous results
 
-## Medium Issues (P1)
+Ping events now carry a request ID and whether they are model-discovery pings or
+background health checks. Results from an older request, a closed dialog, or a
+newer dialog state are ignored.
 
-### 4. No URL validation
-**Location**: `ollama_config_dialog.rs:179`
-**Impact**: User can connect with invalid URLs
+### Fixed: large model lists
 
-`can_connect()` only checks `!host_url_input.trim().is_empty()`. No validation for:
-- Valid URL scheme (http/https)
-- Valid hostname/IP
-- Valid port range
+The model picker now maintains a viewport and scroll offset. It displays up to
+10 rows at a time and keeps the selected row visible.
 
-**Fix**: Add basic URL validation before allowing connection.
+### Fixed: Vim ping shortcut
 
-### 5. No model name validation
-**Location**: `app.rs:5868`
-**Impact**: User can save invalid model names
+The ping shortcut is now `Ctrl+P`, which passes through Vim insert-mode handling
+without being inserted into the host or model field. The edit-mode hint exposes
+the shortcut.
 
-When connecting from Default view, the model name is saved without checking if it exists on the server.
+### Fixed: health refresh
 
-**Fix**: Either validate against the server or at minimum check for empty/whitespace.
+Opening the dialog with a saved host starts a background health check while
+preserving the fast Enter-to-connect view. Health-only results update the dot
+without opening the model picker. Editing the host resets the health state.
 
-### 6. Persist function doesn't handle errors
-**Location**: `app.rs:2721-2738`
-**Impact**: Config may not be saved
+### Fixed: documented endpoint compatibility
 
-`persist_ollama_config` uses `let _ = settings.save_sync()` which silently drops errors.
+`config.provider_configs.ollama.api_base` remains the canonical TUI/settings
+write target. The documented top-level `providers.ollama.api_base` remains a
+compatibility fallback and now also retains native Ollama discovery behavior.
 
-**Fix**: Handle the error and show a status message.
+## Remaining limitations
 
-### 7. Health dot doesn't auto-refresh
-**Location**: `ollama_config_dialog.rs:145-147`
-**Impact**: Health status is stale after edits
+- The health result is held in the dialog state and is not persisted with a
+  timestamp across process restarts.
+- The picker lists server models and supports navigation, but does not provide
+  fuzzy filtering or autocomplete.
+- The dialog does not pull missing models; models must already exist on the
+  Ollama server.
+- Ping verifies `/api/tags`; it does not perform a generation request, so model
+  loading and inference readiness are not fully verified until the first request.
+- The model discovery path is covered by state and event tests, but a mocked HTTP
+  fixture for `ping_ollama_and_fetch_models` would provide stronger parser and
+  timeout coverage.
 
-Health is set on `open()` to `Untested` and only updates on `ping_success()`/`ping_failed()`. If user edits the host URL, the health dot doesn't update.
+## Validation
 
-**Fix**: Reset health to `Untested` when host URL is edited in edit mode.
+The repaired implementation has been validated with:
 
-### 8. No way to go back from model picker to edit
-**Location**: `app.rs:5948-5975`
-**Impact**: User must close dialog and reopen to change host
-
-In `SelectModel` phase, Esc closes the entire dialog. There's no way to go back to edit the host URL.
-
-**Fix**: Add a "back" action (e.g., Esc or Backspace) that returns to Default view instead of closing.
-
-## Minor Issues (P2)
-
-### 9. No vim j/k in Default view when not in vim mode
-**Location**: `app.rs:5878-5882`
-**Impact**: j/k always navigate in Default view, even without vim mode
-
-The Default view always responds to j/k for navigation, but the hint text doesn't show this unless vim is enabled. This is inconsistent.
-
-**Fix**: Always show j/k in hints, or only respond to j/k when vim is enabled.
-
-### 10. Edit mode cursor position not tracked
-**Location**: `ollama_config_dialog.rs:105-112`
-**Impact**: Cursor always appears at end of text
-
-`insert_char` always appends to the end. There's no cursor position tracking, so user can't insert text in the middle.
-
-**Fix**: Add cursor position tracking (like `PromptInputState`).
-
-### 11. No keyboard shortcut to trigger ping from edit mode
-**Location**: `app.rs:5890-5932`
-**Impact**: User must exit edit mode to trigger ping
-
-In edit mode, there's no way to ping the server without first confirming the edit (Enter) then pressing Enter again in Default view.
-
-**Fix**: Add a shortcut (e.g., Ctrl+P) to trigger ping from edit mode.
-
-### 12. Model picker doesn't show parameter size
-**Location**: `ollama_config_dialog.rs:673-680`
-**Impact**: User can't see model parameter count
-
-The model picker shows name, size, and quantization but not parameter size (e.g., "7B", "13B").
-
-**Fix**: Add parameter_size column to the model picker.
-
-### 13. No timeout on ping
-**Location**: N/A (ping not implemented)
-**Impact**: Ping could hang indefinitely
-
-When async ping is implemented, there's no timeout. A slow/unresponsive server could block the dialog.
-
-**Fix**: Add a timeout (e.g., 5 seconds) to the ping request.
-
-## Summary
-
-| Severity | Count | Key Issue |
-|---|---|---|
-| P0 (Critical) | 3 | Async ping not implemented, model picker unreachable, redundant picker |
-| P1 (Medium) | 5 | No URL/model validation, persist errors, health stale, no back navigation |
-| P2 (Minor) | 5 | Vim inconsistency, cursor tracking, ping shortcut, model params, timeout |
-
-## Recommended Fix Order
-
-1. **Implement async ping** (fixes P0 #1, #2, #7)
-2. **Fix activate_provider for Ollama** (fixes P0 #3)
-3. **Add URL validation** (fixes P1 #4)
-4. **Add back navigation from model picker** (fixes P1 #8)
-5. **Handle persist errors** (fixes P1 #6)
-6. **Add ping timeout** (fixes P2 #13)
-
-## Test Coverage
-
-Current tests cover:
-- Open/close
-- Field navigation
-- Edit mode
-- Backspace
-- can_connect
-- Model navigation
-- take_values
-- Model size display
-- Health status
-- is_modal
-- retry_from_failure
-
-Missing test coverage:
-- URL validation
-- Model validation
-- Persist error handling
-- Health reset on edit
-- Back navigation from model picker
-- Ping timeout
+- Ollama-focused TUI tests
+- Ollama-focused core tests
+- `cargo check --workspace`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- Live `GET /api/tags` and `GET /v1/models` checks against the configured remote
+  Windows Ollama host

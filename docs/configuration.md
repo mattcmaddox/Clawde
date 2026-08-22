@@ -106,10 +106,13 @@ In Free Mode the router applies the override per upstream at dispatch time, so `
 
 ### Ollama remote GPU and offline tool mode
 
-Ollama is remote-only by default. Configure `providers.ollama.api_base`,
-`OLLAMA_HOST`, or `providers.ollama.options.default_host` with a non-loopback
-remote endpoint. Clawde fails closed rather than using `http://localhost:11434`,
-so it cannot silently run inference on the local CPU.
+Ollama is remote-only by default. Configure the endpoint through
+`config.provider_configs.ollama.api_base` (the `/connect` and `/settings` write
+target), `OLLAMA_HOST`, or the compatibility path
+`providers.ollama.api_base` / `providers.ollama.options.default_host` with a
+non-loopback remote endpoint. Clawde fails closed rather than using
+`http://localhost:11434`, so it cannot silently run inference on the local CPU.
+The nested `config.provider_configs` value wins when both locations are set.
 
 Normal `ollama:auto` mode keeps tools and web search available. Isolated
 `ollama:offline` mode removes network-capable tools and rejects them at dispatch,
