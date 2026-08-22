@@ -304,7 +304,7 @@ fn walkdir_shallow(root: &Path, max_depth: usize) -> Vec<PathBuf> {
 // Atomic binary swap
 // ---------------------------------------------------------------------------
 
-fn swap_binary(current: &Path, new: &Path) -> Result<()> {
+pub(crate) fn swap_binary(current: &Path, new: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // Windows holds an exclusive lock on the running .exe — we can rename
@@ -328,15 +328,25 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On unix, std::fs::rename won't work across mounts; copy + chmod is safer.
-        // The kernel will let us replace the file even while it's running because
-        // unlink-and-replace just frees the directory entry.
-        std::fs::copy(new, current)
-            .with_context(|| format!("failed to copy new binary into {}", current.display()))?;
+        // Renaming over an executing file is allowed (it just replaces the
+        // directory entry; the old inode lives until the process exits), but
+        // opening it for writing is not — copy-on-write fails with ETXTBSY
+        // ("Text file busy"). So: copy the new binary to a temp file in the
+        // same directory, then rename it into place atomically.
+        let tmp = current.with_extension(format!("clawde-new-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::copy(new, &tmp)
+            .with_context(|| format!("failed to copy new binary into {}", tmp.display()))?;
         let _ = std::process::Command::new("chmod")
             .arg("755")
-            .arg(current)
+            .arg(&tmp)
             .status();
+        if let Err(e) = std::fs::rename(&tmp, current) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| {
+                format!("failed to replace {} with new binary", current.display())
+            });
+        }
         Ok(())
     }
 }
@@ -355,4 +365,32 @@ fn tempdir_for_upgrade() -> Result<PathBuf> {
     let dir = base.join(format!("clawde-upgrade-{}-{}", pid, now));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn swap_binary_replaces_target() {
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "clawde-swap-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let current = tmp.join("clawde");
+        let new = tmp.join("new-clawde");
+        std::fs::write(&current, b"old binary").unwrap();
+        std::fs::write(&new, b"new binary").unwrap();
+
+        swap_binary(&current, &new).unwrap();
+
+        assert_eq!(std::fs::read(&current).unwrap(), b"new binary");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

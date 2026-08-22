@@ -12,6 +12,7 @@
 // parameters; grouping them into structs is a larger refactor out of scope here.
 #![allow(clippy::too_many_arguments)]
 
+mod build;
 mod codex_oauth_flow;
 mod diagnostics;
 mod oauth_flow;
@@ -521,6 +522,14 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: `clawde upgrade [--version <v>] [--force]` — self-update.
     if raw_args.get(1).map(|s| s.as_str()) == Some("upgrade") {
         return upgrade::run_upgrade(&raw_args[2..]).await;
+    }
+
+    // Fast-path: `clawde build` (also accepted as `clawde --build`) — rebuild
+    // from the local source checkout and replace the running binary.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("build")
+        || raw_args.get(1).map(|s| s.as_str()) == Some("--build")
+    {
+        return build::run_build(&raw_args[2..]).await;
     }
 
     // Fast-path: `claude acp` — start the Agent Client Protocol server.
