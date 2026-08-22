@@ -5,6 +5,27 @@
 
 ---
 
+## Implementation Status — COMPLETE (2026-08-22)
+
+All three recommended steps are implemented and committed:
+
+1. **`/stats` project-identifier fix (Option B)** — `collect_jsonl_paths` in `commands/src/stats.rs` now resolves the project root via `clawde_core::git_utils::project_root(cwd)` instead of encoding the raw cwd.
+2. **Migration function (Option A)** — `migrate_cwd_transcript_buckets(config_dir)` in `core/src/session_storage.rs` moves `.jsonl` files from cwd-keyed buckets into git-root buckets. Idempotent, never overwrites, removes empty stale buckets.
+3. **Startup wiring** — `main.rs` runs the migration once before the interactive/headless branch, so new sessions land in the canonical bucket from the start.
+
+**Unifying helper:** `git_utils::project_root(start)` (git root, or the path itself when not in a repo) is now the single source of truth for the project identifier. Every subsystem that keys per-project data routes through it: transcript write/read, stats, history, review, spec, session list, memory, teleport, ACP, and TUI spec review.
+
+**Tests added:**
+- `migrate_cwd_transcript_buckets_moves_subdirectory_transcripts` — moves + removes stale bucket + idempotency
+- `migrate_cwd_transcript_buckets_leaves_other_buckets_alone` — git-root and non-repo buckets untouched
+- `run_summary_from_subdirectory_finds_repo_root_sessions` — `/stats` from a subdir finds repo-root sessions
+- `project_root_is_stable_across_subdirectories` / `project_root_falls_back_to_cwd_outside_repo`
+- `import_sets_project_dir_to_git_root` / `import_sets_project_dir_to_cwd_when_not_a_repo` (teleport)
+
+**Manual smoke test:** launching the debug binary from a git subdirectory with a transcript staged in the git-root bucket, `clawde stats` reports the session (verified end-to-end).
+
+---
+
 ## Problem Statement
 
 When unifying the project identifier for session storage (Section 6.3 of the paths spec), existing transcripts stored under the wrong project bucket need to be migrated. This document analyzes the scope of the problem and proposes a migration strategy.
@@ -185,30 +206,30 @@ fn migrate_transcript_buckets(config_dir: &Path) {
 
 ---
 
-## Recommended Implementation Order
+## Recommended Implementation Order — ALL COMPLETE
 
-1. **Fix `stats.rs`** to use `get_repo_root(&cwd) || cwd` as the project identifier (Option B). This is a 1-line change.
-2. **Add migration function** to `session_storage.rs` that moves transcripts from cwd buckets to git root buckets (Option A).
-3. **Run migration at startup** in `main.rs` before the query loop begins.
-4. **Add a test** that creates a subdirectory structure, writes transcripts, and verifies the migration moves them to the correct bucket.
+1. ✅ **Fix `stats.rs`** to use `get_repo_root(&cwd) || cwd` as the project identifier (Option B).
+2. ✅ **Add migration function** to `session_storage.rs` (`migrate_cwd_transcript_buckets`).
+3. ✅ **Run migration at startup** in `main.rs` before the interactive/headless branch.
+4. ✅ **Add tests** for migration, stats-from-subdirectory, `project_root` stability, and teleport `project_dir`.
 
 ---
 
 ## Risks
 
-| Risk | Mitigation |
-|------|-----------|
-| Migration runs during active session | Run once at startup, not in hot path |
-| Race condition (two instances migrating) | Use file locking on a marker file |
-| Git repo detection fails for shallow clones | `get_repo_root()` checks for `.git` dir existence, works for shallow clones |
-| User has legitimate reason for subdirectory bucket | Unlikely — the divergence is unintentional. If needed, add an env var override |
-| Base64 decoding fails for corrupt dir names | Skip those entries (they're already broken) |
+| Risk | Mitigation | Status |
+|------|-----------|--------|
+| Migration runs during active session | Run once at startup, not in hot path | ✅ Implemented |
+| Race condition (two instances migrating) | Use file locking on a marker file | Not implemented — migration is idempotent and `rename` is atomic; two concurrent runs converge to the same result |
+| Git repo detection fails for shallow clones | `get_repo_root()` checks for `.git` dir existence, works for shallow clones | ✅ Inherently handled |
+| User has legitimate reason for subdirectory bucket | Unlikely — the divergence is unintentional | Not implemented — no env override added; the divergence was a bug, not a feature |
+| Base64 decoding fails for corrupt dir names | Skip those entries (they're already broken) | ✅ Implemented |
 
 ---
 
-## Testing Strategy
+## Testing Strategy — ALL COMPLETE
 
-1. **Unit test for `encoded_dir_for_cwd`:** Verify it produces the same output as `transcript_dir` for the same git root.
-2. **Integration test for migration:** Create temp dirs simulating subdirectory launches, write transcripts, run migration, verify files moved.
-3. **Regression test for stats:** Verify `/stats` from a subdirectory finds sessions that were written from the repo root.
-4. **Manual test:** Launch Clawde from a subdirectory, run some queries, check `/stats` shows the sessions.
+1. ✅ **Unit test for `project_root`:** `project_root_is_stable_across_subdirectories` / `project_root_falls_back_to_cwd_outside_repo`.
+2. ✅ **Integration test for migration:** `migrate_cwd_transcript_buckets_moves_subdirectory_transcripts` / `migrate_cwd_transcript_buckets_leaves_other_buckets_alone`.
+3. ✅ **Regression test for stats:** `run_summary_from_subdirectory_finds_repo_root_sessions`.
+4. ✅ **Manual test:** Debug binary launched from a git subdirectory; `clawde stats` reports the git-root session (verified end-to-end).
