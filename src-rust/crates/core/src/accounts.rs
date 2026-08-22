@@ -409,7 +409,7 @@ mod tests {
         assert_eq!(slugify_profile_id("Work Account!"), "work-account");
         assert_eq!(slugify_profile_id("  --weird-- "), "weird");
         assert_eq!(slugify_profile_id(""), "account");
-        assert_eq!(slugify_profile_id("kuber@example.com"), "kuber-example-com");
+        assert_eq!(slugify_profile_id("dev@example.com"), "dev-example-com");
     }
 
     #[test]
@@ -445,7 +445,7 @@ mod tests {
     fn jwt_identity_pulls_email_and_account_id() {
         use base64::Engine;
         let payload = serde_json::json!({
-            "email": "kuber@example.com",
+            "email": "dev@example.com",
             "https://api.openai.com/auth": {
                 "account_id": "acc_abc123"
             }
@@ -454,10 +454,10 @@ mod tests {
             .encode(serde_json::to_string(&payload).unwrap());
         let token = format!("header.{}.signature", payload_b64);
         let identity = jwt_identity(&token);
-        assert_eq!(identity.email.as_deref(), Some("kuber@example.com"));
+        assert_eq!(identity.email.as_deref(), Some("dev@example.com"));
         assert_eq!(identity.account_id.as_deref(), Some("acc_abc123"));
 
-        assert_eq!(id_from_identity(&identity), "kuber");
+        assert_eq!(id_from_identity(&identity), "dev");
     }
 
     #[test]
@@ -471,12 +471,12 @@ mod tests {
     #[test]
     fn account_profile_display_falls_back_through_label_email_id() {
         let mut p = AccountProfile {
-            id: "kuber".into(),
+            id: "dev".into(),
             ..Default::default()
         };
-        assert_eq!(p.display_name(), "kuber");
-        p.email = Some("kuber@example.com".into());
-        assert_eq!(p.display_name(), "kuber@example.com");
+        assert_eq!(p.display_name(), "dev");
+        p.email = Some("dev@example.com".into());
+        assert_eq!(p.display_name(), "dev@example.com");
         p.label = Some("Personal".into());
         assert_eq!(p.display_name(), "Personal");
     }

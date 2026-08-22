@@ -1206,10 +1206,10 @@ Sample output:
 
 ```
 Anthropic:
-  * personal [pro]    kuber@personal.example
-    work     [max]    kuber@company.example
+  * personal [pro]    dev@personal.example
+    work     [max]    dev@company.example
 Codex:
-    work              kuber@company.example
+    work              dev@company.example
 ```
 
 ---

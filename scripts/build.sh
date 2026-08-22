@@ -23,8 +23,7 @@
 #   linux-aarch64  cross (Docker)            (this machine)
 #   windows-x86_64 needs a Windows box (MSVC; BoringSSL build needs NASM, so
 #                  cross-building the GNU target from Linux is not viable)
-#   macos-x86_64   needs a Mac (Intel)
-#   macos-aarch64  needs a Mac (Apple Silicon)
+# (macOS legs intentionally not built — no Apple hardware in the release flow)
 
 set -euo pipefail
 
@@ -46,14 +45,12 @@ target_info() {  # $1 = id; echoes "triple"
         linux-x86_64)   echo "x86_64-unknown-linux-gnu" ;;
         linux-aarch64)  echo "aarch64-unknown-linux-gnu" ;;
         windows-x86_64) echo "x86_64-pc-windows-msvc" ;;
-        macos-x86_64)   echo "x86_64-apple-darwin" ;;
-        macos-aarch64)  echo "aarch64-apple-darwin" ;;
         *) return 1 ;;
     esac
 }
 
 target_ids() {
-    echo "linux-x86_64 linux-aarch64 windows-x86_64 macos-x86_64 macos-aarch64"
+    echo "linux-x86_64 linux-aarch64 windows-x86_64"
 }
 
 native_here() {  # $1 = triple — can this machine natively build it?
@@ -61,8 +58,6 @@ native_here() {  # $1 = triple — can this machine natively build it?
     case "$triple" in
         x86_64-unknown-linux-gnu)  [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] ;;
         aarch64-unknown-linux-gnu) [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]] ;;
-        x86_64-apple-darwin)       [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]] ;;
-        aarch64-apple-darwin)      [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] ;;
         x86_64-pc-windows-msvc)    [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]] ;;
         *) false ;;
     esac
@@ -166,7 +161,8 @@ build_one() {  # $1 = id (or a raw rust triple)
             echo ":: Skipping $id — cannot be built on this machine."
             echo "   On the right machine, run the same script:"
             echo "     build.sh build-one $id"
-            echo "   then copy its dist/ artifacts here before 'release'."
+            echo "   then copy the binary into src-rust/target/$(target_info "$id")/release/ "
+            echo "   (see docs/release-runbook.md) and re-run package/release."
             ;;
     esac
 }

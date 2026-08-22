@@ -8,8 +8,8 @@
 #   ./setup-acp-client.sh <target-host> [ssh-user]
 #
 # Examples:
-#   ./setup-acp-client.sh 192.168.1.40
-#   ./setup-acp-client.sh theworker.local user
+#   ./setup-acp-client.sh client-host.local
+#   ./setup-acp-client.sh client-host.local alice
 #
 # What it does:
 #   1. Copies the ACP client script to the target machine

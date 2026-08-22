@@ -55,13 +55,13 @@ SHA256SUMS format must not change**, installers depend on them):
 | `linux-x86_64` | `x86_64-unknown-linux-gnu` | native | `clawde-linux-x86_64.tar.gz` |
 | `linux-aarch64` | `aarch64-unknown-linux-gnu` | cross (Docker) | `clawde-linux-aarch64.tar.gz` |
 | `windows-x86_64` | `x86_64-pc-windows-msvc` | manual (Windows box) | `clawde-windows-x86_64.zip` |
-| `macos-x86_64` | `x86_64-apple-darwin` | manual (Mac) | `clawde-macos-x86_64.tar.gz` |
-| `macos-aarch64` | `aarch64-apple-darwin` | manual (Mac) | `clawde-macos-aarch64.tar.gz` |
 
 Cross-compiling the Windows target from Linux is **not viable**: the
 `btls-sys` dependency builds BoringSSL via CMake and needs NASM, which the
 cross windows-gnu image lacks (verified empirically, Aug 2026). The Windows
-leg must be built on a Windows machine with the MSVC target.
+leg must be built on a Windows machine with the MSVC target. **macOS legs are
+intentionally excluded from the release flow** (no Apple hardware; decided
+2026-08-22).
 
 ### Subcommands
 
@@ -131,7 +131,7 @@ leg must be built on a Windows machine with the MSVC target.
 | Risk | Mitigation |
 |---|---|
 | Breaking archive naming / SHA256SUMS format (installers fail) | `package` reuses the exact names and `sha256sum *` format; verified by test in Phase 4 |
-| Missing Mac/Windows legs at publish time | `release` refuses to publish unless all 5 artifacts are present in `dist/` (or `--allow-partial` is passed explicitly) |
+| Missing Windows leg at publish time | `release` refuses to publish unless all 3 artifacts are present in `dist/` (or `--allow-partial` is passed explicitly) |
 | Windows-GNU cross-build from Linux fails (btls-sys needs NASM) | windows-x86_64 is a `manual` leg — build on a Windows box; documented in the script header |
 | `cross` not installed (aarch64 leg) | `build-one`/`build-all` error with the install command; `targets` shows readiness |
 | Version stamping without a commit leaves tag off the stamp commit | `release` commits + pushes the stamp by default; `--no-commit` is explicit opt-out |
@@ -142,7 +142,9 @@ leg must be built on a Windows machine with the MSVC target.
 
 | Question | Resolution |
 |---|---|
-| Windows/macOS legs can't build on this Linux box | `build-one --target <id>` on the respective machine; `release --publish-only` assembles from `dist/`. Zero Actions dependency |
+| Windows leg can't build on this Linux box | `build-one windows-x86_64` on a Windows box; `release --publish-only` assembles from `dist/`. Zero Actions dependency |
+| macOS legs? | Dropped from the release flow entirely (2026-08-22) — no Apple hardware; installers would 404 until a Mac build is added back |
+| ACP registry `agent.json` `website` field | Uses `https://github.com/mattcmaddox/Clawde` (changed from `clawde.example.com` to avoid exposing the home server; 2026-08-22 — see `.local/setup-notes.md`) |
 | Should `release` auto-commit the version bump? | Yes by default (mirrors old auto-release); `--no-commit` opt-out |
 | npm publish with provenance needs OIDC (Actions-only) | npm-publish.yml kept with `workflow_dispatch`; the script dispatches it via `gh workflow run` |
 | Fix or delete the dead-package refs in the two release workflows? | Delete the workflows (Phase 3); fix only `ci.yml` which survives |

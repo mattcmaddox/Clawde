@@ -4,7 +4,7 @@
   "version": "0.1.9",
   "description": "Open-source, multi-provider terminal coding agent built in Rust. Multi-provider routing (Anthropic, OpenAI, Google, Groq, Ollama, OpenAI-compatible, …), full MCP support, plugin system, Rustle companion, chat forking, memory consolidation. No telemetry.",
   "repository": "https://github.com/mattcmaddox/Clawde",
-  "website": "https://clawde.example.com",
+  "website": "https://github.com/mattcmaddox/Clawde",
   "authors": [
     "Matt Maddox"
   ],

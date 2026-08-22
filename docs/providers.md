@@ -607,7 +607,7 @@ GPU host.
   "provider": "ollama",
   "providers": {
     "ollama": {
-      "api_base": "http://devbox:11434"
+      "api_base": "http://gpu-host.example:11434"
     }
   }
 }
@@ -644,7 +644,7 @@ Clawde instance to target the same remote endpoint:
   "providers": {
     "ollama": {
       "options": {
-        "default_host": "http://devbox:11434"
+        "default_host": "http://gpu-host.example:11434"
       }
     }
   }
@@ -1000,7 +1000,7 @@ The `providers` map in `~/.clawde/settings.json` accepts per-provider `ProviderC
     },
     "ollama": {
       "enabled": true,
-      "api_base": "http://192.168.1.50:11434/v1"
+      "api_base": "http://gpu-host.example:11434/v1"
     }
   }
 }

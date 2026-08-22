@@ -3776,14 +3776,14 @@ mod tests {
         // so Enter opens an inline editor (type → save) rather than a toggle
         // or enum cycle, and the row value is the raw URL.
         let mut screen = SettingsScreen::new();
-        screen.ollama_default_host = "http://devbox:11434".to_string();
+        screen.ollama_default_host = "http://gpu-host.example:11434".to_string();
         let entries = all_entries(&screen);
         let entry = entries
             .iter()
             .find(|e| e.key == "ollama_default_host")
             .expect("ollama default host entry");
         assert!(matches!(entry.kind, SettingKind::Text));
-        assert_eq!(entry.value, "http://devbox:11434");
+        assert_eq!(entry.value, "http://gpu-host.example:11434");
         assert_eq!(entry.section, SECTION_OLLAMA);
     }
 }

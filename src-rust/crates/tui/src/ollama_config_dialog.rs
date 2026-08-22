@@ -967,11 +967,11 @@ mod tests {
         assert!(!state.visible);
 
         state.open(
-            Some("http://192.168.1.45:11434".to_string()),
+            Some("http://gpu-host.example:11434".to_string()),
             Some("qwen2.5-coder:3b".to_string()),
         );
         assert!(state.visible);
-        assert_eq!(state.host_url_input, "http://192.168.1.45:11434");
+        assert_eq!(state.host_url_input, "http://gpu-host.example:11434");
         assert_eq!(state.model_input, "qwen2.5-coder:3b");
         assert_eq!(state.phase, OllamaConfigPhase::Default);
 
@@ -1047,7 +1047,7 @@ mod tests {
         state.open(None, None);
         assert!(!state.can_connect());
 
-        state.host_url_input = "http://192.168.1.45:11434".to_string();
+        state.host_url_input = "http://gpu-host.example:11434".to_string();
         assert!(state.can_connect());
     }
 
@@ -1149,12 +1149,12 @@ mod tests {
     fn test_take_values() {
         let mut state = OllamaConfigDialogState::new();
         state.open(
-            Some("http://192.168.1.45:11434".to_string()),
+            Some("http://gpu-host.example:11434".to_string()),
             Some("qwen2.5-coder:3b".to_string()),
         );
 
         let (host, model) = state.take_values();
-        assert_eq!(host, "http://192.168.1.45:11434");
+        assert_eq!(host, "http://gpu-host.example:11434");
         assert_eq!(model, "qwen2.5-coder:3b");
         assert!(!state.visible);
     }
@@ -1226,18 +1226,18 @@ mod tests {
         assert!(state.validate_host_url().is_err());
 
         // Valid URL
-        state.host_url_input = "http://192.168.1.45:11434".to_string();
+        state.host_url_input = "http://gpu-host.example:11434".to_string();
         assert!(state.validate_host_url().is_ok());
 
         // URL without scheme
-        state.host_url_input = "192.168.1.45:11434".to_string();
+        state.host_url_input = "gpu-host.example:11434".to_string();
         assert!(state.validate_host_url().is_err());
 
         // URL with /v1 suffix (should be normalized)
-        state.host_url_input = "http://192.168.1.45:11434/v1".to_string();
+        state.host_url_input = "http://gpu-host.example:11434/v1".to_string();
         let result = state.validate_host_url();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "http://192.168.1.45:11434");
+        assert_eq!(result.unwrap(), "http://gpu-host.example:11434");
     }
 
     #[test]
@@ -1290,31 +1290,31 @@ mod tests {
     fn test_cursor_movement() {
         let mut state = OllamaConfigDialogState::new();
         state.open(None, None);
-        state.host_url_input = "http://192.168.1.45:11434".to_string();
+        state.host_url_input = "http://gpu-host.example:11434".to_string();
         state.start_edit();
 
-        // Cursor starts at end (25 chars)
-        assert_eq!(state.cursor_pos, 25);
+        // Cursor starts at end (29 chars: http://gpu-host.example:11434)
+        assert_eq!(state.cursor_pos, 29);
 
         // Move left
         state.move_cursor_left();
-        assert_eq!(state.cursor_pos, 24);
+        assert_eq!(state.cursor_pos, 28);
 
         // Move left again
         state.move_cursor_left();
-        assert_eq!(state.cursor_pos, 23);
+        assert_eq!(state.cursor_pos, 27);
 
         // Move right
         state.move_cursor_right();
-        assert_eq!(state.cursor_pos, 24);
+        assert_eq!(state.cursor_pos, 28);
 
         // Move right to end
         state.move_cursor_right();
-        assert_eq!(state.cursor_pos, 25);
+        assert_eq!(state.cursor_pos, 29);
 
         // Can't move past end
         state.move_cursor_right();
-        assert_eq!(state.cursor_pos, 25);
+        assert_eq!(state.cursor_pos, 29);
 
         // Move to beginning
         state.cursor_pos = 0;

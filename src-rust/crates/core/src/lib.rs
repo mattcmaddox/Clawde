@@ -3511,7 +3511,7 @@ pub mod config {
                 .providers
                 .entry("ollama".to_string())
                 .or_default()
-                .api_base = Some("http://devbox:11434".to_string());
+                .api_base = Some("http://gpu-host.example:11434".to_string());
             settings
                 .providers
                 .get_mut("ollama")
@@ -3531,7 +3531,10 @@ pub mod config {
                 .provider_configs
                 .get("ollama")
                 .expect("ollama config must exist");
-            assert_eq!(ollama.api_base.as_deref(), Some("http://devbox:11434"));
+            assert_eq!(
+                ollama.api_base.as_deref(),
+                Some("http://gpu-host.example:11434")
+            );
             assert_eq!(
                 ollama
                     .options
@@ -3695,11 +3698,11 @@ pub mod config {
                 .options
                 .insert(
                     "default_host".to_string(),
-                    serde_json::json!("http://devbox:11434"),
+                    serde_json::json!("http://gpu-host.example:11434"),
                 );
             assert_eq!(
                 resolve_ollama_host_from(&settings),
-                Some("http://devbox:11434".to_string())
+                Some("http://gpu-host.example:11434".to_string())
             );
         }
 
@@ -3755,7 +3758,7 @@ pub mod config {
                 .options
                 .insert(
                     "default_host".to_string(),
-                    serde_json::json!("http://devbox:11434"),
+                    serde_json::json!("http://gpu-host.example:11434"),
                 );
             // api_base (priority 1) wins over default_host (priority 3); the
             // trailing /v1 is normalised away.

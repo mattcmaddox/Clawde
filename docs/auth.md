@@ -209,13 +209,13 @@ Pro/Max/Team plans, or testing against multiple organizations.
     "anthropic": {
       "active": "personal",
       "profiles": {
-        "work":     { "id": "work",     "email": "kuber@company.example",  "subscription_tier": "max", "added_at": "2026-05-25T19:00:00Z" },
-        "personal": { "id": "personal", "email": "kuber@personal.example", "subscription_tier": "pro", "added_at": "2026-05-25T19:05:00Z" }
+        "work":     { "id": "work",     "email": "dev@company.example",  "subscription_tier": "max", "added_at": "2026-05-25T19:00:00Z" },
+        "personal": { "id": "personal", "email": "dev@personal.example", "subscription_tier": "pro", "added_at": "2026-05-25T19:05:00Z" }
       }
     },
     "codex": {
       "active": "work",
-      "profiles": { "work": { "id": "work", "email": "kuber@company.example" } }
+      "profiles": { "work": { "id": "work", "email": "dev@company.example" } }
     }
   }
 }

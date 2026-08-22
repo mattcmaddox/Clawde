@@ -7,21 +7,21 @@ this is pure Python stdlib.
 
 Usage:
   # Single prompt (streams output, then exits)
-  acp-client.py 192.168.1.55 "write a fibonacci function in python"
+  acp-client.py acp-host.example "write a fibonacci function in python"
 
   # Read prompt from stdin (pipe mode)
-  echo "list all files" | acp-client.py 192.168.1.55
+  echo "list all files" | acp-client.py acp-host.example
 
   # Interactive REPL (maintains conversation context)
-  acp-client.py 192.168.1.55
-  acp-client.py 192.168.1.55 --interactive
+  acp-client.py acp-host.example
+  acp-client.py acp-host.example --interactive
 
   # TLS options
-  acp-client.py 192.168.1.55 --no-tls              # plain TCP
-  acp-client.py 192.168.1.55 --cert server.crt      # verify server cert
+  acp-client.py acp-host.example --no-tls              # plain TCP
+  acp-client.py acp-host.example --cert server.crt      # verify server cert
 
   # Custom port
-  acp-client.py 192.168.1.55 "hello" --port 9877
+  acp-client.py acp-host.example "hello" --port 9877
 """
 
 import sys
@@ -256,10 +256,10 @@ def main():
         description="ACP LAN client — chat with Clawde over the LAN",
         epilog=(
             "Examples:\n"
-            "  acp-client.py 192.168.1.55 \"explain how DNS works\"\n"
-            "  acp-client.py 192.168.1.55 --interactive\n"
-            "  echo \"hello\" | acp-client.py 192.168.1.55\n"
-            "  acp-client.py 192.168.1.55 --no-tls --port 9876"
+            "  acp-client.py acp-host.example \"explain how DNS works\"\n"
+            "  acp-client.py acp-host.example --interactive\n"
+            "  echo \"hello\" | acp-client.py acp-host.example\n"
+            "  acp-client.py acp-host.example --no-tls --port 9876"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

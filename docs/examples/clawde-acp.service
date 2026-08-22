@@ -21,7 +21,7 @@
 
 [Unit]
 Description=Clawde ACP AI Coding Agent Server
-Documentation=https://github.com/user/clawde
+Documentation=https://github.com/mattcmaddox/Clawde
 After=network-online.target
 Wants=network-online.target
 
@@ -36,11 +36,11 @@ ExecStart=/usr/local/bin/clawde acp --listen 127.0.0.1:9876
 # Environment=CLAWDE_HOME=/home/user/.clawde/ollama-acp
 
 # -- User to run as (read your ~/.clawde/auth.json for provider keys) -------
-User=user
-Group=user
+User=clawde
+Group=clawde
 
 # -- Working directory (used by tools like Read, Glob, Bash) ----------------
-WorkingDirectory=/home/user
+WorkingDirectory=/home/clawde
 
 # -- Environment (API keys are read from ~/.clawde/auth.json by default) ----
 # If you prefer env vars instead of auth.json, uncomment:
@@ -59,7 +59,7 @@ StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/home/user
+ReadWritePaths=/home/clawde
 CapabilityBoundingSet=
 AmbientCapabilities=
 

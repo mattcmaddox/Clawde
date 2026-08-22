@@ -35,3 +35,11 @@ src-rust/crates/api/tests/fixtures/
 
 # Release packaging output (scripts/build.sh package/release)
 dist/
+
+# Local-only setup notes / personal machine mapping (never commit)
+.local/
+
+# Secrets hardening
+.env
+*.env
+.npmrc

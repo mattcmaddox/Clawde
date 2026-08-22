@@ -38,7 +38,7 @@ clawde --provider llamacpp --model your-model "add a health-check endpoint"
 If your server runs elsewhere:
 
 ```bash
-LLAMA_CPP_HOST=http://192.168.1.50:8080 clawde --provider llamacpp --model your-model
+LLAMA_CPP_HOST=http://gpu-host.example:8080 clawde --provider llamacpp --model your-model
 ```
 
 Or persist it in `~/.clawde/settings.json`:
