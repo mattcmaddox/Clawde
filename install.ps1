@@ -1,10 +1,10 @@
 # Clawde installer for Windows (PowerShell).
 #
 # Usage (one-liner):
-#   irm https://github.com/<your-github-username>/clawde/releases/latest/download/install.ps1 | iex
+#   irm https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 | iex
 #
 # Or download and run locally:
-#   Invoke-WebRequest https://github.com/<your-github-username>/clawde/releases/latest/download/install.ps1 -OutFile install.ps1
+#   Invoke-WebRequest https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 -OutFile install.ps1
 #   .\install.ps1
 
 [CmdletBinding()]
@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $App = 'clawde'
-$Repo = '<your-github-username>/clawde'
+$Repo = 'mattcmaddox/Clawde'
 
 function Write-Info($msg)    { Write-Host $msg }
 function Write-Success($msg) { Write-Host $msg -ForegroundColor Green }
@@ -41,7 +41,7 @@ Options:
     -NoModifyPath           Don't add the install dir to user PATH
 
 Examples:
-    irm https://github.com/Kuberwastaken/clawde/releases/latest/download/install.ps1 | iex
+    irm https://github.com/mattcmaddox/Clawde/releases/latest/download/install.ps1 | iex
     .\install.ps1 -Version 0.1.0
     .\install.ps1 -Binary C:\path\to\clawde.exe
 "@
