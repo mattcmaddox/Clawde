@@ -21,7 +21,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     let memory_content = config
         .working_directory
         .as_deref()
-        .filter(|dir| !dir.is_empty())
+        .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| {
             use clawde_core::memdir::{
                 auto_memory_path, build_memory_prompt_content_with_budget, is_auto_memory_enabled,
@@ -33,10 +33,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
             // block at ~4 bytes per configured token, dropping the session
             // summary first when it doesn't fit.
             let budget_bytes = config.memory_max_tokens.map(|tokens| tokens as usize * 4);
-            build_memory_prompt_content_with_budget(
-                &auto_memory_path(std::path::Path::new(dir)),
-                budget_bytes,
-            )
+            build_memory_prompt_content_with_budget(&auto_memory_path(dir), budget_bytes)
         })
         .unwrap_or_default();
 

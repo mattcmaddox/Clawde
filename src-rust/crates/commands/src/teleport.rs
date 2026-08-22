@@ -307,6 +307,8 @@ impl SlashCommand for TeleportCommand {
                 let restored_dir = std::path::PathBuf::from(&bundle.working_dir);
                 if restored_dir.exists() {
                     ctx.working_dir = restored_dir.clone();
+                    ctx.config.project_dir =
+                        Some(clawde_core::git_utils::project_root(&restored_dir));
                     let _ = std::env::set_current_dir(&restored_dir);
                 }
 
@@ -456,5 +458,131 @@ impl SlashCommand for TeleportCommand {
                 other
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use teleport_bundle::{TeleportBundle, TeleportPermissions, BUNDLE_VERSION};
+
+    fn make_ctx(working_dir: PathBuf) -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir,
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+            tool_use_tracker: None,
+        }
+    }
+
+    fn make_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-q"])
+            .output()
+            .expect("git binary available");
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    fn message_text(result: CommandResult) -> String {
+        match result {
+            CommandResult::Message(text) => text,
+            other => panic!("expected CommandResult::Message, got: {:?}", other),
+        }
+    }
+
+    /// Path-consistency regression: importing a bundle whose working_dir is a
+    /// subdirectory of a git repo must set `config.project_dir` to the git
+    /// root (not the raw cwd), so memory/transcripts key on the same project
+    /// identifier the transcript writer uses.
+    #[tokio::test]
+    async fn import_sets_project_dir_to_git_root() {
+        let repo = make_repo();
+        let subdir = repo.path().join("packages/foo");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let bundle = TeleportBundle {
+            version: BUNDLE_VERSION.to_string(),
+            session_id: "sess-teleport".to_string(),
+            messages: vec![],
+            working_dir: subdir.display().to_string(),
+            permissions: TeleportPermissions::default(),
+            model: None,
+            effort: None,
+            files: vec![],
+            env: Default::default(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let file = bundle_dir.path().join("bundle.json");
+        std::fs::write(&file, serde_json::to_string(&bundle).unwrap()).unwrap();
+
+        let mut ctx = make_ctx(PathBuf::from("/tmp/original-cwd"));
+        let res = TeleportCommand
+            .execute(&format!("import {}", file.display()), &mut ctx)
+            .await;
+        let msg = message_text(res);
+        assert!(msg.contains("imported"), "got: {}", msg);
+
+        // working_dir restored to the bundle's cwd.
+        assert_eq!(ctx.working_dir, subdir);
+        // project_dir resolves to the git root, not the subdirectory.
+        let git_root = clawde_core::git_utils::get_repo_root(repo.path()).unwrap();
+        assert_eq!(
+            ctx.config.project_dir.as_deref(),
+            Some(git_root.as_path()),
+            "project_dir must be the git root, not the cwd"
+        );
+    }
+
+    /// When the bundle's working_dir is not inside a git repo, project_dir
+    /// falls back to the working dir itself.
+    #[tokio::test]
+    async fn import_sets_project_dir_to_cwd_when_not_a_repo() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bundle = TeleportBundle {
+            version: BUNDLE_VERSION.to_string(),
+            session_id: "sess-teleport".to_string(),
+            messages: vec![],
+            working_dir: scratch.path().display().to_string(),
+            permissions: TeleportPermissions::default(),
+            model: None,
+            effort: None,
+            files: vec![],
+            env: Default::default(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let file = bundle_dir.path().join("bundle.json");
+        std::fs::write(&file, serde_json::to_string(&bundle).unwrap()).unwrap();
+
+        let mut ctx = make_ctx(PathBuf::from("/tmp/original-cwd"));
+        let res = TeleportCommand
+            .execute(&format!("import {}", file.display()), &mut ctx)
+            .await;
+        let msg = message_text(res);
+        assert!(msg.contains("imported"), "got: {}", msg);
+
+        assert_eq!(ctx.working_dir, scratch.path());
+        assert_eq!(
+            ctx.config.project_dir.as_deref(),
+            Some(scratch.path()),
+            "non-repo cwd falls back to itself"
+        );
     }
 }

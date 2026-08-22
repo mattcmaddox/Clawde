@@ -52,8 +52,7 @@ impl SlashCommand for SpecCommand {
         // ------------------------------------------------------------------
         // 1. Gather repository context
         // ------------------------------------------------------------------
-        let repo_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
-            .unwrap_or_else(|| ctx.working_dir.clone());
+        let repo_root = clawde_core::git_utils::project_root(&ctx.working_dir);
 
         // /spec list: enumerate every parseable spec, newest first — the
         // headless counterpart to the /spec-review picker.

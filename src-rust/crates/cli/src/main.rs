@@ -762,7 +762,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.auto_commits {
         config.auto_commits = Some(true);
     }
-    config.project_dir = Some(cwd.clone());
+    config.project_dir = Some(clawde_core::git_utils::project_root(&cwd));
     if let Some(p) = &cli.provider {
         config.provider = Some(p.clone());
     }
@@ -829,6 +829,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Determine mode early (needed for auth error handling and permission handler selection).
     let is_headless = cli.print || cli.prompt.is_some();
+
+    // One-time transcript-bucket migration: sessions launched from a git repo
+    // subdirectory were stored under a cwd-keyed bucket that `/stats` never
+    // read. Move them into the git-root bucket (idempotent — no-op after the
+    // first run). Runs before any transcript writes so new sessions land in
+    // the canonical bucket from the start.
+    let config_dir = clawde_core::config::Settings::config_dir();
+    let migrated = clawde_core::session_storage::migrate_cwd_transcript_buckets(&config_dir);
+    if migrated > 0 {
+        debug!("Migrated {migrated} transcript(s) from cwd-keyed buckets to git-root buckets");
+    }
 
     // Once-per-run headless banner: a corrupt auth/settings store would
     // otherwise only surface as repeated WARN lines or a failing request. The
@@ -1136,7 +1147,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.prompt_guard_enabled = cli.guard_prompt;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
-    query_config.working_directory = Some(cwd.display().to_string());
+    query_config.working_directory = Some(cwd.clone());
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -3033,8 +3044,7 @@ async fn run_interactive(
     let initial_messages = session.messages.clone();
     // Project root for the directory-scoped JSONL transcript (git repo root,
     // or the working dir when not in a repo) and the cwd stamped on entries.
-    let transcript_project_root = clawde_core::git_utils::get_repo_root(&tool_ctx.working_dir)
-        .unwrap_or_else(|| tool_ctx.working_dir.clone());
+    let transcript_project_root = clawde_core::git_utils::project_root(&tool_ctx.working_dir);
     let transcript_cwd = tool_ctx.working_dir.display().to_string();
     // Messages already mirrored to the transcript. A resumed session's history
     // is assumed present on disk, so the mirror starts past it; `/new` resets
@@ -3995,11 +4005,12 @@ async fn run_interactive(
                                     // saved session all track the new location.
                                     tool_ctx.working_dir = destination.clone();
                                     cmd_ctx.working_dir = destination.clone();
-                                    cmd_ctx.config.project_dir = Some(destination.clone());
-                                    tool_ctx.config.project_dir = Some(destination.clone());
-                                    app.config.project_dir = Some(destination.clone());
-                                    base_query_config.working_directory =
-                                        Some(destination.display().to_string());
+                                    let project_root =
+                                        clawde_core::git_utils::project_root(&destination);
+                                    cmd_ctx.config.project_dir = Some(project_root.clone());
+                                    tool_ctx.config.project_dir = Some(project_root.clone());
+                                    app.config.project_dir = Some(project_root);
+                                    base_query_config.working_directory = Some(destination.clone());
                                     session.working_dir = Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
                                     let _ = clawde_core::history::save_session(&session).await;
@@ -4082,7 +4093,9 @@ async fn run_interactive(
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
-                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.config.project_dir = Some(
+                                        clawde_core::git_utils::project_root(&tool_ctx.working_dir),
+                                    );
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
@@ -4179,10 +4192,9 @@ async fn run_interactive(
                                       // The `/spec list` subcommand also returns a
                                       // Message but must never pop a modal.
                                     if cmd_name.as_str() == "spec" && cmd_args.trim() != "list" {
-                                        let dir = clawde_core::git_utils::get_repo_root(
+                                        let dir = clawde_core::git_utils::project_root(
                                             &cmd_ctx.working_dir,
-                                        )
-                                        .unwrap_or_else(|| cmd_ctx.working_dir.clone());
+                                        );
                                         if let Err(e) = app.spec_review.open_latest(&dir) {
                                             app.status_message = Some(format!("Spec review: {e}"));
                                         }
@@ -4852,7 +4864,7 @@ async fn run_interactive(
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
-                        qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        qcfg.working_directory = Some(tool_ctx.working_dir.clone());
                         // The active-goal system-prompt addendum is now injected
                         // inside run_query_loop per turn (issue #230 / MI-3), so
                         // it also covers in-loop continuation turns.
@@ -5206,7 +5218,8 @@ async fn run_interactive(
                                 cmd_ctx.working_dir = saved_path;
                             }
                         }
-                        app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                        app.config.project_dir =
+                            Some(clawde_core::git_utils::project_root(&tool_ctx.working_dir));
                         app.attach_turn_diff_state(
                             tool_ctx.file_history.clone(),
                             tool_ctx.current_turn.clone(),

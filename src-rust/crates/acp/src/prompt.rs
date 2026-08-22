@@ -60,7 +60,7 @@ pub async fn handle(
     // permission roots for this session only; never mutate the shared runtime
     // config because multiple ACP sessions may run concurrently.
     let mut session_config = runtime.config.clone();
-    session_config.project_dir = Some(session.cwd.clone());
+    session_config.project_dir = Some(clawde_core::git_utils::project_root(&session.cwd));
     session_config
         .additional_dirs
         .extend(session.additional_directories.iter().cloned());
@@ -120,7 +120,7 @@ pub async fn handle(
     // Run the query loop with the session's working directory reflected in
     // prompt/tool metadata as well as the ToolContext.
     let mut query_config = runtime.query_config.clone();
-    query_config.working_directory = Some(session.cwd.display().to_string());
+    query_config.working_directory = Some(session.cwd.clone());
     let outcome = clawde_query::run_query_loop(
         runtime.api_client.as_ref(),
         &mut messages,

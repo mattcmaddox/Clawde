@@ -22,6 +22,18 @@ pub fn get_repo_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The canonical project identifier for a working directory: the git repo
+/// root when inside a repo, otherwise the directory itself.
+///
+/// Every subsystem that keys per-project data (transcript buckets, memory
+/// dirs, stats, session history) MUST derive its project key through this
+/// function so they can never disagree about which bucket a session belongs
+/// to. Before this helper existed, call sites encoded the raw cwd, which
+/// diverged from the git root when the user launched from a subdirectory.
+pub fn project_root(start: &Path) -> PathBuf {
+    get_repo_root(start).unwrap_or_else(|| start.to_path_buf())
+}
+
 /// Run a git command in `repo_root` and return stdout as a String.
 /// Returns empty string on failure (non-zero exit, not-a-repo, etc.).
 fn git_output(repo_root: &Path, args: &[&str]) -> String {
@@ -211,6 +223,37 @@ mod tests {
         // Should find the repo root (may or may not exist in test env)
         // Just verify it doesn't panic.
         let _ = result;
+    }
+
+    /// The project identifier must be stable regardless of how deep inside the
+    /// repo the caller is: `project_root(subdir) == project_root(root)`. This is
+    /// the invariant that keeps transcript buckets, stats, and memory dirs in
+    /// agreement.
+    #[test]
+    fn project_root_is_stable_across_subdirectories() {
+        let repo = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["init", "-q"])
+            .output()
+            .expect("git binary available");
+        assert!(out.status.success());
+
+        let root = project_root(repo.path());
+        let subdir = repo.path().join("packages/foo");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let from_subdir = project_root(&subdir);
+
+        assert_eq!(root, from_subdir, "project_root must be git-root-stable");
+        assert_eq!(root, repo.path());
+    }
+
+    #[test]
+    fn project_root_falls_back_to_cwd_outside_repo() {
+        let scratch = tempfile::tempdir().unwrap();
+        let nested = scratch.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(project_root(&nested), nested);
     }
 
     #[test]

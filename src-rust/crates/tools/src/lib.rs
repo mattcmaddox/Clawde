@@ -421,6 +421,18 @@ struct PermissionCapabilities {
 
 impl ToolContext {
     /// Resolve a potentially relative path against the working directory.
+    ///
+    /// Returns the *un-canonicalized* join of `working_dir` and `path`:
+    /// `working_dir` is NOT canonicalized here, and neither is the result.
+    /// This is deliberate — the method must support paths that do not exist
+    /// yet (Write/Edit/ApplyPatch create new files, and `Path::canonicalize`
+    /// fails on non-existent paths).
+    ///
+    /// Contract for callers: any containment check against the result MUST
+    /// canonicalize BOTH sides before comparing (see
+    /// [`ToolContext::path_is_within_workspace`], which does exactly that), so
+    /// a symlinked `working_dir` never causes a false rejection. Do not do a
+    /// raw `resolved.starts_with(working_dir)` on the output of this method.
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -1252,6 +1264,58 @@ mod tests {
         // Relative paths get joined with working_dir
         let resolved = ctx.resolve_path("src/main.rs");
         assert_eq!(resolved, PathBuf::from("/workspace/src/main.rs"));
+    }
+
+    /// The containment check must accept a file reached through a symlinked
+    /// working_dir: `resolve_path` returns the un-canonicalized join, and
+    /// `path_is_within_workspace` canonicalizes both sides before comparing.
+    /// Guards the documented contract on `resolve_path`.
+    #[cfg(unix)]
+    #[test]
+    fn test_path_is_within_workspace_handles_symlinked_working_dir() {
+        use clawde_core::permissions::AutoPermissionHandler;
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("project-link");
+        symlink(real.path(), &link).unwrap();
+        let file = link.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let handler = Arc::new(AutoPermissionHandler {
+            mode: clawde_core::config::PermissionMode::Default,
+        });
+        let ctx = ToolContext {
+            working_dir: link.clone(),
+            permission_mode: clawde_core::config::PermissionMode::Default,
+            permission_handler: handler,
+            cost_tracker: clawde_core::cost::CostTracker::new(),
+            session_id: "test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                clawde_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: clawde_core::config::Config::default(),
+            provider_registry: None,
+            managed_agent_config: None,
+            effort: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        };
+
+        // The un-canonicalized resolved path (through the symlink) must still
+        // pass the containment check.
+        let resolved = ctx.resolve_path("src/main.rs");
+        assert!(ctx.path_is_within_workspace(&resolved));
+        // A file outside the real target is still rejected.
+        assert!(!ctx.path_is_within_workspace(std::path::Path::new("/etc/passwd")));
     }
 
     #[test]

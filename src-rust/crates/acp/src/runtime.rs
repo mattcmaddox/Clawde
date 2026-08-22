@@ -93,7 +93,7 @@ impl AgentRuntime {
         if config.permission_mode == clawde_core::PermissionMode::Plan {
             config.permission_mode = clawde_core::PermissionMode::Default;
         }
-        config.project_dir = Some(working_dir.clone());
+        config.project_dir = Some(clawde_core::git_utils::project_root(&working_dir));
 
         let active_provider = config.selected_provider_id().to_string();
         let (api_key, use_bearer_auth) = if active_provider == "anthropic" {
@@ -164,7 +164,7 @@ impl AgentRuntime {
         let tools = Arc::new(tools);
 
         let mut query_config = QueryConfig::from_config(&config);
-        query_config.working_directory = Some(working_dir.display().to_string());
+        query_config.working_directory = Some(working_dir.clone());
         query_config.provider_registry = Some(provider_registry.clone());
 
         Ok(Self {

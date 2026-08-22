@@ -447,8 +447,7 @@ impl SlashCommand for HistoryCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let project_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
-            .unwrap_or_else(|| ctx.working_dir.clone());
+        let project_root = clawde_core::git_utils::project_root(&ctx.working_dir);
 
         let sessions = match clawde_core::session_storage::list_sessions(&project_root).await {
             Ok(s) => s,

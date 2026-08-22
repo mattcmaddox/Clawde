@@ -83,8 +83,7 @@ fn plan_gate_error(
         return None;
     }
 
-    let project_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
-        .unwrap_or_else(|| ctx.working_dir.clone());
+    let project_root = clawde_core::git_utils::project_root(&ctx.working_dir);
     let approved = clawde_core::spec::Spec::approved_in(&project_root, &ctx.session_id);
     let Some((approved_path, approved_spec)) = approved.as_ref() else {
         return Some(ToolResult::error_with_code(

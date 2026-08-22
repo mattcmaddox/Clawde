@@ -33,18 +33,6 @@ use crate::{run_query_loop, QueryConfig, QueryOutcome};
 // Worktree isolation helpers
 // ---------------------------------------------------------------------------
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start.to_path_buf();
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 async fn create_worktree(git_root: &Path, agent_id: &str) -> Option<PathBuf> {
     let worktree_dir = std::env::temp_dir().join(format!("claude-agent-{}", agent_id));
     let output = tokio::process::Command::new("git")
@@ -1341,29 +1329,28 @@ impl Tool for AgentTool {
         let use_isolation = resolved_isolation.as_deref() == Some("worktree");
         let agent_id = uuid::Uuid::new_v4().to_string();
 
-        let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
+        let (working_dir, worktree_path, git_root): (PathBuf, Option<PathBuf>, Option<PathBuf>) =
             if use_isolation {
-                let git_root = find_git_root(&ctx.working_dir);
+                let git_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir);
                 if let Some(ref root) = git_root {
                     if let Some(wt) = create_worktree(root, &agent_id).await {
-                        let wd = wt.display().to_string();
-                        (wd, Some(wt), git_root)
+                        (wt.clone(), Some(wt), git_root)
                     } else {
                         warn!(
                             agent_id = %agent_id,
                             "Worktree creation failed; running agent in shared working directory"
                         );
-                        (ctx.working_dir.display().to_string(), None, None)
+                        (ctx.working_dir.clone(), None, None)
                     }
                 } else {
                     warn!(
                         agent_id = %agent_id,
                         "No git root found; isolation=worktree ignored"
                     );
-                    (ctx.working_dir.display().to_string(), None, None)
+                    (ctx.working_dir.clone(), None, None)
                 }
             } else {
-                (ctx.working_dir.display().to_string(), None, None)
+                (ctx.working_dir.clone(), None, None)
             };
 
         let query_config = QueryConfig {
@@ -1374,7 +1361,7 @@ impl Tool for AgentTool {
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
-            working_directory: Some(working_dir_str),
+            working_directory: Some(working_dir),
             network_blocked: clawde_core::network_isolation_enabled(&ctx.config),
             thinking_budget: None,
             memory_max_tokens: None,
@@ -1660,7 +1647,7 @@ pub fn init_team_swarm_runner() {
                     max_tokens: clawde_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
-                    working_directory: Some(ctx.working_dir.display().to_string()),
+                    working_directory: Some(ctx.working_dir.clone()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(Arc::new(provider_registry)),

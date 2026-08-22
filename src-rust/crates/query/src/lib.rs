@@ -88,6 +88,7 @@ use clawde_core::error::ClaudeError;
 use clawde_core::types::{ContentBlock, Message, Role, ToolResultContent, UsageInfo};
 use clawde_tools::{PermissionLevel, Tool, ToolContext, ToolErrorCode, ToolResult};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -124,7 +125,7 @@ pub struct QueryConfig {
     pub append_system_prompt: Option<String>,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
-    pub working_directory: Option<String>,
+    pub working_directory: Option<PathBuf>,
     /// Effective session network isolation snapshot used by prompt assembly.
     /// Refreshed from the live session config before each query turn.
     pub network_blocked: bool,
@@ -281,7 +282,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
@@ -305,7 +306,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
             memory_enabled: cfg.memory.enabled,
@@ -784,8 +785,7 @@ fn active_plan_context(
     task_id: Option<&str>,
 ) -> Option<String> {
     let task_id = task_id?;
-    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
-        .unwrap_or_else(|| working_dir.to_path_buf());
+    let project_root = clawde_core::git_utils::project_root(working_dir);
     let (spec_path, spec) = clawde_core::spec::Spec::approved_in(&project_root, session_id)?;
     if spec.task_id != task_id {
         return None;
@@ -894,8 +894,7 @@ fn record_plan_turn_progress(
     advance_evidence: clawde_core::PlanAdvanceEvidence,
 ) -> Option<clawde_core::PlanProgressEvent> {
     let task_id = task_id?;
-    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
-        .unwrap_or_else(|| working_dir.to_path_buf());
+    let project_root = clawde_core::git_utils::project_root(working_dir);
     match clawde_core::PlanProgress::record_evidence_and_advance_for_approved_spec(
         &project_root,
         task_id,
@@ -933,8 +932,7 @@ fn plan_resume_summary(
     session_id: &str,
     task_id: &str,
 ) -> Option<String> {
-    let project_root = clawde_core::git_utils::get_repo_root(working_dir)
-        .unwrap_or_else(|| working_dir.to_path_buf());
+    let project_root = clawde_core::git_utils::project_root(working_dir);
     let (spec_path, spec) = clawde_core::spec::Spec::approved_in(&project_root, session_id)?;
     if spec.task_id != task_id {
         return None;
@@ -1610,8 +1608,7 @@ pub async fn run_query_loop(
                     &tool_ctx.session_id,
                     active_task_id.as_deref(),
                     plan_turn_evidence(
-                        &clawde_core::git_utils::get_repo_root(&tool_ctx.working_dir)
-                            .unwrap_or_else(|| tool_ctx.working_dir.clone()),
+                        &clawde_core::git_utils::project_root(&tool_ctx.working_dir),
                         turn,
                         $stop_reason,
                         wrote_files,
@@ -4027,9 +4024,8 @@ pub async fn run_query_loop(
                         let (memory_dir, conversations_dir) = {
                             let project = config
                                 .working_directory
-                                .as_deref()
-                                .filter(|d| !d.is_empty())
-                                .map(std::path::PathBuf::from)
+                                .clone()
+                                .filter(|d| !d.as_os_str().is_empty())
                                 .unwrap_or_else(|| tool_ctx.working_dir.clone());
                             // Session transcripts are written per-project (git
                             // repo root, or the cwd when not in a repo) by
@@ -4037,8 +4033,7 @@ pub async fn run_query_loop(
                             // the exact same directory so the session gate and
                             // transcript greps see the real sessions instead of
                             // the legacy (now-unused) `~/.clawde/conversations`.
-                            let transcript_root = clawde_core::git_utils::get_repo_root(&project)
-                                .unwrap_or_else(|| project.clone());
+                            let transcript_root = clawde_core::git_utils::project_root(&project);
                             let memory = if project.is_dir() {
                                 Some(clawde_core::memdir::auto_memory_path(&project))
                             } else {

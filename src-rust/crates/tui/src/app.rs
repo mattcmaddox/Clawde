@@ -3299,7 +3299,7 @@ impl App {
                 // Specs are written to the repository root's specs/ dir —
                 // resolve the project root (matches /spec's write path) so
                 // running from a subdirectory still finds them.
-                let dir = clawde_core::git_utils::get_repo_root(&dir).unwrap_or(dir);
+                let dir = clawde_core::git_utils::project_root(&dir);
                 self.spec_review.open_latest(&dir)
             } else {
                 let requested = std::path::PathBuf::from(arg);
@@ -3311,8 +3311,7 @@ impl App {
                         .as_ref()
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    let root =
-                        clawde_core::git_utils::get_repo_root(&active_dir).unwrap_or(active_dir);
+                    let root = clawde_core::git_utils::project_root(&active_dir);
                     root.join(requested)
                 };
                 self.spec_review.open(path)

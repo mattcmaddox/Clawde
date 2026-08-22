@@ -52,8 +52,7 @@ impl SlashCommand for ReviewCommand {
         // ------------------------------------------------------------------
         // 1. Collect the diff
         // ------------------------------------------------------------------
-        let repo_root = clawde_core::git_utils::get_repo_root(&ctx.working_dir)
-            .unwrap_or_else(|| ctx.working_dir.clone());
+        let repo_root = clawde_core::git_utils::project_root(&ctx.working_dir);
 
         let diff = if base.is_empty() {
             // No base given — use staged changes; fall back to unstaged if empty.

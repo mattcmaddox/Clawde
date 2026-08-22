@@ -255,9 +255,16 @@ fn collect_jsonl_paths(cwd: &Path, all_projects: bool) -> Vec<(String, PathBuf)>
         }
         dirs
     } else {
-        let encoded = encoded_dir_for_cwd(cwd);
+        // Project identifier must match the transcript writer in
+        // `core::session_storage::transcript_dir`: the git repo root (or cwd
+        // when not inside a repo). Encoding the raw cwd here means a session
+        // launched from a subdirectory writes under the git-root bucket but
+        // stats looks in the cwd bucket — sessions appear to vanish. Resolve
+        // the repo root so both sides agree.
+        let project_root = clawde_core::git_utils::project_root(cwd);
+        let encoded = encoded_dir_for_cwd(&project_root);
         let dir = root.join(&encoded);
-        let decoded = cwd.to_string_lossy().to_string();
+        let decoded = project_root.to_string_lossy().to_string();
         vec![(decoded, dir)]
     };
 
@@ -1617,5 +1624,58 @@ mod tests {
         assert!(out.contains("Clawde Session Stats"), "got: {}", out);
         assert!(out.contains("Sessions:"), "got: {}", out);
         assert!(out.contains("sess-a"), "got: {}", out);
+    }
+
+    /// Regression test for the stats/transcript project-identifier divergence:
+    /// a session launched from a git repo root writes its transcript under the
+    /// git-root bucket (via `session_storage::transcript_dir`), and `/stats`
+    /// run from a *subdirectory* of that repo must still find it. Before the
+    /// fix, stats encoded the raw cwd as the project key, so it looked in the
+    /// subdirectory bucket and reported no sessions.
+    #[tokio::test]
+    async fn run_summary_from_subdirectory_finds_repo_root_sessions() {
+        let _home = crate::keys::tests::TestHome::new();
+
+        // A real git repo (repo root) with a subdirectory the user "cd"s into.
+        let repo = TempDir::new().unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["init", "-q"])
+            .output()
+            .expect("git binary available");
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let subdir = repo.path().join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // Transcript is written under the git-root bucket — exactly what
+        // `core::session_storage::transcript_dir(get_repo_root(...))` produces.
+        let repo_root = clawde_core::git_utils::get_repo_root(repo.path()).unwrap();
+        let encoded = encoded_dir_for_cwd(&repo_root);
+        let projects = clawde_core::config::Settings::config_dir()
+            .join("projects")
+            .join(&encoded);
+        std::fs::create_dir_all(&projects).unwrap();
+        build_fixture_session(
+            &projects,
+            "sess-repo-root",
+            vec![make_user("2024-01-15T10:00:00Z")],
+        )
+        .await;
+
+        // Run /stats from the subdirectory.
+        let ctx = run_ctx(subdir.clone());
+        let out = run_message(&[], &ctx);
+        assert!(out.contains("Clawde Session Stats"), "got: {}", out);
+        assert!(out.contains("sess-repo-root"), "got: {}", out);
+
+        // Sanity: without --all-projects the scope is still the single repo
+        // root bucket (not a sweep of every project).
+        let agg = aggregate(&parse_args(&[]).unwrap(), &ctx);
+        assert_eq!(agg.sessions.len(), 1);
+        assert_eq!(agg.sessions[0].session_id, "sess-repo-root");
     }
 }

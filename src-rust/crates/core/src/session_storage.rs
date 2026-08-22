@@ -268,6 +268,94 @@ pub fn transcript_dir_in(config_dir: &Path, project_root: &Path) -> PathBuf {
     config_dir.join("projects").join(encoded)
 }
 
+/// Migrate transcript buckets that were keyed on a raw cwd (a subdirectory of
+/// a git repo) into the git-root bucket, so `/stats` and the transcript writer
+/// agree on the project identifier.
+///
+/// Before the path-consistency fix, transcripts were written under
+/// `projects/<base64(git_root)>/` (via `get_repo_root`) while `/stats` looked
+/// under `projects/<base64(cwd)>/`. Sessions launched from a subdirectory were
+/// stored in a bucket that nothing read. This scans every encoded bucket,
+/// decodes the path, and if it is a subdirectory of a git repo, moves the
+/// `.jsonl` files into the git-root bucket (never overwriting an existing
+/// file). Non-repo buckets and buckets already at the git root are left alone.
+///
+/// Idempotent and safe to run at every startup: after the first pass the
+/// subdirectory buckets no longer exist, so later runs are no-ops. Returns the
+/// number of files moved.
+pub fn migrate_cwd_transcript_buckets(config_dir: &Path) -> usize {
+    let projects = config_dir.join("projects");
+    let mut moved = 0usize;
+
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(_) => return 0, // no projects dir yet
+    };
+
+    for entry in entries.flatten() {
+        let old_bucket = entry.path();
+        if !old_bucket.is_dir() {
+            continue;
+        }
+        let encoded = match old_bucket.file_name().and_then(|s| s.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        // Skip buckets whose names are not reversible base64 (corrupt or
+        // foreign entries) — they are already unreadable by the rest of the
+        // system and must not be touched.
+        let decoded = match URL_SAFE_NO_PAD.decode(&encoded) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let old_path = PathBuf::from(&decoded);
+
+        // Only migrate paths that are a strict subdirectory of a git repo.
+        let Some(git_root) = crate::git_utils::get_repo_root(&old_path) else {
+            continue;
+        };
+        if git_root == old_path {
+            continue; // already at the git root
+        }
+
+        let new_bucket = transcript_dir_in(config_dir, &git_root);
+        if std::fs::create_dir_all(&new_bucket).is_err() {
+            continue;
+        }
+
+        let files: Vec<PathBuf> = match std::fs::read_dir(&old_bucket) {
+            Ok(read) => read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for file in files {
+            let dest = new_bucket.join(file.file_name().unwrap_or_default());
+            if dest.exists() {
+                continue; // never clobber an existing transcript
+            }
+            if std::fs::rename(&file, &dest).is_ok() {
+                moved += 1;
+            }
+        }
+
+        // Remove the old bucket when it is now empty.
+        let empty = std::fs::read_dir(&old_bucket)
+            .map(|mut r| r.next().is_none())
+            .unwrap_or(false);
+        if empty {
+            let _ = std::fs::remove_dir(&old_bucket);
+        }
+    }
+
+    moved
+}
+
 /// Returns the full path to a session's JSONL transcript file.
 ///
 /// # Errors
@@ -1352,5 +1440,80 @@ mod tests {
             .unwrap();
         let decoded = URL_SAFE_NO_PAD.decode(encoded_dir).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), root.to_str().unwrap());
+    }
+
+    /// Create a throwaway git repository (needed so `get_repo_root` resolves).
+    fn make_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-q"])
+            .output()
+            .expect("git binary available");
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    }
+
+    /// A transcript staged under the *cwd* bucket (the pre-fix layout) must be
+    /// moved into the git-root bucket, and the stale bucket removed. Re-running
+    /// the migration is a no-op (idempotent).
+    #[test]
+    fn migrate_cwd_transcript_buckets_moves_subdirectory_transcripts() {
+        let config = tempdir().unwrap();
+        let repo = make_repo();
+        let subdir = repo.path().join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // Stage a transcript under the cwd bucket (pre-fix layout).
+        let cwd_bucket = transcript_dir_in(config.path(), &subdir);
+        std::fs::create_dir_all(&cwd_bucket).unwrap();
+        let staged = cwd_bucket.join("sess-legacy.jsonl");
+        std::fs::write(&staged, "{\"type\":\"user\"}\n").unwrap();
+
+        let moved = migrate_cwd_transcript_buckets(config.path());
+        assert_eq!(moved, 1, "one transcript should be migrated");
+
+        // File now lives in the git-root bucket.
+        let git_root = crate::git_utils::get_repo_root(repo.path()).unwrap();
+        let root_bucket = transcript_dir_in(config.path(), &git_root);
+        assert!(
+            root_bucket.join("sess-legacy.jsonl").exists(),
+            "transcript must be in the git-root bucket"
+        );
+        // Old cwd bucket is gone (empty after the move).
+        assert!(!cwd_bucket.exists(), "stale cwd bucket must be removed");
+
+        // Idempotent: second run moves nothing.
+        assert_eq!(migrate_cwd_transcript_buckets(config.path()), 0);
+    }
+
+    /// Buckets whose decoded path is already the git root, or is not inside a
+    /// git repo at all, are left untouched.
+    #[test]
+    fn migrate_cwd_transcript_buckets_leaves_other_buckets_alone() {
+        let config = tempdir().unwrap();
+        let repo = make_repo();
+
+        // Bucket keyed on the git root itself — already canonical, must not move.
+        let root_bucket = transcript_dir_in(config.path(), repo.path());
+        std::fs::create_dir_all(&root_bucket).unwrap();
+        let root_file = root_bucket.join("sess-root.jsonl");
+        std::fs::write(&root_file, "{\"type\":\"user\"}\n").unwrap();
+
+        // Bucket keyed on a non-repo directory — must not move.
+        let scratch = tempdir().unwrap();
+        let scratch_bucket = transcript_dir_in(config.path(), scratch.path());
+        std::fs::create_dir_all(&scratch_bucket).unwrap();
+        let scratch_file = scratch_bucket.join("sess-scratch.jsonl");
+        std::fs::write(&scratch_file, "{\"type\":\"user\"}\n").unwrap();
+
+        let moved = migrate_cwd_transcript_buckets(config.path());
+        assert_eq!(moved, 0, "nothing should move");
+        assert!(root_file.exists());
+        assert!(scratch_file.exists());
     }
 }

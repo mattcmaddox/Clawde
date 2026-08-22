@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ pub struct SystemPromptOptions {
     /// When present, this overrides the built-in enum-derived suffix.
     pub custom_output_style_prompt: Option<String>,
     /// Absolute path to the working directory (injected as dynamic section).
-    pub working_directory: Option<String>,
+    pub working_directory: Option<PathBuf>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
     /// Custom system prompt (--system-prompt flag or settings).
@@ -315,7 +316,10 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // 11. Working directory (legacy XML tag kept for caching compat)
     if let Some(cwd) = &opts.working_directory {
-        parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+        parts.push(format!(
+            "\n<working_directory>{}</working_directory>",
+            cwd.display()
+        ));
     }
 
     // 12. Memory injection (from memdir)
@@ -350,7 +354,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
 /// Build the dynamic environment-info section injected after the boundary.
 /// Mirrors `computeEnvInfo()` + `getUnameSR()` from `src/constants/prompts.ts`.
-fn build_env_info_section(working_dir: Option<&str>) -> String {
+fn build_env_info_section(working_dir: Option<&Path>) -> String {
     // Platform string
     let platform = if cfg!(target_os = "windows") {
         "win32"
@@ -417,7 +421,7 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
 
     // Is git repo?
     let is_git = working_dir
-        .map(|d| std::path::Path::new(d).join(".git").exists())
+        .map(|d| d.join(".git").exists())
         .unwrap_or(false);
 
     // Today's date
@@ -439,7 +443,7 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
 
     // Build the section
     let cwd_line = working_dir
-        .map(|d| format!("\nWorking directory: {}", d))
+        .map(|d| format!("\nWorking directory: {}", d.display()))
         .unwrap_or_default();
 
     // Platform-specific guidance so the model uses the right commands.
@@ -687,7 +691,7 @@ mod tests {
     #[test]
     fn test_working_directory_in_dynamic_section() {
         let opts = SystemPromptOptions {
-            working_directory: Some("/home/user/project".to_string()),
+            working_directory: Some(PathBuf::from("/home/user/project")),
             ..Default::default()
         };
         let prompt = build_system_prompt(&opts);
