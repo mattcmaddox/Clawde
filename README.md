@@ -2,7 +2,6 @@
 
 <h1>CLAWDE</h1>
 <h2><em>Your home for cat-related puns</em></h2>
-<img src="public/Original_Ship.png" alt="Rustail on the ship" width="350" />
 
 <p>
     <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
