@@ -831,10 +831,11 @@ pub fn render_rustail_editor(frame: &mut Frame, screen: &RustailEditor, area: Re
     let glyph_style = Style::default().fg(p.accent);
     let muted = Style::default().fg(p.disabled);
 
-    // Column width: the 29-col grid + border needs 31; the palette line needs
+    // Column width: the 29-col grid + border needs 31; the palette needs
     // ~42 — use 44 and center the grid inside. Key hints span the full width.
     let panel_w = 44u16;
-    let rows: [u16; 5] = [1, 10, 1, 5, 1]; // title, grid block, palette, hints, notice
+    // title, grid block, glyph row, hotkey row, hints, notice
+    let rows: [u16; 6] = [1, 10, 1, 1, 5, 1];
     let total_h: u16 = rows.iter().sum::<u16>() + 2;
     let x = area.x + area.width.saturating_sub(panel_w) / 2;
     let mut y = area.y + area.height.saturating_sub(total_h) / 2;
@@ -893,43 +894,98 @@ pub fn render_rustail_editor(frame: &mut Frame, screen: &RustailEditor, area: Re
     );
     y += rows[1] + 1;
 
-    // Glyph palette with letter bindings.
-    let mut pal_spans: Vec<Span> = Vec::new();
+    // Glyph palette — two stacked rows: the block glyphs on top, their
+    // hotkey letters directly beneath, each key centred under its glyph.
+    let mut glyph_spans: Vec<Span> = Vec::new();
+    let mut key_spans: Vec<Span> = Vec::new();
     for (i, glyph) in GLYPHS.iter().enumerate() {
         let active = i == screen.palette;
-        let style = if active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            muted
-        };
-        pal_spans.push(Span::styled(format!("{}{} ", GLYPH_KEYS[i], glyph), style));
+        // Glyph row: 1 leading + 14 glyphs + 13×1 gaps = 28 cells, well
+        // inside the 40-cell inner panel. Keys: 1 leading + 14 keys + 13×1
+        // gaps = 28 cells too, each key sitting directly under its glyph.
+        let offset = if i == 0 { 1 } else { 2 };
+        let key_offset = if i == 0 { 1 } else { 2 };
+        glyph_spans.push(Span::raw(" ".repeat(offset)));
+        glyph_spans.push(Span::styled(
+            glyph.to_string(),
+            if active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                muted
+            },
+        ));
+        // Key under the glyph: the active key reads as a highlighted button,
+        // inactive keys stay readable instead of falling to the faint grey.
+        key_spans.push(Span::raw(" ".repeat(key_offset)));
+        key_spans.push(Span::styled(
+            GLYPH_KEYS[i].to_string(),
+            if active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.info).add_modifier(Modifier::BOLD)
+            },
+        ));
     }
     frame.render_widget(
-        Paragraph::new(Line::from(pal_spans)),
+        Paragraph::new(Line::from(glyph_spans)),
         Rect::new(x, y, panel_w, 1),
     );
     y += rows[2] + 1;
+    frame.render_widget(
+        Paragraph::new(Line::from(key_spans)),
+        Rect::new(x, y, panel_w, 1),
+    );
+    y += rows[3] + 1;
 
-    // Key hints (span the full terminal width, centred).
+    // Key hints (span the full terminal width, centred). Each phrase is
+    // "<hotkey> <action>"; the hotkey renders as a highlighted button while
+    // the action description stays muted so the keys read at a glance.
     let hints = [
-        " hjkl/arrows move · space paint · backspace erase · tab cycle · u undo",
-        " = add frame · - remove frame · ctrl+d duplicate · 1-9 go to frame",
-        " shift+1-9 set seconds · enter save & close · esc close (esc esc discards)",
-        " safety: 1 - for blanks, - - for art · esc esc to discard unsaved",
-        " ctrl+n new preset · ctrl+o switch · ctrl+shift+d delete preset",
+        "hjkl/arrows move · space paint · backspace erase · tab cycle · u undo",
+        "= add frame · - remove frame · ctrl+d duplicate · 1-9 go to frame",
+        "shift+1-9 set seconds · enter save & close · esc close (esc esc discards)",
+        "safety: 1 - for blanks, - - for art · esc esc to discard unsaved",
+        "ctrl+n new preset · ctrl+o switch · ctrl+shift+d delete preset",
     ];
+    let key_color = p.info;
     let hint_lines: Vec<Line> = hints
         .iter()
-        .map(|h| Line::from(Span::styled(*h, muted)))
+        .map(|h| {
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, phrase) in h.split(" · ").enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" · ", muted));
+                }
+                match phrase.split_once(' ') {
+                    Some((key, rest)) => {
+                        spans.push(Span::styled(
+                            format!(" {key} "),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(key_color)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(format!(" {rest}"), muted));
+                    }
+                    // A phrase with no action text ("safety:" heading) is
+                    // plain muted text.
+                    None => spans.push(Span::styled(format!(" {phrase}"), muted)),
+                }
+            }
+            Line::from(spans)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(hint_lines).alignment(ratatui::layout::Alignment::Center),
         Rect::new(area.x, y, area.width, 5),
     );
-    y += rows[3] + 1;
+    y += rows[4] + 1;
 
     // Transient notice (errors, discard confirm).
     if let Some(notice) = &screen.notice {
@@ -1248,6 +1304,63 @@ const CYCLE_MS: u64 = FRAME_DURATIONS_MS[0]
             .collect::<String>()
     }
 
+    /// Render and split into rows, so layout tests can assert *where* a glyph
+    /// or hotkey landed (row index), not just that it appears somewhere.
+    fn render_editor_rows(screen: &RustailEditor) -> Vec<String> {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_rustail_editor(frame, screen, frame.area()))
+            .unwrap();
+        let rendered = terminal.backend().buffer();
+        let area = rendered.area;
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|col| rendered[(col, row)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn glyphs_stack_above_their_hotkey_row() {
+        let mut screen = RustailEditor::new();
+        screen.open();
+        let rows = render_editor_rows(&screen);
+
+        // Locate the palette: a row holding every block glyph, and the row
+        // directly beneath it holding every hotkey letter (glyphs and keys
+        // are no longer interleaved on one line).
+        let glyph_row = rows
+            .iter()
+            .position(|r| GLYPHS.iter().all(|g| r.contains(*g)))
+            .expect("a row must contain all block glyphs");
+        let key_row = rows
+            .iter()
+            .position(|r| GLYPH_KEYS.iter().all(|k| r.contains(*k)))
+            .expect("a row must contain all hotkey letters");
+        // The keys sit one row below the glyphs (a blank breathing row between
+        // them); the key row must come after the glyph row, not share it.
+        assert!(
+            key_row > glyph_row,
+            "hotkeys must sit on a row beneath the glyphs (glyph_row={glyph_row}, key_row={key_row})"
+        );
+        // The glyph row must not carry hotkey letters and vice versa.
+        for k in GLYPH_KEYS {
+            assert!(
+                !rows[glyph_row].contains(k),
+                "glyph row must not contain letter {k}"
+            );
+        }
+        for g in GLYPHS {
+            assert!(
+                !rows[key_row].contains(g),
+                "hotkey row must not contain glyph {g}"
+            );
+        }
+    }
+
     #[test]
     fn editor_renders_baseline_ui() {
         let mut screen = RustailEditor::new();
@@ -1259,7 +1372,9 @@ const CYCLE_MS: u64 = FRAME_DURATIONS_MS[0]
             "title shows frame and duration"
         );
         assert!(content.contains(GLYPHS[0]));
-        assert!(content.contains("enter save"));
+        // Hotkey hints now render as " enter  save & close" — the key is its
+        // own button span, so assert on the action text.
+        assert!(content.contains("save & close"));
         assert!(content.contains("safety:"));
     }
 

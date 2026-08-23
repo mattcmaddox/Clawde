@@ -3088,13 +3088,34 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             ])
         };
 
+        // Current directory badge — always shown at the far right of the
+        // model/mode status row, right-aligned. Uses dirs::home_dir() so this
+        // works on Windows (where $HOME is unset and the home is
+        // $USERPROFILE). Guard against an empty home string: `str::replace("",
+        // "~")` inserts "~" between every character, producing the infamous
+        // `~X~:~\~B~i~g~g~e~r~…` output.
+        let cwd_span: Option<Span<'static>> = if app.settings_screen.show_cwd {
+            app.current_dir.as_ref().map(|dir| {
+                let home = dirs::home_dir()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty());
+                let display_dir = match home {
+                    Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
+                    _ => dir.clone(),
+                };
+                Span::styled(display_dir, Style::default().fg(Color::DarkGray))
+            })
+        } else {
+            None
+        };
+
         // Context-sensitive hints in the right slot. These are suppressed
         // once the prompt has text so they don't compete with typing, and
         // during streaming when the input is readonly.
         // Index of the free-model task-sort badge within the final right-hint
         // span list, set when the badge is drawn this frame.
         let mut task_badge_span_idx: Option<usize> = None;
-        let right_hint = if app.prompt_input.has_expandable_paste_ref() {
+        let mut right_hint = if app.prompt_input.has_expandable_paste_ref() {
             // A [Pasted text #N ...] placeholder is in the buffer — tell the
             // user how to view the full pasted body before submitting.
             Line::from(vec![Span::styled(
@@ -3186,6 +3207,17 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         } else {
             Line::from(Vec::<Span>::new())
         };
+        // Pin the cwd to the far right of the status row — it always renders
+        // (even while typing/streaming, when the hint above is suppressed),
+        // right-aligned via the render call below.
+        if let Some(cwd) = cwd_span {
+            if !right_hint.spans.is_empty() {
+                right_hint
+                    .spans
+                    .push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            }
+            right_hint.spans.push(cwd);
+        }
 
         let left_padded = Rect {
             x: chunks[0].x + 1,

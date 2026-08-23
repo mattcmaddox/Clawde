@@ -1,0 +1,342 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Only one release at a time — if a new push lands while a release is
+# in progress, cancel the stale one and release the latest code.
+concurrency:
+  group: release-main
+  cancel-in-progress: true
+
+permissions:
+  contents: write      # push version-bump commit + create GitHub Release
+  id-token: write      # OIDC provenance for npm publish
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Step 1: compute version, bump sources, push commit ───────────────
+  prepare:
+    # Skip if this push is the version-bump commit from a previous release run
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    name: Prepare release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch full history so `gh release list` works and we can push
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute next version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Latest published release tag (e.g. v0.2.0)
+          LATEST=$(gh release list --limit 1 --json tagName \
+            --jq '.[0].tagName' 2>/dev/null || echo "")
+          if [[ -z "$LATEST" ]]; then
+            LATEST="v0.1.0"
+          fi
+          # Strip leading v, bump patch
+          CURRENT="${LATEST#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEXT_PATCH=$((PATCH + 1))
+          VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release $LATEST → v$VERSION"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump version in all sources
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          python3 scripts/bump-version.py "v$VERSION"
+          # Also stamp npm/package.json so it stays in sync
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/package.json', 'utf8'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Commit version bump
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-rust/Cargo.toml src-rust/Cargo.lock npm/package.json \
+            README.md docs/index.md docs/installation.md \
+            src-rust/crates/acp/registry-template/agent.json
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No version-stamp changes to commit (already at v$VERSION?)"
+          else
+            git commit -m "release: v${VERSION} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Tag the release
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+  # ── Step 2: build each platform (parallel) ───────────────────────────
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    name: Build Linux x86_64
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: release-linux-x86_64-${{ hashFiles('src-rust/Cargo.lock') }}
+
+      - name: Build
+        working-directory: src-rust
+        run: bash ../scripts/build.sh build-one linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: src-rust/target/x86_64-unknown-linux-gnu/release/clawde
+          retention-days: 1
+
+  build-linux-aarch64:
+    runs-on: ubuntu-latest
+    name: Build Linux aarch64
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: release-linux-aarch64-${{ hashFiles('src-rust/Cargo.lock') }}
+
+      - name: Build
+        working-directory: src-rust
+        run: bash ../scripts/build.sh build-one linux-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64
+          path: src-rust/target/aarch64-unknown-linux-gnu/release/clawde
+          retention-days: 1
+
+  build-windows-x86_64:
+    runs-on: windows-latest
+    name: Build Windows x86_64
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: release-windows-x86_64-${{ hashFiles('src-rust/Cargo.lock') }}
+
+      - name: Build
+        shell: bash
+        working-directory: src-rust
+        run: bash ../scripts/build.sh build-one windows-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: src-rust/target/x86_64-pc-windows-msvc/release/clawde.exe
+          retention-days: 1
+
+  # ── Step 3: package + create release ─────────────────────────────────
+  release:
+    runs-on: ubuntu-latest
+    name: Create release
+    needs: [prepare, build-linux-x86_64, build-linux-aarch64, build-windows-x86_64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+
+      - name: Assemble release archives
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN_NAME="clawde"
+
+          # Linux x86_64
+          STAGE="dist/.stage-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp dist/artifacts/linux-x86_64/clawde "$STAGE/$BIN_NAME"
+          chmod +x "$STAGE/$BIN_NAME"
+          tar -czf "dist/${BIN_NAME}-linux-x86_64.tar.gz" -C "$STAGE" "$BIN_NAME"
+          rm -rf "$STAGE"
+
+          # Linux aarch64
+          STAGE="dist/.stage-linux-aarch64"
+          mkdir -p "$STAGE"
+          cp dist/artifacts/linux-aarch64/clawde "$STAGE/$BIN_NAME"
+          chmod +x "$STAGE/$BIN_NAME"
+          tar -czf "dist/${BIN_NAME}-linux-aarch64.tar.gz" -C "$STAGE" "$BIN_NAME"
+          rm -rf "$STAGE"
+
+          # Windows x86_64
+          STAGE="dist/.stage-windows-x86_64"
+          mkdir -p "$STAGE"
+          cp dist/artifacts/windows-x86_64/clawde.exe "$STAGE/$BIN_NAME.exe"
+          (cd "$STAGE" && zip -q "../${BIN_NAME}-windows-x86_64.zip" "$BIN_NAME.exe")
+          rm -rf "$STAGE"
+
+          # Install scripts (from repo root)
+          [[ -f install.sh ]] && cp install.sh dist/
+          [[ -f install.ps1 ]] && cp install.ps1 dist/
+
+          # SHA256 checksums
+          (cd dist && sha256sum * > .SHA256SUMS.tmp && mv .SHA256SUMS.tmp SHA256SUMS)
+
+          echo "::notice::Packaged $(ls dist/*.tar.gz dist/*.zip 2>/dev/null | wc -l) archives"
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Build notes from commit log since last release
+          LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+          if [[ -n "$LATEST_TAG" ]]; then
+            LOG=$(git log --oneline "${LATEST_TAG}..HEAD" --no-merges | head -20)
+          else
+            LOG=$(git log --oneline -20 --no-merges)
+          fi
+          cat > dist/RELEASE_NOTES.md <<EOF
+          ## Clawde v${VERSION}
+
+          ### Changes
+          ${LOG}
+
+          ### Install
+          \`\`\`bash
+          npm install -g clawde
+          \`\`\`
+
+          ### Binary checksums
+          See SHA256SUMS in the release assets.
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          FILES=()
+          for f in dist/*; do
+            [[ -f "$f" ]] || continue
+            NAME="$(basename "$f")"
+            [[ "$NAME" == "RELEASE_NOTES.md" ]] && continue
+            [[ "$NAME" == ".stage-"* ]] && continue
+            FILES+=("$NAME")
+          done
+          (cd dist && gh release create "v$VERSION" \
+            --repo "${{ github.repository }}" \
+            --title "Clawde v$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            "${FILES[@]}")
+
+  # ── Step 4: publish to npm ───────────────────────────────────────────
+  npm-publish:
+    runs-on: ubuntu-latest
+    name: Publish to npm
+    needs: [prepare, release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Set npm version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/package.json', 'utf8'));
+            pkg.version = '${VERSION}';
+            fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Publish to npm (OIDC provenance)
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance

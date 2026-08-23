@@ -23,6 +23,8 @@ env:
 
 jobs:
   test:
+    # Skip CI for version-bump commits from the release workflow
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     strategy:
       fail-fast: false
       matrix:
