@@ -210,3 +210,4 @@ The current Rust implementation was written from the behavioral specification
 in [`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec).
 [Contributors](https://github.com/mattcmaddox/Clawde/graphs/contributors) are
 credited in this repository's git history.
+
