@@ -226,7 +226,7 @@ This is a **clean-room Rust reimplementation** of Claude Code's behavior.
 
 The process was explicitly two-phase:
 
-**Specification** [`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec) — An AI agent analyzed the source and produced exhaustive behavioral specifications and improvements, deviated from the original: architecture, data flows, tool contracts, system designs. No source code was carried forward.
+**Specification** — An AI agent analyzed the source and produced exhaustive behavioral specifications and improvements, deviated from the original: architecture, data flows, tool contracts, system designs. No source code was carried forward.
 
 **Implementation** [`src-rust/`](https://github.com/mattcmaddox/Clawde/tree/main/src-rust) — A separate AI agent implemented from the spec alone, never referencing the original TypeScript. The output is idiomatic Rust that reproduces the behavior, not the expression.
 
@@ -240,9 +240,8 @@ Clawde is a **fork of [claurst](https://github.com/Kuberwastaken/claurst)** by
 [Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
 agentic coding agent whose repository history and early codebase this project
 builds on. This repository carries the upstream project's git history; the
-current Rust implementation was written from the behavioral specification in
-[`spec/`](https://github.com/mattcmaddox/Clawde/tree/main/spec) (see the
-Important Notice above).
+current Rust implementation was written from the behavioral specification
+(see the Important Notice above).
 
 Contributors to the upstream project and this fork, as recorded in this
 repository's git history: Kuber Mehta (Kuberwastaken), Jonathan Hult, k99k5,

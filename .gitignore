@@ -38,6 +38,11 @@ dist/
 # Local-only setup notes / personal machine mapping (never commit)
 .local/
 
+# Development/test scripts (not needed in releases)
+scripts/audit-env-tests.py
+scripts/test-timing.sh
+scripts/wire-testhome.py
+
 # Secrets hardening
 .env
 *.env
