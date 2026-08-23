@@ -3789,20 +3789,31 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Ollama connectivity mode indicator — dim and unobtrusive.
-        // Shows whether Ollama is in Auto (participates in free-model
-        // fallback) or Isolated (offline: no network tools).
+        // Ollama connectivity mode indicator.
+        //   - Auto  + no VRAM loaded  →  dim "ollama:auto" (no icon)
+        //   - Auto  + VRAM loaded     →  bright "\u{1f310} ollama:online" (globe)
+        //   - Isolated               →  "\u{1f512} ollama:offline" (lock)
         {
-            let (label, color) = match app.ollama_mode {
-                clawde_core::OllamaMode::Auto => (" ollama:auto ", Color::Rgb(80, 140, 80)),
-                clawde_core::OllamaMode::Isolated => {
-                    (" \u{1f512} ollama:offline ", Color::Rgb(60, 140, 200))
+            let has_loaded = !app.ollama_loaded_models.is_empty();
+            let (label, color, modifier) = match app.ollama_mode {
+                clawde_core::OllamaMode::Auto if has_loaded => (
+                    " \u{1f310} ollama:online ",
+                    Color::Rgb(80, 200, 80),
+                    Modifier::BOLD,
+                ),
+                clawde_core::OllamaMode::Auto => {
+                    (" ollama:auto ", Color::Rgb(80, 140, 80), Modifier::DIM)
                 }
+                clawde_core::OllamaMode::Isolated => (
+                    " \u{1f512} ollama:offline ",
+                    Color::Rgb(60, 140, 200),
+                    Modifier::DIM,
+                ),
             };
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
                 label,
-                Style::default().fg(color).add_modifier(Modifier::DIM),
+                Style::default().fg(color).add_modifier(modifier),
             ));
         }
 
@@ -6148,5 +6159,133 @@ mod task_badge_tooltip_tests {
         let line = project_memory_line(dir.path()).expect("line should render");
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!text.contains("Lethesyne"), "got: {text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama footer indicator — 3-state test
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ollama_indicator_tests {
+    use super::*;
+    use crate::app::App;
+    use clawde_core::config::Config;
+    use clawde_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render_screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn ollama_auto_no_vram_shows_dim_label() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Auto;
+        app.ollama_loaded_models = Vec::new();
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("ollama:auto"),
+            "dim 'ollama:auto' should appear when auto + no VRAM. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:online"),
+            "'ollama:online' must NOT appear when no models are loaded. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:offline"),
+            "'ollama:offline' must NOT appear in auto mode. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn ollama_auto_with_vram_shows_online() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Auto;
+        app.ollama_loaded_models = vec![clawde_core::OllamaLoadedModel {
+            name: "llama3.2".to_string(),
+            size: Some(2_000_000_000),
+            size_vram: Some(2_000_000_000),
+            expires_at: None,
+            context_length: Some(8192),
+        }];
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("ollama:online"),
+            "'ollama:online' should appear when auto + VRAM loaded. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:auto"),
+            "'ollama:auto' must NOT appear when models are loaded. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn ollama_isolated_shows_offline_with_lock() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Isolated;
+        app.ollama_loaded_models = Vec::new();
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("ollama:offline"),
+            "'ollama:offline' should appear in isolated mode. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:auto"),
+            "'ollama:auto' must NOT appear in isolated mode. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:online"),
+            "'ollama:online' must NOT appear in isolated mode. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn ollama_isolated_with_vram_still_shows_offline() {
+        // Even with models loaded, isolated mode always shows offline.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.ollama_mode = clawde_core::OllamaMode::Isolated;
+        app.ollama_loaded_models = vec![clawde_core::OllamaLoadedModel {
+            name: "llama3.2".to_string(),
+            size: Some(2_000_000_000),
+            size_vram: Some(2_000_000_000),
+            expires_at: None,
+            context_length: Some(8192),
+        }];
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("ollama:offline"),
+            "'ollama:offline' should appear even with VRAM loaded in isolated mode. Output: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("ollama:online"),
+            "'ollama:online' must NOT appear in isolated mode. Output: {:?}",
+            out
+        );
     }
 }

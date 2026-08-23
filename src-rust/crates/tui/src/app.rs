@@ -1667,6 +1667,10 @@ pub struct App {
     /// Ollama connectivity mode — Auto (participates in free-model
     /// fallback) or Isolated (manual selection only).
     pub ollama_mode: clawde_core::OllamaMode,
+    /// Models currently loaded in Ollama's VRAM (polled periodically via
+    /// `/api/ps`). Empty when no models are loaded or when Ollama is not
+    /// configured.
+    pub ollama_loaded_models: Vec<clawde_core::OllamaLoadedModel>,
     /// Outcome of the most recent background health sweep. Used by the footer
     /// to show a marker when dead keys were found (also updated by /health).
     pub last_health_sweep: Option<clawde_api::health_poller::ProbeOutcome>,
@@ -2227,6 +2231,7 @@ impl App {
             key_ring_data_fn: None,
             free_model_defaults: Vec::new(),
             ollama_mode: clawde_core::OllamaMode::default(),
+            ollama_loaded_models: Vec::new(),
             last_health_sweep: None,
             free_upstream_index: 0,
             arg_completions: None,

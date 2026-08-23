@@ -3261,6 +3261,26 @@ async fn run_interactive(
         ));
     }
 
+    // ---- Ollama loaded-models poller ----
+    // Periodically queries `/api/ps` to know whether Ollama has a model
+    // loaded in VRAM. The result drives the footer badge color/icon.
+    let (ollama_loaded_tx, mut ollama_loaded_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Vec<clawde_core::OllamaLoadedModel>>();
+    {
+        let config = app.config.clone();
+        tokio::spawn(async move {
+            let poll_interval = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                let models = match clawde_core::ollama_status_for_config(&config).await {
+                    Ok(status) => status.models,
+                    Err(_) => Vec::new(),
+                };
+                let _ = ollama_loaded_tx.send(models);
+            }
+        });
+    }
+
     // Wire the ask-user question channel into the app so the TUI can show
     // the dialog and return an answer to the query loop.
     if let Some(rx) = user_question_rx {
@@ -6102,6 +6122,16 @@ async fn run_interactive(
                     app.last_health_sweep = Some(sweep);
                 }
             }
+        }
+
+        // Ollama loaded-models poll: update the footer badge state.
+        // Only drain the latest result (skip stale queued updates).
+        let mut ollama_latest: Option<Vec<clawde_core::OllamaLoadedModel>> = None;
+        while let Ok(models) = ollama_loaded_rx.try_recv() {
+            ollama_latest = Some(models);
+        }
+        if let Some(models) = ollama_latest {
+            app.ollama_loaded_models = models;
         }
 
         // ---- Device code / OAuth auth: spawn background task when pending ----
