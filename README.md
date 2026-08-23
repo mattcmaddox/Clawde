@@ -2,7 +2,7 @@
 
 <h1>CLAWDE</h1>
 <h2><em>Your home for cat-related puns</em></h2>
-<img src="public/Ship.png" alt="Rustail on the ship" width="350" />
+<img src="public/Original_Ship.png" alt="Rustail on the ship" width="350" />
 
 <p>
     <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
@@ -12,7 +12,7 @@
 
 <br />
 
-<img src="public/Clawde_Screenshot.jpeg" alt="Clawde in action" width="648" />
+<img src="public/Clawde_Build.png" alt="Clawde in action" width="648" />
 </div>
 
 ---
@@ -237,7 +237,7 @@ This mirrors the legal precedent established by Phoenix Technologies v. IBM (198
 
 ## Acknowledgements
 
-Clawde is a **fork of [clawde](https://github.com/Kuberwastaken/clawde)** by
+Clawde is a **fork of [claurst](https://github.com/Kuberwastaken/claurst)** by
 [Kuber Mehta (Kuberwastaken)](https://github.com/Kuberwastaken) — the original
 agentic coding agent whose repository history and early codebase this project
 builds on. This repository carries the upstream project's git history; the
