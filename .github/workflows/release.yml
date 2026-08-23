@@ -20,10 +20,10 @@ env:
 jobs:
   # ── Step 1: compute version, bump sources, push commit ───────────────
   prepare:
-    # Skip if this push is the version-bump commit from a previous release run
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     name: Prepare release
+    # Skip if this push is the version-bump commit from a previous release run
+    if: "github.actor != 'github-actions[bot]'"
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
