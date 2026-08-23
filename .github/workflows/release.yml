@@ -258,10 +258,10 @@ jobs:
           [[ -f install.sh ]] && cp install.sh dist/
           [[ -f install.ps1 ]] && cp install.ps1 dist/
 
-          # SHA256 checksums
-          (cd dist && sha256sum * > .SHA256SUMS.tmp && mv .SHA256SUMS.tmp SHA256SUMS)
+          # SHA256 checksums (exclude the artifacts staging dir and .stage-* dirs)
+          (cd dist && find . -maxdepth 1 -type f ! -name 'RELEASE_NOTES.md' ! -name '.SHA256SUMS*' | sort | xargs sha256sum > .SHA256SUMS.tmp && mv .SHA256SUMS.tmp SHA256SUMS)
 
-          echo "::notice::Packaged $(ls dist/*.tar.gz dist/*.zip 2>/dev/null | wc -l) archives"
+          echo "::notice::Packaged $(find dist -maxdepth 1 -name '*.tar.gz' -o -name '*.zip' | wc -l) archives"
 
       - name: Generate release notes
         env:
