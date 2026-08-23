@@ -1,7 +1,7 @@
 <div align="center">
 
 <h1>CLAWDE</h1>
-<h2><em>Agentic Coding for Builders who Ship</em></h2>
+<h2><em>Your home for cat-related puns</em></h2>
 <img src="public/Ship.png" alt="Rustail on the ship" width="350" />
 
 <p>
@@ -12,7 +12,7 @@
 
 <br />
 
-<img src="public/screenshot.png" alt="CLAWDE in action" width="1080" />
+<img src="public/Clawde_Screenshot.jpeg" alt="Clawde in action" width="648" />
 </div>
 
 ---

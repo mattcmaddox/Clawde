@@ -2150,6 +2150,13 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
     }
+    left_lines.push(Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled(
+            "All borders Are porous to cats",
+            Style::default().fg(accent),
+        ),
+    ]));
     // No wrapping needed: all mascot rows (29 wide + 1 pad) fit within
     // left_w (=29-32), and the welcome message is shorter still. Using plain
     // Paragraph (no Wrap) avoids any potential WordWrapper quirks with
