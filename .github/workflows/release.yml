@@ -23,8 +23,10 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     name: Prepare release
-    # Skip if this push is the version-bump commit from a previous release run
-    if: "github.actor != 'github-actions[bot]'"
+    # Skip if this push is the version-bump commit from a previous release run.
+    # The bot-authored commit has committer 'github-actions[bot]'; human pushes
+    # have the human's email.
+    if: "github.event.head_commit.committer.email != 'github-actions[bot]@users.noreply.github.com'"
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -339,8 +341,10 @@ jobs:
             fs.writeFileSync('npm/package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
-      - name: Publish to npm (OIDC provenance)
+      - name: Publish to npm
         working-directory: npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+        run: |
+          set -euo pipefail
+          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
+          npm publish --access public
+          rm -f ~/.npmrc
