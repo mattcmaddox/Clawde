@@ -1665,6 +1665,13 @@ pub struct App {
     /// `(upstream_id, upstream_title, effective_model_id)` for a configured
     /// upstream in the free-mode fallback chain.
     pub free_model_defaults: Vec<(String, String, String)>,
+    /// Discovered FULL free model lists per configured upstream, refreshed on
+    /// startup and after any key / routing mutation. Each entry is
+    /// `(upstream_id, upstream_title, model_ids)` with the ids in
+    /// default-pick-first order — the model-first source for the Alt+J/K
+    /// popup (every currently-free model per provider, not just the chain's
+    /// effective pick).
+    pub free_model_lists: Vec<(String, String, Vec<String>)>,
     /// Ollama connectivity mode — Auto (participates in free-model
     /// fallback) or Isolated (manual selection only).
     pub ollama_mode: clawde_core::OllamaMode,
@@ -2241,6 +2248,7 @@ impl App {
             status_line_override: None,
             key_ring_data_fn: None,
             free_model_defaults: Vec::new(),
+            free_model_lists: Vec::new(),
             ollama_mode: clawde_core::OllamaMode::default(),
             ollama_loaded_models: Vec::new(),
             last_health_sweep: None,
@@ -2604,11 +2612,9 @@ impl App {
                     );
                 }
                 Ok(None) => {
-                    self.push_notification(
-                        NotificationKind::Info,
-                        "No image in clipboard. Copy a screenshot first (Win+Shift+S).".to_string(),
-                        Some(4),
-                    );
+                    // Quiet status message instead of an intrusive notification
+                    // toast with a countdown timer.
+                    self.status_message = Some("No image in clipboard.".to_string());
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -2733,6 +2739,7 @@ impl App {
             registry.rebuild_free(&config);
         }
         self.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
+        self.free_model_lists = clawde_api::providers::free::take_free_model_lists();
     }
 
     /// Whether a provider id can affect the free-mode fallback chain — i.e.
@@ -2936,11 +2943,156 @@ impl App {
     }
 
     /// Open the free-model dropdown (Alt+J/K). Model-first: lists "auto" plus
-    /// one entry per **model family** that has at least one configured free
-    /// upstream. Each family entry routes via `free/family/<slug>`, which
-    /// round-robins across every configured provider hosting that family — so
-    /// the user picks a model, not a provider. Enter pins it via `set_model`.
+    /// every currently-free model from the discovered per-provider lists
+    /// (grouped by model family sections), so the user picks a model, not a
+    /// provider. Enter pins it via `set_model`.
+    ///
+    /// When discovery lists are unavailable (no keys / fetch failure), falls
+    /// back to one entry per **model family** with a configured upstream.
     fn open_free_model_popup(&mut self) {
+        if self.free_model_lists.is_empty() {
+            self.open_free_model_popup_families();
+            return;
+        }
+        self.open_free_model_popup_full();
+    }
+
+    /// Full-list popup: one selectable row per distinct discovered model
+    /// (deduped by slug across hosting providers), grouped under family
+    /// section headers. A model hosted by several providers whose slug is a
+    /// catalog family routes via `free/family/<slug>` (round-robin across
+    /// hosts); everything else pins `free/<provider>/<model>` (tried first,
+    /// then the rest of the chain falls back).
+    fn open_free_model_popup_full(&mut self) {
+        use crate::free_model_popup::FreeModelItem;
+
+        let mut items = Vec::new();
+        items.push(FreeModelItem {
+            id: "free/auto".to_string(),
+            title: "Auto".to_string(),
+            subtitle: "stacks every configured free key".to_string(),
+            header: false,
+        });
+
+        // Distinct model slugs with their hosting upstream ids, in catalog
+        // order of first appearance. `(slug, example_wire_id, host ids)`.
+        let mut by_slug: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut slug_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for upstream in clawde_api::FREE_CATALOG {
+            let Some((_, _, models)) = self
+                .free_model_lists
+                .iter()
+                .find(|(id, _, _)| id == upstream.id)
+            else {
+                continue;
+            };
+            for model in models {
+                let slug = model.rsplit('/').next().unwrap_or(model).to_string();
+                if let Some(&idx) = slug_index.get(&slug) {
+                    let hosts = &mut by_slug[idx].2;
+                    if !hosts.iter().any(|h| h == upstream.id) {
+                        hosts.push(upstream.id.to_string());
+                    }
+                } else {
+                    slug_index.insert(slug.clone(), by_slug.len());
+                    by_slug.push((slug, model.clone(), vec![upstream.id.to_string()]));
+                }
+            }
+        }
+
+        // Section grouping: catalog families (catalog order) first, then the
+        // unmatched models under one "Other free models" header. A slug
+        // belongs to the first catalog family it matches (exact slug or
+        // `family-*` prefix).
+        let mut families: Vec<(&'static str, Vec<usize>)> = Vec::new();
+        let mut other: Vec<usize> = Vec::new();
+        for (i, (slug, _, _)) in by_slug.iter().enumerate() {
+            let matched = clawde_api::FREE_CATALOG
+                .iter()
+                .find(|u| {
+                    *slug == u.model_family || slug.starts_with(&format!("{}-", u.model_family))
+                })
+                .map(|u| u.model_family);
+            match matched {
+                Some(family) => {
+                    if let Some(entry) = families.iter_mut().find(|(f, _)| *f == family) {
+                        entry.1.push(i);
+                    } else {
+                        families.push((family, vec![i]));
+                    }
+                }
+                None => other.push(i),
+            }
+        }
+
+        for (family, indices) in families {
+            items.push(FreeModelItem {
+                id: String::new(),
+                title: family.to_string(),
+                subtitle: String::new(),
+                header: true,
+            });
+            for &i in &indices {
+                items.push(self.free_model_popup_row(&by_slug[i]));
+            }
+        }
+        if !other.is_empty() {
+            items.push(FreeModelItem {
+                id: String::new(),
+                title: "Other free models".to_string(),
+                subtitle: String::new(),
+                header: true,
+            });
+            for &i in &other {
+                items.push(self.free_model_popup_row(&by_slug[i]));
+            }
+        }
+
+        let current = self.free_family_for_current_model();
+        self.free_model_popup.open(items, &current);
+    }
+
+    /// Build one selectable popup row for a distinct model slug.
+    fn free_model_popup_row(
+        &self,
+        entry: &(String, String, Vec<String>),
+    ) -> crate::free_model_popup::FreeModelItem {
+        use crate::free_model_popup::FreeModelItem;
+        let (slug, model, hosts) = entry;
+        let host_titles: Vec<&str> = hosts
+            .iter()
+            .map(|id| {
+                self.free_model_lists
+                    .iter()
+                    .find(|(hid, _, _)| hid == id)
+                    .map(|(_, title, _)| title.as_str())
+                    .unwrap_or(id)
+            })
+            .collect();
+        // Multi-host rows whose slug is a catalog family keep the
+        // round-robin `free/family/<slug>` route; everything else pins the
+        // first configured host's exact wire id.
+        let is_family_flagship = hosts.len() > 1
+            && clawde_api::FREE_CATALOG
+                .iter()
+                .any(|u| u.model_family == slug.as_str());
+        let id = if is_family_flagship {
+            format!("free/family/{}", slug)
+        } else {
+            format!("free/{}/{}", hosts[0], model)
+        };
+        FreeModelItem {
+            id,
+            title: slug.clone(),
+            subtitle: host_titles.join(", "),
+            header: false,
+        }
+    }
+
+    /// Fallback popup (no discovered lists): one entry per model family with
+    /// a configured upstream, exactly as before.
+    fn open_free_model_popup_families(&mut self) {
         use crate::free_model_popup::FreeModelItem;
         // Upstream ids that actually have keys (from the live free chain).
         let configured: std::collections::HashSet<&str> = self
@@ -2954,6 +3106,7 @@ impl App {
             id: "free/auto".to_string(),
             title: "Auto".to_string(),
             subtitle: "stacks every configured free key".to_string(),
+            header: false,
         });
 
         // Model-first section: one entry per model family, in catalog order,
@@ -2975,6 +3128,7 @@ impl App {
                 id: format!("free/family/{}", upstream.model_family),
                 title: upstream.model_family.to_string(),
                 subtitle: format!("{} · {}", upstream.specialty, hosts.join(", ")),
+                header: false,
             });
         }
 
@@ -2984,9 +3138,10 @@ impl App {
         self.free_model_popup.open(items, &current);
     }
 
-    /// Map the current model name to a `free/family/<slug>` id for popup
-    /// preselection. Returns `free/auto` when the model is not a family id or
-    /// a pinned upstream model.
+    /// Map the current model name to a popup item id for preselection:
+    /// `free/family/<slug>` for family ids, the id itself for pins on a
+    /// catalog upstream (`free/<provider>/<model>` or bare
+    /// `<provider>/<model>`), otherwise `free/auto`.
     fn free_family_for_current_model(&self) -> String {
         let name = self.model_name.as_str();
         if let Some(rest) = name
@@ -2995,9 +3150,19 @@ impl App {
         {
             return format!("free/family/{}", rest);
         }
-        if let Some((provider, _)) = name.split_once('/') {
-            if let Some(upstream) = clawde_api::FREE_CATALOG.iter().find(|u| u.id == provider) {
-                return format!("free/family/{}", upstream.model_family);
+        // A pinned `free/<provider>/<model>` (Alt+J/K single-host row) or a
+        // bare `<provider>/<model>` on a catalog upstream is its own row id.
+        let is_catalog_pin = |s: &str| {
+            s.split_once('/').is_some_and(|(provider, _)| {
+                clawde_api::FREE_CATALOG.iter().any(|u| u.id == provider)
+            })
+        };
+        if is_catalog_pin(name) {
+            return name.to_string();
+        }
+        if let Some(rest) = name.strip_prefix("free/") {
+            if is_catalog_pin(rest) {
+                return name.to_string();
             }
         }
         "free/auto".to_string()
@@ -3142,13 +3307,8 @@ impl App {
         // Sync plan_mode flag for legacy code paths.
         self.plan_mode = next == "plan";
 
-        let label = match next {
-            "build" => "Build",
-            "plan" => "Plan",
-            "image" => "Image",
-            other => other,
-        };
-        self.status_message = Some(format!("Switched to {} mode.", label));
+        // No status message needed — the color-coded mode badge already
+        // tells the user which mode is active.
     }
 
     /// Update the context window size from the model registry for the current model.
@@ -12651,6 +12811,107 @@ mod tests {
                 "free/family/llama-3.3-70b",
                 "free/family/gpt-oss-120b",
             ]
+        );
+    }
+
+    #[test]
+    fn test_full_list_popup_is_model_first_with_family_sections() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Full discovered lists: nvidia hosts gpt-oss-120b + gpt-oss-20b,
+        // groq hosts gpt-oss-120b + llama-3.3-70b-versatile.
+        app.free_model_lists = vec![
+            (
+                "nvidia".to_string(),
+                "NVIDIA NIM".to_string(),
+                vec![
+                    "openai/gpt-oss-120b".to_string(),
+                    "openai/gpt-oss-20b".to_string(),
+                ],
+            ),
+            (
+                "groq".to_string(),
+                "Groq".to_string(),
+                vec![
+                    "gpt-oss-120b".to_string(),
+                    "llama-3.3-70b-versatile".to_string(),
+                ],
+            ),
+        ];
+        app.handle_keybinding_action("openFreeModelPopup");
+        assert!(app.free_model_popup.visible);
+        let rows: Vec<(&str, &str, bool)> = app
+            .free_model_popup
+            .items
+            .iter()
+            .map(|i| (i.id.as_str(), i.title.as_str(), i.header))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                // auto first, then family sections in catalog order, then Other.
+                ("free/auto", "Auto", false),
+                ("", "gpt-oss-120b", true),
+                // gpt-oss-120b is hosted by nvidia + groq and matches the
+                // catalog family exactly → round-robin family route.
+                ("free/family/gpt-oss-120b", "gpt-oss-120b", false),
+                ("", "llama-3.3-70b", true),
+                // Single host → precise provider pin.
+                (
+                    "free/groq/llama-3.3-70b-versatile",
+                    "llama-3.3-70b-versatile",
+                    false
+                ),
+                ("", "Other free models", true),
+                // gpt-oss-20b matches no catalog family slug → Other, pinned.
+                ("free/nvidia/openai/gpt-oss-20b", "gpt-oss-20b", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_full_list_popup_enter_pins_single_host_model() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_lists = vec![(
+            "groq".to_string(),
+            "Groq".to_string(),
+            vec![
+                "gpt-oss-120b".to_string(),
+                "llama-3.3-70b-versatile".to_string(),
+            ],
+        )];
+        app.handle_keybinding_action("openFreeModelPopup");
+        // Rows: auto, gpt-oss-120b (single host → pin), llama-3.3-70b-versatile.
+        app.free_model_popup.select_next();
+        app.free_model_popup.select_next();
+        assert_eq!(
+            app.free_model_popup.selected().map(|i| i.id.as_str()),
+            Some("free/groq/llama-3.3-70b-versatile")
+        );
+        app.confirm_free_model_popup();
+        assert!(!app.free_model_popup.visible);
+        assert_eq!(app.model_name, "free/groq/llama-3.3-70b-versatile");
+    }
+
+    #[test]
+    fn test_full_list_popup_preselects_current_pin() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_lists = vec![(
+            "nvidia".to_string(),
+            "NVIDIA NIM".to_string(),
+            vec![
+                "openai/gpt-oss-120b".to_string(),
+                "openai/gpt-oss-20b".to_string(),
+            ],
+        )];
+        app.model_name = "free/nvidia/openai/gpt-oss-20b".to_string();
+        app.handle_keybinding_action("openFreeModelPopup");
+        // Current pin is preselected (its row id matches exactly).
+        assert_eq!(
+            app.free_model_popup.selected().map(|i| i.id.as_str()),
+            Some("free/nvidia/openai/gpt-oss-20b")
         );
     }
 
