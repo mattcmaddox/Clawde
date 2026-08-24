@@ -163,20 +163,23 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "nvidia",
         title: "NVIDIA NIM",
         key_url: "build.nvidia.com",
-        default_model: "meta/llama-3.3-70b-instruct",
-        model_family: "llama-3.3-70b",
-        note: "Llama 3.3 70B — 2 keys",
+        // NVIDIA retired the llama-3.3-70b family (DEPRECATION 08/25/2026 per
+        // its own catalog API); gpt-oss-120b is the current free flagship and
+        // the discovery default pick (NVIDIA_PREFERRED_FREE).
+        default_model: "openai/gpt-oss-120b",
+        model_family: "gpt-oss-120b",
+        note: "GPT-OSS 120B — 2 keys",
         tool_calling: true,
         vision: false,
         max_tokens_cap: Some(8_192),
         context_window: 128_000,
         specialty: "strong generalist",
         usage: "2 keys · 8K",
-        // The free tier's 70B worker is routinely capacity-starved (503
+        // The free tier's 120B worker is routinely capacity-starved (503
         // "ResourceExhausted" or 25-75s responses vs the 30s upstream
-        // timeout). Fall back to the always-warm 8B on the same key before
-        // giving up on NVIDIA entirely.
-        fallback_models: &["meta/llama-3.1-8b-instruct"],
+        // timeout). Fall back to the always-warm 20B sibling on the same key
+        // before giving up on NVIDIA entirely.
+        fallback_models: &["openai/gpt-oss-20b"],
     },
     FreeUpstream {
         id: "cerebras",
@@ -277,9 +280,12 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "mistral",
         title: "Mistral",
         key_url: "console.mistral.ai/api-keys",
-        default_model: "labs-devstral-small-2512",
-        model_family: "devstral-small",
-        note: "Devstral Small (free) · Large · Codestral",
+        // The free "Experiment" tier rate-limits ALL API models at $0; the
+        // old Devstral Small default was retired 2026-03-31. Mistral Large 3
+        // (25.12) is the current flagship and is free on that tier.
+        default_model: "mistral-large-2512",
+        model_family: "mistral-large",
+        note: "Mistral Large 3 (free Experiment tier) · Codestral",
         tool_calling: true,
         vision: false,
         max_tokens_cap: None,
@@ -324,9 +330,11 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         id: "zai",
         title: "Z.AI",
         key_url: "z.ai/manage-apikey/apikey-list",
-        default_model: "glm-4.7",
-        model_family: "glm-4.7",
-        note: "GLM-4.7 · GLM-5 · GLM-5.1 — Zhipu AI international",
+        // GLM-4.7 is paid ($0.60/$2.20 per 1M); the actually-free models are
+        // GLM-4.7-Flash / GLM-4.5-Flash / GLM-4.6V-Flash (docs.z.ai pricing).
+        default_model: "glm-4.7-flash",
+        model_family: "glm-4.7-flash",
+        note: "GLM-4.7-Flash (free) · GLM-4.5-Flash · GLM-5 — Zhipu AI international",
         tool_calling: true,
         vision: false,
         max_tokens_cap: Some(8_192),
@@ -385,6 +393,40 @@ pub fn store_free_model_defaults(defaults: Vec<(String, String, String)>) {
 /// been stored yet.
 pub fn take_free_model_defaults() -> Vec<(String, String, String)> {
     RECENT_FREE_MODEL_DEFAULTS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// One configured upstream's discovered free model list:
+/// `(upstream_id, upstream_title, model_ids)` with the ids as callable wire
+/// IDs in default-pick-first order.
+pub type FreeModelListEntry = (String, String, Vec<String>);
+
+/// Static storage for the most recently discovered FULL free model lists per
+/// configured upstream. Populated by `build_free_provider` in registry.rs;
+/// read by the TUI's Alt+J/K popup to list every currently-free model per
+/// provider (model-first). Thread-safe via OnceLock.
+static RECENT_FREE_MODEL_LISTS: OnceLock<Mutex<Vec<FreeModelListEntry>>> = OnceLock::new();
+fn recent_free_model_lists() -> &'static Mutex<Vec<FreeModelListEntry>> {
+    RECENT_FREE_MODEL_LISTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set the discovered free model lists from a newly-built FreeProvider's
+/// chain. Called by `build_free_provider` in registry.rs after constructing
+/// the chain. The TUI reads these via [`take_free_model_lists`].
+pub fn store_free_model_lists(lists: Vec<FreeModelListEntry>) {
+    if let Ok(mut guard) = recent_free_model_lists().lock() {
+        *guard = lists;
+    }
+}
+
+/// Retrieve the stored free model lists as `(upstream_id, title, models)`
+/// tuples (default pick first per upstream). Returns an empty vec if none
+/// have been stored yet.
+pub fn take_free_model_lists() -> Vec<FreeModelListEntry> {
+    RECENT_FREE_MODEL_LISTS
         .get()
         .and_then(|m| m.lock().ok())
         .map(|guard| guard.clone())

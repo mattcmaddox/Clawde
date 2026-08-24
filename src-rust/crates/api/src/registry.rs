@@ -256,6 +256,33 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         }
     }
 
+    // Collect the FULL discovered free-model lists for the Alt+J/K popup
+    // (model-first: every currently-free model per configured upstream, not
+    // just the chain's effective pick). Reads the same per-upstream
+    // live-discovery cache populated above, so configured upstreams with a
+    // successful single probe don't re-fetch; upstreams without a discovery
+    // source fall back to their effective model so the popup still lists
+    // them. Ollama (a local chain tail, not a FREE_CATALOG member) is
+    // excluded — the popup is free-providers only.
+    let model_lists: Vec<crate::providers::free::FreeModelListEntry> = chain
+        .iter()
+        .filter(|entry| crate::providers::free::catalog_entry(entry.upstream.id).is_some())
+        .filter_map(|entry| {
+            let upstream_id = entry.upstream.id;
+            let list = crate::providers::free::run_live_discovery_models(upstream_id, &auth_store)
+                .or_else(|| entry.effective_model.clone().map(|m| vec![m]))?;
+            if list.is_empty() {
+                return None;
+            }
+            Some((
+                upstream_id.to_string(),
+                entry.upstream.title.to_string(),
+                list,
+            ))
+        })
+        .collect();
+    crate::providers::free::store_free_model_lists(model_lists);
+
     // When Ollama is in Auto mode, append it to the free-model fallback
     // chain as a local last-resort provider. No API key needed — it uses
     // the already-built Ollama provider from the registry. In Isolated

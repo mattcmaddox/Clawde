@@ -271,6 +271,17 @@ impl FreeProvider {
             return Route::Auto;
         }
 
+        // Explicit provider pin: `free/<provider>/<model>` (produced by the
+        // Alt+J/K popup for a model hosted by exactly one upstream) routes
+        // like a bare `<provider>/<model>` pin — try that upstream first,
+        // then fall through the rest of the chain. `free/auto` and
+        // `free/family/...` were handled above.
+        let normalized: String = if let Some(rest) = normalized.strip_prefix("free/") {
+            rest.to_string()
+        } else {
+            normalized
+        };
+
         // Find a chain entry whose id is a prefix.
         for (idx, entry) in self.chain.iter().enumerate() {
             let prefix = format!("{}/", entry.upstream.id);
@@ -2963,11 +2974,11 @@ mod tests {
 
     #[test]
     fn chat_probe_prefers_fallback_model_for_capacity_starved_upstreams() {
-        // nvidia has a catalog fallback (8B) — the probe must use it instead
-        // of the capacity-starved 70B default, so valid keys aren't marked
+        // nvidia has a catalog fallback (20B) — the probe must use it instead
+        // of the capacity-starved 120B default, so valid keys aren't marked
         // unhealthy by a 30s+ 503.
         let (base, model) = chat_probe_for("nvidia").expect("nvidia probe");
-        assert_eq!(model, "meta/llama-3.1-8b-instruct");
+        assert_eq!(model, "openai/gpt-oss-20b");
         assert!(base.contains("nvidia.com"));
         // Upstreams without fallbacks probe their default model.
         let (_, hf_model) = chat_probe_for("huggingface").expect("hf probe");
@@ -3965,7 +3976,7 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_plan_includes_8b_fallback_after_70b() {
+    fn nvidia_plan_includes_20b_fallback_after_120b() {
         // Sequential explicitly — this test is about fallback-row adjacency
         // (primary then per-upstream fallbacks), not the task-based default
         // plan ordering.
@@ -3981,11 +3992,11 @@ mod tests {
             },
             false,
         );
-        // Sequential Auto plan: nvidia's 70B primary, then its 8B fallback on
-        // the SAME index, then the other upstreams.
+        // Sequential Auto plan: nvidia's 120B primary, then its 20B fallback
+        // on the SAME index, then the other upstreams.
         let plan = provider.attempt_plan(&Route::Auto, None);
-        assert_eq!(plan[0], (0, "meta/llama-3.3-70b-instruct".to_string()));
-        assert_eq!(plan[1], (0, "meta/llama-3.1-8b-instruct".to_string()));
+        assert_eq!(plan[0], (0, "openai/gpt-oss-120b".to_string()));
+        assert_eq!(plan[1], (0, "openai/gpt-oss-20b".to_string()));
         assert_eq!(plan[2], (1, "gpt-oss-120b".to_string()));
         assert_eq!(plan[3], (2, "openai/gpt-oss-120b".to_string()));
         // Upstreams without fallbacks still contribute exactly one row.
@@ -4008,17 +4019,17 @@ mod tests {
             },
             false,
         );
-        // Pinning nvidia: the pinned model, then nvidia's 8B fallback, then
+        // Pinning nvidia: the pinned model, then nvidia's 20B fallback, then
         // the rest of the chain in catalog order.
         let plan = provider.attempt_plan(
             &Route::Pinned {
                 start_idx: 1,
-                pinned_model: "meta/llama-3.3-70b-instruct".to_string(),
+                pinned_model: "openai/gpt-oss-120b".to_string(),
             },
             None,
         );
-        assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
-        assert_eq!(plan[1], (1, "meta/llama-3.1-8b-instruct".to_string()));
+        assert_eq!(plan[0], (1, "openai/gpt-oss-120b".to_string()));
+        assert_eq!(plan[1], (1, "openai/gpt-oss-20b".to_string()));
         assert_eq!(
             plan[2],
             (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
@@ -4053,6 +4064,35 @@ mod tests {
             }
             other => panic!("expected pinned, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn free_provider_prefix_pins_specific_upstream() {
+        // The Alt+J/K popup pins a model hosted by exactly one upstream as
+        // `free/<provider>/<model>`; it must resolve to that exact upstream +
+        // wire id (tried first, then the rest of the chain falls back).
+        let provider = FreeProvider::new(vec![entry("nvidia", true), entry("groq", true)]);
+        match provider.resolve_route("free/nvidia/openai/gpt-oss-120b") {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
+                assert_eq!(start_idx, 0);
+                assert_eq!(pinned_model, "openai/gpt-oss-120b");
+            }
+            other => panic!("expected pinned, got {:?}", other),
+        }
+        // A bare `<provider>/<model>` pin still routes the same way.
+        assert!(matches!(
+            provider.resolve_route("groq/gpt-oss-120b"),
+            Route::Pinned { .. }
+        ));
+        // `free/auto` / `free/family/...` are untouched by the strip.
+        assert!(matches!(provider.resolve_route("free/auto"), Route::Auto));
+        assert!(matches!(
+            provider.resolve_route("free/family/gpt-oss-120b"),
+            Route::Family { .. }
+        ));
     }
 
     #[test]
@@ -4092,21 +4132,21 @@ mod tests {
         ]);
         let plan = provider.attempt_plan(
             &Route::Family {
-                model_family: "llama-3.3-70b",
+                model_family: "gpt-oss-120b",
             },
             None,
         );
-        // Family hosts first in catalog order — huggingface (idx 0), then
-        // nvidia (idx 2) with its 8B fallback on the same index.
+        // Family hosts first in catalog order — cerebras (idx 1), nvidia
+        // (idx 2) with its 20B fallback on the same index, then groq (idx 3).
+        assert_eq!(plan[0], (1, "gpt-oss-120b".to_string()));
+        assert_eq!(plan[1], (2, "openai/gpt-oss-120b".to_string()));
+        assert_eq!(plan[2], (2, "openai/gpt-oss-20b".to_string()));
+        assert_eq!(plan[3], (3, "openai/gpt-oss-120b".to_string()));
+        // Non-family upstreams follow in catalog order.
         assert_eq!(
-            plan[0],
+            plan[4],
             (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
         );
-        assert_eq!(plan[1], (2, "meta/llama-3.3-70b-instruct".to_string()));
-        assert_eq!(plan[2], (2, "meta/llama-3.1-8b-instruct".to_string()));
-        // Non-family upstreams follow in catalog order.
-        assert_eq!(plan[3], (1, "gpt-oss-120b".to_string()));
-        assert_eq!(plan[4], (3, "openai/gpt-oss-120b".to_string()));
     }
 
     #[test]
@@ -5247,7 +5287,7 @@ mod tests {
         // not leak into a later route attempt.
         assert!(!family_plan
             .iter()
-            .any(|(_, model)| model == "meta/llama-3.1-8b-instruct"));
+            .any(|(_, model)| model == "openai/gpt-oss-20b"));
     }
 
     #[tokio::test]
@@ -5893,8 +5933,8 @@ mod tests {
 
         // Record distinct latencies: nvidia fastest (100ms), google 300ms,
         // cerebras 500ms, huggingface 800ms. Even though the latency sort
-        // reorders upstreams, nvidia's 8B fallback row must stay adjacent
-        // AFTER its 70B primary (stable sort keeps same-idx rows together
+        // reorders upstreams, nvidia's 20B fallback row must stay adjacent
+        // AFTER its 120B primary (stable sort keeps same-idx rows together
         // in insertion order).
         provider.record_success(0, TaskType::CodeGeneration, Duration::from_millis(800));
         provider.record_success(1, TaskType::CodeGeneration, Duration::from_millis(100));
@@ -5903,9 +5943,9 @@ mod tests {
 
         let plan = provider.attempt_plan(&Route::Auto, None);
 
-        // nvidia (idx 1, fastest) first: 70B then its 8B fallback adjacent.
-        assert_eq!(plan[0], (1, "meta/llama-3.3-70b-instruct".to_string()));
-        assert_eq!(plan[1], (1, "meta/llama-3.1-8b-instruct".to_string()));
+        // nvidia (idx 1, fastest) first: 120B then its 20B fallback adjacent.
+        assert_eq!(plan[0], (1, "openai/gpt-oss-120b".to_string()));
+        assert_eq!(plan[1], (1, "openai/gpt-oss-20b".to_string()));
         // google (300ms), cerebras (500ms), huggingface (800ms).
         assert_eq!(plan[2], (3, "gemini-2.5-flash".to_string()));
         assert_eq!(plan[3], (2, "gpt-oss-120b".to_string()));
@@ -6340,7 +6380,7 @@ fn fetch_openai_compat_model_list_parses_openai_response() {
             "object": "list",
             "data": [
                 { "id": "llama-3.3-70b-versatile", "object": "model", "created": 1700000000, "owned_by": "groq" },
-                { "id": "mixtral-8x7b-32768",       "object": "model", "created": 1700000001, "owned_by": "groq" }
+                { "id": "openai/gpt-oss-120b",      "object": "model", "created": 1700000001, "owned_by": "groq" }
             ]
         }"#;
 
@@ -6351,13 +6391,15 @@ fn fetch_openai_compat_model_list_parses_openai_response() {
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("test-key", &base_url, "groq");
-    assert_eq!(result.as_deref(), Some("llama-3.3-70b-versatile"));
+    // The known-free catalog default wins over the first listed model.
+    assert_eq!(result.as_deref(), Some("openai/gpt-oss-120b"));
 }
 
 #[test]
-fn fetch_openai_compat_model_list_returns_first_on_no_autodetect() {
-    // When the auto-detected model ID is not available (or not yet populated),
-    // the function should return the first model from the endpoint.
+fn fetch_openai_compat_model_list_returns_none_on_no_safe_pick() {
+    // When neither the auto-detected free model nor a catalog default is on
+    // the live list, discovery must return None (chain keeps the catalog
+    // default) instead of an arbitrary, possibly paid, first model.
     let json = r#"{
             "data": [
                 { "id": "qwen-3-235b", "object": "model" }
@@ -6371,7 +6413,7 @@ fn fetch_openai_compat_model_list_returns_first_on_no_autodetect() {
 
     let base_url = format!("http://127.0.0.1:{}", port);
     let result = fetch_openai_compat_model_list("test-key", &base_url, "unknown-provider");
-    assert_eq!(result.as_deref(), Some("qwen-3-235b"));
+    assert!(result.is_none());
 }
 
 #[test]

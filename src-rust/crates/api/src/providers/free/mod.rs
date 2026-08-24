@@ -48,13 +48,17 @@ use catalog::local_quota_for;
 use catalog::CLOUDFLARE_PROBE_MODEL;
 
 pub use catalog::{
-    catalog_entry, store_free_model_defaults, take_free_model_defaults, FreeUpstream, LocalQuota,
-    LocalQuotaWindow, FREE_CATALOG,
+    catalog_entry, store_free_model_defaults, store_free_model_lists, take_free_model_defaults,
+    take_free_model_lists, FreeModelListEntry, FreeUpstream, LocalQuota, LocalQuotaWindow,
+    FREE_CATALOG,
 };
 pub use discovery::{
-    discovery_for, fetch_cline_free_model, fetch_cline_free_models, fetch_gemini_models,
-    fetch_openai_compat_model_list, fetch_opencode_zen_free_model, fetch_opencode_zen_free_models,
-    fetch_openrouter_free_model, run_live_discovery, FreeModelDiscovery,
+    discovery_for, fetch_cline_free_model, fetch_cline_free_models,
+    fetch_cloudflare_available_free_models, fetch_cohere_free_models, fetch_gemini_free_models,
+    fetch_gemini_models, fetch_openai_compat_free_models, fetch_openai_compat_model_list,
+    fetch_opencode_zen_free_model, fetch_opencode_zen_free_models, fetch_openrouter_free_model,
+    fetch_openrouter_free_models, run_live_discovery, run_live_discovery_models,
+    FreeModelDiscovery,
 };
 
 // Further sub-modules: inherent impl + streaming + trait impl (mutually
@@ -63,7 +67,7 @@ pub use discovery::{
 mod impls;
 mod modelsdev;
 mod task_classifier;
-pub use modelsdev::fetch_best_free_models_from_modelsdev;
+pub use modelsdev::{fetch_best_free_models_from_modelsdev, modelsdev_free_model_ids};
 pub use task_classifier::{classify_request, task_preference_ids, TaskType};
 
 /// Select the first configured vision-capable free upstream in catalog order.
@@ -784,13 +788,16 @@ fn save_modelsdev_defaults_cache(defaults: &HashMap<String, String>) {
 struct LiveDiscoveryCache {
     #[serde(default)]
     saved_at_unix: u64,
-    /// upstream id → discovered model id (successful discoveries only).
+    /// upstream id → discovered free model ids (successful discoveries only),
+    /// default pick first.
     #[serde(default)]
-    models: HashMap<String, String>,
+    models: HashMap<String, Vec<String>>,
 }
 
 /// Load a persisted live-discovery result for `upstream_id` when fresh.
-fn load_live_discovery_cache(upstream_id: &str) -> Option<String> {
+/// Returns the full discovered free list (default pick first), or `None`
+/// when no fresh entry exists.
+fn load_live_discovery_cache(upstream_id: &str) -> Option<Vec<String>> {
     let path = free_state_dir().join("live-discovery.json");
     let json = std::fs::read_to_string(path).ok()?;
     let cached: LiveDiscoveryCache = serde_json::from_str(&json).ok()?;
@@ -807,11 +814,12 @@ fn load_live_discovery_cache(upstream_id: &str) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
-/// Persist a live-discovery result. Only successful discoveries are written so
-/// a temporarily-down upstream is re-probed on the next process (recovery stays
-/// prompt). Merges with the on-disk map so concurrent processes each add their
-/// own upstreams without clobbering the others.
-fn save_live_discovery_cache(upstream_id: &str, model: Option<String>) {
+/// Persist a live-discovery result (full free list). Only successful
+/// discoveries are written so a temporarily-down upstream is re-probed on the
+/// next process (recovery stays prompt). Merges with the on-disk map so
+/// concurrent processes each add their own upstreams without clobbering the
+/// others.
+fn save_live_discovery_cache(upstream_id: &str, model: Option<Vec<String>>) {
     let Some(model) = model else { return };
     if model.is_empty() {
         return;
@@ -833,15 +841,22 @@ fn save_live_discovery_cache(upstream_id: &str, model: Option<String>) {
     write_private_json_locked(&path, Some(&json), false, false);
 }
 
-/// Snapshot of the persisted live-discovery cache: the per-upstream probe
-/// results last written (`upstream id → model id`) plus the `saved_at_unix`
-/// timestamp. `None` when no cache file exists yet. Exposed for
-/// `clawde models --verbose`.
+/// Snapshot of the persisted live-discovery cache: the per-upstream default
+/// picks last written (`upstream id → default model id`) plus the
+/// `saved_at_unix` timestamp. `None` when no cache file exists yet. Exposed
+/// for `clawde models --verbose` and the stats dialog.
 pub fn live_discovery_snapshot() -> Option<(std::collections::HashMap<String, String>, u64)> {
     let path = free_state_dir().join("live-discovery.json");
     let json = std::fs::read_to_string(path).ok()?;
     let cached: LiveDiscoveryCache = serde_json::from_str(&json).ok()?;
-    Some((cached.models, cached.saved_at_unix))
+    let picks: HashMap<String, String> = cached
+        .models
+        .into_iter()
+        .filter_map(|(upstream, mut models)| {
+            (!models.is_empty()).then(|| (upstream, models.remove(0)))
+        })
+        .collect();
+    Some((picks, cached.saved_at_unix))
 }
 
 /// Force the free chain's live discovery to re-probe on the next build.
@@ -2327,10 +2342,7 @@ pub fn free_upstream_base_url_override(upstream_id: &str) -> Option<String> {
 
 fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {
     let (base_url, default_model) = match upstream_id {
-        "nvidia" => (
-            "https://integrate.api.nvidia.com/v1",
-            "meta/llama-3.3-70b-instruct",
-        ),
+        "nvidia" => ("https://integrate.api.nvidia.com/v1", "openai/gpt-oss-120b"),
         "huggingface" => (
             "https://router.huggingface.co/v1",
             "meta-llama/Llama-3.3-70B-Instruct",
@@ -2664,7 +2676,7 @@ mod cache_tests {
         // Seed both cache files with future-fresh timestamps.
         std::fs::write(
             state_dir.join("live-discovery.json"),
-            r#"{"saved_at_unix": 9999999999, "models": {"cloudflare": "@cf/qwen/qwen3-30b-a3b-fp8"}}"#,
+            r#"{"saved_at_unix": 9999999999, "models": {"cloudflare": ["@cf/qwen/qwen3-30b-a3b-fp8"]}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -2750,10 +2762,19 @@ mod cache_tests {
             None,
             "failed discovery must not be persisted"
         );
-        save_live_discovery_cache("groq", Some("llama-3.3-70b-versatile".to_string()));
+        save_live_discovery_cache(
+            "groq",
+            Some(vec![
+                "llama-3.3-70b-versatile".to_string(),
+                "openai/gpt-oss-120b".to_string(),
+            ]),
+        );
         assert_eq!(
             load_live_discovery_cache("groq"),
-            Some("llama-3.3-70b-versatile".to_string())
+            Some(vec![
+                "llama-3.3-70b-versatile".to_string(),
+                "openai/gpt-oss-120b".to_string(),
+            ])
         );
     }
 }

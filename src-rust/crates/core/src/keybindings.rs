@@ -193,27 +193,26 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 /// - **Ctrl+K**: Open the command palette
 /// - **Ctrl+U**: Kill input from cursor to start of line (Emacs-style)
 /// - **Alt+←/Alt+→**: Navigate to previous/next message in transcript
-/// - **Ctrl+. (Ctrl+>)**: Jump to next error/issue in messages
-/// - **Ctrl+Shift+.**: Jump to previous error/issue
+/// - **Alt+.**: Jump to previous error/issue in messages
+/// - **Alt+N**: Jump to next error/issue in messages
 /// - **Shift+Tab**: Reverse indent/unindent in input (cycle permission mode)
 /// - **Ctrl+H**: Delete character before cursor (Chat context, Emacs-style)
-/// - **Alt+H**: Open help (alternative to F1)
-/// - **Ctrl+O**: Jump back in history (command history)
-/// - **Ctrl+I**: Jump forward in history
-/// - **Alt+D**: Delete word forward (already implemented)
-/// - **Ctrl+V**: Paste from clipboard (already implemented)
+/// - **Alt+/**: Open help (alternative to F1)
+/// - **Alt+R**: History search
+/// - **Alt+D**: Delete word forward
+/// - **Ctrl+V**: Paste from clipboard
 pub fn default_bindings() -> Vec<ParsedBinding> {
     let defaults: &[(&str, &str, KeyContext)] = &[
         // ========== GLOBAL CONTROL ==========
         // ("ctrl+c", "interrupt", KeyContext::Global), // Handled directly in handle_key_event for two-press confirmation
         // ("ctrl+d", "exit", KeyContext::Global), // Handled directly in handle_key_event for two-press confirmation
         ("ctrl+l", "redraw", KeyContext::Global),
-        ("ctrl+r", "historySearch", KeyContext::Global),
-        ("ctrl+b", "createBranch", KeyContext::Global),
-        ("alt+h", "openHelp", KeyContext::Global),
+        ("alt+r", "historySearch", KeyContext::Global),
+        ("alt+b", "createBranch", KeyContext::Global),
+        ("alt+/", "openHelp", KeyContext::Global),
         ("alt+c", "compact", KeyContext::Global),
         ("ctrl+/", "showKeybindings", KeyContext::Global),
-        ("ctrl+shift+s", "showSources", KeyContext::Global),
+        ("alt+s", "showSources", KeyContext::Global),
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
         ("enter", "submit", KeyContext::Chat),
@@ -243,6 +242,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Word navigation
         ("ctrl+left", "moveWordBackward", KeyContext::Chat),
         ("ctrl+right", "moveWordForward", KeyContext::Chat),
+        ("alt+b", "moveWordBackward", KeyContext::Chat),
+        ("alt+f", "moveWordForward", KeyContext::Chat),
         // Word deletion
         ("ctrl+w", "killWord", KeyContext::Chat),
         ("alt+backspace", "killWord", KeyContext::Chat),
@@ -267,8 +268,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+left", "previousMessage", KeyContext::Chat),
         ("alt+right", "nextMessage", KeyContext::Chat),
         // Error/issue navigation
-        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
-        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
+        ("alt+n", "jumpToNextError", KeyContext::Chat),
+        ("alt+.", "jumpToPreviousError", KeyContext::Chat),
         // None of the aspirational search/navigation bindings for which
         // no handler arms exist are kept in the default table — a binding
         // with no backend silently swallows the key, which is worse than
@@ -281,7 +282,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("shift+tab", "reverseIndent", KeyContext::Chat),
         // Paste placeholders — expand `[Pasted text #N ...]` back into the
         // full pasted body (clicking the placeholder does the same).
-        ("alt+e", "expandPaste", KeyContext::Chat),
+        ("alt+p", "expandPaste", KeyContext::Chat),
         // Standalone clipboard image paste — reads the system clipboard
         // and attaches any image found, without requiring Ctrl+V (which
         // Windows Terminal via SSH intercepts).
@@ -290,16 +291,25 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
         // App shortcuts
-        ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
+        ("alt+m", "openModelPicker", KeyContext::Chat),
         ("ctrl+,", "openSettings", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
         // ========== FREE MODE UPSTREAM CYCLE ==========
+        // Alt+J/K open the free-model dropdown (auto + every configured free
+        // upstream); Enter pins the selection. Alt+U kept as a forward-cycle
+        // alias for muscle memory.
+        ("alt+j", "openFreeModelPopup", KeyContext::Chat),
+        ("alt+k", "openFreeModelPopup", KeyContext::Chat),
         ("alt+u", "cycleFreeUpstream", KeyContext::Chat),
         ("alt+t", "cycleFreeTask", KeyContext::Chat),
         // ========== OLLAMA MODE TOGGLE ==========
         ("alt+o", "toggleOllama", KeyContext::Chat),
         // ========== EFFORT ==========
-        ("alt+shift+e", "openEffort", KeyContext::Chat),
+        // Alt+H/L step reasoning up/down along the model's supported ladder
+        // (clamped — never wraps). Alt+E opens the visual effort picker.
+        ("alt+h", "effortDecrease", KeyContext::Chat),
+        ("alt+l", "effortIncrease", KeyContext::Chat),
+        ("alt+e", "openEffort", KeyContext::Chat),
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
         ("enter", "yes", KeyContext::Confirmation),
@@ -915,14 +925,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings_map_ctrl_shift_a_and_ctrl_k_to_app_shortcuts() {
+    fn test_default_bindings_map_alt_m_and_alt_k_to_app_shortcuts() {
         let bindings = default_bindings();
 
-        let ctrl_shift_a = bindings.iter().find(|b| {
+        let alt_m = bindings.iter().find(|b| {
             b.chord.len() == 1
-                && b.chord[0].ctrl
-                && b.chord[0].shift
-                && b.chord[0].key == "a"
+                && b.chord[0].alt
+                && b.chord[0].key == "m"
                 && b.context == KeyContext::Chat
         });
         let ctrl_k = bindings.iter().find(|b| {
@@ -933,12 +942,61 @@ mod tests {
         });
 
         assert_eq!(
-            ctrl_shift_a.and_then(|b| b.action.as_deref()),
+            alt_m.and_then(|b| b.action.as_deref()),
             Some("openModelPicker")
         );
         assert_eq!(
             ctrl_k.and_then(|b| b.action.as_deref()),
             Some("openCommandPalette")
+        );
+    }
+
+    #[test]
+    fn test_free_upstream_bindings_on_alt_j_k_and_u() {
+        let bindings = default_bindings();
+        let find = |key: &str| {
+            bindings.iter().find(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].alt
+                    && b.chord[0].key == key
+                    && b.context == KeyContext::Chat
+            })
+        };
+        // Alt+J/K open the free-model dropdown; Alt+U kept as forward-cycle
+        // alias.
+        assert_eq!(
+            find("j").and_then(|b| b.action.as_deref()),
+            Some("openFreeModelPopup")
+        );
+        assert_eq!(
+            find("k").and_then(|b| b.action.as_deref()),
+            Some("openFreeModelPopup")
+        );
+        assert_eq!(
+            find("u").and_then(|b| b.action.as_deref()),
+            Some("cycleFreeUpstream")
+        );
+    }
+
+    #[test]
+    fn test_effort_step_bindings_on_alt_h_and_alt_l() {
+        let bindings = default_bindings();
+        let find = |key: &str| {
+            bindings.iter().find(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].alt
+                    && b.chord[0].key == key
+                    && b.context == KeyContext::Chat
+            })
+        };
+        // Alt+H steps reasoning down, Alt+L steps it up (clamped, never wraps).
+        assert_eq!(
+            find("h").and_then(|b| b.action.as_deref()),
+            Some("effortDecrease")
+        );
+        assert_eq!(
+            find("l").and_then(|b| b.action.as_deref()),
+            Some("effortIncrease")
         );
     }
 
@@ -1322,12 +1380,13 @@ mod tests {
         let result = resolver.process(ks.clone(), &KeyContext::Chat);
         assert!(matches!(result, KeybindingResult::Action(ref a) if a == "moveCharBackward"));
 
-        // And with the Default preset the same chord resolves to the stock
-        // Global binding (ctrl+b → createBranch), NOT the emacs one.
+        // With the Default preset, Alt+B resolves to the Chat-context
+        // binding (moveWordBackward), not the Global one (createBranch).
         let default_user = UserKeybindings::default();
         let mut default_resolver = KeybindingResolver::new(&default_user);
-        let result = default_resolver.process(ks, &KeyContext::Chat);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "createBranch"));
+        let alt_b_ks = parse_keystroke("alt+b").unwrap();
+        let result = default_resolver.process(alt_b_ks, &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "moveWordBackward"));
     }
 
     #[test]

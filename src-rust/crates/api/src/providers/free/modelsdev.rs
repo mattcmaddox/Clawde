@@ -16,6 +16,112 @@ use super::FREE_CATALOG;
 /// Cache for the best free model per upstream, populated once at first use.
 static AUTO_DETECTED_DEFAULTS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
+/// Cache for the FULL free model set per upstream, populated once at first
+/// use. Backs the Alt+J/K popup's model-first list for OpenAI-compatible
+/// upstreams (models.dev's per-provider free set is the authoritative
+/// "everything free on this provider" signal; the live `/v1/models` list is
+/// intersected against it at discovery time).
+static MODELSDEV_FREE_IDS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+
+/// Return every models.dev-listed free (cost=0), tool-calling, non-deprecated
+/// model id for `upstream_id`, ordered by context window descending (the
+/// largest/fastest candidate first, matching the best-pick ranking). Empty
+/// when models.dev has no entry for the upstream or the fetch failed.
+///
+/// Fetched at most once per process; the network call runs on a plain OS
+/// thread (see [`fetch_modelsdev_free_ids_blocking`]).
+pub fn modelsdev_free_model_ids(upstream_id: &str) -> Vec<String> {
+    MODELSDEV_FREE_IDS
+        .get_or_init(fetch_modelsdev_free_ids_blocking)
+        .get(upstream_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The blocking models.dev fetch that collects every free model per upstream.
+/// Shares the same endpoint and filtering rules as
+/// [`fetch_modelsdev_defaults_blocking`] but keeps the whole candidate list
+/// instead of the single best pick.
+fn fetch_modelsdev_free_ids_blocking() -> HashMap<String, Vec<String>> {
+    std::thread::spawn(|| {
+        let url = "https://models.dev/api.json";
+        let Ok(response) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .and_then(|client| client.get(url).send())
+        else {
+            tracing::warn!("fetch_modelsdev_free_ids: HTTP request failed");
+            return HashMap::new();
+        };
+
+        let Ok(data) = response.json::<serde_json::Value>() else {
+            tracing::warn!("fetch_modelsdev_free_ids: failed to parse JSON");
+            return HashMap::new();
+        };
+
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+        for upstream in FREE_CATALOG {
+            let Some(provider) = data.get(upstream.id) else {
+                continue;
+            };
+            let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
+
+            let mut candidates: Vec<(&str, u64)> = Vec::new();
+            for (model_id, model_info) in models {
+                let cost = model_info.get("cost").and_then(|c| c.as_object());
+                let cost_in = cost
+                    .and_then(|c| c.get("input"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                let cost_out = cost
+                    .and_then(|c| c.get("output"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                if cost_in != 0.0 || cost_out != 0.0 {
+                    continue;
+                }
+                let tool_call = model_info
+                    .get("tool_call")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !tool_call {
+                    continue;
+                }
+                let status = model_info
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if status == "deprecated" || status == "legacy" {
+                    continue;
+                }
+                let limit = model_info.get("limit").and_then(|l| l.as_object());
+                let context = limit
+                    .and_then(|l| l.get("context"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                candidates.push((model_id, context));
+            }
+
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            let ids: Vec<String> = candidates
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect();
+            if !ids.is_empty() {
+                result.insert(upstream.id.to_string(), ids);
+            }
+        }
+        result
+    })
+    .join()
+    .unwrap_or_else(|_| {
+        tracing::warn!("fetch_modelsdev_free_ids: thread panicked");
+        HashMap::new()
+    })
+}
+
 /// Fetch `models.dev` and find the best free (cost=0) model with tool_call
 /// support for each FREE_CATALOG upstream.
 ///
