@@ -12781,24 +12781,24 @@ mod tests {
     fn test_open_free_model_popup_is_model_first() {
         let _home = TestHome::acquire();
         let mut app = make_app();
-        // huggingface + nvidia both host llama-3.3-70b (same model family),
-        // so they must collapse into ONE family entry — the popup lists
-        // models, not providers.
+        // nvidia + groq both host gpt-oss-120b (same model family), so they
+        // must collapse into ONE family entry — the popup lists models, not
+        // providers.
         app.free_model_defaults = vec![
-            (
-                "huggingface".to_string(),
-                "Hugging Face".to_string(),
-                "llama-3.3-70b".to_string(),
-            ),
             (
                 "nvidia".to_string(),
                 "NVIDIA NIM".to_string(),
-                "llama-3.3-70b".to_string(),
+                "openai/gpt-oss-120b".to_string(),
             ),
             (
                 "groq".to_string(),
                 "Groq".to_string(),
                 "gpt-oss-120b".to_string(),
+            ),
+            (
+                "sambanova".to_string(),
+                "SambaNova".to_string(),
+                "Meta-Llama-3.3-70B-Instruct".to_string(),
             ),
         ];
         app.handle_keybinding_action("openFreeModelPopup");
@@ -12810,13 +12810,14 @@ mod tests {
             .map(|i| i.id.as_str())
             .collect();
         // Auto first, then one entry per model family (model-first, not
-        // provider-first).
+        // provider-first). gpt-oss-120b (nvidia, groq) collapses into one
+        // entry; sambanova's llama-3.3-70b follows in catalog order.
         assert_eq!(
             ids,
             vec![
                 "free/auto",
-                "free/family/llama-3.3-70b",
                 "free/family/gpt-oss-120b",
+                "free/family/llama-3.3-70b",
             ]
         );
     }
@@ -12928,9 +12929,9 @@ mod tests {
         let mut app = make_app();
         app.free_model_defaults = vec![
             (
-                "huggingface".to_string(),
-                "Hugging Face".to_string(),
-                "llama-3.3-70b".to_string(),
+                "sambanova".to_string(),
+                "SambaNova".to_string(),
+                "Meta-Llama-3.3-70B-Instruct".to_string(),
             ),
             (
                 "groq".to_string(),
@@ -12939,13 +12940,14 @@ mod tests {
             ),
         ];
         app.handle_keybinding_action("openFreeModelPopup");
-        // Rows: auto, llama-3.3-70b, gpt-oss-120b. Current (free/auto) is
-        // preselected, so two downs land on gpt-oss-120b. Confirm with Enter.
+        // Rows: auto, gpt-oss-120b, llama-3.3-70b (catalog order). Current
+        // (free/auto) is preselected, so two downs land on llama-3.3-70b.
+        // Confirm with Enter.
         app.free_model_popup.select_next();
         app.free_model_popup.select_next();
         app.confirm_free_model_popup();
         assert!(!app.free_model_popup.visible);
-        assert_eq!(app.model_name, "free/family/gpt-oss-120b");
+        assert_eq!(app.model_name, "free/family/llama-3.3-70b");
     }
 
     #[test]
@@ -12979,9 +12981,9 @@ mod tests {
         let mut app = make_app();
         app.free_model_defaults = vec![
             (
-                "huggingface".to_string(),
-                "Hugging Face".to_string(),
-                "llama-3.3-70b".to_string(),
+                "sambanova".to_string(),
+                "SambaNova".to_string(),
+                "Meta-Llama-3.3-70B-Instruct".to_string(),
             ),
             (
                 "groq".to_string(),
@@ -12989,9 +12991,10 @@ mod tests {
                 "gpt-oss-120b".to_string(),
             ),
         ];
-        app.model_name = "free/family/gpt-oss-120b".to_string();
+        app.model_name = "free/family/llama-3.3-70b".to_string();
         app.handle_keybinding_action("openFreeModelPopup");
-        // Rows: auto, llama-3.3-70b, gpt-oss-120b — two prevs wraps to auto.
+        // Rows: auto, gpt-oss-120b, llama-3.3-70b — current (last row) means
+        // two prevs wraps to auto.
         app.free_model_popup.select_prev();
         app.free_model_popup.select_prev();
         app.confirm_free_model_popup();
@@ -13296,9 +13299,9 @@ mod tests {
         );
 
         // Upstream pins whose provider id `infer_provider_from_model` does not
-        // recognise (huggingface, nvidia, cloudflare, sambanova, cline, zai)
-        // must still route through free mode rather than leaving the user
-        // stuck on ollama with a broken model string.
+        // recognise (nvidia, cloudflare, sambanova, cline, zai, …) must still
+        // route through free mode rather than leaving the user stuck on ollama
+        // with a broken model string.
         app.config.provider = Some("ollama".to_string());
         app.config.model = None;
         assert!(app.intercept_slash_command("models"));
@@ -13306,8 +13309,8 @@ mod tests {
             .model_picker
             .models
             .iter()
-            .position(|m| m.id.starts_with("huggingface/"))
-            .expect("free picker must list a huggingface pin");
+            .position(|m| m.id.starts_with("cline/"))
+            .expect("free picker must list a cline pin");
         app.model_picker.selected_idx = pin_idx;
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
@@ -13319,7 +13322,7 @@ mod tests {
             app.config
                 .model
                 .as_deref()
-                .map(|m| m.starts_with("huggingface/"))
+                .map(|m| m.starts_with("cline/"))
                 .unwrap_or(false),
             "pin model must keep its upstream prefix"
         );

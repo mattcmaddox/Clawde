@@ -89,8 +89,8 @@ pub struct FreeUpstream {
     pub key_url: &'static str,
     pub default_model: &'static str,
     /// Grouping key for "model-first" routing: upstreams hosting the same
-    /// model family share a slug (e.g. "llama-3.3-70b" covers Hugging Face,
-    /// NVIDIA and SambaNova). Selecting `free/family/<slug>` in the picker
+    /// model family share a slug (e.g. "gpt-oss-120b" covers NVIDIA, Cerebras
+    /// and Groq). Selecting `free/family/<slug>` in the picker
     /// round-robins across every hosting upstream in catalog order.
     pub model_family: &'static str,
     pub note: &'static str,
@@ -159,7 +159,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         context_window: 262_144,
         fallback_models: &[],
         specialty: "coding specialist",
-        usage: "free preview · 1M ctx",
+        usage: "free preview · 256K",
     },
     FreeUpstream {
         id: "nvidia",
@@ -294,7 +294,7 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         context_window: 128_000,
         fallback_models: &[],
         specialty: "creative",
-        usage: "free · ?K",
+        usage: "free · 128K",
     },
     FreeUpstream {
         id: "opencode-zen",

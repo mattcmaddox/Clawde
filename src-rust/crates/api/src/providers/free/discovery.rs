@@ -1014,6 +1014,23 @@ fn select_available_models_from(
     if let Some(pick) = select_available_model(upstream_id, available, auto_detected) {
         out.push(pick);
     }
+    // Then the REST of the curated allowlist (the single selector only ever
+    // returns the first match). These are the provider's own free-tier
+    // designations, so they are authoritative even when models.dev has no
+    // entry for the upstream (e.g. poolside — its laguna-xs-2.1 sibling
+    // would otherwise never surface in the Alt+J/K popup).
+    if let Some((_, known)) = KNOWN_FREE_MODELS
+        .iter()
+        .find(|(id, _)| *id == upstream_id)
+        .copied()
+    {
+        for model in known {
+            let owned = (*model).to_string();
+            if !out.contains(&owned) && available.contains(model) {
+                out.push(owned);
+            }
+        }
+    }
     // Then the rest of models.dev's free set for this upstream (context-desc
     // order), restricted to ids the live list actually serves.
     for model in modelsdev_free {

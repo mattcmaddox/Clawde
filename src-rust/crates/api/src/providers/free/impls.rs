@@ -1230,6 +1230,11 @@ impl RetryingFreeStream {
         let provider = self.chain[hedge_idx].provider.clone();
         let mut req = self.request.clone();
         req.model = hedge_model.clone();
+        // Same per-entry shaping as every other dispatch site: clamp the
+        // raw (unclamped) stored request to the hedge target's cap first so
+        // a large user max_tokens can't let a capped upstream (e.g. poolside's
+        // 8K) run thinking up to the full budget on a hedged request.
+        clamp_max_tokens_for(&mut req, &self.chain[hedge_idx]);
         shape_thinking_for_upstream(&mut req, &self.chain[hedge_idx]);
 
         let (tx, rx) = tokio::sync::oneshot::channel();

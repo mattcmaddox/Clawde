@@ -813,31 +813,42 @@ fn render_perf_pane(buf: &mut Buffer, area: Rect, state: &RoutingDialogState) {
     }
 }
 
-/// Write `text` at (x, y), clipping to `max_chars` columns with an
-/// ellipsis when the text is cut short.
+/// Write `text` at (x, y), clipping to `max_chars` display columns with an
+/// ellipsis when the text is cut short. Uses display width (not char count)
+/// so wide characters (CJK, emoji) occupy the correct number of cells.
 fn draw_clipped(buf: &mut Buffer, x: u16, y: u16, max_chars: u16, text: &str, style: Style) {
+    use unicode_width::UnicodeWidthChar;
+
     if max_chars == 0 {
         return;
     }
-    let width = text.chars().count();
-    let cut = width > max_chars as usize;
-    let limit = if cut {
-        (max_chars as usize).saturating_sub(1)
+    let max = max_chars as usize;
+    let mut col = 0usize;
+    let mut char_idx = 0usize;
+    let chars: Vec<char> = text.chars().collect();
+    // Find how many chars fit, reserving 1 column for the ellipsis when needed.
+    let fits = if unicode_width::UnicodeWidthStr::width(text) > max {
+        max.saturating_sub(1) // leave room for ellipsis
     } else {
-        max_chars as usize
+        max
     };
-    for (i, ch) in text.chars().enumerate() {
-        if i >= limit {
+    for (i, &ch) in chars.iter().enumerate() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + cw > fits {
             break;
         }
-        buf[(x + i as u16, y)]
-            .set_symbol(&ch.to_string())
-            .set_style(style);
+        col += cw;
+        char_idx = i + 1;
     }
-    if cut {
-        buf[(x + limit as u16, y)]
-            .set_symbol("\u{2026}")
-            .set_style(style);
+    // Write each character at the correct column offset.
+    let mut cx = x;
+    for &ch in &chars[..char_idx] {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+        buf[(cx, y)].set_symbol(&ch.to_string()).set_style(style);
+        cx += cw as u16;
+    }
+    if unicode_width::UnicodeWidthStr::width(text) > max {
+        buf[(cx, y)].set_symbol("\u{2026}").set_style(style);
     }
 }
 
@@ -1173,12 +1184,12 @@ mod tests {
             vec![
                 ("groq".to_string(), Some(0.4)),
                 ("google".to_string(), Some(1.0)),
-                ("huggingface".to_string(), Some(0.2)),
+                ("nvidia".to_string(), Some(0.2)),
             ],
             vec![
                 ("groq".to_string(), Some(1.0)),
                 ("google".to_string(), Some(1.0)),
-                ("huggingface".to_string(), Some(0.8)),
+                ("nvidia".to_string(), Some(0.8)),
             ],
             Vec::new(),
             Vec::new(),
@@ -1187,19 +1198,19 @@ mod tests {
             vec![
                 ("groq".to_string(), 5),
                 ("google".to_string(), 5),
-                ("huggingface".to_string(), 5),
+                ("nvidia".to_string(), 5),
             ],
         );
         let rows = dialog.perf_ranking_for(TaskType::CodeGeneration);
         // Tier-0 (reliable) upstreams lead: 100% groq before 100% google
-        // (same rate, faster latency), then 80% huggingface. No-history
+        // (same rate, faster latency), then 80% nvidia. No-history
         // upstreams trail behind them.
         let ids: Vec<&str> = rows
             .iter()
             .take(3)
             .map(|r| r.upstream_id.as_str())
             .collect();
-        assert_eq!(ids, vec!["groq", "google", "huggingface"]);
+        assert_eq!(ids, vec!["groq", "google", "nvidia"]);
         assert!(rows.iter().all(|r| r.tier == 0 || r.tier == 2));
         assert!(rows.iter().skip(3).all(|r| r.tier == 2));
     }
