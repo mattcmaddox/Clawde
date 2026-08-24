@@ -905,6 +905,15 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
     ("zai", &["glm-4.7-flash", "glm-4.5-flash"]),
 ];
 
+/// Upstreams with a generous credit-based free tier where ALL models on the
+/// live list are usable (not just the allowlisted picks). These providers
+/// give monthly token credits rather than per-model free access, so the
+/// Alt+J/K popup should show every model the API returns.
+///
+/// - Mistral: Experiment tier (~1B tokens/month, all models)
+/// - SambaNova: Developer tier (~600M tokens/month, all models)
+const CREDIT_BASED_FREE: &[&str] = &["mistral", "sambanova"];
+
 /// Shared selection rule for live model lists: prefer the curated
 /// known-free allowlist when it matches, then the models.dev auto-detected
 /// pick when the live list confirms it, then the catalog's `default_model`.
@@ -1019,6 +1028,18 @@ fn select_available_models_from(
         for model in entry.fallback_models {
             let owned = model.to_string();
             if !out.contains(&owned) && available.contains(model) {
+                out.push(owned);
+            }
+        }
+    }
+    // For credit-based free tiers (Mistral Experiment, SambaNova Developer),
+    // ALL models on the live list are usable within the monthly allowance.
+    // Append every remaining live model so the Alt+J/K popup shows the full
+    // catalog, not just the curated picks.
+    if CREDIT_BASED_FREE.contains(&upstream_id) {
+        for model in available {
+            let owned = (*model).to_string();
+            if !out.contains(&owned) {
                 out.push(owned);
             }
         }
@@ -1641,6 +1662,43 @@ mod tests {
         assert!(
             select_available_models_from("cloudflare", &available, &HashMap::new(), &[]).is_empty()
         );
+    }
+
+    #[test]
+    fn credit_based_providers_include_full_live_list() {
+        // Mistral and SambaNova have credit-based free tiers where ALL models
+        // are usable. The full list must include every live model, not just
+        // the curated allowlist pick.
+        let available: Vec<&str> = vec![
+            "mistral-large-2512",
+            "mistral-small-latest",
+            "codestral-latest",
+            "pixtral-12b",
+        ];
+        let list = select_available_models_from("mistral", &available, &HashMap::new(), &[]);
+        // Allowlisted model is first.
+        assert_eq!(list.first().map(String::as_str), Some("mistral-large-2512"));
+        // All live models are present.
+        assert_eq!(list.len(), 4);
+        assert!(list.contains(&"mistral-small-latest".to_string()));
+        assert!(list.contains(&"codestral-latest".to_string()));
+        assert!(list.contains(&"pixtral-12b".to_string()));
+    }
+
+    #[test]
+    fn non_credit_based_providers_only_show_curated_picks() {
+        // Groq is rate-limited per model (not credit-based), so only the
+        // allowlisted + models.dev picks appear — NOT every live model.
+        let available: Vec<&str> = vec![
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+        ];
+        let auto = HashMap::from([("groq".to_string(), "llama-3.1-8b-instant".to_string())]);
+        let list = select_available_models_from("groq", &available, &auto, &[]);
+        // Only the allowlisted model and models.dev pick — not all 3.
+        assert!(list.contains(&"openai/gpt-oss-120b".to_string()));
+        assert!(!list.contains(&"llama-3.1-8b-instant".to_string()));
     }
 
     #[test]
