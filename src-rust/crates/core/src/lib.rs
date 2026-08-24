@@ -798,7 +798,6 @@ pub mod config {
             "baseten" => &["BASETEN_API_KEY"],
             "friendli" => &["FRIENDLI_TOKEN"],
             "poolside" => &["POOLSIDE_API_KEY"],
-            "modelscope" => &["MODELSCOPE_API_KEY"],
             "upstage" => &["UPSTAGE_API_KEY"],
             "stepfun" => &["STEPFUN_API_KEY"],
             "fireworks" => &["FIREWORKS_API_KEY"],

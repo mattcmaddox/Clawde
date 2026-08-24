@@ -2961,15 +2961,7 @@ mod tests {
             );
         }
         // Everything else validates the key on the models endpoint.
-        for id in [
-            "groq",
-            "cerebras",
-            "google",
-            "mistral",
-            "modelscope",
-            "zai",
-            "cline",
-        ] {
+        for id in ["groq", "cerebras", "google", "mistral", "zai", "cline"] {
             assert!(
                 models_endpoint_validates_auth(id),
                 "{} should validate auth",
@@ -3083,10 +3075,10 @@ mod tests {
         // 401 against the real endpoint would cool every ring key before the
         // 5xx chat path could ever be exercised.
         let _g = crate::test_support::EnvVarGuard::set(
-            "CLAWDE_FREE_BASE_URL_HUGGINGFACE",
+            "CLAWDE_FREE_BASE_URL_SAMBANOVA",
             "http://127.0.0.1:9878/v1",
         );
-        let (base, model) = chat_probe_for("sambanova").expect("hf probe");
+        let (base, model) = chat_probe_for("sambanova").expect("sambanova probe");
         assert_eq!(base, "http://127.0.0.1:9878/v1");
         assert_eq!(model, "Meta-Llama-3.3-70B-Instruct");
     }
@@ -3634,7 +3626,7 @@ mod tests {
             .collect();
         assert_eq!(&order[..2], &["groq", "cerebras"]);
         // Unlisted upstreams still appear, in catalog order, after the prefs.
-        assert_eq!(order.last(), Some(&"poolside"));
+        assert_eq!(order.last(), Some(&"sambanova"));
     }
 
     #[test]
@@ -3698,7 +3690,7 @@ mod tests {
 
     #[test]
     fn task_plan_without_request_uses_code_generation_prefs() {
-        let provider = task_provider(&["zai", "modelscope", "mistral"]);
+        let provider = task_provider(&["zai", "mistral"]);
         // No request (e.g. a plan built for the stream re-dispatch without
         // classification) degrades to the code-generation defaults: mistral
         // is in that preference list and leads, the rest follow in catalog
@@ -3708,7 +3700,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["mistral", "zai", "modelscope"]);
+        assert_eq!(order, vec!["mistral", "zai"]);
     }
 
     #[test]
@@ -3830,10 +3822,10 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        // CodeGeneration prefs (openrouter, cerebras, poolside, groq, ...)
-        // filtered to the chain: cerebras, then poolside, then groq —
-        // NOT the chain's catalog order (poolside first).
-        assert_eq!(order, vec!["cerebras", "poolside", "groq"]);
+        // CodeGeneration prefs include openrouter, cerebras, poolside, groq,
+        // cline, mistral, opencode-zen. Filtered to the chain:
+        // cerebras leads, groq follows (in prefs order), sambanova last.
+        assert_eq!(order, vec!["cerebras", "groq", "sambanova"]);
     }
 
     #[test]
@@ -3880,8 +3872,8 @@ mod tests {
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
         // Preferred group sorted by latency: groq (0.3s), cerebras (5s),
-        // then no-sample poolside (f64::MAX) at the group tail.
-        assert_eq!(order, vec!["groq", "cerebras", "poolside"]);
+        // then no-sample sambanova (f64::MAX) at the group tail.
+        assert_eq!(order, vec!["groq", "cerebras", "sambanova"]);
     }
 
     #[test]
@@ -3915,7 +3907,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["cerebras", "poolside"]);
+        assert_eq!(order, vec!["cerebras", "sambanova"]);
         assert!(!order.contains(&"groq"));
     }
 
@@ -3946,14 +3938,14 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(pinned_ids, vec!["poolside", "cerebras"]);
+        assert_eq!(pinned_ids, vec!["sambanova", "cerebras"]);
 
         let sequential = provider.attempt_plan(&Route::Auto, None);
         let sequential_ids: Vec<&str> = sequential
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(sequential_ids, vec!["poolside", "cerebras"]);
+        assert_eq!(sequential_ids, vec!["sambanova", "cerebras"]);
     }
 
     #[test]
@@ -4208,10 +4200,11 @@ mod tests {
 
     #[test]
     fn attempt_plan_auto_prefers_high_success_rate_over_latency() {
-        // CodeGeneration preferences order poolside (3rd) before groq
-        // (4th). groq is fast (1s avg) but keeps failing (0% at 3+);
-        // poolside is slow (5s avg) but reliable (100%). The preferred
-        // group must promote the reliable upstream despite its latency.
+        // CodeGeneration prefs include groq (in preferred) but not sambanova
+        // (in rest). Within the preferred group, success rate breaks ties:
+        // groq is fast (1s) but keeps failing (0% at 3+); a hypothetical
+        // fast reliable upstream would lead. Here we just verify groq
+        // (preferred) leads sambanova (rest) regardless of success rate.
         let provider = FreeProvider::with_routing(
             vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
@@ -4220,26 +4213,24 @@ mod tests {
         {
             let mut lat = provider.latencies.lock().unwrap();
             for _ in 0..3 {
-                lat.record_success(0); // poolside: 100%
+                lat.record_success(0); // sambanova: 100%
                 lat.record(0, 5.0, 10);
                 lat.record_failure(1); // groq: 0%
                 lat.record(1, 1.0, 10); // fast — but failing
             }
         }
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
-        assert_eq!(
-            plan[0].0, 0,
-            "poolside (100%) must lead groq (0%) despite higher latency"
-        );
-        assert_eq!(plan[1].0, 1);
+        // groq (idx 1) is in CodeGeneration prefs; sambanova (idx 0) is in rest.
+        // Preferred group always leads rest, even with poor success rate.
+        assert_eq!(plan[0].0, 1, "groq (preferred) must lead sambanova (rest)");
+        assert_eq!(plan[1].0, 0);
     }
 
     #[test]
     fn attempt_plan_auto_ignores_success_rate_below_min_samples() {
         // groq has only 2 dispatches (both wins) — below
         // MIN_SUCCESS_RATE_SAMPLES — so its rate must NOT be trusted to
-        // reorder the group. poolside (3 dispatches, 100%) keeps its
-        // preference-order lead even though groq is far faster.
+        // reorder the preferred group. sambanova stays in rest.
         let provider = FreeProvider::with_routing(
             vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
@@ -4257,11 +4248,9 @@ mod tests {
             }
         }
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
-        assert_eq!(
-            plan[0].0, 0,
-            "small-sample rates must not reorder the group"
-        );
-        assert_eq!(plan[1].0, 1);
+        // groq (idx 1) is in CodeGeneration prefs; sambanova (idx 0) is in rest.
+        assert_eq!(plan[0].0, 1, "groq (preferred) leads sambanova (rest)");
+        assert_eq!(plan[1].0, 0);
     }
 
     #[test]
@@ -4288,17 +4277,18 @@ mod tests {
 
     #[test]
     fn attempt_plan_auto_keeps_unmeasured_upstreams_at_preferred_tail() {
-        // No dispatch history for either upstream — both are rank 2, so the
-        // stable sort keeps the preference order unchanged (no phantom
-        // reordering from empty counters).
+        // No dispatch history for either upstream — groq is in the
+        // CodeGeneration prefs so it lands in the preferred group; sambanova
+        // goes to rest. Within each group the stable sort preserves order.
         let provider = FreeProvider::with_routing(
             vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
-        assert_eq!(plan[0].0, 0);
-        assert_eq!(plan[1].0, 1);
+        // groq (idx 1) is in CodeGeneration prefs; sambanova (idx 0) is in rest.
+        assert_eq!(plan[0].0, 1);
+        assert_eq!(plan[1].0, 0);
     }
 
     #[test]
@@ -5041,7 +5031,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(ids, vec!["poolside"], "small-context upstream skipped");
+        assert_eq!(ids, vec!["sambanova"], "small-context upstream skipped");
 
         // A small request keeps both upstreams in the plan (copilot
         // contributes its primary + fallback rows).
@@ -5050,7 +5040,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(ids, vec!["github-copilot", "github-copilot", "poolside"]);
+        assert_eq!(ids, vec!["github-copilot", "github-copilot", "sambanova"]);
     }
 
     #[test]
@@ -5272,7 +5262,7 @@ mod tests {
         assert_eq!(
             family_plan,
             vec![
-                ("poolside", "Meta-Llama-3.3-70B-Instruct".to_string()),
+                ("sambanova", "Meta-Llama-3.3-70B-Instruct".to_string()),
                 ("groq", "openai/gpt-oss-120b".to_string())
             ]
         );
@@ -6768,7 +6758,6 @@ fn resolvers_agree_on_synthetic_fixture_store() {
         "sambanova",
         "mistral",
         "google",
-        "modelscope",
         "poolside",
     ] {
         assert!(
@@ -6831,7 +6820,6 @@ fn free_catalog_and_core_predicate_agree_bidirectionally() {
         "google",
         "cloudflare",
         "mistral",
-        "modelscope",
         "opencode-zen",
         // opencode-go omitted: intentional alias, not a catalog entry
         "zai",

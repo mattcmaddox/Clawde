@@ -2213,7 +2213,7 @@ fn models_endpoint_validates_auth(upstream_id: &str) -> bool {
     // Cline's upstream chat outages even though the key itself is fine.)
     !matches!(
         upstream_id,
-        "nvidia" | "huggingface" | "openrouter" | "sambanova" | "cloudflare"
+        "nvidia" | "openrouter" | "sambanova" | "cloudflare" | "poolside"
     )
 }
 

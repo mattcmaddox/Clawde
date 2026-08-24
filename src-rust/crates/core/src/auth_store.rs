@@ -150,7 +150,6 @@ impl AuthStore {
                 | "cline"
                 | "openrouter"
                 | "poolside"
-                | "modelscope"
                 | "cerebras"
                 | "nvidia"
                 | "groq"
@@ -814,7 +813,6 @@ impl AuthStore {
             "crof" => "CROF_API_KEY",
             "sambanova" => "SAMBANOVA_API_KEY",
             "poolside" => "POOLSIDE_API_KEY",
-            "modelscope" => "MODELSCOPE_API_KEY",
             // qwen adapter reads DASHSCOPE_API_KEY (Alibaba's DashScope is the
             // backing service), not QWEN_API_KEY.
             "qwen" | "alibaba" => "DASHSCOPE_API_KEY",

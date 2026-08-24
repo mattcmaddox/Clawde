@@ -1,6 +1,6 @@
 {
   "source": "src-rust/crates/api/src/providers/free/catalog.rs",
-  "source_sha256": "1433c37827159498b47805209044f99bf584214f3f5550a7b10f352f14e7d99c",
+  "source_sha256": "TBD",
   "upstreams": [
     {
       "id": "github-copilot",
@@ -8,14 +8,14 @@
       "default_model": "gpt-4o-2024-11-20"
     },
     {
-      "id": "huggingface",
-      "title": "Hugging Face",
-      "default_model": "meta-llama/Llama-3.3-70B-Instruct"
+      "id": "poolside",
+      "title": "Poolside",
+      "default_model": "poolside/laguna-s-2.1"
     },
     {
       "id": "nvidia",
       "title": "NVIDIA NIM",
-      "default_model": "meta/llama-3.3-70b-instruct"
+      "default_model": "openai/gpt-oss-120b"
     },
     {
       "id": "cerebras",
@@ -50,12 +50,7 @@
     {
       "id": "mistral",
       "title": "Mistral",
-      "default_model": "labs-devstral-small-2512"
-    },
-    {
-      "id": "cohere",
-      "title": "Cohere",
-      "default_model": "north-mini-code-1-0"
+      "default_model": "mistral-large-2512"
     },
     {
       "id": "opencode-zen",
@@ -65,7 +60,7 @@
     {
       "id": "zai",
       "title": "Z.AI",
-      "default_model": "glm-4.7"
+      "default_model": "glm-4.7-flash"
     },
     {
       "id": "openrouter",
@@ -75,7 +70,7 @@
   ],
   "ids": [
     "github-copilot",
-    "huggingface",
+    "poolside",
     "nvidia",
     "cerebras",
     "google",
@@ -84,7 +79,6 @@
     "sambanova",
     "cline",
     "mistral",
-    "cohere",
     "opencode-zen",
     "zai",
     "openrouter"
