@@ -1218,11 +1218,39 @@ pub fn fetch_gemini_models(api_key: &str) -> Option<String> {
     fetch_gemini_free_models(api_key)?.into_iter().next()
 }
 
-/// Fetch ALL generateContent-capable Gemini models, default pick first.
+/// Known-free Gemini models on the Developer API free tier (August 2026).
 ///
-/// Gemini's free tier is quota-based on the API key rather than a per-model
-/// cost, so every generateContent-capable model is a candidate. The catalog
-/// default (gemini-2.5-flash) is ordered first via [`select_gemini_model`]'s
+/// Gemini's free tier is NOT every generateContent-capable model — Pro
+/// models left the free tier on April 1, 2026, and TTS / image-generation /
+/// deep-research / robotics models are paid-only. The /v1beta/models API
+/// lists all models regardless of tier, so we intersect against this
+/// curated set to avoid routing free-mode requests to paid endpoints.
+///
+/// Pattern: Flash and Flash-Lite variants are free; Gemma is free
+/// (open-weight hosted). Pro, image, TTS, and specialty models are not.
+const GEMINI_KNOWN_FREE: &[&str] = &[
+    // Flash
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    // Flash-Lite
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    // Open-weight (Gemma) — free hosted on AI Studio
+    "gemma-4-26b-a4b-it",
+    "gemma-4-31b-it",
+];
+
+/// Fetch known-free Gemini models, default pick first.
+///
+/// The /v1beta/models API lists all models regardless of tier. We intersect
+/// against [`GEMINI_KNOWN_FREE`] so paid-only models (Pro, TTS, image, deep
+/// research, robotics, etc.) are excluded. The catalog default
+/// (gemini-2.5-flash) is ordered first via [`select_gemini_model`]'s
 /// precedence so the chain pick is unchanged; the rest follow in API order
 /// for the Alt+J/K popup.
 pub fn fetch_gemini_free_models(api_key: &str) -> Option<Vec<String>> {
@@ -1238,8 +1266,9 @@ pub fn fetch_gemini_free_models(api_key: &str) -> Option<Vec<String>> {
 
     let models = payload.get("models").and_then(|v| v.as_array())?;
 
-    // Collect generateContent-capable model IDs, stripping the "models/"
-    // prefix and skipping deprecated / not-yet-supported models.
+    // Collect generateContent-capable model IDs, then intersect with the
+    // known-free allowlist so paid-only models (Pro, TTS, image, deep
+    // research, robotics, etc.) are excluded.
     let model_ids: Vec<&str> = models
         .iter()
         .filter_map(|model| {
@@ -1255,10 +1284,11 @@ pub fn fetch_gemini_free_models(api_key: &str) -> Option<Vec<String>> {
                 .unwrap_or(false);
             supported.then_some(name.strip_prefix("models/").unwrap_or(name))
         })
+        .filter(|id| GEMINI_KNOWN_FREE.contains(id))
         .collect();
 
     if model_ids.is_empty() {
-        tracing::warn!("fetch_gemini_free_models: no generateContent-capable models found");
+        tracing::warn!("fetch_gemini_free_models: no known-free models on live list");
         return None;
     }
 
@@ -1639,6 +1669,26 @@ mod tests {
     fn select_gemini_model_never_picks_arbitrary_first_model() {
         let available: Vec<&str> = vec!["gemini-2.5-pro", "gemini-1.5-pro"];
         assert_eq!(select_gemini_model(&available, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn gemini_known_free_excludes_pro_and_specialty_models() {
+        // The GEMINI_KNOWN_FREE list must exclude Pro, TTS, image, deep
+        // research, and other paid-only models that the /v1beta/models API
+        // returns alongside genuinely free models.
+        assert!(GEMINI_KNOWN_FREE.contains(&"gemini-2.5-flash"));
+        assert!(GEMINI_KNOWN_FREE.contains(&"gemini-3.7-flash"));
+        assert!(GEMINI_KNOWN_FREE.contains(&"gemini-3.1-flash-lite"));
+        assert!(GEMINI_KNOWN_FREE.contains(&"gemma-4-31b-it"));
+        // Pro models — paid only since April 2026
+        assert!(!GEMINI_KNOWN_FREE.contains(&"gemini-2.5-pro"));
+        assert!(!GEMINI_KNOWN_FREE.contains(&"gemini-3.1-pro-preview"));
+        // TTS / image / specialty — paid only
+        assert!(!GEMINI_KNOWN_FREE.contains(&"gemini-2.5-flash-preview-tts"));
+        assert!(!GEMINI_KNOWN_FREE.contains(&"gemini-3-pro-image"));
+        assert!(!GEMINI_KNOWN_FREE.contains(&"deep-research-preview-04-2026"));
+        assert!(!GEMINI_KNOWN_FREE.contains(&"gemini-robotics-er-2-preview"));
+        assert!(!GEMINI_KNOWN_FREE.contains(&"lyria-3-pro-preview"));
     }
 
     #[test]
