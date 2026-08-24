@@ -708,6 +708,11 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
 }
 
 /// Poolside — coding-optimized inference.  Reads `POOLSIDE_API_KEY`.
+///
+/// Poolside's hosted inference enables thinking by default: responses include
+/// a `reasoning_content` field alongside `content`. Multi-turn conversations
+/// with tool calls must echo back the previous turn's `reasoning_content`,
+/// exactly like DeepSeek V4.
 pub fn poolside() -> OpenAiCompatProvider {
     let key = std::env::var("POOLSIDE_API_KEY").unwrap_or_default();
     OpenAiCompatProvider::new(
@@ -718,6 +723,8 @@ pub fn poolside() -> OpenAiCompatProvider {
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         include_usage_in_stream: true,
+        reasoning_field: Some("reasoning_content".to_string()),
+        requires_reasoning_roundtrip: true,
         ..Default::default()
     })
 }

@@ -68,6 +68,8 @@ pub(crate) fn local_quota_for(id: &str) -> Option<LocalQuota> {
                 window_secs: 24 * 60 * 60,
             }),
         )),
+        // Poolside free tier: 200 requests/hour.
+        "poolside" => Some(LocalQuota::requests(200, 60 * 60)),
         _ => None,
     }
 }
@@ -150,11 +152,11 @@ pub const FREE_CATALOG: &[FreeUpstream] = &[
         key_url: "poolside.ai",
         default_model: "poolside/laguna-s-2.1",
         model_family: "laguna-s-2.1",
-        note: "Laguna S 2.1 (118B MoE, 1M ctx) — free in Preview",
+        note: "Laguna S 2.1 (118B MoE, 256K ctx) — free in Preview",
         tool_calling: true,
         vision: false,
         max_tokens_cap: Some(8_192),
-        context_window: 1_024_000,
+        context_window: 262_144,
         fallback_models: &[],
         specialty: "coding specialist",
         usage: "free preview · 1M ctx",

@@ -65,10 +65,7 @@ pub enum FreeModelDiscovery {
     /// account can actually serve — picking up new models without waiting
     /// for a models.dev refresh.
     CloudflareModels,
-    /// Fetch from Cohere's `/v1/models` endpoint. Cohere's response uses a
-    /// top-level `models` array with the model ID in `name` (not OpenAI's
-    /// `data` shape).
-    CohereModels,
+
     /// Fetch NVIDIA's own catalog API (`/v2/search/catalog/resources`). The
     /// catalog marks each endpoint's `PREVIEW` attribute (the "Free
     /// Endpoint" badge on build.nvidia.com) and a `DEPRECATION` date; only
@@ -82,9 +79,7 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
     match upstream_id {
         "cline" => FreeModelDiscovery::ClineRecommended,
         "openrouter" => FreeModelDiscovery::OpenRouterFreeModels,
-        "huggingface" => FreeModelDiscovery::OpenAiModelList {
-            base_url: "https://router.huggingface.co/v1",
-        },
+
         "cerebras" => FreeModelDiscovery::OpenAiModelList {
             base_url: "https://api.cerebras.ai/v1",
         },
@@ -235,10 +230,7 @@ fn run_live_discovery_models_uncached(
             let key = first_upstream_key(auth_store, "cloudflare")?;
             fetch_cloudflare_available_free_models(&key)
         }
-        FreeModelDiscovery::CohereModels => {
-            let key = first_upstream_key(auth_store, "cohere")?;
-            fetch_cohere_free_models(&key)
-        }
+
         FreeModelDiscovery::NvidiaCatalogModels => {
             // The catalog API is public; pass the stored key through for the
             // /v1/models wire-ID cross-reference when one exists.
@@ -1184,52 +1176,6 @@ fn collect_cloudflare_available_models(payload: &serde_json::Value) -> Vec<&str>
     text_generation
 }
 
-/// Fetch ALL known-free Cohere models, default pick first.
-///
-/// Cohere's API at `https://api.cohere.com/v1/models` returns a top-level
-/// `models` array (not OpenAI's `data` shape), with each entry's model ID in
-/// `name`. Selection mirrors the OpenAI-compat path: models.dev pick →
-/// catalog default, with every qualifying free model returned.
-pub fn fetch_cohere_free_models(api_key: &str) -> Option<Vec<String>> {
-    let payload = blocking_get_json(
-        "https://api.cohere.com/v1/models".to_string(),
-        Some(api_key.to_string()),
-        &[],
-        "fetch_cohere_free_models".to_string(),
-    )?;
-    let available = collect_cohere_model_ids(&payload);
-    if available.is_empty() {
-        tracing::warn!("fetch_cohere_free_models: no models in response");
-        return None;
-    }
-    let list = select_available_models(
-        "cohere",
-        &available,
-        fetch_best_free_models_from_modelsdev(),
-    );
-    if list.is_empty() {
-        tracing::warn!(
-            "fetch_cohere_free_models: no known-free model available ({} listed)",
-            available.len(),
-        );
-        return None;
-    }
-    Some(list)
-}
-
-/// Extract model IDs from a Cohere `/v1/models` payload (`models[].name`).
-fn collect_cohere_model_ids(payload: &serde_json::Value) -> Vec<&str> {
-    payload
-        .get("models")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Fetch Google Gemini's current available models from their models API.
 ///
 /// Gemini's API at `https://generativelanguage.googleapis.com/v1beta/models`
@@ -1505,21 +1451,6 @@ mod tests {
             collect_cloudflare_available_models(&serde_json::json!({ "result": "nope" }))
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn cohere_discovery_extracts_model_names() {
-        let payload = serde_json::json!({
-            "models": [
-                {"name": "north-mini-code-1-0"},
-                {"name": "command-r-plus", "context_length": 128000}
-            ]
-        });
-        assert_eq!(
-            collect_cohere_model_ids(&payload),
-            vec!["north-mini-code-1-0", "command-r-plus"]
-        );
-        assert!(collect_cohere_model_ids(&serde_json::json!({})).is_empty());
     }
 
     #[test]

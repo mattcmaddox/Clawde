@@ -62,6 +62,7 @@ pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
             | "ollama"
             | "codex"
             | "openai-codex"
+            | "poolside"
             | "lmstudio"
             | "lm-studio"
             | "llamacpp"
@@ -260,13 +261,26 @@ pub(crate) fn build_provider_options(
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }
 
-    if (provider_id == "zhipu" || provider_id == "zai") && thinking_budget.is_some() {
+    // Z.AI / Zhipu: GLM models use `thinking.type` enabled/disabled.
+    // Thinking is on by default for reasoning models; effort None disables it.
+    if provider_id == "zhipu" || provider_id == "zai" {
+        let enabled = effort_level != Some(clawde_core::effort::EffortLevel::None);
         options.insert(
             "thinking".to_string(),
             serde_json::json!({
-                "type": "enabled",
+                "type": if enabled { "enabled" } else { "disabled" },
                 "clear_thinking": false,
             }),
+        );
+    }
+
+    // Poolside: binary thinking toggle. Thinking is on by default and
+    // consumes from max_tokens; effort None turns it off via
+    // chat_template_kwargs. No multi-level control exists.
+    if provider_id == "poolside" && effort_level == Some(clawde_core::effort::EffortLevel::None) {
+        options.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({ "enable_thinking": false }),
         );
     }
 

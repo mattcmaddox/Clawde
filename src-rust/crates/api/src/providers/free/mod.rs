@@ -54,11 +54,10 @@ pub use catalog::{
 };
 pub use discovery::{
     discovery_for, fetch_cline_free_model, fetch_cline_free_models,
-    fetch_cloudflare_available_free_models, fetch_cohere_free_models, fetch_gemini_free_models,
-    fetch_gemini_models, fetch_openai_compat_free_models, fetch_openai_compat_model_list,
-    fetch_opencode_zen_free_model, fetch_opencode_zen_free_models, fetch_openrouter_free_model,
-    fetch_openrouter_free_models, run_live_discovery, run_live_discovery_models,
-    FreeModelDiscovery,
+    fetch_cloudflare_available_free_models, fetch_gemini_free_models, fetch_gemini_models,
+    fetch_openai_compat_free_models, fetch_openai_compat_model_list, fetch_opencode_zen_free_model,
+    fetch_opencode_zen_free_models, fetch_openrouter_free_model, fetch_openrouter_free_models,
+    run_live_discovery, run_live_discovery_models, FreeModelDiscovery,
 };
 
 // Further sub-modules: inherent impl + streaming + trait impl (mutually
@@ -345,6 +344,29 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
                     }),
                 );
             }
+        }
+        // Poolside: binary thinking toggle via chat_template_kwargs.
+        // Thinking is enabled by default and consumes from max_tokens;
+        // effort None is the only level that turns it off.
+        "poolside" => {
+            if off {
+                options.insert(
+                    "chat_template_kwargs".to_string(),
+                    serde_json::json!({ "enable_thinking": false }),
+                );
+            }
+        }
+        // Z.AI (Zhipu): GLM models expose thinking via the `thinking`
+        // parameter with type enabled/disabled. Thinking is on by default
+        // for reasoning models (GLM-4.7-Flash, GLM-5, etc.).
+        "zai" => {
+            options.insert(
+                "thinking".to_string(),
+                serde_json::json!({
+                    "type": if off { "disabled" } else { "enabled" },
+                    "clear_thinking": false,
+                }),
+            );
         }
         // DeepSeek models are served by cline / opencode-zen / openrouter
         // through OpenAI-compatible endpoints that pass `thinking` through.
