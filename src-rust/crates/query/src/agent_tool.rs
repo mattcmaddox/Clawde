@@ -1914,10 +1914,10 @@ mod tests {
         assert_eq!(semantic_retry_model(&config), "free/groq/gpt-oss-120b");
 
         // A valid free retry route is honored.
-        config.verify.semantic_retry_model = "free/nvidia/meta/llama-3.3-70b-instruct".to_string();
+        config.verify.semantic_retry_model = "free/nvidia/openai/gpt-oss-120b".to_string();
         assert_eq!(
             semantic_retry_model(&config),
-            "free/nvidia/meta/llama-3.3-70b-instruct"
+            "free/nvidia/openai/gpt-oss-120b"
         );
 
         // Invalid (foreign provider) routes fall back to the primary.

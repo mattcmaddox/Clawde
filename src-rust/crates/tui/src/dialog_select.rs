@@ -342,11 +342,14 @@ pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: 
         }
 
         let badge_text = item.badge.clone().unwrap_or_default();
-        let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
+        let text_len: usize = spans
+            .iter()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
         let badge_len = if badge_text.is_empty() {
             0
         } else {
-            badge_text.len() + 1
+            unicode_width::UnicodeWidthStr::width(badge_text.as_str()) + 1
         };
         let pad = inner
             .width

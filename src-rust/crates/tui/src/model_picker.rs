@@ -1719,9 +1719,13 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 }
             }
 
-            // Pad for full-width highlight
+            // Pad for full-width highlight — use display width (not byte
+            // length) so emoji icons get the correct padding.
             if is_selected {
-                let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                let text_len: usize = spans
+                    .iter()
+                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
                 let pad = inner.width.saturating_sub(text_len as u16) as usize;
                 if pad > 0 {
                     spans.push(Span::styled(

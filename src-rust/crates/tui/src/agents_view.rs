@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthStr;
 
 use crate::overlays::{
     begin_modal_buf, modal_header_line_area, render_modal_title_buf, CLAWDE_ACCENT, CLAWDE_MUTED,
@@ -865,7 +866,10 @@ fn agent_list_row(title: String, meta: String, selected: bool, width: u16) -> Li
         Span::styled(title, title_style),
         Span::styled(format!("  {}", meta), meta_style),
     ];
-    let used: usize = spans.iter().map(|span| span.content.len()).sum();
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
     let pad = width.saturating_sub(used as u16) as usize;
     if pad > 0 {
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));

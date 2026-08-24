@@ -90,9 +90,11 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 | `Shift+Enter` | New line (multi-line message) |
 | `Ctrl+K` | Command palette (search any command) |
 | `Ctrl+,` | Open settings |
-| `Ctrl+R` | Search command history |
+| `Alt+J / Alt+K` | Free models (dropdown) |
+| `Alt+H / Alt+L` | Reasoning down / up (clamped) |
+| `Alt+R` | Search command history |
 | `Ctrl+O` | Expand / collapse thinking blocks |
-| `Alt+H` | Open help |
+| `Alt+/` | Open help |
 | `Esc` | Close a dialog / cancel |
 | `Up / Down` | Previous / next prompt in history |
 

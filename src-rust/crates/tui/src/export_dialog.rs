@@ -164,7 +164,10 @@ fn export_option_row(
             Style::default().fg(desc_fg).bg(bg),
         ),
     ];
-    let used: usize = spans.iter().map(|span| span.content.len()).sum();
+    let used: usize = spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
     let pad = width.saturating_sub(used as u16) as usize;
     if pad > 0 {
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));

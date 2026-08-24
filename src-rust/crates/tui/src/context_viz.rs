@@ -239,8 +239,20 @@ pub fn render_context_viz(
         for (position, (upstream_id, upstream_name, model_id)) in
             free_model_defaults.iter().enumerate()
         {
-            let truncated = if model_id.len() > 32 {
-                format!("{}…{}", &model_id[..15], &model_id[model_id.len() - 15..])
+            // Truncate long model IDs using display width (not byte length)
+            // and char-safe slicing so multi-byte characters aren't split.
+            let truncated = if unicode_width::UnicodeWidthStr::width(model_id.as_str()) > 32 {
+                let chars: Vec<char> = model_id.chars().collect();
+                let head: String = chars.iter().take(15).collect();
+                let tail: String = chars
+                    .iter()
+                    .rev()
+                    .take(15)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                format!("{}…{}", head, tail)
             } else {
                 model_id.clone()
             };
@@ -301,8 +313,18 @@ pub fn render_context_viz(
                 let fb_list: Vec<String> = fallback_note
                     .iter()
                     .map(|m| {
-                        if m.len() > 32 {
-                            format!("{}…{}", &m[..15], &m[m.len() - 15..])
+                        if unicode_width::UnicodeWidthStr::width(*m) > 32 {
+                            let chars: Vec<char> = m.chars().collect();
+                            let head: String = chars.iter().take(15).collect();
+                            let tail: String = chars
+                                .iter()
+                                .rev()
+                                .take(15)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
+                            format!("{}…{}", head, tail)
                         } else {
                             (*m).to_string()
                         }
@@ -653,15 +675,18 @@ fn pct_color(pct: Option<f32>) -> Color {
 }
 
 fn truncate_name(name: &str, max: usize) -> String {
-    if name.len() <= max {
+    if unicode_width::UnicodeWidthStr::width(name) <= max {
         name.to_string()
     } else {
         let mut result = String::with_capacity(max + 1);
-        for (count, ch) in name.chars().enumerate() {
-            if count >= max.saturating_sub(1) {
+        let mut width = 0usize;
+        for ch in name.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if width + cw > max.saturating_sub(1) {
                 result.push('\u{2026}');
                 break;
             }
+            width += cw;
             result.push(ch);
         }
         result
@@ -771,7 +796,7 @@ mod tests {
                         (
                             "nvidia".into(),
                             "NVIDIA NIM".into(),
-                            "meta/llama-3.3-70b-instruct".into(),
+                            "openai/gpt-oss-120b".into(),
                         ),
                         ("groq".into(), "Groq".into(), "openai/gpt-oss-120b".into()),
                     ],
@@ -792,7 +817,7 @@ mod tests {
         // The fallback note appears on nvidia's detail line exactly once
         // (flat buffer — no newlines between rows).
         assert!(
-            content.contains("fb: meta/llama-3.1-8b-instruct"),
+            content.contains("fb: openai/gpt-oss-20b"),
             "expected fallback note, got: {:?}",
             &content[content.find("Free").unwrap_or(0)..]
         );

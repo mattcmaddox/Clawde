@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 /// A dismissible banner shown at the top of the message area when a plugin
 /// wants to surface a hint or recommendation to the user.
@@ -61,8 +62,20 @@ pub fn render_plugin_hints(frame: &mut Frame, hints: &[PluginHintBanner], area: 
 
     let inner_width = area.width.saturating_sub(4) as usize;
     let content = format!(" [{}] {} [Esc to dismiss]", hint.plugin_name, hint.message);
-    let display = if content.len() > inner_width {
-        format!("{}…", &content[..inner_width.saturating_sub(1)])
+    let display = if UnicodeWidthStr::width(content.as_str()) > inner_width {
+        // Char-safe truncation: walk the string by display width.
+        let mut out = String::with_capacity(inner_width);
+        let mut w = 0usize;
+        for ch in content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if w + cw > inner_width.saturating_sub(1) {
+                break;
+            }
+            w += cw;
+            out.push(ch);
+        }
+        out.push('\u{2026}');
+        out
     } else {
         content
     };

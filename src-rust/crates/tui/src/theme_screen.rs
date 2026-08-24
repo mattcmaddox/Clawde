@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::overlays::{
     begin_modal_frame, modal_header_line_area, render_modal_title_frame, render_scrollbar,
@@ -341,7 +342,10 @@ pub fn render_theme_screen(frame: &mut Frame, screen: &ThemeScreen, area: Rect) 
         } else {
             0
         };
-        let used: usize = row_spans.iter().map(|span| span.content.len()).sum();
+        let used: usize = row_spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
         let pad = layout
             .body_area
             .width

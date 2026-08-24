@@ -113,6 +113,7 @@ pub mod file_injection;
 pub mod file_injection_dialog;
 /// Setup dialog for the composite "Free" provider (Zen → OpenRouter).
 pub mod free_mode_dialog;
+pub mod free_model_popup;
 /// Read-only hooks configuration browser.
 pub mod hooks_config_menu;
 /// Clipboard image paste and Ctrl+V text paste.

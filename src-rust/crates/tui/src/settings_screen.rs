@@ -2337,32 +2337,55 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
     frame.render_widget(para, area);
 }
 
-/// Truncate a string to `max` chars, keeping the head and tail with an
-/// ellipsis in the middle (used for the header model name).
+/// Truncate a string to `max` display columns, keeping the head and tail
+/// with an ellipsis in the middle (used for the header model name).
 fn truncate_mid(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if unicode_width::UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
     let keep = (max.saturating_sub(1)) / 2;
-    let head: String = s.chars().take(keep).collect();
-    let tail: String = s
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    // Walk chars using display width to find the cut points.
+    let mut head = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w + cw > keep {
+            break;
+        }
+        w += cw;
+        head.push(ch);
+    }
+    let mut tail = String::new();
+    let mut w = 0usize;
+    for ch in s.chars().rev() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w + cw > keep {
+            break;
+        }
+        w += cw;
+        tail.push(ch);
+    }
+    let tail: String = tail.chars().rev().collect();
     format!("{}…{}", head, tail)
 }
 
-/// Truncate a string to `max` chars with a trailing ellipsis (used for long
-/// setting values so the status tail never wraps off-screen).
+/// Truncate a string to `max` display columns with a trailing ellipsis
+/// (used for long setting values so the status tail never wraps
+/// off-screen).
 fn truncate_end(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if unicode_width::UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
     out.push('…');
     out
 }

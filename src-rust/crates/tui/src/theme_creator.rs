@@ -1192,7 +1192,10 @@ fn render_list(frame: &mut Frame, creator: &ThemeCreator, area: Rect) {
         } else {
             0
         };
-        let used: usize = row_spans.iter().map(|s| s.content.len()).sum();
+        let used: usize = row_spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
         let pad = layout
             .body_area
             .width

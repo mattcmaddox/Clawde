@@ -159,7 +159,7 @@ fn default_levels() -> Vec<EffortLevel> {
 
 /// Choose the selected index for `current` within `levels`: an exact match if
 /// present, otherwise the nearest level at or below it by rank, else the first.
-fn index_for(levels: &[EffortLevel], current: EffortLevel) -> usize {
+pub(crate) fn index_for(levels: &[EffortLevel], current: EffortLevel) -> usize {
     if let Some(i) = levels.iter().position(|l| *l == current) {
         return i;
     }

@@ -467,7 +467,7 @@ fn render_keybindings_page(frame: &mut Frame, area: Rect) {
         )),
         kb("PgUp/PgDn", "scroll transcript"),
         kb("Ctrl+K", "command palette"),
-        kb("Ctrl+Shift+A", "model picker"),
+        kb("Alt+M", "model picker"),
         Line::from(""),
         Line::from(Span::styled(
             "  Permissions",

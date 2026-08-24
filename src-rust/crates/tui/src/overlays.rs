@@ -1,6 +1,6 @@
 // overlays.rs — All full-screen and floating overlays:
 //   - HelpOverlay (? / F1 / /help)
-//   - HistorySearchOverlay (Ctrl+R)
+//   - HistorySearchOverlay (Alt+R)
 //   - MessageSelectorOverlay (/rewind step 1)
 //   - RewindFlowOverlay (/rewind full multi-step flow)
 
@@ -504,7 +504,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     for (key, desc) in &[
         ("Enter", "Submit message"),
         ("Up / Down", "Input history"),
-        ("Ctrl+R", "Search history"),
+        ("Alt+R", "Search history"),
         ("Alt+E", "Expand pasted text"),
         ("Esc", "Cancel / close"),
     ] {
@@ -518,14 +518,17 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &[
-        ("F1 / ?", "Toggle help"),
-        ("Ctrl+Shift+A", "Model picker"),
+        ("F1 / ? / Alt+/", "Toggle help"),
+        ("Alt+M", "Model picker"),
+        ("Alt+J / Alt+K", "Free models"),
         ("Ctrl+K", "Command palette"),
         ("Ctrl+C", "Cancel / quit"),
         ("Ctrl+D", "Quit (empty input)"),
         ("Ctrl+L", "Clear screen"),
-        ("Ctrl+Shift+S", "Show search source"),
+        ("Alt+S", "Show search source"),
         ("Ctrl+O", "Expand/collapse thinking"),
+        ("Alt+H / Alt+L", "Reasoning down / up"),
+        ("Alt+E", "Effort picker"),
     ] {
         left_lines.push(kb_line(key, desc));
     }
@@ -839,7 +842,7 @@ pub struct MatchEntry {
 // HistorySearchOverlay
 // ---------------------------------------------------------------------------
 
-/// State for the Ctrl+R history search floating panel.
+/// State for the Alt+R history search floating panel.
 #[derive(Debug, Default)]
 pub struct HistorySearchOverlay {
     pub visible: bool,
