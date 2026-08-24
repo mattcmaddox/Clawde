@@ -3350,7 +3350,6 @@ fn should_render_status_row(app: &App) -> bool {
         || has_exhausted_keys
         || has_empty_cooldowns
         || app.fast_mode
-        || app.plan_mode
         || app.active_goal_badge.is_some()
 }
 
@@ -3535,7 +3534,10 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     // Skip when the row is otherwise empty — the mode badge in Row 2
     // already communicates the current mode, so a standalone "Plan"
     // line with no context is noise.
-    if (app.active_goal_badge.is_some() || app.fast_mode || app.plan_mode) && !spans.is_empty() {
+    // Note: plan_mode is NOT shown here — the [PLAN] badge in Row 2
+    // already communicates the mode, so a standalone "Plan" in the
+    // transient status row is redundant noise.
+    if (app.active_goal_badge.is_some() || app.fast_mode) && !spans.is_empty() {
         spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         if let Some(ref badge) = app.active_goal_badge {
             spans.push(Span::styled(
@@ -3551,17 +3553,6 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
                 "Fast",
                 Style::default()
                     .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        if app.plan_mode {
-            if !spans.is_empty() {
-                spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            }
-            spans.push(Span::styled(
-                "Plan",
-                Style::default()
-                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -5647,14 +5638,16 @@ mod status_row_badge_tests {
     }
 
     #[test]
-    fn plan_badge_appears_when_plan_mode_enabled() {
+    fn plan_mode_shows_in_prompt_row_not_status_row() {
         let mut app = App::new(Config::default(), CostTracker::new());
         app.plan_mode = true;
         app.status_message = Some("Testing plan mode.".to_string());
         let out = render_screen(&app);
+        // The [PLAN] badge appears in the prompt config row (Row 2),
+        // not as a standalone "Plan" in the transient status row (Row 1).
         assert!(
-            out.contains("Plan"),
-            "'Plan' badge should appear in the status row when plan_mode=true. Output: {:?}",
+            out.contains("PLAN"),
+            "'PLAN' mode badge should appear in the prompt row when plan_mode=true. Output: {:?}",
             out
         );
     }
@@ -5673,7 +5666,7 @@ mod status_row_badge_tests {
     }
 
     #[test]
-    fn fast_and_plan_badges_appear_together() {
+    fn fast_badge_appears_with_plan_mode() {
         let mut app = App::new(Config::default(), CostTracker::new());
         app.fast_mode = true;
         app.plan_mode = true;
@@ -5684,9 +5677,11 @@ mod status_row_badge_tests {
             "'Fast' badge should appear. Output: {:?}",
             out
         );
+        // plan_mode is communicated by [PLAN] in the prompt row,
+        // not as a "Plan" badge in the status row.
         assert!(
-            out.contains("Plan"),
-            "'Plan' badge should appear. Output: {:?}",
+            out.contains("PLAN"),
+            "'PLAN' mode badge should appear. Output: {:?}",
             out
         );
     }
