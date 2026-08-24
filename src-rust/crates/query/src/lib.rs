@@ -2557,6 +2557,7 @@ pub async fn run_query_loop(
                             &model_id_str,
                             effective_effort_level,
                             effective_thinking_budget,
+                            Some(effective_max_tokens),
                             tool_ctx
                                 .config
                                 .provider_configs
@@ -5014,6 +5015,7 @@ mod tests {
             Some(clawde_core::effort::EffortLevel::High),
             None,
             None,
+            None,
         );
         assert_eq!(
             options["thinkingConfig"]["thinkingLevel"],
@@ -5033,6 +5035,7 @@ mod tests {
             Some(clawde_core::effort::EffortLevel::None),
             None,
             None,
+            None,
         );
         assert_eq!(
             options["thinkingConfig"]["includeThoughts"],
@@ -5047,6 +5050,7 @@ mod tests {
             "google",
             "gemini-2.5-pro",
             Some(clawde_core::effort::EffortLevel::None),
+            None,
             None,
             None,
         );
@@ -5068,6 +5072,7 @@ mod tests {
             Some(clawde_core::effort::EffortLevel::None),
             None,
             None,
+            None,
         );
         assert_eq!(disabled["thinking"]["type"], serde_json::json!("disabled"));
         assert!(disabled.get("reasoningEffort").is_none());
@@ -5078,6 +5083,7 @@ mod tests {
             Some(clawde_core::effort::EffortLevel::High),
             Some(10_000),
             None,
+            None,
         );
         assert_eq!(high["thinking"]["type"], serde_json::json!("enabled"));
         assert_eq!(high["reasoningEffort"], serde_json::json!("high"));
@@ -5086,6 +5092,7 @@ mod tests {
             "deepseek",
             "deepseek-v4",
             Some(clawde_core::effort::EffortLevel::Max),
+            None,
             None,
             None,
         );
@@ -5098,6 +5105,7 @@ mod tests {
             "openrouter",
             "gpt-5.4",
             Some(clawde_core::effort::EffortLevel::Medium),
+            None,
             None,
             None,
         );
@@ -5115,7 +5123,7 @@ mod tests {
             (clawde_core::effort::EffortLevel::High, "high"),
         ] {
             let options =
-                build_provider_options("openai-codex", "gpt-5.5", Some(level), None, None);
+                build_provider_options("openai-codex", "gpt-5.5", Some(level), None, None, None);
             assert_eq!(options["reasoningEffort"], serde_json::json!(expected));
         }
         // ...but the top "Max" tier becomes "xhigh" (extra high) on Codex.
@@ -5123,6 +5131,7 @@ mod tests {
             "openai-codex",
             "gpt-5.5",
             Some(clawde_core::effort::EffortLevel::Max),
+            None,
             None,
             None,
         );
@@ -5136,6 +5145,7 @@ mod tests {
             Some(clawde_core::effort::EffortLevel::Max),
             None,
             None,
+            None,
         );
         assert_eq!(other["reasoningEffort"], serde_json::json!("high"));
     }
@@ -5147,6 +5157,7 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1",
             Some(clawde_core::effort::EffortLevel::High),
             Some(10_000),
+            None,
             None,
         );
         assert_eq!(

@@ -284,20 +284,20 @@ fn clamp_max_tokens_for(req: &mut ProviderRequest, entry: &FreeEntry) {
 /// re-assembles per-entry request parameters at dispatch time — mirroring the
 /// `build_provider_options` the query layer performs for direct providers.
 /// No-op when the request carries no effort override, or when the upstream's
-/// model family exposes no thinking control. Single source of truth for the
-/// per-upstream mapping; used by every dispatch site (non-streaming
-/// fallback, streaming fallback, `RetryingFreeStream` re-dispatch, and the
-/// hedge path).
+/// model family exposes no thinking control. The per-upstream mapping is the
+/// shared [`shape_provider_thinking`] in `effort_shaping`, the same single
+/// source of truth the query layer uses; used by every dispatch site
+/// (non-streaming fallback, streaming fallback, `RetryingFreeStream`
+/// re-dispatch, and the hedge path).
 fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
-    use crate::providers::effort_shaping::{
-        deepseek_reasoning_effort_for_level, google_thinking_level_for_effort,
-        openai_compat_reasoning_model, openai_reasoning_effort_for_level,
-    };
-    use clawde_core::effort::EffortLevel;
+    use crate::providers::effort_shaping::shape_provider_thinking;
 
-    let Some(level) = req.effort_level else {
+    // Only re-shape when the request carries an explicit effort override;
+    // otherwise the upstream's own default (or the query layer's shaping for
+    // direct providers) stands.
+    if req.effort_level.is_none() {
         return;
-    };
+    }
     // Requests assembled without provider options (test-constructed requests)
     // must not silently drop the override — fuse into an object first.
     if !req.provider_options.is_object() {
@@ -306,105 +306,17 @@ fn shape_thinking_for_upstream(req: &mut ProviderRequest, entry: &FreeEntry) {
     let Some(options) = req.provider_options.as_object_mut() else {
         return;
     };
-    let upstream = entry.upstream.id;
-    let model = req.model.to_ascii_lowercase();
-    let off = level == EffortLevel::None;
-
-    match upstream {
-        // Gemini: thinkingConfig lives in generationConfig and is expressed
-        // as a budget (2.5 models) or a level (3.x models). Mirrors the
-        // query-layer's google branch.
-        "google" => {
-            if model.contains("2.5") {
-                let mut budget = if off {
-                    0
-                } else {
-                    level.thinking_budget_tokens().unwrap_or(0)
-                };
-                // Gemini requires budget < maxOutputTokens (Clawde already
-                // clamps max_tokens to the upstream cap at this point).
-                budget = budget.min(req.max_tokens.saturating_sub(1));
-                options.insert(
-                    "thinkingConfig".to_string(),
-                    serde_json::json!({
-                        "includeThoughts": !off,
-                        "thinkingBudget": budget,
-                    }),
-                );
-            } else if model.contains("3.") || model.contains("gemini-3") {
-                options.insert(
-                    "thinkingConfig".to_string(),
-                    serde_json::json!({
-                        "includeThoughts": !off,
-                        "thinkingLevel": if off {
-                            "minimal"
-                        } else {
-                            google_thinking_level_for_effort(Some(level))
-                        },
-                    }),
-                );
-            }
-        }
-        // Poolside: binary thinking toggle via chat_template_kwargs.
-        // Thinking is enabled by default and consumes from max_tokens;
-        // effort None is the only level that turns it off.
-        "poolside" => {
-            if off {
-                options.insert(
-                    "chat_template_kwargs".to_string(),
-                    serde_json::json!({ "enable_thinking": false }),
-                );
-            }
-        }
-        // Z.AI (Zhipu): GLM models expose thinking via the `thinking`
-        // parameter with type enabled/disabled. Thinking is on by default
-        // for reasoning models (GLM-4.7-Flash, GLM-5, etc.).
-        "zai" => {
-            options.insert(
-                "thinking".to_string(),
-                serde_json::json!({
-                    "type": if off { "disabled" } else { "enabled" },
-                    "clear_thinking": false,
-                }),
-            );
-        }
-        // DeepSeek models are served by cline / opencode-zen / openrouter
-        // through OpenAI-compatible endpoints that pass `thinking` through.
-        _ if model.starts_with("deepseek") || model.contains("/deepseek") => {
-            // `none` and `low` both disable DeepSeek thinking (query parity).
-            let enabled = !off && level != EffortLevel::Low;
-            options.insert(
-                "thinking".to_string(),
-                serde_json::json!({ "type": if enabled { "enabled" } else { "disabled" } }),
-            );
-            // Drop any leftover effort key from an earlier shape pass so a
-            // disabled request never carries reasoning parameters.
-            if enabled {
-                options.insert(
-                    "reasoningEffort".to_string(),
-                    serde_json::json!(deepseek_reasoning_effort_for_level(level)),
-                );
-            } else {
-                options.remove("reasoningEffort");
-            }
-        }
-        // OpenAI reasoning families (GPT-5 / O-series / Qwen3) via
-        // OpenAI-compatible upstreams; the copilot adapter accepts the same
-        // `reasoningEffort` key. Explicit-off maps to "none" so the model
-        // thinks at its minimum rather than not at all.
-        _ => {
-            if openai_compat_reasoning_model(&model) {
-                options.insert(
-                    "reasoningEffort".to_string(),
-                    serde_json::json!(if off {
-                        "none"
-                    } else {
-                        openai_reasoning_effort_for_level(level)
-                    }),
-                );
-            }
-        }
-    }
+    // max_tokens is already clamped to the entry's cap by every dispatch
+    // site before this runs, so Google's thinkingBudget clamp sees the
+    // effective output budget.
+    shape_provider_thinking(
+        options,
+        entry.upstream.id,
+        &req.model.to_ascii_lowercase(),
+        req.effort_level,
+        None,
+        Some(req.max_tokens),
+    );
 }
 
 /// Serialize provider-state writes in this process. The per-file lock below

@@ -12,62 +12,14 @@ pub(crate) fn reasoning_effort_for_level(
     clawde_api::providers::effort_shaping::openai_reasoning_effort_for_level(effort_level)
 }
 
-pub(crate) fn google_thinking_level_for_effort(
-    effort_level: Option<clawde_core::effort::EffortLevel>,
-) -> &'static str {
-    clawde_api::providers::effort_shaping::google_thinking_level_for_effort(effort_level)
-}
-
 pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
     clawde_api::providers::effort_shaping::openai_reasoning_model(model_id)
 }
 
 pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
-    matches!(
-        provider_id,
-        "openai"
-            | "azure"
-            | "groq"
-            | "mistral"
-            | "deepseek"
-            | "xai"
-            | "openrouter"
-            | "togetherai"
-            | "together-ai"
-            | "perplexity"
-            | "cerebras"
-            | "deepinfra"
-            | "venice"
-            | "huggingface"
-            | "nvidia"
-            | "cloudflare"
-            | "siliconflow"
-            | "sambanova"
-            | "moonshot"
-            | "zhipu"
-            | "zai"
-            | "qwen"
-            | "alibaba"
-            | "nebius"
-            | "novita"
-            | "ovhcloud"
-            | "scaleway"
-            | "vultr"
-            | "vultr-ai"
-            | "baseten"
-            | "friendli"
-            | "upstage"
-            | "stepfun"
-            | "fireworks"
-            | "ollama"
-            | "codex"
-            | "openai-codex"
-            | "poolside"
-            | "lmstudio"
-            | "lm-studio"
-            | "llamacpp"
-            | "llama-cpp"
-    )
+    // Single source of truth moved to clawde-api so the FreeProvider chain
+    // and the gateway share the same list (effort_shaping.rs).
+    clawde_api::providers::effort_shaping::is_openaiish_provider(provider_id)
 }
 
 pub(crate) fn build_provider_options(
@@ -75,11 +27,28 @@ pub(crate) fn build_provider_options(
     model_id: &str,
     effort_level: Option<clawde_core::effort::EffortLevel>,
     thinking_budget: Option<u32>,
+    max_tokens: Option<u32>,
     provider_settings_options: Option<&std::collections::HashMap<String, Value>>,
 ) -> Value {
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
 
+    // Per-provider thinking / effort shaping — single source of truth shared
+    // with the FreeProvider chain (effort_shaping::shape_provider_thinking).
+    // Direct-only extras (Codex effort tiers, reasoning summary, gpt-5 text
+    // verbosity) are layered on below so the shared core stays free of
+    // provider-specific quirks.
+    clawde_api::providers::effort_shaping::shape_provider_thinking(
+        &mut options,
+        provider_id,
+        &model_id,
+        effort_level,
+        thinking_budget,
+        max_tokens,
+    );
+
+    // GitHub Copilot adapter: claude models take a thinking budget; gpt-5
+    // (non-pro) takes reasoningEffort + encrypted reasoning round-trip.
     if provider_id == "github-copilot" {
         if model_id.contains("claude") {
             options.insert(
@@ -109,75 +78,8 @@ pub(crate) fn build_provider_options(
         }
     }
 
-    if provider_id == "google" && model_id.contains("gemini") {
-        if model_id.contains("2.5") {
-            if effort_level == Some(clawde_core::effort::EffortLevel::None) {
-                options.insert(
-                    "thinkingConfig".to_string(),
-                    serde_json::json!({
-                        "includeThoughts": false,
-                        "thinkingBudget": 0,
-                    }),
-                );
-            } else if let Some(budget) = thinking_budget {
-                options.insert(
-                    "thinkingConfig".to_string(),
-                    serde_json::json!({
-                        "includeThoughts": true,
-                        "thinkingBudget": budget,
-                    }),
-                );
-            }
-        } else if model_id.contains("3.") || model_id.contains("gemini-3") {
-            let disabled = effort_level == Some(clawde_core::effort::EffortLevel::None);
-            options.insert(
-                "thinkingConfig".to_string(),
-                serde_json::json!({
-                    "includeThoughts": !disabled,
-                    "thinkingLevel": if disabled {
-                        "minimal"
-                    } else {
-                        google_thinking_level_for_effort(effort_level)
-                    },
-                }),
-            );
-        }
-    }
-
-    // DeepSeek exposes thinking independently of the OpenAI GPT reasoning
-    // model families. Keep this mapping provider/model-specific so DeepSeek V4
-    // and reasoner/chat variants do not depend on an unrelated GPT-5 check.
-    if provider_id == "deepseek" {
-        match effort_level {
-            Some(clawde_core::effort::EffortLevel::None)
-            | Some(clawde_core::effort::EffortLevel::Low) => {
-                options.insert(
-                    "thinking".to_string(),
-                    serde_json::json!({ "type": "disabled" }),
-                );
-            }
-            Some(clawde_core::effort::EffortLevel::XHigh)
-            | Some(clawde_core::effort::EffortLevel::Max)
-            | Some(clawde_core::effort::EffortLevel::Ultracode) => {
-                options.insert(
-                    "thinking".to_string(),
-                    serde_json::json!({ "type": "enabled" }),
-                );
-                options.insert("reasoningEffort".to_string(), serde_json::json!("max"));
-            }
-            None
-            | Some(clawde_core::effort::EffortLevel::Minimal)
-            | Some(clawde_core::effort::EffortLevel::Medium)
-            | Some(clawde_core::effort::EffortLevel::High) => {
-                options.insert(
-                    "thinking".to_string(),
-                    serde_json::json!({ "type": "enabled" }),
-                );
-                options.insert("reasoningEffort".to_string(), serde_json::json!("high"));
-            }
-        }
-    }
-
+    // Amazon Bedrock: reasoningConfig for claude (budgetTokens) or effort
+    // mapped to maxReasoningEffort.
     if provider_id == "amazon-bedrock" {
         if model_id.contains("anthropic") || model_id.contains("claude") {
             if let Some(budget) = thinking_budget {
@@ -200,29 +102,23 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // OpenAI reasoning families: the shared core already inserted
+    // reasoningEffort; layer the direct-only Codex (ChatGPT) extras on top.
     if is_openaiish_provider(provider_id) && is_openai_reasoning_model(&model_id) {
-        let reasoning_effort = effort_level
-            .map(reasoning_effort_for_level)
-            .unwrap_or("medium");
-        // Codex (ChatGPT) accepts the full gpt-5 effort ladder including
-        // `xhigh`, so surface the top tiers (XHigh / Max / Ultracode) as "extra
-        // high" there — matching opencode — without changing the value sent to
+        // Codex accepts the full gpt-5 effort ladder including `xhigh`, so
+        // surface the top tiers (XHigh / Max / Ultracode) as "extra high"
+        // there — matching opencode — without changing the value sent to
         // other OpenAI-compatible providers that may not accept it.
-        let reasoning_effort = if matches!(provider_id, "codex" | "openai-codex")
+        if matches!(provider_id, "codex" | "openai-codex")
             && matches!(
                 effort_level,
                 Some(clawde_core::effort::EffortLevel::XHigh)
                     | Some(clawde_core::effort::EffortLevel::Max)
                     | Some(clawde_core::effort::EffortLevel::Ultracode)
-            ) {
-            "xhigh"
-        } else {
-            reasoning_effort
-        };
-        options.insert(
-            "reasoningEffort".to_string(),
-            serde_json::json!(reasoning_effort),
-        );
+            )
+        {
+            options.insert("reasoningEffort".to_string(), serde_json::json!("xhigh"));
+        }
 
         // Match opencode's gpt-5 defaults for the Codex (ChatGPT) endpoint:
         // request an auto reasoning summary and carry encrypted reasoning state
@@ -246,6 +142,7 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // OpenRouter: request usage in responses; gemini-3 reasoning effort hint.
     if provider_id == "openrouter" {
         options.insert("usage".to_string(), serde_json::json!({ "include": true }));
         if model_id.contains("gemini-3") {
@@ -254,34 +151,6 @@ pub(crate) fn build_provider_options(
                 serde_json::json!({ "effort": "high" }),
             );
         }
-    }
-
-    if provider_id == "qwen" && thinking_budget.is_some() && !model_id.contains("kimi-k2-thinking")
-    {
-        options.insert("enable_thinking".to_string(), serde_json::json!(true));
-    }
-
-    // Z.AI / Zhipu: GLM models use `thinking.type` enabled/disabled.
-    // Thinking is on by default for reasoning models; effort None disables it.
-    if provider_id == "zhipu" || provider_id == "zai" {
-        let enabled = effort_level != Some(clawde_core::effort::EffortLevel::None);
-        options.insert(
-            "thinking".to_string(),
-            serde_json::json!({
-                "type": if enabled { "enabled" } else { "disabled" },
-                "clear_thinking": false,
-            }),
-        );
-    }
-
-    // Poolside: binary thinking toggle. Thinking is on by default and
-    // consumes from max_tokens; effort None turns it off via
-    // chat_template_kwargs. No multi-level control exists.
-    if provider_id == "poolside" && effort_level == Some(clawde_core::effort::EffortLevel::None) {
-        options.insert(
-            "chat_template_kwargs".to_string(),
-            serde_json::json!({ "enable_thinking": false }),
-        );
     }
 
     // Merge provider-specific options from settings.json (e.g. Ollama's
