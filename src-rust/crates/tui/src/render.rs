@@ -420,6 +420,15 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Total display width of a span list, used to check whether right-side
+/// footer/prompt spans fit within the available columns.
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
 // -----------------------------------------------------------------------
 // Startup notice helpers
 // -----------------------------------------------------------------------
@@ -720,6 +729,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     } else {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
+    // CWD row below the prompt input — 1 row when enabled, 0 otherwise.
+    let cwd_row_height: u16 =
+        if app.settings_screen.show_cwd && app.has_credentials && app.current_dir.is_some() {
+            1
+        } else {
+            0
+        };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -728,6 +744,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Length(separator_height),
             Constraint::Length(status_height),
             Constraint::Length(prompt_height),
+            Constraint::Length(cwd_row_height),
             Constraint::Length(suggestions_height),
             Constraint::Length(1),
         ])
@@ -752,10 +769,40 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_input(frame, app, chunks[3], prompt_focused);
     }
     app.last_input_area.set(chunks[3]);
-    if suggestions_height > 0 {
-        render_prompt_suggestions(frame, app, chunks[4]);
+    // CWD row — rendered below the prompt input, left-aligned and dimmed.
+    if cwd_row_height > 0 {
+        if let Some(ref dir) = app.current_dir {
+            let home = dirs::home_dir()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty());
+            let display_dir = match home {
+                Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
+                _ => dir.clone(),
+            };
+            let cwd_area = Rect {
+                x: chunks[4].x + 2, // indent to align with prompt text
+                y: chunks[4].y,
+                width: chunks[4].width.saturating_sub(2),
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    display_dir,
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                cwd_area,
+            );
+        }
     }
-    render_footer(frame, app, chunks[5]);
+    if suggestions_height > 0 {
+        render_prompt_suggestions(frame, app, chunks[5]);
+    }
+    render_footer(frame, app, chunks[6]);
+
+    // Free-model dropdown (Alt+J/K) — anchored just above the prompt input.
+    if app.free_model_popup.visible {
+        crate::free_model_popup::render_free_model_popup(frame, &app.free_model_popup, chunks[3]);
+    }
 
     // Overlays (rendered on top in Z-order)
 
@@ -1584,7 +1631,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_stateful_widget(scrollbar, msg_area, &mut scrollbar_state);
     }
 
-    // “â†” N new messages” indicator when scrolled up and new messages arrived.
+    // “↓ N new messages” jump-to-bottom pill when the user is scrolled up
     if app.new_messages_while_scrolled > 0 && msg_area.height > 4 && msg_area.width > 20 {
         let indicator = format!(
             " \u{2193} {} new message{} ",
@@ -1614,6 +1661,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]);
         frame.render_widget(Paragraph::new(vec![ind_line]), ind_area);
+        // Record the pill's horizontal span so a click on it can jump to bottom.
+        app.last_jump_bottom_area
+            .set(Some((ind_y, ind_x, ind_x.saturating_add(ind_area.width))));
+    } else {
+        app.last_jump_bottom_area.set(None);
     }
 }
 
@@ -3004,10 +3056,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         let dim = p.hint;
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(status_area.width.min(50)),
-            ])
+            .constraints([Constraint::Min(1), Constraint::Min(1)])
             .split(status_area);
 
         let left_line = if app.has_credentials {
@@ -3088,27 +3137,6 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             ])
         };
 
-        // Current directory badge — always shown at the far right of the
-        // model/mode status row, right-aligned. Uses dirs::home_dir() so this
-        // works on Windows (where $HOME is unset and the home is
-        // $USERPROFILE). Guard against an empty home string: `str::replace("",
-        // "~")` inserts "~" between every character, producing the infamous
-        // `~X~:~\~B~i~g~g~e~r~…` output.
-        let cwd_span: Option<Span<'static>> = if app.settings_screen.show_cwd {
-            app.current_dir.as_ref().map(|dir| {
-                let home = dirs::home_dir()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    .filter(|s| !s.is_empty());
-                let display_dir = match home {
-                    Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
-                    _ => dir.clone(),
-                };
-                Span::styled(display_dir, Style::default().fg(Color::DarkGray))
-            })
-        } else {
-            None
-        };
-
         // Context-sensitive hints in the right slot. These are suppressed
         // once the prompt has text so they don't compete with typing, and
         // during streaming when the input is readonly.
@@ -3177,7 +3205,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             } else if app.config.selected_provider_id() == "free"
                 && app.free_model_defaults.len() > 1
             {
-                "Alt+U cycle"
+                "Alt+J/K models"
             } else {
                 "? shortcuts · Ctrl+/ keys"
             };
@@ -3207,17 +3235,27 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         } else {
             Line::from(Vec::<Span>::new())
         };
-        // Pin the cwd to the far right of the status row — it always renders
-        // (even while typing/streaming, when the hint above is suppressed),
-        // right-aligned via the render call below.
-        if let Some(cwd) = cwd_span {
-            if !right_hint.spans.is_empty() {
-                right_hint
-                    .spans
-                    .push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+
+        // Truncate the right hint to fit within the right column so a
+        // right-aligned Paragraph never wraps/clips mid-content.
+        {
+            let right_w = chunks[1].width.saturating_sub(1) as usize;
+            let mut used = 0usize;
+            let mut last_fit = 0usize;
+            for (i, s) in right_hint.spans.iter().enumerate() {
+                let sw = UnicodeWidthStr::width(s.content.as_ref());
+                if used + sw > right_w {
+                    break;
+                }
+                used += sw;
+                last_fit = i + 1;
             }
-            right_hint.spans.push(cwd);
+            right_hint.spans.truncate(last_fit);
         }
+        // NOTE: left_line is NOT truncated here. Ratatui wraps long lines
+        // naturally; truncating would silently drop important context like
+        // the CWD. On very narrow terminals the wrapped tail is clipped by
+        // the 1-row status area, which is acceptable.
 
         let left_padded = Rect {
             x: chunks[0].x + 1,
@@ -3969,7 +4007,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Right side: status metrics and lightweight badges.
-    let right_spans: Vec<Span> = {
+    let mut right_spans: Vec<Span> = {
         let mut parts: Vec<Span> = Vec::new();
 
         // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning.
@@ -4159,31 +4197,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // Current directory (if settings enabled)
-        if app.settings_screen.show_cwd {
-            if let Some(ref dir) = app.current_dir {
-                if !parts.is_empty() {
-                    parts.push(Span::raw("  "));
-                }
-                // Use dirs::home_dir() so this works on Windows (where $HOME
-                // is unset and the home is $USERPROFILE). Guard against an
-                // empty home string: `str::replace("", "~")` inserts "~"
-                // between every character, producing the infamous
-                // `~X~:~\~B~i~g~g~e~r~…` output.
-                let home = dirs::home_dir()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    .filter(|s| !s.is_empty());
-                let display_dir = match home {
-                    Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
-                    _ => dir.clone(),
-                };
-                parts.push(Span::styled(
-                    display_dir,
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-
         // Output style indicator (only when non-default)
         if app.output_style != "auto" {
             if !parts.is_empty() {
@@ -4227,16 +4240,24 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         parts
     };
 
-    // Gap fill
+    // Gap fill — when left + right exceed available width, drop trailing
+    // right-side spans (least important last: bridge, cwd, output-style,
+    // agent badge, goal badge, rate limits, cost) until the line fits.
+    let usable = footer_area.width.saturating_sub(2) as usize; // minus 1-char padding each side
     let left_len: usize = left_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
+    let right_available = usable.saturating_sub(left_len);
+    // Trim trailing right-side spans that no longer fit.
+    while spans_width(&right_spans) > right_available && !right_spans.is_empty() {
+        right_spans.pop();
+    }
     let right_len: usize = right_spans
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let gap = (footer_area.width.saturating_sub(2) as usize).saturating_sub(left_len + right_len);
+    let gap = usable.saturating_sub(left_len + right_len);
 
     let mut spans = left_spans;
     spans.push(Span::raw(" ".repeat(gap)));

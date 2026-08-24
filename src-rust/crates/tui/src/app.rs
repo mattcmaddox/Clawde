@@ -1559,8 +1559,9 @@ pub struct App {
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// Effort-level picker (/effort with no args).
     pub effort_picker: crate::effort_picker::EffortPickerState,
-    /// Set when the effort picker applied a selection on Enter (so the CLI
-    /// runtime can surface it into `current_effort` / the persisted session).
+    /// Set when the effort level changed via the TUI — either the effort
+    /// picker's Enter or an Alt+H/L nudge — so the CLI runtime can surface it
+    /// into `current_effort` / the persisted session.
     pub effort_picker_applied: bool,
     /// Task-routing pinning dialog (/routing edit — audit spec §8.6).
     pub routing_dialog: crate::routing_dialog::RoutingDialogState,
@@ -1678,6 +1679,9 @@ pub struct App {
     /// status line. 0 = auto (abstract label), 1..N = corresponding
     /// upstream from `free_model_defaults`.  Cycled via Alt+U.
     pub free_upstream_index: usize,
+    /// Free-model dropdown opened by Alt+J/K — lists "auto" plus every
+    /// configured free upstream; Enter pins the selection via `set_model`.
+    pub free_model_popup: crate::free_model_popup::FreeModelPopupState,
     pub arg_completions: Option<ArgCompletionsFn>,
     /// Alias → canonical slash-command mapping for the prompt typeahead.
     /// Populated once at startup from `clawde_commands::all_command_aliases()`
@@ -1826,6 +1830,13 @@ pub struct App {
     /// recent verify box starts. Written by the renderer alongside the box;
     /// read on badge click to compute the scroll offset that reveals it.
     pub last_verify_box_line: Cell<Option<usize>>,
+
+    /// On-screen `(row, start_col, end_col)` of the "↓ N new messages"
+    /// jump-to-bottom pill from the last render. Written by the renderer; read
+    /// on mouse-down so a click on the pill snaps the transcript back to the
+    /// newest output. `None` when the pill was not drawn (at the bottom, or a
+    /// transcript too short to overflow).
+    pub last_jump_bottom_area: Cell<Option<(u16, u16, u16)>>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -2234,6 +2245,7 @@ impl App {
             ollama_loaded_models: Vec::new(),
             last_health_sweep: None,
             free_upstream_index: 0,
+            free_model_popup: crate::free_model_popup::FreeModelPopupState::default(),
             arg_completions: None,
             slash_aliases: Vec::new(),
             user_help_entries: Vec::new(),
@@ -2303,6 +2315,7 @@ impl App {
             last_max_scroll: Cell::new(0),
             last_verify_badge_area: Cell::new(None),
             last_verify_box_line: Cell::new(None),
+            last_jump_bottom_area: Cell::new(None),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
@@ -2920,6 +2933,118 @@ impl App {
         self.model_picker.task_sort = task;
         self.persist_free_task_sort();
         self.status_message = Some(format!("Task sort: {}.", task.label()));
+    }
+
+    /// Open the free-model dropdown (Alt+J/K). Model-first: lists "auto" plus
+    /// one entry per **model family** that has at least one configured free
+    /// upstream. Each family entry routes via `free/family/<slug>`, which
+    /// round-robins across every configured provider hosting that family — so
+    /// the user picks a model, not a provider. Enter pins it via `set_model`.
+    fn open_free_model_popup(&mut self) {
+        use crate::free_model_popup::FreeModelItem;
+        // Upstream ids that actually have keys (from the live free chain).
+        let configured: std::collections::HashSet<&str> = self
+            .free_model_defaults
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect();
+
+        let mut items = Vec::with_capacity(configured.len() + 1);
+        items.push(FreeModelItem {
+            id: "free/auto".to_string(),
+            title: "Auto".to_string(),
+            subtitle: "stacks every configured free key".to_string(),
+        });
+
+        // Model-first section: one entry per model family, in catalog order,
+        // limited to families hosted by at least one configured upstream.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for upstream in clawde_api::FREE_CATALOG {
+            if !configured.contains(upstream.id) {
+                continue;
+            }
+            if !seen.insert(upstream.model_family) {
+                continue;
+            }
+            let hosts: Vec<&str> = clawde_api::FREE_CATALOG
+                .iter()
+                .filter(|u| u.model_family == upstream.model_family && configured.contains(u.id))
+                .map(|u| u.title)
+                .collect();
+            items.push(FreeModelItem {
+                id: format!("free/family/{}", upstream.model_family),
+                title: upstream.model_family.to_string(),
+                subtitle: format!("{} · {}", upstream.specialty, hosts.join(", ")),
+            });
+        }
+
+        // Preselect the family of the current model when it is a family id or
+        // a pinned `<provider>/<model>`; otherwise fall back to auto.
+        let current = self.free_family_for_current_model();
+        self.free_model_popup.open(items, &current);
+    }
+
+    /// Map the current model name to a `free/family/<slug>` id for popup
+    /// preselection. Returns `free/auto` when the model is not a family id or
+    /// a pinned upstream model.
+    fn free_family_for_current_model(&self) -> String {
+        let name = self.model_name.as_str();
+        if let Some(rest) = name
+            .strip_prefix("free/family/")
+            .or_else(|| name.strip_prefix("family/"))
+        {
+            return format!("free/family/{}", rest);
+        }
+        if let Some((provider, _)) = name.split_once('/') {
+            if let Some(upstream) = clawde_api::FREE_CATALOG.iter().find(|u| u.id == provider) {
+                return format!("free/family/{}", upstream.model_family);
+            }
+        }
+        "free/auto".to_string()
+    }
+
+    /// Apply the selected free-model popup entry: pin the model and close.
+    fn confirm_free_model_popup(&mut self) {
+        if let Some(item) = self.free_model_popup.selected() {
+            let id = item.id.clone();
+            self.free_model_popup.close();
+            self.set_model(id.clone());
+            self.status_message = Some(format!("Model: {}.", id));
+        }
+    }
+
+    /// Step the effort level one rung up (+1) or down (-1) along the current
+    /// model's supported ladder, clamping at both ends (never wraps).
+    ///
+    /// The ladder is model-adaptive: `supported_efforts` returns the reasoning
+    /// tiers the active provider/model actually exposes (with `Ultracode` always
+    /// last), so stepping never lands on a level the model can't express.
+    fn nudge_effort(&mut self, delta: i8) {
+        let provider = self.config.selected_provider_id();
+        let model_id = self
+            .model_name
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(&self.model_name);
+        let levels = clawde_api::supported_efforts(provider, model_id, Some(&self.model_registry));
+        if levels.is_empty() {
+            return;
+        }
+        let cur = crate::effort_picker::index_for(&levels, self.effort_level);
+        // Clamp, do not wrap: at the ends the step is a no-op.
+        let next = ((cur as i64) + i64::from(delta)).clamp(0, levels.len() as i64 - 1) as usize;
+        if next != cur {
+            self.effort_level = levels[next];
+            // Flag the change so the CLI runtime syncs it into `current_effort`
+            // (the value that actually drives queries) and the persisted
+            // session — same bridge the effort picker's Enter uses. Without
+            // this the badge changes but requests keep the old effort.
+            self.effort_picker_applied = true;
+            self.status_message = Some(format!(
+                "Effort {} {}.",
+                self.effort_level.symbol(),
+                self.effort_level.label()
+            ));
+        }
     }
 
     /// Update the Rustail pose for this frame — handles temporary poses, random blinks,
@@ -4015,6 +4140,7 @@ impl App {
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
+            || self.free_model_popup.visible
             || self.routing_dialog.visible
             || self.session_browser.visible
             || self.session_branching.visible
@@ -5116,6 +5242,19 @@ impl App {
                 KeyCode::Left => {
                     self.onboarding_dialog.prev_page();
                 }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Free-model dropdown (Alt+J/K). Up/Down and j/k move the selection;
+        // Enter pins it via set_model and closes; Esc cancels.
+        if self.free_model_popup.visible {
+            match key.code {
+                KeyCode::Esc => self.free_model_popup.close(),
+                KeyCode::Up | KeyCode::Char('k') => self.free_model_popup.select_prev(),
+                KeyCode::Down | KeyCode::Char('j') => self.free_model_popup.select_next(),
+                KeyCode::Enter => self.confirm_free_model_popup(),
                 _ => {}
             }
             return false;
@@ -6601,6 +6740,10 @@ impl App {
                         // from the picker does NOT clear it.
                         if let Some(e) = effort {
                             self.effort_level = e;
+                            // Same runtime-sync bridge as the effort picker /
+                            // Alt+H/L: without the flag the CLI never learns
+                            // about the inline effort selection.
+                            self.effort_picker_applied = true;
                         }
                         // Store explicit selections in the canonical
                         // "provider/model" form for non-Anthropic providers.
@@ -7506,7 +7649,7 @@ impl App {
             }
 
             // ---- History search ----------------------------------------
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Open the new overlay-based history search
                 let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
@@ -8714,7 +8857,7 @@ impl App {
                 false
             }
             "jumpToPreviousError" => {
-                // Ctrl+Shift+.: Jump to previous error/issue in messages
+                // Alt+.: Jump to previous error/issue in messages
                 self.jump_to_previous_error();
                 false
             }
@@ -8737,7 +8880,7 @@ impl App {
                 false
             }
             "openHelp" => {
-                // Alt+H: Open help (alternative to F1)
+                // Alt+/: Open help (alternative to F1)
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
                 false
@@ -8757,6 +8900,20 @@ impl App {
                 if count > 0 {
                     self.free_upstream_index = (self.free_upstream_index + 1) % (count + 1);
                     // +1 for auto
+                }
+                false
+            }
+            "cycleFreeUpstreamPrev" => {
+                let count = self.free_model_defaults.len();
+                if count > 0 {
+                    // Backward wrap: 0 (auto) wraps to the last upstream.
+                    self.free_upstream_index = (self.free_upstream_index + count) % (count + 1);
+                }
+                false
+            }
+            "openFreeModelPopup" => {
+                if !self.is_streaming {
+                    self.open_free_model_popup();
                 }
                 false
             }
@@ -8799,6 +8956,18 @@ impl App {
                 }
                 false
             }
+            "effortIncrease" => {
+                if !self.is_streaming {
+                    self.nudge_effort(1);
+                }
+                false
+            }
+            "effortDecrease" => {
+                if !self.is_streaming {
+                    self.nudge_effort(-1);
+                }
+                false
+            }
             "openCommandPalette" => {
                 if !self.is_streaming {
                     self.command_palette.open();
@@ -8829,7 +8998,7 @@ impl App {
                     );
                 } else {
                     self.status_message = Some(format!(
-                        "Last search backend: {} (press Ctrl+Shift+S again or /sources)",
+                        "Last search backend: {} (press Alt+S again or /sources)",
                         backend,
                     ));
                 }
@@ -9799,6 +9968,7 @@ impl App {
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
+            || self.free_model_popup.visible
             || self.routing_dialog.visible
             || self.session_browser.visible
             || self.session_branching.visible
@@ -10020,6 +10190,21 @@ impl App {
                             }
                             return;
                         }
+                    }
+                }
+
+                // Click on the "↓ N new messages" pill: snap the transcript
+                // back to the newest output (re-enable live-following).
+                if let Some((row, start, end)) = self.last_jump_bottom_area.get() {
+                    if mouse_event.row == row
+                        && mouse_event.column >= start
+                        && mouse_event.column < end
+                    {
+                        self.scroll_offset = 0;
+                        self.auto_scroll = true;
+                        self.new_messages_while_scrolled = 0;
+                        self.invalidate_transcript();
+                        return;
                     }
                 }
 
@@ -12375,6 +12560,259 @@ mod tests {
     }
 
     #[test]
+    fn test_cycle_free_upstream_advances_and_wraps() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Seed two upstreams so the cycle has somewhere to go.
+        app.free_model_defaults = vec![
+            (
+                "hf".to_string(),
+                "HuggingFace".to_string(),
+                "m1".to_string(),
+            ),
+            ("groq".to_string(), "Groq".to_string(), "m2".to_string()),
+        ];
+        assert_eq!(app.free_upstream_index, 0); // auto
+        app.handle_keybinding_action("cycleFreeUpstream");
+        assert_eq!(app.free_upstream_index, 1);
+        app.handle_keybinding_action("cycleFreeUpstream");
+        assert_eq!(app.free_upstream_index, 2);
+        app.handle_keybinding_action("cycleFreeUpstream");
+        assert_eq!(
+            app.free_upstream_index, 0,
+            "wraps back to auto after last upstream"
+        );
+    }
+
+    #[test]
+    fn test_cycle_free_upstream_prev_wraps_backward() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_defaults = vec![
+            (
+                "hf".to_string(),
+                "HuggingFace".to_string(),
+                "m1".to_string(),
+            ),
+            ("groq".to_string(), "Groq".to_string(), "m2".to_string()),
+        ];
+        // From auto, going backward lands on the last upstream.
+        app.handle_keybinding_action("cycleFreeUpstreamPrev");
+        assert_eq!(app.free_upstream_index, 2);
+        app.handle_keybinding_action("cycleFreeUpstreamPrev");
+        assert_eq!(app.free_upstream_index, 1);
+        app.handle_keybinding_action("cycleFreeUpstreamPrev");
+        assert_eq!(app.free_upstream_index, 0);
+        // Forward then backward returns to start.
+        app.handle_keybinding_action("cycleFreeUpstream");
+        assert_eq!(app.free_upstream_index, 1);
+        app.handle_keybinding_action("cycleFreeUpstreamPrev");
+        assert_eq!(app.free_upstream_index, 0);
+    }
+
+    #[test]
+    fn test_open_free_model_popup_is_model_first() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // huggingface + nvidia both host llama-3.3-70b (same model family),
+        // so they must collapse into ONE family entry — the popup lists
+        // models, not providers.
+        app.free_model_defaults = vec![
+            (
+                "huggingface".to_string(),
+                "Hugging Face".to_string(),
+                "llama-3.3-70b".to_string(),
+            ),
+            (
+                "nvidia".to_string(),
+                "NVIDIA NIM".to_string(),
+                "llama-3.3-70b".to_string(),
+            ),
+            (
+                "groq".to_string(),
+                "Groq".to_string(),
+                "gpt-oss-120b".to_string(),
+            ),
+        ];
+        app.handle_keybinding_action("openFreeModelPopup");
+        assert!(app.free_model_popup.visible);
+        let ids: Vec<&str> = app
+            .free_model_popup
+            .items
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        // Auto first, then one entry per model family (model-first, not
+        // provider-first).
+        assert_eq!(
+            ids,
+            vec![
+                "free/auto",
+                "free/family/llama-3.3-70b",
+                "free/family/gpt-oss-120b",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_free_model_popup_enter_pins_selected_family() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_defaults = vec![
+            (
+                "huggingface".to_string(),
+                "Hugging Face".to_string(),
+                "llama-3.3-70b".to_string(),
+            ),
+            (
+                "groq".to_string(),
+                "Groq".to_string(),
+                "gpt-oss-120b".to_string(),
+            ),
+        ];
+        app.handle_keybinding_action("openFreeModelPopup");
+        // Rows: auto, llama-3.3-70b, gpt-oss-120b. Current (free/auto) is
+        // preselected, so two downs land on gpt-oss-120b. Confirm with Enter.
+        app.free_model_popup.select_next();
+        app.free_model_popup.select_next();
+        app.confirm_free_model_popup();
+        assert!(!app.free_model_popup.visible);
+        assert_eq!(app.model_name, "free/family/gpt-oss-120b");
+    }
+
+    #[test]
+    fn test_free_model_popup_preselects_current_family() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_defaults = vec![
+            (
+                "huggingface".to_string(),
+                "Hugging Face".to_string(),
+                "llama-3.3-70b".to_string(),
+            ),
+            (
+                "groq".to_string(),
+                "Groq".to_string(),
+                "gpt-oss-120b".to_string(),
+            ),
+        ];
+        app.model_name = "free/family/gpt-oss-120b".to_string();
+        app.handle_keybinding_action("openFreeModelPopup");
+        // Current family is preselected.
+        assert_eq!(
+            app.free_model_popup.selected().map(|i| i.id.as_str()),
+            Some("free/family/gpt-oss-120b")
+        );
+    }
+
+    #[test]
+    fn test_free_model_popup_auto_row_resets_to_free_auto() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.free_model_defaults = vec![
+            (
+                "huggingface".to_string(),
+                "Hugging Face".to_string(),
+                "llama-3.3-70b".to_string(),
+            ),
+            (
+                "groq".to_string(),
+                "Groq".to_string(),
+                "gpt-oss-120b".to_string(),
+            ),
+        ];
+        app.model_name = "free/family/gpt-oss-120b".to_string();
+        app.handle_keybinding_action("openFreeModelPopup");
+        // Rows: auto, llama-3.3-70b, gpt-oss-120b — two prevs wraps to auto.
+        app.free_model_popup.select_prev();
+        app.free_model_popup.select_prev();
+        app.confirm_free_model_popup();
+        assert_eq!(app.model_name, "free/auto");
+    }
+
+    #[test]
+    fn test_cycle_free_upstream_noop_without_defaults() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        assert!(app.free_model_defaults.is_empty());
+        app.handle_keybinding_action("cycleFreeUpstream");
+        app.handle_keybinding_action("cycleFreeUpstreamPrev");
+        assert_eq!(app.free_upstream_index, 0);
+    }
+    #[test]
+    fn test_effort_increase_steps_up_along_supported_ladder() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Default free/auto resolves to a base ladder (Low, Medium, High,
+        // Ultracode). Start at the bottom rung and step up.
+        app.effort_level = crate::model_picker::EffortLevel::Low;
+        app.handle_keybinding_action("effortIncrease");
+        assert_eq!(app.effort_level, crate::model_picker::EffortLevel::Medium);
+        app.handle_keybinding_action("effortIncrease");
+        assert_eq!(app.effort_level, crate::model_picker::EffortLevel::High);
+    }
+
+    #[test]
+    fn test_effort_decrease_steps_down_along_supported_ladder() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Start at the top rung and step down.
+        app.effort_level = crate::model_picker::EffortLevel::Ultracode;
+        app.handle_keybinding_action("effortDecrease");
+        assert_eq!(app.effort_level, crate::model_picker::EffortLevel::High);
+        app.handle_keybinding_action("effortDecrease");
+        assert_eq!(app.effort_level, crate::model_picker::EffortLevel::Medium);
+    }
+
+    #[test]
+    fn test_effort_steps_clamp_at_both_ends_no_wrap() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // Bottom rung: decreasing is a no-op (never wraps to Ultracode).
+        app.effort_level = crate::model_picker::EffortLevel::Low;
+        app.handle_keybinding_action("effortDecrease");
+        assert_eq!(app.effort_level, crate::model_picker::EffortLevel::Low);
+        // Top rung: increasing is a no-op (never wraps to Low).
+        app.effort_level = crate::model_picker::EffortLevel::Ultracode;
+        app.handle_keybinding_action("effortIncrease");
+        assert_eq!(
+            app.effort_level,
+            crate::model_picker::EffortLevel::Ultracode
+        );
+    }
+
+    #[test]
+    fn test_effort_nudge_sets_applied_flag_for_runtime_sync() {
+        // Regression: the CLI runtime only surfaces a TUI effort change into
+        // `current_effort` (the value that actually drives queries) when
+        // `effort_picker_applied` is set. Without this the Alt+H/L badge
+        // changed but requests kept the old effort.
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.effort_level = crate::model_picker::EffortLevel::Low;
+        app.effort_picker_applied = false;
+        app.handle_keybinding_action("effortIncrease");
+        assert!(
+            app.effort_picker_applied,
+            "a successful nudge must flag the change"
+        );
+    }
+
+    #[test]
+    fn test_effort_nudge_noop_does_not_set_applied_flag() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // At the top rung, increasing is a no-op — no flag, no phantom sync.
+        app.effort_level = crate::model_picker::EffortLevel::Ultracode;
+        app.effort_picker_applied = false;
+        app.handle_keybinding_action("effortIncrease");
+        assert!(
+            !app.effort_picker_applied,
+            "a clamped no-op must not flag a change"
+        );
+    }
+
+    #[test]
     fn test_toggle_thinking_expand_expands_and_collapses_all() {
         let mut app = make_app();
 
@@ -13071,6 +13509,55 @@ mod tests {
         assert_eq!(app.scroll_offset, 60);
     }
 
+    #[test]
+    fn test_jump_bottom_pill_click_snaps_transcript_to_bottom() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.new_messages_while_scrolled = 3;
+        app.scroll_offset = 40;
+        app.auto_scroll = false;
+        app.last_max_scroll.set(100);
+        // Pill rendered on the transcript bottom row, cols 40..60.
+        app.last_jump_bottom_area.set(Some((10, 40, 60)));
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 50,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        // The transcript snaps back to live-following at the newest output.
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+        assert_eq!(app.new_messages_while_scrolled, 0);
+    }
+
+    #[test]
+    fn test_jump_bottom_pill_click_outside_does_not_jump() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.new_messages_while_scrolled = 2;
+        app.scroll_offset = 25;
+        app.auto_scroll = false;
+        app.last_max_scroll.set(100);
+        // Pill spans cols 40..60 on row 10.
+        app.last_jump_bottom_area.set(Some((10, 40, 60)));
+
+        // Same row but a column outside the pill (left of it).
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.scroll_offset, 25);
+        assert!(!app.auto_scroll);
+        assert_eq!(app.new_messages_while_scrolled, 2);
+    }
+
     // ---- Help overlay -------------------------------------------------------
 
     #[test]
@@ -13131,18 +13618,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_shift_a_shortcut_opens_model_picker() {
+    fn test_alt_m_shortcut_opens_model_picker() {
         let mut app = make_app();
         app.has_credentials = true;
         app.config.provider = Some("anthropic".to_string());
 
-        // The model-picker shortcut moved from Ctrl+A to Ctrl+Shift+A in
-        // commit 8da4a29 to resolve the Ctrl+A conflict (goLineStart in the
-        // prompt). The default bindings map ctrl+shift+a -> openModelPicker.
-        app.handle_key_event(press_key(
-            KeyCode::Char('a'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        // The model-picker shortcut is now Alt+M (moved from Ctrl+Shift+A
+        // as part of the modifier-theme reorganization).
+        app.handle_key_event(press_key(KeyCode::Char('m'), KeyModifiers::ALT));
 
         assert!(app.model_picker.visible);
     }
@@ -13154,6 +13637,7 @@ mod tests {
         app.prompt_input.cursor = app.prompt_input.text.len();
         app.refresh_prompt_input();
 
+        // Command palette lives on Ctrl+K in the default preset.
         app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::CONTROL));
 
         assert!(app.command_palette.visible);
