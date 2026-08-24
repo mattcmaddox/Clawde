@@ -2605,10 +2605,17 @@ impl App {
             match rx.try_recv() {
                 Ok(Some(img)) => {
                     self.prompt_input.add_image(img.clone());
+                    // Persistent status line with image details.
+                    let dims = img
+                        .dimensions
+                        .map(|(w, h)| format!(" {}x{}", w, h))
+                        .unwrap_or_default();
+                    self.status_message = Some(format!("Image: {}{}", img.label, dims));
+                    // Brief toast flash so the user notices the capture.
                     self.push_notification(
                         NotificationKind::Info,
                         format!("Image attached: {}", img.label),
-                        Some(3),
+                        Some(1),
                     );
                 }
                 Ok(None) => {

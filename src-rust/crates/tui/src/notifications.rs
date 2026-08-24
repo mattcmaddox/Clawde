@@ -217,7 +217,8 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
         ));
     }
 
-    // ── Row 1: thin progress bar for timed notifications ──
+    // ── Row 1: pawprint countdown bar for timed notifications ──
+    // Each 🐾 is 2 display columns, so count = inner_w / 2.
     let progress_line = if let Some(exp) = notif.expires_at {
         let now = Instant::now();
         let remaining = if exp > now {
@@ -227,18 +228,19 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
         };
         let total_ms = (exp - notif.pushed_at).as_millis().max(1);
         let frac = (remaining as f64 / total_ms as f64).min(1.0);
-        let bar_w = (inner_w as f64 * frac) as usize;
-        let bar_w = bar_w.min(inner_w);
-        let filled: String = "─".repeat(bar_w);
-        let empty: String = " ".repeat(inner_w.saturating_sub(bar_w));
+        let max_paws = inner_w / 2;
+        let paw_count = (max_paws as f64 * frac) as usize;
+        let paws: String = "🐾".repeat(paw_count);
+        let empty: String = " ".repeat(inner_w.saturating_sub(paw_count * 2));
         Line::from(vec![
-            Span::styled(format!(" {}", filled), Style::default().fg(color)),
+            Span::styled(format!(" {}", paws), Style::default().fg(color)),
             Span::styled(empty, Style::default().fg(CLAWDE_MUTED)),
             Span::raw(" "),
         ])
     } else {
+        let max_paws = inner_w / 2;
         Line::from(Span::styled(
-            format!(" {}", "─".repeat(inner_w)),
+            format!(" {}", "🐾".repeat(max_paws)),
             Style::default().fg(CLAWDE_PANEL_BORDER),
         ))
     };

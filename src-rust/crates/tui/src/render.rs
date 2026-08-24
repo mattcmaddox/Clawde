@@ -3532,10 +3532,11 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     // Append agent/task state badges (goal, fast mode, plan mode) to Row 1.
     // These are persistent config indicators that describe how the agent
     // behaves, not how the model is configured (those go in Row 2).
-    if app.active_goal_badge.is_some() || app.fast_mode || app.plan_mode {
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        }
+    // Skip when the row is otherwise empty — the mode badge in Row 2
+    // already communicates the current mode, so a standalone "Plan"
+    // line with no context is noise.
+    if (app.active_goal_badge.is_some() || app.fast_mode || app.plan_mode) && !spans.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         if let Some(ref badge) = app.active_goal_badge {
             spans.push(Span::styled(
                 format!("\u{1f3af} {}", badge),

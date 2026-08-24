@@ -4667,7 +4667,9 @@ async fn run_interactive(
                             } else if path_part.starts_with('/') {
                                 std::path::PathBuf::from(path_part)
                             } else {
-                                continue; // relative paths: skip, too ambiguous
+                                // Relative path: resolve against the working
+                                // directory, matching parse_at_refs below.
+                                tool_ctx.working_dir.join(path_part)
                             };
                             if path.exists()
                                 && clawde_tui::image_paste::is_image_path(&path)
@@ -4680,10 +4682,11 @@ async fn run_interactive(
                                     .and_then(|n| n.to_str())
                                     .unwrap_or("image")
                                     .to_string();
+                                let dimensions = clawde_tui::image_paste::image_dimensions(&path);
                                 pending_imgs.push(clawde_tui::image_paste::PastedImage {
                                     path,
                                     label,
-                                    dimensions: None,
+                                    dimensions,
                                 });
                             }
                         }
@@ -4770,18 +4773,15 @@ async fn run_interactive(
                                     });
                                 }
 
-                                // Add image blocks
+                                // Add image blocks (media type sniffed from
+                                // the real bytes — a @photo.jpg must be sent
+                                // as image/jpeg, not image/png)
                                 for img in &pending_imgs {
-                                    if let Some(b64) =
-                                        clawde_tui::image_paste::encode_image_base64(&img.path)
+                                    if let Some(source) =
+                                        clawde_tui::image_paste::image_source_from_file(&img.path)
                                     {
                                         blocks.push(clawde_core::types::ContentBlock::Image {
-                                            source: clawde_core::types::ImageSource {
-                                                source_type: "base64".to_string(),
-                                                media_type: Some("image/png".to_string()),
-                                                data: Some(b64),
-                                                url: None,
-                                            },
+                                            source,
                                         });
                                     }
                                 }
@@ -4809,19 +4809,14 @@ async fn run_interactive(
                                     pending_imgs
                                         .iter()
                                         .filter_map(|img| {
-                                            clawde_tui::image_paste::encode_image_base64(&img.path)
-                                                .map(|b64| {
-                                                    clawde_core::types::ContentBlock::Image {
-                                                        source: clawde_core::types::ImageSource {
-                                                            source_type: "base64".to_string(),
-                                                            media_type: Some(
-                                                                "image/png".to_string(),
-                                                            ),
-                                                            data: Some(b64),
-                                                            url: None,
-                                                        },
-                                                    }
-                                                })
+                                            clawde_tui::image_paste::image_source_from_file(
+                                                &img.path,
+                                            )
+                                            .map(
+                                                |source| clawde_core::types::ContentBlock::Image {
+                                                    source,
+                                                },
+                                            )
                                         })
                                         .collect();
                                 blocks.push(clawde_core::types::ContentBlock::Text {

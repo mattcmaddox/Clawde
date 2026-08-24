@@ -36,9 +36,9 @@ These bindings are active in all contexts.
 | `Ctrl+C` | interrupt | Interrupt the current operation (non-rebindable) |
 | `Ctrl+D` | exit | Exit Clawde (non-rebindable) |
 | `Ctrl+L` | redraw | Redraw the terminal screen |
-| `Ctrl+R` | historySearch | Open interactive history search |
-| `Ctrl+B` | createBranch | Create a new git branch |
-| `Alt+H` | openHelp | Open the help panel |
+| `Alt+R` | historySearch | Open interactive history search |
+| `Alt+B` | createBranch | Create a new git branch |
+| `Alt+/` | openHelp | Open the help panel |
 
 ### Chat Context
 
@@ -58,21 +58,27 @@ These bindings are active when focus is in the chat input field.
 | `Page Down` | scrollDown | Scroll the conversation view down one page |
 | `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
 | `End` / `Cmd+Right` / `Ctrl+E` | goLineEnd | Move cursor to end of line |
-| `Ctrl+Left` | moveWordBackward | Move one word left |
-| `Ctrl+Right` | moveWordForward | Move one word right |
+| `Ctrl+Left` / `Alt+B` | moveWordBackward | Move one word left |
+| `Ctrl+Right` / `Alt+F` | moveWordForward | Move one word right |
 | `Alt+Left` | previousMessage | Jump to previous user/assistant message |
 | `Alt+Right` | nextMessage | Jump to next user/assistant message |
-| `Ctrl+Shift+A` | openModelPicker | Open the interactive model picker |
+| `Alt+M` | openModelPicker | Open the interactive model picker |
 | `Ctrl+K` | openCommandPalette | Open the slash command palette |
+| `Alt+R` | historySearch | Search command history |
+| `Alt+.` | jumpToPreviousError | Jump to previous error / issue |
+| `Alt+N` | jumpToNextError | Jump to next error / issue |
 | `Ctrl+U` | killToStart | Delete from cursor to beginning of line |
 | `Ctrl+W` / `Alt+Backspace` | killWord | Delete the word before the cursor |
 | `Alt+D` | deleteWord | Delete the word after the cursor |
 | `Ctrl+H` | deleteCharBefore | Delete character before cursor |
 | `Ctrl+L` | clearLine | Clear current input line |
-| `Ctrl+.` | jumpToNextError | Jump to next error / issue |
-| `Ctrl+Shift+.` | jumpToPreviousError | Jump to previous error / issue |
+| `Alt+J` / `Alt+K` | openFreeModelPopup | Open the free-model dropdown (auto + every configured free upstream); Enter pins the selection |
+| `Alt+U` | cycleFreeUpstream | Cycle to next free-mode upstream (forward alias) |
+| `Alt+H` / `Alt+L` | effortDecrease / effortIncrease | Step reasoning down / up along the model's supported ladder (clamped, no wrap) |
+| `Alt+E` | openEffort | Open the effort/reasoning picker |
+| `Alt+P` | expandPaste | Expand paste placeholder |
 
-> `Ctrl+A` previously opened the model picker; it now moves the cursor to the line start (matching Emacs/readline). The model picker is now `Ctrl+Shift+A`. Old `keybindings.json` files are auto-migrated.
+> **Modifier theme:** `Ctrl` = text editing, `Alt` = navigation + config. No `Ctrl+Shift` or `Alt+Shift` combos remain. Old `keybindings.json` files are auto-migrated.
 
 ### Confirmation Context
 
@@ -350,6 +356,15 @@ An `@` that is *not* at a word boundary (e.g. inside an email `me@example.com`) 
 | Path unreadable | Skipped; error shown in dialog |
 
 Files that pass all checks are injected silently — no dialog is shown.
+
+**Images are attached, not injected.** An `@` reference to an image file
+(`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`, `.bmp`) is never pasted as text —
+it is attached as a real image block so vision models see the pixels.
+Relative paths (`@screenshots/shot.png`) resolve against the working
+directory exactly like text files, and the actual MIME type is sniffed from
+the file bytes, so a JPEG renamed to `.png` is still sent as `image/jpeg`.
+This works without any clipboard tooling, which is what makes it usable over
+SSH.
 
 **Configuration.** Two settings in `~/.clawde/settings.json`:
 
