@@ -173,7 +173,7 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
         TaskType::CodeGeneration => &[
             "openrouter",
             "cerebras",
-            "huggingface",
+            "poolside",
             "groq",
             "cline",
             "mistral",
@@ -185,7 +185,7 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
             "cerebras",
             "cloudflare",
             "opencode-zen",
-            "huggingface",
+            "poolside",
             "nvidia",
         ],
         // Strong reasoning first (Gemini), then the 70B-class fast models.
@@ -199,7 +199,7 @@ pub fn task_preference_ids(task: TaskType) -> &'static [&'static str] {
             "zai",
             "opencode-zen",
             "sambanova",
-            "cohere",
+            "modelscope",
             "nvidia",
             "mistral",
         ],

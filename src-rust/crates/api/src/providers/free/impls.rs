@@ -2949,7 +2949,7 @@ mod tests {
         // different sense: its models endpoint doesn't support GET at all.
         for id in [
             "nvidia",
-            "huggingface",
+            "poolside",
             "openrouter",
             "sambanova",
             "cloudflare",
@@ -2962,7 +2962,13 @@ mod tests {
         }
         // Everything else validates the key on the models endpoint.
         for id in [
-            "groq", "cerebras", "google", "mistral", "cohere", "zai", "cline",
+            "groq",
+            "cerebras",
+            "google",
+            "mistral",
+            "modelscope",
+            "zai",
+            "cline",
         ] {
             assert!(
                 models_endpoint_validates_auth(id),
@@ -2981,8 +2987,8 @@ mod tests {
         assert_eq!(model, "openai/gpt-oss-20b");
         assert!(base.contains("nvidia.com"));
         // Upstreams without fallbacks probe their default model.
-        let (_, hf_model) = chat_probe_for("huggingface").expect("hf probe");
-        assert_eq!(hf_model, "meta-llama/Llama-3.3-70B-Instruct");
+        let (_, hf_model) = chat_probe_for("sambanova").expect("hf probe");
+        assert_eq!(hf_model, "Meta-Llama-3.3-70B-Instruct");
         let (_, sb_model) = chat_probe_for("sambanova").expect("sambanova probe");
         assert_eq!(sb_model, "Meta-Llama-3.3-70B-Instruct");
         // Unsupported upstreams have no chat probe.
@@ -3080,9 +3086,9 @@ mod tests {
             "CLAWDE_FREE_BASE_URL_HUGGINGFACE",
             "http://127.0.0.1:9878/v1",
         );
-        let (base, model) = chat_probe_for("huggingface").expect("hf probe");
+        let (base, model) = chat_probe_for("sambanova").expect("hf probe");
         assert_eq!(base, "http://127.0.0.1:9878/v1");
-        assert_eq!(model, "meta-llama/Llama-3.3-70B-Instruct");
+        assert_eq!(model, "Meta-Llama-3.3-70B-Instruct");
     }
 
     #[tokio::test]
@@ -3604,7 +3610,7 @@ mod tests {
             vec!["groq".to_string(), "cerebras".to_string()],
         );
         let chain = vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry("groq", true),
             entry("cerebras", true),
         ];
@@ -3628,15 +3634,15 @@ mod tests {
             .collect();
         assert_eq!(&order[..2], &["groq", "cerebras"]);
         // Unlisted upstreams still appear, in catalog order, after the prefs.
-        assert_eq!(order.last(), Some(&"huggingface"));
+        assert_eq!(order.last(), Some(&"poolside"));
     }
 
     #[test]
     fn task_plan_orders_by_reasoning_preferences() {
         // Reasoning prefers google, groq, sambanova — so with a chain ordered
-        // [huggingface, sambanova, google, groq] the plan must lead with
-        // google, then sambanova/groq by preference, then huggingface last.
-        let provider = task_provider(&["huggingface", "sambanova", "google", "groq"]);
+        // [poolside, sambanova, google, groq] the plan must lead with
+        // google, then sambanova/groq by preference, then poolside last.
+        let provider = task_provider(&["poolside", "sambanova", "google", "groq"]);
         let req = ProviderRequest {
             messages: vec![Message::user("why does the pool keep exhausting?")],
             ..dummy_request("free/auto")
@@ -3647,14 +3653,14 @@ mod tests {
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
         assert_eq!(&order[..3], &["google", "groq", "sambanova"]);
-        // Every remaining upstream still appears (huggingface last).
-        assert_eq!(order.last(), Some(&"huggingface"));
+        // Every remaining upstream still appears (poolside last).
+        assert_eq!(order.last(), Some(&"poolside"));
         assert_eq!(order.len(), 4);
     }
 
     #[test]
     fn task_plan_verification_prefers_fast_upstreams() {
-        let provider = task_provider(&["google", "huggingface", "groq", "cloudflare"]);
+        let provider = task_provider(&["google", "poolside", "groq", "cloudflare"]);
         let req = ProviderRequest {
             messages: vec![Message::user("run the tests and report failures")],
             ..dummy_request("free/auto")
@@ -3667,14 +3673,14 @@ mod tests {
         // groq + cloudflare lead the verification plan; google is not in the
         // verification preference list so it lands last (catalog order).        assert_eq!(order[0], "groq");
         assert!(order.iter().position(|id| *id == "cloudflare").unwrap() < order.len() - 1);
-        // Neither google nor huggingface are verification preferences, so they
-        // follow in catalog order (google idx 0, then huggingface idx 1).
-        assert_eq!(order.last(), Some(&"huggingface"));
+        // Neither google nor poolside are verification preferences, so they
+        // follow in catalog order (google idx 0, then poolside idx 1).
+        assert_eq!(order.last(), Some(&"poolside"));
     }
 
     #[test]
     fn task_plan_pinned_route_keeps_pin_first() {
-        let provider = task_provider(&["huggingface", "cerebras", "groq"]);
+        let provider = task_provider(&["poolside", "cerebras", "groq"]);
         let req = ProviderRequest {
             messages: vec![Message::user("fix the sorting bug")],
             ..dummy_request("free/auto")
@@ -3692,7 +3698,7 @@ mod tests {
 
     #[test]
     fn task_plan_without_request_uses_code_generation_prefs() {
-        let provider = task_provider(&["zai", "cohere", "mistral"]);
+        let provider = task_provider(&["zai", "modelscope", "mistral"]);
         // No request (e.g. a plan built for the stream re-dispatch without
         // classification) degrades to the code-generation defaults: mistral
         // is in that preference list and leads, the rest follow in catalog
@@ -3702,7 +3708,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["mistral", "zai", "cohere"]);
+        assert_eq!(order, vec!["mistral", "zai", "modelscope"]);
     }
 
     #[test]
@@ -3809,9 +3815,9 @@ mod tests {
         // The smart default (Auto, spec §8.4) uses the task-based plan, not
         // plain catalog order: a request classifying as code generation
         // leads with the code-focused upstreams even though the chain lists
-        // huggingface first.
+        // poolside first.
         let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry("groq", true),
             entry("cerebras", true),
         ]);
@@ -3824,10 +3830,10 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        // CodeGeneration prefs (openrouter, cerebras, huggingface, groq, ...)
-        // filtered to the chain: cerebras, then huggingface, then groq —
-        // NOT the chain's catalog order (huggingface first).
-        assert_eq!(order, vec!["cerebras", "huggingface", "groq"]);
+        // CodeGeneration prefs (openrouter, cerebras, poolside, groq, ...)
+        // filtered to the chain: cerebras, then poolside, then groq —
+        // NOT the chain's catalog order (poolside first).
+        assert_eq!(order, vec!["cerebras", "poolside", "groq"]);
     }
 
     #[test]
@@ -3841,11 +3847,11 @@ mod tests {
             vec![
                 "cerebras".to_string(),
                 "groq".to_string(),
-                "huggingface".to_string(),
+                "poolside".to_string(),
             ],
         );
         let chain = vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry("groq", true),
             entry("cerebras", true),
         ];
@@ -3858,7 +3864,7 @@ mod tests {
             },
             false,
         );
-        // Record latencies: groq is fast, cerebras slow, huggingface unknown.
+        // Record latencies: groq is fast, cerebras slow, poolside unknown.
         {
             let mut lat = provider.latencies.lock().unwrap();
             lat.record(1, 0.3, 10); // groq
@@ -3874,8 +3880,8 @@ mod tests {
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
         // Preferred group sorted by latency: groq (0.3s), cerebras (5s),
-        // then no-sample huggingface (f64::MAX) at the group tail.
-        assert_eq!(order, vec!["groq", "cerebras", "huggingface"]);
+        // then no-sample poolside (f64::MAX) at the group tail.
+        assert_eq!(order, vec!["groq", "cerebras", "poolside"]);
     }
 
     #[test]
@@ -3887,7 +3893,7 @@ mod tests {
         );
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("groq", true),
                 entry("cerebras", true),
             ],
@@ -3909,7 +3915,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(order, vec!["cerebras", "huggingface"]);
+        assert_eq!(order, vec!["cerebras", "poolside"]);
         assert!(!order.contains(&"groq"));
     }
 
@@ -3918,7 +3924,7 @@ mod tests {
         let provider = FreeProvider::with_routing(
             vec![
                 entry("groq", true),
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
             ],
             RoutingConfig {
@@ -3940,19 +3946,19 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(pinned_ids, vec!["huggingface", "cerebras"]);
+        assert_eq!(pinned_ids, vec!["poolside", "cerebras"]);
 
         let sequential = provider.attempt_plan(&Route::Auto, None);
         let sequential_ids: Vec<&str> = sequential
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(sequential_ids, vec!["huggingface", "cerebras"]);
+        assert_eq!(sequential_ids, vec!["poolside", "cerebras"]);
     }
 
     #[test]
     fn route_auto_for_free_aliases() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true), entry("cerebras", true)]);
         assert!(matches!(provider.resolve_route("free"), Route::Auto));
         assert!(matches!(provider.resolve_route("free/auto"), Route::Auto));
         assert!(matches!(provider.resolve_route("auto"), Route::Auto));
@@ -3961,7 +3967,7 @@ mod tests {
 
     #[test]
     fn route_pinned_for_prefix() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true), entry("cerebras", true)]);
         let route = provider.resolve_route("cerebras/qwen-3-235b");
         match route {
             Route::Pinned {
@@ -4009,7 +4015,7 @@ mod tests {
         // fallback order, not the task-based default plan ordering.
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("nvidia", true),
                 entry("cerebras", true),
             ],
@@ -4030,10 +4036,7 @@ mod tests {
         );
         assert_eq!(plan[0], (1, "openai/gpt-oss-120b".to_string()));
         assert_eq!(plan[1], (1, "openai/gpt-oss-20b".to_string()));
-        assert_eq!(
-            plan[2],
-            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
-        );
+        assert_eq!(plan[2], (0, "Meta-Llama-3.3-70B-Instruct".to_string()));
         assert_eq!(plan[3], (2, "gpt-oss-120b".to_string()));
     }
 
@@ -4097,7 +4100,7 @@ mod tests {
 
     #[test]
     fn family_route_resolves_from_slug() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
         match provider.resolve_route("free/family/llama-3.3-70b") {
             Route::Family { model_family } => assert_eq!(model_family, "llama-3.3-70b"),
             other => panic!("expected family, got {:?}", other),
@@ -4111,7 +4114,7 @@ mod tests {
 
     #[test]
     fn unknown_family_falls_back_to_auto() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
         assert!(matches!(
             provider.resolve_route("free/family/does-not-exist"),
             Route::Auto
@@ -4125,7 +4128,7 @@ mod tests {
     #[test]
     fn family_plan_leads_with_hosts_then_rest() {
         let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry("cerebras", true),
             entry("nvidia", true),
             entry("groq", true),
@@ -4143,16 +4146,13 @@ mod tests {
         assert_eq!(plan[2], (2, "openai/gpt-oss-20b".to_string()));
         assert_eq!(plan[3], (3, "openai/gpt-oss-120b".to_string()));
         // Non-family upstreams follow in catalog order.
-        assert_eq!(
-            plan[4],
-            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
-        );
+        assert_eq!(plan[4], (0, "Meta-Llama-3.3-70B-Instruct".to_string()));
     }
 
     #[test]
     fn family_route_reports_host_capabilities() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
-        // The catalog's huggingface entry hosts llama-3.3-70b with tool
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
+        // The catalog's poolside entry hosts llama-3.3-70b with tool
         // calling and a max-tokens cap — the family route must surface those
         // from the first matching host.
         let tc = provider.tool_calling_for("free/family/llama-3.3-70b");
@@ -4165,14 +4165,14 @@ mod tests {
     fn attempt_plan_default_auto_routes_by_task_preference() {
         // The default strategy is Auto (task-based, spec §8.4). Both entries
         // contribute their default model; the order follows the
-        // code-generation preference list, so cerebras leads huggingface.
-        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        // code-generation preference list, so cerebras leads poolside.
+        let provider = FreeProvider::new(vec![entry("sambanova", true), entry("cerebras", true)]);
         let plan = provider.attempt_plan(&Route::Auto, None);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].0, 1);
         assert_eq!(plan[0].1, "gpt-oss-120b");
         assert_eq!(plan[1].0, 0);
-        assert_eq!(plan[1].1, "meta-llama/Llama-3.3-70B-Instruct");
+        assert_eq!(plan[1].1, "Meta-Llama-3.3-70B-Instruct");
     }
 
     #[test]
@@ -4183,7 +4183,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -4208,19 +4208,19 @@ mod tests {
 
     #[test]
     fn attempt_plan_auto_prefers_high_success_rate_over_latency() {
-        // CodeGeneration preferences order huggingface (3rd) before groq
+        // CodeGeneration preferences order poolside (3rd) before groq
         // (4th). groq is fast (1s avg) but keeps failing (0% at 3+);
-        // huggingface is slow (5s avg) but reliable (100%). The preferred
+        // poolside is slow (5s avg) but reliable (100%). The preferred
         // group must promote the reliable upstream despite its latency.
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("groq", true)],
+            vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
         {
             let mut lat = provider.latencies.lock().unwrap();
             for _ in 0..3 {
-                lat.record_success(0); // huggingface: 100%
+                lat.record_success(0); // poolside: 100%
                 lat.record(0, 5.0, 10);
                 lat.record_failure(1); // groq: 0%
                 lat.record(1, 1.0, 10); // fast — but failing
@@ -4229,7 +4229,7 @@ mod tests {
         let plan = provider.attempt_plan(&Route::Auto, Some(&dummy_request("free/auto")));
         assert_eq!(
             plan[0].0, 0,
-            "huggingface (100%) must lead groq (0%) despite higher latency"
+            "poolside (100%) must lead groq (0%) despite higher latency"
         );
         assert_eq!(plan[1].0, 1);
     }
@@ -4238,10 +4238,10 @@ mod tests {
     fn attempt_plan_auto_ignores_success_rate_below_min_samples() {
         // groq has only 2 dispatches (both wins) — below
         // MIN_SUCCESS_RATE_SAMPLES — so its rate must NOT be trusted to
-        // reorder the group. huggingface (3 dispatches, 100%) keeps its
+        // reorder the group. poolside (3 dispatches, 100%) keeps its
         // preference-order lead even though groq is far faster.
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("groq", true)],
+            vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
@@ -4268,7 +4268,7 @@ mod tests {
     fn attempt_plan_auto_breaks_success_rate_ties_by_latency() {
         // Both upstreams 100% at 3+ dispatches — the faster one leads.
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("groq", true)],
+            vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
@@ -4292,7 +4292,7 @@ mod tests {
         // stable sort keeps the preference order unchanged (no phantom
         // reordering from empty counters).
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("groq", true)],
+            vec![entry("sambanova", true), entry("groq", true)],
             RoutingConfig::default(),
             false,
         );
@@ -4309,7 +4309,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -4336,7 +4336,7 @@ mod tests {
 
     #[test]
     fn routing_config_default_is_auto() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
         assert!(matches!(
             provider.routing_config().strategy,
             RoutingStrategy::Auto
@@ -4350,7 +4350,7 @@ mod tests {
             ..Default::default()
         };
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             cfg,
             false,
         );
@@ -4436,7 +4436,7 @@ mod tests {
         // order, not the task-based default plan ordering.
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -4643,7 +4643,7 @@ mod tests {
         // the second fails after. The final exhausted error must include both.
         let provider = FreeProvider::with_routing(
             vec![
-                failing_entry("huggingface", "quota exceeded"),
+                failing_entry("poolside", "quota exceeded"),
                 failing_entry("cerebras", "Model not found: unknown"),
             ],
             RoutingConfig {
@@ -4665,7 +4665,7 @@ mod tests {
             text.contains("all free-mode upstreams exhausted"),
             "got: {text}"
         );
-        assert!(text.contains("huggingface"), "got: {text}");
+        assert!(text.contains("poolside"), "got: {text}");
         assert!(text.contains("cerebras"), "got: {text}");
         assert!(text.contains("quota exceeded"), "got: {text}");
         assert!(text.contains("Model not found: unknown"), "got: {text}");
@@ -4677,7 +4677,7 @@ mod tests {
 
         let provider = FreeProvider::with_routing(
             vec![
-                stream_entry("huggingface", true, None),
+                stream_entry("poolside", true, None),
                 stream_entry("cerebras", true, Some("fallback answer")),
             ],
             RoutingConfig {
@@ -4711,11 +4711,8 @@ mod tests {
             vec![
                 (
                     "free".to_string(),
-                    "huggingface".to_string(),
-                    catalog_entry("huggingface")
-                        .unwrap()
-                        .default_model
-                        .to_string(),
+                    "poolside".to_string(),
+                    catalog_entry("poolside").unwrap().default_model.to_string(),
                 ),
                 (
                     "free".to_string(),
@@ -4732,7 +4729,7 @@ mod tests {
 
         let provider = FreeProvider::with_routing(
             vec![
-                stream_error_entry("huggingface", "partial answer"),
+                stream_error_entry("poolside", "partial answer"),
                 stream_entry("groq", true, Some("replacement answer")),
             ],
             RoutingConfig {
@@ -4778,7 +4775,7 @@ mod tests {
         use futures::StreamExt;
 
         let provider = FreeProvider::with_routing(
-            vec![stream_entry("huggingface", true, Some("hello"))],
+            vec![stream_entry("poolside", true, Some("hello"))],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
                 latency: Some(LatencyConfig { max_samples: 10 }),
@@ -4807,12 +4804,12 @@ mod tests {
         // signal.
         let rates = provider.upstream_success_rates();
         assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].0, "huggingface");
+        assert_eq!(rates[0].0, "poolside");
         assert_eq!(rates[0].1, Some(1.0));
 
         // The latency sample rides the same path — it must be recorded too.
         let lats = provider.upstream_latencies();
-        assert_eq!(lats[0].0, "huggingface");
+        assert_eq!(lats[0].0, "poolside");
         assert!(
             lats[0].1.is_some(),
             "latency sample should be recorded for a streaming win"
@@ -4827,7 +4824,7 @@ mod tests {
         // it must be credited to the code_generation per-task bucket (spec
         // §8.6 per-task view).
         let provider = FreeProvider::with_routing(
-            vec![stream_entry("huggingface", true, Some("hi"))],
+            vec![stream_entry("poolside", true, Some("hi"))],
             RoutingConfig::default(),
             false,
         );
@@ -4844,7 +4841,7 @@ mod tests {
 
         let rates = provider.upstream_task_success_rates();
         assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].0, "huggingface");
+        assert_eq!(rates[0].0, "poolside");
         assert!(
             rates[0]
                 .1
@@ -4864,7 +4861,7 @@ mod tests {
         // counter at MessageStop — it stays uncounted so the empty-completion
         // re-dispatch path remains the authority for empty attempts.
         let provider = FreeProvider::with_routing(
-            vec![stream_entry("huggingface", true, None)],
+            vec![stream_entry("poolside", true, None)],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
                 ..Default::default()
@@ -4885,17 +4882,17 @@ mod tests {
 
         let rates = provider.upstream_success_rates();
         assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].0, "huggingface");
+        assert_eq!(rates[0].0, "poolside");
         assert_eq!(rates[0].1, None, "empty attempts must not be credited");
     }
 
     #[tokio::test]
     async fn create_message_falls_back_to_next_upstream() {
-        // Sequential explicitly so the failing huggingface is genuinely first
+        // Sequential explicitly so the failing poolside is genuinely first
         // in the plan — the default Auto plan would prefer cerebras and
         // never exercise the fallback.
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", false), entry("cerebras", true)],
+            vec![entry("poolside", false), entry("cerebras", true)],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
                 ..Default::default()
@@ -4914,12 +4911,12 @@ mod tests {
     #[tokio::test]
     async fn task_based_dispatch_tries_task_preferred_upstream_first() {
         // End-to-end plan → dispatch → fallback for a reasoning request:
-        // groq is in the reasoning preference list, huggingface is not, so
-        // the plan must try groq before huggingface even though the chain is
-        // ordered [huggingface, groq] in the catalog.
+        // groq is in the reasoning preference list, poolside is not, so
+        // the plan must try groq before poolside even though the chain is
+        // ordered [poolside, groq] in the catalog.
         let log = Arc::new(Mutex::new(Vec::new()));
         let chain = vec![
-            entry_with_log("huggingface", false, log.clone()),
+            entry_with_log("poolside", false, log.clone()),
             entry_with_log("groq", false, log.clone()),
         ];
         let provider = FreeProvider::with_routing(
@@ -4939,7 +4936,7 @@ mod tests {
         let _err = provider.create_message(req).await.unwrap_err();
         let attempts: Vec<String> = log.lock().unwrap().clone();
         let groq_model = catalog_entry("groq").unwrap().default_model;
-        let hf_model = catalog_entry("huggingface").unwrap().default_model;
+        let hf_model = catalog_entry("poolside").unwrap().default_model;
         assert_eq!(attempts.len(), 2, "both upstreams attempted");
         assert_eq!(attempts[0], groq_model, "task-preferred upstream first");
         assert_eq!(attempts[1], hf_model, "remaining upstream after prefs");
@@ -4947,11 +4944,11 @@ mod tests {
 
     #[tokio::test]
     async fn task_based_dispatch_falls_back_from_preferred_to_remaining() {
-        // Same chain, but groq fails and huggingface succeeds: the request
-        // must still reach huggingface after groq, and only after groq.
+        // Same chain, but groq fails and poolside succeeds: the request
+        // must still reach poolside after groq, and only after groq.
         let log = Arc::new(Mutex::new(Vec::new()));
         let chain = vec![
-            entry_with_log("huggingface", true, log.clone()),
+            entry_with_log("poolside", true, log.clone()),
             entry_with_log("groq", false, log.clone()),
         ];
         let provider = FreeProvider::with_routing(
@@ -4969,10 +4966,10 @@ mod tests {
         let resp = provider
             .create_message(req)
             .await
-            .expect("should fall back to huggingface");
+            .expect("should fall back to poolside");
         let attempts: Vec<String> = log.lock().unwrap().clone();
-        let hf_model = catalog_entry("huggingface").unwrap().default_model;
-        assert_eq!(attempts.len(), 2, "groq tried before huggingface");
+        let hf_model = catalog_entry("poolside").unwrap().default_model;
+        assert_eq!(attempts.len(), 2, "groq tried before poolside");
         assert_eq!(resp.model, hf_model);
     }
 
@@ -4997,9 +4994,9 @@ mod tests {
     fn capability_gate_drops_non_vision_upstreams_for_image_request() {
         // An image request must only route to vision-capable upstreams. The
         // catalog marks github-copilot (gpt-4o) and google (gemini) as vision;
-        // huggingface (Llama) is text-only and its 400 InvalidRequest would
+        // poolside (Llama) is text-only and its 400 InvalidRequest would
         // hard-fail the whole request without this gate.
-        let chain = vec![entry("huggingface", true), entry("google", true)];
+        let chain = vec![entry("sambanova", true), entry("google", true)];
         let provider = FreeProvider::with_routing(
             chain,
             RoutingConfig {
@@ -5025,7 +5022,7 @@ mod tests {
         // github-copilot documents a 16K serving context — a request that
         // estimates above 16K tokens must skip it and go to the 128K upstream
         // instead of burning a guaranteed-overflow round-trip.
-        let chain = vec![entry("github-copilot", true), entry("huggingface", true)];
+        let chain = vec![entry("github-copilot", true), entry("sambanova", true)];
         let provider = FreeProvider::with_routing(
             chain,
             RoutingConfig {
@@ -5044,7 +5041,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(ids, vec!["huggingface"], "small-context upstream skipped");
+        assert_eq!(ids, vec!["poolside"], "small-context upstream skipped");
 
         // A small request keeps both upstreams in the plan (copilot
         // contributes its primary + fallback rows).
@@ -5053,7 +5050,7 @@ mod tests {
             .iter()
             .map(|(idx, _)| provider.chain[*idx].upstream.id)
             .collect();
-        assert_eq!(ids, vec!["github-copilot", "github-copilot", "huggingface"]);
+        assert_eq!(ids, vec!["github-copilot", "github-copilot", "poolside"]);
     }
 
     #[test]
@@ -5061,7 +5058,7 @@ mod tests {
         // The central gate also applies to pinned routes: a user-pinned
         // text-only upstream is skipped for an image request so the pin
         // can't hard-fail the whole request on its 400 InvalidRequest.
-        let chain = vec![entry("huggingface", true), entry("google", true)];
+        let chain = vec![entry("sambanova", true), entry("google", true)];
         let provider = FreeProvider::with_routing(
             chain,
             RoutingConfig {
@@ -5073,7 +5070,7 @@ mod tests {
         let plan = provider.attempt_plan(
             &Route::Pinned {
                 start_idx: 0,
-                pinned_model: "meta-llama/Llama-3.3-70B-Instruct".to_string(),
+                pinned_model: "Meta-Llama-3.3-70B-Instruct".to_string(),
             },
             Some(&image_request("free/auto")),
         );
@@ -5127,7 +5124,7 @@ mod tests {
         // (the gate runs before dispatch, not after a failed round-trip).
         let log = Arc::new(Mutex::new(Vec::new()));
         let chain = vec![
-            entry_with_log("huggingface", true, log.clone()),
+            entry_with_log("poolside", true, log.clone()),
             entry_with_log("google", true, log.clone()),
         ];
         let provider = FreeProvider::with_routing(
@@ -5153,7 +5150,7 @@ mod tests {
         // Image request + only text-only upstreams → the plan is empty and
         // the error must explain the capability gap instead of blaming
         // cooldown (which would be actively misleading).
-        let chain = vec![entry("huggingface", true), entry("nvidia", true)];
+        let chain = vec![entry("sambanova", true), entry("nvidia", true)];
         let provider = FreeProvider::with_routing(
             chain,
             RoutingConfig {
@@ -5195,10 +5192,10 @@ mod tests {
         assert_eq!(caps.get("github-copilot"), Some(&(true, 16_384)));
         // Text-only upstreams are flagged so the dialog can explain why an
         // image request routes away from them.
-        let chain = vec![entry("huggingface", true)];
+        let chain = vec![entry("sambanova", true)];
         let provider = FreeProvider::new(chain);
         let caps = provider.upstream_capabilities();
-        assert_eq!(caps, vec![("huggingface".to_string(), false, 128_000)]);
+        assert_eq!(caps, vec![("sambanova".to_string(), false, 128_000)]);
     }
 
     #[test]
@@ -5212,7 +5209,7 @@ mod tests {
         let random_provider = FreeProvider::with_routing(
             vec![
                 entry("nvidia", true),
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("groq", true),
             ],
             RoutingConfig {
@@ -5232,7 +5229,7 @@ mod tests {
         let latency_provider = FreeProvider::with_routing(
             vec![
                 entry("nvidia", true),
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("groq", true),
             ],
             RoutingConfig {
@@ -5252,7 +5249,7 @@ mod tests {
         let family_provider = FreeProvider::with_routing(
             vec![
                 entry("nvidia", true),
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("groq", true),
             ],
             RoutingConfig {
@@ -5275,10 +5272,7 @@ mod tests {
         assert_eq!(
             family_plan,
             vec![
-                (
-                    "huggingface",
-                    "meta-llama/Llama-3.3-70B-Instruct".to_string()
-                ),
+                ("poolside", "Meta-Llama-3.3-70B-Instruct".to_string()),
                 ("groq", "openai/gpt-oss-120b".to_string())
             ]
         );
@@ -5296,7 +5290,7 @@ mod tests {
         let provider = FreeProvider::with_routing(
             vec![
                 entry_with_log("groq", true, log.clone()),
-                entry_with_log("huggingface", true, log.clone()),
+                entry_with_log("poolside", true, log.clone()),
             ],
             RoutingConfig {
                 strategy: RoutingStrategy::TaskBased,
@@ -5315,7 +5309,7 @@ mod tests {
             .await
             .expect("enabled fallback should handle the request");
         let attempts: Vec<String> = log.lock().unwrap().clone();
-        let hf_model = catalog_entry("huggingface").unwrap().default_model;
+        let hf_model = catalog_entry("poolside").unwrap().default_model;
         assert_eq!(attempts, vec![hf_model.to_string()]);
         assert_eq!(response.model, hf_model);
     }
@@ -5326,10 +5320,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_message_clamps_max_tokens_to_upstream_cap() {
-        // huggingface catalog entry has max_tokens_cap = 8_192.
+        // poolside catalog entry has max_tokens_cap = 8_192.
         let recorder = Arc::new(Mutex::new(None));
         let provider = FreeProvider::new(vec![entry_with_recorder(
-            "huggingface",
+            "poolside",
             true,
             recorder.clone(),
         )]);
@@ -5356,8 +5350,8 @@ mod tests {
 
     #[test]
     fn clamp_max_tokens_for_never_raises_max_tokens() {
-        let entry = entry("huggingface", true); // cap = 8_192
-        let mut req = dummy_request("huggingface/x");
+        let entry = entry("sambanova", true); // cap = 8_192
+        let mut req = dummy_request("poolside/x");
         req.max_tokens = 4_096;
         clamp_max_tokens_for(&mut req, &entry);
         assert_eq!(
@@ -5375,9 +5369,9 @@ mod tests {
         // Circuit breaker is disabled by default; the 5xx cooldown must
         // still be visible to is_in_cooldown (regression for the old gate
         // that made 5xx cooldowns dead on the non-streaming path).
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
         let err = ProviderError::ServerError {
-            provider: ProviderId::new("huggingface"),
+            provider: ProviderId::new("poolside"),
             status: Some(503),
             message: "boom".into(),
             is_retryable: true,
@@ -5392,13 +5386,13 @@ mod tests {
     #[tokio::test]
     async fn five_xx_cooldown_skips_upstream_in_fallback() {
         // Use a *working* first upstream so the skip is observable: with the
-        // old buggy is_in_cooldown gate the loop would try huggingface,
+        // old buggy is_in_cooldown gate the loop would try poolside,
         // succeed, and return its model; with the fix it skips the cooled
-        // upstream and lands on cerebras. Sequential explicitly so huggingface
+        // upstream and lands on cerebras. Sequential explicitly so poolside
         // is genuinely first in the plan — the default Auto plan would prefer
         // cerebras and never exercise the skip.
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             RoutingConfig {
                 strategy: RoutingStrategy::Sequential,
                 ..Default::default()
@@ -5406,7 +5400,7 @@ mod tests {
             false,
         );
         let err = ProviderError::ServerError {
-            provider: ProviderId::new("huggingface"),
+            provider: ProviderId::new("poolside"),
             status: Some(503),
             message: "boom".into(),
             is_retryable: true,
@@ -5426,10 +5420,10 @@ mod tests {
 
     #[test]
     fn upstream_cooldowns_reports_5xx_and_empty_kinds() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true), entry("cerebras", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true), entry("cerebras", true)]);
         // 5xx cooldown on the first upstream (default 45s).
         let err = ProviderError::ServerError {
-            provider: ProviderId::new("huggingface"),
+            provider: ProviderId::new("poolside"),
             status: Some(503),
             message: "boom".into(),
             is_retryable: true,
@@ -5645,7 +5639,7 @@ mod tests {
         // dispatcher uses.
         {
             let mut cd = CooldownState::new(2, CircuitBreakerConfig::default()).with_persistence(
-                vec!["huggingface".to_string(), "groq".to_string()],
+                vec!["poolside".to_string(), "groq".to_string()],
                 Some(path.clone()),
             );
             cd.apply_upstream_cooldown(1, 45);
@@ -5654,14 +5648,14 @@ mod tests {
           // cooldown with ~45s remaining.
         {
             let cd = CooldownState::new(2, CircuitBreakerConfig::default()).with_persistence(
-                vec!["huggingface".to_string(), "groq".to_string()],
+                vec!["poolside".to_string(), "groq".to_string()],
                 Some(path.clone()),
             );
             assert!(
                 cd.is_in_cooldown(1),
                 "groq must still be in 5xx cooldown after restart"
             );
-            assert!(!cd.is_in_cooldown(0), "huggingface stays active");
+            assert!(!cd.is_in_cooldown(0), "poolside stays active");
             let remaining = cd.cooldown_remaining_secs(1);
             assert!(
                 matches!(remaining, Some(s) if (1..=60).contains(&s)),
@@ -5712,7 +5706,7 @@ mod tests {
     #[test]
     fn upstream_key_health_reports_ring_backed_upstreams() {
         let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry_with_ring("cerebras", (1, 2, Some(45))),
         ]);
         let health = provider.upstream_key_health();
@@ -5731,7 +5725,7 @@ mod tests {
     fn mark_key_exhausted_forwards_to_matching_upstream() {
         let recorder: ExhaustionRecorder = Arc::new(Mutex::new(Vec::new()));
         let provider = FreeProvider::new(vec![
-            entry("huggingface", true),
+            entry("sambanova", true),
             entry_with_exhaustion_recorder("cerebras", recorder.clone()),
         ]);
 
@@ -5761,7 +5755,7 @@ mod tests {
 
     #[test]
     fn circuit_breaker_disabled_by_default() {
-        let provider = FreeProvider::new(vec![entry("huggingface", true)]);
+        let provider = FreeProvider::new(vec![entry("sambanova", true)]);
         provider.record_failure(0, TaskType::CodeGeneration);
         assert!(!provider.is_in_cooldown(0));
     }
@@ -5777,7 +5771,7 @@ mod tests {
             ..Default::default()
         };
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             cfg,
             false,
         );
@@ -5799,7 +5793,7 @@ mod tests {
             ..Default::default()
         };
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             cfg,
             false,
         );
@@ -5831,7 +5825,7 @@ mod tests {
             ..Default::default()
         };
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             cfg,
             false,
         );
@@ -5861,7 +5855,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -5892,7 +5886,7 @@ mod tests {
             ..Default::default()
         };
         let provider = FreeProvider::with_routing(
-            vec![entry("huggingface", true), entry("cerebras", true)],
+            vec![entry("sambanova", true), entry("cerebras", true)],
             cfg,
             false,
         );
@@ -5922,7 +5916,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("nvidia", true),
                 entry("cerebras", true),
                 entry("google", true),
@@ -5932,7 +5926,7 @@ mod tests {
         );
 
         // Record distinct latencies: nvidia fastest (100ms), google 300ms,
-        // cerebras 500ms, huggingface 800ms. Even though the latency sort
+        // cerebras 500ms, poolside 800ms. Even though the latency sort
         // reorders upstreams, nvidia's 20B fallback row must stay adjacent
         // AFTER its 120B primary (stable sort keeps same-idx rows together
         // in insertion order).
@@ -5946,13 +5940,10 @@ mod tests {
         // nvidia (idx 1, fastest) first: 120B then its 20B fallback adjacent.
         assert_eq!(plan[0], (1, "openai/gpt-oss-120b".to_string()));
         assert_eq!(plan[1], (1, "openai/gpt-oss-20b".to_string()));
-        // google (300ms), cerebras (500ms), huggingface (800ms).
+        // google (300ms), cerebras (500ms), poolside (800ms).
         assert_eq!(plan[2], (3, "gemini-2.5-flash".to_string()));
         assert_eq!(plan[3], (2, "gpt-oss-120b".to_string()));
-        assert_eq!(
-            plan[4],
-            (0, "meta-llama/Llama-3.3-70B-Instruct".to_string())
-        );
+        assert_eq!(plan[4], (0, "Meta-Llama-3.3-70B-Instruct".to_string()));
         assert_eq!(plan.len(), 5);
     }
 
@@ -5965,7 +5956,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -6003,7 +5994,7 @@ mod tests {
         };
         let provider = FreeProvider::with_routing(
             vec![
-                entry("huggingface", true),
+                entry("sambanova", true),
                 entry("cerebras", true),
                 entry("google", true),
             ],
@@ -6161,8 +6152,8 @@ mod tests {
 
         // Non-reasoning models (Llama) must not receive a parameter their
         // API may reject.
-        let hf = entry("huggingface", true);
-        let mut llama = dummy_request("meta-llama/Llama-3.3-70B-Instruct");
+        let hf = entry("sambanova", true);
+        let mut llama = dummy_request("Meta-Llama-3.3-70B-Instruct");
         llama.effort_level = Some(EffortLevel::High);
         shape_thinking_for_upstream(&mut llama, &hf);
         assert!(llama
@@ -6777,8 +6768,8 @@ fn resolvers_agree_on_synthetic_fixture_store() {
         "sambanova",
         "mistral",
         "google",
-        "cohere",
-        "huggingface",
+        "modelscope",
+        "poolside",
     ] {
         assert!(
             first_free_upstream_key(&store, upstream).is_some(),
@@ -6833,14 +6824,14 @@ fn free_catalog_and_core_predicate_agree_bidirectionally() {
         "github-copilot",
         "cline",
         "openrouter",
-        "huggingface",
+        "poolside",
         "cerebras",
         "nvidia",
         "groq",
         "google",
         "cloudflare",
         "mistral",
-        "cohere",
+        "modelscope",
         "opencode-zen",
         // opencode-go omitted: intentional alias, not a catalog entry
         "zai",

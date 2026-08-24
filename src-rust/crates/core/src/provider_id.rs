@@ -67,6 +67,8 @@ impl ProviderId {
     pub const VULTR: &'static str = "vultr";
     pub const BASETEN: &'static str = "baseten";
     pub const FRIENDLI: &'static str = "friendli";
+    pub const POOLSIDE: &'static str = "poolside";
+    pub const MODELSCOPE: &'static str = "modelscope";
     pub const UPSTAGE: &'static str = "upstage";
     pub const STEPFUN: &'static str = "stepfun";
     pub const FIREWORKS: &'static str = "fireworks";

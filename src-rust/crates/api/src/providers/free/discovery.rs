@@ -111,7 +111,12 @@ pub fn discovery_for(upstream_id: &str) -> FreeModelDiscovery {
         // account-scoped models/search API instead — it reflects per-account
         // availability and sees new models without a models.dev refresh.
         "cloudflare" => FreeModelDiscovery::CloudflareModels,
-        "cohere" => FreeModelDiscovery::CohereModels,
+        "poolside" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://inference.poolside.ai/v1",
+        },
+        "modelscope" => FreeModelDiscovery::OpenAiModelList {
+            base_url: "https://api-inference.modelscope.cn/v1",
+        },
         // github-copilot intentionally stays on the catch-all None here: the
         // CopilotProvider fetches its own /models list internally (with a
         // hardcoded fallback), so it needs no separate discovery probe.
@@ -895,7 +900,13 @@ const KNOWN_FREE_MODELS: &[(&str, &[&str])] = &[
     ("cerebras", &["gpt-oss-120b"]),
     ("sambanova", &["Meta-Llama-3.3-70B-Instruct"]),
     ("cloudflare", &[super::catalog::CLOUDFLARE_PROBE_MODEL]),
-    ("cohere", &["north-mini-code-1-0"]),
+    // Poolside: free-in-Preview, flagship coding model is laguna-s-2.1.
+    (
+        "poolside",
+        &["poolside/laguna-s-2.1", "poolside/laguna-xs-2.1"],
+    ),
+    // ModelScope: free tier (2K RPD), Qwen3 235B is the flagship.
+    ("modelscope", &["Qwen/Qwen3-235B-A22B-Instruct"]),
     // Mistral's models.dev free pick (labs-devstral-small-2512) is retired
     // (3/31/2026); the Experiment tier makes every current model free, so
     // pin the flagship. Z.AI's docs mark GLM-4.7-Flash / GLM-4.5-Flash free
@@ -1565,12 +1576,15 @@ mod tests {
 
     #[test]
     fn select_available_model_known_free_covers_provider_without_modelsdev() {
-        // Cohere has no models.dev free entries; the allowlist is the free
+        // ModelScope has no models.dev free entries; the allowlist is the free
         // signal that keeps the pick off a paid model.
-        let available: Vec<&str> = vec!["command-a-03-2025", "north-mini-code-1-0"];
+        let available: Vec<&str> = vec![
+            "Qwen/Qwen3-235B-A22B-Thinking",
+            "Qwen/Qwen3-235B-A22B-Instruct",
+        ];
         assert_eq!(
-            select_available_model("cohere", &available, &HashMap::new()).as_deref(),
-            Some("north-mini-code-1-0")
+            select_available_model("modelscope", &available, &HashMap::new()).as_deref(),
+            Some("Qwen/Qwen3-235B-A22B-Instruct")
         );
     }
 

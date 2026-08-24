@@ -797,6 +797,8 @@ pub mod config {
             "vultr" | "vultr-ai" => &["VULTR_API_KEY"],
             "baseten" => &["BASETEN_API_KEY"],
             "friendli" => &["FRIENDLI_TOKEN"],
+            "poolside" => &["POOLSIDE_API_KEY"],
+            "modelscope" => &["MODELSCOPE_API_KEY"],
             "upstage" => &["UPSTAGE_API_KEY"],
             "stepfun" => &["STEPFUN_API_KEY"],
             "fireworks" => &["FIREWORKS_API_KEY"],
@@ -7600,7 +7602,7 @@ mod tests {
             cost::ModelPricing::FREE
         );
         assert_eq!(
-            cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"),
+            cost::ModelPricing::for_model("nvidia/openai/gpt-oss-120b"),
             cost::ModelPricing::FREE
         );
         assert_eq!(

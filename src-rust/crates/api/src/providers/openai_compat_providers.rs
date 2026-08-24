@@ -55,6 +55,8 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "neuralwatt" => Some(neuralwatt()),
         "cline" => Some(cline()),
         "cloudflare" => Some(cloudflare()),
+        "poolside" => Some(poolside()),
+        "modelscope" => Some(modelscope()),
         _ => None,
     }
 }
@@ -698,6 +700,37 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
         ProviderId::NEURALWATT,
         "NeuralWatt",
         "https://api.neuralwatt.com/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// Poolside — coding-optimized inference.  Reads `POOLSIDE_API_KEY`.
+pub fn poolside() -> OpenAiCompatProvider {
+    let key = std::env::var("POOLSIDE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::POOLSIDE,
+        "Poolside",
+        "https://inference.poolside.ai/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// ModelScope — Alibaba's model hub with free Qwen inference.
+/// Reads `MODELSCOPE_API_KEY` (DashScope token).
+pub fn modelscope() -> OpenAiCompatProvider {
+    let key = std::env::var("MODELSCOPE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::MODELSCOPE,
+        "ModelScope",
+        "https://api-inference.modelscope.cn/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
