@@ -54,7 +54,7 @@ impl Chain {
         let second = MockServer::new(second);
         let entries = vec![
             mock_entry("groq", &first.base_url, "groq/mock-model"),
-            mock_entry("huggingface", &second.base_url, "hf/mock-model"),
+            mock_entry("poolside", &second.base_url, "poolside/mock-model"),
         ];
         let provider = FreeProvider::with_routing(
             entries,
@@ -165,7 +165,7 @@ async fn server_error_before_first_byte_falls_through() {
             r#"{"error":{"message":"mock 500"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "hello from huggingface"),
+            frames: text_stream("poolside/mock-model", "hello from poolside"),
         }],
     );
 
@@ -177,14 +177,14 @@ async fn server_error_before_first_byte_falls_through() {
     let (events, error) = collect(stream).await;
 
     assert!(error.is_none(), "unexpected error: {error:?}");
-    assert_eq!(attribution(&events), Some("huggingface"));
-    assert_eq!(text(&events), "hello from huggingface");
+    assert_eq!(attribution(&events), Some("poolside"));
+    assert_eq!(text(&events), "hello from poolside");
 
     let (first, second) = chain.requests();
     assert_eq!(first.len(), 1, "first upstream must be attempted once");
     assert_eq!(second.len(), 1, "second upstream must serve the request");
     assert_request(&first[0], "groq/mock-model");
-    assert_request(&second[0], "hf/mock-model");
+    assert_request(&second[0], "poolside/mock-model");
 }
 
 #[tokio::test]
@@ -196,7 +196,7 @@ async fn rate_limit_before_first_byte_falls_through() {
             r#"{"error":{"message":"mock 429"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "recovered after rate limit"),
+            frames: text_stream("poolside/mock-model", "recovered after rate limit"),
         }],
     );
 
@@ -208,7 +208,7 @@ async fn rate_limit_before_first_byte_falls_through() {
     let (events, error) = collect(stream).await;
 
     assert!(error.is_none());
-    assert_eq!(attribution(&events), Some("huggingface"));
+    assert_eq!(attribution(&events), Some("poolside"));
     assert_eq!(text(&events), "recovered after rate limit");
     assert_eq!(chain.requests().1.len(), 1);
 }
@@ -224,7 +224,7 @@ async fn auth_failure_before_first_byte_falls_through() {
             r#"{"error":{"message":"mock bad key"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "valid key answered"),
+            frames: text_stream("poolside/mock-model", "valid key answered"),
         }],
     );
 
@@ -236,7 +236,7 @@ async fn auth_failure_before_first_byte_falls_through() {
     let (events, error) = collect(stream).await;
 
     assert!(error.is_none());
-    assert_eq!(attribution(&events), Some("huggingface"));
+    assert_eq!(attribution(&events), Some("poolside"));
     assert_eq!(text(&events), "valid key answered");
 }
 
@@ -249,7 +249,7 @@ async fn context_overflow_before_first_byte_falls_through() {
             r#"{"error":{"message":"mock overflow"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "larger context answered"),
+            frames: text_stream("poolside/mock-model", "larger context answered"),
         }],
     );
 
@@ -261,7 +261,7 @@ async fn context_overflow_before_first_byte_falls_through() {
     let (events, error) = collect(stream).await;
 
     assert!(error.is_none());
-    assert_eq!(attribution(&events), Some("huggingface"));
+    assert_eq!(attribution(&events), Some("poolside"));
     assert_eq!(text(&events), "larger context answered");
 }
 
@@ -281,7 +281,7 @@ async fn malformed_request_is_surfaced_without_fallback() {
             r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#,
         )],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "should never be used"),
+            frames: text_stream("poolside/mock-model", "should never be used"),
         }],
     );
 
@@ -317,7 +317,7 @@ async fn mid_stream_truncation_surfaces_error_without_replay() {
             ],
         }],
         vec![ScriptedResponse::SseStream {
-            frames: text_stream("hf/mock-model", "must not replay"),
+            frames: text_stream("poolside/mock-model", "must not replay"),
         }],
     );
 
@@ -370,7 +370,7 @@ async fn non_streaming_server_error_falls_through() {
         vec![json_response(
             200,
             "OK",
-            r#"{"id":"cmpl-hf","model":"hf/mock-model","choices":[{"index":0,"message":{"role":"assistant","content":"non-streaming answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+            r#"{"id":"cmpl-hf","model":"poolside/mock-model","choices":[{"index":0,"message":{"role":"assistant","content":"non-streaming answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
         )],
     );
 
