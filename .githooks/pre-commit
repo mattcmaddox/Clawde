@@ -34,6 +34,29 @@ fi
 ROOT="$(git rev-parse --show-toplevel)" || exit 0
 cd "$ROOT" || exit 0
 
+# ---- Auto-version bump (patch +1) --------------------------------------
+# Increments vMAJOR.MINOR.PATCH on every commit so local builds always
+# report a unique version. Release commits (message starts with "release:")
+# are stamped by scripts/build.sh and must not be auto-bumped.
+if command -v python3 >/dev/null 2>&1 && [ -f "$ROOT/scripts/bump-version.py" ]; then
+    commit_msg=$(cat "$ROOT/.git/COMMIT_EDITMSG" 2>/dev/null || echo "")
+    if ! echo "$commit_msg" | grep -qi '^release:'; then
+        current=$(grep '^version = ' "$ROOT/src-rust/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+        if [ -n "$current" ]; then
+            major=$(echo "$current" | cut -d. -f1)
+            minor=$(echo "$current" | cut -d. -f2)
+            patch=$(echo "$current" | cut -d. -f3)
+            new_patch=$((patch + 1))
+            new_version="v${major}.${minor}.${new_patch}"
+            python3 "$ROOT/scripts/bump-version.py" "$new_version" 2>/dev/null && \
+                git add "$ROOT/src-rust/Cargo.toml" "$ROOT/src-rust/Cargo.lock" \
+                        "$ROOT/npm/package.json" "$ROOT/README.md" \
+                        "$ROOT/docs/index.md" "$ROOT/docs/installation.md" \
+                        "$ROOT/src-rust/crates/acp/registry-template/agent.json" 2>/dev/null || true
+        fi
+    fi
+fi
+
 # Only relevant when Rust sources are staged.
 if ! git diff --cached --name-only | grep -q '^src-rust/.*\.rs$'; then
     exit 0
