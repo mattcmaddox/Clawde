@@ -3158,10 +3158,12 @@ async fn run_interactive(
                     .unwrap_or_default()
             },
         ));
-        // Wire free-model defaults for the /ctx-viz overlay.
-        // These are computed during build_free_provider and stored via
-        // store_free_model_defaults; read them back now for the TUI.
+        // Wire free-model defaults for the /ctx-viz overlay and the
+        // Alt+J/K popup. Both are computed during build_free_provider and
+        // stored via store_free_model_defaults / store_free_model_lists;
+        // read them back now for the TUI.
         app.free_model_defaults = clawde_api::providers::free::take_free_model_defaults();
+        app.free_model_lists = clawde_api::providers::free::take_free_model_lists();
     }
 
     // Ollama mode is a config-level setting, not registry-dependent.
