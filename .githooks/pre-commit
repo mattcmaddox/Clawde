@@ -114,16 +114,19 @@ if [ "${newest_staged_rs:-0}" -gt "$binary_mtime" ]; then
 fi
 
 python3 "$ROOT/scripts/probes/idle-cpu-probe.py" \
-    --binary "$BINARY" --warmup-secs 5 --idle-secs 6 --max-cpu-secs 1.2 \
+    --binary "$BINARY" --warmup-secs 25 --idle-secs 6 --max-cpu-secs 1.2 \
     >/dev/null 2>&1
 status=$?
 if [ "$status" -eq 2 ]; then
     exit 0  # probe self-skipped (non-Linux)
 fi
 if [ "$status" -ne 0 ]; then
-    echo "pre-commit: idle-CPU probe FAILED — the TUI repaints at full rate while idle."
-    echo "  Check App::needs_fast_repaint() (crates/tui/src/app.rs) and the poll"
-    echo "  timeout (crates/cli/src/main.rs). Run the probe manually for details:"
+    echo "pre-commit: idle-CPU probe FAILED."
+    echo "  Either the TUI repaints at full rate while idle (check"
+    echo "  App::needs_fast_repaint() in crates/tui/src/app.rs and the poll"
+    echo "  timeout in crates/cli/src/main.rs), or the process never went idle"
+    echo "  within the warmup (startup health probes / model discovery hanging"
+    echo "  on a slow network). Run the probe manually for details:"
     echo "    python3 scripts/probes/idle-cpu-probe.py --binary src-rust/target/debug/clawde"
     exit 1
 fi

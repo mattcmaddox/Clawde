@@ -4491,7 +4491,14 @@ impl App {
             || self.is_verifying
             || self.is_compacting
             || self.effort_picker.wants_animation()
-            || self.any_modal_open()
+        // Intentionally NOT including `any_modal_open()` here.  Most modals
+        // are static forms (onboarding, settings, connect, model picker, …)
+        // that don't need 60fps.  The effort picker is the one exception and
+        // already has its own `wants_animation()` guard that only fires for
+        // Max/Ultracode.  Including all modals forced the idle-CPU probe to
+        // fail on any first-run session (onboarding modal open → 16ms poll →
+        // ~15% CPU burn), because the probe launches a bare binary that hits
+        // the onboarding dialog before a config exists.
     }
 
     fn dismiss_error_notifications(&mut self) {
@@ -11504,9 +11511,34 @@ mod tests {
     }
 
     #[test]
-    fn open_modal_needs_fast_repaint() {
+    fn static_modal_does_not_need_fast_repaint() {
+        // Static modals (model picker, onboarding, settings, …) are forms
+        // with no per-frame animation — 250ms poll is sufficient and avoids
+        // burning ~15% of a core while idle.
         let mut app = make_app();
         app.model_picker.visible = true;
+        assert!(!app.needs_fast_repaint());
+    }
+
+    #[test]
+    fn animated_effort_picker_needs_fast_repaint() {
+        // The effort picker only triggers fast repaint when the selected
+        // level has a rainbow shimmer (Max/Ultracode).
+        let mut app = make_app();
+        app.effort_picker.open(
+            clawde_core::effort::EffortLevel::Medium,
+            vec![
+                clawde_core::effort::EffortLevel::Low,
+                clawde_core::effort::EffortLevel::Medium,
+                clawde_core::effort::EffortLevel::High,
+                clawde_core::effort::EffortLevel::Max,
+                clawde_core::effort::EffortLevel::Ultracode,
+            ],
+        );
+        // Medium selected: no animation.
+        assert!(!app.needs_fast_repaint());
+        // Select Max: triggers animation.
+        app.effort_picker.selected = 3; // Max
         assert!(app.needs_fast_repaint());
     }
 

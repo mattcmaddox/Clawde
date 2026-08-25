@@ -14,10 +14,14 @@ flake-resistant on loaded CI runners.
 Usage:
   python3 scripts/probes/idle-cpu-probe.py \
       [--binary src-rust/target/debug/clawde] [--idle-secs 15] \
-      [--warmup-secs 10] [--max-cpu-secs 2]
+      [--warmup-secs 30] [--max-cpu-secs 2]
 
-A warm-up phase skips the one-time startup cost (welcome render, models-cache
-check, health probe) so the measured window reflects steady-state idle only.
+The warmup phase adaptively waits for the one-time startup cost (welcome
+render, health-key probe sweep, model discovery) to finish — sampling CPU
+once per second until the process goes genuinely idle — so the measured
+window reflects steady-state idle only. On a healthy network the sweep
+finishes in a couple of seconds and the warmup returns early; on a slow or
+unreachable network it may take the full warmup budget.
 Run manually as a health check (build first: cargo build), or wire into CI as a
 Linux-only step.
 """
@@ -52,6 +56,40 @@ def cpu_seconds(pid):
     return (utime + stime) / hz
 
 
+def wait_for_quiescence(pid, max_wait, quiet=False):
+    """Wait for the child to stop burning CPU.
+
+    Startup sweeps (health-key probes, model discovery) can run well past a
+    fixed warmup on a slow/unreachable network, and the probe must not measure
+    that one-time work.  We sample CPU once per second and require three
+    consecutive samples each burning under 0.05s (i.e. the process is
+    genuinely idle — the tail of a staggered probe sweep burns ~0.08s/s,
+    which stays above the 0.05s bar, while a healthy idle session at the
+    250ms repaint throttle burns well under 0.05s/s).  Returns the elapsed
+    settle time, or None if the process never settled within `max_wait`.
+    """
+    start = time.monotonic()
+    deadline = start + max_wait
+    prev = cpu_seconds(pid)
+    quiet_streak = 0
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        cur = cpu_seconds(pid)
+        if cur is None:
+            return None
+        if prev is not None and (cur - prev) < 0.05:
+            quiet_streak += 1
+            if quiet_streak >= 3:
+                elapsed = time.monotonic() - start
+                if not quiet:
+                    print("idle-cpu-probe: settled after %.1fs" % elapsed)
+                return elapsed
+        else:
+            quiet_streak = 0
+        prev = cur
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -63,14 +101,20 @@ def main():
     ap.add_argument(
         "--warmup-secs",
         type=int,
-        default=10,
-        help="seconds to let startup settle before sampling begins",
+        default=30,
+        help="max seconds to wait for the startup sweep to finish before "
+        "sampling begins (returns early once the process goes idle)",
     )
     ap.add_argument(
         "--max-cpu-secs",
         type=float,
         default=2.0,
         help="max CPU seconds allowed over the idle window",
+    )
+    ap.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress the settle-status line (for pre-commit hook output)",
     )
     args = ap.parse_args()
 
@@ -84,7 +128,15 @@ def main():
         os._exit(127)
 
     try:
-        time.sleep(args.warmup_secs)  # skip one-time startup cost
+        settle = wait_for_quiescence(pid, args.warmup_secs, args.quiet)
+        if settle is None:
+            print(
+                "idle-cpu-probe: FAIL — CPU never settled within %ds warmup; "
+                "the binary is doing sustained background work (startup "
+                "health probes / model discovery on a slow network?)"
+                % args.warmup_secs
+            )
+            return 1
         start = cpu_seconds(pid)
         time.sleep(args.idle_secs)
         end = cpu_seconds(pid)
