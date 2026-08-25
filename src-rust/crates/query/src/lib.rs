@@ -33,6 +33,7 @@ pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
+pub(crate) mod tool_exec;
 pub mod tool_use_tracker;
 pub mod verify;
 mod verify_container;
@@ -606,7 +607,7 @@ fn effective_effort_for_turn(
 
 /// Whether a tool name writes files — drives the verify loop's
 /// `skip_when_no_writes` gating (audit spec Phase 1).
-fn is_write_tool(name: &str) -> bool {
+pub(crate) fn is_write_tool(name: &str) -> bool {
     clawde_core::constants::is_file_mutator(name)
 }
 
@@ -614,14 +615,17 @@ fn is_write_tool(name: &str) -> bool {
 /// report executable test/lint outcomes directly, so an active approved plan
 /// can feed their failure into durable replan accounting even when the generic
 /// continuation verifier is disabled.
-fn is_deterministic_check_tool(name: &str) -> bool {
+pub(crate) fn is_deterministic_check_tool(name: &str) -> bool {
     matches!(name, "RunTests" | "RunLints")
 }
 
 /// Classify a direct check result without retaining its raw output in plan
 /// state. Permission, sandbox, and dispatch failures are infrastructure signals
 /// rather than deterministic code failures and must not consume replan budget.
-fn deterministic_check_observation(name: &str, result: &clawde_tools::ToolResult) -> (bool, bool) {
+pub(crate) fn deterministic_check_observation(
+    name: &str,
+    result: &clawde_tools::ToolResult,
+) -> (bool, bool) {
     if !is_deterministic_check_tool(name) {
         return (false, false);
     }
@@ -1267,25 +1271,12 @@ pub async fn run_query_loop(
     let mut recent_no_progress: std::collections::VecDeque<String> =
         std::collections::VecDeque::new();
     let mut no_progress_streak: u32 = 0;
-    // Signatures of the tool calls executed during the current logical turn.
-    // Filled at each tool-execution site; consumed and cleared when the turn
-    // ends at `continue_or_end!`.
-    let mut turn_tool_signatures: Vec<String> = Vec::new();
-    // Count tool failures for the current logical turn without retaining raw
-    // tool output in the durable plan artifact.
-    let mut turn_tool_error_count: u32 = 0;
-    // How many of those failures were FATAL (uncorrectable by retry — unknown
-    // tool, unavailable tool, network blocked) vs recoverable
-    // (InvalidInput/PermissionDenied/ExecutionFailed/Timeout). Fatal errors
-    // collapse into the no-progress sentinel so a changing sequence of them is
-    // still one stalled pattern; recoverable errors use the real signature so
-    // the model gets headroom to iterate on a fix. Hard fatal errors are the
-    // fatal subset that is NOT a deterministic check failure (RunTests/
-    // RunLints): unknown/unavailable tools, blocked network, etc. Check
-    // failures are fixable by writing code, so the stop message must not call
-    // them "uncorrectable" even though both collapse to the sentinel.
-    let mut turn_fatal_tool_error_count: u32 = 0;
-    let mut turn_hard_fatal_error_count: u32 = 0;
+    // Per-turn tool-health accumulator (tool_exec.rs, refactor-loop-health
+    // Phase A): error counts, deterministic-check flags, and no-progress
+    // signatures, filled by the shared prepare/execute core and consumed at
+    // `continue_or_end!` and plan evidence. `wrote_files` deliberately stays a
+    // loop local — it feeds goal/plan/snapshot logic beyond turn health.
+    let mut turn_state = crate::tool_exec::TurnToolState::default();
     // Trajectory-sanitization upstream tracker: the free provider falls back
     // through upstreams internally (free/auto → cline etc.) without the query
     // loop noticing a model change. We remember the upstream that served the
@@ -1307,10 +1298,6 @@ pub async fn run_query_loop(
     // Repeat-tool-reminder guard: detects consecutive identical tool calls
     // and injects escalating reminders to break infinite loops.
     let mut repeat_detector = repeat_guard::RepeatCallDetector::new();
-    // Direct RunTests/RunLints outcomes are deterministic plan evidence even
-    // when the separate end-of-turn verifier policy is disabled.
-    let mut turn_deterministic_check_run = false;
-    let mut turn_deterministic_check_failed = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -1572,16 +1559,16 @@ pub async fn run_query_loop(
                 // actually executed this logical turn (accumulated at the
                 // execution sites below), so an end_turn message carrying only
                 // text still reflects the tool round that preceded it.
-                let tool_count = turn_tool_signatures.len();
-                let signature = if turn_tool_signatures.is_empty() {
+                let tool_count = turn_state.signatures.len();
+                let signature = if turn_state.signatures.is_empty() {
                     None
                 } else {
-                    Some(turn_tool_signatures.join("|"))
+                    Some(turn_state.signatures.join("|"))
                 };
-                let had_tool_errors = turn_tool_error_count > 0;
-                let had_fatal_tool_errors = turn_fatal_tool_error_count > 0;
-                let had_hard_fatal_errors = turn_hard_fatal_error_count > 0;
-                turn_tool_signatures.clear();
+                let had_tool_errors = turn_state.error_count > 0;
+                let had_fatal_tool_errors = turn_state.fatal_error_count > 0;
+                let had_hard_fatal_errors = turn_state.hard_fatal_error_count > 0;
+                turn_state.signatures.clear();
                 if update_no_progress_state_with_errors(
                     signature,
                     &mut recent_no_progress,
@@ -1597,7 +1584,7 @@ pub async fn run_query_loop(
                                 "No progress detected: the model hit uncorrectable tool errors for {} consecutive turns without changing any files — stopping the loop.",
                                 no_progress_streak
                             )
-                        } else if turn_deterministic_check_failed {
+                        } else if turn_state.check_failed {
                             // Test/lint failures are fixable by writing code;
                             // the write would have reset the streak, so this
                             // stop means the model kept re-running checks
@@ -1670,16 +1657,16 @@ pub async fn run_query_loop(
                     turn_made_writes: wrote_files,
                     has_scoped_diff: $assistant_msg.snapshot_patch.is_some()
                         && turn_diff.as_deref().is_some_and(|diff| !diff.trim().is_empty()),
-                    deterministic_checks_run: turn_deterministic_check_run
+                    deterministic_checks_run: turn_state.check_run
                         || verify_report.as_ref().is_some_and(|report| {
                             !report.unavailable && !report.results.is_empty()
                         }),
-                    deterministic_passed: !turn_deterministic_check_failed
-                        && ((turn_deterministic_check_run)
+                    deterministic_passed: !turn_state.check_failed
+                        && ((turn_state.check_run)
                             || verify_report.as_ref().is_some_and(|report| {
                                 matches!(report.verdict, crate::verify::VerifyVerdict::Pass)
                             })),
-                    deterministic_failed: turn_deterministic_check_failed
+                    deterministic_failed: turn_state.check_failed
                         || verify_report.as_ref().is_some_and(|report| {
                             !report.unavailable
                                 && report.results.iter().any(|result| !result.ok && !result.skipped)
@@ -1696,9 +1683,9 @@ pub async fn run_query_loop(
                         $stop_reason,
                         wrote_files,
                         tool_count,
-                        turn_tool_error_count,
-                        turn_deterministic_check_run,
-                        turn_deterministic_check_failed,
+                        turn_state.error_count,
+                        turn_state.check_run,
+                        turn_state.check_failed,
                         $assistant_msg.snapshot_patch.as_ref(),
                         turn_diff.as_deref(),
                         verify_report.as_ref(),
@@ -1803,14 +1790,13 @@ pub async fn run_query_loop(
                         // next turn's semantic context or write guard.
                         wrote_files = false;
                         turn_diff = None;
-                        turn_tool_error_count = 0;
-                        turn_fatal_tool_error_count = 0;
-                        turn_hard_fatal_error_count = 0;
+                        // A continuation starts a fresh verification scope:
+                        // per-turn counters are cleared with the other turn
+                        // state below.
+                        turn_state.clear_turn();
                         // Reset repeat-tool-reminder: a user message changes the
                         // context; repetition across it is not a loop.
                         repeat_detector.reset();
-                        turn_deterministic_check_run = false;
-                        turn_deterministic_check_failed = false;
                         turn_snapshot = if let Some(ref snap) = shadow_snap {
                             snap.track().await
                         } else {
@@ -3313,226 +3299,37 @@ pub async fn run_query_loop(
                             .collect();
 
                         // -----------------------------------------------------------------
-                        // Parallel tool executor: concurrent dispatch.
-                        //
-                        // Phase 1: Emit ToolStart events, record side effects, and
-                        //          build execution futures (or pre-computed errors for
-                        //          malformed tool calls).
-                        // Phase 2: Run all tool futures concurrently via join_all,
-                        //          racing against the cancel token.
-                        // Phase 3: Emit ToolEnd events, collect result blocks, run
-                        //          deterministic checks, and observe the repeat detector.
+                        // Parallel tool executor (shared core — tool_exec.rs):
+                        // Phase 1 pre-hooks / prepare, then the shared Phase 2/3
+                        // batch dispatch. Provider-path-only post-steps
+                        // (auto-lint, context-refresh tracking) run below after
+                        // the results are pushed.
                         // -----------------------------------------------------------------
-                        struct PreparedProviderTool {
-                            id: String,
-                            name: String,
-                            input: Value,
-                            result: Option<ToolResult>,
-                        }
+                        let prepared = crate::tool_exec::prepare_tool_batch(
+                            &tool_use_blocks,
+                            tool_ctx,
+                            event_tx.as_ref(),
+                            &malformed_tool_calls,
+                            &mut turn_state,
+                            &mut wrote_files,
+                            &mut total_tool_calls,
+                        )
+                        .await;
 
-                        let mut prepared: Vec<PreparedProviderTool> =
-                            Vec::with_capacity(tool_use_blocks.len());
-                        for (tool_id, tool_name, tool_input) in &tool_use_blocks {
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::ToolStart {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
-                                    input_json: tool_input.to_string(),
-                                });
-                            }
-                            wrote_files |= is_write_tool(tool_name);
-                            turn_tool_signatures.push(format!(
-                                "{}:{}",
-                                tool_name,
-                                serde_json::to_string(tool_input).unwrap_or_default()
-                            ));
-
-                            // PreToolUse hooks (config + plugins). Mirrors the
-                            // Anthropic path so user hooks fire on every
-                            // provider, not just the explicit Anthropic one
-                            // (refactor-loop-health W1: the provider path is
-                            // the default for free + non-Anthropic providers).
-                            let hooks = &tool_ctx.config.hooks;
-                            let hook_ctx = clawde_core::hooks::HookContext {
-                                event: "PreToolUse".to_string(),
-                                tool_name: Some(tool_name.clone()),
-                                tool_input: Some(tool_input.clone()),
-                                tool_output: None,
-                                is_error: None,
-                                session_id: Some(tool_ctx.session_id.clone()),
-                                upstream_id: None,
-                                model: None,
-                                elapsed_ms: None,
-                                cost_usd: None,
-                                fallback_used: None,
-                                retries: None,
-                            };
-                            let pre_outcome = clawde_core::hooks::run_hooks(
-                                hooks,
-                                clawde_core::config::HookEvent::PreToolUse,
-                                &hook_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
-
-                            let plugin_pre_outcome =
-                                clawde_plugins::run_global_pre_tool_hook(tool_name, tool_input);
-
-                            // A hook veto takes priority over the malformed-args
-                            // fallback: a blocked call is never executed.
-                            let blocked = if let clawde_core::hooks::HookOutcome::Blocked(reason) =
-                                pre_outcome
-                            {
-                                warn!(tool = %tool_name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(clawde_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let clawde_plugins::HookOutcome::Deny(reason) =
-                                plugin_pre_outcome
-                            {
-                                warn!(tool = %tool_name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(clawde_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else if malformed_tool_calls.contains(tool_id) {
-                                Some(ToolResult::error_with_code(
-                                    clawde_tools::ToolErrorCode::InvalidInput,
-                                    format!(
-                                        "Tool call '{}' was not executed: its arguments were \
-                                             malformed or truncated JSON. {}",
-                                        tool_name,
-                                        clawde_tools::ToolErrorCode::InvalidInput.recovery_hint()
-                                    ),
-                                ))
-                            } else {
-                                None
-                            };
-                            prepared.push(PreparedProviderTool {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                input: tool_input.clone(),
-                                result: blocked,
-                            });
-                        }
-
-                        // Track total tool calls for goal re-anchoring (mirrors
-                        // the Anthropic path; without it the re-anchor milestone
-                        // never advances on the provider path).
-                        total_tool_calls += prepared.len() as u32;
-
-                        // Phase 2: build execution futures for non-blocked tools.
-                        let exec_task_id = active_task_id.clone();
-                        let exec_futures: Vec<_> = prepared
-                            .iter()
-                            .map(|p| {
-                                let task_id = exec_task_id.clone();
-                                if let Some(ref r) = p.result {
-                                    let r = r.clone();
-                                    futures::future::Either::Left(async move { r })
-                                } else {
-                                    let name = p.name.clone();
-                                    let input = p.input.clone();
-                                    futures::future::Either::Right(async move {
-                                        execute_tool_for_task(
-                                            &name,
-                                            &input,
-                                            tools,
-                                            tool_ctx,
-                                            task_id.as_deref(),
-                                        )
-                                        .await
-                                    })
-                                }
-                            })
-                            .collect();
-
-                        let (exec_results, batch_cancelled) =
-                            run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
-
-                        // Phase 3: post-processing — events, results, checks.
-                        let mut tool_results = Vec::new();
-                        for (p, result) in prepared.iter().zip(exec_results) {
-                            let (check_run, check_failed) =
-                                deterministic_check_observation(&p.name, &result);
-                            turn_deterministic_check_run |= check_run;
-                            turn_deterministic_check_failed |= check_failed;
-                            if result.is_error {
-                                turn_tool_error_count += 1;
-                                if result.error_code.is_none_or(|code| !code.is_recoverable()) {
-                                    turn_fatal_tool_error_count += 1;
-                                    if !check_failed {
-                                        turn_hard_fatal_error_count += 1;
-                                    }
-                                }
-                            }
-                            // PostToolUse hooks (config + plugins), skipped when
-                            // the batch was cancelled — they run external
-                            // commands and would defeat the point of returning
-                            // promptly (mirrors the Anthropic path).
-                            if !batch_cancelled {
-                                let hooks = &tool_ctx.config.hooks;
-                                let post_ctx = clawde_core::hooks::HookContext {
-                                    event: "PostToolUse".to_string(),
-                                    tool_name: Some(p.name.clone()),
-                                    tool_input: Some(p.input.clone()),
-                                    tool_output: Some(result.content.clone()),
-                                    is_error: Some(result.is_error),
-                                    session_id: Some(tool_ctx.session_id.clone()),
-                                    upstream_id: None,
-                                    model: None,
-                                    elapsed_ms: None,
-                                    cost_usd: None,
-                                    fallback_used: None,
-                                    retries: None,
-                                };
-                                clawde_core::hooks::run_hooks(
-                                    hooks,
-                                    clawde_core::config::HookEvent::PostToolUse,
-                                    &post_ctx,
-                                    &tool_ctx.working_dir,
-                                )
-                                .await;
-
-                                clawde_plugins::run_global_post_tool_hook(
-                                    &p.name,
-                                    &p.input,
-                                    &result.content,
-                                    result.is_error,
-                                );
-                            }
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::ToolEnd {
-                                    tool_name: p.name.clone(),
-                                    tool_id: p.id.clone(),
-                                    result: result.content.clone(),
-                                    is_error: result.is_error,
-                                    error_code: result
-                                        .error_code
-                                        .map(|code| code.as_str().to_string()),
-                                });
-                            }
-                            tool_results.push(ContentBlock::ToolResult {
-                                tool_use_id: p.id.clone(),
-                                content: clawde_core::types::ToolResultContent::Text(
-                                    result.content,
-                                ),
-                                // Canonical wire form: omit is_error on success
-                                // (matches the Anthropic path / sanitize).
-                                is_error: if result.is_error { Some(true) } else { None },
-                            });
-                            if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
-                                tool_results.push(ContentBlock::ToolResult {
-                                    tool_use_id: p.id.clone(),
-                                    content: clawde_core::types::ToolResultContent::Text(format!(
-                                        "[SYSTEM NOTICE: {}]",
-                                        reminder
-                                    )),
-                                    is_error: Some(false),
-                                });
-                            }
-                        }
+                        let tool_exec_ctx = crate::tool_exec::ToolExecCtx {
+                            tools,
+                            tool_ctx,
+                            active_task_id: active_task_id.as_deref(),
+                            cancel_token: &tool_ctx.cancel_token,
+                            event_tx: event_tx.as_ref(),
+                        };
+                        let (tool_results, batch_cancelled) = crate::tool_exec::execute_tool_batch(
+                            &tool_exec_ctx,
+                            &prepared,
+                            &mut turn_state,
+                            &mut repeat_detector,
+                        )
+                        .await;
                         if batch_cancelled {
                             return QueryOutcome::Cancelled;
                         }
@@ -4480,229 +4277,54 @@ pub async fn run_query_loop(
                     }
 
                     // ---------------------------------------------------------------------------
-                    // Streaming tool executor: parallel non-agent tool dispatch.
-                    //
-                    // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
-                    //          and may display interactive permission dialogs).
-                    // Phase 2: Dispatch all non-blocked tool executions concurrently via
-                    //          futures::future::join_all, preserving original order.
-                    // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
-                    //
-                    // This mirrors the TypeScript StreamingToolExecutor pattern.
+                    // Streaming tool executor (shared core — tool_exec.rs): Phase 1
+                    // pre-hooks / prepare, then the shared Phase 2/3 batch dispatch.
+                    // Mirrors the TypeScript StreamingToolExecutor pattern.
                     // ---------------------------------------------------------------------------
 
-                    // Intermediate record produced during Phase 1.
-                    struct PreparedTool {
-                        id: String,
-                        name: String,
-                        input: Value,
-                        /// None means the pre-hook blocked execution; the String is the error reason.
-                        blocked_result: Option<ToolResult>,
-                    }
-
-                    // Phase 1: sequential pre-hook pass.
-                    let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
-                    for block in tool_blocks {
-                        if let ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } = block
-                        {
-                            // Clone from the references returned by get_tool_use_blocks()
-                            let id = id.clone();
-                            let name = name.clone();
-                            let input = input.clone();
-
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::ToolStart {
-                                    tool_name: name.clone(),
-                                    tool_id: id.clone(),
-                                    input_json: input.to_string(),
-                                });
-                            }
-                            wrote_files |= is_write_tool(&name);
-                            turn_tool_signatures.push(format!(
-                                "{}:{}",
-                                name,
-                                serde_json::to_string(&input).unwrap_or_default()
-                            ));
-
-                            let hooks = &tool_ctx.config.hooks;
-                            let hook_ctx = clawde_core::hooks::HookContext {
-                                event: "PreToolUse".to_string(),
-                                tool_name: Some(name.clone()),
-                                tool_input: Some(input.clone()),
-                                tool_output: None,
-                                is_error: None,
-                                session_id: Some(tool_ctx.session_id.clone()),
-                                upstream_id: None,
-                                model: None,
-                                elapsed_ms: None,
-                                cost_usd: None,
-                                fallback_used: None,
-                                retries: None,
-                            };
-                            let pre_outcome = clawde_core::hooks::run_hooks(
-                                hooks,
-                                clawde_core::config::HookEvent::PreToolUse,
-                                &hook_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
-
-                            let plugin_pre_outcome =
-                                clawde_plugins::run_global_pre_tool_hook(&name, &input);
-
-                            let blocked_result = if let clawde_core::hooks::HookOutcome::Blocked(
-                                reason,
-                            ) = pre_outcome
+                    // Normalize tool_use blocks into (id, name, input) tuples for
+                    // the shared prepare step.
+                    let tool_calls: Vec<_> = tool_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } = b
                             {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(clawde_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let clawde_plugins::HookOutcome::Deny(reason) =
-                                plugin_pre_outcome
-                            {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(clawde_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
+                                Some((id.clone(), name.clone(), input.clone()))
                             } else {
                                 None
-                            };
-
-                            prepared.push(PreparedTool {
-                                id,
-                                name,
-                                input,
-                                blocked_result,
-                            });
-                        }
-                    }
-
-                    // Track total tool calls for goal re-anchoring.
-                    total_tool_calls += prepared.len() as u32;
-
-                    // Phase 2: build execution futures for non-blocked tools and join them.
-                    // Blocked tools yield a ready future with the pre-computed error result.
-                    // Non-blocked tools execute concurrently via join_all.
-                    // Each async block owns its cloned name/input so there are no lifetime issues.
-                    let exec_task_id = active_task_id.clone();
-                    let exec_futures: Vec<_> = prepared
-                        .iter()
-                        .map(|p| {
-                            let task_id = exec_task_id.clone();
-                            if p.blocked_result.is_some() {
-                                let r = p.blocked_result.clone().unwrap();
-                                futures::future::Either::Left(async move { r })
-                            } else {
-                                let name = p.name.clone();
-                                let input = p.input.clone();
-                                futures::future::Either::Right(async move {
-                                    execute_tool_for_task(
-                                        &name,
-                                        &input,
-                                        tools,
-                                        tool_ctx,
-                                        task_id.as_deref(),
-                                    )
-                                    .await
-                                })
                             }
                         })
                         .collect();
 
-                    // Run all tool futures concurrently, but race the batch against the
-                    // loop's cancel token (issue #218): on cancellation the in-flight
-                    // tools are abandoned promptly instead of blocking until the
-                    // slowest one finishes, and a cancelled ToolResult is synthesized
-                    // for EVERY tool so each tool_use still gets a matching tool_result
-                    // and the message history stays well-formed.
-                    let (exec_results, batch_cancelled) =
-                        run_tool_batch(exec_futures, &tool_ctx.cancel_token).await;
+                    let prepared = crate::tool_exec::prepare_tool_batch(
+                        &tool_calls,
+                        tool_ctx,
+                        event_tx.as_ref(),
+                        // The Anthropic stream handler does not detect malformed
+                        // tool calls (provider-path only, D6).
+                        &std::collections::HashSet::new(),
+                        &mut turn_state,
+                        &mut wrote_files,
+                        &mut total_tool_calls,
+                    )
+                    .await;
 
-                    // Phase 3: post-hooks, event emission, and result block assembly.
-                    // When the batch was cancelled we skip the awaiting PostToolUse
-                    // hooks (they run external commands and would defeat the point of
-                    // returning promptly) but still emit ToolEnd + build every result
-                    // block so the conversation and TUI stay consistent.
-                    let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                    for (p, result) in prepared.iter().zip(exec_results) {
-                        let (check_run, check_failed) =
-                            deterministic_check_observation(&p.name, &result);
-                        turn_deterministic_check_run |= check_run;
-                        turn_deterministic_check_failed |= check_failed;
-                        if result.is_error {
-                            turn_tool_error_count += 1;
-                            if result.error_code.is_none_or(|code| !code.is_recoverable()) {
-                                turn_fatal_tool_error_count += 1;
-                                if !check_failed {
-                                    turn_hard_fatal_error_count += 1;
-                                }
-                            }
-                        }
-                        if !batch_cancelled {
-                            let hooks = &tool_ctx.config.hooks;
-                            let post_ctx = clawde_core::hooks::HookContext {
-                                event: "PostToolUse".to_string(),
-                                tool_name: Some(p.name.clone()),
-                                tool_input: Some(p.input.clone()),
-                                tool_output: Some(result.content.clone()),
-                                is_error: Some(result.is_error),
-                                session_id: Some(tool_ctx.session_id.clone()),
-                                upstream_id: None,
-                                model: None,
-                                elapsed_ms: None,
-                                cost_usd: None,
-                                fallback_used: None,
-                                retries: None,
-                            };
-                            clawde_core::hooks::run_hooks(
-                                hooks,
-                                clawde_core::config::HookEvent::PostToolUse,
-                                &post_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
-
-                            clawde_plugins::run_global_post_tool_hook(
-                                &p.name,
-                                &p.input,
-                                &result.content,
-                                result.is_error,
-                            );
-                        }
-
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::ToolEnd {
-                                tool_name: p.name.clone(),
-                                tool_id: p.id.clone(),
-                                result: result.content.clone(),
-                                is_error: result.is_error,
-                                error_code: result.error_code.map(|code| code.as_str().to_string()),
-                            });
-                        }
-
-                        result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: p.id.clone(),
-                            content: ToolResultContent::Text(result.content),
-                            is_error: if result.is_error { Some(true) } else { None },
-                        });
-                        // Repeat-tool-reminder: detect consecutive identical
-                        // tool calls and inject a warning to break loops.
-                        if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
-                            result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: p.id.clone(),
-                                content: ToolResultContent::Text(format!(
-                                    "[SYSTEM NOTICE: {}]",
-                                    reminder
-                                )),
-                                is_error: Some(false),
-                            });
-                        }
-                    }
+                    let tool_exec_ctx = crate::tool_exec::ToolExecCtx {
+                        tools,
+                        tool_ctx,
+                        active_task_id: active_task_id.as_deref(),
+                        cancel_token: &tool_ctx.cancel_token,
+                        event_tx: event_tx.as_ref(),
+                    };
+                    let (result_blocks, batch_cancelled) = crate::tool_exec::execute_tool_batch(
+                        &tool_exec_ctx,
+                        &prepared,
+                        &mut turn_state,
+                        &mut repeat_detector,
+                    )
+                    .await;
 
                     // Append tool results as a user message so the history remains
                     // valid (every tool_use is answered) even on cancellation.

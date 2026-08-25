@@ -157,6 +157,21 @@ and asserts both PreToolUse and PostToolUse fired, plus the canonical
 
 ### Phase A — Extract shared tool-execution core (W1, W2, W5)
 
+**Status: implemented.** `crates/query/src/tool_exec.rs` now holds
+`TurnToolState` (error/fatal/hard-fatal counters + check flags + no-progress
+signatures, with `observe()` / `clear_turn()`), `ToolExecCtx` (bundled
+immutable deps — refactor-loop-health R1), `PreparedTool`, the shared
+`prepare_tool_batch` (Phase 1) and `execute_tool_batch` (Phase 2/3). Both
+call sites in `lib.rs` now delegate to it; `wrote_files` stays a loop local
+(G4) and the provider-path post-steps (auto-lint, file_tracker — D4/D5)
+stay at the provider call site (G3). The no-progress detector reads
+`turn_state` fields (W5) and `plan_turn_evidence` keeps its individual-arg
+signature (G4). B1 landed too: hook/plugin blocks now carry
+`PermissionDenied` instead of an unclassified `error_code: None`, so the
+no-progress detector treats them as recoverable rather than hard-fatal.
+Direct unit tests in `tool_exec.rs` pin the classification, blocked-tool
+handling, canonical `is_error`, and `clear_turn` (G1).
+
 New module `crates/query/src/tool_exec.rs`:
 
 - `struct TurnToolState` — one accumulator replacing the scattered locals:
