@@ -1238,6 +1238,10 @@ pub async fn run_query_loop(
     // Count tool failures for the current logical turn without retaining raw
     // tool output in the durable plan artifact.
     let mut turn_tool_error_count: u32 = 0;
+    // Goal re-anchoring: counts total tool calls across the entire session
+    // and injects a reminder with the original user request every N calls
+    // to prevent goal drift (research: arXiv 2505.02709, Zylos 2026).
+    let mut total_tool_calls: u32 = 0;
     // Repeat-tool-reminder guard: detects consecutive identical tool calls
     // and injects escalating reminders to break infinite loops.
     let mut repeat_detector = repeat_guard::RepeatCallDetector::new();
@@ -4315,6 +4319,9 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    // Track total tool calls for goal re-anchoring.
+                    total_tool_calls += prepared.len() as u32;
+
                     // Phase 2: build execution futures for non-blocked tools and join them.
                     // Blocked tools yield a ready future with the pre-computed error result.
                     // Non-blocked tools execute concurrently via join_all.
@@ -4431,6 +4438,30 @@ pub async fn run_query_loop(
                     // Append tool results as a user message so the history remains
                     // valid (every tool_use is answered) even on cancellation.
                     messages.push(Message::user_blocks(result_blocks));
+
+                    // Goal re-anchoring: every GOAL_REANCHOR_INTERVAL tool calls,
+                    // inject the user's original request to prevent goal drift.
+                    // Research shows agents drift from their original objective as
+                    // context fills with operational detail (arXiv 2505.02709).
+                    const GOAL_REANCHOR_INTERVAL: u32 = 6;
+                    if total_tool_calls > 0
+                        && total_tool_calls.is_multiple_of(GOAL_REANCHOR_INTERVAL)
+                    {
+                        // Extract the first user message as the original request.
+                        if let Some(first_user) = messages
+                            .iter()
+                            .find(|m| matches!(m.role, clawde_core::types::Role::User))
+                        {
+                            let original = first_user.get_all_text();
+                            if !original.is_empty() && original.len() < 500 {
+                                messages.push(Message::user(format!(
+                                    "[Goal reminder] Your original task: \"{}\". \nFocus on producing the requested output. You have used {} tool calls so far.",
+                                    original,
+                                    total_tool_calls
+                                )));
+                            }
+                        }
+                    }
 
                     // If the batch was abandoned due to cancellation, stop the loop
                     // now rather than sending the (cancelled) results back to the model.
