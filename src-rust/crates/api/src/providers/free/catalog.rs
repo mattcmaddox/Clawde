@@ -395,6 +395,9 @@ pub struct FreeLastRoute {
     pub upstream_id: String,
     pub model: String,
     pub usage: clawde_core::types::UsageInfo,
+    /// Debug-form stop reason ("EndTurn", "MaxTokens", "ToolUse", …) so
+    /// the inspector can flag `MaxTokens` truncation.
+    pub stop_reason: Option<String>,
 }
 
 static RECENT_FREE_LAST_ROUTE: OnceLock<Mutex<Option<FreeLastRoute>>> = OnceLock::new();
@@ -472,6 +475,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 reasoning_tokens: 480,
             },
+            stop_reason: Some("MaxTokens".to_string()),
         };
         // The slot is process-global and parallel dispatch tests write to it;
         // re-store our marker up to 3 times to ride out any interleaving.

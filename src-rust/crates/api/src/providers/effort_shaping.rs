@@ -288,6 +288,283 @@ pub fn shape_provider_thinking(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thinking inspector (read-only)
+// ---------------------------------------------------------------------------
+
+use super::free::{FreeLastRoute, FreeUpstream};
+
+/// How Clawde's shaping treats thinking for the inspected model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Clawde sends an explicit enable (or a non-minimum behavioral tier).
+    Enabled,
+    /// Clawde sends an explicit disable.
+    Disabled,
+    /// The model/provider has no thinking knob in Clawde's shaping.
+    NotSupported,
+}
+
+/// The kind of thinking control the provider's API exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    /// A hard token budget (Gemini 2.5 `thinkingBudget`).
+    Budget,
+    /// A behavioral level, not a strict token budget
+    /// (`reasoningEffort`, `thinkingLevel`).
+    Behavioral,
+    /// A binary on/off (`thinking.type`, `enable_thinking`,
+    /// `chat_template_kwargs`).
+    Toggle,
+}
+
+/// One row of the thinking inspector: what Clawde would send for a
+/// (provider, model, effort) triple, plus the upstream's constraints and the
+/// last successful dispatch's usage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThinkingInspection {
+    pub provider_id: String,
+    pub provider_title: String,
+    pub model_id: String,
+    pub mode: ThinkingMode,
+    pub control: Option<ThinkingControl>,
+    /// Human-readable wire param, e.g. `reasoningEffort: high`.
+    pub wire_param: Option<String>,
+    /// Effective thinking budget after clamping (budget-type controls only).
+    pub effective_budget: Option<u32>,
+    pub max_tokens_cap: Option<u32>,
+    pub context_window: Option<u32>,
+    pub tool_calling: bool,
+    pub vision: bool,
+    pub warnings: Vec<String>,
+    pub last_response: Option<LastResponseInspection>,
+}
+
+/// Usage of the last successful dispatch, plus diagnostic flags.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LastResponseInspection {
+    pub upstream_id: String,
+    pub model: String,
+    pub reasoning_tokens: u64,
+    pub completion_tokens: u64,
+    pub stop_reason: Option<String>,
+    /// Human-readable diagnostics ("budget eaten", "truncated", …).
+    pub flags: Vec<String>,
+}
+
+/// Read-only view of what thinking parameters Clawde would send for a
+/// (provider, model, effort) triple — the thinking inspector's row data.
+///
+/// Mirrors [`shape_provider_thinking`] exactly: it calls the real shaping
+/// function on a fresh options map and interprets what was written, so the
+/// inspector can never drift from dispatch behavior. `upstream` supplies the
+/// catalog constraints (cap, context, capabilities); pass `None` for
+/// direct (non-free) providers. `last_route` supplies the previous turn's
+/// usage; pass `None` when there is none.
+///
+/// Pure and deterministic over its inputs — safe for the TUI to call on
+/// every repaint of the pickers.
+pub fn inspect_thinking(
+    provider_id: &str,
+    model_id: &str,
+    effort_level: Option<EffortLevel>,
+    thinking_budget: Option<u32>,
+    max_tokens: Option<u32>,
+    upstream: Option<&FreeUpstream>,
+    last_route: Option<&FreeLastRoute>,
+) -> ThinkingInspection {
+    let model = model_id.to_ascii_lowercase();
+    let mut options = serde_json::Map::new();
+    shape_provider_thinking(
+        &mut options,
+        provider_id,
+        &model,
+        effort_level,
+        thinking_budget,
+        max_tokens,
+    );
+
+    let mut warnings = Vec::new();
+
+    // Ladder quirks that hold regardless of the wire param.
+    if effort_level == Some(EffortLevel::Low) {
+        warnings.push(
+            "Low disables thinking; Minimal enables a 1,024-token budget — use Minimal for cheap thinking"
+                .to_string(),
+        );
+        warnings.push("Low forces temperature 0.0".to_string());
+    }
+    if let Some(upstream) = upstream {
+        if let (Some(cap), Some(mt)) = (upstream.max_tokens_cap, max_tokens) {
+            if mt > cap {
+                warnings.push(format!("max_tokens {mt} clamped to upstream cap {cap}"));
+            }
+        }
+    }
+
+    // Interpret what shape_provider_thinking wrote. Ordered to match the
+    // arms: google thinkingConfig, then thinking.type, then enable_thinking,
+    // then chat_template_kwargs, then the reasoningEffort catch-all.
+    let mut mode = ThinkingMode::NotSupported;
+    let mut control: Option<ThinkingControl> = None;
+    let mut wire_param: Option<String> = None;
+    let mut effective_budget: Option<u32> = None;
+
+    if let Some(cfg) = options.get("thinkingConfig") {
+        // Google: 2.5 models take a budget, 3.x take a level.
+        let include = cfg
+            .get("includeThoughts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if let Some(budget) = cfg.get("thinkingBudget").and_then(|v| v.as_u64()) {
+            if !include || budget == 0 {
+                mode = ThinkingMode::Disabled;
+                control = Some(ThinkingControl::Budget);
+                wire_param = Some("thinkingConfig: off".to_string());
+            } else {
+                mode = ThinkingMode::Enabled;
+                control = Some(ThinkingControl::Budget);
+                effective_budget = Some(budget as u32);
+                wire_param = Some(format!("thinkingBudget: {budget}"));
+                // Surface the clamp the shaping applied (budget < max_tokens).
+                let raw = thinking_budget
+                    .or_else(|| effort_level.and_then(|l| l.thinking_budget_tokens()))
+                    .unwrap_or(budget as u32);
+                if let Some(mt) = max_tokens {
+                    if raw >= mt {
+                        warnings.push(format!(
+                            "budget {raw} clamped below max_tokens {mt} (Gemini requires budget < maxOutputTokens)"
+                        ));
+                    }
+                }
+            }
+        } else if let Some(level) = cfg.get("thinkingLevel").and_then(|v| v.as_str()) {
+            if include {
+                mode = ThinkingMode::Enabled;
+                control = Some(ThinkingControl::Behavioral);
+                wire_param = Some(format!("thinkingLevel: {level}"));
+            } else {
+                mode = ThinkingMode::Disabled;
+                wire_param = Some(format!("thinkingLevel: {level} (off)"));
+            }
+        }
+    } else if let Some(thinking) = options.get("thinking") {
+        // Z.AI / Zhipu / DeepSeek: thinking.type.
+        let t = thinking
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("enabled");
+        if t == "disabled" {
+            mode = ThinkingMode::Disabled;
+            control = Some(ThinkingControl::Toggle);
+            wire_param = Some("thinking.type: disabled".to_string());
+        } else {
+            mode = ThinkingMode::Enabled;
+            control = Some(ThinkingControl::Toggle);
+            wire_param = Some("thinking.type: enabled".to_string());
+            // DeepSeek also writes a behavioral effort tier alongside.
+            if let Some(effort) = options.get("reasoningEffort").and_then(|v| v.as_str()) {
+                wire_param = Some(format!(
+                    "thinking.type: enabled · reasoningEffort: {effort}"
+                ));
+            }
+        }
+    } else if options.get("enable_thinking").and_then(|v| v.as_bool()) == Some(true) {
+        mode = ThinkingMode::Enabled;
+        control = Some(ThinkingControl::Toggle);
+        wire_param = Some("enable_thinking: true".to_string());
+    } else if let Some(kwargs) = options.get("chat_template_kwargs") {
+        if kwargs.get("enable_thinking").and_then(|v| v.as_bool()) == Some(false) {
+            mode = ThinkingMode::Disabled;
+            control = Some(ThinkingControl::Toggle);
+            wire_param = Some("chat_template_kwargs.enable_thinking: false".to_string());
+        }
+    } else if let Some(effort) = options.get("reasoningEffort").and_then(|v| v.as_str()) {
+        mode = ThinkingMode::Enabled;
+        control = Some(ThinkingControl::Behavioral);
+        wire_param = Some(format!("reasoningEffort: {effort}"));
+        if effort == "none" {
+            warnings
+                .push("reasoningEffort \"none\" is the minimum thinking tier, not off".to_string());
+        }
+    }
+
+    // Arms that write nothing on purpose: describe the default rather than
+    // claiming the model has no thinking knob.
+    if mode == ThinkingMode::NotSupported {
+        if provider_id == "poolside" && effort_level != Some(EffortLevel::None) {
+            mode = ThinkingMode::Enabled;
+            control = Some(ThinkingControl::Toggle);
+            wire_param =
+                Some("chat_template_kwargs.enable_thinking: true (provider default)".to_string());
+            warnings.push(
+                "poolside thinking is on by default and consumes from max_tokens".to_string(),
+            );
+        } else if provider_id == "qwen" && thinking_budget.is_none() {
+            mode = ThinkingMode::Disabled;
+            control = Some(ThinkingControl::Toggle);
+            wire_param = Some("enable_thinking: not requested (no thinking budget)".to_string());
+        } else if effort_level.is_none() && provider_id == "google" && model.contains("gemini") {
+            // No override: the request carries no thinking param and the
+            // provider default stands.
+            mode = ThinkingMode::Enabled;
+            control = Some(if model.contains("2.5") {
+                ThinkingControl::Budget
+            } else {
+                ThinkingControl::Behavioral
+            });
+            wire_param = Some("provider default (no effort override)".to_string());
+        }
+    }
+
+    let last_response = last_route.map(|route| {
+        let mut flags = Vec::new();
+        if route.usage.reasoning_tokens > 0 {
+            if let Some(mt) = max_tokens {
+                let mt = mt as u64;
+                if route.usage.reasoning_tokens >= mt.saturating_mul(9) / 10
+                    && route.usage.output_tokens == 0
+                {
+                    flags.push(
+                        "budget eaten — reasoning ≈ max_tokens with no visible output".to_string(),
+                    );
+                } else if route.usage.reasoning_tokens >= mt / 2 {
+                    flags.push("thinking-heavy — reasoning ≥ half the output budget".to_string());
+                }
+            }
+        }
+        if route.stop_reason.as_deref() == Some("MaxTokens") {
+            flags.push("truncated — hit the max_tokens limit".to_string());
+        }
+        LastResponseInspection {
+            upstream_id: route.upstream_id.clone(),
+            model: route.model.clone(),
+            reasoning_tokens: route.usage.reasoning_tokens,
+            completion_tokens: route.usage.output_tokens,
+            stop_reason: route.stop_reason.clone(),
+            flags,
+        }
+    });
+
+    ThinkingInspection {
+        provider_id: provider_id.to_string(),
+        provider_title: upstream
+            .map(|u| u.title.to_string())
+            .unwrap_or_else(|| provider_id.to_string()),
+        model_id: model_id.to_string(),
+        mode,
+        control,
+        wire_param,
+        effective_budget,
+        max_tokens_cap: upstream.and_then(|u| u.max_tokens_cap),
+        context_window: upstream.map(|u| u.context_window),
+        tool_calling: upstream.map(|u| u.tool_calling).unwrap_or(false),
+        vision: upstream.map(|u| u.vision).unwrap_or(false),
+        warnings,
+        last_response,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +847,264 @@ mod tests {
             None,
         );
         assert!(o.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // inspect_thinking (the thinking inspector row)
+    // -------------------------------------------------------------------
+
+    fn poolside_upstream() -> &'static crate::providers::free::FreeUpstream {
+        crate::providers::free::catalog_entry("poolside").expect("poolside in catalog")
+    }
+
+    #[test]
+    fn inspect_google_25_budget_clamped_and_warned() {
+        let insp = inspect_thinking(
+            "google",
+            "gemini-2.5-flash",
+            Some(EffortLevel::High),
+            None,
+            Some(1_000),
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Budget));
+        assert_eq!(
+            insp.effective_budget,
+            Some(999),
+            "clamped to max_tokens − 1"
+        );
+        assert_eq!(insp.wire_param.as_deref(), Some("thinkingBudget: 999"));
+        assert!(insp
+            .warnings
+            .iter()
+            .any(|w| w.contains("clamped below max_tokens")));
+    }
+
+    #[test]
+    fn inspect_google_25_none_disables() {
+        let insp = inspect_thinking(
+            "google",
+            "gemini-2.5-flash",
+            Some(EffortLevel::None),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Disabled);
+        assert_eq!(insp.wire_param.as_deref(), Some("thinkingConfig: off"));
+    }
+
+    #[test]
+    fn inspect_google_3_behavioral_level() {
+        let insp = inspect_thinking(
+            "google",
+            "gemini-3-pro-preview",
+            Some(EffortLevel::Medium),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Behavioral));
+        assert_eq!(insp.wire_param.as_deref(), Some("thinkingLevel: medium"));
+        assert_eq!(
+            insp.effective_budget, None,
+            "no hard budget for a level control"
+        );
+    }
+
+    #[test]
+    fn inspect_zai_toggle_on_off() {
+        let on = inspect_thinking(
+            "zai",
+            "glm-4.7",
+            Some(EffortLevel::High),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(on.mode, ThinkingMode::Enabled);
+        assert_eq!(on.control, Some(ThinkingControl::Toggle));
+        assert_eq!(on.wire_param.as_deref(), Some("thinking.type: enabled"));
+
+        let off = inspect_thinking(
+            "zai",
+            "glm-4.7",
+            Some(EffortLevel::None),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(off.mode, ThinkingMode::Disabled);
+        assert_eq!(off.wire_param.as_deref(), Some("thinking.type: disabled"));
+    }
+
+    #[test]
+    fn inspect_poolside_default_on_when_effort_not_none() {
+        // Medium effort writes nothing for poolside (thinking on by default) —
+        // the inspector must say "enabled (default)", not "no knob".
+        let insp = inspect_thinking(
+            "poolside",
+            "poolside/laguna-3",
+            Some(EffortLevel::Medium),
+            None,
+            Some(20_000),
+            Some(poolside_upstream()),
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Toggle));
+        assert_eq!(
+            insp.wire_param.as_deref(),
+            Some("chat_template_kwargs.enable_thinking: true (provider default)")
+        );
+        assert_eq!(insp.max_tokens_cap, Some(8_192));
+        assert_eq!(insp.context_window, Some(262_144));
+        assert!(insp.tool_calling);
+        assert!(!insp.vision);
+        // 20K request against the 8K cap is flagged.
+        assert!(insp
+            .warnings
+            .iter()
+            .any(|w| w.contains("clamped to upstream cap 8192")));
+    }
+
+    #[test]
+    fn inspect_deepseek_on_openaiish_provider_combines_toggle_and_effort() {
+        let insp = inspect_thinking(
+            "groq",
+            "deepseek-chat",
+            Some(EffortLevel::XHigh),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Toggle));
+        assert_eq!(
+            insp.wire_param.as_deref(),
+            Some("thinking.type: enabled · reasoningEffort: max")
+        );
+    }
+
+    #[test]
+    fn inspect_plain_chat_model_is_not_supported() {
+        let insp = inspect_thinking(
+            "groq",
+            "llama-3.3-70b-versatile",
+            Some(EffortLevel::High),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::NotSupported);
+        assert_eq!(insp.control, None);
+        assert_eq!(insp.wire_param, None);
+    }
+
+    #[test]
+    fn inspect_openai_effort_none_is_minimum_not_off() {
+        let insp = inspect_thinking(
+            "groq",
+            "gpt-5.2",
+            Some(EffortLevel::None),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Behavioral));
+        assert_eq!(insp.wire_param.as_deref(), Some("reasoningEffort: none"));
+        assert!(insp
+            .warnings
+            .iter()
+            .any(|w| w.contains("minimum thinking tier, not off")));
+    }
+
+    #[test]
+    fn inspect_low_effort_flags_ladder_quirk() {
+        let insp = inspect_thinking(
+            "groq",
+            "gpt-5.2",
+            Some(EffortLevel::Low),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(insp
+            .warnings
+            .iter()
+            .any(|w| w.contains("Low disables thinking; Minimal enables")));
+        assert!(insp.warnings.iter().any(|w| w.contains("temperature 0.0")));
+    }
+
+    #[test]
+    fn inspect_last_response_flags_budget_eaten_and_truncation() {
+        let route = FreeLastRoute {
+            upstream_id: "poolside".to_string(),
+            model: "poolside/laguna-3".to_string(),
+            usage: clawde_core::types::UsageInfo {
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_tokens: 950,
+            },
+            stop_reason: Some("MaxTokens".to_string()),
+        };
+        let insp = inspect_thinking(
+            "poolside",
+            "poolside/laguna-3",
+            Some(EffortLevel::Medium),
+            None,
+            Some(1_000),
+            Some(poolside_upstream()),
+            Some(&route),
+        );
+        let last = insp.last_response.expect("route provided");
+        assert_eq!(last.reasoning_tokens, 950);
+        assert_eq!(last.completion_tokens, 0);
+        assert_eq!(last.stop_reason.as_deref(), Some("MaxTokens"));
+        assert!(last.flags.iter().any(|f| f.contains("budget eaten")));
+        assert!(last.flags.iter().any(|f| f.contains("truncated")));
+    }
+
+    #[test]
+    fn inspect_last_response_thinking_heavy_with_output_present() {
+        let route = FreeLastRoute {
+            upstream_id: "zai".to_string(),
+            model: "glm-4.7".to_string(),
+            usage: clawde_core::types::UsageInfo {
+                input_tokens: 100,
+                output_tokens: 300,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_tokens: 600,
+            },
+            stop_reason: Some("EndTurn".to_string()),
+        };
+        let insp = inspect_thinking(
+            "zai",
+            "glm-4.7",
+            Some(EffortLevel::High),
+            None,
+            Some(1_000),
+            None,
+            Some(&route),
+        );
+        let last = insp.last_response.expect("route provided");
+        assert!(last.flags.iter().any(|f| f.contains("thinking-heavy")));
+        assert!(!last.flags.iter().any(|f| f.contains("budget eaten")));
+        assert!(!last.flags.iter().any(|f| f.contains("truncated")));
     }
 }

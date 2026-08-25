@@ -1940,10 +1940,12 @@ impl Stream for RetryingFreeStream {
                             self.final_usage = Some(usage.clone());
                         }
                         StreamEvent::MessageDelta {
-                            stop_reason: Some(_),
+                            stop_reason: Some(reason),
                             ..
                         } => {
-                            self.attempt_stop_reason = Some("end_turn".to_string());
+                            // Keep the real reason (EndTurn / MaxTokens /
+                            // ToolUse / …) — the inspector flags truncation.
+                            self.attempt_stop_reason = Some(format!("{reason:?}"));
                         }
                         StreamEvent::RateLimitHeaders {
                             tokens_pct_used,
@@ -1982,6 +1984,7 @@ impl Stream for RetryingFreeStream {
                                 upstream_id: self.chain[self.current_idx].upstream.id.to_string(),
                                 model: self.current_model.clone(),
                                 usage: self.final_usage.clone().unwrap_or_default(),
+                                stop_reason: self.attempt_stop_reason.clone(),
                             });
                         }
                     }
@@ -2241,6 +2244,7 @@ impl LlmProvider for FreeProvider {
                         upstream_id: entry.upstream.id.to_string(),
                         model: upstream_model,
                         usage: resp.usage.clone(),
+                        stop_reason: Some(format!("{:?}", resp.stop_reason)),
                     });
                     return Ok(resp);
                 }
