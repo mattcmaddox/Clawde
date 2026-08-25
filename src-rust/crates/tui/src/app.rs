@@ -3185,6 +3185,50 @@ impl App {
         }
     }
 
+    /// Compute a read-only thinking inspection for the currently selected
+    /// free-model popup entry. Called by render.rs to show the inspector
+    /// footer — no effect on the request path.
+    pub fn free_model_popup_inspector(
+        &self,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        use clawde_api::providers::effort_shaping::inspect_thinking;
+        let item = self.free_model_popup.selected()?;
+        let id = &item.id;
+
+        let (provider_id, model_id) = if id == "free/auto" {
+            let (upstream_id, _, model) = self.free_model_defaults.first()?;
+            (upstream_id.as_str(), model.as_str())
+        } else if let Some(slug) = id.strip_prefix("free/family/") {
+            let upstream = clawde_api::FREE_CATALOG
+                .iter()
+                .find(|u| u.model_family == slug)?;
+            let model = self
+                .free_model_defaults
+                .iter()
+                .find(|(uid, _, _)| uid == upstream.id)
+                .map(|(_, _, model)| model.as_str())
+                .unwrap_or(upstream.default_model);
+            (upstream.id, model)
+        } else if let Some(rest) = id.strip_prefix("free/") {
+            let (upstream_id, model) = rest.split_once('/')?;
+            (upstream_id, model)
+        } else {
+            return None;
+        };
+
+        let upstream = clawde_api::providers::free::catalog_entry(provider_id);
+        let last_route = clawde_api::providers::free::take_free_last_route();
+        Some(inspect_thinking(
+            provider_id,
+            model_id,
+            Some(self.effort_level),
+            None,
+            None,
+            upstream,
+            last_route.as_ref(),
+        ))
+    }
+
     /// Step the effort level one rung up (+1) or down (-1) along the current
     /// model's supported ladder, clamping at both ends (never wraps).
     ///

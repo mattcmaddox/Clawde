@@ -801,7 +801,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // Free-model dropdown (Alt+J/K) — anchored just above the prompt input.
     if app.free_model_popup.visible {
-        crate::free_model_popup::render_free_model_popup(frame, &app.free_model_popup, chunks[3]);
+        let inspector = app.free_model_popup_inspector();
+        crate::free_model_popup::render_free_model_popup(
+            frame,
+            &app.free_model_popup,
+            chunks[3],
+            inspector.as_ref(),
+        );
     }
 
     // Overlays (rendered on top in Z-order)

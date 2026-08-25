@@ -117,16 +117,21 @@ impl FreeModelPopupState {
 
 /// Render the popup anchored just above `input_area`, left-aligned with the
 /// prompt text (matching the input's own 2-column indent).
-pub fn render_free_model_popup(frame: &mut Frame, state: &FreeModelPopupState, input_area: Rect) {
+pub fn render_free_model_popup(
+    frame: &mut Frame,
+    state: &FreeModelPopupState,
+    input_area: Rect,
+    inspector: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
+) {
     if !state.visible || state.items.is_empty() {
         return;
     }
 
     let width = 72u16.min(input_area.width.saturating_sub(4));
-    // Title row + blank + header line + one row per item, clamped to a
-    // reasonable max so long model-first lists scroll instead of covering the
-    // whole screen.
-    let height = (state.items.len() as u16 + 4)
+    // Title row + blank + header line + footer + one row per item, clamped
+    // to a reasonable max so long model-first lists scroll instead of
+    // covering the whole screen.
+    let height = (state.items.len() as u16 + 5)
         .min(MAX_HEIGHT)
         .min(input_area.y.max(4));
     let x = input_area.x + 2;
@@ -233,6 +238,35 @@ pub fn render_free_model_popup(frame: &mut Frame, state: &FreeModelPopupState, i
             ),
         ]);
         buf.set_line(inner.x, row_y, &line, inner.width);
+    }
+
+    // Inspector footer: one line showing the thinking wire param for the
+    // selected model, or a hint when the selection is a section header.
+    let footer_y = area.y + area.height.saturating_sub(2);
+    if footer_y >= area.y && inner.height > 1 {
+        let footer_text = if let Some(insp) = inspector {
+            if let Some(ref wp) = insp.wire_param {
+                format!(" → {wp}")
+            } else {
+                match insp.mode {
+                    clawde_api::providers::effort_shaping::ThinkingMode::NotSupported => {
+                        " → (no thinking knob)".to_string()
+                    }
+                    _ => String::new(),
+                }
+            }
+        } else {
+            " ↓ select to inspect".to_string()
+        };
+        let footer_fg = inspector
+            .filter(|i| !i.warnings.is_empty())
+            .map(|_| CLAWDE_ACCENT)
+            .unwrap_or(CLAWDE_MUTED);
+        let footer_line = Line::from(vec![Span::styled(
+            footer_text,
+            Style::default().fg(footer_fg),
+        )]);
+        buf.set_line(inner.x, footer_y, &footer_line, inner.width);
     }
 }
 
