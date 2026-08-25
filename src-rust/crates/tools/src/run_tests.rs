@@ -432,15 +432,30 @@ impl Tool for RunTestsTool {
 
         let truncated = truncate_output(&output);
 
+        // Structured check summary (refactor-loop-health Phase B): the query
+        // loop's deterministic_check_observation reads this instead of parsing
+        // the prose output, so the classification survives any output wording.
+        let summary = |passed: bool, timed_out: bool, exit_code: Option<i32>| {
+            crate::CheckSummary {
+                kind: crate::CheckKind::Tests,
+                passed,
+                timed_out,
+                exit_code,
+            }
+            .metadata_value()
+        };
+
         match exit_code {
-            Some(0) => ToolResult::success(format!("Tests passed ({}).\n{}", command, truncated)),
+            Some(0) => ToolResult::success(format!("Tests passed ({}).\n{}", command, truncated))
+                .with_metadata(summary(true, false, exit_code)),
             Some(code) => ToolResult::error_with_code(
                 ToolErrorCode::TestFailed,
                 format!(
                     "Tests FAILED — '{}' exited with code {}\n{}",
                     command, code, truncated
                 ),
-            ),
+            )
+            .with_metadata(summary(false, false, exit_code)),
             None => {
                 if timed_out {
                     ToolResult::error_with_code(
@@ -450,11 +465,13 @@ impl Tool for RunTestsTool {
                             command, timeout_secs, truncated
                         ),
                     )
+                    .with_metadata(summary(false, true, None))
                 } else {
                     ToolResult::error_with_code(
                         ToolErrorCode::ExecutionFailed,
                         format!("'{}' could not be run.\n{}", command, truncated),
                     )
+                    .with_metadata(summary(false, false, None))
                 }
             }
         }

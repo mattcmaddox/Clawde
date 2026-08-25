@@ -622,12 +622,23 @@ pub(crate) fn is_deterministic_check_tool(name: &str) -> bool {
 /// Classify a direct check result without retaining its raw output in plan
 /// state. Permission, sandbox, and dispatch failures are infrastructure signals
 /// rather than deterministic code failures and must not consume replan budget.
+///
+/// Structured-first (refactor-loop-health Phase B): the built-in RunTests /
+/// RunLints tools attach a `CheckSummary` to the result metadata, which is
+/// authoritative. The content-substring heuristics below are kept only as a
+/// fallback for third-party tools that report check outcomes without a
+/// structured summary.
 pub(crate) fn deterministic_check_observation(
     name: &str,
     result: &clawde_tools::ToolResult,
 ) -> (bool, bool) {
     if !is_deterministic_check_tool(name) {
         return (false, false);
+    }
+    if let Some(summary) = clawde_tools::CheckSummary::from_metadata(result.metadata.as_ref()) {
+        let timed_out = summary.timed_out;
+        let failed = !summary.passed;
+        return (true, timed_out || failed);
     }
     let lower = result.content.to_ascii_lowercase();
     let timed_out =
@@ -4608,6 +4619,78 @@ mod tests {
         assert_eq!(
             deterministic_check_observation("RunLints", &passed),
             (true, false)
+        );
+    }
+
+    #[test]
+    fn deterministic_check_observation_reads_structured_summary_first() {
+        // Phase B: a structured CheckSummary in metadata is authoritative —
+        // the content wording no longer matters for the classification.
+        let pass = clawde_tools::ToolResult::success("totally custom output wording")
+            .with_metadata(
+                clawde_tools::CheckSummary {
+                    kind: clawde_tools::CheckKind::Tests,
+                    passed: true,
+                    timed_out: false,
+                    exit_code: Some(0),
+                }
+                .metadata_value(),
+            );
+        assert_eq!(
+            deterministic_check_observation("RunTests", &pass),
+            (true, false)
+        );
+
+        let fail = clawde_tools::ToolResult::error_with_code(
+            ToolErrorCode::TestFailed,
+            "weird prose with no recognizable markers",
+        )
+        .with_metadata(
+            clawde_tools::CheckSummary {
+                kind: clawde_tools::CheckKind::Tests,
+                passed: false,
+                timed_out: false,
+                exit_code: Some(1),
+            }
+            .metadata_value(),
+        );
+        assert_eq!(
+            deterministic_check_observation("RunTests", &fail),
+            (true, true)
+        );
+
+        // Timeout carries the timed-out flag even though the exit code is None.
+        let timed_out = clawde_tools::ToolResult::error_with_code(
+            ToolErrorCode::Timeout,
+            "hung, killed after 300s",
+        )
+        .with_metadata(
+            clawde_tools::CheckSummary {
+                kind: clawde_tools::CheckKind::Lints,
+                passed: false,
+                timed_out: true,
+                exit_code: None,
+            }
+            .metadata_value(),
+        );
+        assert_eq!(
+            deterministic_check_observation("RunLints", &timed_out),
+            (true, true)
+        );
+
+        // A summary on a NON-check tool is still ignored (name gate first).
+        let bash_pass = clawde_tools::ToolResult::success("ran").with_metadata(
+            clawde_tools::CheckSummary {
+                kind: clawde_tools::CheckKind::Tests,
+                passed: true,
+                timed_out: false,
+                exit_code: Some(0),
+            }
+            .metadata_value(),
+        );
+        assert_eq!(
+            deterministic_check_observation("Bash", &bash_pass),
+            (false, false)
         );
     }
 
