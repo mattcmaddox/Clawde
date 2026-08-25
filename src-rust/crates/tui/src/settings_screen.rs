@@ -318,10 +318,11 @@ impl SettingsScreen {
         self.mouse_capture = s.config.mouse_capture_enabled();
         self.show_cwd = s.show_cwd;
         self.show_git_branch = s.show_git_branch;
-        // The threshold is stored as a percentage number in the screen's terms;
-        // an unset (0.0) value means the default is in effect.
+        // The threshold is stored as a fraction (0.0-1.0) in config but shown
+        // as a percentage (0-100) in the UI. 0.0 (unset) means the default
+        // (75%) is in effect.
         self.compact_threshold = if s.config.compact_threshold > 0.0 {
-            s.config.compact_threshold.to_string()
+            format!("{:.0}", s.config.compact_threshold * 100.0)
         } else {
             "75".to_string()
         };
@@ -748,9 +749,13 @@ impl SettingsScreen {
                     self.settings_snapshot.config.output_style = v;
                 }
                 "compact_threshold" => {
+                    // The setting is a PERCENTAGE (0-100) in the UI but the
+                    // config stores a FRACTION (0.0-1.0). Convert on write so
+                    // the value flows into the compact trigger correctly.
                     if let Ok(n) = value.parse::<f32>() {
-                        config.compact_threshold = n;
-                        self.settings_snapshot.config.compact_threshold = n;
+                        let fraction = n / 100.0;
+                        config.compact_threshold = fraction;
+                        self.settings_snapshot.config.compact_threshold = fraction;
                         self.compact_threshold = value.clone();
                     }
                 }
@@ -1120,10 +1125,11 @@ fn value_from_settings(settings: &Settings, key: &str) -> String {
         "mouse_capture" => c.mouse_capture_enabled().to_string(),
         "show_cwd" => settings.show_cwd.to_string(),
         "show_git_branch" => settings.show_git_branch.to_string(),
-        // The threshold is stored as a percentage number; 0.0 means unset.
+        // The threshold is stored as a fraction (0.0-1.0) in config but shown
+        // as a percentage (0-100) in the UI. 0.0 means unset.
         "compact_threshold" => {
             if c.compact_threshold > 0.0 {
-                c.compact_threshold.to_string()
+                format!("{:.0}", c.compact_threshold * 100.0)
             } else {
                 String::new()
             }

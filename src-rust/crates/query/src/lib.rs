@@ -1274,6 +1274,12 @@ pub async fn run_query_loop(
     // and injects a reminder with the original user request every N calls
     // to prevent goal drift (research: arXiv 2505.02709, Zylos 2026).
     let mut total_tool_calls: u32 = 0;
+    // Milestone bucket of the last goal re-anchor that fired. `total_tool_calls`
+    // only increments while tools execute, so a text-only stretch (analysis,
+    // permission dialogs) would otherwise re-inject the reminder on EVERY
+    // request once the count reaches a multiple of the interval. Firing only
+    // when the bucket advances keeps it to one reminder per milestone.
+    let mut last_reanchored_bucket: u32 = 0;
     // Repeat-tool-reminder guard: detects consecutive identical tool calls
     // and injects escalating reminders to break infinite loops.
     let mut repeat_detector = repeat_guard::RepeatCallDetector::new();
@@ -1931,18 +1937,22 @@ pub async fn run_query_loop(
         // transcript. Reuses the instruction pin's current-task text, so a
         // resumed session anchors on the LATEST instruction, not the stale
         // first prompt.
-        let goal_reanchor_pin =
-            if total_tool_calls > 0 && total_tool_calls.is_multiple_of(GOAL_REANCHOR_INTERVAL) {
-                instruction_pin.as_ref().map(|pin| {
-                    format!(
-                        "[Goal reminder] You are {} tool calls into this task. Task: \"{}\". \
-                         Focus on producing the requested output.",
-                        total_tool_calls, pin
-                    )
-                })
-            } else {
-                None
-            };
+        let bucket = total_tool_calls / GOAL_REANCHOR_INTERVAL;
+        let mut goal_reanchor_pin = None;
+        // Fire only when the milestone bucket advances AND a current-task pin is
+        // available (a fresh user instruction means the new task supersedes the
+        // anchor, so the milestone is held for the next mid-task request rather
+        // than consumed silently).
+        if bucket > last_reanchored_bucket && total_tool_calls > 0 {
+            if let Some(pin) = instruction_pin.as_ref() {
+                goal_reanchor_pin = Some(format!(
+                    "[Goal reminder] You are {} tool calls into this task. Task: \"{}\". \
+                     Focus on producing the requested output.",
+                    total_tool_calls, pin
+                ));
+                last_reanchored_bucket = bucket;
+            }
+        }
 
         // Build API request
         let mut api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
@@ -3902,6 +3912,15 @@ pub async fn run_query_loop(
         // no API key is configured at the start of a session).
         if let Some(ref cp) = compact_provider {
             if tool_ctx.config.auto_compact {
+                // Effective trigger fraction: the user-facing compact_threshold
+                // setting (0.0–1.0) when set, else the research-backed default.
+                // Threaded into BOTH the reactive and proactive paths so the
+                // setting actually takes effect.
+                let trigger_fraction = if tool_ctx.config.compact_threshold > 0.0 {
+                    tool_ctx.config.compact_threshold as f64
+                } else {
+                    compact::AUTOCOMPACT_TRIGGER_FRACTION
+                };
                 if reactive_compact_enabled {
                     // Reactive path: emergency collapse takes priority over normal compact.
                     let context_limit = context_window;
@@ -3929,7 +3948,11 @@ pub async fn run_query_loop(
                                 warn!(error = %e, "Context-collapse failed; conversation preserved");
                             }
                         }
-                    } else if compact::should_compact(context_tokens, context_limit) {
+                    } else if compact::should_compact(
+                        context_tokens,
+                        context_limit,
+                        trigger_fraction,
+                    ) {
                         if let Some(ref tx) = event_tx {
                             let _ =
                                 tx.send(QueryEvent::Status("Compacting context...".to_string()));
@@ -3996,6 +4019,7 @@ pub async fn run_query_loop(
                         &config.model,
                         context_window,
                         &mut compact_state,
+                        trigger_fraction,
                         config.effort_level,
                         &cancel_token,
                     )

@@ -57,7 +57,9 @@ const WARNING_THRESHOLD_BUFFER_TOKENS: u64 = 20_000;
 /// 0.75 is the research-backed optimal quality point (Chroma 2025):
 /// sessions compacting at 90% produce lower-quality code with more bugs;
 /// the remaining 25% is working memory for reasoning.
-const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.75;
+/// This is the DEFAULT; the user-facing `compact_threshold` config setting
+/// (0.0–1.0) overrides it when set.
+pub const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.75;
 
 /// Token budget for the recent tail we preserve verbatim after compaction.
 ///
@@ -1003,19 +1005,28 @@ pub fn calculate_token_warning_state_for_window(
 /// Convenience wrapper that derives the window from the model-name heuristic.
 /// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
-    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+    should_auto_compact_for_window(
+        input_tokens,
+        context_window_for_model(model),
+        state,
+        AUTOCOMPACT_TRIGGER_FRACTION,
+    )
 }
 
-/// Return `true` when auto-compaction should fire, against an explicit window.
+/// Return `true` when auto-compaction should fire, against an explicit window
+/// and a trigger fraction. `trigger_fraction` is the fraction of the context
+/// window at which compaction fires — the user-facing `compact_threshold`
+/// setting (0.0–1.0, unset → the research-backed default).
 pub fn should_auto_compact_for_window(
     input_tokens: u64,
     window: u64,
     state: &AutoCompactState,
+    trigger_fraction: f64,
 ) -> bool {
     if state.disabled {
         return false;
     }
-    let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    let threshold = (window as f64 * trigger_fraction) as u64;
     input_tokens >= threshold
 }
 
@@ -1362,10 +1373,12 @@ pub async fn auto_compact_if_needed(
     model: &str,
     context_window: u64,
     state: &mut AutoCompactState,
+    trigger_fraction: f64,
     effort: Option<EffortLevel>,
     cancel: &CancellationToken,
 ) -> Option<Vec<Message>> {
-    if cancel.is_cancelled() || !should_auto_compact_for_window(input_tokens, context_window, state)
+    if cancel.is_cancelled()
+        || !should_auto_compact_for_window(input_tokens, context_window, state, trigger_fraction)
     {
         return None;
     }
@@ -1473,16 +1486,17 @@ pub struct CompactResult {
     pub tokens_freed: u64,
 }
 
-/// Return `true` when reactive compact should fire (≥ 90 % of context window).
+/// Return `true` when reactive compact should fire (≥ trigger fraction of the
+/// context window).
 ///
-/// Threshold is intentionally identical to `AUTOCOMPACT_TRIGGER_FRACTION` so
+/// Threshold is intentionally identical to the proactive path's trigger so
 /// that exactly one of the two paths (proactive auto-compact vs reactive
 /// compact) fires, chosen by the `CLAUDE_REACTIVE_COMPACT` gate.
-pub fn should_compact(tokens_used: u64, context_limit: u64) -> bool {
+pub fn should_compact(tokens_used: u64, context_limit: u64, trigger_fraction: f64) -> bool {
     if context_limit == 0 {
         return false;
     }
-    let threshold = (context_limit as f64 * REACTIVE_COMPACT_THRESHOLD) as u64;
+    let threshold = (context_limit as f64 * trigger_fraction) as u64;
     tokens_used >= threshold
 }
 
@@ -1806,9 +1820,7 @@ pub async fn context_collapse(
     })
 }
 
-// Threshold constants for reactive compact / context-collapse.
-/// Reactive compact fires at 75 % of the context window.
-const REACTIVE_COMPACT_THRESHOLD: f64 = 0.75;
+// Threshold constant for context-collapse.
 /// Context collapse (emergency) fires at 97 % of the context window.
 const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 
@@ -2775,6 +2787,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            AUTOCOMPACT_TRIGGER_FRACTION,
             None,
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -2803,6 +2816,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            AUTOCOMPACT_TRIGGER_FRACTION,
             None,
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -2845,6 +2859,7 @@ mod tests {
             "test-model",
             200_000,
             &mut state,
+            AUTOCOMPACT_TRIGGER_FRACTION,
             None,
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -2925,6 +2940,7 @@ mod tests {
                 "test-model",
                 200_000,
                 &mut state,
+                AUTOCOMPACT_TRIGGER_FRACTION,
                 None,
                 &task_cancel,
             )

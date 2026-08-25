@@ -12,7 +12,9 @@
 use clawde_commands::{AutoCompactCommand, CommandContext, CommandResult, SlashCommand};
 use clawde_core::config::{Config, Settings};
 use clawde_core::cost::CostTracker;
-use clawde_query::compact::{should_auto_compact_for_window, AutoCompactState};
+use clawde_query::compact::{
+    should_auto_compact_for_window, AutoCompactState, AUTOCOMPACT_TRIGGER_FRACTION,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -191,11 +193,11 @@ fn threshold_triggers_at_75_percent() {
     let window = 200_000;
     // 75% of 200k = 150k
     assert!(
-        should_auto_compact_for_window(150_000, window, &state),
+        should_auto_compact_for_window(150_000, window, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "must trigger at exactly 75% of context window"
     );
     assert!(
-        should_auto_compact_for_window(160_000, window, &state),
+        should_auto_compact_for_window(160_000, window, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "must trigger above 75%"
     );
 }
@@ -206,7 +208,7 @@ fn threshold_does_not_trigger_below_75_percent() {
     let window = 200_000;
     // 74% of 200k = 148k
     assert!(
-        !should_auto_compact_for_window(149_999, window, &state),
+        !should_auto_compact_for_window(149_999, window, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "must not trigger below 75% threshold"
     );
 }
@@ -220,7 +222,7 @@ fn threshold_disabled_state_blocks_compaction() {
     let window = 200_000;
     // Even at 100%, a disabled state returns false.
     assert!(
-        !should_auto_compact_for_window(200_000, window, &state),
+        !should_auto_compact_for_window(200_000, window, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "disabled state must block compaction even at 100% usage"
     );
 }
@@ -230,11 +232,11 @@ fn threshold_tiny_window() {
     let state = AutoCompactState::default();
     // Small window: 1000 tokens, 75% = 750.
     assert!(
-        should_auto_compact_for_window(750, 1000, &state),
+        should_auto_compact_for_window(750, 1000, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "must trigger at 75% even for small windows"
     );
     assert!(
-        !should_auto_compact_for_window(749, 1000, &state),
+        !should_auto_compact_for_window(749, 1000, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "must not trigger below 75% for small windows"
     );
 }
@@ -352,7 +354,7 @@ async fn end_to_end_toggle_on_then_check_threshold() {
     let state = AutoCompactState::default();
     // At 80% of a 200k window, compaction should fire.
     assert!(
-        should_auto_compact_for_window(160_000, 200_000, &state),
+        should_auto_compact_for_window(160_000, 200_000, &state, AUTOCOMPACT_TRIGGER_FRACTION),
         "with auto_compact enabled, threshold must trigger at 80%"
     );
 }

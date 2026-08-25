@@ -57,7 +57,7 @@ impl TokenBudget {
     }
 
     /// True if we should trigger reactive compact (≥ 75% used).
-    /// Mirrors `REACTIVE_COMPACT_THRESHOLD` in clawde-query compact.rs.
+    /// Mirrors `AUTOCOMPACT_TRIGGER_FRACTION` in clawde-query compact.rs.
     pub fn should_compact(&self) -> bool {
         self.fill_fraction >= 0.75
     }
