@@ -195,6 +195,16 @@ impl ToolErrorCode {
     /// approach or stop). Research: AgentDebug (Zhu et al., Sep 2025)
     /// shows that classifying errors as recoverable vs fatal improves
     /// task success by 24%.
+    ///
+    /// The classification is deliberately about the CALL, not the code:
+    /// `TestFailed`/`LintFailed` are fatal here even though the model can
+    /// recover by fixing code — the fix is a write, and the no-progress
+    /// detector already resets on writes, so reclassifying them as
+    /// recoverable would only weaken the detector in the true-stall case
+    /// (running check after check without changing any files).
+    /// [`recovery_hint`](Self::recovery_hint) still tells the model to fix
+    /// the code and re-run; this method only drives orchestration (loop
+    /// detection), where verification without a write is not progress.
     pub const fn is_recoverable(self) -> bool {
         matches!(
             self,
