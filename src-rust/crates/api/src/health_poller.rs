@@ -7,7 +7,8 @@
 // `chat/completions` confirmation probe) and logs the results so dead
 // keys are surfaced before the first user request hits them.
 //
-// Runs once at startup, then every `health_poll_interval_secs` (default 300s).
+// Runs once shortly after startup (after a 2s grace so the TUI's first frame
+// wins the CPU), then every `health_poll_interval_secs` (default 300s).
 // 0 disables the periodic sweep (startup probe still runs). Probes use bounded
 // concurrency, preserve ring indexes, and skip providers without keys.
 
@@ -28,6 +29,12 @@ use crate::providers::free::{probe_upstream_key, UpstreamKeyProbe};
 /// Default poll interval (seconds).  0 disables periodic sweeps; the
 /// startup probe still runs once.
 pub const DEFAULT_HEALTH_POLL_INTERVAL_SECS: u64 = 300;
+
+/// Grace period before the startup sweep begins, so the TUI can render its
+/// first frame (and any onboarding/welcome screen) before the background key
+/// probes start burning CPU. Short enough that dead keys are still surfaced
+/// before the user's first request.
+pub const STARTUP_SWEEP_DELAY: Duration = Duration::from_secs(2);
 
 /// Result of probing a single stored key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +128,12 @@ pub async fn run_health_poller(
     free_provider: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     report_tx: Option<mpsc::UnboundedSender<ProbeOutcome>>,
 ) {
-    // Startup sweep — always runs.
+    // Startup sweep — always runs, but deferred briefly so the TUI's first
+    // frame and the onboarding/welcome render win the CPU before the probe
+    // storm (15 keys × up to 5s timeouts) starts. The sweep is already fully
+    // async (bounded spawn_blocking), so this only shifts its start; it never
+    // blocks the main loop.
+    tokio::time::sleep(STARTUP_SWEEP_DELAY).await;
     poll_and_log(free_provider.as_deref(), report_tx.as_ref()).await;
 
     if interval_secs == 0 {
