@@ -398,6 +398,7 @@ mod tests {
                 changed_files: None,
                 changed_diff: None,
                 spec: None,
+                plan_replan_headroom: None,
             },
         );
 

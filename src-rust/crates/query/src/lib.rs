@@ -1005,6 +1005,45 @@ fn plan_resume_summary(
 /// the cap.
 pub const NO_PROGRESS_STOP_STREAK: u32 = 3;
 
+/// Remaining plan replan headroom (`PLAN_MAX_REPLANS - replan_count`) for the
+/// approved, active plan matching `task_id`, or `None` when there is no
+/// active approved plan for this task. This is the single source of truth for
+/// the budget-interplay alignment (refactor-loop-health Phase C): when an
+/// approved plan is in flight, its replan budget — not an independent
+/// loop-local counter — is the stop authority for deterministic check
+/// failures. The no-progress detector excludes check-failure turns from its
+/// streak (C1) and VerifyPolicy caps its auto-fix retries at this headroom
+/// (C2) so verify/semantic budgets cannot outrun the plan fail-close.
+fn active_plan_replan_headroom(
+    working_dir: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Option<u32> {
+    let project_root = clawde_core::git_utils::project_root(working_dir);
+    let (spec_path, spec) = clawde_core::spec::Spec::approved_in(&project_root, session_id)?;
+    if spec.task_id != task_id {
+        return None;
+    }
+    let raw_spec = std::fs::read_to_string(spec_path).ok()?;
+    let spec_hash = clawde_core::spec::Spec::content_hash(&raw_spec);
+    let progress =
+        clawde_core::PlanProgress::load_for(&project_root, task_id, session_id, &spec_hash)
+            .ok()??;
+    if progress.status != clawde_core::PlanStatus::Active {
+        return None;
+    }
+    Some(replan_headroom(progress.replan_count))
+}
+
+/// `PLAN_MAX_REPLANS` minus replans already used, floored at 1 so a caller
+/// that reached terminal budget still gets exactly one bounded attempt before
+/// the plan fail-closes on the next deterministic failure.
+fn replan_headroom(replan_count: u32) -> u32 {
+    clawde_core::PLAN_MAX_REPLANS
+        .saturating_sub(replan_count)
+        .max(1)
+}
+
 /// How many recent no-progress tool signatures the detector remembers. A turn
 /// whose signature appears in this window is a loop repeat, even if the
 /// signature is not identical to the immediately preceding turn (e.g. an
@@ -1036,6 +1075,8 @@ fn update_no_progress_state(
         has_diff,
         false,
         false,
+        false,
+        false,
     )
 }
 
@@ -1048,6 +1089,14 @@ fn update_no_progress_state(
 /// approach resets the streak while repeating the same failing call still
 /// accumulates it. A failed file-mutator does not count as progress unless a
 /// scoped diff exists.
+///
+/// `check_failed` is whether this turn ran a deterministic check that failed.
+/// `plan_owns_check_stop` is the refactor-loop-health Phase C (C1) alignment:
+/// when an approved plan is active, its replan budget is the stop authority
+/// for deterministic failures, so a check-failure no-progress turn is handed
+/// to the plan instead of counted here (the streak is left untouched and
+/// `false` is returned). Non-check tool loops (e.g. a bad repeated Bash call)
+/// still accumulate even when a plan is active.
 fn update_no_progress_state_with_errors(
     signature: Option<String>,
     recent_no_progress: &mut std::collections::VecDeque<String>,
@@ -1056,6 +1105,8 @@ fn update_no_progress_state_with_errors(
     has_diff: bool,
     had_tool_errors: bool,
     had_fatal_tool_errors: bool,
+    check_failed: bool,
+    plan_owns_check_stop: bool,
 ) -> bool {
     // A text-only turn (no tools) is never a no-progress signature: reset.
     let Some(sig) = signature else {
@@ -1070,6 +1121,15 @@ fn update_no_progress_state_with_errors(
     if has_diff || (wrote_files && !had_tool_errors) {
         recent_no_progress.clear();
         *no_progress_streak = 0;
+        return false;
+    }
+    // C1: an active approved plan owns deterministic-check-failure stops. A
+    // stale check-failure turn must not accumulate the loop-local no-progress
+    // streak while the plan (its own failure_streak/replan_count) is still
+    // deciding how to advance — otherwise no-progress would truncate the plan
+    // mid-replan. The plan's replan budget is the stop authority; count
+    // nothing here.
+    if plan_owns_check_stop && check_failed {
         return false;
     }
     let effective_signature = if had_fatal_tool_errors {
@@ -1541,6 +1601,23 @@ pub async fn run_query_loop(
         // Defined as a macro because it must `continue`/`return` the loop.
         macro_rules! continue_or_end {
             ($assistant_msg:expr, $usage:expr, $stop_reason:expr) => {{
+                // Remaining plan replan budget for an approved, active plan
+                // (refactor-loop-health Phase C). Serves two budget-interplay
+                // alignment points: (C1) the no-progress detector excludes
+                // deterministic-check-failure turns from its streak when a
+                // plan is active, and (C2) VerifyPolicy caps its auto-fix
+                // retries at this headroom — so the plan's replan budget is
+                // the single stop authority for failing checks, not an
+                // independent loop counter or verify budget. Computed once;
+                // `None` when there is no active approved plan (both levers
+                // then fall back to their independent budgets).
+                let plan_replan_headroom = active_task_id.as_deref().and_then(|task_id| {
+                    active_plan_replan_headroom(
+                        &tool_ctx.working_dir,
+                        &tool_ctx.session_id,
+                        task_id,
+                    )
+                });
                 let turn_ctx = crate::continuation::TurnEndContext {
                     session_id: &tool_ctx.session_id,
                     total_tokens_used: cost_tracker.total_tokens(),
@@ -1557,6 +1634,7 @@ pub async fn run_query_loop(
                             &tool_ctx.session_id,
                         )
                     }),
+                    plan_replan_headroom,
                 };
                 // Loop-health no-progress detector (research lever): if the
                 // model revisited a tool signature seen in the recent
@@ -1588,6 +1666,11 @@ pub async fn run_query_loop(
                     turn_diff.is_some(),
                     had_tool_errors,
                     had_fatal_tool_errors,
+                    turn_state.check_failed,
+                    // C1: when an approved plan is in flight, deterministic
+                    // check failures are owned by the plan's replan budget, so
+                    // the loop-local streak must not truncate the plan.
+                    plan_replan_headroom.is_some(),
                 ) {
                     if let Some(ref tx) = event_tx {
                         let status = if had_hard_fatal_errors {
@@ -7926,6 +8009,8 @@ mod tests {
             false,
             true,
             true,
+            false,
+            false,
         ));
         assert_eq!(streak, 1);
         assert!(!update_no_progress_state_with_errors(
@@ -7936,6 +8021,8 @@ mod tests {
             false,
             true,
             true,
+            false,
+            false,
         ));
         assert_eq!(streak, 2);
         assert!(update_no_progress_state_with_errors(
@@ -7946,6 +8033,8 @@ mod tests {
             false,
             true,
             true,
+            false,
+            false,
         ));
         assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
     }
@@ -7966,6 +8055,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         ));
         assert_eq!(streak, 1);
         assert!(!update_no_progress_state_with_errors(
@@ -7975,6 +8066,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         ));
         assert_eq!(streak, 1);
@@ -7987,6 +8080,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         ));
         assert_eq!(streak, 2);
         assert!(update_no_progress_state_with_errors(
@@ -7997,8 +8092,80 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         ));
         assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
+    }
+
+    #[test]
+    fn no_progress_detector_defers_to_plan_for_check_failure() {
+        // refactor-loop-health Phase C (C1): when an approved plan is active
+        // (`plan_owns_check_stop`), deterministic check failures are owned by
+        // the plan's replan budget. A repeated failing RunTests turn must not
+        // accumulate the loop-local streak — the plan decides how to advance.
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        for _ in 0..5 {
+            let stop = update_no_progress_state_with_errors(
+                Some("RunTests:{}".to_string()),
+                &mut recent,
+                &mut streak,
+                false,
+                false,
+                true,
+                true, // TestFailed is fatal; still must be deferred to the plan
+                true, // check_failed
+                true, // plan_owns_check_stop
+            );
+            // No matter how many identical failing-check turns, the streak is
+            // never touched when the plan owns the stop — fully deferred.
+            assert!(!stop, "plan-owned check failure must not no-progress stop");
+        }
+        assert_eq!(
+            streak, 0,
+            "plan-owned check failures never count toward the streak"
+        );
+
+        // A non-check tool loop still accumulates even with a plan active
+        // (the plan only owns deterministic-check stops, not generic tool
+        // loops). Three identical bad Bash calls reach the stop threshold.
+        let mut recent2 = std::collections::VecDeque::new();
+        let mut streak2 = 0;
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:curl-x".to_string()),
+            &mut recent2,
+            &mut streak2,
+            false,
+            false,
+            true,
+            true,
+            false, // not a check failure
+            true,  // plan active, but irrelevant for a non-check loop
+        ));
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:curl-x".to_string()),
+            &mut recent2,
+            &mut streak2,
+            false,
+            false,
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert!(update_no_progress_state_with_errors(
+            Some("Bash:curl-x".to_string()),
+            &mut recent2,
+            &mut streak2,
+            false,
+            false,
+            true,
+            true,
+            false,
+            true,
+        ));
+        assert_eq!(streak2, NO_PROGRESS_STOP_STREAK);
     }
 
     #[test]
@@ -8012,6 +8179,8 @@ mod tests {
             true,
             false,
             true,
+            false,
+            false,
             false,
         ));
         assert_eq!(streak, 1);

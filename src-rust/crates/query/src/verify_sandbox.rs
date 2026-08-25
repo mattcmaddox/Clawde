@@ -361,6 +361,7 @@ mod tests {
                 changed_files: None,
                 changed_diff: None,
                 spec: None,
+                plan_replan_headroom: None,
             },
         );
         assert!(!decision.is_continue());
@@ -407,6 +408,7 @@ mod tests {
                 changed_files: None,
                 changed_diff: None,
                 spec: None,
+                plan_replan_headroom: None,
             },
         );
 
@@ -459,6 +461,7 @@ mod tests {
                 changed_files: None,
                 changed_diff: None,
                 spec: None,
+                plan_replan_headroom: None,
             },
         );
 
@@ -498,6 +501,7 @@ mod tests {
                 changed_files: None,
                 changed_diff: None,
                 spec: None,
+                plan_replan_headroom: None,
             },
         );
         match &decision {

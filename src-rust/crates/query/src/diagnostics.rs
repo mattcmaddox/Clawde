@@ -263,6 +263,7 @@ pub async fn run_native_diagnostics() -> NativeDiagnosticsReport {
             "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+// native diagnostics fixture diff\n",
         ),
         spec: None,
+        plan_replan_headroom: None,
     };
     let decision = policy.decide_async(&context).await;
     let deterministic_report = policy.verify_report();

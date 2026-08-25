@@ -507,6 +507,7 @@ async fn run_production_smoke(
             changed_files: Some(patch),
             changed_diff: Some(diff),
             spec: Some(spec.clone()),
+            plan_replan_headroom: None,
         };
         let decision =
             match tokio::time::timeout(PRODUCTION_ATTEMPT_TIMEOUT, policy.decide_async(&context))
@@ -822,6 +823,7 @@ pub async fn run_live_semantic_smoke_with_config(
         changed_files: Some(&patch),
         changed_diff: Some(diff),
         spec: Some(fixture_spec()),
+        plan_replan_headroom: None,
     };
 
     let started = Instant::now();

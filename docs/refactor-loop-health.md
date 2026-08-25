@@ -205,16 +205,80 @@ full `cargo test -p clawde-query` green, plus new tests pinning (1)–(3).
   back to content heuristics only for legacy/third-party tools.
 - Removes i18n / framework-fragile substring matching for the built-in tools.
 
-### Phase C — Budget interplay audit (W4)
+### Phase C — Budget interplay audit (W4) — executed
 
-- Trace one failing-check trajectory through all four budgets; document the
-  combined behavior in this doc and in `continuation.rs` / `verify.rs`
-  module docs.
-- Align responsibilities: plan gate owns write-verification budgets; the
-  no-progress detector owns tool-loop budgets; VerifyPolicy owns end-of-turn
-  auto-fix retries.
-- Add an integration test for the combined path (test fails → verify retries →
-  plan replan → no-progress) asserting no budget is double-consumed silently.
+Four budgets, all defaults: VerifyPolicy `max_retries = 3` (config.rs),
+plan `PLAN_FAILURE_REPLAN_THRESHOLD = 2` + `PLAN_MAX_REPLANS = 3` (plan.rs),
+semantic `DEFAULT_SEMANTIC_MAX_ATTEMPTS = 3` / `FIX_MAX_ATTEMPTS = 3` /
+`FIX_MAX_TURNS = 5` (config), no-progress `NO_PROGRESS_STOP_STREAK = 3`
+window 4 (lib.rs:1006). `SemanticAfterVerifyPolicy` = VerifyPolicy then
+SemanticVerifyPolicy (composite), and every `deterministic_failed` turn feeds
+BOTH the plan's failure_streak/replan_count AND the no-progress fatal bucket.
+
+Findings:
+
+- **O1 (verify × plan double-count, real)**: each failing-check turn
+  increments verify's attempt AND the plan's failure_streak. In interactive
+  mode with an active plan, a stubborn test gets 3 verify auto-fix attempts
+  (Continue) *plus* a replan recovery turn at ~1732 (failure_streak hits the
+  2-turn threshold during verify) *plus* up to 3 replan signals — the budgets
+  SUM (~6+ turns on the same failure) instead of sharing one stop authority.
+- **O2 (no-progress × plan, real)**: no-progress is plan-blind (lib.rs:1283,
+  plain loop-local). With an active plan and no writes between failures
+  (a legit replan pattern), no-progress stops at 3 stalled turns while the
+  plan still has replan headroom (threshold 2 + 3 replans = up to 5). Writes
+  reset no-progress, so the plan budget only gets exercised when the model
+  writes between failures.
+- **O3 (semantic stacking, structural)**: semantic runs after verify; the
+  fixer's writes re-arm verify on the next turn. The plan gate (replan_count
+  = 3 → Blocked) is the only hard backstop; the cycle is untested.
+- **O4 (mode asymmetry)**: headless mode has no VerifyPolicy — verify's 3
+  attempts are interactive-only; headless relies on no-progress (3) + plan
+  (5), giving different total headroom for the same task.
+
+Recommendations (C1–C3, from the audit):
+
+- **C1 — plan owns check-failure stops when active**: when an active plan
+  exists, exclude check-failure turns from the no-progress streak (the plan's
+  failure_streak/replan budget is the stop authority for deterministic
+  failures); no-progress keeps tool-loop budgets (unknown/repeated tool
+  errors) unconditionally.
+- **C2 — cap verify retries by plan headroom**: when a plan is active,
+  VerifyPolicy's effective `max_retries` = remaining replan headroom
+  (`PLAN_MAX_REPLANS - replan_count`), so a failing test cannot outrun the
+  plan fail-close (fixes O1's summing).
+- **C3 — pin the semantic cycle**: add an integration test proving a stubborn
+  test in semantic mode fail-closes the plan at replan_count = 3 (not before,
+  not after), and that verify/semantic budgets cannot exceed the plan gate.
+  Document the cycle in `continuation.rs` module docs.
+- **C4 (ties to Phase D)**: extend the bounded recovery turn to non-plan
+  mode so headless gets verify-equivalent headroom (fixes O4).
+
+Implementation landed:
+
+- **C1 — no-progress defers check failures to an active plan.** New
+  `active_plan_replan_headroom()` helper (query/src/lib.rs) loads the
+  approved, active plan for the current task and returns
+  `PLAN_MAX_REPLANS - replan_count` (floored at 1). The `continue_or_end!`
+  macro computes it once; `update_no_progress_state_with_errors` now takes
+  `check_failed` + `plan_owns_check_stop`. When an active plan owns the stop
+  AND the turn failed a deterministic check, the streak is left untouched
+  (fully deferred to the plan's `failure_streak`/`replan_count`). Non-check
+  tool loops (e.g. a bad repeated Bash call) still accumulate even under an
+  active plan. This fixes O2 — no-progress no longer truncates the plan
+  mid-replan.
+- **C2 — VerifyPolicy caps retries by plan headroom.** `TurnEndContext` gains
+  `plan_replan_headroom: Option<u32>`, wired from the same helper in the
+  macro. VerifyPolicy's effective `max_retries` is
+  `configured.min(headroom.max(1))`. Fixes O1 — verify's auto-fix attempts
+  can no longer outrun the plan fail-close; a stubborn test gets exactly the
+  plan's remaining replan budget, then escalates and the plan blocks.
+- **Tests**: `no_progress_detector_defers_to_plan_for_check_failure` (C1:
+  plan-owned check failures never touch the streak; non-check loops still
+  stop at `NO_PROGRESS_STOP_STREAK`) and `retries_capped_by_plan_replan_headroom`
+  (C2: `max_retries=3` but headroom 1 → escalate on the second failing
+  round). Verified: 417 query tests pass, clippy `-D warnings` clean, fmt
+  clean, `cargo check --workspace` clean.
 
 ### Phase D (optional) — In-turn check failure feed
 

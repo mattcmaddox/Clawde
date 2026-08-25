@@ -49,6 +49,13 @@ pub struct TurnEndContext<'a> {
     /// exists. Owned so a future async verifier can safely retain it across an
     /// await without borrowing the filesystem or query-loop state.
     pub spec: Option<clawde_core::spec::Spec>,
+    /// Remaining plan replan budget (`PLAN_MAX_REPLANS - replan_count`) for an
+    /// approved, active plan, or `None` when no active approved plan is in
+    /// flight. VerifyPolicy caps its auto-fix retries at this headroom so a
+    /// failing check's stop authority is the plan's replan budget rather than
+    /// VerifyPolicy's independent `max_retries` (refactor-loop-health Phase C,
+    /// C2).
+    pub plan_replan_headroom: Option<u32>,
 }
 
 /// Find the spec that belongs to an accepted task in the active session.
@@ -1606,6 +1613,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         }
     }
 
@@ -2930,6 +2938,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         });
         assert!(!decision.is_continue());
         match decision {
@@ -2972,6 +2981,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         });
         assert!(policy.spec_for_review().is_some());
         // A later non-spec turn must not keep reporting the old path.
@@ -2985,6 +2995,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         });
         assert!(policy.spec_for_review().is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3362,6 +3373,7 @@ mod tests {
             changed_files: Some(&patch),
             changed_diff: Some("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n+fn changed() {}\n"),
             spec: None,
+            plan_replan_headroom: None,
         };
         let decision = policy.decide_async(&context).await;
         assert!(decision.is_continue());
@@ -3770,6 +3782,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         });
         assert!(!decision.is_continue());
         match decision {

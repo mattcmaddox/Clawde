@@ -284,7 +284,15 @@ impl VerifyPolicy {
             };
         }
 
-        let max_retries = self.config.max_retries.max(1);
+        // Effective auto-fix budget. When an approved plan is active
+        // (`ctx.plan_replan_headroom` is Some), cap verify retries at the
+        // plan's remaining replan headroom (refactor-loop-health Phase C, C2)
+        // so a failing test cannot outrun the plan fail-close — the plan's
+        // replan_count is the single stop authority for a stubborn check.
+        let configured = self.config.max_retries.max(1);
+        let max_retries = ctx
+            .plan_replan_headroom
+            .map_or(configured, |headroom| configured.min(headroom.max(1)));
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
         let skipped: Vec<&CheckResult> = results.iter().filter(|r| r.skipped).collect();
@@ -876,6 +884,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         }
     }
 
@@ -1045,6 +1054,47 @@ mod tests {
     }
 
     #[test]
+    fn retries_capped_by_plan_replan_headroom() {
+        // refactor-loop-health Phase C (C2): when an approved plan is active,
+        // VerifyPolicy's effective auto-fix budget is capped at the plan's
+        // remaining replan headroom so a failing test cannot outrun the plan
+        // fail-close. config.max_retries=3 but headroom=1 → only one auto-fix
+        // attempt; the second failing round escalates (budget exhausted).
+        let mut cfg = default_config();
+        cfg.max_retries = 3;
+        let p = policy(cfg);
+
+        let ctx = TurnEndContext {
+            plan_replan_headroom: Some(1),
+            ..ctx()
+        };
+
+        // Headroom 1: round 1 is Fixable and continues (1/1).
+        let first = p.decide_with_results(&ctx, &[failing_check()]);
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Fixable);
+        match &first {
+            ContinuationDecision::Continue { message } => {
+                assert!(message.contains("1/1"), "message: {message}");
+            }
+            _ => panic!("first check must continue within headroom, got: {first:?}"),
+        }
+
+        // Round 2 exceeds headroom → escalate (budget exhausted), not continue.
+        let second = p.decide_with_results(&ctx, &[failing_check()]);
+        assert_eq!(p.verify_report().unwrap().verdict, VerifyVerdict::Escalate);
+        match &second {
+            ContinuationDecision::Stop { note } => {
+                let note = note.as_deref().expect("exhaustion note must be present");
+                assert!(
+                    note.contains("Auto-fix exhausted (1 attempts)"),
+                    "note: {note}"
+                );
+            }
+            _ => panic!("second check must escalate at headroom 1, got: {second:?}"),
+        }
+    }
+
+    #[test]
     fn spawn_failure_is_skipped_not_a_failure() {
         // A binary that does not exist cannot start — that is an environment
         // gap, so the check is skipped and never triggers auto-fix.
@@ -1100,6 +1150,7 @@ mod tests {
             changed_files: None,
             changed_diff: None,
             spec: None,
+            plan_replan_headroom: None,
         };
         let p = VerifyPolicy::new(default_config(), dir.path().to_path_buf());
         let decision = p.decide_with_results(&ctx, &[failing_check()]);
