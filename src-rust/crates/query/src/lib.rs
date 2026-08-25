@@ -3346,12 +3346,62 @@ pub async fn run_query_loop(
                                 tool_name,
                                 serde_json::to_string(tool_input).unwrap_or_default()
                             ));
-                            let blocked = if malformed_tool_calls.contains(tool_id) {
+
+                            // PreToolUse hooks (config + plugins). Mirrors the
+                            // Anthropic path so user hooks fire on every
+                            // provider, not just the explicit Anthropic one
+                            // (refactor-loop-health W1: the provider path is
+                            // the default for free + non-Anthropic providers).
+                            let hooks = &tool_ctx.config.hooks;
+                            let hook_ctx = clawde_core::hooks::HookContext {
+                                event: "PreToolUse".to_string(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_input: Some(tool_input.clone()),
+                                tool_output: None,
+                                is_error: None,
+                                session_id: Some(tool_ctx.session_id.clone()),
+                                upstream_id: None,
+                                model: None,
+                                elapsed_ms: None,
+                                cost_usd: None,
+                                fallback_used: None,
+                                retries: None,
+                            };
+                            let pre_outcome = clawde_core::hooks::run_hooks(
+                                hooks,
+                                clawde_core::config::HookEvent::PreToolUse,
+                                &hook_ctx,
+                                &tool_ctx.working_dir,
+                            )
+                            .await;
+
+                            let plugin_pre_outcome =
+                                clawde_plugins::run_global_pre_tool_hook(tool_name, tool_input);
+
+                            // A hook veto takes priority over the malformed-args
+                            // fallback: a blocked call is never executed.
+                            let blocked = if let clawde_core::hooks::HookOutcome::Blocked(reason) =
+                                pre_outcome
+                            {
+                                warn!(tool = %tool_name, reason = %reason, "PreToolUse hook blocked execution");
+                                Some(clawde_tools::ToolResult::error(format!(
+                                    "Blocked by hook: {}",
+                                    reason
+                                )))
+                            } else if let clawde_plugins::HookOutcome::Deny(reason) =
+                                plugin_pre_outcome
+                            {
+                                warn!(tool = %tool_name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                                Some(clawde_tools::ToolResult::error(format!(
+                                    "Blocked by plugin hook: {}",
+                                    reason
+                                )))
+                            } else if malformed_tool_calls.contains(tool_id) {
                                 Some(ToolResult::error_with_code(
                                     clawde_tools::ToolErrorCode::InvalidInput,
                                     format!(
                                         "Tool call '{}' was not executed: its arguments were \
-                                         malformed or truncated JSON. {}",
+                                             malformed or truncated JSON. {}",
                                         tool_name,
                                         clawde_tools::ToolErrorCode::InvalidInput.recovery_hint()
                                     ),
@@ -3366,6 +3416,11 @@ pub async fn run_query_loop(
                                 result: blocked,
                             });
                         }
+
+                        // Track total tool calls for goal re-anchoring (mirrors
+                        // the Anthropic path; without it the re-anchor milestone
+                        // never advances on the provider path).
+                        total_tool_calls += prepared.len() as u32;
 
                         // Phase 2: build execution futures for non-blocked tools.
                         let exec_task_id = active_task_id.clone();
@@ -3412,6 +3467,41 @@ pub async fn run_query_loop(
                                     }
                                 }
                             }
+                            // PostToolUse hooks (config + plugins), skipped when
+                            // the batch was cancelled — they run external
+                            // commands and would defeat the point of returning
+                            // promptly (mirrors the Anthropic path).
+                            if !batch_cancelled {
+                                let hooks = &tool_ctx.config.hooks;
+                                let post_ctx = clawde_core::hooks::HookContext {
+                                    event: "PostToolUse".to_string(),
+                                    tool_name: Some(p.name.clone()),
+                                    tool_input: Some(p.input.clone()),
+                                    tool_output: Some(result.content.clone()),
+                                    is_error: Some(result.is_error),
+                                    session_id: Some(tool_ctx.session_id.clone()),
+                                    upstream_id: None,
+                                    model: None,
+                                    elapsed_ms: None,
+                                    cost_usd: None,
+                                    fallback_used: None,
+                                    retries: None,
+                                };
+                                clawde_core::hooks::run_hooks(
+                                    hooks,
+                                    clawde_core::config::HookEvent::PostToolUse,
+                                    &post_ctx,
+                                    &tool_ctx.working_dir,
+                                )
+                                .await;
+
+                                clawde_plugins::run_global_post_tool_hook(
+                                    &p.name,
+                                    &p.input,
+                                    &result.content,
+                                    result.is_error,
+                                );
+                            }
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
                                     tool_name: p.name.clone(),
@@ -3428,7 +3518,9 @@ pub async fn run_query_loop(
                                 content: clawde_core::types::ToolResultContent::Text(
                                     result.content,
                                 ),
-                                is_error: Some(result.is_error),
+                                // Canonical wire form: omit is_error on success
+                                // (matches the Anthropic path / sanitize).
+                                is_error: if result.is_error { Some(true) } else { None },
                             });
                             if let Some(reminder) = repeat_detector.observe(&p.name, &p.input) {
                                 tool_results.push(ContentBlock::ToolResult {
@@ -7089,6 +7181,132 @@ mod tests {
             .summary
             .contains("fixture needs semantic review"));
         assert_eq!(fix_requests[0].findings, vec!["review the generated value"]);
+    }
+
+    #[tokio::test]
+    async fn provider_path_fires_pre_and_post_tool_hooks() {
+        // Drift pin (refactor-loop-health W1): the provider dispatch path — the
+        // default for free and non-Anthropic providers — must run the same
+        // PreToolUse / PostToolUse hook machinery as the Anthropic path, or
+        // user-configured hooks silently never fire in free mode. A hook that
+        // appends a marker per event proves both fire end-to-end through the
+        // real loop.
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        let marker = fixture.path().join("hooks.log");
+        let marker_str = marker.to_string_lossy().into_owned();
+
+        let mut registry = clawde_api::ProviderRegistry::new();
+        registry.register(Arc::new(RecordingProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            always_end_turn: false,
+            write_path: None,
+            write_content: None,
+            write_emitted: Arc::new(AtomicBool::new(false)),
+            keep_tool_use_after_write: false,
+            alternate_tool_then_end: true,
+            write_on_requests: None,
+            scripted_write_contents: None,
+        }));
+        let registry = Arc::new(registry);
+
+        let client = clawde_api::AnthropicClient::new(clawde_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.working_dir = fixture.path().to_path_buf();
+        ctx.session_id = "hook-drift-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+        let mut hooks: std::collections::HashMap<
+            clawde_core::config::HookEvent,
+            Vec<clawde_core::config::HookEntry>,
+        > = std::collections::HashMap::new();
+        hooks.insert(
+            clawde_core::config::HookEvent::PreToolUse,
+            vec![clawde_core::config::HookEntry {
+                command: format!("echo pre >> {}", marker_str),
+                tool_filter: None,
+                blocking: false,
+            }],
+        );
+        hooks.insert(
+            clawde_core::config::HookEvent::PostToolUse,
+            vec![clawde_core::config::HookEntry {
+                command: format!("echo post >> {}", marker_str),
+                tool_filter: None,
+                blocking: false,
+            }],
+        );
+        ctx.config.hooks = hooks;
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.max_turns = 5;
+        config.provider_registry = Some(registry);
+
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                clawde_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "expected EndTurn, got {outcome:?}"
+        );
+        let log = std::fs::read_to_string(&marker).expect("hook marker file");
+        assert!(
+            log.contains("pre"),
+            "PreToolUse hook did not fire on the provider path; log={log:?}"
+        );
+        assert!(
+            log.contains("post"),
+            "PostToolUse hook did not fire on the provider path; log={log:?}"
+        );
+        // Success results carry the canonical wire form (is_error omitted),
+        // matching the Anthropic path (refactor-loop-health D3).
+        let tool_result_blocks: Vec<_> = messages
+            .iter()
+            .flat_map(|m| {
+                if let clawde_core::types::MessageContent::Blocks(blocks) = &m.content {
+                    blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolResult { is_error, .. } = b {
+                                Some(*is_error)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        assert!(
+            !tool_result_blocks.is_empty(),
+            "noop_tool round produced no ToolResult blocks"
+        );
+        assert!(
+            tool_result_blocks.iter().all(|e| e.is_none()),
+            "successful tool results must carry is_error=None, got {tool_result_blocks:?}"
+        );
     }
 
     /// A deterministic replay of repeated failed checks must exercise the real

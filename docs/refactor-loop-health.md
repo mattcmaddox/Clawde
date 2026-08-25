@@ -131,6 +131,28 @@ now distinguishes hard-fatal stalls from check stalls
 - **W6 (LOW)** — `is_recoverable` binary axis (call vs approach). Documented;
   keep — a tri-state adds complexity without a consumer.
 
+## 3b. Drift audit (executed)
+
+A line-by-line diff of the two tool-execution sites found eight differences.
+Three were real bugs/gaps fixed immediately; the rest are documented for the
+Phase A unification.
+
+| # | Drift | Severity | Disposition |
+|---|-------|----------|-------------|
+| D1 | Provider path ran **no PreToolUse/PostToolUse hooks** (config or plugin) — the default path for free + non-Anthropic providers silently skipped all user hooks | HIGH | **Fixed** — mirrored the Anthropic path's Phase 1 pre-hooks (with the hook-veto-before-malformed priority) and Phase 3 post-hooks under the `!batch_cancelled` guard |
+| D2 | `total_tool_calls += prepared.len()` existed only on the Anthropic path — goal re-anchoring never advanced on the provider path | HIGH | **Fixed** — added the increment after the provider path's Phase 1 |
+| D3 | `is_error` wire form differed: provider path emitted `Some(is_error)` (always `Some`), Anthropic path `if is_error { Some(true) } else { None }` | MEDIUM | **Fixed** — unified to the canonical form (omit on success) |
+| D4 | Within-turn `lint_edited_files` auto-lint after writes exists only on the provider path | MEDIUM | Documented — provider-path-only feature; Phase A decides whether both paths get it (VerifyPolicy covers end-of-turn for both) |
+| D5 | Auto-context-refresh `file_tracker` read tracking exists only on the provider path | LOW | Documented — provider-path-only; Phase A moves it into the shared core |
+| D6 | Malformed-tool-call filtering exists only on the provider path (Anthropic path's stream handler doesn't detect them) | LOW | Likely intentional (different stream handlers); Phase A preserves the filter in the shared prepare step |
+| D7 | Prepared-tool struct names differ (`PreparedProviderTool` vs `PreparedTool`) | LOW | Cosmetic — one struct in the shared core |
+| D8 | Batch-cancel PostToolUse hook guard existed only on the Anthropic path | MEDIUM | **Fixed as part of D1** — the `!batch_cancelled` guard now wraps post-hooks on both paths |
+
+Pin test: `provider_path_fires_pre_and_post_tool_hooks` drives a `noop_tool`
+round through the real loop on the provider path with marker-appending hooks
+and asserts both PreToolUse and PostToolUse fired, plus the canonical
+`is_error = None` wire form on success.
+
 ## 4. Proposed Refactor (phased)
 
 ### Phase A — Extract shared tool-execution core (W1, W2, W5)
