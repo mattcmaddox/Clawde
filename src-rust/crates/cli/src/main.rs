@@ -6487,6 +6487,45 @@ async fn run_interactive(
                     }
                 }
 
+                // --- Post-task file check ---
+                // When the user asked to write/create a file, check if it was
+                // created. If not, surface a warning so the user knows the task
+                // may be incomplete (e.g. provider change or context collapse
+                // interrupted the model before it could produce output).
+                if let Some(last_user_msg) = messages
+                    .iter()
+                    .rfind(|m| m.role == clawde_core::types::Role::User)
+                {
+                    let text = last_user_msg.get_all_text();
+                    let asked_to_write = text.contains("write")
+                        || text.contains("create")
+                        || text.contains("save")
+                        || text.contains(".md")
+                        || text.contains(".txt")
+                        || text.contains(".rs")
+                        || text.contains(".py");
+                    if asked_to_write {
+                        // Check if any assistant message mentions creating a file
+                        let wrote_any = messages.iter().any(|m| {
+                            m.role == clawde_core::types::Role::Assistant
+                                && (m.get_all_text().contains("Created")
+                                    || m.get_all_text().contains("created")
+                                    || m.get_all_text().contains("wrote")
+                                    || m.get_all_text().contains("Written")
+                                    || m.get_all_text().contains("written"))
+                        });
+                        if !wrote_any {
+                            app.notifications.push(
+                                clawde_tui::notifications::NotificationKind::Warning,
+                                "The model analyzed the project but did not write the requested \
+                                 output file. You may want to ask it to try again."
+                                    .to_string(),
+                                None,
+                            );
+                        }
+                    }
+                }
+
                 // --- Goal continuation (issue #230 / MI-3) ---
                 // Continuation toward an active goal is now decided *inside*
                 // run_query_loop by the goal continuation policy, so the REPL no

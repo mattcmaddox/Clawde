@@ -349,6 +349,30 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         );
     }
 
+    // 16. Tool-retry and output-deadline hints.
+    // When a tool call fails (malformed JSON, permission denied, etc.), the
+    // error is returned as a tool_result. The model MUST retry the failed
+    // tool call with corrected arguments — do not abandon the task.
+    // When the user asks to write a file, commit to writing it within a
+    // reasonable number of tool calls (5-8). Analysis is valuable but the
+    // user's explicit request to produce output takes priority.
+    parts.push(
+        concat!(
+            "\n<tool_use_hints>\n",
+            "- If a tool call fails (malformed JSON, permission error, not-found), ",
+            "retry it with corrected arguments. Do not abandon the task after a ",
+            "single tool failure.\n",
+            "- When the user asks you to write/create a file, prioritize producing ",
+            "that file. You may read and analyze first, but commit to writing the ",
+            "output within 5-8 tool calls. Do not spend 15+ turns analyzing ",
+            "without producing the requested output.\n",
+            "- If context is running low (you see compaction/summary messages), ",
+            "write the output file immediately rather than continuing to explore.\n",
+            "</tool_use_hints>",
+        )
+        .to_string(),
+    );
+
     parts.join("\n")
 }
 
