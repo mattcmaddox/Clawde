@@ -325,10 +325,12 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         // Column widths (approximate):
         //   title: ~40 chars  |  date: ~14 chars  |  msgs: 5  |  cost: 9
         let date_w: usize = 14;
-        let msgs_w: usize = 5;
-        // Free sessions price at $0.00 — drop the Cost column entirely when no
-        // visible session has a nonzero cost instead of printing a column of
-        // "$0.0000" cells.
+        // Drop the Msgs column when no visible session has a nonzero count
+        // (e.g. project-scoped JSONL store doesn't track costs).
+        let any_msgs = filtered.iter().any(|s| s.message_count > 0);
+        let msgs_w: usize = if any_msgs { 5 } else { 0 };
+        let msgs_header = if any_msgs { "Msgs" } else { "" };
+        // Drop the Cost column when no visible session has a nonzero cost.
         let any_cost = filtered.iter().any(|s| s.cost_usd >= 0.0001);
         let cost_w: usize = if any_cost { 9 } else { 0 };
         let cost_header = if any_cost { "Cost" } else { "" };
@@ -341,7 +343,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 "  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
                 "Title",
                 "Last Updated",
-                "Msgs",
+                msgs_header,
                 cost_header,
                 title_w = title_w,
                 date_w = date_w,

@@ -240,6 +240,8 @@ pub struct SessionSummary {
     /// The AI-generated title found in the tail, if any (written by the
     /// auto-titler at session exit).
     pub ai_title: Option<String>,
+    /// Approximate message count (user + assistant entries in the tail).
+    pub message_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +539,7 @@ pub async fn list_sessions_in(
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         // Read the tail of the file (up to 64 KB) to extract metadata.
-        let (last_prompt, title, ai_title) = read_session_tail_metadata(&path).await;
+        let (last_prompt, title, ai_title, message_count) = read_session_tail_metadata(&path).await;
 
         sessions.push(SessionSummary {
             session_id,
@@ -546,6 +548,7 @@ pub async fn list_sessions_in(
             last_prompt,
             title,
             ai_title,
+            message_count,
         });
     }
 
@@ -715,20 +718,20 @@ pub async fn branch_before(path: &Path, target_message_uuid: &str) -> crate::Res
 /// the relevant entries are absent or the file cannot be read.
 async fn read_session_tail_metadata(
     path: &Path,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>, usize) {
     const TAIL_BUF: u64 = 65_536; // 64 KB
 
     let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, 0),
     };
     let meta = match file.metadata().await {
         Ok(m) => m,
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, 0),
     };
     let file_size = meta.len();
     if file_size == 0 {
-        return (None, None, None);
+        return (None, None, None, 0);
     }
 
     // Seek to the start of the tail window.
@@ -738,10 +741,10 @@ async fn read_session_tail_metadata(
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = file;
     if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
-        return (None, None, None);
+        return (None, None, None, 0);
     }
     if file.read_exact(&mut buf).await.is_err() {
-        return (None, None, None);
+        return (None, None, None, 0);
     }
 
     // Scan lines in reverse order so we get the last occurrence of each field.
@@ -749,11 +752,25 @@ async fn read_session_tail_metadata(
     let mut last_prompt: Option<String> = None;
     let mut title: Option<String> = None;
     let mut ai_title: Option<String> = None;
+    // Count user + assistant entries for an approximate message count.
+    // We scan the full tail (up to 64 KB) to get a reasonable count; for
+    // sessions that fit in the tail this is exact.
+    let mut message_count: usize = 0;
 
     for line in text.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+
+        // Count user and assistant entries for approximate message count.
+        // These two cheap `contains` checks avoid serde for every line.
+        if trimmed.contains("\"type\":\"user\"")
+            || trimmed.contains("\"type\": \"user\"")
+            || trimmed.contains("\"type\":\"assistant\"")
+            || trimmed.contains("\"type\": \"assistant\"")
+        {
+            message_count += 1;
         }
 
         if last_prompt.is_none()
@@ -794,7 +811,7 @@ async fn read_session_tail_metadata(
         }
     }
 
-    (last_prompt, title, ai_title)
+    (last_prompt, title, ai_title, message_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,11 +1120,14 @@ mod tests {
             .await
             .unwrap();
 
-        // The tail reader extracts all three metadata fields.
-        let (last_prompt, custom_title, ai_title) = read_session_tail_metadata(&path).await;
+        // The tail reader extracts all three metadata fields plus message count.
+        let (last_prompt, custom_title, ai_title, message_count) =
+            read_session_tail_metadata(&path).await;
         assert_eq!(last_prompt.as_deref(), Some("Fix the flaky test"));
         assert_eq!(custom_title, None, "no custom title written");
         assert_eq!(ai_title.as_deref(), Some("Fix flaky test"));
+        // The tail contains the user entry from write_last_prompt.
+        assert!(message_count >= 1, "at least one entry: {message_count}");
     }
 
     #[tokio::test]

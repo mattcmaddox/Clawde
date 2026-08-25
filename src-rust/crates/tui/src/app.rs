@@ -1606,6 +1606,12 @@ pub struct App {
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
+    /// Set by the session browser when the user presses Enter on a session.
+    /// The CLI main loop drains this and loads/resumes the session.
+    pub pending_resume_session_id: Option<String>,
+    /// Set by the session browser when the user confirms a rename.
+    /// The CLI main loop drains this and persists the new title to disk.
+    pub pending_rename: Option<(String, String)>, // (session_id, new_name)
     /// The most-recent sessions shown in the welcome screen's "Recent activity"
     /// list. Populated once from disk via the background loader below; empty
     /// until it resolves (or when there are genuinely no sessions).
@@ -2215,6 +2221,8 @@ impl App {
             model_picker_provider_id: None,
             session_list_pending: false,
             session_list_rx: None,
+            pending_resume_session_id: None,
+            pending_rename: None,
             recent_sessions: Vec::new(),
             // Load recent activity once, lazily, on the first run-loop iteration.
             recent_sessions_pending: true,
@@ -7184,6 +7192,12 @@ impl App {
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => match key.code {
                     KeyCode::Esc => self.session_browser.close(),
+                    KeyCode::Enter => {
+                        if let Some(session) = self.session_browser.selected_session().cloned() {
+                            self.pending_resume_session_id = Some(session.id);
+                            self.session_browser.close();
+                        }
+                    }
                     KeyCode::Up => self.session_browser.select_prev(),
                     KeyCode::Char('k') if self.prompt_input.vim_enabled => {
                         self.session_browser.select_prev()
@@ -7204,9 +7218,8 @@ impl App {
                 SessionBrowserMode::Rename => match key.code {
                     KeyCode::Esc => self.session_browser.cancel(),
                     KeyCode::Enter => {
-                        if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                            self.session_title = Some(name.clone());
-                            self.status_message = Some(format!("Renamed to: {}", name));
+                        if let Some((id, name)) = self.session_browser.confirm_rename() {
+                            self.pending_rename = Some((id, name.clone()));
                         }
                     }
                     KeyCode::Backspace => self.session_browser.pop_rename_char(),
@@ -11140,31 +11153,42 @@ impl App {
             }
 
             // Spawn async session-list load when requested.
+            // Uses project-scoped storage so the browser only shows sessions
+            // for the current working directory (matching the welcome screen).
             if self.session_list_pending {
                 self.session_list_pending = false;
+                let root = self.project_root();
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 self.session_list_rx = Some(rx);
                 tokio::spawn(async move {
-                    let sessions = clawde_core::history::list_sessions().await;
-                    let entries: Vec<crate::session_browser::SessionEntry> = sessions
+                    let summaries = clawde_core::session_storage::list_sessions(&root)
+                        .await
+                        .unwrap_or_default();
+                    let entries: Vec<crate::session_browser::SessionEntry> = summaries
                         .into_iter()
                         .map(|s| {
                             let last_updated = clawde_core::format_utils::format_relative_time(
-                                s.updated_at.timestamp_millis() as u64,
+                                s.mtime
+                                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
                             );
-                            let searchable_text = s
-                                .messages
-                                .iter()
-                                .map(Message::get_all_text)
-                                .collect::<Vec<_>>()
-                                .join("\n");
+                            let title = s
+                                .title
+                                .or(s.ai_title)
+                                .unwrap_or_else(|| "(untitled)".to_string());
+                            let mut searchable_text = title.clone();
+                            if let Some(ref prompt) = s.last_prompt {
+                                searchable_text.push('\n');
+                                searchable_text.push_str(prompt);
+                            }
                             crate::session_browser::SessionEntry {
-                                id: s.id,
-                                title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                                id: s.session_id,
+                                title,
                                 searchable_text,
                                 last_updated,
-                                message_count: s.messages.len(),
-                                cost_usd: s.total_cost,
+                                message_count: s.message_count,
+                                cost_usd: 0.0,
                             }
                         })
                         .collect();

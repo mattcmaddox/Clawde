@@ -5260,6 +5260,77 @@ async fn run_interactive(
             }
         }
 
+        // Handle session resume from the session browser (Enter key).
+        if let Some(session_id) = app.pending_resume_session_id.take() {
+            if !session_id.is_empty() {
+                match clawde_core::history::load_session(&session_id).await {
+                    Ok(resumed_session) => {
+                        session = resumed_session;
+                        current_effort = session.effort;
+                        messages = session.messages.clone();
+                        app.replace_messages(messages.clone());
+                        cmd_ctx.config.model = Some(session.model.clone());
+                        app.config.model = Some(session.model.clone());
+                        tool_ctx.config.model = Some(session.model.clone());
+                        app.model_name = session.model.clone();
+                        tool_ctx.session_id = session.id.clone();
+                        app.session_id = session.id.clone();
+                        app.spec_review.set_session_id(session.id.clone());
+                        tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                            clawde_core::file_history::FileHistory::new(),
+                        ));
+                        tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        cmd_ctx.session_id = session.id.clone();
+                        cmd_ctx.session_title = session.title.clone();
+                        if let Some(saved_dir) = session.working_dir.as_ref() {
+                            let saved_path = std::path::PathBuf::from(saved_dir);
+                            if saved_path.exists() {
+                                tool_ctx.working_dir = saved_path.clone();
+                                cmd_ctx.working_dir = saved_path;
+                            }
+                        }
+                        app.config.project_dir =
+                            Some(clawde_core::git_utils::project_root(&tool_ctx.working_dir));
+                        app.attach_turn_diff_state(
+                            tool_ctx.file_history.clone(),
+                            tool_ctx.current_turn.clone(),
+                        );
+                        clawde_tui::update_terminal_title(session.title.as_deref());
+                        app.status_message = Some(format!("Resumed session {}.", &session.id[..8]));
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Failed to resume session: {}", e));
+                    }
+                }
+            }
+        }
+
+        // Handle session rename from the session browser (r → type → Enter).
+        if let Some((session_id, new_name)) = app.pending_rename.take() {
+            if session_id == session.id {
+                // Renaming the current session — update in-place.
+                session.title = Some(new_name.clone());
+                session.updated_at = chrono::Utc::now();
+                cmd_ctx.session_title = session.title.clone();
+                app.session_title = Some(new_name.clone());
+                let _ = clawde_core::history::save_session(&session).await;
+                clawde_tui::update_terminal_title(Some(&new_name));
+            } else {
+                // Renaming a different session from the browser — load, rename, save.
+                match clawde_core::history::load_session(&session_id).await {
+                    Ok(mut s) => {
+                        s.title = Some(new_name.clone());
+                        s.updated_at = chrono::Utc::now();
+                        let _ = clawde_core::history::save_session(&s).await;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Failed to rename session: {}", e));
+                    }
+                }
+            }
+            app.status_message = Some(format!("Renamed to: {}", new_name));
+        }
+
         if app.permission_request.is_none() {
             loop {
                 let next_pending = pending_permissions.lock().queue.pop_front();

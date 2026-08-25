@@ -755,6 +755,12 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
     }
+    // Compute the current-thinking inspector once per frame and thread it
+    // to both `render_input` (warning marker) and `render_context_viz`
+    // (thinking section) — avoids double `inspect_thinking()` + JSON-map
+    // construction at 60 fps.
+    let current_insp = app.current_inspector();
+
     // The `/effort` selector replaces the prompt box while open: render it into
     // the input area (full width) and SKIP the prompt input. The prompt returns
     // when the picker closes on confirm/cancel.
@@ -768,7 +774,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             inspector.as_ref(),
         );
     } else {
-        render_input(frame, app, chunks[3], prompt_focused);
+        render_input(frame, app, chunks[3], prompt_focused, current_insp.as_ref());
     }
     app.last_input_area.set(chunks[3]);
     // CWD row — rendered below the prompt input, left-aligned and dimmed.
@@ -1192,7 +1198,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             free_health,
             free_cooldowns,
             app.model_picker.task_sort,
-            app.current_inspector().as_ref(),
+            current_insp.as_ref(),
         );
     }
 
@@ -3039,7 +3045,13 @@ fn render_task_badge_tooltip(frame: &mut Frame, app: &App) {
     );
 }
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+fn render_input(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    focused: bool,
+    current_inspector: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
+) {
     // Any stale task-badge rect from a previous frame must not keep the
     // hover tooltip alive once the badge is gone (streaming, tiny terminal,
     // non-free provider, …).
@@ -3141,10 +3153,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             // Persistent thinking-inspector warning marker: when the current
             // model+effort has a clamp / ignored-param / ladder quirk, surface
             // it subtly here (the popup/pickers carry the detail).
-            if app
-                .current_inspector()
-                .is_some_and(|insp| !insp.warnings.is_empty())
-            {
+            if current_inspector.is_some_and(|insp| !insp.warnings.is_empty()) {
                 spans.push(Span::styled(
                     " · ⚠",
                     Style::default()
