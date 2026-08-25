@@ -100,8 +100,11 @@ impl OpenAiChatDecoder {
         }
 
         let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
-            Some(c) => c,
-            None => {
+            Some(c) if !c.is_empty() => c,
+            // Usage-only final chunk. OpenAI sends `choices: []` alongside
+            // usage; some compatible servers omit the key entirely — treat
+            // both as usage-only.
+            _ => {
                 if let Some(usage_val) = chunk_json.get("usage") {
                     let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
                     out.push(StreamEvent::MessageDelta {
@@ -545,5 +548,33 @@ mod tests {
                 usage: Some(_)
             }]
         ));
+    }
+
+    /// OpenAI's real usage chunk carries `choices: []` alongside usage — a
+    /// shape that was previously dropped (empty choices → no delta). It must
+    /// yield the same usage MessageDelta as the no-choices form, including
+    /// reasoning tokens.
+    #[test]
+    fn usage_chunk_with_empty_choices_yields_message_delta() {
+        let mut d = OpenAiChatDecoder::new(None);
+        let mut out = Vec::new();
+        d.feed_line(
+            r#"data: {"id":"c","model":"m","choices":[{"delta":{"content":"x"}}]}"#,
+            &mut out,
+        );
+        out.clear();
+        let stop = d.feed_line(
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"reasoning_tokens":4}}"#,
+            &mut out,
+        );
+        assert!(!stop);
+        let usage = match out.as_slice() {
+            [StreamEvent::MessageDelta {
+                stop_reason: None,
+                usage: Some(usage),
+            }] => usage,
+            other => panic!("expected a single usage delta, got {other:?}"),
+        };
+        assert_eq!(usage.reasoning_tokens, 4);
     }
 }

@@ -19,7 +19,9 @@ use clawde_api::providers::{
 use clawde_core::types::Message;
 use futures::{Stream, StreamExt};
 
-use common::mock_provider::{text_stream, MockServer, RequestRecord, ScriptedResponse};
+use common::mock_provider::{
+    sse_done, sse_finish, sse_first_delta, text_stream, MockServer, RequestRecord, ScriptedResponse,
+};
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
 
@@ -405,6 +407,54 @@ async fn non_streaming_server_error_falls_through() {
     assert!(!last.upstream_id.is_empty());
     if last.upstream_id == "poolside" {
         assert_eq!(last.model, "poolside/mock-model");
+        assert_eq!(last.usage.reasoning_tokens, 1);
+    }
+}
+
+#[tokio::test]
+async fn streaming_success_records_last_route_telemetry() {
+    // A stream whose final usage-carrying delta reports reasoning tokens, so
+    // the streaming hook records the same telemetry as the non-streaming path.
+    let usage_frame = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "reasoning_tokens": 1,
+                "total_tokens": 3,
+            },
+        })
+    );
+    let chain = Chain::new(
+        vec![ScriptedResponse::SseStream {
+            frames: vec![
+                sse_first_delta("groq/mock-model", "streaming answer"),
+                usage_frame,
+                sse_finish(),
+                sse_done(),
+            ],
+        }],
+        vec![],
+    );
+
+    let stream = chain
+        .provider
+        .create_message_stream(request())
+        .await
+        .expect("chain succeeds");
+    let (events, error) = collect(stream).await;
+
+    assert!(error.is_none(), "unexpected error: {error:?}");
+    assert_eq!(text(&events), "streaming answer");
+
+    // Same race-tolerant assertion as the non-streaming test above.
+    let last = clawde_api::providers::free::take_free_last_route()
+        .expect("successful stream records telemetry");
+    assert!(!last.upstream_id.is_empty());
+    if last.upstream_id == "groq" {
+        assert_eq!(last.model, "groq/mock-model");
         assert_eq!(last.usage.reasoning_tokens, 1);
     }
 }

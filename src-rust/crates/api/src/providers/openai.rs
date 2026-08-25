@@ -1019,9 +1019,11 @@ impl LlmProvider for OpenAiProvider {
                     }
 
                     let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
-                        Some(c) => c,
-                        None => {
-                            // May be a usage-only chunk (the final one).
+                        Some(c) if !c.is_empty() => c,
+                        // Usage-only final chunk. OpenAI sends `choices: []`
+                        // alongside usage; some compatible servers omit the
+                        // key entirely — treat both as usage-only.
+                        _ => {
                             if let Some(usage_val) = chunk_json.get("usage") {
                                 let usage = OpenAiProvider::parse_usage(Some(usage_val));
                                 yield Ok(StreamEvent::MessageDelta {

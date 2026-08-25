@@ -1122,6 +1122,10 @@ struct RetryingFreeStream {
     /// count the win; guards against double-crediting when a consumer polls
     /// the stream through to `None`.
     success_recorded: bool,
+    /// Authoritative final usage from the last `MessageDelta` that carried
+    /// one — telemetry for the thinking inspector's "last response" row.
+    /// Reset per attempt so a fallback never leaks the failed attempt's usage.
+    final_usage: Option<clawde_core::types::UsageInfo>,
     starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
     /// Parallel probe for first-byte watchdog (§6.5).
     parallel_starting: Option<tokio::task::JoinHandle<Result<BoxedProviderStream, ProviderError>>>,
@@ -1197,6 +1201,7 @@ impl RetryingFreeStream {
             current_model: upstream_model,
             pending_attribution: true,
             success_recorded: false,
+            final_usage: None,
             starting: None,
             parallel_starting: None,
             parallel_idx: 0,
@@ -1547,6 +1552,7 @@ impl RetryingFreeStream {
         self.attempt_stop_reason = None;
         self.attempt_start = Some(Instant::now());
         self.first_byte_received = false;
+        self.final_usage = None;
     }
 
     fn is_empty_attempt(&self) -> bool {
@@ -1926,6 +1932,14 @@ impl Stream for RetryingFreeStream {
                             self.attempt_tool_count += 1;
                         }
                         StreamEvent::MessageDelta {
+                            usage: Some(usage), ..
+                        } => {
+                            // Last usage-carrying delta wins; upstreams emit
+                            // the authoritative final usage in a delta near
+                            // the end of the stream.
+                            self.final_usage = Some(usage.clone());
+                        }
+                        StreamEvent::MessageDelta {
                             stop_reason: Some(_),
                             ..
                         } => {
@@ -1959,6 +1973,17 @@ impl Stream for RetryingFreeStream {
                     // `None`, and otherwise remain uncounted.
                     if matches!(evt, StreamEvent::MessageStop) {
                         self.maybe_record_success();
+                        // Telemetry for the thinking inspector: which upstream
+                        // served this stream, with what model and usage. Empty
+                        // completions are excluded — they re-dispatch, so the
+                        // "last response" should reflect real output.
+                        if !self.is_empty_attempt() {
+                            store_free_last_route(FreeLastRoute {
+                                upstream_id: self.chain[self.current_idx].upstream.id.to_string(),
+                                model: self.current_model.clone(),
+                                usage: self.final_usage.clone().unwrap_or_default(),
+                            });
+                        }
                     }
                     return Poll::Ready(Some(Ok(evt)));
                 }
