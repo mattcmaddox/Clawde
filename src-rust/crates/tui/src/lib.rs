@@ -2179,6 +2179,7 @@ mod tests {
                     output_tokens: 0,
                     cache_creation_input_tokens: 30,
                     cache_read_input_tokens: 450,
+                    reasoning_tokens: 0,
                 },
             },
         ));
@@ -2194,6 +2195,7 @@ mod tests {
                     output_tokens: 12,
                     cache_creation_input_tokens: 8,
                     cache_read_input_tokens: 360,
+                    reasoning_tokens: 0,
                 }),
             },
         ));
@@ -2208,6 +2210,7 @@ mod tests {
                     output_tokens: 99,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    reasoning_tokens: 0,
                 }),
             },
         ));
@@ -2226,6 +2229,7 @@ mod tests {
                 output_tokens: 80,
                 cache_creation_input_tokens: 20,
                 cache_read_input_tokens: 300,
+                reasoning_tokens: 0,
             }),
             observability: None,
         });

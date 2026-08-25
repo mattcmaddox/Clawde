@@ -48,9 +48,9 @@ use catalog::local_quota_for;
 use catalog::CLOUDFLARE_PROBE_MODEL;
 
 pub use catalog::{
-    catalog_entry, store_free_model_defaults, store_free_model_lists, take_free_model_defaults,
-    take_free_model_lists, FreeModelListEntry, FreeUpstream, LocalQuota, LocalQuotaWindow,
-    FREE_CATALOG,
+    catalog_entry, store_free_last_route, store_free_model_defaults, store_free_model_lists,
+    take_free_last_route, take_free_model_defaults, take_free_model_lists, FreeLastRoute,
+    FreeModelListEntry, FreeUpstream, LocalQuota, LocalQuotaWindow, FREE_CATALOG,
 };
 pub use discovery::{
     discovery_for, fetch_cline_free_model, fetch_cline_free_models,

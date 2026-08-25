@@ -366,6 +366,7 @@ fn parse_cohere_usage(usage: Option<&Value>) -> UsageInfo {
         output_tokens: output,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
+        reasoning_tokens: 0,
     }
 }
 

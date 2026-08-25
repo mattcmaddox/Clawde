@@ -370,7 +370,7 @@ async fn non_streaming_server_error_falls_through() {
         vec![json_response(
             200,
             "OK",
-            r#"{"id":"cmpl-hf","model":"poolside/mock-model","choices":[{"index":0,"message":{"role":"assistant","content":"non-streaming answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+            r#"{"id":"cmpl-hf","model":"poolside/mock-model","choices":[{"index":0,"message":{"role":"assistant","content":"non-streaming answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"reasoning_tokens":1,"total_tokens":3}}"#,
         )],
     );
 
@@ -395,4 +395,16 @@ async fn non_streaming_server_error_falls_through() {
     let (first, second) = chain.requests();
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
+
+    // The successful dispatch records last-route telemetry. The slot is
+    // process-global and other tests in this binary dispatch concurrently,
+    // so assert presence unconditionally and the exact parse only when our
+    // route still owns the slot.
+    let last = clawde_api::providers::free::take_free_last_route()
+        .expect("successful dispatch records telemetry");
+    assert!(!last.upstream_id.is_empty());
+    if last.upstream_id == "poolside" {
+        assert_eq!(last.model, "poolside/mock-model");
+        assert_eq!(last.usage.reasoning_tokens, 1);
+    }
 }

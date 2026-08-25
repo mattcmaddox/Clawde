@@ -615,6 +615,7 @@ impl BedrockProvider {
             output_tokens: u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 }
@@ -947,6 +948,7 @@ fn parse_bedrock_event(
                     .unwrap_or(0),
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                reasoning_tokens: 0,
             };
             events.push(Ok(StreamEvent::MessageDelta {
                 stop_reason: None,

@@ -2210,6 +2210,13 @@ impl LlmProvider for FreeProvider {
                     }
                     self.record_success(idx, task, start.elapsed());
                     persist_env_key_if_unstored(entry.upstream.id);
+                    // Telemetry for the thinking inspector: which upstream
+                    // served this request, with what model and usage.
+                    store_free_last_route(FreeLastRoute {
+                        upstream_id: entry.upstream.id.to_string(),
+                        model: upstream_model,
+                        usage: resp.usage.clone(),
+                    });
                     return Ok(resp);
                 }
                 Ok(Err(err)) if Self::should_fallback(&err) => {

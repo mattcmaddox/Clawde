@@ -143,6 +143,7 @@ impl MinimaxProvider {
                     output_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    reasoning_tokens: 0,
                 };
                 Some(StreamEvent::MessageStart { id, model, usage })
             }
@@ -230,6 +231,7 @@ impl MinimaxProvider {
                             .get("cache_read_input_tokens")?
                             .as_u64()
                             .unwrap_or(0),
+                        reasoning_tokens: 0,
                     })
                 });
 

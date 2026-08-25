@@ -468,6 +468,11 @@ impl CopilotProvider {
                 .and_then(|value| value.get("cached_tokens"))
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0),
+            reasoning_tokens: usage
+                .get("output_tokens_details")
+                .and_then(|value| value.get("reasoning_tokens"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0),
         }
     }
 

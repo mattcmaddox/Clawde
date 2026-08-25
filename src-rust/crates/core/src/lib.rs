@@ -682,6 +682,14 @@ pub mod types {
         pub cache_creation_input_tokens: u64,
         #[serde(default)]
         pub cache_read_input_tokens: u64,
+        /// Tokens the model spent on internal reasoning/thinking before
+        /// producing visible output. Where the provider reports it
+        /// separately (Gemini `thoughtsTokenCount`, OpenAI responses API
+        /// `output_tokens_details.reasoning_tokens`, Poolside / Z.AI
+        /// top-level `reasoning_tokens`); 0 when absent or when the provider
+        /// folds thinking into `output_tokens` (Anthropic).
+        #[serde(default)]
+        pub reasoning_tokens: u64,
     }
 
     impl UsageInfo {

@@ -579,6 +579,17 @@ impl OpenAiProvider {
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
             .min(prompt_tokens);
+        // Reasoning tokens arrive in two shapes across OpenAI-compatible
+        // servers: `completion_tokens_details.reasoning_tokens` (OpenAI
+        // spec) or a top-level `reasoning_tokens` (Poolside, Z.AI GLM,
+        // DeepSeek-compatible). Prefer the details field, fall back to the
+        // top-level.
+        let reasoning_tokens = u
+            .get("completion_tokens_details")
+            .and_then(|v| v.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| u.get("reasoning_tokens").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
         UsageInfo {
             input_tokens: prompt_tokens.saturating_sub(cache_read),
             output_tokens: u
@@ -587,6 +598,7 @@ impl OpenAiProvider {
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: cache_read,
+            reasoning_tokens,
         }
     }
 
@@ -773,6 +785,47 @@ mod tests {
         })));
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_reads_reasoning_tokens_from_details_field() {
+        // OpenAI spec: completion_tokens_details.reasoning_tokens.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+            "completion_tokens_details": { "reasoning_tokens": 40 },
+        })));
+        assert_eq!(usage.reasoning_tokens, 40);
+        assert_eq!(usage.output_tokens, 50);
+        // Details take precedence over a (contradictory) top-level value.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+            "completion_tokens_details": { "reasoning_tokens": 40 },
+            "reasoning_tokens": 99,
+        })));
+        assert_eq!(usage.reasoning_tokens, 40);
+    }
+
+    #[test]
+    fn parse_usage_reads_top_level_reasoning_tokens() {
+        // Poolside / Z.AI GLM / DeepSeek-compatible servers report reasoning
+        // tokens as a top-level usage field.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+            "reasoning_tokens": 45,
+        })));
+        assert_eq!(usage.reasoning_tokens, 45);
+    }
+
+    #[test]
+    fn parse_usage_without_reasoning_tokens_reports_zero() {
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 50,
+        })));
+        assert_eq!(usage.reasoning_tokens, 0);
     }
 
     #[test]

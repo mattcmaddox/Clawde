@@ -386,6 +386,38 @@ pub fn take_free_model_defaults() -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+/// Telemetry: which upstream + model served the last successful free
+/// dispatch, and its usage. Written by the FreeProvider success path;
+/// read by the TUI's thinking inspector ("last response" row).
+/// Last-writer-wins — this is observability, not state.
+#[derive(Debug, Clone)]
+pub struct FreeLastRoute {
+    pub upstream_id: String,
+    pub model: String,
+    pub usage: clawde_core::types::UsageInfo,
+}
+
+static RECENT_FREE_LAST_ROUTE: OnceLock<Mutex<Option<FreeLastRoute>>> = OnceLock::new();
+fn recent_free_last_route() -> &'static Mutex<Option<FreeLastRoute>> {
+    RECENT_FREE_LAST_ROUTE.get_or_init(|| Mutex::new(None))
+}
+
+/// Record the upstream/model/usage of a successful free dispatch.
+pub fn store_free_last_route(route: FreeLastRoute) {
+    if let Ok(mut guard) = recent_free_last_route().lock() {
+        *guard = Some(route);
+    }
+}
+
+/// Retrieve the last successful dispatch's upstream/model/usage.
+/// Returns `None` before the first successful free dispatch.
+pub fn take_free_last_route() -> Option<FreeLastRoute> {
+    RECENT_FREE_LAST_ROUTE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|guard| guard.clone())
+}
+
 /// One configured upstream's discovered free model list:
 /// `(upstream_id, upstream_title, model_ids)` with the ids as callable wire
 /// IDs in default-pick-first order.
@@ -423,3 +455,36 @@ pub fn take_free_model_lists() -> Vec<FreeModelListEntry> {
 /// Default model used for Cloudflare chat probes (must match the catalog's
 /// `default_model` so validation exercises the same endpoint the chain uses).
 pub(crate) const CLOUDFLARE_PROBE_MODEL: &str = "@cf/qwen/qwen3-30b-a3b-fp8";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_last_route_store_take_roundtrip() {
+        let route = FreeLastRoute {
+            upstream_id: "poolside".to_string(),
+            model: "poolside/laguna-3".to_string(),
+            usage: clawde_core::types::UsageInfo {
+                input_tokens: 10,
+                output_tokens: 500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                reasoning_tokens: 480,
+            },
+        };
+        // The slot is process-global and parallel dispatch tests write to it;
+        // re-store our marker up to 3 times to ride out any interleaving.
+        for _ in 0..3 {
+            store_free_last_route(route.clone());
+            if let Some(taken) = take_free_last_route() {
+                if taken.upstream_id == "poolside" {
+                    assert_eq!(taken.model, "poolside/laguna-3");
+                    assert_eq!(taken.usage.reasoning_tokens, 480);
+                    return;
+                }
+            }
+        }
+        panic!("free last-route slot kept being overwritten by parallel tests");
+    }
+}

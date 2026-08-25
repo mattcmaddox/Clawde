@@ -644,6 +644,10 @@ impl GoogleProvider {
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            reasoning_tokens: meta
+                .and_then(|m| m.get("thoughtsTokenCount"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
         }
     }
 }
@@ -854,6 +858,10 @@ impl LlmProvider for GoogleProvider {
                                     .unwrap_or(0),
                                 cache_creation_input_tokens: 0,
                                 cache_read_input_tokens: 0,
+                                reasoning_tokens: meta
+                                    .and_then(|m| m.get("thoughtsTokenCount"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
                             };
                             yield Ok(StreamEvent::MessageStart {
                                 id: message_id.clone(),
@@ -1016,6 +1024,10 @@ impl LlmProvider for GoogleProvider {
                                         .unwrap_or(0),
                                     cache_creation_input_tokens: 0,
                                     cache_read_input_tokens: 0,
+                                    reasoning_tokens: meta
+                                        .and_then(|m| m.get("thoughtsTokenCount"))
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0),
                                 };
 
                                 yield Ok(StreamEvent::MessageDelta {

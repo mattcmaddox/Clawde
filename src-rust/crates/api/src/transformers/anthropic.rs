@@ -150,6 +150,9 @@ impl MessageTransformer for AnthropicTransformer {
                     .and_then(|v| v.get("cache_read_input_tokens"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
+                // Anthropic folds thinking tokens into `output_tokens`; there
+                // is no separate count on the wire.
+                reasoning_tokens: 0,
             }
         };
 

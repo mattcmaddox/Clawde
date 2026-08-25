@@ -531,6 +531,11 @@ impl CodexProvider {
                     .unwrap_or(0),
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                reasoning_tokens: u
+                    .and_then(|v| v.get("output_tokens_details"))
+                    .and_then(|v| v.get("reasoning_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
             }
         };
 
@@ -846,6 +851,11 @@ impl LlmProvider for CodexProvider {
                                         cache_read_input_tokens: usage_json
                                             .and_then(|value| value.get("input_tokens_details"))
                                             .and_then(|value| value.get("cached_tokens"))
+                                            .and_then(|value| value.as_u64())
+                                            .unwrap_or(0),
+                                        reasoning_tokens: usage_json
+                                            .and_then(|value| value.get("output_tokens_details"))
+                                            .and_then(|value| value.get("reasoning_tokens"))
                                             .and_then(|value| value.as_u64())
                                             .unwrap_or(0),
                                     };
