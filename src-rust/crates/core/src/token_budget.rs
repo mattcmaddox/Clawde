@@ -56,9 +56,10 @@ impl TokenBudget {
         }
     }
 
-    /// True if we should trigger reactive compact (≥ 90% used).
+    /// True if we should trigger reactive compact (≥ 75% used).
+    /// Mirrors `REACTIVE_COMPACT_THRESHOLD` in clawde-query compact.rs.
     pub fn should_compact(&self) -> bool {
-        self.fill_fraction >= 0.90
+        self.fill_fraction >= 0.75
     }
 
     /// True if we should trigger context collapse (≥ 97% used).
@@ -136,8 +137,8 @@ mod tests {
 
     #[test]
     fn should_compact_threshold() {
-        assert!(!TokenBudget::new(89_000, 100_000).should_compact());
-        assert!(TokenBudget::new(90_000, 100_000).should_compact());
+        assert!(!TokenBudget::new(74_000, 100_000).should_compact());
+        assert!(TokenBudget::new(75_000, 100_000).should_compact());
     }
 
     #[test]

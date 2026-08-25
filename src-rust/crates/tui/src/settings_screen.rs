@@ -253,7 +253,7 @@ impl SettingsScreen {
             mouse_capture: true,
             show_cwd: false,
             show_git_branch: false,
-            compact_threshold: "95".to_string(),
+            compact_threshold: "75".to_string(),
             auto_commits: false,
             output_format: "text".to_string(),
             disable_claude_mds: false,
@@ -323,7 +323,7 @@ impl SettingsScreen {
         self.compact_threshold = if s.config.compact_threshold > 0.0 {
             s.config.compact_threshold.to_string()
         } else {
-            "95".to_string()
+            "75".to_string()
         };
         self.auto_commits = s.config.auto_commits.unwrap_or(false);
         self.output_format = match &s.config.output_format {
@@ -1489,7 +1489,7 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             "Auto-compact threshold",
             "Context usage % at which to trigger auto-compact (0-100).",
             SECTION_COMMON,
-            "95".to_string(),
+            "75".to_string(),
             SettingEffect::Immediate,
             SettingKind::Number,
             screen.compact_threshold.clone(),
@@ -2805,7 +2805,7 @@ fn sync_screen_field(screen: &mut SettingsScreen, key: &str) {
         "fileAutocompleteShowHiddenFiles" => screen.file_autocomplete_show_hidden_files = false,
         "auto_commits" => screen.auto_commits = false,
         "max_tokens" => {}
-        "compact_threshold" => screen.compact_threshold = "95".to_string(),
+        "compact_threshold" => screen.compact_threshold = "75".to_string(),
         "fileAutocompleteLimit" => screen.file_autocomplete_limit = "15".to_string(),
         "fileInjectionMaxSize" => screen.file_injection_max_size = "100".to_string(),
         "output_style" => screen.output_style = "default".to_string(),

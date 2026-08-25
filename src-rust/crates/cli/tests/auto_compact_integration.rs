@@ -186,28 +186,28 @@ fn effective_config_config_level_auto_compact_wins_when_top_level_none() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn threshold_triggers_at_90_percent() {
+fn threshold_triggers_at_75_percent() {
     let state = AutoCompactState::default();
     let window = 200_000;
-    // 90% of 200k = 180k
+    // 75% of 200k = 150k
     assert!(
-        should_auto_compact_for_window(180_000, window, &state),
-        "must trigger at exactly 90% of context window"
+        should_auto_compact_for_window(150_000, window, &state),
+        "must trigger at exactly 75% of context window"
     );
     assert!(
-        should_auto_compact_for_window(195_000, window, &state),
-        "must trigger above 90%"
+        should_auto_compact_for_window(160_000, window, &state),
+        "must trigger above 75%"
     );
 }
 
 #[test]
-fn threshold_does_not_trigger_below_90_percent() {
+fn threshold_does_not_trigger_below_75_percent() {
     let state = AutoCompactState::default();
     let window = 200_000;
-    // 89% of 200k = 178k
+    // 74% of 200k = 148k
     assert!(
-        !should_auto_compact_for_window(179_999, window, &state),
-        "must not trigger below 90% threshold"
+        !should_auto_compact_for_window(149_999, window, &state),
+        "must not trigger below 75% threshold"
     );
 }
 
@@ -228,14 +228,14 @@ fn threshold_disabled_state_blocks_compaction() {
 #[test]
 fn threshold_tiny_window() {
     let state = AutoCompactState::default();
-    // Small window: 1000 tokens, 90% = 900.
+    // Small window: 1000 tokens, 75% = 750.
     assert!(
-        should_auto_compact_for_window(900, 1000, &state),
-        "must trigger at 90% even for small windows"
+        should_auto_compact_for_window(750, 1000, &state),
+        "must trigger at 75% even for small windows"
     );
     assert!(
-        !should_auto_compact_for_window(899, 1000, &state),
-        "must not trigger below 90% for small windows"
+        !should_auto_compact_for_window(749, 1000, &state),
+        "must not trigger below 75% for small windows"
     );
 }
 
@@ -350,10 +350,10 @@ async fn end_to_end_toggle_on_then_check_threshold() {
     //    (The actual query loop gate checks `tool_ctx.config.auto_compact` —
     //    this test verifies the config state is correct after the command.)
     let state = AutoCompactState::default();
-    // At 95% of a 200k window, compaction should fire.
+    // At 80% of a 200k window, compaction should fire.
     assert!(
-        should_auto_compact_for_window(190_000, 200_000, &state),
-        "with auto_compact enabled, threshold must trigger at 95%"
+        should_auto_compact_for_window(160_000, 200_000, &state),
+        "with auto_compact enabled, threshold must trigger at 80%"
     );
 }
 

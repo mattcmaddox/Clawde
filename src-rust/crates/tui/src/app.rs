@@ -2266,7 +2266,7 @@ impl App {
             slash_aliases: Vec::new(),
             user_help_entries: Vec::new(),
             auto_compact_enabled: false,
-            auto_compact_threshold: 95,
+            auto_compact_threshold: 75,
             auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command

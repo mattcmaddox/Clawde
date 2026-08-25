@@ -1,6 +1,6 @@
 // Auto-compact service for cc-query.
 //
-// When the conversation context window fills up (~90%+), we automatically
+// When the conversation context window fills up (~75%+), we automatically
 // summarise older messages to free space. This mirrors the TypeScript
 // autoCompact / compact service behaviour.
 //
@@ -54,7 +54,10 @@ const AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
 const WARNING_THRESHOLD_BUFFER_TOKENS: u64 = 20_000;
 
 /// Fraction of the context window at which auto-compact triggers.
-const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.90;
+/// 0.75 is the research-backed optimal quality point (Chroma 2025):
+/// sessions compacting at 90% produce lower-quality code with more bugs;
+/// the remaining 25% is working memory for reasoning.
+const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.75;
 
 /// Token budget for the recent tail we preserve verbatim after compaction.
 ///
@@ -1804,8 +1807,8 @@ pub async fn context_collapse(
 }
 
 // Threshold constants for reactive compact / context-collapse.
-/// Reactive compact fires at 90 % of the context window.
-const REACTIVE_COMPACT_THRESHOLD: f64 = 0.90;
+/// Reactive compact fires at 75 % of the context window.
+const REACTIVE_COMPACT_THRESHOLD: f64 = 0.75;
 /// Context collapse (emergency) fires at 97 % of the context window.
 const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 
@@ -2138,14 +2141,14 @@ mod tests {
     }
 
     #[test]
-    fn test_should_compact_at_90pct() {
+    fn test_should_compact_at_75pct() {
         let state = AutoCompactState::default();
-        // 90 % of 200k = 180k — should trigger
-        assert!(should_auto_compact(180_000, "claude-sonnet-4-6", &state));
+        // 75 % of 200k = 150k — should trigger
+        assert!(should_auto_compact(150_000, "claude-sonnet-4-6", &state));
     }
 
     #[test]
-    fn test_should_not_compact_below_90pct() {
+    fn test_should_not_compact_below_75pct() {
         let state = AutoCompactState::default();
         // 70 % of 200k = 140k — should NOT trigger
         assert!(!should_auto_compact(140_000, "claude-sonnet-4-6", &state));
@@ -2764,7 +2767,7 @@ mod tests {
             ..Default::default()
         };
 
-        // 95% of a 200k window = 190k — above the 90% threshold.
+        // 95% of a 200k window = 190k — above the 75% threshold.
         let result = auto_compact_if_needed(
             &provider,
             &messages,
@@ -2784,7 +2787,7 @@ mod tests {
         );
     }
 
-    /// When auto-compact is enabled but the token count is below the 90% threshold,
+    /// When auto-compact is enabled but the token count is below the 75% threshold,
     /// the gate must also skip the provider call.
     #[tokio::test]
     async fn gate_skips_provider_when_below_threshold() {
@@ -2792,7 +2795,7 @@ mod tests {
         let messages: Vec<Message> = vec![];
         let mut state = AutoCompactState::default();
 
-        // 50% of a 200k window = 100k — below the 90% threshold.
+        // 50% of a 200k window = 100k — below the 75% threshold.
         let result = auto_compact_if_needed(
             &provider,
             &messages,
@@ -2834,6 +2837,7 @@ mod tests {
         };
 
         // 95% — above threshold. First compaction has no debounce history.
+        // (95% of 200k = 190k > 150k trigger at 75%.)
         let result = auto_compact_if_needed(
             &provider,
             &messages,

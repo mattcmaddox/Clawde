@@ -156,7 +156,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `auto_compact` | boolean | true | Automatically compact the conversation context when the context window nears capacity. |
-| `compact_threshold` | float | 0.85 | Fraction of the context window that triggers auto-compaction (0.0–1.0). |
+| `compact_threshold` | float | 0.75 | Fraction of the context window that triggers auto-compaction (0.0–1.0). 75% is the research-backed optimal quality point (Chroma 2025); the remaining 25% is working memory for reasoning. |
 
 ### System prompt
 
@@ -711,9 +711,9 @@ matches. They are defined in the `formatter` map:
     // Dark theme for the TUI
     "theme": "dark",
 
-    // Compact when context window is 85% full
+    // Compact when context window is 75% full
     "auto_compact": true,
-    "compact_threshold": 0.85,
+    "compact_threshold": 0.75,
 
     // Show debug logs
     "verbose": false,

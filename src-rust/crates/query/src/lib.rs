@@ -547,9 +547,33 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 /// text so the message history stays well-formed.
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
+/// Tool calls between goal re-anchoring reminders. Every N tool calls the
+/// query loop restates the current task at the end of the request context so
+/// the model doesn't drift from its original objective as context fills with
+/// operational detail (research: arXiv 2505.02709, Zylos 2026).
+const GOAL_REANCHOR_INTERVAL: u32 = 6;
+
 // Spinner verbs are imported from clawde_core::spinner
 
 const FREE_NO_CREDENTIALS_HINT: &str = "Free mode has no configured upstream keys. Configure the default free router with `clawde -p \"/keys set <upstream> <key>\"` (for example, `/keys set groq gsk_...`), or set GROQ_API_KEY, GOOGLE_API_KEY, CEREBRAS_API_KEY, MISTRAL_API_KEY, or another free-upstream key. Use `clawde --check-keys` to validate the store.";
+
+/// Strip thinking blocks from assistant messages in the trajectory.
+/// Used when the provider switches mid-task (e.g., free tier exhausts and
+/// falls back to another provider). Research: Zylos 2026 — "cascade drift"
+/// shows that trajectories from weaker models corrupt goal state in
+/// stronger models. Removing speculative reasoning while keeping state
+/// facts (tool results, text) prevents the new provider from anchoring
+/// on stale or corrupted reasoning.
+fn sanitize_thinking_from_trajectory(messages: &mut [Message]) {
+    for msg in messages.iter_mut() {
+        if msg.role != clawde_core::types::Role::Assistant {
+            continue;
+        }
+        if let clawde_core::types::MessageContent::Blocks(blocks) = &mut msg.content {
+            blocks.retain(|b| !matches!(b, ContentBlock::Thinking { .. }));
+        }
+    }
+}
 
 /// Resolve the effective effort level for a turn.
 ///
@@ -1238,6 +1262,14 @@ pub async fn run_query_loop(
     // Count tool failures for the current logical turn without retaining raw
     // tool output in the durable plan artifact.
     let mut turn_tool_error_count: u32 = 0;
+    // Trajectory-sanitization upstream tracker: the free provider falls back
+    // through upstreams internally (free/auto → cline etc.) without the query
+    // loop noticing a model change. We remember the upstream that served the
+    // LAST successful turn; when the attribution for a new turn names a
+    // different upstream, the trajectory's thinking blocks (produced by the
+    // weaker model) are stripped so the new provider doesn't inherit corrupted
+    // goal state (research: Zylos 2026 "cascade drift").
+    let mut last_turn_upstream: Option<String> = None;
     // Goal re-anchoring: counts total tool calls across the entire session
     // and injects a reminder with the original user request every N calls
     // to prevent goal drift (research: arXiv 2505.02709, Zylos 2026).
@@ -1890,6 +1922,28 @@ pub async fn run_query_loop(
         // and the compact summary stay clean.
         let instruction_pin = build_instruction_pin(messages);
 
+        // Goal re-anchoring (arXiv 2505.02709, Zylos 2026): every N tool calls,
+        // restate the current task at the END of the request — the position
+        // models attend to best — and nudge the model to produce output rather
+        // than continuing to explore. Request-only, like the instruction pin:
+        // never persisted to `messages`, so history and the compact summary
+        // stay clean and no consecutive user messages accumulate in the
+        // transcript. Reuses the instruction pin's current-task text, so a
+        // resumed session anchors on the LATEST instruction, not the stale
+        // first prompt.
+        let goal_reanchor_pin =
+            if total_tool_calls > 0 && total_tool_calls.is_multiple_of(GOAL_REANCHOR_INTERVAL) {
+                instruction_pin.as_ref().map(|pin| {
+                    format!(
+                        "[Goal reminder] You are {} tool calls into this task. Task: \"{}\". \
+                         Focus on producing the requested output.",
+                        total_tool_calls, pin
+                    )
+                })
+            } else {
+                None
+            };
+
         // Build API request
         let mut api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
         if let Some(ref pin) = instruction_pin {
@@ -1897,6 +1951,9 @@ pub async fn run_query_loop(
                 "## Current task\n{}\n\nThis is the user's latest instruction — stay on it. If a later user message changes it, the later message wins.",
                 pin
             ))));
+        }
+        if let Some(ref reanchor) = goal_reanchor_pin {
+            api_messages.push(ApiMessage::from(&Message::user(reanchor.clone())));
         }
         // Max-steps degradation: the final summary turn is dispatched with NO
         // tool definitions so the model can only produce text (issue #230).
@@ -2540,6 +2597,9 @@ pub async fn run_query_loop(
                             pin
                         )));
                     }
+                    if let Some(ref reanchor) = goal_reanchor_pin {
+                        provider_messages.push(Message::user(reanchor.clone()));
+                    }
 
                     let provider_request = clawde_api::ProviderRequest {
                         model: provider_request_model(&provider_id_str, &model_id_str),
@@ -3029,6 +3089,34 @@ pub async fn run_query_loop(
                         )));
                     }
 
+                    // Trajectory sanitization on free-chain upstream switch
+                    // (research: Zylos 2026 "cascade drift"). The FreeProvider
+                    // falls back through upstreams INTERNALLY — free/auto →
+                    // cline etc. — with no model change visible here. When the
+                    // attribution for this turn names a different upstream than
+                    // the previous turn's, strip the Thinking blocks from the
+                    // trajectory so the new provider doesn't inherit corrupted
+                    // goal state or stale reasoning from the weaker model.
+                    // `messages` holds only PRIOR turns at this point (the
+                    // current assistant message is pushed later), so the new
+                    // upstream's own fresh thinking is preserved.
+                    if provider_id_str == "free" {
+                        if let Some(upstream) = actual_upstream_id.as_deref() {
+                            if last_turn_upstream
+                                .as_deref()
+                                .is_some_and(|prev| prev != upstream)
+                            {
+                                info!(
+                                    from = ?last_turn_upstream,
+                                    to = upstream,
+                                    "Free chain switched upstream — sanitizing thinking from trajectory"
+                                );
+                                sanitize_thinking_from_trajectory(messages);
+                            }
+                            last_turn_upstream = Some(upstream.to_string());
+                        }
+                    }
+
                     // Build the content blocks from accumulated stream data,
                     // preserving the interleaved order the provider emitted
                     // them (thinking / text / tool blocks stay in place).
@@ -3206,12 +3294,15 @@ pub async fn run_query_loop(
                                 serde_json::to_string(tool_input).unwrap_or_default()
                             ));
                             let blocked = if malformed_tool_calls.contains(tool_id) {
-                                Some(ToolResult::error(format!(
-                                    "Tool call '{}' was not executed: its arguments were \
-                                     malformed or truncated JSON. Retry the tool call with \
-                                     complete, valid JSON arguments.",
-                                    tool_name
-                                )))
+                                Some(ToolResult::error_with_code(
+                                    clawde_tools::ToolErrorCode::InvalidInput,
+                                    format!(
+                                        "Tool call '{}' was not executed: its arguments were \
+                                         malformed or truncated JSON. {}",
+                                        tool_name,
+                                        clawde_tools::ToolErrorCode::InvalidInput.recovery_hint()
+                                    ),
+                                ))
                             } else {
                                 None
                             };
@@ -3525,6 +3616,13 @@ pub async fn run_query_loop(
                         effective_model = fb.clone();
                         used_fallback = true;
                         request_retries += 1;
+                        // Trajectory sanitization on provider switch (research:
+                        // Zylos 2026 — "cascade drift"). Strip thinking blocks
+                        // from the trajectory so the new provider doesn't inherit
+                        // corrupted goal representations from the weaker model.
+                        // Keep only state facts (tool results, text) to prevent
+                        // the new provider from anchoring on stale reasoning.
+                        sanitize_thinking_from_trajectory(messages);
                         turn -= 1; // don't count this attempt against max_turns
                         continue;
                     }
@@ -4438,30 +4536,6 @@ pub async fn run_query_loop(
                     // Append tool results as a user message so the history remains
                     // valid (every tool_use is answered) even on cancellation.
                     messages.push(Message::user_blocks(result_blocks));
-
-                    // Goal re-anchoring: every GOAL_REANCHOR_INTERVAL tool calls,
-                    // inject the user's original request to prevent goal drift.
-                    // Research shows agents drift from their original objective as
-                    // context fills with operational detail (arXiv 2505.02709).
-                    const GOAL_REANCHOR_INTERVAL: u32 = 6;
-                    if total_tool_calls > 0
-                        && total_tool_calls.is_multiple_of(GOAL_REANCHOR_INTERVAL)
-                    {
-                        // Extract the first user message as the original request.
-                        if let Some(first_user) = messages
-                            .iter()
-                            .find(|m| matches!(m.role, clawde_core::types::Role::User))
-                        {
-                            let original = first_user.get_all_text();
-                            if !original.is_empty() && original.len() < 500 {
-                                messages.push(Message::user(format!(
-                                    "[Goal reminder] Your original task: \"{}\". \nFocus on producing the requested output. You have used {} tool calls so far.",
-                                    original,
-                                    total_tool_calls
-                                )));
-                            }
-                        }
-                    }
 
                     // If the batch was abandoned due to cancellation, stop the loop
                     // now rather than sending the (cancelled) results back to the model.

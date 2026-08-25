@@ -189,6 +189,50 @@ impl ToolErrorCode {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// Whether this error is recoverable (the model should retry with
+    /// corrected arguments) vs fatal (the model should take a different
+    /// approach or stop). Research: AgentDebug (Zhu et al., Sep 2025)
+    /// shows that classifying errors as recoverable vs fatal improves
+    /// task success by 24%.
+    pub const fn is_recoverable(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidInput | Self::PermissionDenied | Self::ExecutionFailed | Self::Timeout
+        )
+    }
+
+    /// Model-facing guidance for this error class. Injected after the
+    /// tool error message to help the model recover correctly.
+    pub const fn recovery_hint(self) -> &'static str {
+        match self {
+            Self::InvalidInput => {
+                "This is a recoverable error. Fix the arguments and retry the same tool call."
+            }
+            Self::PermissionDenied => {
+                "Permission was denied. Ask the user for permission, or try a different approach."
+            }
+            Self::ExecutionFailed => {
+                "The tool execution failed. Check the error details and retry with corrected input."
+            }
+            Self::Timeout => {
+                "The tool timed out. Simplify the request or split it into smaller steps."
+            }
+            Self::TestFailed | Self::LintFailed => {
+                "Tests or lints failed. Read the error output and fix the code, then retry."
+            }
+            Self::NetworkIsolationBlocked | Self::NetworkSandboxUnavailable => {
+                "Network access is blocked. Use local tools (Read, Grep, Glob, Bash) instead."
+            }
+            Self::ToolUnavailable | Self::UnknownTool => {
+                "This tool is not available. Use a different tool to accomplish the same goal."
+            }
+            Self::PlanBlocked => {
+                "The plan gate blocked this action. Review the plan and adjust your approach."
+            }
+            Self::Cancelled => "",
+        }
+    }
 }
 
 /// The result of executing a tool.
