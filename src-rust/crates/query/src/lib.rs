@@ -1279,8 +1279,13 @@ pub async fn run_query_loop(
     // (InvalidInput/PermissionDenied/ExecutionFailed/Timeout). Fatal errors
     // collapse into the no-progress sentinel so a changing sequence of them is
     // still one stalled pattern; recoverable errors use the real signature so
-    // the model gets headroom to iterate on a fix.
+    // the model gets headroom to iterate on a fix. Hard fatal errors are the
+    // fatal subset that is NOT a deterministic check failure (RunTests/
+    // RunLints): unknown/unavailable tools, blocked network, etc. Check
+    // failures are fixable by writing code, so the stop message must not call
+    // them "uncorrectable" even though both collapse to the sentinel.
     let mut turn_fatal_tool_error_count: u32 = 0;
+    let mut turn_hard_fatal_error_count: u32 = 0;
     // Trajectory-sanitization upstream tracker: the free provider falls back
     // through upstreams internally (free/auto → cline etc.) without the query
     // loop noticing a model change. We remember the upstream that served the
@@ -1575,6 +1580,7 @@ pub async fn run_query_loop(
                 };
                 let had_tool_errors = turn_tool_error_count > 0;
                 let had_fatal_tool_errors = turn_fatal_tool_error_count > 0;
+                let had_hard_fatal_errors = turn_hard_fatal_error_count > 0;
                 turn_tool_signatures.clear();
                 if update_no_progress_state_with_errors(
                     signature,
@@ -1586,9 +1592,18 @@ pub async fn run_query_loop(
                     had_fatal_tool_errors,
                 ) {
                     if let Some(ref tx) = event_tx {
-                        let status = if had_fatal_tool_errors {
+                        let status = if had_hard_fatal_errors {
                             format!(
                                 "No progress detected: the model hit uncorrectable tool errors for {} consecutive turns without changing any files — stopping the loop.",
+                                no_progress_streak
+                            )
+                        } else if turn_deterministic_check_failed {
+                            // Test/lint failures are fixable by writing code;
+                            // the write would have reset the streak, so this
+                            // stop means the model kept re-running checks
+                            // without fixing anything.
+                            format!(
+                                "No progress detected: the model ran checks for {} consecutive turns without changing any files — stopping the loop.",
                                 no_progress_streak
                             )
                         } else if had_tool_errors {
@@ -1790,6 +1805,7 @@ pub async fn run_query_loop(
                         turn_diff = None;
                         turn_tool_error_count = 0;
                         turn_fatal_tool_error_count = 0;
+                        turn_hard_fatal_error_count = 0;
                         // Reset repeat-tool-reminder: a user message changes the
                         // context; repetition across it is not a loop.
                         repeat_detector.reset();
@@ -3391,6 +3407,9 @@ pub async fn run_query_loop(
                                 turn_tool_error_count += 1;
                                 if result.error_code.is_none_or(|code| !code.is_recoverable()) {
                                     turn_fatal_tool_error_count += 1;
+                                    if !check_failed {
+                                        turn_hard_fatal_error_count += 1;
+                                    }
                                 }
                             }
                             if let Some(ref tx) = event_tx {
@@ -4527,6 +4546,9 @@ pub async fn run_query_loop(
                             turn_tool_error_count += 1;
                             if result.error_code.is_none_or(|code| !code.is_recoverable()) {
                                 turn_fatal_tool_error_count += 1;
+                                if !check_failed {
+                                    turn_hard_fatal_error_count += 1;
+                                }
                             }
                         }
                         if !batch_cancelled {
