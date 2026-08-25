@@ -3185,20 +3185,15 @@ impl App {
         }
     }
 
-    /// Compute a read-only thinking inspection for the currently selected
-    /// free-model popup entry. Called by render.rs to show the inspector
-    /// footer — no effect on the request path.
-    pub fn free_model_popup_inspector(
-        &self,
-    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
-        use clawde_api::providers::effort_shaping::inspect_thinking;
-        let item = self.free_model_popup.selected()?;
-        let id = &item.id;
-
-        let (provider_id, model_id) = if id == "free/auto" {
+    /// Resolve a free-model id (`free/auto`, `free/family/<slug>`, or
+    /// `free/<upstream>/<model>`) to the (provider, model) pair it would
+    /// dispatch to. `None` for non-free ids.
+    fn free_model_id_pair(&self, id: &str) -> Option<(String, String)> {
+        if id == "free/auto" {
             let (upstream_id, _, model) = self.free_model_defaults.first()?;
-            (upstream_id.as_str(), model.as_str())
-        } else if let Some(slug) = id.strip_prefix("free/family/") {
+            return Some((upstream_id.clone(), model.clone()));
+        }
+        if let Some(slug) = id.strip_prefix("free/family/") {
             let upstream = clawde_api::FREE_CATALOG
                 .iter()
                 .find(|u| u.model_family == slug)?;
@@ -3206,27 +3201,112 @@ impl App {
                 .free_model_defaults
                 .iter()
                 .find(|(uid, _, _)| uid == upstream.id)
-                .map(|(_, _, model)| model.as_str())
-                .unwrap_or(upstream.default_model);
-            (upstream.id, model)
-        } else if let Some(rest) = id.strip_prefix("free/") {
+                .map(|(_, _, model)| model.clone())
+                .unwrap_or_else(|| upstream.default_model.to_string());
+            return Some((upstream.id.to_string(), model));
+        }
+        if let Some(rest) = id.strip_prefix("free/") {
             let (upstream_id, model) = rest.split_once('/')?;
-            (upstream_id, model)
-        } else {
-            return None;
-        };
+            return Some((upstream_id.to_string(), model.to_string()));
+        }
+        None
+    }
 
+    /// Compute a read-only thinking inspection for a free-model id at a given
+    /// effort level. Shared by the free-model popup, the model picker, and the
+    /// effort picker surfaces.
+    fn inspection_for_model_id(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        effort: clawde_core::effort::EffortLevel,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        use clawde_api::providers::effort_shaping::inspect_thinking;
         let upstream = clawde_api::providers::free::catalog_entry(provider_id);
         let last_route = clawde_api::providers::free::take_free_last_route();
         Some(inspect_thinking(
             provider_id,
             model_id,
-            Some(self.effort_level),
+            Some(effort),
             None,
             None,
             upstream,
             last_route.as_ref(),
         ))
+    }
+
+    /// Compute a read-only thinking inspection for the currently selected
+    /// free-model popup entry. Called by render() to show the inspector
+    /// footer — no effect on the request path.
+    pub fn free_model_popup_inspector(
+        &self,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        let item = self.free_model_popup.selected()?;
+        let (provider_id, model_id) = self.free_model_id_pair(&item.id)?;
+        self.inspection_for_model_id(&provider_id, &model_id, self.effort_level)
+    }
+
+    /// Compute a read-only thinking inspection for the model currently
+    /// highlighted in the model picker (Alt+M), using the picker's own
+    /// in-flight effort selection. Called by render.rs — no effect on the
+    /// request path.
+    pub fn model_picker_inspector(
+        &self,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        if !self.model_picker.visible {
+            return None;
+        }
+        let filtered = self.model_picker.filtered_models();
+        let id = filtered.get(self.model_picker.selected_idx)?.id.clone();
+        let (provider_id, model_id) = self.free_model_id_pair(&id)?;
+        self.inspection_for_model_id(&provider_id, &model_id, self.model_picker.effort_level)
+    }
+    /// Compute a read-only thinking inspection for the *committed* model +
+    /// effort selection (what the next request will actually send). Used by
+    /// the status row to surface a persistent warning marker when the current
+    /// selection has a clamp / ignored-param / ladder quirk. Pure — no effect
+    /// on the request path.
+    pub fn current_inspector(
+        &self,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        let provider = self.config.selected_provider_id();
+        // `free/auto` is a routing alias, not a real provider — resolve it to
+        // the first configured upstream so the inspector shows the wire param
+        // the auto chain would actually send (mirrors the popup's resolution).
+        if provider == "free" && self.model_name == "free/auto" {
+            let (upstream_id, _, model) = self.free_model_defaults.first()?;
+            return self.inspection_for_model_id(upstream_id, model, self.effort_level);
+        }
+        let model_id = self
+            .model_name
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(&self.model_name);
+        self.inspection_for_model_id(provider, model_id, self.effort_level)
+    }
+
+    /// Compute a read-only thinking inspection for the effort level currently
+    /// highlighted in the `/effort` picker (mid-dial, not yet committed).
+    /// Called by render.rs to show the one-line wire-param summary. Pure — no
+    /// effect on the request path.
+    pub fn effort_picker_inspector(
+        &self,
+    ) -> Option<clawde_api::providers::effort_shaping::ThinkingInspection> {
+        if !self.effort_picker.visible {
+            return None;
+        }
+        let effort = self.effort_picker.current();
+        let provider = self.config.selected_provider_id();
+        // Resolve `free/auto` to the first configured upstream so the mid-dial
+        // wire param reflects what the auto chain would actually send.
+        if provider == "free" && self.model_name == "free/auto" {
+            let (upstream_id, _, model) = self.free_model_defaults.first()?;
+            return self.inspection_for_model_id(upstream_id, model, effort);
+        }
+        let model_id = self
+            .model_name
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(&self.model_name);
+        self.inspection_for_model_id(provider, model_id, effort)
     }
 
     /// Step the effort level one rung up (+1) or down (-1) along the current
@@ -11479,6 +11559,36 @@ mod tests {
         let config = Config::default();
         let cost_tracker = clawde_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    #[test]
+    fn current_inspector_resolves_free_auto_to_first_upstream() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        // free/auto with a configured google default — the inspector must
+        // resolve to the google wire param, not a no-op "free" inspection.
+        app.model_name = "free/auto".to_string();
+        app.config.provider = Some("free".to_string());
+        app.free_model_defaults = vec![(
+            "google".to_string(),
+            "Google Gemini".to_string(),
+            "gemini-2.5-flash".to_string(),
+        )];
+        app.effort_level = clawde_core::effort::EffortLevel::High;
+        let insp = app.current_inspector().expect("inspector resolves");
+        // Gemini 2.5 at High is a budget control (thinkingBudget), not a no-op.
+        assert_eq!(
+            insp.control,
+            Some(clawde_api::providers::effort_shaping::ThinkingControl::Budget)
+        );
+        assert!(
+            insp.wire_param
+                .as_deref()
+                .unwrap_or("")
+                .contains("thinkingBudget"),
+            "got: {:?}",
+            insp.wire_param
+        );
     }
 
     #[test]

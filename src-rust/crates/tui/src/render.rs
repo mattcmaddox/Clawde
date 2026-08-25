@@ -37,7 +37,7 @@ use crate::onboarding_dialog::render_onboarding_dialog;
 use crate::overage_upsell::render_overage_upsell;
 use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay,
-    render_keybindings_overlay, render_rewind_flow,
+    render_keybindings_overlay, render_rewind_flow, CLAWDE_ACCENT,
 };
 use crate::plugin_views::render_plugin_hints;
 use crate::prompt_input::{input_height, render_prompt_input, InputMode, TypeaheadSource, VimMode};
@@ -759,11 +759,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // the input area (full width) and SKIP the prompt input. The prompt returns
     // when the picker closes on confirm/cancel.
     if app.effort_picker.visible {
+        let inspector = app.effort_picker_inspector();
         crate::effort_picker::render_effort_picker(
             frame,
             &app.effort_picker,
             chunks[3],
             app.frame_count,
+            inspector.as_ref(),
         );
     } else {
         render_input(frame, app, chunks[3], prompt_focused);
@@ -1099,7 +1101,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
 
     // Model picker overlay
     if app.model_picker.visible {
-        render_model_picker(&app.model_picker, size, frame.buffer_mut());
+        let inspector = app.model_picker_inspector();
+        render_model_picker(
+            &app.model_picker,
+            size,
+            frame.buffer_mut(),
+            inspector.as_ref(),
+        );
     }
 
     // Session browser overlay
@@ -1184,6 +1192,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             free_health,
             free_cooldowns,
             app.model_picker.task_sort,
+            app.current_inspector().as_ref(),
         );
     }
 
@@ -3129,6 +3138,20 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                 ),
                 Style::default().fg(effort_color),
             ));
+            // Persistent thinking-inspector warning marker: when the current
+            // model+effort has a clamp / ignored-param / ladder quirk, surface
+            // it subtly here (the popup/pickers carry the detail).
+            if app
+                .current_inspector()
+                .is_some_and(|insp| !insp.warnings.is_empty())
+            {
+                spans.push(Span::styled(
+                    " · ⚠",
+                    Style::default()
+                        .fg(CLAWDE_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             Line::from(spans)
         } else {
             Line::from(vec![

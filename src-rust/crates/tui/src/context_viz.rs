@@ -129,6 +129,9 @@ pub fn render_context_viz(
     // Active free-model task sort — rendered as a status line so the user can
     // see /models is pre-sorted by task (hidden when the default `All`).
     free_task_sort: crate::model_picker::FreeTask,
+    // Thinking-inspector row for the current model+effort (the deep-dive
+    // "Thinking" section). `None` when there is nothing to inspect.
+    thinking: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
 ) {
     if !state.visible {
         return;
@@ -339,6 +342,85 @@ pub fn render_context_viz(
             )]));
         }
 
+        lines.push(Line::from(""));
+    }
+
+    // -- Thinking (inspector deep-dive) ------------------------------------------
+    if let Some(insp) = thinking {
+        lines.push(Line::from(vec![Span::styled(
+            " Thinking",
+            Style::default()
+                .fg(CLAWDE_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        let mode = match insp.mode {
+            clawde_api::providers::effort_shaping::ThinkingMode::Enabled => "enabled",
+            clawde_api::providers::effort_shaping::ThinkingMode::Disabled => "disabled",
+            clawde_api::providers::effort_shaping::ThinkingMode::NotSupported => "n/a",
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Mode: {mode}"),
+            Style::default().fg(Color::White),
+        )]));
+        if let Some(ref wp) = insp.wire_param {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" Wire: {wp}"),
+                Style::default().fg(Color::White),
+            )]));
+        }
+        if let Some(budget) = insp.effective_budget {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" Budget: {budget} tokens"),
+                Style::default().fg(Color::White),
+            )]));
+        }
+        if let Some(cap) = insp.max_tokens_cap {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" Max tokens cap: {cap}"),
+                Style::default().fg(CLAWDE_MUTED),
+            )]));
+        }
+        if let Some(ctx) = insp.context_window {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" Context window: {}", format_tokens(ctx as u64)),
+                Style::default().fg(CLAWDE_MUTED),
+            )]));
+        }
+        let caps = match (insp.tool_calling, insp.vision) {
+            (true, true) => "tools + vision",
+            (true, _) => "tools",
+            (_, true) => "vision",
+            _ => "text only",
+        };
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Capabilities: {caps}"),
+            Style::default().fg(CLAWDE_MUTED),
+        )]));
+        for w in &insp.warnings {
+            lines.push(Line::from(vec![Span::styled(
+                format!(" \u{26a0} {w}"),
+                Style::default().fg(Color::Yellow),
+            )]));
+        }
+        if let Some(ref lr) = insp.last_response {
+            let diag: Vec<String> = lr.flags.iter().map(|f| format!(" \u{26a0} {f}")).collect();
+            let diag_str = diag.join("");
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    " Last response: {} reasoning / {} completion{} (stop: {})",
+                    lr.reasoning_tokens,
+                    lr.completion_tokens,
+                    diag_str,
+                    lr.stop_reason.as_deref().unwrap_or("-")
+                ),
+                Style::default().fg(if diag.is_empty() {
+                    CLAWDE_MUTED
+                } else {
+                    Color::Yellow
+                }),
+            )]));
+        }
         lines.push(Line::from(""));
     }
 
@@ -758,6 +840,7 @@ mod tests {
                     vec![("groq".into(), 2, 3, Some(30))],
                     vec![("groq".into(), "empty".into(), Some(42))],
                     crate::model_picker::FreeTask::All,
+                    None,
                 );
             })
             .unwrap();
@@ -803,6 +886,7 @@ mod tests {
                     vec![("nvidia".into(), 2, 2, None), ("groq".into(), 2, 2, None)],
                     Vec::new(),
                     crate::model_picker::FreeTask::All,
+                    None,
                 );
             })
             .unwrap();
@@ -888,6 +972,7 @@ mod tests {
                     vec![],
                     vec![],
                     crate::model_picker::FreeTask::All,
+                    None,
                 );
             })
             .unwrap();
@@ -929,6 +1014,7 @@ mod tests {
                     vec![],
                     vec![],
                     crate::model_picker::FreeTask::Coding,
+                    None,
                 );
             })
             .unwrap();
@@ -966,6 +1052,7 @@ mod tests {
                     vec![],
                     vec![],
                     crate::model_picker::FreeTask::All,
+                    None,
                 );
             })
             .unwrap();
@@ -980,6 +1067,64 @@ mod tests {
         assert!(
             !content_all.contains("Free model sort"),
             "ctx-viz must hide the sort section when the task is All"
+        );
+    }
+
+    #[test]
+    fn context_viz_thinking_section_renders_inspection() {
+        use clawde_api::providers::effort_shaping::inspect_thinking;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut state = ContextVizState::new();
+        state.open();
+        // A real inspection: poolside at Medium is enabled-by-default with a
+        // max_tokens cap — exercises mode + wire + cap + warning lines.
+        let upstream = clawde_api::providers::free::catalog_entry("poolside");
+        let insp = inspect_thinking(
+            "poolside",
+            "poolside/laguna-s-2.1",
+            Some(clawde_core::effort::EffortLevel::Medium),
+            None,
+            Some(20_000),
+            upstream,
+            None,
+        );
+        terminal
+            .draw(|frame| {
+                render_context_viz(
+                    frame,
+                    &state,
+                    frame.area(),
+                    0,
+                    0,
+                    vec![],
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    vec![],
+                    vec![],
+                    vec![],
+                    crate::model_picker::FreeTask::All,
+                    Some(&insp),
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(content.contains("Thinking"), "got: {content}");
+        assert!(content.contains("Mode: enabled"), "got: {content}");
+        assert!(content.contains("Max tokens cap: 8192"), "got: {content}");
+        // The poolside cap warning is listed under the section.
+        assert!(
+            content.contains("\u{26a0}") || content.contains("clamp"),
+            "warning row present: {content}"
         );
     }
 
@@ -1006,6 +1151,7 @@ mod tests {
                     vec![],
                     vec![],
                     crate::model_picker::FreeTask::All,
+                    None,
                 );
             })
             .unwrap();

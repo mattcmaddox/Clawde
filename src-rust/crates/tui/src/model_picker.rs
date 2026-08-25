@@ -1380,7 +1380,12 @@ impl Default for ModelPickerState {
 /// - A scrollable list of models with effort indicator for supporting models
 /// - Selection highlight on the focused row
 /// - Bottom hint bar with ←/→ keys for effort adjustment
-pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffer) {
+pub fn render_model_picker(
+    state: &ModelPickerState,
+    area: Rect,
+    buf: &mut Buffer,
+    inspector: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
+) {
     if !state.visible {
         return;
     }
@@ -1418,9 +1423,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         .map(|m| m.id == "free/auto")
         .unwrap_or(false);
 
-    let content_h = (filtered.len() as u16 + if is_free_picker_list { 9 } else { 6 })
-        .min(max_height)
-        .max(8);
+    // Free pickers get an extra footer row for the thinking-inspector line.
+    let extra_footer = if is_free_picker_list { 1 } else { 0 };
+    let content_h =
+        (filtered.len() as u16 + if is_free_picker_list { 9 } else { 6 } + extra_footer)
+            .min(max_height)
+            .max(8);
     let dialog_area = centered_rect(width, content_h, area);
 
     // ── Fill dialog bg (no border) ──
@@ -1441,7 +1449,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         height: dialog_area.height.saturating_sub(2),
     };
 
-    let footer_height = 1u16.min(inner.height);
+    let footer_height = (1u16 + extra_footer).min(inner.height);
     let header_height =
         (if is_free_picker_list { 5 } else { 3 }).min(inner.height.saturating_sub(footer_height));
     let header_area = Rect {
@@ -1813,7 +1821,35 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         Style::default().fg(Color::Rgb(233, 30, 99)),
     ));
     footer_spans.push(Span::styled(" providers", Style::default().fg(dim)));
-    Paragraph::new(Line::from(footer_spans))
+    let mut footer_lines = vec![Line::from(footer_spans)];
+
+    // Thinking-inspector one-liner (free picker only): the wire param for the
+    // highlighted model at the picker's in-flight effort. Accent on warnings.
+    if extra_footer > 0 {
+        let insp_text = match inspector {
+            Some(insp) => match insp.wire_param.as_deref() {
+                Some(wp) => format!(" \u{2192} {wp}"),
+                None => match insp.mode {
+                    clawde_api::providers::effort_shaping::ThinkingMode::NotSupported => {
+                        " \u{2192} (no thinking knob for this model)".to_string()
+                    }
+                    _ => String::new(),
+                },
+            },
+            None => String::new(),
+        };
+        let insp_fg = if inspector.map(|i| !i.warnings.is_empty()).unwrap_or(false) {
+            Color::Rgb(233, 30, 99)
+        } else {
+            dim
+        };
+        footer_lines.push(Line::from(vec![Span::styled(
+            insp_text,
+            Style::default().fg(insp_fg),
+        )]));
+    }
+
+    Paragraph::new(footer_lines)
         .bg(dialog_bg)
         .render(footer_area, buf);
 }
@@ -2144,7 +2180,7 @@ mod tests {
         p.open("claude-sonnet-4-6");
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
-        render_model_picker(&p, area, &mut buf);
+        render_model_picker(&p, area, &mut buf, None);
     }
 
     // 15. render does nothing when not visible.
@@ -2153,7 +2189,7 @@ mod tests {
         let p = ModelPickerState::new();
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        render_model_picker(&p, area, &mut buf);
+        render_model_picker(&p, area, &mut buf, None);
         for cell in buf.content() {
             assert_eq!(
                 cell.symbol(),
@@ -2177,7 +2213,7 @@ mod tests {
         p.open("cerebras/gpt-oss-120b");
         let area = Rect::new(0, 0, 120, 30);
         let mut buf = Buffer::empty(area);
-        render_model_picker(&p, area, &mut buf);
+        render_model_picker(&p, area, &mut buf, None);
 
         let rendered: Vec<String> = buf
             .content()

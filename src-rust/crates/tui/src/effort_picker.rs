@@ -62,9 +62,10 @@ const TRACK_FG: Color = Color::Rgb(90, 90, 104);
 /// The "Faster" end label.
 const FASTER_FG: Color = Color::Rgb(120, 160, 200);
 
-/// Rows the docked panel wants (7 content rows + top/bottom border). Clamped to
-/// the available height by the layout in `render_app`.
-pub const DOCK_HEIGHT: u16 = 9;
+/// Rows the docked panel wants (8 content rows + top/bottom border). Clamped to
+/// the available height by the layout in `render_app`. The extra row hosts the
+/// thinking-inspector one-liner (wire param for the currently-dialed effort).
+pub const DOCK_HEIGHT: u16 = 10;
 
 /// Controls hint line.
 const CONTROLS: &str = "\u{2190}/\u{2192} to adjust \u{b7} Enter to confirm \u{b7} Esc to cancel";
@@ -198,11 +199,14 @@ fn rank(level: EffortLevel) -> u8 {
 /// laid out INSIDE the given `area` (typically the prompt input area). No
 /// centering — the panel fills `area`. `frame_count` drives the animated
 /// ultracode spectrum background and the animated `max` rainbow.
+/// `inspector` (when present) renders a one-line read-only summary of the
+/// thinking wire param for the currently-dialed effort level.
 pub fn render_effort_picker(
     frame: &mut Frame,
     state: &EffortPickerState,
     area: Rect,
     frame_count: u64,
+    inspector: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
 ) {
     if !state.visible || state.levels.is_empty() || area.width < 4 || area.height < 3 {
         state.last_rect.set(area);
@@ -324,7 +328,7 @@ pub fn render_effort_picker(
     // Over the red wave, description/controls use a near-white so they read
     // cleanly on the animated background (no dark cut-out boxes).
     let text_fg = if on_spectrum { DESC_ON_WAVE } else { DIM_FG };
-    let desc_rows = controls_row.saturating_sub(4).min(2) as usize;
+    let desc_rows = controls_row.saturating_sub(5).min(2) as usize;
     if desc_rows > 0 {
         let desc = level_description(sel_level, &state.levels);
         for (i, line) in word_wrap(&desc, usable as usize)
@@ -338,6 +342,38 @@ pub fn render_effort_picker(
                 row(4 + i as u16),
                 &line,
                 Style::default().fg(text_fg),
+                inner,
+            );
+        }
+    }
+
+    // Thinking-inspector one-liner: the exact wire param this effort level will
+    // send for the active provider/model, so dialing shows the consequence at
+    // the moment of dialing (spec: effort picker surface). Accent when it
+    // carries a warning (clamp / ignored-param / Low quirk).
+    let insp_row = controls_row.saturating_sub(1);
+    if let Some(insp) = inspector {
+        let insp_text = match insp.wire_param.as_deref() {
+            Some(wp) => format!(" \u{2192} {wp}"),
+            None => match insp.mode {
+                clawde_api::providers::effort_shaping::ThinkingMode::NotSupported => {
+                    " \u{2192} (no thinking knob for this model)".to_string()
+                }
+                _ => String::new(),
+            },
+        };
+        let insp_fg = if insp.warnings.is_empty() {
+            text_fg
+        } else {
+            RED_BRIGHT
+        };
+        if !insp_text.is_empty() {
+            blit_str(
+                buf,
+                x0,
+                row(insp_row),
+                &insp_text,
+                Style::default().fg(insp_fg),
                 inner,
             );
         }
@@ -716,9 +752,17 @@ mod tests {
     }
 
     fn render_to_buffer(state: &EffortPickerState, frame_count: u64) -> Buffer {
+        render_to_buffer_with_inspector(state, frame_count, None)
+    }
+
+    fn render_to_buffer_with_inspector(
+        state: &EffortPickerState,
+        frame_count: u64,
+        inspector: Option<&clawde_api::providers::effort_shaping::ThinkingInspection>,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render_effort_picker(f, state, f.area(), frame_count))
+            .draw(|f| render_effort_picker(f, state, f.area(), frame_count, inspector))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -887,7 +931,7 @@ mod tests {
         // Render into a bottom-docked rect within a taller buffer; the panel must
         // fill exactly that rect (full width at the docked y), NOT be centered.
         let state = state_with(full_ladder(), 5); // ultracode
-        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let area = Rect {
             x: 0,
             y: 5,
@@ -895,9 +939,10 @@ mod tests {
             height: DOCK_HEIGHT,
         };
         terminal
-            .draw(|f| render_effort_picker(f, &state, area, 0))
+            .draw(|f| render_effort_picker(f, &state, area, 0, None))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
+        let bottom = 5 + DOCK_HEIGHT - 1;
 
         // Border corners sit exactly on the rect edges — a bottom-docked panel,
         // not a small centered modal.
@@ -912,12 +957,12 @@ mod tests {
             "top-right at rect edge"
         );
         assert_eq!(
-            buf.cell((0, 13)).unwrap().symbol(),
+            buf.cell((0, bottom)).unwrap().symbol(),
             "\u{2514}",
             "bottom-left at rect bottom"
         );
         assert_eq!(
-            buf.cell((59, 13)).unwrap().symbol(),
+            buf.cell((59, bottom)).unwrap().symbol(),
             "\u{2518}",
             "bottom-right at rect corner"
         );
@@ -1063,6 +1108,49 @@ mod tests {
                 other => panic!("expected Rgb, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn inspector_line_shows_wire_param_for_dialed_effort() {
+        use clawde_api::providers::effort_shaping::{
+            inspect_thinking, ThinkingControl, ThinkingMode,
+        };
+        // Simulate the picker's context: zai/glm-4.7-flash with effort dialed
+        // to High — shape_provider_thinking maps that to a toggle + effort
+        // combo. Build the inspection exactly like App::effort_picker_inspector
+        // does and assert the panel renders its wire param.
+        let upstream = clawde_api::providers::free::catalog_entry("zai");
+        let insp = inspect_thinking(
+            "zai",
+            "glm-4.7-flash",
+            Some(EffortLevel::High),
+            None,
+            None,
+            upstream,
+            None,
+        );
+        assert_eq!(insp.mode, ThinkingMode::Enabled);
+        assert_eq!(insp.control, Some(ThinkingControl::Toggle));
+        let wp = insp.wire_param.as_deref().expect("wire param present");
+        assert!(wp.contains("thinking.type: enabled"), "got: {wp}");
+
+        let state = state_with(full_ladder(), 2); // High selected
+        let buf = render_to_buffer_with_inspector(&state, 0, Some(&insp));
+        let rows = buffer_rows(&buf);
+        let insp_row = rows
+            .iter()
+            .position(|r| r.contains("\u{2192}") && r.contains("thinking"))
+            .expect("inspector line present");
+        assert!(
+            insp_row > 3,
+            "inspector sits below the marker row: row {insp_row}"
+        );
+        // Controls hint sits one row below the inspector line.
+        let controls_row = rows
+            .iter()
+            .position(|r| r.contains("Enter to confirm"))
+            .expect("controls hint present");
+        assert_eq!(controls_row, insp_row + 1);
     }
 
     #[test]
