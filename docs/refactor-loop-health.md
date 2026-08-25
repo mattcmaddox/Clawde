@@ -273,18 +273,32 @@ Implementation landed:
   `configured.min(headroom.max(1))`. Fixes O1 — verify's auto-fix attempts
   can no longer outrun the plan fail-close; a stubborn test gets exactly the
   plan's remaining replan budget, then escalates and the plan blocks.
-- **Tests**: `no_progress_detector_defers_to_plan_for_check_failure` (C1:
-  plan-owned check failures never touch the streak; non-check loops still
-  stop at `NO_PROGRESS_STOP_STREAK`) and `retries_capped_by_plan_replan_headroom`
-  (C2: `max_retries=3` but headroom 1 → escalate on the second failing
-  round). Verified: 417 query tests pass, clippy `-D warnings` clean, fmt
-  clean, `cargo check --workspace` clean.
+- **C3 — plan fail-close is write-immune.** New core test
+  `writes_do_not_reset_failure_streak_when_check_fails` (plan.rs) pins the
+  semantic-fixer path: a plan that receives `turn_made_writes &&
+  deterministic_failed` every turn still fail-closes at exactly
+  `PLAN_MAX_REPLANS`. The fixer's writes reset the loop-local no-progress
+  streak but can never mask the plan's replan accounting.
+- **C4 — non-plan recovery turn (implements Phase D).** Broadened the
+  deterministic-recovery block in `continue_or_end!` (previously active-plan
+  only) to fire whenever `!decision.is_continue() && !degradation_turn &&
+  deterministic_check_failed`. In default headless mode (`StopPolicy` always
+  stops) a bare RunTests/RunLints failure now gets one bounded recovery
+  `Continue` telling the model to fix and re-run, instead of a silent stop
+  (fixes O4's mode asymmetry). The message branches by whether an active plan
+  owns the stop. Safety: the no-progress check runs BEFORE this block, so a
+  stuck model that repeats a failing check without writing is still stopped
+  at streak 3 — C4 only grants a recovery turn to models that make progress
+  (writes reset the streak).
+- **Tests**: `default_mode_feeds_failed_check_back_as_recovery_turn` (query,
+  C4) — a lone failing RunTests in Default mode grants exactly one recovery
+  turn; `writes_do_not_reset_failure_streak_when_check_fails` (core, C3).
+  Full Phase C verified: 418 query + 13 core-plan tests pass, clippy `-D
+  warnings` clean, fmt clean, `cargo check --workspace` clean.
 
-### Phase D (optional) — In-turn check failure feed
-
-- The deterministic recovery turn (~line 1734) already feeds RunTests failures
-  back to the model for **active plans**; extend it to non-plan mode so a bare
-  in-turn `RunTests` failure always gets one bounded fix turn.
+Phase C is complete (C1–C4). The remaining loop-health backlog is Phase A's
+follow-on hygiene (already landed) and any future budget-tuning; see the
+Weaknesses section for open items.
 
 ## 5. Risks
 

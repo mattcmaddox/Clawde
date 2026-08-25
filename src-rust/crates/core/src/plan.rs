@@ -1133,6 +1133,68 @@ mod tests {
     }
 
     #[test]
+    fn writes_do_not_reset_failure_streak_when_check_fails() {
+        // refactor-loop-health Phase C (C3): a semantic fixer that writes
+        // between failing deterministic checks must NOT reset the plan's
+        // failure_streak. The plan gate tracks deterministic_failed
+        // independently of writes, so a stubborn test still fail-closes the
+        // plan at exactly PLAN_MAX_REPLANS — the fixer's writes only re-arm
+        // the verify loop; they cannot mask the plan's fail-close. This is the
+        // `turn_made_writes && deterministic_failed` (semantic re-arm) path.
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("specs/task.json");
+        let spec = sample_spec("session-one");
+        spec.write_to(&spec_path).unwrap();
+        let raw = std::fs::read_to_string(&spec_path).unwrap();
+        let mut progress =
+            PlanProgress::initialize_for_spec(dir.path(), &spec_path, &raw, &spec, "session-one")
+                .unwrap();
+
+        // Semantic-fixer every turn: the agent writes AND the deterministic
+        // check still fails. Writes reset the loop-local no-progress streak,
+        // but the plan's failure accounting must be untouched by the write.
+        let failed_but_wrote = PlanAdvanceEvidence {
+            turn_made_writes: true,
+            has_scoped_diff: true,
+            deterministic_checks_run: true,
+            deterministic_failed: true,
+            ..Default::default()
+        };
+        for _ in 0..PLAN_FAILURE_REPLAN_THRESHOLD {
+            progress
+                .record_evidence(PlanEvidence {
+                    kind: "check".to_string(),
+                    summary: "semantic fixer wrote, but the check still failed".to_string(),
+                    reference: Some("src/lib.rs".to_string()),
+                })
+                .unwrap();
+            assert!(
+                progress
+                    .coordinate_from_evidence(failed_but_wrote)
+                    .unwrap()
+                    .is_none(),
+                "writing while the check fails must still accumulate failure_streak"
+            );
+        }
+        assert!(progress.replan_required);
+        assert_eq!(progress.replan_count, 1);
+        // The write must not have reset the streak below the replan threshold.
+        assert_eq!(progress.failure_streak, PLAN_FAILURE_REPLAN_THRESHOLD);
+
+        // The rest of the bounded budget burns and fail-closes at
+        // PLAN_MAX_REPLANS, exactly the same as the no-write case.
+        for _ in 0..(PLAN_MAX_REPLANS - 1) {
+            assert!(progress
+                .coordinate_from_evidence(failed_but_wrote)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(progress.replan_count, PLAN_MAX_REPLANS);
+        assert_eq!(progress.status, PlanStatus::Blocked);
+        assert_eq!(progress.active_step_id, None);
+    }
+
+    #[test]
     fn replan_budget_clears_when_recovery_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let spec_path = dir.path().join("specs/task.json");

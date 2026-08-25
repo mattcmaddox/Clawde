@@ -1814,22 +1814,34 @@ pub async fn run_query_loop(
                 }
                 // In the default headless mode there is no separate VerifyPolicy
                 // continuation to feed a failed RunTests/RunLints result back to
-                // the model. An active approved plan must still get one bounded
-                // recovery turn; the persisted failure streak and replan budget
-                // decide whether that turn may write again or the plan blocks.
+                // the model (ContinuationMode::Default -> StopPolicy always
+                // stops). An active approved plan must get one bounded recovery
+                // turn; the persisted failure streak and replan budget decide
+                // whether that turn may write again or the plan blocks. When no
+                // plan is active (bare in-turn RunTests/RunLints), still give
+                // one bounded recovery turn so the model is told the check
+                // failed instead of silently stopping (refactor-loop-health
+                // Phase C, C4). This is safe under both bounds: a stuck model
+                // that repeats the failing check without writing is stopped by
+                // the no-progress detector BEFORE this block, and a model that
+                // keeps writing but never fixing burns only up to the turn cap.
                 if !decision.is_continue()
+                    && !degradation_turn
                     && deterministic_check_failed
-                    && plan_event
-                        .as_ref()
-                        .is_some_and(|event| event.plan_status == clawde_core::PlanStatus::Active)
                 {
-                    let recovery_message = if plan_event
-                        .as_ref()
-                        .is_some_and(|event| event.replan_required)
+                    let active_plan = plan_event.as_ref().map_or(false, |event| {
+                        event.plan_status == clawde_core::PlanStatus::Active
+                    });
+                    let recovery_message = if active_plan
+                        && plan_event
+                            .as_ref()
+                            .is_some_and(|event| event.replan_required)
                     {
                         "The deterministic project check failed repeatedly. Replan is required: change the implementation approach before retrying, and do not claim success until the check passes.".to_string()
-                    } else {
+                    } else if active_plan {
                         "The deterministic project check failed. Inspect the RunTests/RunLints failure, change the implementation approach, and retry the active approved plan step; do not claim success yet.".to_string()
+                    } else {
+                        "The deterministic project check failed. Inspect the RunTests/RunLints failure, fix the underlying issue, and re-run the check; do not claim success until it passes.".to_string()
                     };
                     decision = crate::continuation::ContinuationDecision::Continue {
                         message: recovery_message,
@@ -5332,7 +5344,7 @@ mod tests {
     //      execute() runs even though the handler would deny;
     //  (c) a ReadOnly / None tool is never gated centrally.
 
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AtomicOrdering};
 
     /// Permission handler that denies everything (returns `Ask`, which in a
     /// non-interactive context surfaces as a hard denial).
@@ -8311,6 +8323,199 @@ mod tests {
         assert!(
             statuses.iter().any(|s| s.contains("No progress detected")),
             "expected a no-progress Status event, got: {statuses:?}"
+        );
+    }
+
+    /// A RunTests-named tool that always reports a failed deterministic check.
+    struct FailingRunTestsTool {
+        ran: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for FailingRunTestsTool {
+        fn name(&self) -> &str {
+            "RunTests"
+        }
+        fn description(&self) -> &str {
+            "mock RunTests that always fails"
+        }
+        // ReadOnly rather than Execute so the mock is never blocked by the
+        // permission gate under `deny_all_context()` — this test only needs
+        // the tool to dispatch and return a failed check, not real gate
+        // semantics.
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+        fn self_gates(&self) -> bool {
+            false
+        }
+        fn stateful(&self) -> bool {
+            false
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            self.ran.fetch_add(1, AtomicOrdering::SeqCst);
+            ToolResult::error_with_code(
+                clawde_tools::ToolErrorCode::TestFailed,
+                "tests failed: 2/14",
+            )
+        }
+    }
+
+    /// Provider that emits one `RunTests` tool_use on its first request, then
+    /// an end_turn text on the second so the loop reaches `continue_or_end!`.
+    struct RunTestsOnceProvider {
+        id: clawde_core::provider_id::ProviderId,
+        requests: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl clawde_api::LlmProvider for RunTestsOnceProvider {
+        fn id(&self) -> &clawde_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "run-tests-once-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: clawde_api::ProviderRequest,
+        ) -> Result<clawde_api::ProviderResponse, clawde_api::ProviderError> {
+            unimplemented!("stream only")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: clawde_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<clawde_api::StreamEvent, clawde_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            clawde_api::ProviderError,
+        > {
+            use clawde_api::provider_types::StopReason;
+            use clawde_api::StreamEvent;
+            let which = self.requests.fetch_add(1, AtomicOrdering::SeqCst);
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let events: Vec<Result<StreamEvent, clawde_api::ProviderError>> = if which == 0 {
+                // First request: emit a RunTests tool_use so a deterministic
+                // check fails this turn.
+                let tool_id = uuid::Uuid::new_v4().to_string();
+                vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: tool_id,
+                            name: "RunTests".to_string(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta {
+                        index: 0,
+                        partial_json: "{}".to_string(),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::MessageStart {
+                        id: msg_id,
+                        model: "mock-model".to_string(),
+                        usage: UsageInfo::default(),
+                    }),
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "Done.".to_string(),
+                    }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ]
+            };
+            let _ = request;
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<clawde_api::ProviderStatus, clawde_api::ProviderError> {
+            Ok(clawde_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> clawde_api::ProviderCapabilities {
+            clawde_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: clawde_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// refactor-loop-health Phase C (C4): in default (non-plan, non-verify)
+    /// headless mode a failed deterministic check used to stop the loop
+    /// silently. Now it gets one bounded recovery turn — the provider is asked
+    /// a second time (the future check-runner continuation), proving the model
+    /// was told to fix the failing check rather than stopped immediately.
+    #[tokio::test]
+    async fn default_mode_feeds_failed_check_back_as_recovery_turn() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let provider = Arc::new(RunTestsOnceProvider {
+            id: clawde_core::provider_id::ProviderId::new("mockprov"),
+            requests: requests.clone(),
+        });
+        let ran = Arc::new(AtomicU32::new(0));
+        let tool = FailingRunTestsTool { ran: ran.clone() };
+
+        let (outcome, _messages) = drive_loop_with_provider(
+            provider,
+            vec![Box::new(tool)],
+            5,
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "expected EndTurn, got {outcome:?}"
+        );
+        // The RunTests tool ran exactly once: a single check-failure round.
+        assert_eq!(ran.load(AtomicOrdering::SeqCst), 1);
+        // One logical turn spans the RunTests round (request 1) + the model's
+        // end_turn summary (request 2); C4 turns that failed-check logical
+        // turn into a `Continue`, which clears turn state and starts a real
+        // recovery turn (request 3). So exactly one extra provider request
+        // over the pre-C4 count of 2 proves the recovery turn was granted —
+        // the loop did NOT silently stop after the failed check.
+        assert_eq!(
+            requests.load(AtomicOrdering::SeqCst),
+            3,
+            "default-mode failed check must continue once for a bounded recovery turn"
         );
     }
 }
