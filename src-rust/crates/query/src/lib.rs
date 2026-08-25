@@ -1020,13 +1020,19 @@ fn update_no_progress_state(
         wrote_files,
         has_diff,
         false,
+        false,
     )
 }
 
 /// Error-aware variant of [`update_no_progress_state`]. A changing sequence of
 /// unavailable/failed tool names is still one stalled execution pattern, so
-/// error turns use a stable sentinel instead of their individual signatures.
-/// A failed file-mutator does not count as progress unless a scoped diff exists.
+/// FATAL error turns (uncorrectable by retry) collapse to a stable sentinel
+/// instead of their individual signatures. Recoverable errors
+/// (InvalidInput/PermissionDenied/ExecutionFailed/Timeout) are legitimate
+/// fix-and-retry turns: they keep their real signature so a NEW recovery
+/// approach resets the streak while repeating the same failing call still
+/// accumulates it. A failed file-mutator does not count as progress unless a
+/// scoped diff exists.
 fn update_no_progress_state_with_errors(
     signature: Option<String>,
     recent_no_progress: &mut std::collections::VecDeque<String>,
@@ -1034,6 +1040,7 @@ fn update_no_progress_state_with_errors(
     wrote_files: bool,
     has_diff: bool,
     had_tool_errors: bool,
+    had_fatal_tool_errors: bool,
 ) -> bool {
     // A text-only turn (no tools) is never a no-progress signature: reset.
     let Some(sig) = signature else {
@@ -1050,9 +1057,14 @@ fn update_no_progress_state_with_errors(
         *no_progress_streak = 0;
         return false;
     }
-    let effective_signature = if had_tool_errors {
+    let effective_signature = if had_fatal_tool_errors {
+        // Fatal errors cannot be fixed by retrying; a changing sequence of
+        // them is one stalled pattern, so collapse to a stable sentinel.
         "<tool-error>".to_string()
     } else {
+        // Recoverable-only error turns keep the real signature (the model is
+        // iterating toward a fix), so a genuinely new approach resets the
+        // streak while an identical repeat still accumulates it.
         sig
     };
     // A no-progress tool turn: if this signature was seen in the recent
@@ -1262,6 +1274,13 @@ pub async fn run_query_loop(
     // Count tool failures for the current logical turn without retaining raw
     // tool output in the durable plan artifact.
     let mut turn_tool_error_count: u32 = 0;
+    // How many of those failures were FATAL (uncorrectable by retry — unknown
+    // tool, unavailable tool, network blocked) vs recoverable
+    // (InvalidInput/PermissionDenied/ExecutionFailed/Timeout). Fatal errors
+    // collapse into the no-progress sentinel so a changing sequence of them is
+    // still one stalled pattern; recoverable errors use the real signature so
+    // the model gets headroom to iterate on a fix.
+    let mut turn_fatal_tool_error_count: u32 = 0;
     // Trajectory-sanitization upstream tracker: the free provider falls back
     // through upstreams internally (free/auto → cline etc.) without the query
     // loop noticing a model change. We remember the upstream that served the
@@ -1555,6 +1574,7 @@ pub async fn run_query_loop(
                     Some(turn_tool_signatures.join("|"))
                 };
                 let had_tool_errors = turn_tool_error_count > 0;
+                let had_fatal_tool_errors = turn_fatal_tool_error_count > 0;
                 turn_tool_signatures.clear();
                 if update_no_progress_state_with_errors(
                     signature,
@@ -1563,11 +1583,17 @@ pub async fn run_query_loop(
                     wrote_files,
                     turn_diff.is_some(),
                     had_tool_errors,
+                    had_fatal_tool_errors,
                 ) {
                     if let Some(ref tx) = event_tx {
-                        let status = if had_tool_errors {
+                        let status = if had_fatal_tool_errors {
                             format!(
-                                "No progress detected: the model encountered tool errors for {} consecutive turns without changing any files — stopping the loop.",
+                                "No progress detected: the model hit uncorrectable tool errors for {} consecutive turns without changing any files — stopping the loop.",
+                                no_progress_streak
+                            )
+                        } else if had_tool_errors {
+                            format!(
+                                "No progress detected: the model repeated the same failing tool call for {} consecutive turns without changing any files — stopping the loop.",
                                 no_progress_streak
                             )
                         } else {
@@ -1763,6 +1789,7 @@ pub async fn run_query_loop(
                         wrote_files = false;
                         turn_diff = None;
                         turn_tool_error_count = 0;
+                        turn_fatal_tool_error_count = 0;
                         // Reset repeat-tool-reminder: a user message changes the
                         // context; repetition across it is not a loop.
                         repeat_detector.reset();
@@ -3362,6 +3389,9 @@ pub async fn run_query_loop(
                             turn_deterministic_check_failed |= check_failed;
                             if result.is_error {
                                 turn_tool_error_count += 1;
+                                if result.error_code.is_none_or(|code| !code.is_recoverable()) {
+                                    turn_fatal_tool_error_count += 1;
+                                }
                             }
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -4495,6 +4525,9 @@ pub async fn run_query_loop(
                         turn_deterministic_check_failed |= check_failed;
                         if result.is_error {
                             turn_tool_error_count += 1;
+                            if result.error_code.is_none_or(|code| !code.is_recoverable()) {
+                                turn_fatal_tool_error_count += 1;
+                            }
                         }
                         if !batch_cancelled {
                             let hooks = &tool_ctx.config.hooks;
@@ -7947,6 +7980,7 @@ mod tests {
             false,
             false,
             true,
+            true,
         ));
         assert_eq!(streak, 1);
         assert!(!update_no_progress_state_with_errors(
@@ -7955,6 +7989,7 @@ mod tests {
             &mut streak,
             false,
             false,
+            true,
             true,
         ));
         assert_eq!(streak, 2);
@@ -7965,6 +8000,58 @@ mod tests {
             false,
             false,
             true,
+            true,
+        ));
+        assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
+    }
+
+    #[test]
+    fn no_progress_detector_recoverable_errors_use_real_signature() {
+        let mut recent = std::collections::VecDeque::new();
+        let mut streak = 0;
+        // Recoverable errors (ExecutionFailed etc.) are legitimate fix-and-retry
+        // turns: a CHANGING recovery approach keeps the streak at 1 (headroom
+        // to iterate), while repeating the SAME failing call accumulates it and
+        // stops at NO_PROGRESS_STOP_STREAK.
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:ls".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert_eq!(streak, 1);
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:pwd".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert_eq!(streak, 1);
+        // Same failing call revisited within the window → accumulates.
+        assert!(!update_no_progress_state_with_errors(
+            Some("Bash:ls".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert_eq!(streak, 2);
+        assert!(update_no_progress_state_with_errors(
+            Some("Bash:ls".to_string()),
+            &mut recent,
+            &mut streak,
+            false,
+            false,
+            true,
+            false,
         ));
         assert_eq!(streak, NO_PROGRESS_STOP_STREAK);
     }
@@ -7980,6 +8067,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         ));
         assert_eq!(streak, 1);
     }
