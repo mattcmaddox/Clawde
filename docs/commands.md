@@ -1362,7 +1362,7 @@ Run the Clawde diagnostics suite. Checks configuration integrity, provider conne
 Probe every stored free-mode API key and report per-key health. Each key is
 checked with a live request to the provider's `/v1/models` endpoint (5s
 timeout). Upstreams whose models endpoint does not validate the key —
-**nvidia**, **huggingface**, **openrouter**, **sambanova**, **cline** — get a
+**nvidia**, **openrouter**, **sambanova**, **cloudflare**, **poolside** — get a
 1-token `chat/completions` confirmation probe instead, so dead keys on those
 providers are actually caught (their models endpoint returns 200 even for a
 garbage key). Keys that fail authentication are marked exhausted in the

@@ -1137,14 +1137,14 @@ mod tests {
             Vec::new(),
             vec![
                 ("google".to_string(), true, 128_000),
-                ("huggingface".to_string(), false, 128_000),
+                ("poolside".to_string(), false, 128_000),
             ],
             Vec::new(),
             Vec::new(),
             Vec::new(),
         );
         assert_eq!(dialog.capability_for("google"), Some((true, 128_000)));
-        assert_eq!(dialog.capability_for("huggingface"), Some((false, 128_000)));
+        assert_eq!(dialog.capability_for("poolside"), Some((false, 128_000)));
         // Unknown upstreams (e.g. not configured) are absent.
         assert_eq!(dialog.capability_for("groq"), None);
     }

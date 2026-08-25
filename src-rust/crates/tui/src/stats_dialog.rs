@@ -1526,7 +1526,7 @@ mod tests {
     fn live_provider_health_renders_success_rate_and_latency() {
         let mut state = free_state();
         state.live_provider_health.push(ProviderHealthRow {
-            label: "free/huggingface".into(),
+            label: "free/poolside".into(),
             active_keys: 0,
             total_keys: 0,
             retry_secs: None,
@@ -1549,7 +1549,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_overview(state.data.as_ref().unwrap(), &state, area, &mut buf);
         let content: String = buf.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(content.contains("free/huggingface"));
+        assert!(content.contains("free/poolside"));
         assert!(content.contains("25%"));
         assert!(content.contains("9.4s"));
         assert!(content.contains("free/groq"));
@@ -1604,9 +1604,9 @@ mod tests {
             "routing".to_string(),
             serde_json::json!({
                 "disabled_upstreams": [
-                    "huggingface", "nvidia", "cerebras", "google", "cloudflare",
-                    "groq", "sambanova", "cline", "cohere", "opencode-zen",
-                    "zai", "openrouter"
+                    "nvidia", "cerebras", "google", "cloudflare",
+                    "groq", "sambanova", "cline", "opencode-zen",
+                    "zai", "openrouter", "poolside"
                 ]
             }),
         );

@@ -2277,16 +2277,12 @@ pub fn free_upstream_base_url_override(upstream_id: &str) -> Option<String> {
 fn chat_probe_for(upstream_id: &str) -> Option<(String, &'static str)> {
     let (base_url, default_model) = match upstream_id {
         "nvidia" => ("https://integrate.api.nvidia.com/v1", "openai/gpt-oss-120b"),
-        "huggingface" => (
-            "https://router.huggingface.co/v1",
-            "meta-llama/Llama-3.3-70B-Instruct",
-        ),
         "openrouter" => ("https://openrouter.ai/api/v1", "openrouter/free"),
         "sambanova" => ("https://api.sambanova.ai/v1", "Meta-Llama-3.3-70B-Instruct"),
-        "cline" => ("https://api.cline.bot/api/v1", "deepseek/deepseek-v4-flash"),
-        // Only the 5 auth-lax upstreams reach this probe — every caller gates
-        // on `!models_endpoint_validates_auth`. opencode-zen is handled by its
-        // models 2xx, so this arm is defensive only.
+        "poolside" => ("https://inference.poolside.ai/v1", "poolside/laguna-s-2.1"),
+        // Only the auth-lax upstreams reach this probe — every caller gates
+        // on `!models_endpoint_validates_auth`. cloudflare is handled by its
+        // own account-scoped chat probe in `probe_upstream_key`, never here.
         _ => return None,
     };
     let model = catalog_entry(upstream_id)
@@ -2408,7 +2404,6 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
     }
 
     let native: &str = match upstream_id {
-        "huggingface" => "https://router.huggingface.co/v1/models",
         "cerebras" => "https://api.cerebras.ai/v1/models",
         "nvidia" => "https://integrate.api.nvidia.com/v1/models",
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
@@ -2416,11 +2411,11 @@ pub fn probe_upstream_key(upstream_id: &str, key: &str) -> UpstreamKeyProbe {
         "openrouter" => "https://openrouter.ai/api/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
         "mistral" => "https://api.mistral.ai/v1/models",
-        "cohere" => "https://api.cohere.com/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
         "github-copilot" => "https://api.githubcopilot.com/models",
+        "poolside" => "https://inference.poolside.ai/v1/models",
         _ => {
             return UpstreamKeyProbe::Transient(format!(
                 "No validation endpoint for '{}'",
@@ -2710,6 +2705,35 @@ mod cache_tests {
                 "openai/gpt-oss-120b".to_string(),
             ])
         );
+    }
+
+    /// Poolside's models endpoint does not validate auth, so key probes must
+    /// fall through to the chat-completions confirmation. Regression guard for
+    /// the probe path being wired up when poolside joined the catalog.
+    #[test]
+    fn poolside_key_probe_reaches_chat_probe() {
+        // Poolside is auth-lax: its /models endpoint returns 200 for garbage
+        // keys, so the probe must use the chat confirmation path.
+        assert!(!models_endpoint_validates_auth("poolside"));
+
+        // chat_probe_for must know poolside's endpoint + probe model.
+        let (base, model) = chat_probe_for("poolside").expect("poolside chat probe");
+        assert_eq!(base, "https://inference.poolside.ai/v1");
+        assert_eq!(model, "poolside/laguna-s-2.1");
+
+        // The probe URL builder must not hit the "no validation endpoint"
+        // fallback. Exercise the pure URL resolution via the same match used
+        // by probe_upstream_key by checking a too-short key short-circuits
+        // before any network I/O (proving poolside is not rejected early).
+        let short = probe_upstream_key("poolside", "short");
+        assert_eq!(
+            short,
+            UpstreamKeyProbe::Invalid("Key too short (min 8 characters)".to_string())
+        );
+
+        // Removed upstreams no longer have probe endpoints.
+        assert_eq!(chat_probe_for("huggingface"), None);
+        assert_eq!(chat_probe_for("cohere"), None);
     }
 }
 

@@ -5,4 +5,4 @@ Analyze the FreeProvider fallback chain in this codebase. Read crates/api/src/pr
 3. Which upstream is the last resort (Tier 4), and what does its note say about credits?
 4. What do the `fallback_models` fields do, and which two catalog entries use them?
 
-Be specific: enumerate the ids explicitly. Use the exact upstream ids (e.g. huggingface, nvidia) rather than display names.
+Be specific: enumerate the ids explicitly. Use the exact upstream ids (e.g. poolside, nvidia) rather than display names.

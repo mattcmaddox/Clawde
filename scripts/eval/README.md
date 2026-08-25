@@ -30,11 +30,11 @@ python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/retention
 # Force the free chain to fall through (first configured upstream's keys are
 # replaced with invalid placeholders; the chain must recover via a later one):
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/fallback-behavior \
-    --sabotage huggingface
+    --sabotage nvidia
 
 # Arbitrary prompt, pin a specific upstream for determinism:
 python3 scripts/eval/run_eval.py --prompt "What is the catalog order?" \
-    --model free/nvidia/meta/llama-3.3-70b-instruct
+    --model free/nvidia/openai/gpt-oss-120b
 
 # Before/after comparison for a change:
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order --tag before

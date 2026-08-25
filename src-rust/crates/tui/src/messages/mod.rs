@@ -2552,7 +2552,7 @@ mod tests {
     fn assistant_meta_omits_cost_for_free_provider_zero_pricing() {
         let mut msg = Message::assistant("hello");
         msg.turn_meta = Some(clawde_core::types::TurnMeta {
-            upstream_id: Some("huggingface".to_string()),
+            upstream_id: Some("poolside".to_string()),
             ..Default::default()
         });
         msg.cost = Some(clawde_core::types::MessageCost {
@@ -2563,7 +2563,7 @@ mod tests {
         let line = render_transcript_assistant_meta(None, Some(&msg), Color::White)
             .expect("badge renders with upstream even at zero cost");
         let text = line_text(&line);
-        assert!(text.contains("huggingface"));
+        assert!(text.contains("poolside"));
         assert!(
             !text.contains("$"),
             "zero-cost free turn shows no price: {text}"

@@ -5731,19 +5731,23 @@ pub mod cost {
     ///
     /// These overlap with providers that appear in `api_key_env_vars_for_provider`.
     /// When adding a provider to one, check whether it also belongs in the other.
+    /// Keep in sync with `AuthStore::is_free_upstream` (opencode-go is the
+    /// shared-key alias, not a catalog entry).
     const FREE_UPSTREAM_IDS: &[&str] = &[
-        "groq",
+        "github-copilot",
+        "poolside",
+        "nvidia",
         "cerebras",
         "google",
         "cloudflare",
-        "mistral",
+        "groq",
         "sambanova",
-        "nvidia",
-        "cohere",
-        "openrouter",
+        "cline",
+        "mistral",
         "opencode-zen",
+        "opencode-go",
         "zai",
-        "zhipuai",
+        "openrouter",
     ];
 
     /// Check if a model name is an upstream-prefixed free model (e.g., "groq/llama-3.3-70b-versatile").
@@ -7613,7 +7617,15 @@ mod tests {
             cost::ModelPricing::FREE
         );
         assert_eq!(
-            cost::ModelPricing::for_model("cohere/command-r-plus"),
+            cost::ModelPricing::for_model("poolside/laguna-s-2.1"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("github-copilot/gpt-4o-2024-11-20"),
+            cost::ModelPricing::FREE
+        );
+        assert_eq!(
+            cost::ModelPricing::for_model("cline/deepseek-v4-flash"),
             cost::ModelPricing::FREE
         );
         assert_eq!(
@@ -7628,9 +7640,15 @@ mod tests {
             cost::ModelPricing::for_model("zai/glm-4.6"),
             cost::ModelPricing::FREE
         );
+        // Removed free upstreams (cohere) and the billed direct Z.AI provider
+        // (zhipuai) are no longer classified as FREE.
+        assert_eq!(
+            cost::ModelPricing::for_model("cohere/command-r-plus"),
+            cost::ModelPricing::SONNET
+        );
         assert_eq!(
             cost::ModelPricing::for_model("zhipuai/glm-4.5"),
-            cost::ModelPricing::FREE
+            cost::ModelPricing::SONNET
         );
 
         // Test that other models use their appropriate pricing

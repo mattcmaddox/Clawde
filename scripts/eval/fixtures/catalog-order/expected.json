@@ -1,12 +1,12 @@
 {
   "threshold": 0.85,
   "judge": {
-    "rubric": "Enumerate all 14 FREE_CATALOG upstream ids in fallback priority order (github-copilot, huggingface, nvidia, cerebras, google, cloudflare, groq, sambanova, cline, mistral, cohere, opencode-zen, zai, openrouter). State the default model for each of the first three upstreams. Identify the last-resort Tier 4 upstream and what its note says about credits. Explain what the fallback_models field does and which two catalog entries use it. Dock points for missing, misordered, or fabricated upstream ids, wrong default models, vague answers, and refusals.",
+    "rubric": "Enumerate all 13 FREE_CATALOG upstream ids in fallback priority order (github-copilot, poolside, nvidia, cerebras, google, cloudflare, groq, sambanova, cline, mistral, opencode-zen, zai, openrouter). State the default model for each of the first three upstreams. Identify the last-resort Tier 4 upstream and what its note says about credits. Explain what the fallback_models field does and which two catalog entries use it. Dock points for missing, misordered, or fabricated upstream ids, wrong default models, vague answers, and refusals.",
     "min_score": 0.15
   },
   "assert": [
     {"type": "mentions-upstreams", "min": 8, "weight": 3, "detail": "response should name at least 8 of the catalog upstream ids (source-derived)"},
-    {"type": "contains", "value": "huggingface", "weight": 2},
+    {"type": "contains", "value": "mistral", "weight": 2},
     {"type": "contains", "value": "openrouter", "weight": 2},
     {"type": "regex", "value": "fallback_models", "weight": 1},
     {"type": "contains", "value": "github-copilot", "weight": 1},

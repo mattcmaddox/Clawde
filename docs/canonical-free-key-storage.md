@@ -95,19 +95,18 @@ ensures no regressions.
 | Provider | Notes |
 |----------|-------|
 | github-copilot | OAuth only, no API key |
-| groq | API key |
+| poolside | API key |
 | nvidia | API key |
+| cerebras | API key |
+| google | API key |
+| cloudflare | Composite key (ACCOUNT_ID:TOKEN) |
+| groq | API key |
+| sambanova | API key |
+| cline | API key |
+| mistral | API key |
 | opencode-zen | API key (shared with opencode-go) |
 | opencode-go | Alias for opencode-zen, not a catalog entry |
-| cerebras | API key |
 | zai | API key |
-| sambanova | API key |
-| mistral | API key |
-| google | API key |
-| cohere | API key |
-| cloudflare | Composite key (ACCOUNT_ID:TOKEN) |
-| huggingface | API key |
-| cline | API key |
 | openrouter | API key |
 
 ## Testing

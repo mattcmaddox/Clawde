@@ -221,8 +221,8 @@ override uses it verbatim; tasks without one keep their built-in defaults:
 ```
 
 Upstream ids must match the free catalog (e.g. `groq`, `cerebras`,
-`huggingface`, `google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
-`sambanova`, `nvidia`, `cohere`, `mistral`, `cline`).
+`google`, `openrouter`, `zai`, `opencode-zen`, `cloudflare`,
+`sambanova`, `nvidia`, `mistral`, `cline`, `poolside`).
 
 ### Router behaviour (audit spec Phase 2)
 
@@ -245,7 +245,7 @@ refinements on every request:
   `providers.free.options.routing.upstream_5xx_cooldown_secs` (default 45s);
   set it to `0` to disable.
 
-**Individual free upstreams (`groq/…`, `huggingface/…`, …):** selecting a
+**Individual free upstreams (`groq/…`, `poolside/…`, …):** selecting a
 free-catalog upstream — `clawde -m groq/llama-3.3-70b-versatile`,
 `/model <upstream>/<model>`, `--provider groq`, or a `provider`/`model` pair in
 settings.json — routes through the router's *pinned* route: the pinned upstream

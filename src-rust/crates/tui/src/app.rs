@@ -13032,9 +13032,9 @@ mod tests {
         let mut app = make_app();
         app.free_model_defaults = vec![
             (
-                "huggingface".to_string(),
-                "Hugging Face".to_string(),
-                "llama-3.3-70b".to_string(),
+                "poolside".to_string(),
+                "Poolside".to_string(),
+                "laguna-s-2.1".to_string(),
             ),
             (
                 "groq".to_string(),

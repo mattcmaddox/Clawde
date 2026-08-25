@@ -17,8 +17,8 @@ impl SlashCommand for HealthCommand {
         "Usage: /health [<upstream>]\n\
          Runs a live probe (GET /v1/models, 5s timeout; a 1-token\n\
          chat/completions confirmation for upstreams whose models endpoint\n\
-         doesn't check auth — nvidia, huggingface, openrouter, sambanova,\n\
-         cline) against every stored key for each configured free-mode\n\
+         doesn't check auth — nvidia, openrouter, sambanova, cloudflare,\n\
+         poolside) against every stored key for each configured free-mode\n\
          upstream and reports per-key results. Keys that fail authentication\n\
          are marked exhausted in the running key rings (visible in the\n\
          footer and /ctx-viz).\n\n\
