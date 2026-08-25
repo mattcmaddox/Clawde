@@ -394,6 +394,36 @@ mod tests {
         }
     }
 
+    /// Tool that never completes — makes `run_tool_batch`'s cancelled branch
+    /// win deterministically when the token is pre-cancelled (a ready tool
+    /// future would race the cancelled branch non-deterministically).
+    struct HangingTool;
+
+    #[async_trait::async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "hanging_tool"
+        }
+        fn description(&self) -> &str {
+            "hangs forever"
+        }
+        fn permission_level(&self) -> clawde_tools::PermissionLevel {
+            clawde_tools::PermissionLevel::ReadOnly
+        }
+        fn self_gates(&self) -> bool {
+            false
+        }
+        fn stateful(&self) -> bool {
+            false
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            std::future::pending::<ToolResult>().await
+        }
+    }
+
     fn prepared(id: &str, name: &str, blocked: Option<ToolResult>) -> PreparedTool {
         PreparedTool {
             id: id.to_string(),
@@ -540,6 +570,170 @@ mod tests {
         assert_eq!(state.error_count, 1);
         assert_eq!(state.fatal_error_count, 0);
         assert_eq!(state.hard_fatal_error_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_tool_batch_applies_blocking_hooks_and_tracks_state() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        let mut tool_ctx = test_ctx();
+        // Hook commands spawn with current_dir = working_dir; it must exist
+        // or the spawn fails and the hook is silently skipped.
+        tool_ctx.working_dir = fixture.path().to_path_buf();
+        let mut hooks: std::collections::HashMap<
+            clawde_core::config::HookEvent,
+            Vec<clawde_core::config::HookEntry>,
+        > = std::collections::HashMap::new();
+        hooks.insert(
+            clawde_core::config::HookEvent::PreToolUse,
+            vec![clawde_core::config::HookEntry {
+                command: "exit 1".to_string(),
+                // Scope the veto to Edit so the second call stays unblocked.
+                tool_filter: Some("Edit".to_string()),
+                blocking: true,
+            }],
+        );
+        tool_ctx.config.hooks = hooks;
+
+        let mut state = TurnToolState::default();
+        let mut wrote_files = false;
+        let mut total_tool_calls = 0;
+        // "m1" is BOTH blocked by the hook AND malformed — the hook veto must
+        // win; "ok" is a plain call that would execute.
+        let malformed: std::collections::HashSet<String> = ["m1".to_string()].into_iter().collect();
+        let calls = vec![
+            (
+                "m1".to_string(),
+                "Edit".to_string(),
+                serde_json::json!({ "file_path": "/tmp/x" }),
+            ),
+            (
+                "ok".to_string(),
+                "noop_tool".to_string(),
+                serde_json::json!({}),
+            ),
+        ];
+        let prepared = prepare_tool_batch(
+            &calls,
+            &tool_ctx,
+            None,
+            &malformed,
+            &mut state,
+            &mut wrote_files,
+            &mut total_tool_calls,
+        )
+        .await;
+
+        assert_eq!(prepared.len(), 2);
+        assert!(wrote_files, "Edit must mark wrote_files");
+        assert_eq!(
+            total_tool_calls, 2,
+            "blocked calls still advance the re-anchor counter"
+        );
+        assert_eq!(state.signatures.len(), 2);
+
+        // B1: a hook veto carries PermissionDenied (recoverable), and wins
+        // over the malformed-args fallback.
+        let blocked = prepared[0]
+            .blocked_result
+            .as_ref()
+            .expect("hook must block the call");
+        assert_eq!(blocked.error_code, Some(ToolErrorCode::PermissionDenied));
+        assert!(blocked.content.contains("Blocked by hook"));
+        // The unblocked call has no synthesized result and would execute.
+        assert!(prepared[1].blocked_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_tool_batch_malformed_call_gets_invalid_input() {
+        let tool_ctx = test_ctx(); // no hooks configured
+        let mut state = TurnToolState::default();
+        let mut wrote_files = false;
+        let mut total_tool_calls = 0;
+        let malformed: std::collections::HashSet<String> = ["m1".to_string()].into_iter().collect();
+        let prepared = prepare_tool_batch(
+            &[(
+                "m1".to_string(),
+                "noop_tool".to_string(),
+                serde_json::json!({}),
+            )],
+            &tool_ctx,
+            None,
+            &malformed,
+            &mut state,
+            &mut wrote_files,
+            &mut total_tool_calls,
+        )
+        .await;
+
+        let blocked = prepared[0]
+            .blocked_result
+            .as_ref()
+            .expect("malformed call must be blocked");
+        assert_eq!(blocked.error_code, Some(ToolErrorCode::InvalidInput));
+        assert!(blocked.content.contains("malformed or truncated JSON"));
+        assert!(
+            blocked.content.contains("recoverable"),
+            "recovery hint attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_batch_skips_post_hooks_when_cancelled() {
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        let marker = fixture.path().join("post-hooks.log");
+        let marker_str = marker.to_string_lossy().into_owned();
+
+        let mut tool_ctx = test_ctx();
+        tool_ctx.working_dir = fixture.path().to_path_buf();
+        let mut hooks: std::collections::HashMap<
+            clawde_core::config::HookEvent,
+            Vec<clawde_core::config::HookEntry>,
+        > = std::collections::HashMap::new();
+        hooks.insert(
+            clawde_core::config::HookEvent::PostToolUse,
+            vec![clawde_core::config::HookEntry {
+                command: format!("echo post >> {}", marker_str),
+                tool_filter: None,
+                blocking: false,
+            }],
+        );
+        tool_ctx.config.hooks = hooks;
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(HangingTool)];
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let exec_ctx = ToolExecCtx {
+            tools: &tools,
+            tool_ctx: &tool_ctx,
+            active_task_id: None,
+            cancel_token: &cancelled,
+            event_tx: Some(&tx),
+        };
+        let mut state = TurnToolState::default();
+        let mut detector = RepeatCallDetector::new();
+
+        let (blocks, batch_cancelled) = execute_tool_batch(
+            &exec_ctx,
+            &[prepared("t1", "hanging_tool", None)],
+            &mut state,
+            &mut detector,
+        )
+        .await;
+
+        assert!(batch_cancelled, "pre-cancelled token must cancel the batch");
+        assert_eq!(blocks.len(), 1, "every tool_use still gets a tool_result");
+        let ContentBlock::ToolResult { is_error, .. } = &blocks[0] else {
+            panic!("expected a ToolResult block");
+        };
+        assert_eq!(*is_error, Some(true), "cancelled results are errors");
+        assert!(
+            !marker.exists(),
+            "PostToolUse hooks must be skipped on a cancelled batch"
+        );
+        // Cancelled results are counted as fatal errors by observe().
+        assert_eq!(state.error_count, 1);
+        assert_eq!(state.fatal_error_count, 1);
     }
 
     #[test]
