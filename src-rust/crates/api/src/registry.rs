@@ -12,9 +12,9 @@ use crate::client::ClientConfig;
 use crate::provider::{LlmProvider, UpstreamCapacitySummaries};
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
-    AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeEntry, FreeProvider, GoogleProvider, KeyRotatingProvider, MinimaxProvider,
-    OpenAiProvider, RoutingConfig, FREE_CATALOG,
+    AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CopilotProvider, FreeEntry,
+    FreeProvider, GoogleProvider, KeyRotatingProvider, MinimaxProvider, OpenAiProvider,
+    RoutingConfig, FREE_CATALOG,
 };
 
 fn normalize_openai_compat_base(override_base: &str) -> String {
@@ -86,7 +86,6 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
             // Load from the stored token file instead.
             CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         }
-        "cohere" => Some(Arc::new(CohereProvider::new(key))),
         "custom-openai" => Some(Arc::new(p::custom_openai().with_api_key(key))),
         // "free" is handled by `build_free_provider` and `runtime_provider_for`
         // because it needs to iterate the full catalog, not a single key.
@@ -158,9 +157,6 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
                         "google" => {
                             Arc::new(GoogleProvider::new(key_owned)) as Arc<dyn LlmProvider>
                         }
-                        "cohere" => {
-                            Arc::new(CohereProvider::new(key_owned)) as Arc<dyn LlmProvider>
-                        }
                         "cloudflare" => {
                             let mut p =
                                 crate::providers::openai_compat_providers::cloudflare_with_key(
@@ -213,7 +209,6 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
 
         let provider: Option<Arc<dyn LlmProvider>> = match upstream.id {
             "google" => Some(Arc::new(GoogleProvider::new(key))),
-            "cohere" => Some(Arc::new(CohereProvider::new(key))),
             "cloudflare" => {
                 let mut p = crate::providers::openai_compat_providers::cloudflare_with_key(&key);
                 if let Some(base) =
@@ -455,7 +450,6 @@ pub fn provider_from_config(
             }
             Some(Arc::new(provider))
         }
-        "cohere" => api_key.map(|key| Arc::new(CohereProvider::new(key)) as Arc<dyn LlmProvider>),
         "github-copilot" => {
             // Try env/api_key first, fall back to stored OAuth token from /connect.
             api_key
@@ -977,15 +971,6 @@ impl ProviderRegistry {
         self
     }
 
-    /// Register [`CohereProvider`] if `COHERE_API_KEY` is set in the environment.
-    /// Returns `&mut self` for builder chaining.
-    pub fn with_cohere_if_key_set(&mut self) -> &mut Self {
-        if let Some(p) = CohereProvider::from_env() {
-            self.register(Arc::new(p));
-        }
-        self
-    }
-
     /// Build a registry with **all** providers that have credentials configured
     /// in the environment. The active provider is selected later by
     /// `from_config`; a fresh config uses Free Mode (`free/auto`).
@@ -1000,7 +985,6 @@ impl ProviderRegistry {
             .with_bedrock_if_configured()
             .with_copilot_if_configured()
             .with_codex_if_configured()
-            .with_cohere_if_key_set()
             .with_available_providers();
         registry
     }
@@ -1143,12 +1127,6 @@ impl ProviderRegistry {
             .unwrap_or(false)
         {
             self.register(Arc::new(p::sambanova()));
-        }
-        if std::env::var("HF_TOKEN")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            self.register(Arc::new(p::huggingface()));
         }
         if std::env::var("MINIMAX_API_KEY")
             .map(|v| !v.is_empty())

@@ -256,7 +256,7 @@ mod tests {
                 "assistant",
                 "The OAuth callback needs a regression test",
                 None,
-                Some("huggingface"),
+                Some("nvidia"),
                 Some("2026-08-19T00:00:00.000Z"),
                 Some("2026-08-19T00:01:00.000Z"),
             )

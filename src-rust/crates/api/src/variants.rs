@@ -466,7 +466,6 @@ pub(crate) fn variant_effort_keys(
                 vec!["high"]
             }
         }
-        "@ai-sdk/cohere" => Vec::new(),
         "@ai-sdk/groq" => vec!["none", "low", "medium", "high"],
         "@ai-sdk/perplexity" => Vec::new(),
         "@jerome-benoit/sap-ai-provider-v2" => {
@@ -796,14 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn cohere_and_perplexity_have_no_variants() {
-        assert!(keys(
-            "@ai-sdk/cohere",
-            "command-a-03-2025",
-            "2025-03-01",
-            "cohere"
-        )
-        .is_empty());
+    fn perplexity_has_no_variants() {
         assert!(keys(
             "@ai-sdk/perplexity",
             "sonar-reasoning",

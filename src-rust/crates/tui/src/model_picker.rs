@@ -424,7 +424,7 @@ pub fn default_model_for_provider(
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax" | "cline"
+        "openai" | "google" | "azure" | "amazon-bedrock" | "minimax" | "cline"
     )
 }
 
@@ -2531,7 +2531,7 @@ mod tests {
     //     project from the catalog (no live fetch that could clobber it).
     #[test]
     fn hardcoded_list_providers_use_catalog_projection() {
-        for pid in ["azure", "amazon-bedrock", "cohere", "minimax", "cline"] {
+        for pid in ["azure", "amazon-bedrock", "minimax", "cline"] {
             assert!(
                 provider_uses_catalog_projection(pid),
                 "{pid} must project from the catalog after its hardcoded list was removed"

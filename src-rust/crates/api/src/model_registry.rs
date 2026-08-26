@@ -1002,8 +1002,6 @@ impl ModelRegistry {
             Some(ProviderId::MISTRAL)
         } else if model_name.starts_with("grok") {
             Some(ProviderId::XAI)
-        } else if model_name.starts_with("command-r") || model_name.starts_with("command-a") {
-            Some(ProviderId::COHERE)
         } else if model_name.starts_with("sonar") {
             Some(ProviderId::PERPLEXITY)
         } else if model_name.starts_with("glm-") {
@@ -1844,7 +1842,6 @@ fn small_patterns_for(provider_id: &str) -> &'static [&'static str] {
         "deepseek" => &["deepseek-v4-flash", "deepseek-chat"],
         "mistral" => &["mistral-small", "mistral-nemo"],
         "xai" => &["grok-3-mini", "grok-2-mini"],
-        "cohere" => &["command-r7b", "command-r"],
         "groq" => &["llama-3.1-8b", "gemma2-9b"],
         "openrouter" => &[
             "anthropic/claude-haiku",
@@ -2115,15 +2112,11 @@ mod tests {
 
     #[test]
     fn hardcoded_list_providers_surface_full_catalog() {
-        // cohere/azure/amazon-bedrock/minimax previously overwrote the catalog
-        // via a tiny hardcoded discover_models() (2/4/3/1 models). The catalog
+        // azure/amazon-bedrock/minimax previously overwrote the catalog
+        // via a tiny hardcoded discover_models() (4/3/1 models). The catalog
         // itself carries the full models.dev list for each; the provider fix
         // stops the overwrite so these surface in the picker.
         let reg = ModelRegistry::new();
-        assert!(
-            reg.list_by_provider("cohere").len() >= 10,
-            "cohere catalog must surface (~12), not the old hardcoded 2"
-        );
         assert!(
             reg.list_by_provider("azure").len() >= 50,
             "azure catalog must surface (~108), not the old hardcoded 4"

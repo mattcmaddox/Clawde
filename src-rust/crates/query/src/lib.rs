@@ -3624,7 +3624,6 @@ pub async fn run_query_loop(
                             "deepseek" => "Set DEEPSEEK_API_KEY.".to_string(),
                             "xai" => "Set XAI_API_KEY.".to_string(),
                             "github-copilot" => "Reconnect GitHub Copilot via /connect, or set GITHUB_TOKEN.".to_string(),
-                            "cohere" => "Set COHERE_API_KEY.".to_string(),
                             "free" => FREE_NO_CREDENTIALS_HINT.to_string(),
                             _ => "Set the appropriate API key environment variable or use `clawde auth login`.".to_string(),
                         }

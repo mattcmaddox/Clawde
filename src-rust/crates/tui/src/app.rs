@@ -489,13 +489,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             badge: None,
         },
         SelectItem {
-            id: "cohere".into(),
-            title: "Cohere".into(),
-            description: "Command models".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
             id: "xai".into(),
             title: "xAI".into(),
             description: "Grok models".into(),
@@ -541,13 +534,6 @@ fn provider_picker_items() -> Vec<SelectItem> {
             id: "helicone".into(),
             title: "Helicone".into(),
             description: "AI gateway and observability".into(),
-            category: "Other".into(),
-            badge: None,
-        },
-        SelectItem {
-            id: "huggingface".into(),
-            title: "Hugging Face".into(),
-            description: "Hosted community models".into(),
             category: "Other".into(),
             badge: None,
         },

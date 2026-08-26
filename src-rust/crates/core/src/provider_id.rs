@@ -41,7 +41,6 @@ impl ProviderId {
     pub const GROQ: &'static str = "groq";
     pub const DEEPINFRA: &'static str = "deepinfra";
     pub const CEREBRAS: &'static str = "cerebras";
-    pub const COHERE: &'static str = "cohere";
     pub const CROF: &'static str = "crof";
     pub const TOGETHER_AI: &'static str = "together-ai";
     pub const PERPLEXITY: &'static str = "perplexity";
@@ -55,7 +54,6 @@ impl ProviderId {
     pub const VENICE: &'static str = "venice";
     pub const SAP: &'static str = "sap";
     pub const SAMBANOVA: &'static str = "sambanova";
-    pub const HUGGINGFACE: &'static str = "huggingface";
     pub const NVIDIA: &'static str = "nvidia";
     pub const SILICONFLOW: &'static str = "siliconflow";
     pub const MOONSHOT: &'static str = "moonshotai";
@@ -143,7 +141,6 @@ impl ProviderId {
                 | Self::GROQ
                 | Self::DEEPINFRA
                 | Self::CEREBRAS
-                | Self::COHERE
                 | Self::TOGETHER_AI
                 | Self::PERPLEXITY
                 | Self::OPENROUTER
@@ -156,7 +153,6 @@ impl ProviderId {
                 | Self::VENICE
                 | Self::SAP
                 | Self::SAMBANOVA
-                | Self::HUGGINGFACE
                 | Self::NVIDIA
                 | Self::SILICONFLOW
                 | Self::MOONSHOT

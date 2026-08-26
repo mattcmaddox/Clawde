@@ -31,7 +31,6 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "mistral" => Some(mistral()),
         "openrouter" => Some(openrouter()),
         "sambanova" => Some(sambanova()),
-        "huggingface" => Some(huggingface()),
         "nvidia" => Some(nvidia()),
         "siliconflow" => Some(siliconflow()),
         "moonshot" | "moonshotai" => Some(moonshot()),
@@ -341,17 +340,6 @@ pub fn sambanova() -> OpenAiCompatProvider {
         ProviderId::SAMBANOVA,
         "SambaNova",
         "https://api.sambanova.ai/v1",
-    )
-    .with_api_key(key)
-}
-
-/// Hugging Face Inference API.  Reads `HF_TOKEN`.
-pub fn huggingface() -> OpenAiCompatProvider {
-    let key = std::env::var("HF_TOKEN").unwrap_or_default();
-    OpenAiCompatProvider::new(
-        ProviderId::HUGGINGFACE,
-        "Hugging Face",
-        "https://router.huggingface.co/v1",
     )
     .with_api_key(key)
 }

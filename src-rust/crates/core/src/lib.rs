@@ -784,12 +784,10 @@ pub mod config {
             "openrouter" => &["OPENROUTER_API_KEY"],
             "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
             "perplexity" => &["PERPLEXITY_API_KEY"],
-            "cohere" => &["COHERE_API_KEY"],
             "xai" => &["XAI_API_KEY"],
             "deepinfra" => &["DEEPINFRA_API_KEY"],
             "azure" => &["AZURE_API_KEY"],
             "gitlab" => &["GITLAB_TOKEN"],
-            "huggingface" => &["HF_TOKEN"],
             "nvidia" => &["NVIDIA_API_KEY"],
             "alibaba" | "qwen" => &["DASHSCOPE_API_KEY"],
             "venice" => &["VENICE_API_KEY"],
@@ -2350,7 +2348,6 @@ pub mod config {
                     "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo"
                 }
                 Some("perplexity") => "perplexity/sonar-pro",
-                Some("cohere") => "cohere/command-r-plus",
                 // DashScope runs as "qwen" at runtime but is "alibaba" in the
                 // models.dev catalog; terminal fallback keeps a qwen id so an
                 // unconfigured Qwen provider never resolves to a claude-* model.
@@ -7640,12 +7637,7 @@ mod tests {
             cost::ModelPricing::for_model("zai/glm-4.6"),
             cost::ModelPricing::FREE
         );
-        // Removed free upstreams (cohere) and the billed direct Z.AI provider
-        // (zhipuai) are no longer classified as FREE.
-        assert_eq!(
-            cost::ModelPricing::for_model("cohere/command-r-plus"),
-            cost::ModelPricing::SONNET
-        );
+        // The billed direct Z.AI provider (zhipuai) is no longer classified as FREE.
         assert_eq!(
             cost::ModelPricing::for_model("zhipuai/glm-4.5"),
             cost::ModelPricing::SONNET

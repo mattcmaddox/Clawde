@@ -195,9 +195,6 @@ pub fn stream_idle_timeout() -> Duration {
 // `free/auto` model id.
 pub use providers::{FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
 
-// Phase 2D re-exports — Cohere native provider.
-pub use providers::CohereProvider;
-
 // Phase 4 re-exports — concrete message transformers.
 pub use transformers::{AnthropicTransformer, OpenAiChatTransformer};
 
@@ -807,11 +804,6 @@ pub mod client {
                         "Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.",
                         model
                     )
-                } else if model.starts_with("command-") {
-                    format!(
-                        "Model '{}' is a Cohere model. Use `--provider cohere` or set COHERE_API_KEY.",
-                        model
-                    )
                 } else if model.starts_with("llama") {
                     format!(
                         "Model '{}' looks like a Llama model. Use `--provider groq` (set GROQ_API_KEY) or `--provider ollama` for local.",
@@ -932,8 +924,6 @@ pub mod client {
                     )
                 } else if model.starts_with("mistral") || model.starts_with("codestral") {
                     format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
-                } else if model.starts_with("command-") {
-                    format!("Model '{}' is a Cohere model. Use `--provider cohere` or set COHERE_API_KEY.", model)
                 } else if model.starts_with("llama") {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {

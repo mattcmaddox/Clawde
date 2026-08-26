@@ -161,11 +161,11 @@ mod tests {
         let report = format_health_report(
             &[
                 ("groq".to_string(), Some(0.4)),
-                ("huggingface".to_string(), None),
+                ("nvidia".to_string(), None),
             ],
             &[
                 ("groq".to_string(), Some(1.0)),
-                ("huggingface".to_string(), None),
+                ("nvidia".to_string(), None),
             ],
             &[(
                 "groq".to_string(),
@@ -174,7 +174,7 @@ mod tests {
                     ("verification".to_string(), Some(1.0)),
                 ],
             )],
-            &[("groq".to_string(), 8), ("huggingface".to_string(), 3)],
+            &[("groq".to_string(), 8), ("nvidia".to_string(), 3)],
         );
         assert!(report.contains("groq"), "report must list groq");
         assert!(report.contains("100% success"));
@@ -183,15 +183,15 @@ mod tests {
         assert!(report.contains("code_generation 50%, verification 100%"));
         // No samples → em-dash cells, no per-task section on that upstream's
         // own line (the whole report may still contain brackets from groq).
-        let hf_line = report
+        let nv_line = report
             .lines()
-            .find(|l| l.contains("huggingface"))
+            .find(|l| l.contains("nvidia"))
             .unwrap_or_default();
-        assert!(hf_line.contains("— success"));
-        assert!(hf_line.contains("— avg"));
+        assert!(nv_line.contains("— success"));
+        assert!(nv_line.contains("— avg"));
         assert!(
-            !hf_line.contains("["),
-            "no per-task brackets on the huggingface line"
+            !nv_line.contains("["),
+            "no per-task brackets on the nvidia line"
         );
     }
 

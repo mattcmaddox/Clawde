@@ -102,7 +102,6 @@ pub fn is_openaiish_provider(provider_id: &str) -> bool {
             | "cerebras"
             | "deepinfra"
             | "venice"
-            | "huggingface"
             | "nvidia"
             | "cloudflare"
             | "siliconflow"

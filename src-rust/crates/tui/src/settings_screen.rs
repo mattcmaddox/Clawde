@@ -1773,7 +1773,7 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
     entries.push(make_entry(
         "disabled_upstreams",
         "Disabled upstreams",
-        "Free upstreams to skip (comma-separated IDs, e.g. nvidia, cohere).",
+        "Free upstreams to skip (comma-separated IDs, e.g. nvidia, groq).",
         SECTION_FREE_ROUTING,
         String::new(),
         SettingEffect::Immediate,

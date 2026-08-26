@@ -2003,9 +2003,9 @@ pub fn first_free_upstream_key(
 /// Query rate-limit information for a given upstream by making a lightweight
 /// GET request to the provider's models endpoint and parsing response headers.
 ///
-/// Uses GET (not HEAD): several upstreams (nvidia, huggingface, cline) reject
+/// Uses GET (not HEAD): several upstreams (nvidia, cline) reject
 /// HEAD with 405. For upstreams whose models endpoint doesn't check auth
-/// (nvidia, huggingface, openrouter, sambanova, cline), the key is confirmed
+/// (nvidia, openrouter, sambanova, cline), the key is confirmed
 /// with the same minimal `chat/completions` probe as [`validate_upstream_key`]
 /// so a dead key is reported as invalid instead of returning empty headers —
 /// and the rate-limit headers are read from the **chat response**, since those
@@ -2034,7 +2034,6 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
     }
 
     let native: &str = match upstream_id {
-        "huggingface" => "https://router.huggingface.co/v1/models",
         "cerebras" => "https://api.cerebras.ai/v1/models",
         "nvidia" => "https://integrate.api.nvidia.com/v1/models",
         "google" => "https://generativelanguage.googleapis.com/v1beta/models",
@@ -2042,7 +2041,6 @@ pub fn query_rate_limits(upstream_id: &str, key: &str) -> Result<RateLimitInfo, 
         "openrouter" => "https://openrouter.ai/api/v1/models",
         "sambanova" => "https://api.sambanova.ai/v1/models",
         "mistral" => "https://api.mistral.ai/v1/models",
-        "cohere" => "https://api.cohere.com/v1/models",
         "opencode-zen" => "https://api.opencode.ai/v1/models",
         "zai" => "https://open.bigmodel.cn/api/paas/v4/models",
         "cline" => "https://api.cline.bot/api/v1/ai/cline/recommended-models",
@@ -2238,7 +2236,7 @@ fn split_cloudflare_key(key: &str) -> Result<(&str, &str), String> {
 /// empty-completion cooldown paths are deterministically testable live.
 ///
 /// Only OpenAI-compatible upstreams honour the override on the chat
-/// dispatch path; `google`, `cohere` and `github-copilot` use native wire
+/// dispatch path; `google` and `github-copilot` use native wire
 /// formats and keep their real endpoints. The key-validation / probe
 /// endpoints honour it where applicable (cloudflare's chat probe is
 /// account-scoped and ignores it). Not for production use.

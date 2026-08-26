@@ -107,11 +107,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         key_url: "the provider's website",
     },
     ProviderMetadata {
-        id: "cohere",
-        env_var: "COHERE_API_KEY",
-        key_url: "dashboard.cohere.com/api-keys",
-    },
-    ProviderMetadata {
         id: "deepinfra",
         env_var: "DEEPINFRA_API_KEY",
         key_url: "deepinfra.com/dash/api_keys",
@@ -165,11 +160,6 @@ pub const ALL_PROVIDERS: &[ProviderMetadata] = &[
         id: "helicone",
         env_var: "HELICONE_API_KEY",
         key_url: "the provider's website",
-    },
-    ProviderMetadata {
-        id: "huggingface",
-        env_var: "HF_TOKEN",
-        key_url: "huggingface.co/settings/tokens",
     },
     ProviderMetadata {
         id: "minimax",
