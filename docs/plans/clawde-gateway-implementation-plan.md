@@ -88,7 +88,9 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
    (`clawde-gateway`) is optional; the primary entry point is
    `clawde serve [--port N]`, mirroring how `clawde acp` is dispatched today.
 2. **Dependency decision (explicit):** axum is the first HTTP-server dependency
-   in the workspace (Cargo.lock has no axum today; only `hyper` transitively
+   in the workspace. `subtle` (constant-time comparison for bearer keys) and
+   `tower-http` (cors) are the only other new runtime deps; everything else
+   is already in the workspace. (Cargo.lock has no axum today; only `hyper` transitively
    via reqwest). Acceptable for a purpose-built server crate: axum is the
    standard tokio-native choice and keeps handler code minimal. Keep the new
    tree small: `axum`, `tokio` (already present), `serde`/`serde_json`
@@ -133,14 +135,29 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
 
 - `parse_chat_completion_request(Value) -> Result<ProviderRequest, GatewayError>`:
   accepts `model`, `messages[]` (`role`/`content`/`tool_calls`/`tool_call_id`),
-  `tools[]`, `temperature`, `max_tokens`, `stream`, `stop`,
-  `reasoning_effort`; **tolerates unknown fields** (OpenAI clients send
-  `stream_options`, `user`, `seed`, …). Reject only structurally invalid
-  bodies (`400 invalid_request_error`).
+  `tools[]`, `tool_choice`, `temperature`, `max_tokens`, `stream`, `stop`,
+  `reasoning_effort`, `response_format`, `seed`, `logprobs`, `top_logprobs`;
+  **tolerates unknown fields** (OpenAI clients send `stream_options`, `user`,
+  `n`, …) — serde must NOT set `deny_unknown_fields`. Reject only
+  structurally invalid bodies (`400 invalid_request_error`).
+  - `tool_choice` (`auto`/`none`/`required`/`{type,function}`) maps to
+    `ProviderRequest.tool_choice` so `tool_choice: "none"` suppresses tool
+    calls instead of being silently dropped (audit §1a).
+  - `response_format` / `seed` / `logprobs` / `top_logprobs` are tolerated
+    and passed through when the upstream supports them; documented as such
+    (audit §1b–1d).
+  - `n > 1` is rejected with `400` in v1 (upstreams are single-choice);
+    documented as a future multi-call mapping (audit §1f).
 - `to_openai_response(ProviderResponse) -> Value`: `id`, `object:
   "chat.completion"`, `created`, `model`, `choices[0].message`,
   `usage`. Provider-side thinking (`reasoning_content`) maps to
-  `message.reasoning_content` (matches poolside/deepseek wire behavior).
+  `message.reasoning_content` in BOTH streaming and non-streaming responses
+  (matches poolside/deepseek wire behavior; audit §1e).
+- Tool-call argument accumulation (streaming): the first chunk with a tool
+  call carries `delta.tool_calls[].index` + `id` + `function.name` +
+  `function.arguments` (possibly empty); subsequent chunks carry `index` +
+  `function.arguments` deltas. The gateway ACCUMULATES `arguments` strings
+  across chunks for the same `index` — never replaces (audit §2a).
 - `to_openai_stream_event(StreamEvent) -> Option<Chunk>`: the event stream is
   Anthropic-shaped (`MessageStart`, `ContentBlockStart`, `TextDelta`,
   `ThinkingDelta`, tool-call deltas, `MessageStop`) — accumulate into OpenAI
@@ -150,8 +167,12 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
   - tool-call argument fragments accumulate into `delta.tool_calls[].function.arguments`
   - terminal chunk carries `finish_reason` (`stop` | `tool_calls` | `length`)
   - `[DONE]` terminator; with `stream_options.include_usage`, a final
-    usage-only chunk before `[DONE]` (some providers already send usage — see
-    `include_usage_in_stream` quirks; dedupe).
+    usage-only chunk before `[DONE]`. Dedup rule: if the upstream's terminal
+    chunk already carries `usage`, emit it there; otherwise emit a separate
+    usage-only chunk (audit §2c).
+  - `finish_reason`: `null` on all non-terminal chunks; the actual reason
+    (`stop` | `length` | `tool_calls` | `content_filter`) only on the
+    terminal chunk (audit §2d).
 - Fixtures: golden request/response/chunk transcripts in
   `crates/gateway/tests/fixtures/`, plus a raw-socket and curl smoke test.
 
@@ -159,7 +180,7 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
 
 - Bearer key from `Authorization` header, validated against
   `GatewayConfig.allowed_keys` (settings) or `CLAWDE_GATEWAY_KEY` (env).
-  Constant-time comparison.
+  Constant-time comparison via `subtle::ConstantTimeEq` (audit §3a).
 - **Two-dimensional token bucket per key** (hand-rolled, `Mutex<HashMap<Key,
   Bucket>>` behind a small axum middleware), following the LiteLLM "virtual
   key" model:
@@ -173,9 +194,15 @@ run the agent loop, execute tools, manage sessions, or expose the TUI.
     quota", so surface remaining budget in the 429/`X-RateLimit-*` headers.
   - Fixed key table from config; unknown keys rejected before any state
     allocation.
-- `429` responses carry OpenAI-style bodies, `Retry-After`, and
-  `X-RateLimit-*` headers (mirroring what the repo's own
-  `parse_rate_limit_headers` reads from upstreams).
+- `429` responses carry OpenAI-style bodies, `Retry-After`, and the full
+  OpenAI `X-RateLimit-*` header set for BOTH dimensions (audit §4c):
+  `X-RateLimit-Limit-Requests`, `X-RateLimit-Remaining-Requests`,
+  `X-RateLimit-Reset-Requests`, `X-RateLimit-Limit-Tokens`,
+  `X-RateLimit-Remaining-Tokens`, `X-RateLimit-Reset-Tokens`.
+- Bucket state is allocated lazily on first use per key, not pre-allocated
+  for every configured key at startup (audit §4a). TPM is enforced after
+  stream completion (usage is only known then); a stream aborted mid-flight
+  estimates from `usage` if present, else from chunk count (audit §4b).
 - Distributed rate limiting (Redis) is **explicitly out of scope for v1** —
   the gateway is a single localhost process; if multi-instance deployment ever
   appears, the per-key state moves behind a shared counter (see §6d for the
@@ -237,10 +264,13 @@ SSE stream is active** (hyper#2787) — the upstream stream task keeps the
 future alive. The gateway therefore tracks active streams explicitly:
 
 - `Arc<AtomicUsize>` active-stream counter; each handler increments on start,
-  decrements on completion/abort.
+  decrements in a `Drop` guard (not at the end of the handler, so panics
+  can't leak the count; audit §5a).
 - On SIGINT/SIGTERM (same `CancellationToken` wiring as `clawde acp`):
-  1. stop accepting new requests; `/healthz` starts returning `503` (the
-     Kubernetes readiness-drain pattern),
+  1. stop accepting new requests; `/healthz` returns `200` with
+     `{"status":"draining"}` during the grace period (load balancers stop
+     sending new traffic), then `503` with `{"status":"shutting_down"}`
+     after grace expiry (audit §5b),
   2. wait up to `shutdown_grace_secs` for the counter to reach zero
      (finishing in-flight completions), then
   3. abort remaining streams via their per-request `CancellationToken`s and
@@ -409,3 +439,13 @@ must not re-implement them:
    overridable per key.
 5. In-flight cap default per upstream (e.g. 8) — pick from observed free-tier
    concurrency behavior, or expose `AdaptiveConcurrency` from day one?
+6. CORS: default no CORS headers (localhost-only, no browser access expected);
+   optional `tower-http` CORS middleware with configurable origins for
+   browser clients (Open WebUI). Ship the middleware behind a config flag
+   (audit §3c).
+7. TPM counting during streaming: enforce RPM only mid-stream (usage unknown),
+   TPM after completion; document the abort-estimation fallback (audit §4b).
+8. Test cases to add beyond golden transcripts: tool-call argument
+   accumulation, mixed content + tool calls, reasoning passthrough (stream +
+   non-stream), upstream 429/500/timeout mapping, RPM/TPM enforcement +
+   429 headers, drain with active SSE, client-disconnect abort (audit §6a).
