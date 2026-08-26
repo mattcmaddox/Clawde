@@ -206,6 +206,23 @@ impl LlmProvider for ScriptedResponsesProvider {
 // Harness
 // ---------------------------------------------------------------------------
 
+fn state_with_capacity(
+    config: EffectiveGatewayConfig,
+    registry: ProviderRegistry,
+    capacity: usize,
+) -> GatewayState {
+    GatewayState {
+        limiter: Arc::new(RateLimiter::new(100, 100_000)),
+        registry: Arc::new(registry),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+        force_cancel: tokio_util::sync::CancellationToken::new(),
+        sessions: Arc::new(SessionStore::new(capacity, 3600)),
+        config,
+    }
+}
+
 fn state_with(config: EffectiveGatewayConfig, registry: ProviderRegistry) -> GatewayState {
     GatewayState {
         limiter: Arc::new(RateLimiter::new(100, 100_000)),
@@ -293,6 +310,21 @@ fn missing_file_call() -> ScriptedTurn {
         "call_1",
         json!({"file_path": "/nonexistent/clawde-responses-test-file"}),
     )
+}
+
+/// Strip volatile fields (response/event ids, timestamps) so a golden
+/// comparison pins the deterministic event stream.
+fn strip_volatile(ev: &Value) -> Value {
+    let mut ev = ev.clone();
+    if let Value::Object(map) = &mut ev {
+        map.remove("id");
+        map.remove("created_at");
+        if let Some(Value::Object(resp)) = map.get_mut("response") {
+            resp.remove("id");
+            resp.remove("created_at");
+        }
+    }
+    ev
 }
 
 fn output_types(items: &Value) -> Vec<&str> {
@@ -547,6 +579,71 @@ async fn responses_continuation_hydrates_previous_turn() {
         counts[1] + 2,
         "prev output + new input: {counts:?}"
     );
+}
+
+/// Golden transcript: the full SSE event stream for a canonical two-turn run
+/// (internal tool round + final text) must match the Open Responses spec
+/// fixture exactly — every event, in order, with deterministic fields
+/// (sequence numbers, item ids, output indices, payloads) pinned.
+#[tokio::test]
+async fn responses_golden_stream_transcript() {
+    let prov = provider(vec![
+        missing_file_call(),
+        ScriptedTurn::text("streamed final answer"),
+    ]);
+    let (status, body) = post(
+        state_with(default_config(), register(prov)),
+        responses_body(json!({"stream": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/responses_golden_stream.json"))
+            .expect("fixture parses");
+    let want = fixture.as_array().expect("fixture is an array");
+    let got: Vec<Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str(d).ok())
+        .map(|v: Value| strip_volatile(&v))
+        .collect();
+    assert_eq!(got.len(), want.len(), "event count mismatch; body: {body}");
+    for (i, (got_ev, want_ev)) in got.iter().zip(want).enumerate() {
+        assert_eq!(got_ev, want_ev, "event {i} mismatch; body: {body}");
+    }
+    assert!(
+        body.trim_end().ends_with("data: [DONE]"),
+        "body must end with [DONE]: {body}"
+    );
+}
+
+#[tokio::test]
+async fn responses_evicted_session_returns_not_found() {
+    let prov = provider(vec![ScriptedTurn::text("first")]);
+    // Capacity 1: the second request evicts the first session.
+    let state = state_with_capacity(default_config(), register(prov), 1);
+    let first = post(state.clone(), responses_body(json!({"store": true}))).await;
+    assert_eq!(first.0, StatusCode::OK);
+    let first_id = serde_json::from_str::<Value>(&first.1).expect("JSON body")["id"]
+        .as_str()
+        .expect("response id")
+        .to_string();
+    let second = post(state.clone(), responses_body(json!({"store": true}))).await;
+    assert_eq!(second.0, StatusCode::OK);
+    // Continuing with the evicted id fails with previous_response_not_found.
+    let (status, body) = post(
+        state.clone(),
+        responses_body(json!({
+            "previous_response_id": first_id,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let json: Value = serde_json::from_str(&body).expect("JSON body");
+    assert_eq!(json["error"]["code"], "previous_response_not_found");
+    assert_eq!(json["error"]["param"], "previous_response_id");
 }
 
 #[tokio::test]

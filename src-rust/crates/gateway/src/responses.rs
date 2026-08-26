@@ -268,6 +268,11 @@ pub struct ResponsesItemBuilder {
     reasoning: Option<OpenItem>,
 }
 
+/// Cap for accumulated reasoning text in the final item (D3 — raw `content`
+/// from Thinking blocks, truncated to a budget). The streamed deltas stay
+/// raw; only the exposed item text is capped.
+const THINKING_TEXT_BUDGET: usize = 32 * 1024;
+
 /// An in-progress streamable item (message or reasoning text).
 struct OpenItem {
     item_id: String,
@@ -275,6 +280,8 @@ struct OpenItem {
     role: &'static str,
     text: String,
     has_part: bool,
+    /// Content was cut at `THINKING_TEXT_BUDGET` (close appends a marker).
+    truncated: bool,
     /// The item's slot in `items` (stable even as later items append).
     output_index: usize,
 }
@@ -389,11 +396,15 @@ impl ResponsesItemBuilder {
                         "delta": thinking,
                     }),
                 ));
-                self.reasoning
-                    .as_mut()
-                    .expect("reasoning opened")
-                    .text
-                    .push_str(thinking);
+                // Bounded accumulation (D3): keep the first `budget` bytes on a
+                // char boundary; mark truncated so the close appends a marker.
+                let reason = self.reasoning.as_mut().expect("reasoning opened");
+                let remaining = THINKING_TEXT_BUDGET.saturating_sub(reason.text.len());
+                let take = thinking.floor_char_boundary(remaining);
+                reason.text.push_str(&thinking[..take]);
+                if take < thinking.len() {
+                    reason.truncated = true;
+                }
                 out
             }
             LoopEvent::ToolCall { id, name, input }
@@ -578,6 +589,7 @@ impl ResponsesItemBuilder {
                 role: "assistant",
                 text: String::new(),
                 has_part: false,
+                truncated: false,
                 output_index,
             },
             vec![evt],
@@ -620,6 +632,7 @@ impl ResponsesItemBuilder {
                 role: "assistant",
                 text: String::new(),
                 has_part: false,
+                truncated: false,
                 output_index,
             },
             vec![evt],
@@ -629,6 +642,11 @@ impl ResponsesItemBuilder {
     /// Emit `output_text.done` + `content_part.done` + `output_item.done` and
     /// write the completed item back into its slot in `items`.
     fn close_open_item(&mut self, item: OpenItem) -> Vec<Value> {
+        let display_text = if item.truncated {
+            format!("{}…[truncated]", item.text)
+        } else {
+            item.text
+        };
         let mut out = Vec::new();
         if item.has_part {
             out.push(self.event(
@@ -637,7 +655,7 @@ impl ResponsesItemBuilder {
                     "item_id": item.item_id,
                     "output_index": item.output_index,
                     "content_index": 0,
-                    "text": item.text,
+                    "text": display_text,
                 }),
             ));
             out.push(self.event(
@@ -646,7 +664,7 @@ impl ResponsesItemBuilder {
                     "item_id": item.item_id,
                     "output_index": item.output_index,
                     "content_index": 0,
-                    "part": {"type": "output_text", "annotations": [], "text": item.text},
+                    "part": {"type": "output_text", "annotations": [], "text": display_text},
                 }),
             ));
         }
@@ -656,7 +674,7 @@ impl ResponsesItemBuilder {
             "status": "completed",
             "role": item.role,
             "content": if item.has_part {
-                json!([{"type": "output_text", "annotations": [], "text": item.text}])
+                json!([{"type": "output_text", "annotations": [], "text": display_text}])
             } else {
                 json!([])
             },
@@ -980,6 +998,55 @@ mod tests {
         let (status, reason) = outcome_status(&outcome);
         assert_eq!(status, "incomplete");
         assert_eq!(reason, Some("max_tool_calls"));
+    }
+
+    #[test]
+    fn parses_tool_choice_passthrough() {
+        let mut b = body();
+        b["tool_choice"] = json!({"type": "function", "name": "Read"});
+        let parsed = parse_responses_request(&b).unwrap();
+        assert_eq!(
+            parsed.provider_request.provider_options["tool_choice"]["name"],
+            "Read"
+        );
+    }
+
+    #[test]
+    fn parses_string_tool_choice() {
+        let mut b = body();
+        b["tool_choice"] = json!("none");
+        let parsed = parse_responses_request(&b).unwrap();
+        assert_eq!(
+            parsed.provider_request.provider_options["tool_choice"],
+            "none"
+        );
+    }
+
+    #[test]
+    fn thinking_text_is_capped_at_budget() {
+        let mut builder = ResponsesItemBuilder::new();
+        let big = "x".repeat(THINKING_TEXT_BUDGET + 100);
+        builder.push(&LoopEvent::ThinkingDelta { thinking: big });
+        builder.push(&LoopEvent::TurnEnd {
+            stop_reason: StopReason::EndTurn,
+        });
+        builder.finalize();
+        let item = &builder.items[0];
+        assert_eq!(item["type"], "reasoning");
+        let text = item["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with("…[truncated]"), "marker expected: {text:?}");
+        // Capped to the budget plus the marker.
+        assert!(text.len() <= THINKING_TEXT_BUDGET + 16);
+        // Under-budget thinking passes through untouched.
+        let mut small = ResponsesItemBuilder::new();
+        small.push(&LoopEvent::ThinkingDelta {
+            thinking: "think hard".into(),
+        });
+        small.push(&LoopEvent::TurnEnd {
+            stop_reason: StopReason::EndTurn,
+        });
+        small.finalize();
+        assert_eq!(small.items[0]["content"][0]["text"], "think hard");
     }
 
     #[test]
