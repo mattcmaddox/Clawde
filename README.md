@@ -5,7 +5,7 @@
 
 <p>
     <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Version-0.2.39-2E8B57?style=for-the-badge" alt="Version 0.2.39"></a>
+    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Version-0.2.40-2E8B57?style=for-the-badge" alt="Version 0.2.40"></a>
     <a href="https://github.com/mattcmaddox/Clawde/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
 </p>
 
@@ -23,7 +23,7 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 ---
 
 > [!IMPORTANT]
-> **Clawde is now officially in Beta (v0.2.39).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
+> **Clawde is now officially in Beta (v0.2.40).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
 
 > [!NOTE]
 > **Recent Updates:**

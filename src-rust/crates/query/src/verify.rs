@@ -616,59 +616,149 @@ pub fn run_verify_after_edit(
     })
 }
 
-/// Lint specific files after edit (Aider's lint_edited() pattern).
-/// This runs the linter on specific files that were just edited.
+/// Map a just-edited file to a cheap, non-mutating per-file lint command, or
+/// `None` to skip. Whole-project lint commands (cargo clippy, go vet, mvn),
+/// which write `Cargo.lock` / `target/` or otherwise mutate the tree, must
+/// NOT run inside every tool return — they would pollute change tracking and
+/// add heavy per-write latency. End-of-turn VerifyPolicy runs those correctly
+/// (sandboxed, once). This returns only linters that accept a single file
+/// argument and have no build side effects.
+///
+/// `info` is the project's detected info; the caller re-detects it so the
+/// per-file selection matches what verify already uses.
+fn file_lint_command(
+    file: &std::path::Path,
+    info: &clawde_tools::detect_project::ProjectInfo,
+    working_dir: &Path,
+) -> Option<(String, String)> {
+    let rel = file.display().to_string();
+    let ext = file
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let uses = |needle: &str| info.lint_commands.iter().any(|c| c.contains(needle));
+    match info.language {
+        clawde_tools::detect_project::ProjectLanguage::Python => match ext.as_str() {
+            // ruff and mypy lint a single file with zero side effects.
+            "py" | "pyi" => {
+                if uses("mypy") {
+                    Some((format!("mypy:{rel}"), format!("mypy {rel}")))
+                } else {
+                    Some((format!("ruff:{rel}"), format!("ruff check {rel}")))
+                }
+            }
+            _ => None,
+        },
+        clawde_tools::detect_project::ProjectLanguage::TypeScript
+        | clawde_tools::detect_project::ProjectLanguage::JavaScript => match ext.as_str() {
+            // eslint is per-file and non-mutating, but only run it when the
+            // project actually configures it — on an unconfigured project a
+            // bare `eslint file` just errors out and is worse than nothing.
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => {
+                if has_eslint_config(working_dir) {
+                    Some((format!("eslint:{rel}"), format!("eslint {rel}")))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        // Rust (cargo clippy), Go (go vet), Java, C/C++ have no cheap safe
+        // file-scoped linter here; end-of-turn VerifyPolicy covers them.
+        _ => None,
+    }
+}
+
+/// Whether the project ships an ESLint config (legacy `.eslintrc*` or flat
+/// `eslint.config.*`). Used to avoid running `eslint <file>` where it is not
+/// configured.
+fn has_eslint_config(working_dir: &Path) -> bool {
+    const FLAT: [&str; 2] = ["eslint.config.js", "eslint.config.mjs"];
+    const LEGACY: [&str; 5] = [
+        ".eslintrc",
+        ".eslintrc.js",
+        ".eslintrc.cjs",
+        ".eslintrc.json",
+        ".eslintrc.yml",
+    ];
+    FLAT.iter()
+        .chain(LEGACY.iter())
+        .any(|name| working_dir.join(name).exists())
+}
+
+/// Lint edited files after edits (Aider's lint_edited() pattern), running only
+/// cheap, non-mutating per-file linters (ruff/mypy for Python, eslint for
+/// TS/JS) that accept a single file argument. Languages without a safe
+/// file-scoped linter are skipped — end-of-turn VerifyPolicy runs their real
+/// whole-project lint sandboxed.
+///
+/// Supersedes the old `echo 'Linting {file}'` placeholder (never caught
+/// anything) AND avoids the regression of running whole-project commands like
+/// `cargo clippy` per write, which write `Cargo.lock` + `target/` into the
+/// user's tree and pollute change tracking.
+///
+/// Bounded by `config.timeout_secs` per command; a hung linter cannot stall
+/// the loop. Each file lints independently so one failure doesn't mask others.
 pub fn lint_edited_files(
     files: &[std::path::PathBuf],
     config: &VerifyConfig,
     working_dir: &Path,
 ) -> Result<VerifyReport, String> {
-    if !config.auto_lint {
+    if !config.auto_lint || files.is_empty() {
         return Ok(VerifyReport {
             verdict: VerifyVerdict::Escalate,
             results: Vec::new(),
             attempt: 0,
             max_retries: 1,
-            headline: "Linting disabled".to_string(),
+            headline: "Linting disabled or nothing edited".to_string(),
             sandbox: config.sandbox,
             unavailable: false,
         });
     }
 
+    let info = clawde_tools::detect_project::detect_project_info(working_dir);
     let mut results = Vec::new();
     for file in files {
-        let rel_path = file.strip_prefix(working_dir).unwrap_or(file);
-        // Run lint command for this specific file
-        // Note: This is a simplified version - in production, you would
-        // detect the file type and run the appropriate linter
-        let cmd = format!("echo 'Linting {}'", rel_path.display());
-        let (stdout, _exit_code, _success, _elapsed) =
-            run_command_sync(&cmd, working_dir, config.timeout_secs);
-        if !stdout.is_empty() {
-            results.push(CheckResult {
-                label: format!("lint:{}", rel_path.display()),
-                ok: true,
-                skipped: false,
-                output: stdout,
-                timed_out: false,
-                elapsed_secs: Some(0),
-            });
-        }
+        let Some((label, command)) = file_lint_command(file, &info, working_dir) else {
+            continue;
+        };
+        // run it from the project root (relative path in the command resolves
+        // correctly) with the per-command timeout.
+        results.push(run_check(
+            &label,
+            &command,
+            working_dir,
+            config.timeout_secs,
+        ));
     }
 
-    let failures: Vec<&CheckResult> = results.iter().filter(|r| !r.ok && !r.skipped).collect();
-    let headline = if failures.is_empty() {
-        "All files passed linting".to_string()
-    } else {
-        format!("{} file(s) failed linting", failures.len())
-    };
+    // No cheap linter applies -> nothing was run; report as a clean skip so
+    // the caller isn't told "lint passed" when nothing actually ran.
+    if results.is_empty() {
+        return Ok(VerifyReport {
+            verdict: VerifyVerdict::Escalate,
+            results,
+            attempt: 0,
+            max_retries: 1,
+            headline: "No per-file linter applies".to_string(),
+            sandbox: config.sandbox,
+            unavailable: false,
+        });
+    }
 
+    let failure_count = results.iter().filter(|r| !r.ok && !r.skipped).count();
+    let verdict = if failure_count == 0 {
+        VerifyVerdict::Pass
+    } else {
+        VerifyVerdict::Fixable
+    };
+    let headline = if failure_count == 0 {
+        "Lint check passed".to_string()
+    } else {
+        format!("{failure_count} file(s) failed linting")
+    };
     Ok(VerifyReport {
-        verdict: if failures.is_empty() {
-            VerifyVerdict::Pass
-        } else {
-            VerifyVerdict::Fixable
-        },
+        verdict,
         results,
         attempt: 1,
         max_retries: 1,

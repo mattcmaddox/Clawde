@@ -611,6 +611,77 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
     clawde_core::constants::is_file_mutator(name)
 }
 
+/// Shared within-turn post-steps run after a tool round dispatches, on BOTH
+/// request paths (refactor-loop-health D4/D5 resolution).
+///
+/// - D4: when the round edited files, run the project's real detected lint
+///   (`lint_edited_files`) and surface the report via `QueryEvent::Verify` so
+///   the model/TUI sees a genuine within-turn lint outcome.
+/// - D5: track files read by tools (`file_read` / `read_file`) in the
+///   context-refresh tracker so external modifications are detected on later
+///   turns.
+///
+/// `tool_calls` is the `(id, name, input)` list for the round that just ran on
+/// the calling path. Factored here so the provider path and the Anthropic path
+/// run identical behavior instead of drifting (Phase A one-site goal).
+fn run_edited_post_steps(
+    tool_calls: &[(String, String, Value)],
+    working_dir: &std::path::Path,
+    file_tracker: &mut context_refresh::FileModificationTracker,
+    context_files: &mut Vec<std::path::PathBuf>,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    // D4: real within-turn auto-lint after any write this round.
+    let edited_files: Vec<std::path::PathBuf> = tool_calls
+        .iter()
+        .filter(|(_, name, _)| is_write_tool(name))
+        .filter_map(|(_, _, input)| {
+            input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+        })
+        .collect();
+    if !edited_files.is_empty() {
+        let verify_config = clawde_core::config::VerifyConfig {
+            auto_lint: true,
+            auto_test: false,
+            ..Default::default()
+        };
+        if let Ok(report) =
+            crate::verify::lint_edited_files(&edited_files, &verify_config, working_dir)
+        {
+            // Surface only genuine lint failures. A passing within-turn lint is
+            // informational noise and would otherwise collide with the terminal
+            // deterministic-gate `Pass` event that the loop and its tests treat
+            // as the authoritative "check passed" signal.
+            if report.verdict == crate::verify::VerifyVerdict::Fixable {
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(QueryEvent::Verify(report));
+                }
+            }
+        }
+    }
+
+    // D5: context-refresh read tracking for external-modification detection.
+    for (_, tool_name, tool_input) in tool_calls {
+        if tool_name == "file_read" || tool_name == "read_file" {
+            if let Some(path) = tool_input
+                .get("file_path")
+                .or_else(|| tool_input.get("path"))
+                .and_then(|v| v.as_str())
+            {
+                let path_buf = std::path::PathBuf::from(path);
+                if !context_files.contains(&path_buf) {
+                    file_tracker.record_file(&path_buf);
+                    context_files.push(path_buf);
+                }
+            }
+        }
+    }
+}
+
 /// Whether a tool result is itself a deterministic project check. These tools
 /// report executable test/lint outcomes directly, so an active approved plan
 /// can feed their failure into durable replan accounting even when the generic
@@ -3385,19 +3456,6 @@ pub async fn run_query_loop(
                     // compatible providers (Ollama, LM Studio, etc.) return
                     // finish_reason "stop" even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
-                        // Collect files that will be written before consuming tool_use_blocks
-                        let edited_files: Vec<std::path::PathBuf> = tool_use_blocks
-                            .iter()
-                            .filter(|(_, name, _)| is_write_tool(name))
-                            .filter_map(|(_, _, input)| {
-                                input
-                                    .get("file_path")
-                                    .or_else(|| input.get("path"))
-                                    .and_then(|v| v.as_str())
-                                    .map(std::path::PathBuf::from)
-                            })
-                            .collect();
-
                         // Save a copy for context-refresh tracking after execution
                         let tool_use_blocks_back: Vec<_> = tool_use_blocks
                             .iter()
@@ -3448,37 +3506,17 @@ pub async fn run_query_loop(
                             turn_meta: None,
                         });
 
-                        // Auto-verify after edit: run verification if files were written
-                        if !edited_files.is_empty() {
-                            let verify_config = clawde_core::config::VerifyConfig {
-                                auto_lint: true,
-                                auto_test: false,
-                                ..Default::default()
-                            };
-                            let _ = crate::verify::lint_edited_files(
-                                &edited_files,
-                                &verify_config,
-                                &tool_ctx.working_dir,
-                            );
-                        }
-
-                        // Auto-context-refresh: track files that were read by tools
-                        // so we can detect external modifications on subsequent turns
-                        for (_, tool_name, tool_input) in &tool_use_blocks_back {
-                            if tool_name == "file_read" || tool_name == "read_file" {
-                                if let Some(path) = tool_input
-                                    .get("file_path")
-                                    .or_else(|| tool_input.get("path"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    let path_buf = std::path::PathBuf::from(path);
-                                    if !context_files.contains(&path_buf) {
-                                        file_tracker.record_file(&path_buf);
-                                        context_files.push(path_buf);
-                                    }
-                                }
-                            }
-                        }
+                        // D4/D5 shared within-turn post-steps (real auto-lint
+                        // after edits + context-refresh read tracking) — see
+                        // `run_edited_post_steps`. Identical behavior on the
+                        // Anthropic path below (Phase A one-site goal).
+                        run_edited_post_steps(
+                            &tool_use_blocks_back,
+                            &tool_ctx.working_dir,
+                            &mut file_tracker,
+                            &mut context_files,
+                            event_tx.as_ref(),
+                        );
 
                         continue; // loop for next tool round
                     }
@@ -4441,6 +4479,17 @@ pub async fn run_query_loop(
                     if batch_cancelled {
                         return QueryOutcome::Cancelled;
                     }
+
+                    // D4/D5 shared within-turn post-steps (real auto-lint after
+                    // edits + context-refresh read tracking) — identical to the
+                    // provider path (Phase A one-site goal).
+                    run_edited_post_steps(
+                        &tool_calls,
+                        &tool_ctx.working_dir,
+                        &mut file_tracker,
+                        &mut context_files,
+                        event_tx.as_ref(),
+                    );
 
                     // Continue the loop to send results back to the model
                     continue;
