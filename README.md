@@ -5,7 +5,7 @@
 
 <p>
     <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Version-0.2.44-2E8B57?style=for-the-badge" alt="Version 0.2.44"></a>
+    <a href="https://github.com/mattcmaddox/Clawde"><img src="https://img.shields.io/badge/Version-0.2.46-2E8B57?style=for-the-badge" alt="Version 0.2.46"></a>
     <a href="https://github.com/mattcmaddox/Clawde/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
 </p>
 
@@ -23,7 +23,7 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 ---
 
 > [!IMPORTANT]
-> **Clawde is now officially in Beta (v0.2.44).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
+> **Clawde is now officially in Beta (v0.2.46).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
 
 > [!NOTE]
 > **Recent Updates:**
@@ -35,6 +35,8 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 > - **/goal support:** Try out `/goal <objective>` to see clawde keep working an objective, spanning multiple turns instead of stopping after one normal turn. `[EXPERIMENTAL]`
 >
 > - **ultracode:** The **highest effort level** — pick it in the effort selector (`/effort`, where it sits past `max` on the "Smarter" end with an animated purple spectrum) or just type **`ultracode`** anywhere in your prompt. The keyword lights up with a purple gradient (clawde's take on Claude Code's `ultrathink`) and that turn runs at the model's top reasoning **plus** a disciplined plan → delegate → integrate → verify workflow that fans bounded packets out across native subagents (`Agent`), swarms (`TeamCreate`), and background tasks (`TaskCreate`). Composes with `/goal` for sustained multi-turn objectives. `[EXPERIMENTAL]`
+>
+> - **OpenAI-compatible gateway:** Run `clawde serve` to expose Clawde's free-tier router (FreeProvider fallback + key rotation) as an OpenAI-compatible HTTP API — point openai-python, LangChain, Cursor, aider, or Open WebUI at it with a `base_url` override. See [docs/gateway.md](docs/gateway.md). `[EXPERIMENTAL]`
 
 ---
 

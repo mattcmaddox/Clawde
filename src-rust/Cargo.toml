@@ -13,10 +13,11 @@ members = [
     "crates/buddy",
     "crates/plugins",
     "crates/acp",
+    "crates/gateway",
 ]
 
 [workspace.package]
-version = "0.2.44"
+version = "0.2.46"
 edition = "2021"
 authors = ["Clawde"]
 license = "GPL-3.0"
@@ -106,6 +107,12 @@ tokio-util = { version = "0.7", features = ["codec", "rt"] }
 # WebSocket
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
+# HTTP server (gateway only)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+subtle = "2"
+
+
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }
 
@@ -121,6 +128,7 @@ clawde-mcp = { path = "crates/mcp" }
 clawde-bridge = { path = "crates/bridge" }
 clawde-buddy = { path = "crates/buddy" }
 clawde-plugins = { path = "crates/plugins" }
+clawde-gateway = { path = "crates/gateway" }
 
 # Shipped binaries statically link two TLS stacks (rustls + BoringSSL),
 # bundled SQLite, syntect, and image codecs — LTO and symbol stripping cut

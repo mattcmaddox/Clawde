@@ -369,6 +369,106 @@ fn set_acp_option(options: &mut AcpCliOptions, option: &str, value: String) -> a
     Ok(())
 }
 
+const GATEWAY_USAGE: &str = r#"Usage: clawde serve [OPTIONS]
+
+Start Clawde as an OpenAI-compatible gateway server.
+
+Options:
+  --port <N>                 Port to listen on (default 8787, loopback)
+  --key <KEY>                Bearer key to accept (adds to settings allowed_keys)
+  --allow-non-loopback       Explicitly allow a non-loopback bind
+  --tls-cert <PATH>          PEM certificate for TLS
+  --tls-key <PATH>           PEM private key for TLS (use with --tls-cert)
+  -h, --help                 Show this help
+
+Endpoints:
+  POST /v1/chat/completions  Chat completions (stream + non-stream)
+  GET /v1/models             List models
+  GET /v1/models/{id}        Get a model
+  GET /healthz               Liveness
+  GET /status                Key-ring/cooldown status (auth-gated)
+
+Security:
+  Non-loopback binds are rejected by default. Use --allow-non-loopback to
+  bind elsewhere (e.g. behind an authenticated tunnel). Set CLAWDE_GATEWAY_KEY
+  or use --key to configure the bearer key.
+"#;
+
+/// Run the OpenAI-compatible gateway (`clawde serve`).
+/// Mirrors the ACP dispatch: load settings, apply CLI overrides, wire signal
+/// handlers, and serve. The gateway is a separate process from the TUI so the
+/// TUI repaint cadence and idle-CPU guarantees are untouched.
+async fn run_gateway_command(args: &[String]) -> anyhow::Result<()> {
+    use clawde_gateway::config::EffectiveGatewayConfig;
+
+    let mut port: Option<u16> = None;
+    let mut cli_key: Option<String> = None;
+    let mut allow_non_loopback = false;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--port needs a value"))?;
+                port = Some(v.parse()?);
+            }
+            "--key" => {
+                i += 1;
+                cli_key = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--key needs a value"))?
+                        .clone(),
+                );
+            }
+            "--allow-non-loopback" => allow_non_loopback = true,
+            "--tls-cert" => {
+                i += 1;
+                tls_cert = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--tls-cert needs a value"))?
+                        .clone(),
+                );
+            }
+            "--tls-key" => {
+                i += 1;
+                tls_key = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--tls-key needs a value"))?
+                        .clone(),
+                );
+            }
+            other => anyhow::bail!("unknown gateway argument: {other}\n\n{GATEWAY_USAGE}"),
+        }
+        i += 1;
+    }
+
+    let settings = clawde_core::config::Settings::load()
+        .await
+        .unwrap_or_default();
+    let mut gateway_config = settings.gateway.clone();
+    if let Some(p) = port {
+        gateway_config.listen = format!("127.0.0.1:{p}");
+    }
+    if allow_non_loopback {
+        gateway_config.allow_non_loopback = true;
+    }
+    if let Some(cert) = tls_cert {
+        gateway_config.tls_cert_path = Some(cert);
+    }
+    if let Some(key) = tls_key {
+        gateway_config.tls_key_path = Some(key);
+    }
+
+    let config = EffectiveGatewayConfig::from_settings(&gateway_config, cli_key);
+
+    clawde_gateway::run_gateway(&config).await
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliPermissionMode {
     Default,
@@ -588,7 +688,22 @@ async fn main() -> anyhow::Result<()> {
         return clawde_acp::run_acp_server().await;
     }
 
-    // Fast-path: `clawde models [provider] [--refresh] [--verbose] [--json]`
+    // Fast-path: `clawde serve` — start the OpenAI-compatible gateway.
+    // `--port N` overrides the listen address; `--allow-non-loopback` opts
+    // into binding a non-loopback address; `--key K` adds a bearer key;
+    // `--tls-cert/--tls-key` enable TLS.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("serve") {
+        if raw_args[2..]
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h")
+        {
+            print!("{GATEWAY_USAGE}");
+            return Ok(());
+        }
+        return run_gateway_command(&raw_args[2..]).await;
+    }
+
+    // Fast-path: `clawde models [--json] [--refresh] [--verbose]`
     //   — list all available providers and models from the bundled snapshot
     //     plus any disk-cached overlay from models.dev.
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {

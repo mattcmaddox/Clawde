@@ -334,6 +334,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,7 +749,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clawde-acp"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -727,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-api"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -761,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-bridge"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -790,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-buddy"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "chrono",
@@ -803,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-cli"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -815,6 +867,7 @@ dependencies = [
  "clawde-bridge",
  "clawde-commands",
  "clawde-core",
+ "clawde-gateway",
  "clawde-mcp",
  "clawde-plugins",
  "clawde-query",
@@ -841,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-commands"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "arboard",
@@ -878,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-core"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "base64",
@@ -915,8 +968,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "clawde-gateway"
+version = "0.2.46"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "chrono",
+ "clawde-api",
+ "clawde-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "clawde-mcp"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -948,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-plugins"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -974,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-query"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1001,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tools"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1042,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tui"
-version = "0.2.44"
+version = "0.2.46"
 dependencies = [
  "anyhow",
  "base64",
@@ -2119,6 +2194,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2131,6 +2212,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -2738,6 +2820,12 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maybe-rayon"
@@ -4943,6 +5031,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -4981,6 +5070,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

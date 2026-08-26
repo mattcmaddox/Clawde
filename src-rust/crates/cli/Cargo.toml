@@ -23,6 +23,7 @@ clawde-commands = { workspace = true }
 clawde-mcp = { workspace = true }
 clawde-bridge = { workspace = true }
 clawde-plugins = { workspace = true }
+clawde-gateway = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }

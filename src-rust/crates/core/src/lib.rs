@@ -101,7 +101,7 @@ pub use config::{
     network_isolation_enabled, ollama_status, ollama_status_for_config, ollama_unload_models,
     ollama_unload_models_for_config, set_ollama_network_blocked, spawn_ollama_unload,
     spawn_ollama_unload_for_config, strip_jsonc_comments, substitute_env_vars, AcpServerConfig,
-    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
+    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig, GatewayConfig,
     ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OllamaLoadedModel,
     OllamaMode, OllamaStatus, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig,
     Theme, VerifyConfig, VerifySandbox,
@@ -2147,6 +2147,10 @@ pub mod config {
         /// ACP TCP server configuration (standalone or embedded).
         #[serde(default, rename = "acpServer")]
         pub acp_server: AcpServerConfig,
+
+        /// OpenAI-compatible gateway server configuration.
+        #[serde(default, rename = "gateway")]
+        pub gateway: GatewayConfig,
     }
 
     fn default_preferred_search_backend() -> String {
@@ -2196,6 +2200,105 @@ pub mod config {
                 allow_non_loopback: false,
                 tls_cert_path: None,
                 tls_key_path: None,
+            }
+        }
+    }
+
+    /// Configuration for the OpenAI-compatible gateway server.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct GatewayConfig {
+        /// Whether the gateway should listen.
+        #[serde(default)]
+        pub enabled: bool,
+        /// Address to bind, e.g. "127.0.0.1:8787".
+        #[serde(default = "default_gateway_listen")]
+        pub listen: String,
+        /// Explicitly allow binding to a non-loopback address. The gateway
+        /// has its own bearer-key auth, but loopback-only is the safe default.
+        #[serde(default, rename = "allowNonLoopback", alias = "allow_non_loopback")]
+        pub allow_non_loopback: bool,
+        /// Path to a PEM-encoded TLS certificate file (enables TLS when set).
+        #[serde(
+            default,
+            rename = "tlsCertPath",
+            alias = "tls_cert_path",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub tls_cert_path: Option<String>,
+        /// Path to a PEM-encoded TLS private key file (required with tlsCertPath).
+        #[serde(
+            default,
+            rename = "tlsKeyPath",
+            alias = "tls_key_path",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub tls_key_path: Option<String>,
+        /// Bearer keys accepted by the gateway (from settings or env).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub allowed_keys: Vec<String>,
+        /// Max requests per minute per key.
+        #[serde(default = "default_gateway_rpm")]
+        pub rpm: u32,
+        /// Max tokens per minute per key.
+        #[serde(default = "default_gateway_tpm")]
+        pub tpm: u32,
+        /// Max concurrent requests per upstream.
+        #[serde(default = "default_gateway_max_in_flight")]
+        pub max_in_flight_per_upstream: usize,
+        /// Per-request timeout in seconds.
+        #[serde(default = "default_gateway_request_timeout_secs")]
+        pub request_timeout_secs: u64,
+        /// Discovery refresh interval in seconds (default 6 h).
+        #[serde(default = "default_gateway_discovery_refresh_secs")]
+        pub discovery_refresh_secs: u64,
+        /// Grace period for draining active streams on shutdown.
+        #[serde(default = "default_gateway_shutdown_grace_secs")]
+        pub shutdown_grace_secs: u64,
+    }
+
+    fn default_gateway_listen() -> String {
+        "127.0.0.1:8787".to_string()
+    }
+
+    fn default_gateway_rpm() -> u32 {
+        60
+    }
+
+    fn default_gateway_tpm() -> u32 {
+        100_000
+    }
+
+    fn default_gateway_max_in_flight() -> usize {
+        8
+    }
+
+    fn default_gateway_request_timeout_secs() -> u64 {
+        120
+    }
+
+    fn default_gateway_discovery_refresh_secs() -> u64 {
+        21_600
+    }
+
+    fn default_gateway_shutdown_grace_secs() -> u64 {
+        10
+    }
+
+    impl Default for GatewayConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                listen: default_gateway_listen(),
+                allow_non_loopback: false,
+                tls_cert_path: None,
+                tls_key_path: None,
+                allowed_keys: Vec::new(),
+                rpm: default_gateway_rpm(),
+                tpm: default_gateway_tpm(),
+                max_in_flight_per_upstream: default_gateway_max_in_flight(),
+                request_timeout_secs: default_gateway_request_timeout_secs(),
+                discovery_refresh_secs: default_gateway_discovery_refresh_secs(),
+                shutdown_grace_secs: default_gateway_shutdown_grace_secs(),
             }
         }
     }
@@ -3276,6 +3379,11 @@ pub mod config {
                     over.acp_server.clone()
                 } else {
                     base.acp_server.clone()
+                },
+                gateway: if over.gateway.enabled {
+                    over.gateway.clone()
+                } else {
+                    base.gateway.clone()
                 },
             }
         }
