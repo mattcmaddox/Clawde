@@ -355,10 +355,77 @@ Feature E (task undo / snapshots) is implemented in
   call (`resolve_command_provider`, diffs capped at 60K chars) — cached per
   session in `{transcript_dir}/{session}.checkpoints.json`, rendered under
   each checkpoint, raw file stats as the fallback.
-- **Tests**: 16 history tests (grouping, tool-result skipping, preview,
+- **Tests**: 17 history tests (grouping, tool-result skipping, preview,
   confirmed multi-prompt revert, description render + cache persistence +
-  no-provider fallback). `CLAWDE_HOME` mutation serialized on the crate
-  `CLAWDE_HOME_LOCK`; full workspace green, clippy `-D warnings` clean.
+  no-provider fallback, out-of-range reporting). `CLAWDE_HOME` mutation
+  serialized on the crate `CLAWDE_HOME_LOCK`; full workspace green, clippy
+  `-D warnings` clean.
+
+**Phase 1 audit (post-implementation) findings:**
+
+1. `/undo n` out of range said "Nothing to undo" (misleading) — now errors
+   "Cannot go back {n} prompts — this session has {count}", with a friendly
+   "no prompts yet" for empty sessions. Test: `undo_out_of_range_reports_prompt_count`.
+2. Confirmed-path patch collection now filters to `Role::Assistant` — a
+   stray non-assistant `snapshot_patch` could otherwise be reverted
+   invisibly and skew the preview count.
+3. Success message is n-aware ("since that prompt" for n > 1;
+   "/undo {n+1} goes back further").
+4. If the transcript has no message id at the undo boundary, files still
+   restore and a note explains the transcript was not branched (was silent).
+5. `checkpoints_lists_turns_newest_first` now runs under `TestHome` so the
+   description-cache probe cannot read a real `~/.clawde` or fire a live
+   generation call if a provider env key is present in CI.
+6. **Deliberate deviation**: the `/undo` confirmation shows per-turn file
+   lists, not full diffs (multi-turn diffs can be huge; `/snapshot <n>`
+   provides diffs). This reuses the `/checkpoints` data shape per spec
+   §4.5 item 3's intent.
+7. **Known limitation (shared with `/revert`, machinery-level)**: file
+   revert restores the pre-turn snapshot; a file the user edited after the
+   agent's turn is overwritten. The mandatory confirmation mitigates this
+   by showing the file list first.
+
+## 5b. Phase 2 status — IMPLEMENTED AND AUDITED
+
+Feature A (named presets / modes) is implemented for TUI/CLI sessions:
+
+- Typed `ModeDef` schema with `PlanKnobs`, `AskAmbiguityMode`, and
+  `CheckinCadence`; no type-erased configuration map.
+- Built-in `default`, `careful`, and `fast` presets. `careful` is the D5
+  starter: Plan permission posture, design-decision questions, and milestone
+  check-ins.
+- Custom JSON modes load from global `~/.clawde/modes/` and project
+  `.clawde/modes/`; project definitions override global definitions, which
+  override built-ins.
+- Persistent selection through `/config set mode <name>`, with
+  `/config get mode` and `/config unset mode`; `default` resets the selection.
+- Transient `mode:<name>` inline keyword, scoped to the latest user turn and
+  taking precedence over the persistent mode. Names may include letters,
+  digits, `-`, and `_`.
+- Preset config knobs apply at CLI startup while explicit CLI flags win.
+  Mode cadence/ambiguity behavior is injected as per-turn prompt guidance
+  using the existing `AskUserQuestion` tool; the orchestrator and safety
+  rails remain unchanged.
+- Presets can never silently select `BypassPermissions`.
+
+**Phase 2 audit findings and fixes:**
+
+1. The original CLI permission assignment unconditionally reset the effective
+   settings value to `Default`, which would have defeated a mode's Plan
+   posture; it now changes the value only when `--permission-mode` was
+   explicitly supplied.
+2. Inline mode scanning originally sliced a lowercased `String` at arbitrary
+   byte offsets and could panic on UTF-8 prompts; it now scans byte vectors and
+   includes a multibyte regression test.
+3. Project mode files were initially omitted; the resolver now merges
+   built-ins, global modes, and project modes with deterministic precedence.
+4. Unknown mode names are warned/ignored at startup and rejected by
+   `/config set mode`; no silent fallback changes agent behavior.
+5. Mode changes from `/config` apply to subsequent requests; the current
+   request's transient mode remains turn-scoped.
+
+**Verification:** core mode/keyword tests, query mode tests, commands config
+ tests, workspace tests, workspace check, and strict workspace Clippy pass.
 
 ## 6. Out of scope / explicitly not in v1
 

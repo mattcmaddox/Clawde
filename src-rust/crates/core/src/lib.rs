@@ -15,6 +15,13 @@
 pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
 
+// Named mode presets (bundles of config knobs + decision-rule posture).
+pub mod modes;
+pub use modes::{
+    all_modes, apply_mode, builtin_modes, find_mode, load_modes_dir, mode_prompt_block,
+    resolve_mode_block, AskAmbiguityMode, CheckinCadence, ModeDef, PlanKnobs,
+};
+
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
@@ -1528,6 +1535,12 @@ pub mod config {
         )]
         pub default_effort: Option<crate::effort::EffortLevel>,
         pub permission_mode: PermissionMode,
+        /// Active mode preset name (e.g. `"careful"`, `"fast"`), applied to
+        /// the effective config at session start and per-turn prompt guidance
+        /// in the query loop. `None` = current behavior. Per project (project
+        /// settings merge over global).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mode: Option<String>,
         pub theme: Theme,
         #[serde(default)]
         pub output_style: Option<String>,
@@ -3219,6 +3232,7 @@ pub mod config {
                 max_tokens: over.config.max_tokens.or(base.config.max_tokens),
                 default_effort: over.config.default_effort.or(base.config.default_effort),
                 permission_mode: over.config.permission_mode,
+                mode: over.config.mode.or(base.config.mode),
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
                 free_task_sort: over.config.free_task_sort.or(base.config.free_task_sort),

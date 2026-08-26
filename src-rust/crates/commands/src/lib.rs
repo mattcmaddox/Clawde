@@ -686,6 +686,27 @@ fn available_output_style_names() -> Vec<String> {
         .clone()
 }
 
+/// Names of all available mode presets (built-ins + user-defined disk modes).
+fn available_mode_names() -> Vec<String> {
+    // Cache the disk read per process lifetime — called on every keystroke
+    // while the user types /config mode arguments.
+    use std::sync::OnceLock;
+    static MODES: OnceLock<Vec<String>> = OnceLock::new();
+    MODES
+        .get_or_init(|| {
+            clawde_core::modes::all_modes_for_project(
+                &Settings::config_dir(),
+                &clawde_core::git_utils::project_root(
+                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                ),
+            )
+            .into_iter()
+            .map(|mode| mode.name)
+            .collect()
+        })
+        .clone()
+}
+
 fn split_command_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();

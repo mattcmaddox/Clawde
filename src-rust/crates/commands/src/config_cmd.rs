@@ -71,6 +71,11 @@ impl SlashCommand for ConfigCommand {
                 description: "Set the default reasoning effort".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "set mode".into(),
+                description: "Set the active mode preset".into(),
+                available: true,
+            });
         }
         if partial == "get" || partial.starts_with("get ") {
             completions.push(ArgCompletion {
@@ -98,6 +103,11 @@ impl SlashCommand for ConfigCommand {
                 description: "Show the default reasoning effort".into(),
                 available: true,
             });
+            completions.push(ArgCompletion {
+                value: "get mode".into(),
+                description: "Show the active mode preset".into(),
+                available: true,
+            });
         }
         if partial == "unset" || partial.starts_with("unset ") {
             completions.push(ArgCompletion {
@@ -113,6 +123,11 @@ impl SlashCommand for ConfigCommand {
             completions.push(ArgCompletion {
                 value: "unset default-effort".into(),
                 description: "Use the provider/model default effort".into(),
+                available: true,
+            });
+            completions.push(ArgCompletion {
+                value: "unset mode".into(),
+                description: "Reset to default behavior (no mode preset)".into(),
                 available: true,
             });
         }
@@ -160,6 +175,15 @@ impl SlashCommand for ConfigCommand {
                 });
             }
         }
+        if partial == "set mode" || partial.starts_with("set mode ") {
+            for mode in available_mode_names() {
+                completions.push(ArgCompletion {
+                    value: format!("set mode {mode}"),
+                    description: String::new(),
+                    available: true,
+                });
+            }
+        }
         // `set model` takes a free-form model ID that cannot be completed.
         // Show a dimmed placeholder hint while the value is still empty so the
         // popup says what goes next instead of repeating the key.
@@ -182,7 +206,7 @@ impl SlashCommand for ConfigCommand {
         if args.is_empty() || matches!(args, "show" | "get") {
             let json = serde_json::to_string_pretty(&ctx.config).unwrap_or_default();
             return CommandResult::Message(format!(
-                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <default|concise|explanatory|learning|formal|casual>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config set default-effort <none|minimal|low|medium|high|xhigh|max|ultracode>\n  /config unset <model|output-style|default-effort>",
+                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <default|concise|explanatory|learning|formal|casual>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config set default-effort <none|minimal|low|medium|high|xhigh|max|ultracode>\n  /config set mode <default|careful|fast|…>\n  /config unset <model|output-style|default-effort|mode>",
                 json
             ));
         }
@@ -208,6 +232,26 @@ impl SlashCommand for ConfigCommand {
                         .map(|level| level.as_str())
                         .unwrap_or("provider-default")
                 )),
+                "mode" => {
+                    let current = ctx.config.mode.as_deref().unwrap_or("default");
+                    let description = clawde_core::modes::all_modes_for_project(
+                        &Settings::config_dir(),
+                        &clawde_core::git_utils::project_root(&ctx.working_dir),
+                    )
+                    .iter()
+                    .find(|m| m.name == current)
+                    .map(|m| m.description.clone())
+                    .unwrap_or_default();
+                    CommandResult::Message(format!(
+                        "mode = {}{}",
+                        current,
+                        if description.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {description}")
+                        }
+                    ))
+                }
                 other => CommandResult::Error(format!("Unknown config key '{}'", other)),
             };
         }
@@ -260,6 +304,22 @@ impl SlashCommand for ConfigCommand {
                     CommandResult::ConfigChangeMessage(
                         new_config,
                         "Default effort reset to the provider/model default.".to_string(),
+                    )
+                }
+                "mode" => {
+                    let mut new_config = ctx.config.clone();
+                    new_config.mode = None;
+                    if let Err(err) = save_settings_mutation(|settings| settings.config.mode = None)
+                    {
+                        return CommandResult::Error(format!(
+                            "Failed to save configuration: {}",
+                            err
+                        ));
+                    }
+                    CommandResult::ConfigChangeMessage(
+                        new_config,
+                        "Mode reset to default behavior. Takes effect on the next request."
+                            .to_string(),
                     )
                 }
                 other => CommandResult::Error(format!("Unknown config key '{}'", other)),
@@ -392,7 +452,187 @@ impl SlashCommand for ConfigCommand {
                     ),
                 )
             }
+            "mode" => {
+                let normalized = value.trim().to_lowercase();
+                let modes = clawde_core::modes::all_modes_for_project(
+                    &Settings::config_dir(),
+                    &clawde_core::git_utils::project_root(&ctx.working_dir),
+                )
+                .into_iter()
+                .map(|mode| mode.name)
+                .collect::<Vec<_>>();
+                if normalized == "default" {
+                    // `default` is the reset, mirroring `/config set output-style default`.
+                    let mut new_config = ctx.config.clone();
+                    new_config.mode = None;
+                    if let Err(err) = save_settings_mutation(|settings| settings.config.mode = None)
+                    {
+                        return CommandResult::Error(format!(
+                            "Failed to save configuration: {}",
+                            err
+                        ));
+                    }
+                    return CommandResult::ConfigChangeMessage(
+                        new_config,
+                        "Mode reset to default behavior. Takes effect on the next request."
+                            .to_string(),
+                    );
+                }
+                if !modes.iter().any(|name| name == &normalized) {
+                    return CommandResult::Error(format!(
+                        "Unknown mode '{}'. Available modes: {}",
+                        value,
+                        modes.join(", ")
+                    ));
+                }
+                let mut new_config = ctx.config.clone();
+                new_config.mode = Some(normalized.clone());
+                if let Err(err) = save_settings_mutation(|settings| {
+                    settings.config.mode = Some(normalized.clone());
+                }) {
+                    return CommandResult::Error(format!("Failed to save configuration: {}", err));
+                }
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!(
+                        "Mode set to {}. Knobs apply on the next request; guidance applies per turn.",
+                        normalized
+                    ),
+                )
+            }
             other => CommandResult::Error(format!("Unknown config key '{}'", other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawde_core::cost::CostTracker;
+
+    /// Redirect `CLAWDE_HOME` to a fresh temp dir for the lifetime of the
+    /// guard, serialised on the shared crate lock (the /config mutations
+    /// write settings.json under the config dir).
+    struct TestHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _tmp: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let lock = crate::tests::CLAWDE_HOME_LOCK
+                .get_or_init(|| std::sync::Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os("CLAWDE_HOME");
+            let tmp = tempfile::tempdir().unwrap();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            TestHome {
+                _lock: lock,
+                _tmp: tmp,
+                prev,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLAWDE_HOME", v),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    fn make_ctx() -> CommandContext {
+        CommandContext {
+            config: clawde_core::config::Config::default(),
+            cost_tracker: CostTracker::new(),
+            messages: vec![],
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            provider_registry: None,
+            test_provider: None,
+            effort: None,
+            tool_use_tracker: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_mode_validates_and_persists() {
+        let _home = TestHome::new();
+        let mut ctx = make_ctx();
+        match ConfigCommand.execute("set mode careful", &mut ctx).await {
+            CommandResult::ConfigChangeMessage(cfg, msg) => {
+                assert_eq!(cfg.mode.as_deref(), Some("careful"));
+                assert!(msg.contains("Mode set to careful"), "{}", msg);
+            }
+            other => panic!("expected ConfigChangeMessage, got {:?}", other),
+        }
+        // Persisted to settings.json under the (redirected) config dir.
+        let settings = Settings::load_sync().expect("settings load");
+        assert_eq!(settings.config.mode.as_deref(), Some("careful"));
+    }
+
+    #[tokio::test]
+    async fn config_set_mode_rejects_unknown_name() {
+        let _home = TestHome::new();
+        let mut ctx = make_ctx();
+        match ConfigCommand.execute("set mode bogus", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("Unknown mode 'bogus'"), "{}", e);
+                assert!(
+                    e.contains("careful"),
+                    "error should list available modes: {}",
+                    e
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_mode_default_resets() {
+        let _home = TestHome::new();
+        let mut ctx = make_ctx();
+        let _ = ConfigCommand.execute("set mode fast", &mut ctx).await;
+        match ConfigCommand.execute("set mode default", &mut ctx).await {
+            CommandResult::ConfigChangeMessage(cfg, _) => {
+                assert_eq!(cfg.mode, None, "default resets the mode");
+            }
+            other => panic!("expected ConfigChangeMessage, got {:?}", other),
+        }
+        let settings = Settings::load_sync().expect("settings load");
+        assert_eq!(settings.config.mode, None);
+    }
+
+    #[tokio::test]
+    async fn config_get_mode_shows_current() {
+        let _home = TestHome::new();
+        let mut ctx = make_ctx();
+        let _ = ConfigCommand.execute("set mode careful", &mut ctx).await;
+        ctx.config.mode = Some("careful".to_string());
+        match ConfigCommand.execute("get mode", &mut ctx).await {
+            CommandResult::Message(m) => assert!(m.contains("mode = careful"), "{}", m),
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_unset_mode_resets() {
+        let _home = TestHome::new();
+        let mut ctx = make_ctx();
+        let _ = ConfigCommand.execute("set mode careful", &mut ctx).await;
+        match ConfigCommand.execute("unset mode", &mut ctx).await {
+            CommandResult::ConfigChangeMessage(cfg, _) => assert_eq!(cfg.mode, None),
+            other => panic!("expected ConfigChangeMessage, got {:?}", other),
+        }
+        let settings = Settings::load_sync().expect("settings load");
+        assert_eq!(settings.config.mode, None);
     }
 }

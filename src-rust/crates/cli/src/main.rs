@@ -835,6 +835,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Build effective config (CLI args override settings)
     let mut config = settings.effective_config();
+    // Apply the active mode preset (if any). CLI args below override preset
+    // knobs — explicit flags always win over the profile. An unknown mode
+    // name is reported and ignored rather than silently changing behavior.
+    if let Some(mode_name) = config.mode.clone() {
+        let modes = clawde_core::modes::all_modes_for_project(
+            &clawde_core::config::Settings::config_dir(),
+            &clawde_core::git_utils::project_root(&cwd),
+        );
+        match clawde_core::modes::find_mode(&modes, &mode_name) {
+            Some(mode_def) => clawde_core::modes::apply_mode(&mut config, mode_def),
+            None => eprintln!(
+                "Warning: unknown mode '{}' — ignoring. Available modes: {}",
+                mode_name,
+                modes
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
@@ -878,7 +899,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
-    } else {
+    } else if raw_args
+        .iter()
+        .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode="))
+    {
+        // Explicit --permission-mode wins over settings and the active mode
+        // preset. With no flag, keep the effective setting / preset value —
+        // the old unconditional reset to Default here silently discarded
+        // settings.json's `permissionMode` on every launch and would have
+        // defeated a preset's plan posture.
         config.permission_mode = cli.permission_mode.into();
     }
     config.additional_dirs = cli.add_dir.clone();
@@ -1269,6 +1298,12 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config =
         clawde_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
+    // Mode registry for per-turn guidance resolution (built-ins + user modes
+    // from <config_dir>/modes). `mode` itself was copied by from_config.
+    query_config.modes = Some(clawde_core::modes::all_modes_for_project(
+        &clawde_core::config::Settings::config_dir(),
+        &clawde_core::git_utils::project_root(&cwd),
+    ));
     query_config.max_turns = cli.max_turns;
     query_config.prompt_guard_enabled = cli.guard_prompt;
     query_config.system_prompt = Some(system_prompt);
@@ -5007,6 +5042,7 @@ async fn run_interactive(
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
+                        qcfg.mode = cmd_ctx.config.mode.clone();
                         qcfg.working_directory = Some(tool_ctx.working_dir.clone());
                         // The active-goal system-prompt addendum is now injected
                         // inside run_query_loop per turn (issue #230 / MI-3), so

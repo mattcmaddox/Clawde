@@ -126,6 +126,13 @@ pub struct QueryConfig {
     pub append_system_prompt: Option<String>,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
+    /// Persisted active mode preset name (e.g. `"careful"`). An inline
+    /// `mode:<name>` keyword in the latest user message overrides it for one
+    /// turn (see [`effective_mode_name_for_turn`]).
+    pub mode: Option<String>,
+    /// Mode registry for the session (built-ins + user-defined disk modes).
+    /// `None` falls back to the built-ins only (used by tests / sub-agents).
+    pub modes: Option<Vec<clawde_core::modes::ModeDef>>,
     pub working_directory: Option<PathBuf>,
     /// Effective session network isolation snapshot used by prompt assembly.
     /// Refreshed from the live session config before each query turn.
@@ -245,6 +252,8 @@ impl Default for QueryConfig {
             append_system_prompt: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            mode: None,
+            modes: None,
             working_directory: None,
             network_blocked: false,
             thinking_budget: None,
@@ -283,6 +292,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
@@ -307,6 +317,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
             memory_max_tokens: cfg.memory.max_tokens,
@@ -766,6 +777,21 @@ fn effective_output_style_for_turn(
     }
     // No inline persona keyword — keep the persistent selection.
     (config.output_style, config.output_style_prompt.clone())
+}
+
+/// Resolve the effective mode preset for this turn.
+///
+/// Mirrors [`effective_output_style_for_turn`]: an inline `mode:<name>`
+/// keyword in the most recent user message wins (transient — that turn only),
+/// otherwise the persisted `config.mode` stands. Checking only the *last*
+/// user message keeps the override scoped to the turn that asked for it.
+fn effective_mode_name_for_turn(config: &QueryConfig, messages: &[Message]) -> Option<String> {
+    if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
+        if let Some(name) = clawde_core::keywords::inline_mode_name(&last_user.get_all_text()) {
+            return Some(name.to_string());
+        }
+    }
+    config.mode.clone()
 }
 
 /// Materialize the bounded turn-change context from the shadow snapshot.
@@ -2303,6 +2329,29 @@ pub async fn run_query_loop(
                 effective_output_style_for_turn(config, messages.as_slice());
             patched.output_style = turn_output_style;
             patched.output_style_prompt = turn_output_style_prompt;
+
+            // Active-mode guidance for THIS turn. An inline `mode:<name>`
+            // keyword in the latest user message overrides the persisted mode
+            // transiently (used for this turn, then reverts); otherwise the
+            // persisted selection stands. The block is synthesized from the
+            // mode's cadence/ask knobs — prompt-level guidance only, the loop
+            // and safety rails are untouched (spec §7.2/§7.3).
+            if let Some(mode_name) = effective_mode_name_for_turn(config, messages.as_slice()) {
+                // `resolve_mode_block` itself falls back to the built-ins, so
+                // an empty registry (tests / sub-agents) still resolves the
+                // built-in mode names.
+                let block = clawde_core::modes::resolve_mode_block(
+                    config.modes.as_deref().unwrap_or(&[]),
+                    &mode_name,
+                );
+                if let Some(block) = block {
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{existing}\n\n{block}"),
+                            None => block,
+                        });
+                }
+            }
 
             build_system_prompt(&patched)
         };
@@ -4907,6 +4956,8 @@ mod tests {
             append_system_prompt: append.map(String::from),
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            mode: None,
+            modes: None,
             working_directory: None,
             network_blocked: false,
             memory_max_tokens: None,
@@ -6828,6 +6879,89 @@ mod tests {
         let msgs = vec![Message::user("rocky, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.unwrap().contains("Project Hail Mary"));
+    }
+
+    // ---- mode preset (transient vs persistent) ---------------------------
+
+    #[test]
+    fn inline_mode_keyword_applies_transiently_for_the_turn() {
+        // No persisted mode; an inline `mode:careful` selects it for this turn
+        // only.
+        let cfg = QueryConfig::default();
+        let msgs = vec![Message::user("mode:careful, review this design")];
+        assert_eq!(
+            effective_mode_name_for_turn(&cfg, &msgs).as_deref(),
+            Some("careful")
+        );
+
+        // Disk-defined names work through the same matcher.
+        let msgs = vec![Message::user("go mode:my-mode please")];
+        assert_eq!(
+            effective_mode_name_for_turn(&cfg, &msgs).as_deref(),
+            Some("my-mode")
+        );
+    }
+
+    #[test]
+    fn persisted_mode_stands_without_an_inline_keyword() {
+        let cfg = QueryConfig {
+            mode: Some("careful".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("just a plain request here please")];
+        assert_eq!(
+            effective_mode_name_for_turn(&cfg, &msgs).as_deref(),
+            Some("careful")
+        );
+    }
+
+    #[test]
+    fn inline_mode_overrides_persisted_mode_for_the_turn() {
+        // Persisted fast, but this turn asks for careful inline → careful wins
+        // transiently (precedence: transient keyword beats the preset).
+        let cfg = QueryConfig {
+            mode: Some("fast".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("mode:careful, do the wide refactor")];
+        assert_eq!(
+            effective_mode_name_for_turn(&cfg, &msgs).as_deref(),
+            Some("careful")
+        );
+    }
+
+    #[test]
+    fn mode_only_checks_the_last_user_message() {
+        // A mode keyword in an earlier turn does not linger onto a later
+        // plain turn (transient, like personas).
+        let cfg = QueryConfig::default();
+        let msgs = vec![
+            Message::user("mode:careful kick things off"),
+            Message::assistant("ok"),
+            Message::user("now just tidy the docs"),
+        ];
+        assert_eq!(effective_mode_name_for_turn(&cfg, &msgs), None);
+    }
+
+    #[test]
+    fn mode_prompt_block_resolves_from_registry_and_builtins() {
+        // Careful synthesizes guidance; fast (Off + Rare) injects nothing.
+        let careful = clawde_core::modes::resolve_mode_block(&[], "careful")
+            .expect("careful should have a block");
+        assert!(careful.contains("## Active Mode"));
+        assert!(careful.contains("AskUserQuestion"));
+        assert!(careful.contains("milestone"));
+        assert!(clawde_core::modes::resolve_mode_block(&[], "fast").is_none());
+        assert!(clawde_core::modes::resolve_mode_block(&[], "default").is_none());
+        // A registry overrides built-ins with the same name.
+        let mut custom = clawde_core::modes::ModeDef::builtin_default();
+        custom.name = "careful".to_string();
+        custom.checkin_cadence = clawde_core::modes::CheckinCadence::Rare;
+        custom.ask_on_ambiguity = clawde_core::modes::AskAmbiguityMode::Off;
+        assert!(
+            clawde_core::modes::resolve_mode_block(&[custom], "careful").is_none(),
+            "custom careful with Off+Rare injects nothing"
+        );
     }
 
     struct AllowAllHandler;

@@ -33,6 +33,13 @@ pub enum InlineEffect {
     /// [`crate::output_styles`]). The reserved name `"default"` means "reset to
     /// no persona for this turn" — that is what `normal` does.
     Persona(&'static str),
+    /// Activate the named mode preset for the turn (e.g. `mode:careful`).
+    ///
+    /// Unlike personas, mode names are resolved dynamically (built-in +
+    /// user-defined disk modes), so the static registry only carries the
+    /// built-in names for highlighting; the query loop uses
+    /// [`inline_mode_name`] for the actual resolution.
+    Mode(&'static str),
 }
 
 /// One inline keyword and the effect it triggers.
@@ -57,7 +64,7 @@ impl InlineKeyword {
     pub fn persona_style(&self) -> Option<&'static str> {
         match self.effect {
             InlineEffect::Persona(name) => Some(name),
-            InlineEffect::Effort(_) => None,
+            InlineEffect::Effort(_) | InlineEffect::Mode(_) => None,
         }
     }
 }
@@ -87,6 +94,16 @@ pub const INLINE_KEYWORDS: &[InlineKeyword] = &[
         keyword: "normal",
         effect: InlineEffect::Persona("default"),
         gradient: false,
+    },
+    InlineKeyword {
+        keyword: "mode:careful",
+        effect: InlineEffect::Mode("careful"),
+        gradient: true,
+    },
+    InlineKeyword {
+        keyword: "mode:fast",
+        effect: InlineEffect::Mode("fast"),
+        gradient: true,
     },
 ];
 
@@ -136,6 +153,52 @@ pub fn find_inline_keyword(word: &str) -> Option<&'static InlineKeyword> {
     INLINE_KEYWORDS
         .iter()
         .find(|kw| kw.keyword.eq_ignore_ascii_case(word))
+}
+
+/// The transient mode selected by an inline `mode:<name>` keyword in `text`,
+/// if any.
+///
+/// Matches whole-word `mode:<name>` tokens case-insensitively; the name is
+/// `[A-Za-z0-9_-]+` (so `mode:careful` and `mode:my-mode` both work). When
+/// several appear, the one whose last occurrence is **latest** in the text
+/// wins (mirrors [`inline_persona_style`]). The name is resolved against the
+/// session's mode registry by the caller — disk-defined modes work even
+/// though they are not in the static [`INLINE_KEYWORDS`] registry.
+pub fn inline_mode_name(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    // Lowercase into a byte vector (like `keyword_match_ranges`) so scanning
+    // never slices a String at a non-char-boundary byte when the text contains
+    // multi-byte UTF-8 (e.g. '—'): `Vec<u8>` slicing has no boundary checks.
+    let lower = bytes.to_ascii_lowercase();
+    const PREFIX: &[u8] = b"mode:";
+    let mut best: Option<(usize, &str)> = None;
+    let mut i = 0usize;
+    while i < lower.len() {
+        if i + PREFIX.len() <= lower.len() && &lower[i..i + PREFIX.len()] == PREFIX {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if left_ok {
+                let name_start = i + PREFIX.len();
+                let mut end = name_start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'-'
+                        || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+                // The name run is pure ASCII, so `name_start..end` is a char
+                // boundary in `text` — slicing the original String is safe.
+                if end > name_start && right_ok {
+                    best = Some((i, &text[name_start..end]));
+                }
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    best.map(|(_, name)| name)
 }
 
 /// The transient persona selected by inline keywords in `text`, if any.
@@ -253,5 +316,73 @@ mod tests {
         );
         // ...and vice-versa.
         assert_eq!(inline_persona_style("normal then rocky"), Some("rocky"));
+    }
+
+    #[test]
+    fn registry_covers_builtin_mode_keywords() {
+        assert_eq!(
+            find_inline_keyword("mode:careful").unwrap().effect,
+            InlineEffect::Mode("careful")
+        );
+        assert_eq!(
+            find_inline_keyword("mode:fast").unwrap().effect,
+            InlineEffect::Mode("fast")
+        );
+        // Mode keywords are not personas.
+        assert_eq!(
+            find_inline_keyword("mode:careful").unwrap().persona_style(),
+            None
+        );
+        assert!(find_inline_keyword("mode:careful").unwrap().gradient);
+    }
+
+    #[test]
+    fn inline_mode_name_picks_mode_keyword() {
+        assert_eq!(inline_mode_name("do it mode:careful"), Some("careful"));
+        assert_eq!(inline_mode_name("Mode:FAST now"), Some("FAST"));
+        assert_eq!(inline_mode_name("mode:my-mode please"), Some("my-mode"));
+        assert_eq!(inline_mode_name("plain text here"), None);
+        // `mode:` with no name does not match.
+        assert_eq!(inline_mode_name("insert mode: now"), None);
+        // No left boundary: `xmode:careful` is not a mode keyword.
+        assert_eq!(inline_mode_name("xmode:careful"), None);
+        // The name token is greedy `[A-Za-z0-9_-]+`: `mode:carefulx` parses
+        // as the (unknown) mode "carefulx" — resolution happens downstream.
+        assert_eq!(inline_mode_name("mode:carefulx"), Some("carefulx"));
+    }
+
+    #[test]
+    fn inline_mode_name_last_wins() {
+        // A trailing keyword overrides an earlier one (mirrors personas).
+        assert_eq!(
+            inline_mode_name("mode:fast then mode:careful"),
+            Some("careful")
+        );
+        assert_eq!(
+            inline_mode_name("mode:careful then mode:fast"),
+            Some("fast")
+        );
+    }
+
+    #[test]
+    fn inline_mode_name_ignored_by_persona_resolver() {
+        // The persona resolver must not report mode keywords as personas.
+        assert_eq!(inline_persona_style("mode:careful please"), None);
+    }
+
+    #[test]
+    fn inline_mode_name_survives_multibyte_utf8() {
+        // Regression: scanning must not slice at a non-char-boundary byte when
+        // the prompt contains multi-byte characters (e.g. '—').
+        assert_eq!(
+            inline_mode_name("summarize — mode:careful now"),
+            Some("careful")
+        );
+        assert_eq!(
+            inline_mode_name("→ do it mode:fast"),
+            Some("fast"),
+            "multibyte before the keyword must not panic"
+        );
+        assert_eq!(inline_mode_name("—plain—"), None);
     }
 }
