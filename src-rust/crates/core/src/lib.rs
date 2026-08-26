@@ -2282,6 +2282,21 @@ pub mod config {
         /// entry must name a real built-in tool; no wildcard in v1.
         #[serde(default, rename = "builtinTools", alias = "builtin_tools")]
         pub builtin_tools: Vec<String>,
+        /// Max in-memory response sessions retained for `previous_response_id`
+        /// continuation (D5 — ephemeral only, no disk).
+        #[serde(
+            default = "default_gateway_session_capacity",
+            rename = "sessionCapacity",
+            alias = "session_capacity"
+        )]
+        pub session_capacity: usize,
+        /// TTL for retained response sessions, in seconds.
+        #[serde(
+            default = "default_gateway_session_ttl_secs",
+            rename = "sessionTtlSecs",
+            alias = "session_ttl_secs"
+        )]
+        pub session_ttl_secs: u64,
     }
 
     fn default_gateway_listen() -> String {
@@ -2320,6 +2335,14 @@ pub mod config {
         "allow-readonly".to_string()
     }
 
+    fn default_gateway_session_capacity() -> usize {
+        256
+    }
+
+    fn default_gateway_session_ttl_secs() -> u64 {
+        3600
+    }
+
     impl Default for GatewayConfig {
         fn default() -> Self {
             Self {
@@ -2340,6 +2363,8 @@ pub mod config {
                 permission_mode: default_gateway_permission_mode(),
                 workspace_paths: Vec::new(),
                 builtin_tools: Vec::new(),
+                session_capacity: default_gateway_session_capacity(),
+                session_ttl_secs: default_gateway_session_ttl_secs(),
             }
         }
     }

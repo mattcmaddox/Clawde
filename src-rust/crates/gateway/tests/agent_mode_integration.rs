@@ -228,6 +228,7 @@ fn state_with(config: EffectiveGatewayConfig, registry: ProviderRegistry) -> Gat
         active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
         force_cancel: tokio_util::sync::CancellationToken::new(),
+        sessions: Arc::new(clawde_gateway::session::SessionStore::new(16, 3600)),
         config,
     }
 }

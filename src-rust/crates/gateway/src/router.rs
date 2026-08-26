@@ -16,11 +16,16 @@ use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{run_agent_loop, AgentConfig, AgentFailure, LoopEvent};
+use crate::agent::{run_agent_loop, AgentConfig, AgentFailure, AgentOutcome, LoopEvent};
 use crate::auth::{validate_bearer, RateLimiter};
 use crate::config::EffectiveGatewayConfig;
 use crate::context::OverflowCompactor;
 use crate::error::{map_agent_failure, map_provider_error, GatewayError};
+use crate::responses::{
+    new_response_id, outcome_status, parse_responses_request, response_skeleton, responses_object,
+    ParsedResponsesRequest, ResponsesItemBuilder,
+};
+use crate::session::{output_items_to_messages, ResponseSession, SessionStore};
 use crate::tool_exec::GatewayToolExecutor;
 use crate::translate::{
     agent_outcome_to_response, agent_stream_chunks, parse_chat_completion_request,
@@ -41,6 +46,8 @@ pub struct GatewayState {
     pub in_flight: Arc<Semaphore>,
     /// Cancellation token used to force active streams after the grace period.
     pub force_cancel: tokio_util::sync::CancellationToken,
+    /// Ephemeral response sessions for `previous_response_id` continuation (D5).
+    pub sessions: Arc<SessionStore>,
 }
 
 /// Per-request agent-loop machinery. Present (agent mode) only when the
@@ -54,50 +61,102 @@ struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Chat completions: agent mode activates only with a client cap AND a
+    /// built-in-mapped tool, or an explicit gateway `agentMode` (relay stays
+    /// the default, R9). Mixed turns yield everything (relay semantics).
     fn build(
         cfg: &EffectiveGatewayConfig,
         parsed: &ParsedRequest,
         cancel: CancellationToken,
     ) -> Option<Self> {
-        let executor = GatewayToolExecutor::new(
-            cfg.permission_mode,
-            &cfg.workspace_paths,
-            &session_id(),
-            &cfg.builtin_tools,
-            cancel.clone(),
-        );
+        let executor = build_executor(cfg, cancel.clone());
         let client_cap = parsed.max_tool_calls.filter(|m| *m > 0);
         let has_builtin = parsed
             .provider_request
             .tools
             .iter()
             .any(|t| executor.is_builtin(&t.name));
-        // Relay mode stays the default: agent mode needs a client cap AND a
-        // built-in-mapped tool, or an explicit gateway `agentMode: true`.
-        let active = cfg.agent_mode || (client_cap.is_some() && has_builtin);
-        if !active {
+        if !(cfg.agent_mode || client_cap.is_some() && has_builtin) {
             return None;
         }
         let max_tool_calls = client_cap.unwrap_or(cfg.max_tool_calls).max(1);
+        Some(Self::assemble(
+            cfg,
+            executor,
+            max_tool_calls,
+            parsed.parallel_tool_calls,
+            None,
+            true, // yield_mixed_turns (chat relay semantics)
+            &parsed.provider_request.model,
+            cancel,
+        ))
+    }
+
+    /// Responses: the loop is the engine (no relay), so every request runs it
+    /// with the configured cap default. Mixed turns execute internal calls and
+    /// yield only external ones (`yield_mixed_turns: false`).
+    fn build_responses(
+        cfg: &EffectiveGatewayConfig,
+        parsed: &ParsedResponsesRequest,
+        cancel: CancellationToken,
+    ) -> Self {
+        let executor = build_executor(cfg, cancel.clone());
+        let max_tool_calls = parsed
+            .max_tool_calls
+            .filter(|m| *m > 0)
+            .unwrap_or(cfg.max_tool_calls)
+            .max(1);
+        Self::assemble(
+            cfg,
+            executor,
+            max_tool_calls,
+            parsed.parallel_tool_calls,
+            parsed.allowed_tools.clone(),
+            false,
+            &parsed.provider_request.model,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        cfg: &EffectiveGatewayConfig,
+        executor: GatewayToolExecutor,
+        max_tool_calls: u32,
+        parallel_tool_calls: bool,
+        allowed_tools: Option<Vec<String>>,
+        yield_mixed_turns: bool,
+        model: &str,
+        cancel: CancellationToken,
+    ) -> Self {
         let config = AgentConfig {
             max_tool_calls,
             max_turns: max_tool_calls + 1,
             timeout_secs: cfg.request_timeout_secs,
-            parallel_tool_calls: parsed.parallel_tool_calls,
+            parallel_tool_calls,
+            yield_mixed_turns,
+            allowed_tools,
             ..AgentConfig::default()
         };
-        let compactor = OverflowCompactor::new(
-            parsed.provider_request.model.clone(),
-            4096,
-            cfg.request_timeout_secs,
-        );
-        Some(Self {
+        let compactor = OverflowCompactor::new(model.to_string(), 4096, cfg.request_timeout_secs);
+        Self {
             executor: Arc::new(executor),
             config,
             cancel,
             compactor,
-        })
+        }
     }
+}
+
+/// Build the per-request executor from gateway config.
+fn build_executor(cfg: &EffectiveGatewayConfig, cancel: CancellationToken) -> GatewayToolExecutor {
+    GatewayToolExecutor::new(
+        cfg.permission_mode,
+        &cfg.workspace_paths,
+        &session_id(),
+        &cfg.builtin_tools,
+        cancel,
+    )
 }
 
 /// A per-request session id for shell-state isolation in the tool context.
@@ -112,6 +171,7 @@ fn session_id() -> String {
 pub fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{id}", get(get_model))
         .route("/healthz", get(healthz))
@@ -175,6 +235,7 @@ pub fn resolve_model(
 }
 
 /// Estimate request tokens from the body for TPM accounting.
+/// Handles both chat completions (`messages`) and Responses (`input`).
 fn estimate_tokens(body: &Value) -> u64 {
     let mut total = 0usize;
     if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
@@ -189,10 +250,37 @@ fn estimate_tokens(body: &Value) -> u64 {
             }
         }
     }
+    // Responses `input`: string or item array.
+    if let Some(input) = body.get("input") {
+        match input {
+            Value::String(s) => total += s.len() / 4,
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(text) = item.get("content").and_then(|v| v.as_str()) {
+                        total += text.len() / 4;
+                    }
+                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                        total += args.len() / 4;
+                    }
+                    if let Some(out) = item.get("output").and_then(|v| v.as_str()) {
+                        total += out.len() / 4;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ins) = body.get("instructions").and_then(|v| v.as_str()) {
+        total += ins.len() / 4;
+    }
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         total += serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0) / 4;
     }
-    if let Some(mt) = body.get("max_tokens").and_then(|v| v.as_u64()) {
+    if let Some(mt) = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(|v| v.as_u64())
+    {
         total += mt as usize;
     }
     total as u64
@@ -332,6 +420,193 @@ async fn chat_completions(
             .record_usage(&key, tokens_estimate, resp.usage.total());
         axum::Json(to_openai_response(&resp)).into_response()
     }
+}
+
+/// `POST /v1/responses` — the agent-native surface (Open Responses).
+///
+/// Every request runs the agent loop (no relay); internal tool calls execute
+/// server-side and stream as items, external calls yield as `function_call`
+/// items. `previous_response_id` hydrates the transcript from the in-memory
+/// session store (D5), serialized per session (D11). Sessions are retained for
+/// both `store: true` and `store: false` (D5).
+async fn responses(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let key = match auth_key(&headers, &state.config.allowed_keys) {
+        Ok(k) => k,
+        Err(_) => {
+            return GatewayError::unauthorized(
+                "Missing or invalid bearer key. Set Authorization: Bearer <key>.",
+            )
+            .into_response()
+        }
+    };
+
+    if state.draining.load(Ordering::Relaxed) {
+        return GatewayError::service_unavailable("Gateway is shutting down").into_response();
+    }
+
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return GatewayError::invalid_request(format!("invalid JSON: {e}")).into_response()
+        }
+    };
+    let parsed = match parse_responses_request(&body) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+
+    let tokens_estimate = estimate_tokens(&body);
+    match state.limiter.check(&key, tokens_estimate) {
+        crate::auth::RateLimitOutcome::Allowed => {}
+        crate::auth::RateLimitOutcome::RpmExhausted(secs) => {
+            return GatewayError::rate_limited("Rate limit exceeded (requests/min)", secs)
+                .into_response()
+        }
+        crate::auth::RateLimitOutcome::TpmExhausted(secs) => {
+            return GatewayError::rate_limited("Rate limit exceeded (tokens/min)", secs)
+                .into_response()
+        }
+    }
+
+    let (provider, wire_model) =
+        match resolve_model(&state.registry, &parsed.provider_request.model) {
+            Ok((p, m)) => (p, m),
+            Err(e) => return e.into_response(),
+        };
+    let mut req = parsed.provider_request.clone();
+    req.model = wire_model.clone();
+
+    // Session continuation (D5/D11): sample over prev.input + prev.output +
+    // new input; serialize concurrent continuations on the same id.
+    let mut messages = parsed.provider_request.messages.clone();
+    let continuation_guard = if let Some(prev_id) = &parsed.previous_response_id {
+        match state.sessions.get(prev_id) {
+            Some(prev) => {
+                let guard = state.sessions.continuation_lock(prev_id).await;
+                let mut transcript = prev.input.clone();
+                transcript.extend(output_items_to_messages(&prev.output));
+                transcript.extend(messages.clone());
+                messages = transcript;
+                Some(guard)
+            }
+            None => return GatewayError::previous_response_not_found(prev_id).into_response(),
+        }
+    } else {
+        None
+    };
+    let _continuation_guard = continuation_guard;
+    req.messages = messages;
+
+    let cancel = CancellationToken::new();
+    let rt = AgentRuntime::build_responses(&state.config, &parsed, cancel.clone());
+    let response_id = new_response_id();
+
+    if parsed.stream {
+        handle_responses_stream(
+            state,
+            provider,
+            req,
+            &parsed,
+            response_id,
+            key,
+            tokens_estimate,
+            rt,
+        )
+        .await
+    } else {
+        let permit = match state.in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return GatewayError::service_unavailable("Gateway concurrency limit is closed")
+                    .into_response()
+            }
+        };
+        let result = run_responses_loop(provider, req, &rt, cancel, rt.compactor.clone()).await;
+        drop(permit);
+        match result {
+            Ok((outcome, builder)) => {
+                let (status, reason) = outcome_status(&outcome);
+                state
+                    .limiter
+                    .record_usage(&key, tokens_estimate, outcome.usage.total());
+                state.sessions.put(ResponseSession {
+                    id: response_id.clone(),
+                    input: parsed.provider_request.messages.clone(),
+                    output: builder.items.clone(),
+                    created_at: std::time::Instant::now(),
+                });
+                axum::Json(responses_object(
+                    &response_id,
+                    &wire_model,
+                    builder.items,
+                    &outcome.usage,
+                    status,
+                    reason,
+                    None,
+                ))
+                .into_response()
+            }
+            Err(failure) => {
+                state.limiter.record_usage(&key, tokens_estimate, 0);
+                let error = json!({
+                    "message": failure.message,
+                    "type": "server_error",
+                    "param": null,
+                    "code": null,
+                });
+                axum::Json(responses_object(
+                    &response_id,
+                    &wire_model,
+                    builder_items_or_empty(&failure),
+                    &clawde_core::types::UsageInfo::default(),
+                    "failed",
+                    None,
+                    Some(error),
+                ))
+                .into_response()
+            }
+        }
+    }
+}
+
+/// Non-stream loop run with event collection for the Responses builder.
+async fn run_responses_loop(
+    provider: Arc<dyn LlmProvider>,
+    req: ProviderRequest,
+    rt: &AgentRuntime,
+    cancel: CancellationToken,
+    compactor: OverflowCompactor,
+) -> Result<(AgentOutcome, ResponsesItemBuilder), AgentFailure> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
+    let outcome = run_agent_loop(
+        provider,
+        req,
+        rt.executor.clone(),
+        rt.config.clone(),
+        cancel,
+        Some(tx),
+        Some(compactor),
+    )
+    .await;
+    let mut builder = ResponsesItemBuilder::new();
+    while let Ok(ev) = rx.try_recv() {
+        builder.push(&ev);
+    }
+    builder.finalize();
+    outcome.map(|o| (o, builder))
+}
+
+/// Partial items for a failed response (D10: fail with the partial transcript).
+fn builder_items_or_empty(failure: &AgentFailure) -> Vec<Value> {
+    failure
+        .partial
+        .as_deref()
+        .map(|m| vec![json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": m.get_all_text()}]})])
+        .unwrap_or_default()
 }
 
 /// Streaming handler: relay `create_message_stream` -> SSE chunks, or the
@@ -546,6 +821,161 @@ async fn handle_agent_stream(
     Sse::new(sse).into_response()
 }
 
+/// Agent-mode Responses streaming: semantic events (Open Responses) stream
+/// incrementally as the loop runs — items, text deltas, tool calls AND their
+/// outputs all surface (unlike chat completions' silent turns, D1). Terminates
+/// with `response.completed` / `response.incomplete` / `response.failed` and
+/// `[DONE]`. A client disconnect drops the generator, which cancels the
+/// per-request token so in-flight tool execution is aborted (D16).
+#[allow(clippy::too_many_arguments)]
+async fn handle_responses_stream(
+    state: GatewayState,
+    provider: Arc<dyn LlmProvider>,
+    req: ProviderRequest,
+    parsed: &ParsedResponsesRequest,
+    response_id: String,
+    key: String,
+    tokens_estimate: u64,
+    rt: AgentRuntime,
+) -> Response {
+    let AgentRuntime {
+        executor,
+        config,
+        cancel,
+        compactor,
+    } = rt;
+    let active = state.active_streams.clone();
+    let limiter = state.limiter.clone();
+    let force_cancel = state.force_cancel.clone();
+    let sessions = state.sessions.clone();
+    let model = req.model.clone();
+    let input_messages = parsed.provider_request.messages.clone();
+
+    let sse = async_stream::stream! {
+        let _guard = ActiveStreamGuard(active);
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+
+        let skeleton = response_skeleton(&response_id, &model);
+        yield Ok::<_, std::convert::Infallible>(Event::default().json_data(json!({
+            "type": "response.created",
+            "response": skeleton,
+        })).unwrap_or_default());
+        yield Ok::<_, std::convert::Infallible>(Event::default().json_data(json!({
+            "type": "response.in_progress",
+            "response": response_skeleton(&response_id, &model),
+        })).unwrap_or_default());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
+        let mut builder = ResponsesItemBuilder::new();
+        let run = run_agent_loop(
+            provider,
+            req,
+            executor,
+            config,
+            cancel.clone(),
+            Some(tx),
+            Some(compactor),
+        );
+        tokio::pin!(run);
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                result = &mut run => break result,
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            for chunk in builder.push(&ev) {
+                                if let Ok(e) = Event::default().json_data(chunk) {
+                                    yield Ok::<_, std::convert::Infallible>(e);
+                                }
+                            }
+                        }
+                        // All senders dropped but run not yet ready: yield so
+                        // the loop future can make progress.
+                        None => tokio::task::yield_now().await,
+                    }
+                }
+                _ = force_cancel.clone().cancelled_owned() => {
+                    break Err(AgentFailure::cancelled());
+                }
+            }
+        };
+        while let Ok(ev) = rx.try_recv() {
+            for chunk in builder.push(&ev) {
+                if let Ok(e) = Event::default().json_data(chunk) {
+                    yield Ok::<_, std::convert::Infallible>(e);
+                }
+            }
+        }
+        for chunk in builder.finalize() {
+            if let Ok(e) = Event::default().json_data(chunk) {
+                yield Ok::<_, std::convert::Infallible>(e);
+            }
+        }
+
+        match &outcome {
+            Ok(outcome) => {
+                limiter.record_usage(&key, tokens_estimate, outcome.usage.total());
+                let (status, reason) = outcome_status(outcome);
+                let obj = responses_object(
+                    &response_id,
+                    &model,
+                    builder.items.clone(),
+                    &outcome.usage,
+                    status,
+                    reason,
+                    None,
+                );
+                sessions.put(ResponseSession {
+                    id: response_id.clone(),
+                    input: input_messages,
+                    output: builder.items.clone(),
+                    created_at: std::time::Instant::now(),
+                });
+                let event_type = if status == "completed" {
+                    "response.completed"
+                } else {
+                    "response.incomplete"
+                };
+                if let Ok(e) = Event::default().json_data(json!({"type": event_type, "response": obj.clone()})) {
+                    yield Ok::<_, std::convert::Infallible>(e);
+                }
+                // Terminal event with the full response object (Open Responses).
+                if let Ok(e) = Event::default().json_data(json!({"type": "response.done", "response": obj})) {
+                    yield Ok::<_, std::convert::Infallible>(e);
+                }
+            }
+            Err(failure) => {
+                limiter.record_usage(&key, tokens_estimate, 0);
+                let error = json!({
+                    "message": failure.message,
+                    "type": "server_error",
+                    "param": null,
+                    "code": null,
+                });
+                let obj = responses_object(
+                    &response_id,
+                    &model,
+                    builder.items.clone(),
+                    &clawde_core::types::UsageInfo::default(),
+                    "failed",
+                    None,
+                    Some(error),
+                );
+                if let Ok(e) = Event::default().json_data(json!({"type": "response.failed", "response": obj.clone()})) {
+                    yield Ok::<_, std::convert::Infallible>(e);
+                }
+                if let Ok(e) = Event::default().json_data(json!({"type": "response.done", "response": obj})) {
+                    yield Ok::<_, std::convert::Infallible>(e);
+                }
+            }
+        }
+        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(sse).into_response()
+}
+
 /// Drop guard that cancels the per-request token when the SSE stream is
 /// dropped (client disconnect / shutdown), so in-flight tool execution stops.
 struct CancelOnDrop(CancellationToken);
@@ -702,6 +1132,10 @@ pub async fn run_gateway(config: &EffectiveGatewayConfig) -> anyhow::Result<()> 
         active_streams: coordinator.active_streams.clone(),
         in_flight: Arc::new(Semaphore::new(config.max_in_flight_per_upstream.max(1))),
         force_cancel: coordinator.force_cancel.clone(),
+        sessions: Arc::new(SessionStore::new(
+            config.session_capacity,
+            config.session_ttl_secs,
+        )),
     };
 
     let app = build_router(state);

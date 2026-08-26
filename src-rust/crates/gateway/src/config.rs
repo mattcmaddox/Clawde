@@ -34,6 +34,10 @@ pub struct EffectiveGatewayConfig {
     pub workspace_paths: Vec<PathBuf>,
     /// Replacement list for the default built-in tool surface.
     pub builtin_tools: Vec<String>,
+    /// Max in-memory response sessions retained for continuation (D5).
+    pub session_capacity: usize,
+    /// TTL for retained response sessions, in seconds.
+    pub session_ttl_secs: u64,
 }
 
 impl EffectiveGatewayConfig {
@@ -70,6 +74,8 @@ impl EffectiveGatewayConfig {
             permission_mode,
             workspace_paths: base.workspace_paths.clone(),
             builtin_tools: base.builtin_tools.clone(),
+            session_capacity: base.session_capacity.max(1),
+            session_ttl_secs: base.session_ttl_secs,
         })
     }
 }

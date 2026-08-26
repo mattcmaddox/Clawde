@@ -36,6 +36,7 @@ const TOOL_RESULT_TRUNCATE_KEEP: usize = 120;
 ///
 /// The loop owns one of these; each `ContextOverflow` advances one stage.
 /// Two stages max: truncate tool results, then summarise the head.
+#[derive(Clone)]
 pub struct OverflowCompactor {
     model: String,
     max_summary_tokens: u32,

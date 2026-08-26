@@ -197,6 +197,10 @@ pub struct AgentConfig {
     pub yield_mixed_turns: bool,
     /// Whether internal tool calls execute in parallel (up to 4) or serially.
     pub parallel_tool_calls: bool,
+    /// Hard per-request tool restriction (D6): when present, any tool call to
+    /// a name outside the list is rejected with a `tool_error` observation so
+    /// the model can self-correct. Case-insensitive.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl Default for AgentConfig {
@@ -209,6 +213,7 @@ impl Default for AgentConfig {
             no_progress_stop_streak: 3,
             yield_mixed_turns: true,
             parallel_tool_calls: true,
+            allowed_tools: None,
         }
     }
 }
@@ -387,7 +392,49 @@ pub async fn run_agent_loop(
             });
         }
 
-        let (internal, external) = executor.partition_calls(&calls);
+        // D6: `allowed_tools` is a hard constraint. Calls outside the list are
+        // rejected with a tool_error observation and never execute nor yield;
+        // the loop continues so the model can self-correct.
+        let (allowed, denied) = partition_by_allowed(&calls, config.allowed_tools.as_deref());
+        if !denied.is_empty() {
+            let mut results: Vec<ContentBlock> = Vec::with_capacity(denied.len());
+            for call in &denied {
+                if let ContentBlock::ToolUse { id, name, .. } = call {
+                    emit(
+                        &event_tx,
+                        LoopEvent::ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: Value::Null,
+                        },
+                    );
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: clawde_core::types::ToolResultContent::Text(format!(
+                            "tool_error: tool '{name}' is not in allowed_tools for this request"
+                        )),
+                        is_error: Some(true),
+                    });
+                }
+            }
+            for call in &denied {
+                if let ContentBlock::ToolUse { id, name, .. } = call {
+                    emit(
+                        &event_tx,
+                        LoopEvent::ToolExecuted {
+                            id: id.clone(),
+                            name: name.clone(),
+                            result: "tool is not in allowed_tools for this request".to_string(),
+                            is_error: true,
+                        },
+                    );
+                }
+            }
+            messages.push(Message::user_blocks(results));
+            continue;
+        }
+
+        let (internal, external) = executor.partition_calls(&allowed);
 
         if !external.is_empty() {
             if config.yield_mixed_turns {
@@ -419,7 +466,9 @@ pub async fn run_agent_loop(
                     pending_external_calls: calls,
                 });
             }
-            // Responses: execute internal calls, then yield external.
+            // Responses: execute internal calls, then yield external. The
+            // yielded calls surface as `ExternalToolCall` events so the item
+            // transcript (and stream) carries them for the client to execute.
             let results = execute_internal(
                 executor.clone(),
                 internal.clone(),
@@ -431,6 +480,21 @@ pub async fn run_agent_loop(
             .await;
             tool_calls_executed += internal.len() as u32;
             messages.push(Message::user_blocks(results));
+            for call in &external {
+                if let ContentBlock::ToolUse {
+                    id, name, input, ..
+                } = call
+                {
+                    emit(
+                        &event_tx,
+                        LoopEvent::ExternalToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        },
+                    );
+                }
+            }
             return Ok(AgentOutcome {
                 status: AgentStatus::Yielding,
                 message: msg,
@@ -764,6 +828,29 @@ fn append_thinking(
     {
         existing.push_str(&thinking);
     }
+}
+
+/// Split calls into (allowed, denied) per the `allowed_tools` hard constraint
+/// (D6). With no restriction, everything is allowed. Case-insensitive.
+fn partition_by_allowed(
+    calls: &[ContentBlock],
+    allowed_tools: Option<&[String]>,
+) -> (Vec<ContentBlock>, Vec<ContentBlock>) {
+    let Some(allowed_tools) = allowed_tools else {
+        return (calls.to_vec(), Vec::new());
+    };
+    let mut allowed = Vec::new();
+    let mut denied = Vec::new();
+    for call in calls {
+        let ok = matches!(call, ContentBlock::ToolUse { name, .. }
+            if allowed_tools.iter().any(|t| t.eq_ignore_ascii_case(name)));
+        if ok {
+            allowed.push(call.clone());
+        } else {
+            denied.push(call.clone());
+        }
+    }
+    (allowed, denied)
 }
 
 /// Collect `ToolUse` blocks from an assistant message.

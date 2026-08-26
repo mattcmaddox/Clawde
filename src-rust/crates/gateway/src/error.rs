@@ -73,6 +73,19 @@ impl GatewayError {
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::new(StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", message)
     }
+
+    /// `400 previous_response_not_found` — a `previous_response_id` referenced
+    /// a session that was evicted or expired (D5/D6 per Open Responses).
+    pub fn previous_response_not_found(id: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error".to_string(),
+            message: format!("Previous response with id '{id}' not found"),
+            param: Some("previous_response_id".to_string()),
+            code: Some("previous_response_not_found".to_string()),
+            retry_after_secs: None,
+        }
+    }
 }
 
 impl IntoResponse for GatewayError {
