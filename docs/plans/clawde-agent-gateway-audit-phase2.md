@@ -49,14 +49,71 @@ deliverables that were missing tests (golden Open Responses transcript,
    added `responses_evicted_session_returns_not_found` (capacity-1 store,
    LRU eviction, 400 with `previous_response_not_found`).
 
+## Live SDK smoke tests (plan Phase 2 step 11) — done 2026-08-26
+
+Ran against a debug gateway on `free/groq` (free cascade; Groq + Gemini
+fallback) with openai-python 3.3.1 and openai-agents 0.22.0:
+
+- `client.chat.completions.create` — relay round-trip.
+- Chat completions agent mode — server-side `Read` executed, final answer
+  returned, no yielded `tool_calls` (activation via `extra_body={
+  "max_tool_calls": N}` since the knob is not in the SDK schema).
+- `client.responses.create` — items + `completed`, `previous_response_id`
+  continuation hydrated (`prev.input + prev.output + new input`).
+- openai-agents `Runner.run_sync` — client-side `function_tool` over the
+  gateway's Responses API (model passed as `OpenAIResponsesModel` instance;
+  the SDK's provider-prefix resolver rejects the gateway's `free/` routes).
+- curl SSE transcript — full semantic event sequence incl. `response.done`
+  and `[DONE]`.
+
+Two real edge cases surfaced only under live traffic, both fixed:
+
+1. **`MALFORMED_FUNCTION_CALL` stop reason** (Gemini fallback): the model
+   emitted a ToolUse block whose arguments never streamed, with
+   `Other("MALFORMED_FUNCTION_CALL")` instead of `ToolUse`. The loop treated
+   it as a completed text turn and returned a `completed` response with
+   **empty output**. Fix: any turn containing ToolUse blocks routes through
+   the tool path regardless of stop reason; the null-input call becomes a
+   `malformed_arguments` error observation (E6) and the model self-corrects.
+   Regression test: `malformed_stop_reason_routes_tool_blocks_through_execution`.
+2. **Empty terminal turns** (free-cascade upstreams returning 0-token
+   completions or thinking-only turns): the loop completed "successfully"
+   with no content. Fix: a terminal turn with no text and no tool calls
+   (thinking is not an answer) retries once, bounded like D10. Tests:
+   `empty_terminal_turn_retries_once`, `thinking_only_terminal_turn_retries`,
+   `empty_terminal_turn_does_not_retry_twice`.
+
 ## Deferred (not defects)
 
-- **SDK smoke tests** (plan Phase 2 step 11: openai-python, Agents SDK, curl
-  SSE transcript) — manual, require a live gateway; defer to Phase 3 hardening.
 - **D15 opt-in semantic prompt-injection guard** — plan Phase 3 candidate by
   design; do not add before the docs land.
+
+## Post-SDK full-feature audit
+
+Edge-case sweep across the committed feature (E1-E12, config knobs, error
+wire fidelity):
+
+- E1 cap notice, E4 tool_choice passthrough, E10 retry placement (D10 retry
+  lives in `dispatch_turn`; FreeProvider handles upstream cooldowns) — all
+  verified against code and tests.
+- `parallel_tool_calls: false` → serial execution (`parallel_concurrency`
+  returns 1); `tool_result_budget` (50K) truncation tested.
+- Responses error path wire fidelity: `response.failed` + `response.done` +
+  `[DONE]` on loop failure; 400/401/429/404/503/504 mappings carry
+  `Retry-After` from provider errors and agent failures.
+- New-fix interaction check: malformed-stop (routes ToolUse turns to the tool
+  path) and empty-turn retry (turns with neither text nor ToolUse) are
+  disjoint — no interaction bug.
+
+One fidelity gap fixed: **`n: 0` was accepted** by both parsers (OpenAI
+spec requires `n >= 1`; their API returns 400). Both chat and Responses
+parsers now reject `n == 0` with `400 n must be at least 1`; tests
+`rejects_n_zero` added on each surface.
 
 ## Verdict
 
 16/16 decisions verified; the one gap (D3 budget) was a small bounded fix.
-No architecture drift. The phase boundary is clean for Phase 3 (docs + hygiene).
+No architecture drift. Live SDK smoke tests passed and surfaced two
+additional loop hardening fixes (malformed stop reasons, empty terminal
+retry), now regression-tested. Post-SDK edge sweep found one wire-fidelity
+nit (`n: 0`), fixed with tests on both surfaces.

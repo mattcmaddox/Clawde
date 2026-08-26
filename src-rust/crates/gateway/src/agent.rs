@@ -246,6 +246,8 @@ pub async fn run_agent_loop(
     let mut last_upstream: Option<String> = None;
     let mut last_signature: Option<String> = None;
     let mut no_progress_streak: u32 = 0;
+    // Bounded retries for empty terminal turns (see the retry below).
+    let mut empty_retries: u32 = 0;
 
     loop {
         if cancel.is_cancelled() {
@@ -346,6 +348,25 @@ pub async fn run_agent_loop(
             last_upstream = Some(u.clone());
         }
 
+        // A terminal turn with no answer (no text, no tool calls — only
+        // thinking or nothing at all) is a degenerate completion, not a
+        // reply: free-cascade upstreams sometimes return a 0-token response
+        // or reason without answering. Retry once (bounded, like D10's
+        // in-turn transient retry) instead of silently completing empty.
+        let has_answer = match &msg.content {
+            MessageContent::Text(t) => !t.is_empty(),
+            MessageContent::Blocks(blocks) => blocks.iter().any(|b| match b {
+                ContentBlock::Text { text } => !text.is_empty(),
+                ContentBlock::ToolUse { .. } => true,
+                // Thinking blocks are not an answer.
+                _ => false,
+            }),
+        };
+        if stop_reason != StopReason::ToolUse && !has_answer && empty_retries < 1 {
+            empty_retries += 1;
+            continue;
+        }
+
         messages.push(msg.clone());
         emit(
             &event_tx,
@@ -354,19 +375,8 @@ pub async fn run_agent_loop(
             },
         );
 
-        if stop_reason != StopReason::ToolUse {
-            return Ok(AgentOutcome::completed(
-                msg,
-                usage,
-                stop_reason,
-                turns,
-                tool_calls_executed,
-                last_upstream,
-            ));
-        }
-
         let calls = extract_tool_uses(&msg);
-        if calls.is_empty() {
+        if calls.is_empty() && stop_reason == StopReason::ToolUse {
             // Degenerate: model signalled ToolUse but emitted none.
             return Ok(AgentOutcome::completed(
                 msg,
@@ -377,6 +387,25 @@ pub async fn run_agent_loop(
                 last_upstream,
             ));
         }
+        if calls.is_empty() {
+            // Ordinary terminal text turn (incl. provider-specific stop
+            // reasons like `Other("MALFORMED_FUNCTION_CALL")` that emitted
+            // no blocks at all).
+            return Ok(AgentOutcome::completed(
+                msg,
+                usage,
+                stop_reason,
+                turns,
+                tool_calls_executed,
+                last_upstream,
+            ));
+        }
+        // A turn that emitted ToolUse blocks routes through the tool path
+        // even when the stop reason is not `ToolUse` — e.g. Gemini's
+        // `MALFORMED_FUNCTION_CALL`, where the block started but its
+        // arguments never streamed (input stays `Null`). Executing such a
+        // call yields an error observation the model can self-correct from,
+        // instead of silently completing with empty content.
 
         // D9: cap exhaustion force-stops; never execute, never yield.
         if tool_calls_executed >= config.max_tool_calls {
@@ -961,6 +990,9 @@ mod tests {
         error: Option<ProviderError>,
         /// Upstream attribution for this turn (cascade-drift tests).
         upstream: Option<String>,
+        /// Override the streamed stop reason (e.g. provider-specific
+        /// `Other("MALFORMED_FUNCTION_CALL")`).
+        stop_override: Option<StopReason>,
     }
 
     impl MockTurn {
@@ -971,6 +1003,7 @@ mod tests {
                 thinking: None,
                 error: None,
                 upstream: None,
+                stop_override: None,
             }
         }
 
@@ -985,6 +1018,7 @@ mod tests {
                 thinking: None,
                 error: None,
                 upstream: None,
+                stop_override: None,
             }
         }
 
@@ -995,6 +1029,7 @@ mod tests {
                 thinking: None,
                 error: None,
                 upstream: None,
+                stop_override: None,
             }
         }
 
@@ -1005,6 +1040,24 @@ mod tests {
                 thinking: None,
                 error: Some(err),
                 upstream: None,
+                stop_override: None,
+            }
+        }
+
+        /// A turn whose streamed stop reason is not `ToolUse` even though it
+        /// emitted a ToolUse block (Gemini `MALFORMED_FUNCTION_CALL`).
+        fn malformed_tool_call(name: &str, id: &str) -> Self {
+            Self {
+                tool_calls: vec![MockToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: Value::Null,
+                }],
+                text: String::new(),
+                thinking: None,
+                error: None,
+                upstream: None,
+                stop_override: Some(StopReason::Other("MALFORMED_FUNCTION_CALL".to_string())),
             }
         }
     }
@@ -1129,11 +1182,14 @@ mod tests {
                 events.push(Ok(StreamEvent::ContentBlockStop { index: next_index }));
             }
 
-            let stop = if turn.tool_calls.is_empty() {
-                StopReason::EndTurn
-            } else {
-                StopReason::ToolUse
-            };
+            let stop = turn
+                .stop_override
+                .clone()
+                .unwrap_or(if turn.tool_calls.is_empty() {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::ToolUse
+                });
             events.push(Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(stop),
                 usage: Some(UsageInfo {
@@ -1476,6 +1532,7 @@ mod tests {
                 thinking: Some("weak model reasoning".to_string()),
                 error: None,
                 upstream: Some("groq".to_string()),
+                stop_override: None,
             },
             MockTurn {
                 tool_calls: vec![read_call("c2", "/nonexistent/b")],
@@ -1483,6 +1540,7 @@ mod tests {
                 thinking: Some("strong model reasoning".to_string()),
                 error: None,
                 upstream: Some("cline".to_string()),
+                stop_override: None,
             },
             MockTurn {
                 tool_calls: Vec::new(),
@@ -1490,6 +1548,7 @@ mod tests {
                 thinking: None,
                 error: None,
                 upstream: Some("cline".to_string()),
+                stop_override: None,
             },
         ]);
         let out = run(
@@ -1578,6 +1637,99 @@ mod tests {
                     if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { is_error: Some(true), .. }))
             )
         }));
+    }
+
+    #[test]
+    fn malformed_stop_reason_routes_tool_blocks_through_execution() {
+        // Gemini's `MALFORMED_FUNCTION_CALL`: a ToolUse block whose arguments
+        // never streamed (input Null) with a non-ToolUse stop reason. The
+        // loop must execute it as an error observation (E6) and continue,
+        // not silently complete with empty content.
+        let mock = provider(vec![
+            MockTurn::malformed_tool_call("Read", "c1"),
+            MockTurn::text("the call was malformed, I will not retry"),
+        ]);
+        let out = run(
+            mock.clone(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out.status, AgentStatus::Completed);
+        // The loop re-dispatched after the malformed call (2 dispatches) and
+        // the final message carries the recovery text, not empty content.
+        assert!(!out.message.get_all_text().is_empty());
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
+        let received = mock.received.lock().unwrap();
+        assert!(received[1].iter().any(|m| {
+            matches!(
+                &m.content,
+                MessageContent::Blocks(blocks)
+                    if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { is_error: Some(true), .. }))
+            )
+        }));
+    }
+
+    #[test]
+    fn empty_terminal_turn_retries_once() {
+        // An upstream returning a completely empty completion (no blocks at
+        // all, EndTurn) must not silently complete with nothing: the loop
+        // retries once and serves the next dispatch's real answer.
+        let mock = provider(vec![MockTurn::text(""), MockTurn::text("the real answer")]);
+        let out = run(
+            mock.clone(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out.status, AgentStatus::Completed);
+        assert_eq!(out.message.get_all_text(), "the real answer");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn thinking_only_terminal_turn_retries() {
+        // A turn with thinking blocks but no text and no tool calls is not
+        // an answer; the loop retries once and serves the next dispatch.
+        let mock = provider(vec![
+            MockTurn {
+                tool_calls: Vec::new(),
+                text: String::new(),
+                thinking: Some("deep thoughts".to_string()),
+                error: None,
+                upstream: None,
+                stop_override: None,
+            },
+            MockTurn::text("here is the answer"),
+        ]);
+        let out = run(
+            mock.clone(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out.status, AgentStatus::Completed);
+        assert_eq!(out.message.get_all_text(), "here is the answer");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn empty_terminal_turn_does_not_retry_twice() {
+        // Two consecutive empty completions: the retry is bounded to one, so
+        // the loop completes (empty) on the second rather than spinning.
+        let mock = provider(vec![
+            MockTurn::text(""),
+            MockTurn::text(""),
+            MockTurn::text("unused"),
+        ]);
+        let out = run(
+            mock.clone(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out.status, AgentStatus::Completed);
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

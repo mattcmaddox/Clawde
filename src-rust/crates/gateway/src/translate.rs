@@ -87,8 +87,11 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         .and_then(|v| v.as_str())
         .and_then(clawde_core::effort::EffortLevel::from_str);
 
-    // n > 1 unsupported in v1.
+    // n must be >= 1; v1 additionally rejects n > 1.
     let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    if n == 0 {
+        return Err(GatewayError::invalid_request("n must be at least 1"));
+    }
     if n > 1 {
         return Err(GatewayError::invalid_request(
             "n > 1 is not supported by the gateway (v1)",
@@ -965,6 +968,13 @@ mod tests {
     fn rejects_n_greater_than_one() {
         let mut body = request_body();
         body["n"] = json!(2);
+        assert!(parse_chat_completion_request(&body).is_err());
+    }
+
+    #[test]
+    fn rejects_n_zero() {
+        let mut body = request_body();
+        body["n"] = json!(0);
         assert!(parse_chat_completion_request(&body).is_err());
     }
 
