@@ -1532,4 +1532,445 @@ mod tests {
         assert!(report.results.is_empty());
         assert_eq!(report.attempt, 0);
     }
+
+    // ------------------------------------------------------------------
+    // file_lint_command tests
+    // ------------------------------------------------------------------
+
+    fn python_project(lint_cmds: Vec<&str>) -> clawde_tools::detect_project::ProjectInfo {
+        clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::Python,
+            test_commands: vec![],
+            lint_commands: lint_cmds.into_iter().map(String::from).collect(),
+            build_command: None,
+            package_manager: None,
+        }
+    }
+
+    fn ts_project() -> clawde_tools::detect_project::ProjectInfo {
+        clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::TypeScript,
+            test_commands: vec![],
+            lint_commands: vec!["eslint .".to_string()],
+            build_command: None,
+            package_manager: None,
+        }
+    }
+
+    fn js_project() -> clawde_tools::detect_project::ProjectInfo {
+        clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::JavaScript,
+            test_commands: vec![],
+            lint_commands: vec![],
+            build_command: None,
+            package_manager: None,
+        }
+    }
+
+    fn rust_project() -> clawde_tools::detect_project::ProjectInfo {
+        clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::Rust,
+            test_commands: vec![],
+            lint_commands: vec!["cargo clippy".to_string()],
+            build_command: None,
+            package_manager: None,
+        }
+    }
+
+    #[test]
+    fn file_lint_command_python_ruff_when_no_mypy() {
+        let info = python_project(vec!["ruff check ."]);
+        let dir = tempfile::tempdir().unwrap();
+        let result = file_lint_command(&std::path::PathBuf::from("src/main.py"), &info, dir.path());
+        let (label, cmd) = result.unwrap();
+        assert!(label.starts_with("ruff:"), "label: {label}");
+        assert!(cmd.starts_with("ruff check "), "cmd: {cmd}");
+        assert!(cmd.contains("src/main.py"));
+    }
+
+    #[test]
+    fn file_lint_command_python_mypy_when_configured() {
+        let info = python_project(vec!["mypy ."]);
+        let dir = tempfile::tempdir().unwrap();
+        let result = file_lint_command(
+            &std::path::PathBuf::from("lib/models.pyi"),
+            &info,
+            dir.path(),
+        );
+        let (label, cmd) = result.unwrap();
+        assert!(label.starts_with("mypy:"), "label: {label}");
+        assert!(cmd.starts_with("mypy "), "cmd: {cmd}");
+        assert!(cmd.contains("lib/models.pyi"));
+    }
+
+    #[test]
+    fn file_lint_command_python_ruff_for_pyi_extension() {
+        // .pyi files should be treated the same as .py
+        let info = python_project(vec!["ruff check ."]);
+        let dir = tempfile::tempdir().unwrap();
+        let result = file_lint_command(
+            &std::path::PathBuf::from("types stubs.pyi"),
+            &info,
+            dir.path(),
+        );
+        assert!(result.is_some());
+        let (label, cmd) = result.unwrap();
+        assert!(label.starts_with("ruff:"));
+        assert!(cmd.contains("types stubs.pyi"));
+    }
+
+    #[test]
+    fn file_lint_command_python_skips_non_py_extension() {
+        let info = python_project(vec!["ruff check ."]);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("README.md"), &info, dir.path(),).is_none()
+        );
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("setup.toml"), &info, dir.path(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_typescript_eslint_with_config() {
+        let info = ts_project();
+        let dir = tempfile::tempdir().unwrap();
+        // Create a flat eslint config so has_eslint_config returns true
+        std::fs::write(dir.path().join("eslint.config.js"), "").unwrap();
+        let result = file_lint_command(&std::path::PathBuf::from("src/App.tsx"), &info, dir.path());
+        let (label, cmd) = result.unwrap();
+        assert!(label.starts_with("eslint:"), "label: {label}");
+        assert!(cmd.starts_with("eslint "), "cmd: {cmd}");
+        assert!(cmd.contains("src/App.tsx"));
+    }
+
+    #[test]
+    fn file_lint_command_typescript_skip_without_config() {
+        let info = ts_project();
+        let dir = tempfile::tempdir().unwrap();
+        // No eslint config → should skip
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("src/index.ts"), &info, dir.path(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_javascript_eslint_with_legacy_config() {
+        let info = js_project();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc.json"), "{}").unwrap();
+        let result = file_lint_command(&std::path::PathBuf::from("utils.js"), &info, dir.path());
+        let (label, cmd) = result.unwrap();
+        assert!(label.starts_with("eslint:"));
+        assert!(cmd.contains("utils.js"));
+    }
+
+    #[test]
+    fn file_lint_command_javascript_mjs_skip_without_config() {
+        let info = js_project();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("worker.mjs"), &info, dir.path(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_javascript_cjs_with_config() {
+        let info = js_project();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eslint.config.mjs"), "").unwrap();
+        let result = file_lint_command(&std::path::PathBuf::from("lib/old.cjs"), &info, dir.path());
+        assert!(result.is_some());
+        let (_, cmd) = result.unwrap();
+        assert!(cmd.contains("lib/old.cjs"));
+    }
+
+    #[test]
+    fn file_lint_command_javascript_skips_non_js_extension() {
+        let info = js_project();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eslint.config.js"), "").unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("README.md"), &info, dir.path(),).is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_rust_always_none() {
+        let info = rust_project();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("src/main.rs"), &info, dir.path(),)
+                .is_none()
+        );
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("lib/utils.rs"), &info, dir.path(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_go_always_none() {
+        let info = clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::Go,
+            test_commands: vec![],
+            lint_commands: vec!["go vet ./...".to_string()],
+            build_command: None,
+            package_manager: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("main.go"), &info, dir.path(),).is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_no_extension_is_none() {
+        let info = python_project(vec!["ruff check ."]);
+        let dir = tempfile::tempdir().unwrap();
+        // File with no extension (e.g. Makefile, LICENSE)
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("Makefile"), &info, dir.path(),).is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_unknown_language_is_none() {
+        let info = clawde_tools::detect_project::ProjectInfo {
+            language: clawde_tools::detect_project::ProjectLanguage::Unknown("kotlin".into()),
+            test_commands: vec![],
+            lint_commands: vec![],
+            build_command: None,
+            package_manager: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            file_lint_command(&std::path::PathBuf::from("src/Main.kt"), &info, dir.path(),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn file_lint_command_path_with_spaces() {
+        let info = python_project(vec!["ruff check ."]);
+        let dir = tempfile::tempdir().unwrap();
+        let result = file_lint_command(
+            &std::path::PathBuf::from("src/my file.py"),
+            &info,
+            dir.path(),
+        );
+        let (_, cmd) = result.unwrap();
+        assert!(cmd.contains("src/my file.py"));
+    }
+
+    // ------------------------------------------------------------------
+    // has_eslint_config tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn has_eslint_config_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_flat_js() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eslint.config.js"), "").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_flat_mjs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("eslint.config.mjs"), "").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_legacy_dotfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc"), "").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_legacy_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc.json"), "{}").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_legacy_yml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc.yml"), "").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_legacy_js() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc.js"), "module.exports={}").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_legacy_cjs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eslintrc.cjs"), "module.exports={}").unwrap();
+        assert!(has_eslint_config(dir.path()));
+    }
+
+    #[test]
+    fn has_eslint_config_ignores_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join(".prettierrc"), "").unwrap();
+        assert!(!has_eslint_config(dir.path()));
+    }
+
+    // ------------------------------------------------------------------
+    // lint_edited_files integration tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn lint_edited_files_empty_files_returns_escalate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = default_config();
+        let report = lint_edited_files(&[], &cfg, dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Escalate);
+        assert_eq!(report.headline, "Linting disabled or nothing edited");
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn lint_edited_files_auto_lint_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = default_config();
+        cfg.auto_lint = false;
+        let files = vec![std::path::PathBuf::from("main.py")];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Escalate);
+        assert_eq!(report.headline, "Linting disabled or nothing edited");
+    }
+
+    #[test]
+    fn lint_edited_files_rust_files_skip_no_per_file_linter() {
+        // Rust has no cheap per-file linter; the result should be Escalate
+        // (no per-file linter applies) rather than attempting cargo clippy.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = default_config();
+        let files = vec![std::path::PathBuf::from("src/main.rs")];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Escalate);
+        assert_eq!(report.headline, "No per-file linter applies");
+    }
+
+    #[test]
+    fn lint_edited_files_mixed_file_types_reports_applicable() {
+        // A mix of .rs (skipped) and .py (skipped if no ruff installed or
+        // Escalate if no lint command matches) — the key assertion is that
+        // Rust files are NOT turned into a cargo clippy call.
+        let dir = tempfile::tempdir().unwrap();
+        // Write a dummy Cargo.toml so detect_project_info returns Rust
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"t\"").unwrap();
+        let cfg = default_config();
+        let files = vec![
+            std::path::PathBuf::from("src/main.rs"),
+            std::path::PathBuf::from("src/lib.rs"),
+        ];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Escalate);
+        // Ensure no cargo clippy was invoked (results should be empty)
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn lint_edited_files_python_runs_ruff() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a pyproject.toml so detect_project_info returns Python
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname=\"t\"").unwrap();
+        // Create the file to lint
+        std::fs::write(dir.path().join("hello.py"), "x = 1\n").unwrap();
+        let cfg = default_config();
+        let files = vec![std::path::PathBuf::from("hello.py")];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        // ruff may or may not be installed; if installed, we get a Pass or
+        // Fixable result; if not, run_check reports a non-zero exit (Fixable).
+        // Either way, the report should contain exactly one result labelled
+        // "ruff:hello.py" and never reference cargo/clippy.
+        assert_eq!(report.results.len(), 1, "results: {:?}", report.results);
+        assert!(
+            report.results[0].label.starts_with("ruff:"),
+            "label: {}",
+            report.results[0].label
+        );
+        assert!(report.results[0].label.contains("hello.py"));
+        // The headline should reflect the actual outcome (pass or failure)
+        assert!(!report.headline.is_empty());
+    }
+
+    #[test]
+    fn lint_edited_files_ts_with_eslint_config_runs_eslint() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a package.json so detect_project_info returns TypeScript
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"name\":\"t\",\"devDependencies\":{\"typescript\":\"*\"}}",
+        )
+        .unwrap();
+        // Create an eslint config so has_eslint_config returns true
+        std::fs::write(dir.path().join("eslint.config.js"), "").unwrap();
+        // Create the file to lint
+        std::fs::write(dir.path().join("index.ts"), "export {}\n").unwrap();
+        let cfg = default_config();
+        let files = vec![std::path::PathBuf::from("index.ts")];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.results.len(), 1, "results: {:?}", report.results);
+        assert!(
+            report.results[0].label.starts_with("eslint:"),
+            "label: {}",
+            report.results[0].label
+        );
+        assert!(report.results[0].label.contains("index.ts"));
+    }
+
+    #[test]
+    fn lint_edited_files_ts_without_eslint_config_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        // TypeScript project but no eslint config → nothing runs
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"name\":\"t\",\"devDependencies\":{\"typescript\":\"*\"}}",
+        )
+        .unwrap();
+        let cfg = default_config();
+        let files = vec![std::path::PathBuf::from("index.ts")];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.verdict, VerifyVerdict::Escalate);
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn lint_edited_files_multiple_python_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname=\"t\"").unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), "y = 2\n").unwrap();
+        let cfg = default_config();
+        let files = vec![
+            std::path::PathBuf::from("a.py"),
+            std::path::PathBuf::from("b.py"),
+        ];
+        let report = lint_edited_files(&files, &cfg, dir.path()).unwrap();
+        assert_eq!(report.results.len(), 2, "results: {:?}", report.results);
+        let labels: Vec<&str> = report.results.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.iter().any(|l| l.contains("a.py")));
+        assert!(labels.iter().any(|l| l.contains("b.py")));
+    }
 }
