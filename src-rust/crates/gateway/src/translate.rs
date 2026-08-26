@@ -28,6 +28,12 @@ pub struct ParsedRequest {
     pub include_usage: bool,
     /// `n` — number of choices. v1 rejects `n > 1`.
     pub n: u32,
+    /// Agent loop cap from the client (`max_tool_calls`). `None`/`0` keeps
+    /// the gateway in relay mode unless `agentMode` is enabled.
+    pub max_tool_calls: Option<u32>,
+    /// Client `parallel_tool_calls` (default true). When false, internal tool
+    /// calls execute serially.
+    pub parallel_tool_calls: bool,
 }
 
 /// Parse an OpenAI chat completion request body into a [`ProviderRequest`].
@@ -104,6 +110,17 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         json!({})
     };
 
+    // Agent mode knobs. max_tool_calls of 0 is treated as "no agent loop"
+    // (relay), matching the activation rule in the router.
+    let max_tool_calls = body
+        .get("max_tool_calls")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let parallel_tool_calls = body
+        .get("parallel_tool_calls")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     Ok(ParsedRequest {
         provider_request: ProviderRequest {
             model,
@@ -123,6 +140,8 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         stream,
         include_usage,
         n,
+        max_tool_calls,
+        parallel_tool_calls,
     })
 }
 
@@ -332,6 +351,175 @@ pub fn to_openai_response(resp: &ProviderResponse) -> Value {
         }],
         "usage": usage_to_openai(&resp.usage),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Agent-mode response translation (chat completions wire shape)
+// ---------------------------------------------------------------------------
+
+/// Non-streaming agent response: the final assistant message from the loop,
+/// with tool calls executed server-side invisible to the client. External
+/// (yielded) calls surface as `tool_calls` with `finish_reason: tool_calls`;
+/// cap/no-progress force-stops return a clean `finish_reason: stop` and never
+/// yield pending calls (D9). Usage is the aggregate across turns.
+pub fn agent_outcome_to_response(outcome: &crate::agent::AgentOutcome, model: &str) -> Value {
+    use crate::agent::AgentStatus;
+    let blocks = match &outcome.message.content {
+        MessageContent::Blocks(b) => b.clone(),
+        MessageContent::Text(t) => vec![ContentBlock::Text { text: t.clone() }],
+    };
+    let (content, mut tool_calls, reasoning) = blocks_to_message(&blocks);
+    let finish_reason = match outcome.status {
+        AgentStatus::Completed => stop_reason_to_openai(&outcome.stop_reason),
+        AgentStatus::Yielding => "tool_calls",
+        AgentStatus::CapExhausted | AgentStatus::NoProgress => "stop",
+        AgentStatus::Failed | AgentStatus::Cancelled => "stop", // unreachable (Err path)
+    };
+    if matches!(
+        outcome.status,
+        AgentStatus::CapExhausted | AgentStatus::NoProgress
+    ) {
+        tool_calls = None;
+    }
+
+    let message = json!({ "role": "assistant", "content": content });
+    let mut message = message.as_object().cloned().unwrap_or_default();
+    if let Some(tc) = tool_calls {
+        message.insert("tool_calls".to_string(), tc);
+    }
+    if let Some(rc) = reasoning {
+        message.insert("reasoning_content".to_string(), Value::String(rc));
+    }
+
+    json!({
+        "id": agent_chunk_id(),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage_to_openai(&outcome.usage),
+    })
+}
+
+/// Agent-mode SSE chunks: only the final turn's events render (D1 silent
+/// intermediate turns). Internal tool events (`ToolCall`/`ToolExecuted`) are
+/// dropped; external (yielded) calls stream as tool-call deltas exactly as
+/// relay mode does. One terminal chunk, shared `created` timestamp, aggregate
+/// usage chunk only when the client asked for it.
+pub fn agent_stream_chunks(
+    outcome: &crate::agent::AgentOutcome,
+    events: &[crate::agent::LoopEvent],
+    include_usage: bool,
+    model: &str,
+) -> Vec<Value> {
+    use crate::agent::{AgentStatus, LoopEvent};
+
+    let last_start = events
+        .iter()
+        .rposition(|e| matches!(e, LoopEvent::TurnStart { .. }))
+        .unwrap_or(0);
+    let segment = &events[last_start..];
+
+    let id = agent_chunk_id();
+    let created = chrono::Utc::now().timestamp();
+    let mut chunks = vec![json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": null},
+            "finish_reason": null,
+        }]
+    })];
+
+    let mut tool_idx = 0usize;
+    for ev in segment {
+        match ev {
+            LoopEvent::TextDelta { text } => chunks.push(json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+            })),
+            LoopEvent::ThinkingDelta { thinking } => chunks.push(json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"reasoning_content": thinking}, "finish_reason": null}]
+            })),
+            LoopEvent::ExternalToolCall {
+                id: call_id,
+                name,
+                input,
+            } => {
+                chunks.push(json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": tool_idx,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                }));
+                let args = if input.is_null() {
+                    "{}".to_string()
+                } else {
+                    input.to_string()
+                };
+                chunks.push(json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": tool_idx,
+                                "function": {"arguments": args},
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                }));
+                tool_idx += 1;
+            }
+            // Internal tool events, turn bookkeeping, and compaction notices
+            // never surface on the chat-completions wire (D1).
+            _ => {}
+        }
+    }
+
+    let finish_reason = match outcome.status {
+        AgentStatus::Completed => stop_reason_to_openai(&outcome.stop_reason),
+        AgentStatus::Yielding => "tool_calls",
+        AgentStatus::CapExhausted | AgentStatus::NoProgress => "stop",
+        AgentStatus::Failed | AgentStatus::Cancelled => "stop", // unreachable (Err path)
+    };
+    chunks.push(json!({
+        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+    }));
+
+    if include_usage {
+        chunks.push(json!({
+            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [],
+            "usage": usage_to_openai(&outcome.usage),
+        }));
+    }
+    chunks
+}
+
+/// Synthetic id for agent-mode responses (the loop owns the transcript, so
+/// there is no upstream message id to echo).
+fn agent_chunk_id() -> String {
+    format!("chatcmpl-agent-{}", chrono::Utc::now().timestamp())
 }
 
 /// Convert `ContentBlock`s into OpenAI message fields.
@@ -716,6 +904,33 @@ mod tests {
         } else {
             panic!("expected blocks");
         }
+    }
+
+    #[test]
+    fn parses_agent_mode_knobs() {
+        let mut body = request_body();
+        body["max_tool_calls"] = json!(5);
+        body["parallel_tool_calls"] = json!(false);
+        let parsed = parse_chat_completion_request(&body).unwrap();
+        assert_eq!(parsed.max_tool_calls, Some(5));
+        assert!(!parsed.parallel_tool_calls);
+    }
+
+    #[test]
+    fn agent_knobs_default_when_absent() {
+        let parsed = parse_chat_completion_request(&request_body()).unwrap();
+        assert_eq!(parsed.max_tool_calls, None);
+        assert!(parsed.parallel_tool_calls);
+    }
+
+    #[test]
+    fn zero_max_tool_calls_is_relay() {
+        let mut body = request_body();
+        body["max_tool_calls"] = json!(0);
+        let parsed = parse_chat_completion_request(&body).unwrap();
+        // 0 is filtered to None at the router level; the parser keeps the raw
+        // value so the activation rule stays in one place.
+        assert_eq!(parsed.max_tool_calls, Some(0));
     }
 
     #[test]

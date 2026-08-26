@@ -77,7 +77,8 @@ fn main() -> anyhow::Result<()> {
         if let Some(key) = tls_key {
             base.tls_key_path = Some(key);
         }
-        let config = EffectiveGatewayConfig::from_settings(&base, cli_key);
+        let config = EffectiveGatewayConfig::from_settings(&base, cli_key)
+            .map_err(|e| anyhow::anyhow!(e))?;
         clawde_gateway::run_gateway(&config).await
     })
 }

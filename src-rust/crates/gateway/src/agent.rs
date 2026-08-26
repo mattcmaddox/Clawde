@@ -30,6 +30,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::OverflowCompactor;
 use crate::tool_exec::GatewayToolExecutor;
 
 /// How the loop ended.
@@ -99,6 +100,10 @@ pub struct AgentFailure {
     pub partial: Option<Box<Message>>,
     /// `Retry-After` seconds when the failure was a rate limit.
     pub retry_after_secs: Option<u64>,
+    /// True when the failure is an (unrecoverable) context overflow —
+    /// compaction was exhausted or never possible. The wire layer maps this
+    /// to a 400 context-length error (D13).
+    pub context_overflow: bool,
 }
 
 impl AgentFailure {
@@ -107,24 +112,32 @@ impl AgentFailure {
             message: "Request cancelled".to_string(),
             partial: None,
             retry_after_secs: None,
+            context_overflow: false,
         }
     }
 
     fn from_provider(err: &ProviderError, partial: Option<Message>) -> Self {
         let partial = partial.map(Box::new);
         use ProviderError::*;
-        let (message, retry_after_secs) = match err {
-            RateLimited { retry_after, .. } => {
-                ("Upstream rate limit exceeded".to_string(), *retry_after)
-            }
-            QuotaExceeded { .. } => ("Upstream quota exhausted".to_string(), Some(3600)),
-            ContextOverflow { .. } => ("Request exceeds model context window".to_string(), None),
-            other => (format!("Upstream error: {other}"), None),
+        let (message, retry_after_secs, context_overflow) = match err {
+            RateLimited { retry_after, .. } => (
+                "Upstream rate limit exceeded".to_string(),
+                *retry_after,
+                false,
+            ),
+            QuotaExceeded { .. } => ("Upstream quota exhausted".to_string(), Some(3600), false),
+            ContextOverflow { .. } => (
+                "Request exceeds model context window".to_string(),
+                None,
+                true,
+            ),
+            other => (format!("Upstream error: {other}"), None, false),
         };
         Self {
             message,
             partial,
             retry_after_secs,
+            context_overflow,
         }
     }
 }
@@ -159,6 +172,9 @@ pub enum LoopEvent {
     },
     /// A model turn ended.
     TurnEnd { stop_reason: StopReason },
+    /// A context-overflow compaction stage was applied (D13); the turn is
+    /// being retried with the compacted transcript.
+    ContextCompacted { stage: u32 },
 }
 
 /// Loop configuration (gateway knobs; defaults per the plan's decisions).
@@ -179,6 +195,8 @@ pub struct AgentConfig {
     ///   runs every declared function and resubmits (relay semantics).
     /// - `false` (Responses): execute internal calls, yield only external.
     pub yield_mixed_turns: bool,
+    /// Whether internal tool calls execute in parallel (up to 4) or serially.
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for AgentConfig {
@@ -190,6 +208,7 @@ impl Default for AgentConfig {
             timeout_secs: 120,
             no_progress_stop_streak: 3,
             yield_mixed_turns: true,
+            parallel_tool_calls: true,
         }
     }
 }
@@ -200,13 +219,19 @@ impl Default for AgentConfig {
 /// the loop clones it per turn with the growing transcript. `executor`
 /// provides the built-in tool surface. Events are emitted to `event_tx` when
 /// provided (streaming translators).
+/// The executor and config are owned so callers can hand them to an SSE
+/// generator (the loop must be spawnable/Send without holding borrows).
+/// Owned inputs throughout (no borrows of local state held across awaits) so
+/// the returned future is provably `Send` — required by the SSE generator in
+/// the router and by `tokio::spawn`-style callers.
 pub async fn run_agent_loop(
     provider: Arc<dyn LlmProvider>,
     request: ProviderRequest,
-    executor: &GatewayToolExecutor,
-    config: &AgentConfig,
+    executor: Arc<GatewayToolExecutor>,
+    config: AgentConfig,
     cancel: CancellationToken,
     event_tx: Option<UnboundedSender<LoopEvent>>,
+    mut compactor: Option<OverflowCompactor>,
 ) -> Result<AgentOutcome, AgentFailure> {
     let max_turns = config.max_turns.max(1);
     let mut messages = request.messages.clone();
@@ -243,25 +268,56 @@ pub async fn run_agent_loop(
 
         emit(&event_tx, LoopEvent::TurnStart { turn: turns });
 
-        let mut req = request.clone();
-        req.messages = messages.clone();
-
-        // Dispatch, retrying once on transient errors within the turn (D10).
-        let (msg, stop_reason, turn_usage, upstream) =
-            match dispatch_turn(provider.clone(), &req, config, &cancel).await {
-                Ok(v) => v,
+        // Dispatch, retrying once on transient errors within the turn (D10)
+        // and, on a context overflow, applying the next reactive compaction
+        // stage (D13) before retrying. A compacted retry rebuilds `req` from
+        // the compacted transcript.
+        let (msg, stop_reason, turn_usage, upstream) = loop {
+            let mut req = request.clone();
+            req.messages = messages.clone();
+            match dispatch_turn(
+                provider.clone(),
+                req,
+                config.clone(),
+                cancel.clone(),
+                &event_tx,
+            )
+            .await
+            {
+                Ok(v) => break v,
                 Err(mut failure) => {
+                    if failure.context_overflow {
+                        if let Some(c) = compactor.as_mut() {
+                            match c
+                                .compact(messages.clone(), provider.clone(), cancel.clone())
+                                .await
+                            {
+                                Ok(Some(new_messages)) => {
+                                    messages = new_messages;
+                                    emit(
+                                        &event_tx,
+                                        LoopEvent::ContextCompacted {
+                                            stage: c.stage_done(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    // Nothing left to compact; surface the overflow.
+                                    failure.partial = last_assistant_message(&messages);
+                                    return Err(failure);
+                                }
+                                Err(compact_failure) => return Err(compact_failure),
+                            }
+                        }
+                    }
                     // D10: fail with the partial transcript (assistant
                     // messages produced before the failure).
-                    failure.partial = messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == Role::Assistant)
-                        .cloned()
-                        .map(Box::new);
+                    failure.partial = last_assistant_message(&messages);
                     return Err(failure);
                 }
-            };
+            }
+        };
 
         usage = sum_usage(usage, turn_usage);
 
@@ -365,10 +421,11 @@ pub async fn run_agent_loop(
             }
             // Responses: execute internal calls, then yield external.
             let results = execute_internal(
-                executor,
-                &internal,
-                &cancel,
+                executor.clone(),
+                internal.clone(),
+                cancel.clone(),
                 config.tool_result_budget,
+                parallel_concurrency(config.parallel_tool_calls),
                 &event_tx,
             )
             .await;
@@ -388,10 +445,11 @@ pub async fn run_agent_loop(
 
         // All-internal turn: execute and continue the loop.
         let results = execute_internal(
-            executor,
-            &internal,
-            &cancel,
+            executor.clone(),
+            internal.clone(),
+            cancel.clone(),
             config.tool_result_budget,
+            parallel_concurrency(config.parallel_tool_calls),
             &event_tx,
         )
         .await;
@@ -424,13 +482,14 @@ pub async fn run_agent_loop(
 
 /// Execute internal tool calls, emitting per-call events (parallel, ordered).
 async fn execute_internal(
-    executor: &GatewayToolExecutor,
-    calls: &[ContentBlock],
-    cancel: &CancellationToken,
+    executor: Arc<GatewayToolExecutor>,
+    calls: Vec<ContentBlock>,
+    cancel: CancellationToken,
     budget: usize,
+    max_concurrent: usize,
     event_tx: &Option<UnboundedSender<LoopEvent>>,
 ) -> Vec<ContentBlock> {
-    for call in calls {
+    for call in &calls {
         if let ContentBlock::ToolUse {
             id, name, input, ..
         } = call
@@ -445,7 +504,9 @@ async fn execute_internal(
             );
         }
     }
-    let results = executor.execute_all(calls, cancel, 4, budget).await;
+    let results = executor
+        .execute_all(calls.clone(), cancel, max_concurrent, budget)
+        .await;
     for (call, block) in calls.iter().zip(results.iter()) {
         if let ContentBlock::ToolUse { id, name, .. } = call {
             if let ContentBlock::ToolResult {
@@ -476,14 +537,16 @@ async fn execute_internal(
 /// assistant message. Retries once on transient errors (D10).
 async fn dispatch_turn(
     provider: Arc<dyn LlmProvider>,
-    req: &ProviderRequest,
-    config: &AgentConfig,
-    cancel: &CancellationToken,
+    req: ProviderRequest,
+    config: AgentConfig,
+    cancel: CancellationToken,
+    event_tx: &Option<UnboundedSender<LoopEvent>>,
 ) -> Result<(Message, StopReason, UsageInfo, Option<String>), AgentFailure> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let stream = match provider_call(provider.clone(), req, config.timeout_secs).await {
+        let timeout_secs = config.timeout_secs;
+        let stream = match provider_call(provider.clone(), req.clone(), timeout_secs).await {
             Ok(s) => s,
             Err(e) => {
                 if attempt == 1 && is_transient(&e) {
@@ -492,7 +555,7 @@ async fn dispatch_turn(
                 return Err(AgentFailure::from_provider(&e, None));
             }
         };
-        match collect_turn(stream, cancel).await {
+        match collect_turn(stream, cancel.clone(), event_tx).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt == 1 && is_transient(&e) {
@@ -519,15 +582,15 @@ fn is_transient(err: &ProviderError) -> bool {
 /// Call `create_message_stream` with the configured timeout.
 async fn provider_call(
     provider: Arc<dyn LlmProvider>,
-    req: &ProviderRequest,
+    req: ProviderRequest,
     timeout_secs: u64,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError> {
     if timeout_secs == 0 {
-        return provider.create_message_stream(req.clone()).await;
+        return provider.create_message_stream(req).await;
     }
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        provider.create_message_stream(req.clone()),
+        provider.create_message_stream(req),
     )
     .await
     {
@@ -545,7 +608,8 @@ async fn provider_call(
 /// serving upstream via `ProviderAttribution`.
 async fn collect_turn(
     mut stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-    cancel: &CancellationToken,
+    cancel: CancellationToken,
+    event_tx: &Option<UnboundedSender<LoopEvent>>,
 ) -> Result<(Message, StopReason, UsageInfo, Option<String>), ProviderError> {
     use futures::StreamExt;
 
@@ -589,13 +653,22 @@ async fn collect_turn(
                 blocks.push(content_block);
             }
             StreamEvent::TextDelta { index, text } => {
-                append_text(&mut blocks, index, &tool_index_to_block, text);
+                append_text(&mut blocks, index, &tool_index_to_block, text.clone());
+                // Forward incremental text so the final turn can stream (D1).
+                emit(event_tx, LoopEvent::TextDelta { text });
             }
             StreamEvent::ThinkingDelta { index, thinking } => {
-                append_thinking(&mut blocks, index, &tool_index_to_block, thinking);
+                append_thinking(&mut blocks, index, &tool_index_to_block, thinking.clone());
+                emit(event_tx, LoopEvent::ThinkingDelta { thinking });
             }
             StreamEvent::ReasoningDelta { index, reasoning } => {
-                append_thinking(&mut blocks, index, &tool_index_to_block, reasoning);
+                append_thinking(&mut blocks, index, &tool_index_to_block, reasoning.clone());
+                emit(
+                    event_tx,
+                    LoopEvent::ThinkingDelta {
+                        thinking: reasoning,
+                    },
+                );
             }
             StreamEvent::InputJsonDelta {
                 index,
@@ -702,6 +775,26 @@ fn extract_tool_uses(msg: &Message) -> Vec<ContentBlock> {
             .cloned()
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Last assistant message in the transcript (D10 partial-failure payload).
+fn last_assistant_message(messages: &[Message]) -> Option<Box<Message>> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .cloned()
+        .map(Box::new)
+}
+
+/// Concurrency for internal tool execution: 4-wide when parallel, serial when
+/// the client sent `parallel_tool_calls: false` (R7).
+fn parallel_concurrency(parallel: bool) -> usize {
+    if parallel {
+        4
+    } else {
+        1
     }
 }
 
@@ -1032,8 +1125,8 @@ mod tests {
 
     fn run(
         provider: Arc<dyn LlmProvider>,
-        executor: &GatewayToolExecutor,
-        config: &AgentConfig,
+        executor: GatewayToolExecutor,
+        config: AgentConfig,
     ) -> Result<AgentOutcome, AgentFailure> {
         let cancel = CancellationToken::new();
         tokio::runtime::Runtime::new()
@@ -1041,9 +1134,10 @@ mod tests {
             .block_on(run_agent_loop(
                 provider,
                 request(vec![Message::user("hello")]),
-                executor,
+                Arc::new(executor),
                 config,
                 cancel,
+                None,
                 None,
             ))
     }
@@ -1053,8 +1147,8 @@ mod tests {
         let mock = provider(vec![MockTurn::text("hi there")]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
@@ -1072,8 +1166,8 @@ mod tests {
         ]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
@@ -1103,12 +1197,7 @@ mod tests {
             max_tool_calls: 1,
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::CapExhausted);
         assert_eq!(out.tool_calls_executed, 1);
         // Only two dispatches: the second tool turn is force-stopped, the
@@ -1128,12 +1217,7 @@ mod tests {
             no_progress_stop_streak: 3,
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::NoProgress);
         assert_eq!(out.tool_calls_executed, 3);
     }
@@ -1149,12 +1233,7 @@ mod tests {
             yield_mixed_turns: true,
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::Yielding);
         assert_eq!(out.pending_external_calls.len(), 1);
         assert_eq!(out.tool_calls_executed, 0);
@@ -1175,12 +1254,7 @@ mod tests {
             yield_mixed_turns: true,
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::Yielding);
         // BOTH calls yielded; nothing executed (relay semantics).
         assert_eq!(out.pending_external_calls.len(), 2);
@@ -1201,12 +1275,7 @@ mod tests {
             yield_mixed_turns: false, // Responses mode
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::Yielding);
         assert_eq!(out.pending_external_calls.len(), 1);
         let ContentBlock::ToolUse {
@@ -1234,8 +1303,8 @@ mod tests {
         ]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         );
         assert!(out.is_err());
         let failure = out.unwrap_err();
@@ -1255,8 +1324,8 @@ mod tests {
         ]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
@@ -1280,8 +1349,8 @@ mod tests {
         ]);
         let failure = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap_err();
         assert_eq!(failure.retry_after_secs, Some(30));
@@ -1298,9 +1367,10 @@ mod tests {
             .block_on(run_agent_loop(
                 mock.clone(),
                 request(vec![Message::user("hello")]),
-                &ex,
-                &AgentConfig::default(),
+                Arc::new(ex),
+                AgentConfig::default(),
                 cancel,
+                None,
                 None,
             ));
         assert!(matches!(result, Err(AgentFailure { .. })));
@@ -1337,8 +1407,8 @@ mod tests {
         ]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
@@ -1407,8 +1477,8 @@ mod tests {
         ]);
         let out = run(
             mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &AgentConfig::default(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
         )
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
@@ -1433,12 +1503,7 @@ mod tests {
             tool_result_budget: 10,
             ..AgentConfig::default()
         };
-        let out = run(
-            mock.clone(),
-            &executor(GatewayPermissionMode::Allow),
-            &config,
-        )
-        .unwrap();
+        let out = run(mock.clone(), executor(GatewayPermissionMode::Allow), config).unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
         let received = mock.received.lock().unwrap();
         let second = &received[1];

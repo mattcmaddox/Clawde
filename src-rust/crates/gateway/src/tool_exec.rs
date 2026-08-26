@@ -177,15 +177,18 @@ impl GatewayToolExecutor {
     /// Execute internal tool calls, up to `max_concurrent` at a time,
     /// emitting results in call order (models expect received-order results).
     /// Each result is sanitized and truncated to `budget` bytes (D14).
+    ///
+    /// Inputs are owned so the returned future is Send without holding
+    /// borrows across the buffered awaits (required by the SSE generator).
     pub async fn execute_all(
         &self,
-        calls: &[ContentBlock],
-        cancel: &CancellationToken,
+        calls: Vec<ContentBlock>,
+        cancel: CancellationToken,
         max_concurrent: usize,
         budget: usize,
     ) -> Vec<ContentBlock> {
         stream::iter(calls)
-            .map(|call| self.execute_one(call, cancel, budget))
+            .map(|call| self.execute_one(call, cancel.clone(), budget))
             .buffered(max_concurrent.max(1))
             .collect::<Vec<_>>()
             .await
@@ -194,14 +197,14 @@ impl GatewayToolExecutor {
     /// Execute a single internal tool call, producing a `ToolResult` block.
     async fn execute_one(
         &self,
-        call: &ContentBlock,
-        cancel: &CancellationToken,
+        call: ContentBlock,
+        cancel: CancellationToken,
         budget: usize,
     ) -> ContentBlock {
         let (id, name, input) = match call {
             ContentBlock::ToolUse {
                 id, name, input, ..
-            } => (id.clone(), name.clone(), input.clone()),
+            } => (id, name, input),
             _ => return tool_error_block("unknown", "not a tool call", "invalid_tool_call"),
         };
 
@@ -229,7 +232,7 @@ impl GatewayToolExecutor {
             return tool_error_block(&id, "Unknown built-in tool", "unknown_tool");
         };
 
-        let result = tool.execute(input.clone(), &self.ctx).await;
+        let result = tool.execute(input, &self.ctx).await;
         let is_error = result.is_error;
         let content = sanitize_result(&result.content, budget);
         ContentBlock::ToolResult {
@@ -368,9 +371,7 @@ mod tests {
             input: Value::Null,
             thought_signature: None,
         };
-        let out = ex
-            .execute_one(&call, &CancellationToken::new(), 50_000)
-            .await;
+        let out = ex.execute_one(call, CancellationToken::new(), 50_000).await;
         let ContentBlock::ToolResult {
             is_error, content, ..
         } = &out
@@ -390,9 +391,7 @@ mod tests {
             input: json!({"path": "whatever"}),
             thought_signature: None,
         };
-        let out = ex
-            .execute_one(&call, &CancellationToken::new(), 50_000)
-            .await;
+        let out = ex.execute_one(call, CancellationToken::new(), 50_000).await;
         let ContentBlock::ToolResult {
             is_error, content, ..
         } = &out
@@ -412,9 +411,7 @@ mod tests {
             input: json!({"path": "/nonexistent/clawde-gateway-test-file"}),
             thought_signature: None,
         };
-        let out = ex
-            .execute_one(&call, &CancellationToken::new(), 50_000)
-            .await;
+        let out = ex.execute_one(call, CancellationToken::new(), 50_000).await;
         let ContentBlock::ToolResult { is_error, .. } = &out else {
             panic!("expected tool result");
         };
@@ -449,7 +446,7 @@ mod tests {
             })
             .collect();
         let out = ex
-            .execute_all(&calls, &CancellationToken::new(), 4, 50_000)
+            .execute_all(calls, CancellationToken::new(), 4, 50_000)
             .await;
         assert_eq!(out.len(), 4);
         for (i, block) in out.iter().enumerate() {

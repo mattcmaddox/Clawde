@@ -13,12 +13,19 @@ use axum::Router;
 use clawde_api::provider_types::{ProviderRequest, StreamEvent};
 use clawde_api::{LlmProvider, ProviderRegistry};
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
+use crate::agent::{run_agent_loop, AgentConfig, AgentFailure, LoopEvent};
 use crate::auth::{validate_bearer, RateLimiter};
 use crate::config::EffectiveGatewayConfig;
-use crate::error::{map_provider_error, GatewayError};
-use crate::translate::{parse_chat_completion_request, to_openai_response, StreamTranslator};
+use crate::context::OverflowCompactor;
+use crate::error::{map_agent_failure, map_provider_error, GatewayError};
+use crate::tool_exec::GatewayToolExecutor;
+use crate::translate::{
+    agent_outcome_to_response, agent_stream_chunks, parse_chat_completion_request,
+    to_openai_response, ParsedRequest, StreamTranslator,
+};
 
 /// Shared gateway state.
 #[derive(Clone)]
@@ -34,6 +41,71 @@ pub struct GatewayState {
     pub in_flight: Arc<Semaphore>,
     /// Cancellation token used to force active streams after the grace period.
     pub force_cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Per-request agent-loop machinery. Present (agent mode) only when the
+/// gateway config enables it or the client sent `max_tool_calls` with at
+/// least one tool that maps to a built-in (plan §2 rule 2).
+struct AgentRuntime {
+    executor: Arc<GatewayToolExecutor>,
+    config: AgentConfig,
+    cancel: CancellationToken,
+    compactor: OverflowCompactor,
+}
+
+impl AgentRuntime {
+    fn build(
+        cfg: &EffectiveGatewayConfig,
+        parsed: &ParsedRequest,
+        cancel: CancellationToken,
+    ) -> Option<Self> {
+        let executor = GatewayToolExecutor::new(
+            cfg.permission_mode,
+            &cfg.workspace_paths,
+            &session_id(),
+            &cfg.builtin_tools,
+            cancel.clone(),
+        );
+        let client_cap = parsed.max_tool_calls.filter(|m| *m > 0);
+        let has_builtin = parsed
+            .provider_request
+            .tools
+            .iter()
+            .any(|t| executor.is_builtin(&t.name));
+        // Relay mode stays the default: agent mode needs a client cap AND a
+        // built-in-mapped tool, or an explicit gateway `agentMode: true`.
+        let active = cfg.agent_mode || (client_cap.is_some() && has_builtin);
+        if !active {
+            return None;
+        }
+        let max_tool_calls = client_cap.unwrap_or(cfg.max_tool_calls).max(1);
+        let config = AgentConfig {
+            max_tool_calls,
+            max_turns: max_tool_calls + 1,
+            timeout_secs: cfg.request_timeout_secs,
+            parallel_tool_calls: parsed.parallel_tool_calls,
+            ..AgentConfig::default()
+        };
+        let compactor = OverflowCompactor::new(
+            parsed.provider_request.model.clone(),
+            4096,
+            cfg.request_timeout_secs,
+        );
+        Some(Self {
+            executor: Arc::new(executor),
+            config,
+            cancel,
+            compactor,
+        })
+    }
+}
+
+/// A per-request session id for shell-state isolation in the tool context.
+fn session_id() -> String {
+    format!(
+        "gw-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
 }
 
 /// Build the axum Router.
@@ -192,18 +264,44 @@ async fn chat_completions(
             Err(e) => return e.into_response(),
         };
     let mut req = parsed.provider_request.clone();
-    req.model = wire_model;
+    req.model = wire_model.clone();
+
+    // Agent-mode machinery (None keeps the request in relay mode).
+    let agent = AgentRuntime::build(&state.config, &parsed, CancellationToken::new());
 
     if parsed.stream {
-        handle_stream(
-            state,
-            provider,
-            req,
-            parsed.include_usage,
-            key,
-            tokens_estimate,
+        handle_stream(state, provider, req, &parsed, key, tokens_estimate, agent).await
+    } else if let Some(rt) = agent {
+        let permit = match state.in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return GatewayError::service_unavailable("Gateway concurrency limit is closed")
+                    .into_response()
+            }
+        };
+        let result = run_agent_loop(
+            provider.clone(),
+            req.clone(),
+            rt.executor,
+            rt.config,
+            rt.cancel,
+            None,
+            Some(rt.compactor),
         )
-        .await
+        .await;
+        drop(permit);
+        match result {
+            Ok(outcome) => {
+                state
+                    .limiter
+                    .record_usage(&key, tokens_estimate, outcome.usage.total());
+                axum::Json(agent_outcome_to_response(&outcome, &wire_model)).into_response()
+            }
+            Err(failure) => {
+                state.limiter.record_usage(&key, tokens_estimate, 0);
+                map_agent_failure(&failure).into_response()
+            }
+        }
     } else {
         let permit = match state.in_flight.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -236,14 +334,16 @@ async fn chat_completions(
     }
 }
 
-/// Streaming handler: `create_message_stream` -> SSE chunks.
+/// Streaming handler: relay `create_message_stream` -> SSE chunks, or the
+/// agent loop with silent intermediate turns (D1).
 async fn handle_stream(
     state: GatewayState,
     provider: Arc<dyn LlmProvider>,
     req: ProviderRequest,
-    include_usage: bool,
+    parsed: &ParsedRequest,
     key: String,
     tokens_estimate: u64,
+    agent: Option<AgentRuntime>,
 ) -> Response {
     let permit = match state.in_flight.clone().acquire_owned().await {
         Ok(permit) => permit,
@@ -252,6 +352,22 @@ async fn handle_stream(
                 .into_response()
         }
     };
+    if let Some(rt) = agent {
+        return handle_agent_stream(
+            state,
+            provider,
+            req,
+            parsed,
+            UsageAccount {
+                key,
+                estimate: tokens_estimate,
+            },
+            permit,
+            rt,
+        )
+        .await;
+    }
+    let include_usage = parsed.include_usage;
     let stream = match provider_call_with_timeout(
         provider.create_message_stream(req),
         state.config.request_timeout_secs,
@@ -341,6 +457,102 @@ async fn handle_stream(
     };
 
     Sse::new(sse).into_response()
+}
+
+/// Per-request usage-accounting handle (key + token estimate for TPM).
+struct UsageAccount {
+    key: String,
+    estimate: u64,
+}
+
+/// Agent-mode streaming: run the loop to completion, then render ONLY the
+/// final turn (D1 — silent intermediate turns). Internal tool executions
+/// never surface as SSE chunks; external (yielded) calls stream exactly as
+/// relay mode does (`finish_reason: tool_calls`). A client disconnect drops
+/// the generator, which cancels the per-request token so in-flight tool
+/// execution is aborted (D16).
+async fn handle_agent_stream(
+    state: GatewayState,
+    provider: Arc<dyn LlmProvider>,
+    req: ProviderRequest,
+    parsed: &ParsedRequest,
+    account: UsageAccount,
+    permit: OwnedSemaphorePermit,
+    rt: AgentRuntime,
+) -> Response {
+    let AgentRuntime {
+        executor,
+        config,
+        cancel,
+        compactor,
+    } = rt;
+    let include_usage = parsed.include_usage;
+    // The executor is an Arc so the SSE generator owns it ('static + Send).
+    let active = state.active_streams.clone();
+    let limiter = state.limiter.clone();
+    let force_cancel = state.force_cancel.clone();
+    let model = req.model.clone();
+    let UsageAccount {
+        key,
+        estimate: tokens_estimate,
+    } = account;
+
+    let sse = async_stream::stream! {
+        let _guard = ActiveStreamGuard(active);
+        let _permit = permit;
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LoopEvent>();
+        let mut events: Vec<LoopEvent> = Vec::new();
+        let outcome = tokio::select! {
+            outcome = run_agent_loop(
+                provider,
+                req,
+                executor,
+                config,
+                cancel.clone(),
+                Some(tx),
+                Some(compactor),
+            ) => outcome,
+            _ = force_cancel.clone().cancelled_owned() => Err(AgentFailure::cancelled()),
+        };
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        match &outcome {
+            Ok(outcome) => {
+                limiter.record_usage(&key, tokens_estimate, outcome.usage.total());
+                for chunk in agent_stream_chunks(outcome, &events, include_usage, &model) {
+                    match Event::default().json_data(chunk) {
+                        Ok(e) => yield Ok::<_, std::convert::Infallible>(e),
+                        Err(_) => {}
+                    }
+                }
+            }
+            Err(failure) => {
+                limiter.record_usage(&key, tokens_estimate, 0);
+                let ge = map_agent_failure(failure);
+                if let Ok(ev) = Event::default().json_data(json!({
+                    "error": {"message": ge.message}
+                })) {
+                    yield Ok::<_, std::convert::Infallible>(ev);
+                }
+            }
+        }
+        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(sse).into_response()
+}
+
+/// Drop guard that cancels the per-request token when the SSE stream is
+/// dropped (client disconnect / shutdown), so in-flight tool execution stops.
+struct CancelOnDrop(CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 async fn provider_call_with_timeout<T>(

@@ -2254,6 +2254,34 @@ pub mod config {
         /// Grace period for draining active streams on shutdown.
         #[serde(default = "default_gateway_shutdown_grace_secs")]
         pub shutdown_grace_secs: u64,
+        /// Enable server-side agent loop (tool execution) even when the client
+        /// doesn't send `max_tool_calls`. The per-request loop cap still applies.
+        #[serde(default, rename = "agentMode", alias = "agent_mode")]
+        pub agent_mode: bool,
+        /// Default agent-loop tool-call cap (`max_tool_calls` when the client
+        /// doesn't send one).
+        #[serde(
+            default = "default_gateway_max_tool_calls",
+            rename = "maxToolCalls",
+            alias = "max_tool_calls"
+        )]
+        pub max_tool_calls: u32,
+        /// Tool permission posture for the gateway agent loop:
+        /// `allow-readonly` (default) | `allow` | `deny`.
+        #[serde(
+            default = "default_gateway_permission_mode",
+            rename = "permissionMode",
+            alias = "permission_mode"
+        )]
+        pub permission_mode: String,
+        /// Workspace paths the built-in tools operate on; `[0]` is the tool
+        /// working directory. Required for write/execute tools to be useful.
+        #[serde(default, rename = "workspacePaths", alias = "workspace_paths")]
+        pub workspace_paths: Vec<std::path::PathBuf>,
+        /// Replacement list for the default built-in tool surface (D2). Every
+        /// entry must name a real built-in tool; no wildcard in v1.
+        #[serde(default, rename = "builtinTools", alias = "builtin_tools")]
+        pub builtin_tools: Vec<String>,
     }
 
     fn default_gateway_listen() -> String {
@@ -2284,6 +2312,14 @@ pub mod config {
         10
     }
 
+    fn default_gateway_max_tool_calls() -> u32 {
+        10
+    }
+
+    fn default_gateway_permission_mode() -> String {
+        "allow-readonly".to_string()
+    }
+
     impl Default for GatewayConfig {
         fn default() -> Self {
             Self {
@@ -2299,6 +2335,11 @@ pub mod config {
                 request_timeout_secs: default_gateway_request_timeout_secs(),
                 discovery_refresh_secs: default_gateway_discovery_refresh_secs(),
                 shutdown_grace_secs: default_gateway_shutdown_grace_secs(),
+                agent_mode: false,
+                max_tool_calls: default_gateway_max_tool_calls(),
+                permission_mode: default_gateway_permission_mode(),
+                workspace_paths: Vec::new(),
+                builtin_tools: Vec::new(),
             }
         }
     }

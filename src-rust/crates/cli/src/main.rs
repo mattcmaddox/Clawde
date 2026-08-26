@@ -464,7 +464,8 @@ async fn run_gateway_command(args: &[String]) -> anyhow::Result<()> {
         gateway_config.tls_key_path = Some(key);
     }
 
-    let config = EffectiveGatewayConfig::from_settings(&gateway_config, cli_key);
+    let config = EffectiveGatewayConfig::from_settings(&gateway_config, cli_key)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     clawde_gateway::run_gateway(&config).await
 }

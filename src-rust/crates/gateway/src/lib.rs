@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod router;
 pub mod shutdown;
@@ -15,6 +16,7 @@ pub mod tool_exec;
 pub mod translate;
 
 pub use agent::{run_agent_loop, AgentConfig, AgentFailure, AgentOutcome, AgentStatus, LoopEvent};
+pub use context::OverflowCompactor;
 pub use tool_exec::{GatewayPermissionMode, GatewayToolExecutor};
 
 pub use config::EffectiveGatewayConfig;

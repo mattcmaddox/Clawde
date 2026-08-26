@@ -158,6 +158,33 @@ pub fn map_provider_error(err: &clawde_api::ProviderError) -> GatewayError {
     }
 }
 
+/// Map an agent-loop failure to a `GatewayError`.
+///
+/// - context overflow (compaction exhausted) → 400 (OpenAI uses
+///   `context_length_exceeded` semantics),
+/// - rate limit / quota → 429 with Retry-After,
+/// - cancellation → 503 (shutdown drain),
+/// - anything else → 502 api_error.
+pub fn map_agent_failure(failure: &crate::agent::AgentFailure) -> GatewayError {
+    if failure.context_overflow {
+        return GatewayError::invalid_request(failure.message.clone());
+    }
+    if let Some(retry) = failure.retry_after_secs {
+        return GatewayError::rate_limited(failure.message.clone(), retry);
+    }
+    if failure.message == "Request cancelled" {
+        return GatewayError::service_unavailable("Request cancelled (gateway draining)");
+    }
+    GatewayError {
+        status: StatusCode::BAD_GATEWAY,
+        error_type: "api_error".to_string(),
+        message: failure.message.clone(),
+        param: None,
+        code: None,
+        retry_after_secs: None,
+    }
+}
+
 /// Convenience: a `Value`-shaped OpenAI error body (used in tests).
 pub fn error_body(e: &GatewayError) -> Value {
     json!({
