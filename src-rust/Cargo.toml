@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.46"
+version = "0.2.48"
 edition = "2021"
 authors = ["Clawde"]
 license = "GPL-3.0"
@@ -109,6 +109,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # HTTP server (gateway only)
 axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 subtle = "2"
 

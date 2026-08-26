@@ -6,7 +6,9 @@
 //! the result back to OpenAI wire format (non-streaming JSON or SSE chunks).
 
 use axum::http::StatusCode;
-use clawde_api::provider_types::{ProviderRequest, ProviderResponse, StopReason, StreamEvent};
+use clawde_api::provider_types::{
+    ProviderRequest, ProviderResponse, StopReason, StreamEvent, SystemPrompt,
+};
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use serde_json::{json, Value};
 
@@ -45,7 +47,7 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         .and_then(|v| v.as_array())
         .ok_or_else(|| GatewayError::invalid_request("missing required field 'messages'"))?;
 
-    let messages = parse_messages(messages_value)?;
+    let (system_prompt, messages) = parse_messages(messages_value)?;
 
     let tools = parse_tools(body.get("tools"))?;
 
@@ -106,7 +108,7 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         provider_request: ProviderRequest {
             model,
             messages,
-            system_prompt: None,
+            system_prompt,
             tools,
             max_tokens,
             temperature,
@@ -124,9 +126,17 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
     })
 }
 
-/// Parse OpenAI `messages[]` into Clawde `Message`s.
-fn parse_messages(messages: &[Value]) -> Result<Vec<Message>, GatewayError> {
+/// Parse OpenAI `system`/`developer`/`user`/`assistant`/`tool` messages into
+/// Clawde `Message`s plus an extracted `SystemPrompt`.
+///
+/// `system`/`developer` roles are NOT converted to user messages (that would
+/// lose the system-vs-user distinction upstreams rely on): their text is
+/// collected into `ProviderRequest.system_prompt`.
+fn parse_messages(
+    messages: &[Value],
+) -> Result<(Option<SystemPrompt>, Vec<Message>), GatewayError> {
     let mut out = Vec::with_capacity(messages.len());
+    let mut system_parts: Vec<String> = Vec::new();
     for m in messages {
         let role = m
             .get("role")
@@ -136,20 +146,9 @@ fn parse_messages(messages: &[Value]) -> Result<Vec<Message>, GatewayError> {
 
         match role {
             "system" | "developer" => {
-                // System prompt: extract text and hold it as a user-role message
-                // with the system text prefixed. (Claw stores system prompt
-                // separately; simpler: prepend a user message with the system
-                // text as a marker-free instruction.)
                 let text = content_text(&content);
                 if !text.is_empty() {
-                    out.push(Message {
-                        role: Role::User,
-                        content: MessageContent::Text(text),
-                        uuid: None,
-                        cost: None,
-                        snapshot_patch: None,
-                        turn_meta: None,
-                    });
+                    system_parts.push(text);
                 }
             }
             "user" => {
@@ -239,7 +238,12 @@ fn parse_messages(messages: &[Value]) -> Result<Vec<Message>, GatewayError> {
             }
         }
     }
-    Ok(out)
+    let system_prompt = if system_parts.is_empty() {
+        None
+    } else {
+        Some(SystemPrompt::Text(system_parts.join("\n")))
+    };
+    Ok((system_prompt, out))
 }
 
 /// Extract plain text from an OpenAI message `content` (string or array of
@@ -399,23 +403,46 @@ pub fn usage_to_openai(usage: &UsageInfo) -> Value {
 ///
 /// Call [`StreamTranslator::push`] for each event; it returns the OpenAI
 /// chunks to emit (usually 0 or 1, sometimes 2 for the terminal usage chunk).
-#[derive(Debug, Default)]
+///
+/// OpenAI wire-fidelity invariants this enforces:
+/// - exactly ONE terminal chunk carries the `finish_reason` (if the upstream
+///   sends both a `MessageDelta` and a `MessageStop`, the delta's reason wins
+///   and `MessageStop` does not emit a duplicate),
+/// - all chunks share the same `created` timestamp (OpenAI spec: "Each chunk
+///   has the same timestamp"),
+/// - a usage-only chunk is emitted only when the client requested
+///   `stream_options.include_usage`.
 pub struct StreamTranslator {
-    /// Whether the first chunk (with `delta.role`) has been emitted.
+    /// Whether the terminal chunk has been emitted.
     started: bool,
+    /// Whether a chunk with `finish_reason` has already been emitted.
+    finish_reason_sent: bool,
     /// In-progress tool-call argument fragments, keyed by tool-call index.
     tool_calls: Vec<(usize, String)>,
     /// The message id (from MessageStart).
     id: String,
     /// The model (from MessageStart).
     model: String,
+    /// The single `created` timestamp shared by every chunk.
+    created: i64,
     /// Accumulated usage for the terminal usage chunk.
     usage: Option<UsageInfo>,
+    /// Whether the client asked for a usage chunk (`stream_options.include_usage`).
+    include_usage: bool,
 }
 
 impl StreamTranslator {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(include_usage: bool) -> Self {
+        Self {
+            started: false,
+            finish_reason_sent: false,
+            tool_calls: Vec::new(),
+            id: String::new(),
+            model: String::new(),
+            created: chrono::Utc::now().timestamp(),
+            usage: None,
+            include_usage,
+        }
     }
 
     /// Push one provider `StreamEvent`; returns OpenAI chunks to emit.
@@ -502,45 +529,56 @@ impl StreamTranslator {
                 if let Some(u) = usage {
                     self.usage = Some(u.clone());
                 }
-                let reason = stop_reason
-                    .as_ref()
-                    .map(stop_reason_to_openai)
-                    .unwrap_or("stop");
+                // OpenAI-compatible providers may send a usage-only delta
+                // (`stop_reason: null`) before the final stop event. It is
+                // metadata, not a terminal choice chunk.
+                let Some(stop_reason) = stop_reason else {
+                    return vec![];
+                };
+                if self.finish_reason_sent {
+                    return vec![];
+                }
+                self.finish_reason_sent = true;
                 vec![self.chunk(json!({
                     "choices": [{
                         "index": 0,
                         "delta": {},
-                        "finish_reason": reason,
+                        "finish_reason": stop_reason_to_openai(stop_reason),
                     }]
                 }))]
             }
             StreamEvent::MessageStop => {
                 self.started = true;
                 let mut chunks = Vec::new();
-                // Terminal chunk (finish_reason already sent in MessageDelta;
-                // emit an empty one for clients that expect it).
-                chunks.push(self.chunk(json!({
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop",
-                    }]
-                })));
-                // Usage chunk if requested.
-                if let Some(usage) = self.usage.clone() {
-                    chunks.push(self.usage_chunk(&usage));
+                // Exactly one terminal chunk carries the finish_reason. If the
+                // upstream sent a MessageDelta (which already emitted it), do
+                // NOT emit a second one — clients reject duplicate terminal
+                // chunks.
+                if !self.finish_reason_sent {
+                    chunks.push(self.chunk(json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }]
+                    })));
+                }
+                // Usage chunk only when the client asked for it.
+                if self.include_usage {
+                    if let Some(usage) = self.usage.clone() {
+                        chunks.push(self.usage_chunk(&usage));
+                    }
                 }
                 chunks
             }
-            StreamEvent::Error { message, .. } => {
-                // Emit an error chunk then let the client see the [DONE].
+            StreamEvent::Error {
+                error_type,
+                message,
+            } => {
+                // Emit an OpenAI error object; the router follows it with
+                // [DONE] and stops consuming the upstream stream.
                 vec![self.chunk(json!({
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": null,
-                    }],
-                    "error": {"message": message},
+                    "error": {"message": message, "type": error_type},
                 }))]
             }
             _ => vec![],
@@ -561,7 +599,7 @@ impl StreamTranslator {
         let mut base = json!({
             "id": self.id,
             "object": "chat.completion.chunk",
-            "created": chrono::Utc::now().timestamp(),
+            "created": self.created,
             "model": self.model,
         });
         if let Value::Object(map) = &mut base {
@@ -579,7 +617,7 @@ impl StreamTranslator {
         json!({
             "id": self.id,
             "object": "chat.completion.chunk",
-            "created": chrono::Utc::now().timestamp(),
+            "created": self.created,
             "model": self.model,
             "choices": [],
             "usage": usage_to_openai(usage),
@@ -725,7 +763,7 @@ mod tests {
 
     #[test]
     fn stream_accumulates_tool_arguments() {
-        let mut t = StreamTranslator::new();
+        let mut t = StreamTranslator::new(false);
         let chunks: Vec<Value> = t
             .push(&StreamEvent::MessageStart {
                 id: "msg_1".to_string(),

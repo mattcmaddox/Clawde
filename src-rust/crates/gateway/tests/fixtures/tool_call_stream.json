@@ -1,0 +1,63 @@
+[
+  {
+    "id": "msg_tool",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"role": "assistant", "content": null},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_tool",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"tool_calls": [{
+        "index": 0,
+        "id": "call_weather",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": ""}
+      }]},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_tool",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"arguments": "{\"city\":"}
+      }]},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_tool",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"arguments": "\"SF\"}"}
+      }]},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_tool",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {},
+      "finish_reason": "tool_calls"
+    }]
+  }
+]

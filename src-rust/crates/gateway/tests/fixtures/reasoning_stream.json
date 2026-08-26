@@ -1,0 +1,42 @@
+[
+  {
+    "id": "msg_reason",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"role": "assistant", "content": null},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_reason",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"reasoning_content": "Need to inspect the request."},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_reason",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"content": "Done."},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_reason",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {},
+      "finish_reason": "stop"
+    }]
+  }
+]

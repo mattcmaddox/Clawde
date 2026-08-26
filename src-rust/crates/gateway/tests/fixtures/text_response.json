@@ -1,0 +1,40 @@
+{
+  "request": {
+    "model": "free/auto",
+    "messages": [
+      {"role": "system", "content": "Answer concisely."},
+      {"role": "user", "content": "What is 2 + 2?"}
+    ],
+    "max_tokens": 32
+  },
+  "upstream_response": {
+    "id": "msg_response",
+    "content": [{"type": "text", "text": "4"}],
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 10,
+      "output_tokens": 1,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "model": "gpt-oss-120b",
+    "rate_limit": null
+  },
+  "expected": {
+    "id": "msg_response",
+    "object": "chat.completion",
+    "model": "gpt-oss-120b",
+    "choices": [{
+      "index": 0,
+      "message": {"role": "assistant", "content": "4"},
+      "finish_reason": "stop"
+    }],
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 1,
+      "total_tokens": 11,
+      "reasoning_tokens": 0
+    }
+  }
+}

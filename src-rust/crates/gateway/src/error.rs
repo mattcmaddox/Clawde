@@ -68,6 +68,11 @@ impl GatewayError {
             message,
         )
     }
+
+    /// `504 gateway_timeout` — the configured upstream deadline elapsed.
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", message)
+    }
 }
 
 impl IntoResponse for GatewayError {

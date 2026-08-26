@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -12,6 +13,7 @@ use axum::Router;
 use clawde_api::provider_types::{ProviderRequest, StreamEvent};
 use clawde_api::{LlmProvider, ProviderRegistry};
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use crate::auth::{validate_bearer, RateLimiter};
 use crate::config::EffectiveGatewayConfig;
@@ -28,6 +30,10 @@ pub struct GatewayState {
     pub draining: Arc<AtomicBool>,
     /// Active SSE stream count.
     pub active_streams: Arc<AtomicUsize>,
+    /// Maximum concurrent provider calls accepted by this gateway instance.
+    pub in_flight: Arc<Semaphore>,
+    /// Cancellation token used to force active streams after the grace period.
+    pub force_cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Build the axum Router.
@@ -189,13 +195,43 @@ async fn chat_completions(
     req.model = wire_model;
 
     if parsed.stream {
-        handle_stream(state, provider, req).await
+        handle_stream(
+            state,
+            provider,
+            req,
+            parsed.include_usage,
+            key,
+            tokens_estimate,
+        )
+        .await
     } else {
-        let resp = match provider.create_message(req).await {
-            Ok(r) => r,
-            Err(e) => return map_provider_error(&e).into_response(),
+        let permit = match state.in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return GatewayError::service_unavailable("Gateway concurrency limit is closed")
+                    .into_response()
+            }
         };
-        state.limiter.record_usage(&key, resp.usage.total());
+        let result = provider_call_with_timeout(
+            provider.create_message(req),
+            state.config.request_timeout_secs,
+        )
+        .await;
+        drop(permit);
+        let resp = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                state.limiter.record_usage(&key, tokens_estimate, 0);
+                return map_provider_error(&e).into_response();
+            }
+            Err(response) => {
+                state.limiter.record_usage(&key, tokens_estimate, 0);
+                return response;
+            }
+        };
+        state
+            .limiter
+            .record_usage(&key, tokens_estimate, resp.usage.total());
         axum::Json(to_openai_response(&resp)).into_response()
     }
 }
@@ -205,21 +241,52 @@ async fn handle_stream(
     state: GatewayState,
     provider: Arc<dyn LlmProvider>,
     req: ProviderRequest,
+    include_usage: bool,
+    key: String,
+    tokens_estimate: u64,
 ) -> Response {
-    let stream = match provider.create_message_stream(req).await {
-        Ok(s) => s,
-        Err(e) => return map_provider_error(&e).into_response(),
+    let permit = match state.in_flight.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return GatewayError::service_unavailable("Gateway concurrency limit is closed")
+                .into_response()
+        }
+    };
+    let stream = match provider_call_with_timeout(
+        provider.create_message_stream(req),
+        state.config.request_timeout_secs,
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            drop(permit);
+            state.limiter.record_usage(&key, tokens_estimate, 0);
+            return map_provider_error(&e).into_response();
+        }
+        Err(response) => {
+            drop(permit);
+            state.limiter.record_usage(&key, tokens_estimate, 0);
+            return response;
+        }
     };
 
     state.active_streams.fetch_add(1, Ordering::SeqCst);
     let active = state.active_streams.clone();
-    let _guard = ActiveStreamGuard(active);
-
-    let mut translator = StreamTranslator::new();
+    let limiter = state.limiter.clone();
+    let force_cancel = state.force_cancel.clone();
+    let mut translator = StreamTranslator::new(include_usage);
     let sse = async_stream::stream! {
         use futures::StreamExt;
+        let _guard = ActiveStreamGuard(active);
+        let _permit = permit;
         let mut stream = stream;
-        while let Some(event) = stream.next().await {
+        let mut final_usage = None;
+        let mut usage_reconciled = false;
+        while let Some(event) = tokio::select! {
+            event = stream.next() => event,
+            _ = force_cancel.cancelled() => None,
+        } {
             match event {
                 Ok(ev) => {
                     for chunk in translator.push(&ev) {
@@ -228,8 +295,23 @@ async fn handle_stream(
                             Err(_) => {}
                         }
                     }
-                    if matches!(ev, StreamEvent::MessageStop) {
-                        yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
+                    if let StreamEvent::MessageDelta { usage: Some(usage), .. } = &ev {
+                        final_usage = Some(usage.clone());
+                    }
+                    // A mid-stream Error event also terminates the SSE stream
+                    // cleanly with [DONE] (OpenAI closes the stream on error).
+                    let terminal = matches!(
+                        ev,
+                        StreamEvent::MessageStop | StreamEvent::Error { .. }
+                    );
+                    if terminal {
+                        if let Some(usage) = final_usage.take() {
+                            limiter.record_usage(&key, tokens_estimate, usage.total());
+                            usage_reconciled = true;
+                        }
+                        yield Ok::<_, std::convert::Infallible>(
+                            Event::default().data("[DONE]"),
+                        );
                         break;
                     }
                 }
@@ -244,9 +326,34 @@ async fn handle_stream(
                 }
             }
         }
+        // A transport may end without a MessageStop. Do not leave the
+        // request estimate charged forever, but only reconcile when the
+        // provider supplied authoritative usage.
+        if !usage_reconciled {
+            if let Some(usage) = final_usage {
+                limiter.record_usage(&key, tokens_estimate, usage.total());
+            } else {
+                // Failed, cancelled, or usage-less streams must not consume
+                // the request estimate permanently.
+                limiter.record_usage(&key, tokens_estimate, 0);
+            }
+        }
     };
 
     Sse::new(sse).into_response()
+}
+
+async fn provider_call_with_timeout<T>(
+    future: impl std::future::Future<Output = T>,
+    timeout_secs: u64,
+) -> Result<T, Response> {
+    if timeout_secs == 0 {
+        return Ok(future.await);
+    }
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), future).await {
+        Ok(result) => Ok(result),
+        Err(_) => Err(GatewayError::timeout("Upstream request timed out").into_response()),
+    }
 }
 
 /// `GET /v1/models` — synthetic free-catalog entries + registered providers.
@@ -353,10 +460,22 @@ impl Drop for ActiveStreamGuard {
 pub async fn run_gateway(config: &EffectiveGatewayConfig) -> anyhow::Result<()> {
     use crate::shutdown::{install_signal_handlers, ShutdownCoordinator};
 
-    if !config.allow_non_loopback && !config.listen.starts_with("127.0.0.1") {
+    if !config.allow_non_loopback {
+        let is_loopback = config
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip().is_loopback())
+            .unwrap_or(false);
+        if !is_loopback {
+            anyhow::bail!(
+                "Refusing to bind non-loopback address {} without --allow-non-loopback",
+                config.listen
+            );
+        }
+    }
+    if config.tls_cert_path.is_some() || config.tls_key_path.is_some() {
         anyhow::bail!(
-            "Refusing to bind non-loopback address {} without --allow-non-loopback",
-            config.listen
+            "TLS configuration is not supported by the current gateway listener; use a TLS reverse proxy"
         );
     }
     let registry = build_registry();
@@ -369,6 +488,8 @@ pub async fn run_gateway(config: &EffectiveGatewayConfig) -> anyhow::Result<()> 
         registry,
         draining: coordinator.draining.clone(),
         active_streams: coordinator.active_streams.clone(),
+        in_flight: Arc::new(Semaphore::new(config.max_in_flight_per_upstream.max(1))),
+        force_cancel: coordinator.force_cancel.clone(),
     };
 
     let app = build_router(state);

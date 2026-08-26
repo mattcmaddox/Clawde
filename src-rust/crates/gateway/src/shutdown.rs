@@ -17,8 +17,11 @@ pub struct ShutdownCoordinator {
     pub draining: Arc<AtomicBool>,
     /// Active SSE stream count.
     pub active_streams: Arc<std::sync::atomic::AtomicUsize>,
-    /// Cancelled on SIGINT/SIGTERM.
+    /// Cancelled on SIGINT/SIGTERM to begin graceful shutdown.
     pub cancel: CancellationToken,
+    /// Cancelled only after the grace period expires, forcing active streams
+    /// to end.
+    pub force_cancel: CancellationToken,
     /// Grace period for draining active streams.
     pub grace_secs: u64,
 }
@@ -29,6 +32,7 @@ impl ShutdownCoordinator {
             draining: Arc::new(AtomicBool::new(false)),
             active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cancel: CancellationToken::new(),
+            force_cancel: CancellationToken::new(),
             grace_secs,
         }
     }
@@ -47,8 +51,9 @@ impl ShutdownCoordinator {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // Grace expired: cancel remaining streams.
-        self.cancel.cancel();
+        // Grace expired: force remaining streams to end. Keep `cancel`
+        // reserved for the shutdown trigger so handlers can drain first.
+        self.force_cancel.cancel();
     }
 }
 

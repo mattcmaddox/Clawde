@@ -1,0 +1,44 @@
+[
+  {
+    "id": "msg_usage",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"role": "assistant", "content": null},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_usage",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {"content": "Done."},
+      "finish_reason": null
+    }]
+  },
+  {
+    "id": "msg_usage",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [{
+      "index": 0,
+      "delta": {},
+      "finish_reason": "stop"
+    }]
+  },
+  {
+    "id": "msg_usage",
+    "object": "chat.completion.chunk",
+    "model": "free/auto",
+    "choices": [],
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 7,
+      "total_tokens": 17,
+      "reasoning_tokens": 0
+    }
+  }
+]

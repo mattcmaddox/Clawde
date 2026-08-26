@@ -60,8 +60,6 @@ impl Bucket {
 struct KeyState {
     rpm: Bucket,
     tpm: Bucket,
-    /// Tokens consumed this minute (for TPM header reporting).
-    tokens_used: f64,
 }
 
 /// Per-key rate limiter with lazy bucket allocation.
@@ -98,36 +96,48 @@ impl RateLimiter {
     /// `max_tokens` + input estimate). TPM is enforced on the estimate
     /// up-front; the exact count is added on completion via [`Self::record_usage`].
     pub fn check(&self, key: &str, tokens_estimate: u64) -> RateLimitOutcome {
-        let mut keys = self.keys.lock().unwrap();
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = keys.entry(key.to_string()).or_insert_with(|| KeyState {
             rpm: Bucket::new(self.rpm_limit, self.rpm_limit),
             tpm: Bucket::new(self.tpm_limit, self.tpm_limit),
-            tokens_used: 0.0,
         });
         if !state.rpm.try_consume(1.0) {
             return RateLimitOutcome::RpmExhausted(state.rpm.seconds_until(1.0));
         }
         if !state.tpm.try_consume(tokens_estimate as f64) {
+            // A rejected request must not burn an RPM token.
+            state.rpm.tokens = (state.rpm.tokens + 1.0).min(state.rpm.capacity);
             return RateLimitOutcome::TpmExhausted(state.tpm.seconds_until(tokens_estimate as f64));
         }
-        state.tokens_used += tokens_estimate as f64;
         RateLimitOutcome::Allowed
     }
 
-    /// Record actual usage after a response/stream completes.
-    pub fn record_usage(&self, key: &str, tokens: u64) {
-        let mut keys = self.keys.lock().unwrap();
+    /// Replace the request estimate with the provider's actual usage.
+    ///
+    /// The estimate was consumed by [`Self::check`]. Refund it first, then
+    /// consume the actual count. Keeping both values is important: charging
+    /// only the actual count would let a client repeatedly reserve a large
+    /// request and receive a free token refund.
+    pub fn record_usage(&self, key: &str, estimated_tokens: u64, actual_tokens: u64) {
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(state) = keys.get_mut(key) {
-            // Refund the estimate, charge the actual. (The estimate was
-            // consumed up-front; adjust the difference.)
-            state.tokens_used += tokens as f64;
-            state.tpm.tokens = (state.tpm.tokens + (tokens as f64)).min(state.tpm.capacity);
+            state.tpm.tokens = (state.tpm.tokens + estimated_tokens as f64).min(state.tpm.capacity);
+            state.tpm.tokens = (state.tpm.tokens - actual_tokens as f64).max(0.0);
         }
     }
 
     /// Remaining budget info for headers (0.0..=1.0 fractions).
     pub fn remaining(&self, key: &str) -> (f64, f64) {
-        let keys = self.keys.lock().unwrap();
+        let keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match keys.get(key) {
             Some(state) => (
                 (state.rpm.tokens / state.rpm.capacity).clamp(0.0, 1.0),
@@ -145,6 +155,9 @@ pub fn validate_bearer(auth_header: Option<&str>, allowed_keys: &[String]) -> Op
         .strip_prefix("Bearer ")
         .or_else(|| header.strip_prefix("bearer "))?;
     let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
     for key in allowed_keys {
         // Constant-time comparison to avoid timing attacks.
         if token.as_bytes().ct_eq(key.as_bytes()).into() {
@@ -201,5 +214,14 @@ mod tests {
             RateLimitOutcome::TpmExhausted(secs) => assert!(secs > 0),
             other => panic!("expected TpmExhausted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn actual_usage_replaces_not_adds_to_the_estimate() {
+        let limiter = RateLimiter::new(100, 100);
+        assert_eq!(limiter.check("k", 80), RateLimitOutcome::Allowed);
+        limiter.record_usage("k", 80, 10);
+        let (_, remaining) = limiter.remaining("k");
+        assert!((remaining - 0.9).abs() < 0.001);
     }
 }

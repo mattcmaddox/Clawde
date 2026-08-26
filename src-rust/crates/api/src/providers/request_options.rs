@@ -13,17 +13,6 @@ fn merge_maps(target: &mut Map<String, Value>, source: &Map<String, Value>) {
     }
 }
 
-pub(crate) fn merge_root_options(body: &mut Value, provider_options: &Value) {
-    let Some(body_obj) = body.as_object_mut() else {
-        return;
-    };
-    let Some(options_obj) = provider_options.as_object() else {
-        return;
-    };
-
-    merge_maps(body_obj, options_obj);
-}
-
 pub(crate) fn merge_openai_compatible_options(body: &mut Value, provider_options: &Value) {
     let Some(options_obj) = provider_options.as_object() else {
         return;
