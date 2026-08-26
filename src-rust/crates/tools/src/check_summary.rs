@@ -22,6 +22,8 @@ pub enum CheckKind {
 /// Structured verdict for one deterministic check invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckSummary {
+    /// Raw exit code, when the command actually started.
+    pub exit_code: Option<i32>,
     pub kind: CheckKind,
     /// The command exited 0 — the runner reported success. Note this does not
     /// claim every assertion passed; it is the exit-code signal the tool
@@ -29,8 +31,6 @@ pub struct CheckSummary {
     pub passed: bool,
     /// The command was killed after the configured timeout.
     pub timed_out: bool,
-    /// Raw exit code, when the command actually started.
-    pub exit_code: Option<i32>,
 }
 
 /// Metadata key under which the summary is attached to a `ToolResult`.
