@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 clawde-api = { workspace = true }
 clawde-core = { workspace = true }
+clawde-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -21,6 +22,7 @@ subtle = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
