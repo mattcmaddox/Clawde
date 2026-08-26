@@ -382,7 +382,8 @@ Options:
   -h, --help                 Show this help
 
 Endpoints:
-  POST /v1/chat/completions  Chat completions (stream + non-stream)
+  POST /v1/chat/completions  Chat completions (relay + agent mode, stream + non-stream)
+  POST /v1/responses         Agent-native Responses API (Open Responses)
   GET /v1/models             List models
   GET /v1/models/{id}        Get a model
   GET /healthz               Liveness

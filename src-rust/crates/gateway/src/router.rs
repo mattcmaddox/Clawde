@@ -85,7 +85,7 @@ impl AgentRuntime {
             executor,
             max_tool_calls,
             parsed.parallel_tool_calls,
-            None,
+            parsed.allowed_tools.clone(),
             true, // yield_mixed_turns (chat relay semantics)
             &parsed.provider_request.model,
             cancel,

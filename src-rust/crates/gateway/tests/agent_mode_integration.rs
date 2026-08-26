@@ -457,6 +457,39 @@ async fn permission_deny_short_circuits_internal_tools() {
 }
 
 #[tokio::test]
+async fn chat_allowed_tools_denied_becomes_error_observation() {
+    let provider = Arc::new(ScriptedAgentProvider {
+        id: ProviderId::new("scripted"),
+        script: vec![
+            missing_file_call(),
+            ScriptedTurn::text("read is not allowed"),
+        ],
+        create_message_text: "summary".to_string(),
+        dispatches: AtomicUsize::new(0),
+        creates: AtomicUsize::new(0),
+    });
+    // D6 on chat completions: the client whitelists only `Other`, so the
+    // model's `Read` call becomes a tool_error observation and is never
+    // executed; the loop continues and the model self-corrects.
+    let (status, body) = post(
+        state_with(default_config(), register(provider.clone())),
+        agent_body(json!({"allowed_tools": ["Other"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: Value = serde_json::from_str(&body).expect("JSON body");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "read is not allowed"
+    );
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    // Two dispatches: the denied-call turn, then the recovery turn. The
+    // denied call never surfaced as a yielded tool_call.
+    assert_eq!(provider.dispatches.load(Ordering::SeqCst), 2);
+    assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+}
+
+#[tokio::test]
 async fn relay_mode_stays_default_without_agent_knobs() {
     let provider = Arc::new(ScriptedAgentProvider {
         id: ProviderId::new("scripted"),

@@ -1,5 +1,10 @@
 # Clawde Gateway Implementation Plan
 
+> **Superseded.** This was the relay-only gateway plan (chat completions
+> proxy). The agent-capable design replaced it — see
+> [clawde-agent-gateway-plan.md](clawde-agent-gateway-plan.md); the shipped
+> surface is documented in [docs/gateway.md](../../gateway.md).
+
 ## 1. Goals
 
 - Expose an OpenAI-compatible HTTP API (`POST /v1/chat/completions`,

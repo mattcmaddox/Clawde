@@ -1,9 +1,12 @@
-//! Clawde Gateway — an OpenAI-compatible HTTP API that routes chat completion
-//! requests through Clawde's provider registry (FreeProvider fallback, key
-//! rotation, cooldowns).
+//! Clawde Gateway — an OpenAI-compatible HTTP API that routes requests
+//! through Clawde's provider registry (FreeProvider fallback, key rotation,
+//! cooldowns) and can run Clawde's server-side agent loop.
 //!
-//! Scope guardrail: the gateway proxies **chat completions only**. It does not
-//! run the agent loop, execute tools, manage sessions, or expose the TUI.
+//! Two surfaces: relay chat completions (`POST /v1/chat/completions`, the
+//! default) and agent mode — server-side built-in tool execution on the same
+//! endpoint plus the agent-native `POST /v1/responses` (Open Responses).
+//! Response sessions for `previous_response_id` continuation are ephemeral
+//! in-memory only (no disk).
 
 pub mod agent;
 pub mod auth;

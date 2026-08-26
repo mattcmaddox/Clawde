@@ -34,6 +34,9 @@ pub struct ParsedRequest {
     /// Client `parallel_tool_calls` (default true). When false, internal tool
     /// calls execute serially.
     pub parallel_tool_calls: bool,
+    /// Hard allow-list for the agent loop (D6, same semantics as Responses):
+    /// calls outside it become `tool_error` observations, never executed.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Parse an OpenAI chat completion request body into a [`ProviderRequest`].
@@ -120,6 +123,14 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         .get("parallel_tool_calls")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let allowed_tools = body
+        .get("allowed_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        });
 
     Ok(ParsedRequest {
         provider_request: ProviderRequest {
@@ -142,6 +153,7 @@ pub fn parse_chat_completion_request(body: &Value) -> Result<ParsedRequest, Gate
         n,
         max_tool_calls,
         parallel_tool_calls,
+        allowed_tools,
     })
 }
 
@@ -874,6 +886,22 @@ mod tests {
             parsed.provider_request.provider_options["tool_choice"]["function"]["name"],
             "get_weather"
         );
+    }
+
+    #[test]
+    fn parses_allowed_tools() {
+        let mut body = request_body();
+        body["max_tool_calls"] = json!(4);
+        body["allowed_tools"] = json!(["Read", "Bash"]);
+        let parsed = parse_chat_completion_request(&body).unwrap();
+        assert_eq!(parsed.max_tool_calls, Some(4));
+        assert_eq!(
+            parsed.allowed_tools.as_deref(),
+            Some(&["Read".to_string(), "Bash".to_string()][..])
+        );
+        // Absent -> None (no restriction).
+        let parsed = parse_chat_completion_request(&request_body()).unwrap();
+        assert!(parsed.allowed_tools.is_none());
     }
 
     #[test]
