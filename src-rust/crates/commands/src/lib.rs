@@ -4099,6 +4099,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_compact_command_toggle_on_from_off() {
+        let _home = crate::keys::tests::TestHome::new();
         let mut ctx = make_ctx();
         ctx.config.auto_compact = false;
         let cmd = AutoCompactCommand;
@@ -4122,6 +4123,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_compact_command_toggle_off_from_on() {
+        let _home = crate::keys::tests::TestHome::new();
         let mut ctx = make_ctx();
         ctx.config.auto_compact = true;
         let cmd = AutoCompactCommand;
@@ -4145,6 +4147,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_compact_command_toggle_no_args_flips_state() {
+        let _home = crate::keys::tests::TestHome::new();
         let mut ctx = make_ctx();
         ctx.config.auto_compact = false;
         let cmd = AutoCompactCommand;
