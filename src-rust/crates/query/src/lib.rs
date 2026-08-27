@@ -126,6 +126,8 @@ pub struct QueryConfig {
     pub append_system_prompt: Option<String>,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
+    /// Enable strict ranked followups in final model responses.
+    pub ranked_followups: bool,
     /// Persisted active mode preset name (e.g. `"careful"`). An inline
     /// `mode:<name>` keyword in the latest user message overrides it for one
     /// turn (see [`effective_mode_name_for_turn`]).
@@ -252,6 +254,7 @@ impl Default for QueryConfig {
             append_system_prompt: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            ranked_followups: true,
             mode: None,
             modes: None,
             working_directory: None,
@@ -292,6 +295,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            ranked_followups: true,
             mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
@@ -317,6 +321,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            ranked_followups: true,
             mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
             network_blocked: clawde_core::network_isolation_enabled(cfg),
@@ -4956,6 +4961,7 @@ mod tests {
             append_system_prompt: append.map(String::from),
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            ranked_followups: true,
             mode: None,
             modes: None,
             working_directory: None,

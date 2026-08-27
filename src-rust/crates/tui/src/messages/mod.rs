@@ -11,6 +11,7 @@ use crate::app::TurnMetadata;
 use crate::kitty_image::render_image;
 use crate::transcript_turn::reasoning_heading;
 use clawde_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use clawde_core::{FollowupRank, RankedFollowup};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -822,14 +823,24 @@ pub fn render_transcript_assistant_message_tagged(
 ) -> Vec<(Line<'static>, Option<u64>)> {
     let mut out: Vec<(Line<'static>, Option<u64>)> = Vec::new();
     let mut pending_text = String::new();
+    let mut ranked_followups = Vec::new();
 
-    let flush_text =
+    let mut flush_text =
         |buffer: &mut String, target: &mut Vec<(Line<'static>, Option<u64>)>, width: u16| {
             if buffer.is_empty() {
                 return;
             }
-            for line in render_transcript_live_text(buffer, width) {
-                target.push((line, None));
+            let parsed = clawde_core::parse_ranked_followups(buffer);
+            if parsed.had_block {
+                if !parsed.followups.is_empty() {
+                    ranked_followups.extend(parsed.followups);
+                }
+                *buffer = parsed.visible_text;
+            }
+            if !buffer.is_empty() {
+                for line in render_transcript_live_text(buffer, width) {
+                    target.push((line, None));
+                }
             }
             buffer.clear();
         };
@@ -1112,7 +1123,15 @@ pub fn render_transcript_assistant_message_tagged(
         }
     }
 
+    // Flush the final text buffer. Parsing also happens at earlier text/block
+    // boundaries, so a metadata block can never leak merely because a tool or
+    // thinking block followed it.
     flush_text(&mut pending_text, &mut out, ctx.width);
+    if !ranked_followups.is_empty() {
+        for line in render_ranked_followups(&ranked_followups) {
+            out.push((line, None));
+        }
+    }
     out
 }
 
@@ -2364,6 +2383,48 @@ pub fn render_resource_update(server: &str, uri: &str, reason: &str) -> Vec<Line
     ])]
 }
 
+/// Render ranked post-response followups.
+///
+/// The rank remains visible so the user can distinguish required verification
+/// from optional ideas. Undesired items are intentionally dimmed rather than
+/// hidden, matching the feature specification.
+pub fn render_ranked_followups(followups: &[RankedFollowup]) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "  Suggested followups",
+        Style::default()
+            .fg(TRANSCRIPT_MUTED)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for followup in followups {
+        let (rank_color, modifier) = match followup.rank {
+            FollowupRank::HighlyRecommended => (Color::Green, Modifier::BOLD),
+            FollowupRank::Recommended => (Color::Cyan, Modifier::BOLD),
+            FollowupRank::Optional => (Color::Yellow, Modifier::empty()),
+            FollowupRank::ForCompletion => (Color::Blue, Modifier::empty()),
+            FollowupRank::Unimportant => (Color::DarkGray, Modifier::DIM),
+            FollowupRank::Undesired => (Color::DarkGray, Modifier::DIM | Modifier::ITALIC),
+        };
+        let reason = if followup.reason.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", followup.reason.trim())
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(rank_color)),
+            Span::styled(
+                format!("{}: ", followup.rank.label()),
+                Style::default().fg(rank_color).add_modifier(modifier),
+            ),
+            Span::styled(
+                followup.text.trim().to_string(),
+                Style::default().fg(TRANSCRIPT_TEXT),
+            ),
+            Span::styled(reason, Style::default().fg(TRANSCRIPT_SUBTLE)),
+        ]));
+    }
+    lines
+}
+
 /// Render a collapsed read/search tool use summary.
 /// Shows: `▸ ` in yellow + `{tool_name} ` in yellow bold + first few paths comma-joined,
 /// followed by `(+ {n_hidden} more)` in dark gray if n_hidden > 0.
@@ -2971,6 +3032,63 @@ mod tests {
     }
 
     // ── New function tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn tagged_renderer_strips_followups_before_a_following_tool() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "Done.\n<clawde_followups>[{\"text\":\"Run tests\",\"rank\":\"recommended\",\"reason\":\"Verify\"}]</clawde_followups>".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({"file_path":"src/lib.rs"}),
+                thought_signature: None,
+            },
+        ]);
+        let tagged = render_transcript_assistant_message_tagged(&msg, &RenderContext::default());
+        let visible = tagged
+            .iter()
+            .map(|(line, _)| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("Done."));
+        assert!(visible.contains("Read"));
+        assert!(!visible.contains("clawde_followups"));
+        // The action is intentionally rendered as a visible ranked followup;
+        // only the transport metadata must be absent.
+        assert!(visible.contains("Run tests"));
+        assert!(visible.contains("Recommended"));
+    }
+
+    #[test]
+    fn tagged_renderer_strips_malformed_closed_followup_block() {
+        let msg = Message::assistant_blocks(vec![ContentBlock::Text {
+            text: "Answer <clawde_followups>{bad}</clawde_followups>".to_string(),
+        }]);
+        let tagged = render_transcript_assistant_message_tagged(&msg, &RenderContext::default());
+        let visible = tagged
+            .iter()
+            .map(|(line, _)| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("Answer"));
+        assert!(!visible.contains("clawde_followups"));
+    }
+
+    #[test]
+    fn tagged_renderer_keeps_unclosed_followup_text() {
+        let msg = Message::assistant_blocks(vec![ContentBlock::Text {
+            text: "Answer <clawde_followups>".to_string(),
+        }]);
+        let tagged = render_transcript_assistant_message_tagged(&msg, &RenderContext::default());
+        let visible = tagged
+            .iter()
+            .map(|(line, _)| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("clawde_followups"));
+    }
 
     #[test]
     fn test_render_system_api_error_short_message() {

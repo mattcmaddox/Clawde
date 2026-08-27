@@ -237,6 +237,10 @@ pub struct SystemPromptOptions {
     /// injected into the dynamic section so the model knows not to attempt
     /// these tools.
     pub network_blocked: bool,
+    /// Ask the model to emit the optional, strict ranked-followup block at the
+    /// end of useful final responses. The client parses and strips the block
+    /// before rendering it to the user.
+    pub ranked_followups: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +303,13 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(format!(
             "\n<custom_instructions>\n{}\n</custom_instructions>",
             custom
+        ));
+    }
+
+    if opts.ranked_followups {
+        parts.push(format!(
+            "\n## Suggested Followups\n{}",
+            crate::followups::prompt_instruction()
         ));
     }
 

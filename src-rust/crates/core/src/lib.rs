@@ -15,6 +15,12 @@
 pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
 
+// Ranked followups emitted by the model and rendered by interactive clients.
+pub mod followups;
+pub use followups::{
+    parse_and_strip as parse_ranked_followups, FollowupRank, ParsedFollowups, RankedFollowup,
+};
+
 // Named mode presets (bundles of config knobs + decision-rule posture).
 pub mod modes;
 pub use modes::{
