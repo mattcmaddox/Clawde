@@ -420,10 +420,11 @@ mod tests {
         for m in &modes {
             assert!(seen.insert(&m.name), "duplicate mode name: {}", m.name);
         }
-        // default first, then the D5 starter, then fast.
+        // default first, then the D5 starter, then fast, then walkaway.
         assert_eq!(modes[0].name, "default");
         assert_eq!(modes[1].name, "careful");
         assert_eq!(modes[2].name, "fast");
+        assert_eq!(modes[3].name, "walkaway");
     }
 
     #[test]

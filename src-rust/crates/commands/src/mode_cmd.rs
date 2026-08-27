@@ -203,8 +203,26 @@ mod tests {
                 assert!(msg.contains("Current mode:"));
                 assert!(msg.contains("careful"));
                 assert!(msg.contains("fast"));
+                assert!(msg.contains("walkaway"));
             }
             other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_to_walkaway() {
+        let mut c = ctx();
+        let result = ModeCommand.execute("walkaway", &mut c).await;
+        match result {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
+                assert!(msg.contains("Walk Away"), "{msg}");
+                assert_eq!(new_cfg.mode.as_deref(), Some("walkaway"));
+                assert_eq!(
+                    new_cfg.permission_mode,
+                    clawde_core::config::PermissionMode::AcceptEdits
+                );
+            }
+            other => panic!("expected ConfigChangeMessage, got {:?}", other),
         }
     }
 
