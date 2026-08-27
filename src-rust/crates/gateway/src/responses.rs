@@ -228,6 +228,17 @@ fn parse_responses_tools(tools: Option<&Value>) -> Result<Vec<ToolDefinition>, G
     };
     let mut out = Vec::with_capacity(arr.len());
     for t in arr {
+        // Open Responses defines non-function built-in tools
+        // (`web_search_preview`, `file_search`, …) which the gateway does not
+        // implement; reject them explicitly rather than with a confusing
+        // "missing name" error.
+        if let Some(ty) = t.get("type").and_then(|v| v.as_str()) {
+            if ty != "function" {
+                return Err(GatewayError::invalid_request(format!(
+                    "tool type '{ty}' is not supported by the gateway (only 'function')"
+                )));
+            }
+        }
         let function = t.get("function").unwrap_or(t);
         let name = function
             .get("name")
@@ -888,6 +899,25 @@ mod tests {
         assert!(!parsed.parallel_tool_calls);
         assert_eq!(parsed.previous_response_id.as_deref(), Some("resp_123"));
         assert!(parsed.store);
+    }
+
+    #[test]
+    fn rejects_unsupported_builtin_tool_type() {
+        // Open Responses built-in tools (web_search_preview etc.) are not
+        // implemented; the error must name the type, not claim a missing name.
+        let mut b = body();
+        b["tools"] = json!([{"type": "web_search_preview"}]);
+        let err = parse_responses_request(&b).unwrap_err();
+        assert!(
+            err.message.contains("web_search_preview"),
+            "unexpected error: {}",
+            err.message
+        );
+        // Ordinary function tools still parse.
+        let mut ok = body();
+        ok["tools"] = json!([{"type": "function", "name": "Grep", "description": "g",
+                               "parameters": {"type": "object", "properties": {}}}]);
+        assert!(parse_responses_request(&ok).is_ok());
     }
 
     #[test]

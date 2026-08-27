@@ -26,9 +26,11 @@ SRC_DIR="$REPO_ROOT/src-rust"
 needs_build() {
     [ ! -f "$BINARY" ] && return 0
     local newest_src
+    # `|| true`: head -1 closes the pipe early, xargs gets SIGPIPE, and
+    # pipefail would turn that into a shell-exiting failure.
     newest_src=$(find "$SRC_DIR/crates" "$SRC_DIR/Cargo.toml" "$SRC_DIR/Cargo.lock" \
         -type f \( -name '*.rs' -o -name '*.toml' \) \
-        -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | head -1)
+        -print0 2>/dev/null | xargs -0 ls -t 2>/dev/null | head -1 || true)
     [ -z "$newest_src" ] && return 0
     [ "$newest_src" -nt "$BINARY" ]
 }

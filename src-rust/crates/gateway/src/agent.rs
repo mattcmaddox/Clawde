@@ -353,6 +353,10 @@ pub async fn run_agent_loop(
         // reply: free-cascade upstreams sometimes return a 0-token response
         // or reason without answering. Retry once (bounded, like D10's
         // in-turn transient retry) instead of silently completing empty.
+        // The retry also covers a ToolUse stop reason that emitted no blocks
+        // (some upstreams signal ToolUse but stream nothing) — otherwise a
+        // thinking-only or empty turn could still complete silently empty
+        // via the degenerate branch below.
         let has_answer = match &msg.content {
             MessageContent::Text(t) => !t.is_empty(),
             MessageContent::Blocks(blocks) => blocks.iter().any(|b| match b {
@@ -362,7 +366,8 @@ pub async fn run_agent_loop(
                 _ => false,
             }),
         };
-        if stop_reason != StopReason::ToolUse && !has_answer && empty_retries < 1 {
+        let calls = extract_tool_uses(&msg);
+        if !has_answer && calls.is_empty() && empty_retries < 1 {
             empty_retries += 1;
             continue;
         }
@@ -375,7 +380,6 @@ pub async fn run_agent_loop(
             },
         );
 
-        let calls = extract_tool_uses(&msg);
         if calls.is_empty() && stop_reason == StopReason::ToolUse {
             // Degenerate: model signalled ToolUse but emitted none.
             return Ok(AgentOutcome::completed(
@@ -1710,6 +1714,33 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, AgentStatus::Completed);
         assert_eq!(out.message.get_all_text(), "here is the answer");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn degenerate_tool_use_stop_without_blocks_retries() {
+        // An upstream that signals ToolUse but streams no blocks and no text
+        // (thinking-only or empty) must not complete silently empty: the
+        // retry now covers ToolUse stops with zero calls.
+        let mock = provider(vec![
+            MockTurn {
+                tool_calls: Vec::new(),
+                text: String::new(),
+                thinking: Some("reasoned but never answered".to_string()),
+                error: None,
+                upstream: None,
+                stop_override: Some(StopReason::ToolUse),
+            },
+            MockTurn::text("the eventual answer"),
+        ]);
+        let out = run(
+            mock.clone(),
+            executor(GatewayPermissionMode::Allow),
+            AgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out.status, AgentStatus::Completed);
+        assert_eq!(out.message.get_all_text(), "the eventual answer");
         assert_eq!(mock.calls.load(Ordering::SeqCst), 2);
     }
 

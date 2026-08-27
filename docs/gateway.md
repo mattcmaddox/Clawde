@@ -349,3 +349,24 @@ cd src-rust && cargo build -p clawde-gateway
 
 The same server runs through the CLI: `clawde serve [--port N] [--key K]
 [--allow-non-loopback] [--tls-cert P] [--tls-key P]`.
+
+## End-to-end smoke test
+
+`scripts/gateway-sdk-smoke.sh` builds the gateway (if stale), starts it on a
+loopback port, waits for `/healthz`, and drives it through the official
+SDKs: relay chat completions, chat agent mode (server-side tool execution),
+`/v1/responses` items + `previous_response_id` continuation, and a full
+openai-agents `Runner` loop. It tears the gateway down on exit (including
+on failure).
+
+```bash
+./scripts/gateway-sdk-smoke.sh
+```
+
+Requires `python3` with `openai` and `openai-agents` installed (use
+`GATEWAY_PYTHON=/path/to/venv/bin/python` if they live in a venv) and at
+least one free-cascade credential (`GROQ_API_KEY` or stored keys). Other
+knobs: `GATEWAY_PORT`, `GATEWAY_KEY`, `SKIP_BUILD=1`. The free cascade is
+nondeterministic, so the script retries transient empty completions;
+tool-round behavior itself is pinned deterministically by the integration
+tests under `src-rust/crates/gateway/tests/`.

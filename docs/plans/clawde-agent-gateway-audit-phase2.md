@@ -110,10 +110,45 @@ spec requires `n >= 1`; their API returns 400). Both chat and Responses
 parsers now reject `n == 0` with `400 n must be at least 1`; tests
 `rejects_n_zero` added on each surface.
 
+## Second sweep: interaction + fidelity audit
+
+Re-audited the committed feature for interactions between the fixes and
+remaining fidelity gaps:
+
+- **Fixed — degenerate ToolUse stop, no blocks.** The empty-terminal retry
+  excluded `stop_reason == ToolUse`, and the degenerate branch (`ToolUse`
+  stop with zero emitted blocks) completed the turn regardless of content —
+  so a thinking-only or empty turn with a ToolUse stop reason still
+  completed silently empty, the same failure class as the live-found fixes.
+  The retry now covers any no-answer, no-calls turn regardless of stop
+  reason, before the empty message enters the trajectory. Regression test:
+  `degenerate_tool_use_stop_without_blocks_retries`.
+- **Fixed — misleading tool-type error.** `parse_responses_tools` reported
+  "tool missing 'name'" for spec-defined non-function built-ins
+  (`web_search_preview`, `file_search`), which the gateway does not
+  implement. Now rejected explicitly with the type named. Test:
+  `rejects_unsupported_builtin_tool_type`.
+- **Verified clean** — rate limiter (estimate charged up-front, actual
+  reconciled on completion, clamped at 0: overshoot self-starvation is by
+  design), E2 mixed internal+external ordering (chat yields all; Responses
+  executes internals then yields externals), relay stream error mid-stream
+  (`[DONE]` + usage reconciliation on every exit path), per-dispatch timeout
+  wired into every turn (`dispatch_turn` → `provider_call`).
+- **Verified accurate** — `allow-readonly` allows read-only tools anywhere
+  (Read's own contract: "You can access any file directly"); glob/grep are
+  the only workspace-filtered tools. The docs' "workspace scoping" claim
+  (working directory, not a read boundary) matches the code.
+- **Known limitation (pre-existing, matches relay)** — the per-dispatch
+  timeout wraps stream *setup* only, not consumption; a stalled upstream
+  stream hangs until client disconnect / force-cancel. Same semantics as
+  the relay path; noted, not changed.
+
 ## Verdict
 
 16/16 decisions verified; the one gap (D3 budget) was a small bounded fix.
 No architecture drift. Live SDK smoke tests passed and surfaced two
 additional loop hardening fixes (malformed stop reasons, empty terminal
 retry), now regression-tested. Post-SDK edge sweep found one wire-fidelity
-nit (`n: 0`), fixed with tests on both surfaces.
+nit (`n: 0`), fixed with tests on both surfaces. Second sweep closed the
+last empty-completion hole (degenerate ToolUse stop) and made unsupported
+Responses tool types fail honestly.

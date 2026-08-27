@@ -72,8 +72,16 @@ impl SlashCommand for UndoCommand {
                 )
             }
         };
-
+        let prompt_count = undo_prompt_count(&ctx.messages);
         let Some(group) = undo_group(&ctx.messages, n) else {
+            if prompt_count == 0 {
+                return CommandResult::Message("Nothing to undo: no prompts yet.".into());
+            }
+            if n > prompt_count {
+                return CommandResult::Error(format!(
+                    "Cannot go back {n} prompts — this session has {prompt_count}."
+                ));
+            }
             return CommandResult::Message(
                 "Nothing to undo: no file changes recorded since that prompt.".into(),
             );
@@ -149,6 +157,7 @@ impl SlashCommand for UndoCommand {
         // user prompt survives and the work moves to a sibling branch.
         let patches: Vec<clawde_core::snapshot::Patch> = ctx.messages[group.prompt_index + 1..]
             .iter()
+            .filter(|m| m.role == clawde_core::types::Role::Assistant)
             .filter_map(|m| m.snapshot_patch.clone())
             .collect();
         snap.revert(&patches).await;
@@ -159,6 +168,7 @@ impl SlashCommand for UndoCommand {
                 Ok(p) => p,
                 Err(e) => return CommandResult::Error(format!("Invalid session ID: {e}")),
             };
+        let mut note = String::new();
         if path.exists() {
             // Branch before the FIRST assistant turn after the prompt so the
             // prompt (and everything before it) stays on the active leaf.
@@ -174,13 +184,21 @@ impl SlashCommand for UndoCommand {
                         "Reverted files but could not update transcript: {e}"
                     ));
                 }
+            } else {
+                note = "\nNote: the transcript has no message id at the undo boundary, so it was \
+                        not branched — files were still restored."
+                    .to_string();
             }
         }
 
+        let prompt_word = if n == 1 { "your prompt" } else { "that prompt" };
         CommandResult::Message(format!(
-            "Reverted {} file(s) changed since your prompt. Later turns kept on a branch.\n\
-             /undo 2 goes back further; /revert <n> for single-turn control.",
-            file_count
+            "Reverted {} file(s) changed since {}. Later turns kept on a branch.\n\
+             /undo {} goes back further; /revert <n> for single-turn control.{}",
+            file_count,
+            prompt_word,
+            n + 1,
+            note
         ))
     }
 }
@@ -535,6 +553,11 @@ struct UndoGroup {
     patched: Vec<usize>,
 }
 
+/// Number of real prompts in the transcript (for out-of-range messages).
+fn undo_prompt_count(messages: &[clawde_core::types::Message]) -> usize {
+    messages.iter().filter(|m| is_user_prompt(m)).count()
+}
+
 fn undo_group(messages: &[clawde_core::types::Message], n: usize) -> Option<UndoGroup> {
     let prompts: Vec<usize> = messages
         .iter()
@@ -737,6 +760,10 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoints_lists_turns_newest_first() {
+        // TestHome keeps the description-cache probe hermetic (no reads of a
+        // real ~/.clawde and, if a provider env key is present in CI, no
+        // accidental live generation call).
+        let _home = TestHome::new();
         let messages = vec![
             assistant_with_patch("aaaaaaaaaaaa", &["old.rs"]),
             Message::user("do the thing"),
@@ -869,9 +896,24 @@ mod tests {
         let mut ctx = make_ctx(repo.path().to_path_buf(), vec![]);
         match UndoCommand.execute("", &mut ctx).await {
             CommandResult::Message(m) => {
-                assert!(m.contains("Nothing to undo"), "{}", m);
+                assert!(m.contains("Nothing to undo: no prompts yet"), "{}", m);
             }
             other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn undo_out_of_range_reports_prompt_count() {
+        let repo = make_repo();
+        let mut ctx = make_ctx(
+            repo.path().to_path_buf(),
+            vec![Message::user("one"), assistant_with_patch("aaa", &["a.rs"])],
+        );
+        match UndoCommand.execute("5", &mut ctx).await {
+            CommandResult::Error(e) => {
+                assert!(e.contains("has 1"), "{}", e);
+            }
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
