@@ -84,8 +84,17 @@ impl AutopilotCommand {
                     && item.session_id == ctx.session_id
             })
             .count();
+        let blast = &s.blast_radius;
+        let blast_line = if blast.has_activity() {
+            format!(
+                "\nBlast radius: {} files changed, {} risky actions allowed, {} irreversible denied",
+                blast.files_changed, blast.risky_actions_allowed, blast.irreversible_denied,
+            )
+        } else {
+            String::new()
+        };
         CommandResult::Message(format!(
-            "Autopilot: {posture}\nPending for this session: {session_pending}\nQueue: {}/{} items\n{SAFETY_NOTE}",
+            "Autopilot: {posture}\nPending for this session: {session_pending}\nQueue: {}/{} items{blast_line}\n{SAFETY_NOTE}",
             s.items.len(),
             s.capacity,
         ))

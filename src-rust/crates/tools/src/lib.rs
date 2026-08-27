@@ -503,6 +503,15 @@ impl ToolContext {
         }
     }
 
+    /// Record a successful file-modifying tool execution for blast-radius
+    /// observability (Phase 4F). Call after Write, Edit, or ApplyPatch
+    /// succeeds.
+    pub fn record_file_changed(&self) {
+        if let Some(autonomy) = &self.autonomy {
+            autonomy.lock().record_file_changed();
+        }
+    }
+
     fn permission_allowed_roots(&self) -> Vec<PathBuf> {
         let mut roots = self.config.workspace_paths.clone();
         roots.extend(self.config.additional_dirs.clone());
@@ -561,7 +570,27 @@ impl ToolContext {
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
-            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
+            PermissionDecision::Allow | PermissionDecision::AllowPermanently => {
+                // Blast-radius (Phase 4F): track review-required actions that
+                // execute under bypass. Only increment when we have an autonomy
+                // handle (interactive session) and the action would have been
+                // review-required — i.e., bypass is allowing something that
+                // autopilot would defer.
+                if let Some(autonomy) = &self.autonomy {
+                    let risk = clawde_core::action_risk::classify_action(
+                        &request.tool_name,
+                        &request.description,
+                        request.permission_level,
+                        request.path.as_deref(),
+                        request.network_capable,
+                        request.stateful,
+                    );
+                    if matches!(risk, clawde_core::action_risk::ActionRisk::ReviewRequired) {
+                        autonomy.lock().record_risky_action_allowed();
+                    }
+                }
+                Ok(())
+            }
             PermissionDecision::Ask { reason } => {
                 // Autopilot (Phase 4B): never block on a dialog. Safe actions
                 // run, review-required actions are deferred with a stable id,
@@ -592,6 +621,7 @@ impl ToolContext {
                         match risk {
                             clawde_core::action_risk::ActionRisk::Safe => return Ok(()),
                             clawde_core::action_risk::ActionRisk::Irreversible => {
+                                state.record_irreversible_denied();
                                 return Err(clawde_core::error::ClaudeError::PermissionDenied(
                                     format!(
                                         "Denied: '{}' is classified as irreversible and cannot run under autopilot.",

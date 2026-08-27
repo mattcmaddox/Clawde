@@ -4547,6 +4547,10 @@ async fn run_interactive(
                                         clawde_core::config::PermissionMode::Plan
                                     );
                                     app.config = applied_cfg.clone();
+                                    // Mode preset changes propagate immediately so
+                                    // effective_mode_name_for_turn reads the new value
+                                    // on the very next turn.
+                                    base_query_config.mode = applied_cfg.mode.clone();
                                     // A persisted default applies immediately only when
                                     // there is no invocation- or session-scoped override.
                                     if cli_effort_override.is_none() && current_effort.is_none() {

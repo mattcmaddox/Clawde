@@ -504,6 +504,8 @@ pub mod verify_cmd;
 pub use usage::*;
 mod autopilot;
 pub use autopilot::AutopilotCommand;
+mod mode_cmd;
+pub use mode_cmd::ModeCommand;
 pub use verify_cmd::*;
 mod extras;
 pub use extras::*;
@@ -2368,6 +2370,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(GoalCommand),
         // Session-scoped autopilot posture and deferred review queue
         Box::new(AutopilotCommand),
+        // Mode preset switching
+        Box::new(ModeCommand),
         // Multi-key management
         Box::new(KeysCommand),
         // Rate-limit query

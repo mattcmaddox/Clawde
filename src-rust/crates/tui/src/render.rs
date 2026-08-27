@@ -4025,24 +4025,38 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
         // Autopilot badge (Phase 4C) — shown only while autopilot is active,
         // with the session's pending count read from the shared autonomy state.
+        // Blast-radius counters (Phase 4F) are shown when non-zero.
         if let Some(autonomy) = &app.autonomy {
-            let active = {
+            let (active, pending, blast) = {
                 let state = autonomy.lock();
-                state.is_active(&app.session_id)
+                (
+                    state.is_active(&app.session_id),
+                    state.pending_count(),
+                    state.blast_radius.clone(),
+                )
             };
             if active {
-                let pending = {
-                    let state = autonomy.lock();
-                    state.pending_count()
-                };
                 if !spans.is_empty() {
                     spans.push(Span::raw("  "));
                 }
-                let (label, style) = if pending == 0 {
+                let (label, style) = if pending == 0 && !blast.has_activity() {
                     ("autopilot".to_string(), Style::default().fg(Color::Magenta))
                 } else {
+                    let mut parts = Vec::new();
+                    if pending > 0 {
+                        parts.push(format!("{} pending", pending));
+                    }
+                    if blast.files_changed > 0 {
+                        parts.push(format!("{}f", blast.files_changed));
+                    }
+                    if blast.risky_actions_allowed > 0 {
+                        parts.push(format!("{}r", blast.risky_actions_allowed));
+                    }
+                    if blast.irreversible_denied > 0 {
+                        parts.push(format!("{}!", blast.irreversible_denied));
+                    }
                     (
-                        format!("autopilot · {} pending", pending),
+                        format!("autopilot · {}", parts.join(" ")),
                         Style::default()
                             .fg(Color::Magenta)
                             .add_modifier(Modifier::BOLD),

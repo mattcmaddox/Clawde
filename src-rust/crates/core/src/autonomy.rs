@@ -153,6 +153,29 @@ pub struct AutonomyState {
     /// Test-only clock override. `None` in production (wall clock).
     #[cfg(test)]
     pub now_override: Option<i64>,
+    /// Blast-radius observability counters (Phase 4F). These are informational
+    /// only — they do not enforce limits, but surface in the TUI badge and
+    /// `/autopilot status` so the user can see what happened during the session.
+    pub blast_radius: BlastRadius,
+}
+
+/// Cumulative observability counters for the session. Displayed in the TUI
+/// badge and `/autopilot status` when non-zero.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlastRadius {
+    /// File-modifying tool executions (Write, Edit, ApplyPatch) that succeeded.
+    pub files_changed: u32,
+    /// Review-required actions that executed under bypass permissions.
+    pub risky_actions_allowed: u32,
+    /// Irreversible actions that were denied (autopilot or hard boundary).
+    pub irreversible_denied: u32,
+}
+
+impl BlastRadius {
+    /// True when any counter is non-zero.
+    pub fn has_activity(&self) -> bool {
+        self.files_changed > 0 || self.risky_actions_allowed > 0 || self.irreversible_denied > 0
+    }
 }
 
 impl AutonomyState {
@@ -166,6 +189,7 @@ impl AutonomyState {
             base_dir: None,
             #[cfg(test)]
             now_override: None,
+            blast_radius: BlastRadius::default(),
         }
     }
 
@@ -326,6 +350,22 @@ impl AutonomyState {
         self.mode = AutonomyMode::Off;
         self.items.clear();
         self.next_id = 1;
+        self.blast_radius = BlastRadius::default();
+    }
+
+    /// Record a file-modifying tool execution (Write, Edit, ApplyPatch).
+    pub fn record_file_changed(&mut self) {
+        self.blast_radius.files_changed += 1;
+    }
+
+    /// Record a review-required action that executed under bypass.
+    pub fn record_risky_action_allowed(&mut self) {
+        self.blast_radius.risky_actions_allowed += 1;
+    }
+
+    /// Record an irreversible action that was denied.
+    pub fn record_irreversible_denied(&mut self) {
+        self.blast_radius.irreversible_denied += 1;
     }
 
     fn alloc_id(&mut self) -> String {
@@ -1288,5 +1328,39 @@ mod tests {
         assert_eq!(state.items[0].state, DeferredState::Rejected);
         assert_eq!(state.items[1].state, DeferredState::Completed);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- Phase 4F: blast-radius counters -----------------------------------
+
+    #[test]
+    fn blast_radius_defaults_are_zero() {
+        let state = AutonomyState::new("s1");
+        assert!(!state.blast_radius.has_activity());
+        assert_eq!(state.blast_radius.files_changed, 0);
+        assert_eq!(state.blast_radius.risky_actions_allowed, 0);
+        assert_eq!(state.blast_radius.irreversible_denied, 0);
+    }
+
+    #[test]
+    fn blast_radius_increments_and_has_activity() {
+        let mut state = AutonomyState::new("s1");
+        state.record_file_changed();
+        assert!(state.blast_radius.has_activity());
+        assert_eq!(state.blast_radius.files_changed, 1);
+        state.record_risky_action_allowed();
+        assert_eq!(state.blast_radius.risky_actions_allowed, 1);
+        state.record_irreversible_denied();
+        assert_eq!(state.blast_radius.irreversible_denied, 1);
+    }
+
+    #[test]
+    fn blast_radius_resets_on_session_reset() {
+        let mut state = AutonomyState::new("s1");
+        state.record_file_changed();
+        state.record_risky_action_allowed();
+        state.record_irreversible_denied();
+        assert!(state.blast_radius.has_activity());
+        state.reset();
+        assert!(!state.blast_radius.has_activity());
     }
 }

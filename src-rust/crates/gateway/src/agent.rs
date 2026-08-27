@@ -1237,7 +1237,14 @@ mod tests {
     }
 
     fn executor(mode: GatewayPermissionMode) -> GatewayToolExecutor {
-        GatewayToolExecutor::new(mode, &[], "agent-loop-test", &[], CancellationToken::new())
+        GatewayToolExecutor::new(
+            mode,
+            &[],
+            "agent-loop-test",
+            &[],
+            CancellationToken::new(),
+            None,
+        )
     }
 
     fn request(messages: Vec<Message>) -> ProviderRequest {

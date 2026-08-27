@@ -149,13 +149,26 @@ impl AgentRuntime {
 }
 
 /// Build the per-request executor from gateway config.
+///
+/// When `AllowAutopilot` is configured, creates a per-request `AutonomyState`
+/// and wires it into the executor so the tool permission handler can defer
+/// review-required actions into the session's queue.
 fn build_executor(cfg: &EffectiveGatewayConfig, cancel: CancellationToken) -> GatewayToolExecutor {
+    let sid = session_id();
+    let autonomy = if cfg.permission_mode.is_autopilot() {
+        let mut state = clawde_core::autonomy::AutonomyState::new(&sid);
+        state.start_autopilot(&sid);
+        Some(Arc::new(parking_lot::Mutex::new(state)))
+    } else {
+        None
+    };
     GatewayToolExecutor::new(
         cfg.permission_mode,
         &cfg.workspace_paths,
-        &session_id(),
+        &sid,
         &cfg.builtin_tools,
         cancel,
+        autonomy,
     )
 }
 

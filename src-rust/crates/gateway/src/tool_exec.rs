@@ -29,6 +29,10 @@ pub enum GatewayPermissionMode {
     AllowReadonly,
     /// Every built-in tool executes (core `BypassPermissions`).
     Allow,
+    /// Autopilot: safe actions run, review-required are deferred into
+    /// the session's autonomy queue, irreversible are denied. Requires an
+    /// `Arc<Mutex<AutonomyState>>` to be passed at construction time.
+    AllowAutopilot,
     /// Nothing executes; every call short-circuits to a permission-denied
     /// tool error. Relay-only posture.
     Deny,
@@ -39,7 +43,9 @@ impl GatewayPermissionMode {
     fn core_mode(self) -> PermissionMode {
         match self {
             GatewayPermissionMode::AllowReadonly => PermissionMode::Default,
-            GatewayPermissionMode::Allow => PermissionMode::BypassPermissions,
+            GatewayPermissionMode::Allow | GatewayPermissionMode::AllowAutopilot => {
+                PermissionMode::BypassPermissions
+            }
             GatewayPermissionMode::Deny => PermissionMode::Default,
         }
     }
@@ -51,6 +57,11 @@ impl GatewayPermissionMode {
                 mode: mode.core_mode(),
             }),
         }
+    }
+
+    /// Whether this mode uses the autopilot deferral path.
+    pub fn is_autopilot(self) -> bool {
+        self == GatewayPermissionMode::AllowAutopilot
     }
 }
 
@@ -96,12 +107,17 @@ impl GatewayToolExecutor {
     /// Build an executor with the curated surface (or a `builtin_names`
     /// replacement list, D2). `workspace_paths[0]` (or the process cwd) is
     /// the tool working directory; `session_id` keys shell state.
+    ///
+    /// When `mode` is `AllowAutopilot`, pass `Some(autonomy)` to enable the
+    /// deferral path. `None` with `AllowAutopilot` falls back to `Allow`
+    /// (bypass) semantics — fail closed, never silently drop.
     pub fn new(
         mode: GatewayPermissionMode,
         workspace_paths: &[PathBuf],
         session_id: &str,
         builtin_names: &[String],
         cancel: CancellationToken,
+        autonomy: Option<Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>>,
     ) -> Self {
         let working_dir = workspace_paths
             .first()
@@ -124,10 +140,24 @@ impl GatewayToolExecutor {
             }
         }
 
+        // Wire autopilot state into the tool context when requested.
+        // When mode is AllowAutopilot but no state was provided, fall back
+        // to Allow (bypass) — never silently drop the autopilot request.
+        let effective_mode = if mode.is_autopilot() && autonomy.is_none() {
+            tracing::warn!(
+                "gateway permission mode is 'allow-autopilot' but no autonomy state was \
+                 provided; falling back to 'allow' (bypass). Set permissionMode to \
+                 'allow-autopilot' with a valid workspace to enable autopilot deferral."
+            );
+            GatewayPermissionMode::Allow
+        } else {
+            mode
+        };
+
         let ctx = ToolContext {
             working_dir,
-            permission_mode: mode.core_mode(),
-            permission_handler: mode.handler(),
+            permission_mode: effective_mode.core_mode(),
+            permission_handler: effective_mode.handler(),
             cost_tracker: clawde_core::cost::CostTracker::new(),
             session_id: session_id.to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
@@ -144,11 +174,19 @@ impl GatewayToolExecutor {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
-            autonomy: None,
+            autonomy: if effective_mode.is_autopilot() {
+                autonomy
+            } else {
+                None
+            },
             cancel_token: cancel,
         };
 
-        Self { tools, ctx, mode }
+        Self {
+            tools,
+            ctx,
+            mode: effective_mode,
+        }
     }
 
     /// Whether a tool name is a built-in this executor can run.
@@ -307,7 +345,14 @@ mod tests {
     use serde_json::{json, Value};
 
     fn executor(mode: GatewayPermissionMode) -> GatewayToolExecutor {
-        GatewayToolExecutor::new(mode, &[], "tool-exec-test", &[], CancellationToken::new())
+        GatewayToolExecutor::new(
+            mode,
+            &[],
+            "tool-exec-test",
+            &[],
+            CancellationToken::new(),
+            None,
+        )
     }
 
     #[test]
@@ -328,6 +373,7 @@ mod tests {
             "t",
             &["read".to_string()],
             CancellationToken::new(),
+            None,
         );
         assert_eq!(ex.builtin_names(), vec!["read".to_string()]);
     }
@@ -456,5 +502,47 @@ mod tests {
             };
             assert_eq!(tool_use_id, &format!("c{i}"));
         }
+    }
+
+    // ---- Gateway autopilot adapter tests ------------------------------------
+
+    #[test]
+    fn autopilot_mode_without_state_falls_back_to_allow() {
+        // AllowAutopilot with None autonomy → effective mode becomes Allow
+        // (fail-closed: never silently drop the autopilot request).
+        let ex = GatewayToolExecutor::new(
+            GatewayPermissionMode::AllowAutopilot,
+            &[],
+            "test",
+            &[],
+            CancellationToken::new(),
+            None,
+        );
+        assert_eq!(ex.mode, GatewayPermissionMode::Allow);
+    }
+
+    #[test]
+    fn autopilot_mode_with_state_is_autopilot() {
+        let state = Arc::new(parking_lot::Mutex::new(
+            clawde_core::autonomy::AutonomyState::new("gw-test"),
+        ));
+        state.lock().start_autopilot("gw-test");
+        let ex = GatewayToolExecutor::new(
+            GatewayPermissionMode::AllowAutopilot,
+            &[],
+            "gw-test",
+            &[],
+            CancellationToken::new(),
+            Some(state),
+        );
+        assert_eq!(ex.mode, GatewayPermissionMode::AllowAutopilot);
+    }
+
+    #[test]
+    fn autopilot_mode_is_autopilot_method() {
+        assert!(GatewayPermissionMode::AllowAutopilot.is_autopilot());
+        assert!(!GatewayPermissionMode::Allow.is_autopilot());
+        assert!(!GatewayPermissionMode::AllowReadonly.is_autopilot());
+        assert!(!GatewayPermissionMode::Deny.is_autopilot());
     }
 }

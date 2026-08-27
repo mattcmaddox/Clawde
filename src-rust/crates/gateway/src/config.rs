@@ -94,9 +94,12 @@ fn parse_permission_mode(value: &str) -> Result<GatewayPermissionMode, String> {
             Ok(GatewayPermissionMode::AllowReadonly)
         }
         "allow" => Ok(GatewayPermissionMode::Allow),
+        "allow-autopilot" | "allow_autopilot" | "autopilot" => {
+            Ok(GatewayPermissionMode::AllowAutopilot)
+        }
         "deny" => Ok(GatewayPermissionMode::Deny),
         other => Err(format!(
-            "invalid gateway.permissionMode '{other}' (expected 'allow-readonly', 'allow', or 'deny')"
+            "invalid gateway.permissionMode '{other}' (expected 'allow-readonly', 'allow', 'allow-autopilot', or 'deny')"
         )),
     }
 }
@@ -111,6 +114,9 @@ mod tests {
             ("allow-readonly", GatewayPermissionMode::AllowReadonly),
             ("allow_readonly", GatewayPermissionMode::AllowReadonly),
             ("allow", GatewayPermissionMode::Allow),
+            ("allow-autopilot", GatewayPermissionMode::AllowAutopilot),
+            ("allow_autopilot", GatewayPermissionMode::AllowAutopilot),
+            ("autopilot", GatewayPermissionMode::AllowAutopilot),
             ("deny", GatewayPermissionMode::Deny),
         ] {
             let cfg = GatewayConfig {

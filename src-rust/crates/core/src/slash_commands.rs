@@ -38,6 +38,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "advisor", description: "Set or unset the server-side advisor model", category: "Commands", tui_only: false },
     PromptCommand { name: "agent", description: "List available agents or show agent details", category: "Tools", tui_only: false },
     PromptCommand { name: "autopilot", description: "Toggle autopilot and manage deferred review items", category: "Session", tui_only: false },
+    PromptCommand { name: "mode", description: "Switch mode preset (careful, fast, default, ...)", category: "Session", tui_only: false },
     PromptCommand { name: "agents", description: "Browse agent definitions and active agents", category: "Tools", tui_only: false },
     PromptCommand { name: "new-agent", description: "Create a new sub-agent in the editor", category: "Tools", tui_only: false },
     PromptCommand { name: "changes", description: "Inspect changes from the current session", category: "Review & History", tui_only: true },
