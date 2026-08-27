@@ -848,6 +848,8 @@ impl ToolContext {
             self.current_turn_index(),
             tool_name,
         );
+        // Blast-radius: every successful file write increments the counter.
+        self.record_file_changed();
     }
 }
 
