@@ -3237,6 +3237,16 @@ fn render_input(
                 badge_spans.push(Span::styled("K↑J↓H↑L↓", Style::default().fg(p.vim_hint)));
             }
 
+            // Active mode preset name (when not default).
+            if let Some(ref mode_name) = app.config.mode {
+                if mode_name != "default" {
+                    badge_spans.push(Span::styled(
+                        mode_name.clone(),
+                        Style::default().fg(p.effort).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+
             // Shortcut hint: pick the most relevant actionable hint.
             let shortcut = if app.voice_recorder.is_some() {
                 "Alt+V speak"
@@ -5880,6 +5890,34 @@ mod status_row_badge_tests {
         assert_eq!(trailing.lines.len(), 2);
         // Empty content produces no lines at all.
         assert!(spans_to_text(Vec::new()).lines.is_empty());
+    }
+
+    #[test]
+    fn mode_preset_badge_applies_when_non_default() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.config.mode = Some("careful".to_string());
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        assert!(
+            out.contains("careful"),
+            "'careful' mode badge should appear in prompt row when config.mode is set. Output: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn default_mode_does_not_show_badge() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.config.mode = Some("default".to_string());
+        app.status_message = Some("test".to_string());
+        let out = render_screen(&app);
+        // 'default' should not appear as a badge — only non-default modes are shown.
+        let badge_marker = " · default";
+        assert!(
+            !out.contains(badge_marker),
+            "'default' mode badge should NOT appear. Output: {:?}",
+            out
+        );
     }
 }
 
