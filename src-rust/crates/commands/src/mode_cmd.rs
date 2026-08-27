@@ -88,46 +88,62 @@ impl SlashCommand for ModeCommand {
             ));
         };
 
-        if transient {
-            // Transient: apply for this turn only. Store in config for the
-            // query loop's `effective_mode_name_for_turn` to pick up.
-            ctx.config.mode = Some(mode.name.clone());
-            CommandResult::Message(format!(
+        // Transient: apply the mode's config knobs but do NOT persist to
+        // settings.json — it reverts on the next turn because
+        // effective_mode_name_for_turn only reads config.mode when there is
+        // no inline `mode:<name>` keyword in the last user message.
+        //
+        // Persistent: apply the mode's config knobs AND save to settings.json
+        // so the mode survives across sessions.
+        let mut new_config = ctx.config.clone();
+        apply_mode(&mut new_config, mode);
+        new_config.mode = Some(mode.name.clone());
+
+        let mut msg = if transient {
+            format!(
                 "Mode '{}' applied transiently for this turn. It will revert after.",
                 mode.label
-            ))
+            )
         } else {
-            // Persistent: apply the mode's config knobs and store the name.
-            let mut new_config = ctx.config.clone();
-            apply_mode(&mut new_config, mode);
-            new_config.mode = Some(mode.name.clone());
-            let mut msg = format!("Mode switched to '{}' — {}", mode.label, mode.description);
+            format!("Mode switched to '{}' — {}", mode.label, mode.description)
+        };
 
-            // Show what changed.
-            let mut changes = Vec::new();
-            if let Some(ref eff) = mode.effort {
-                changes.push(format!("effort: {:?}", eff));
-            }
-            if mode.permission_mode.is_some() {
-                changes.push("permissions: plan".to_string());
-            }
-            if let Some(ref style) = mode.output_style {
-                changes.push(format!("output style: {}", style));
-            }
-            if !changes.is_empty() {
-                msg.push_str(&format!("\nChanges: {}", changes.join(", ")));
-            }
-
-            // Show the prompt guidance if any.
-            if let Some(ref block) = clawde_core::modes::mode_prompt_block(mode) {
-                let preview = block.lines().take(3).collect::<Vec<_>>().join("\n");
-                msg.push_str(&format!("\nGuidance:\n{}", preview));
-            }
-
-            // Return ConfigChangeMessage so the CLI propagates the mode to
-            // base_query_config.mode, tool_ctx, and app.config immediately.
-            CommandResult::ConfigChangeMessage(new_config, msg)
+        // Show what changed.
+        let mut changes = Vec::new();
+        if let Some(ref eff) = mode.effort {
+            changes.push(format!("effort: {:?}", eff));
         }
+        if mode.permission_mode.is_some() {
+            changes.push("permissions: plan".to_string());
+        }
+        if let Some(ref style) = mode.output_style {
+            changes.push(format!("output style: {}", style));
+        }
+        if !changes.is_empty() {
+            msg.push_str(&format!("\nChanges: {}", changes.join(", ")));
+        }
+
+        // Show the prompt guidance if any.
+        if let Some(ref block) = clawde_core::modes::mode_prompt_block(mode) {
+            let preview = block.lines().take(3).collect::<Vec<_>>().join("\n");
+            msg.push_str(&format!("\nGuidance:\n{}", preview));
+        }
+
+        // Persist mode to settings.json for non-transient switches.
+        if !transient {
+            let mode_name = mode.name.clone();
+            if let Err(e) = crate::save_settings_mutation(|settings| {
+                settings.config.mode = Some(mode_name);
+            }) {
+                msg.push_str(&format!(
+                    "\n(Note: could not persist mode to settings.json: {e})"
+                ));
+            }
+        }
+
+        // Return ConfigChangeMessage so the CLI propagates the mode to
+        // base_query_config.mode, tool_ctx, and app.config immediately.
+        CommandResult::ConfigChangeMessage(new_config, msg)
     }
 }
 
@@ -247,11 +263,11 @@ mod tests {
         let mut c = ctx();
         let result = ModeCommand.execute("careful --turn", &mut c).await;
         match result {
-            CommandResult::Message(msg) => {
+            CommandResult::ConfigChangeMessage(new_cfg, msg) => {
                 assert!(msg.contains("transiently"), "{msg}");
-                assert_eq!(c.config.mode.as_deref(), Some("careful"));
+                assert_eq!(new_cfg.mode.as_deref(), Some("careful"));
             }
-            other => panic!("expected Message, got {:?}", other),
+            other => panic!("expected ConfigChangeMessage, got {:?}", other),
         }
     }
 

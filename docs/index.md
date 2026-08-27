@@ -4,7 +4,7 @@
 
 Clawde is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
-**Version:** 0.2.64 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/mattcmaddox/Clawde)
+**Version:** 0.2.65 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/mattcmaddox/Clawde)
 
 </div>
 
