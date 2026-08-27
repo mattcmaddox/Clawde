@@ -460,6 +460,11 @@ pub struct ToolContext {
     /// Channel for the `AskUserQuestion` tool to send questions to the TUI and
     /// receive the user's typed answer.  `None` in headless / non-interactive mode.
     pub user_question_tx: Option<tokio::sync::mpsc::UnboundedSender<UserQuestionEvent>>,
+    /// Session-scoped autonomy state (autopilot). `None` when autopilot is not
+    /// wired (headless, gateway, sub-agent harnesses) — autopilot then fails
+    /// closed: no deferral, no queue, no non-blocking path.
+    pub autonomy: Option<Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>>,
+    /// Cancellation token for the owning query loop (issue #218). The parallel
     /// Cancellation token for the owning query loop (issue #218). The parallel
     /// tool executor selects on this to abandon in-flight tools when the user
     /// cancels, and long-running tools may observe it to bail out early. Defaults
@@ -557,39 +562,115 @@ impl ToolContext {
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
-            PermissionDecision::Ask { reason } if self.non_interactive => {
-                Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
-                    "Permission denied for tool '{}': {}",
-                    request.tool_name,
-                    interactive_reason.unwrap_or(reason)
-                )))
-            }
             PermissionDecision::Ask { reason } => {
-                let Some(queue) = &self.pending_permissions else {
-                    return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
-                        "Permission denied for tool '{}'",
-                        request.tool_name
-                    )));
-                };
+                // Autopilot (Phase 4B): never block on a dialog. Safe actions
+                // run, review-required actions are deferred with a stable id,
+                // and irreversible actions are denied outright. This runs
+                // before the interactive queue so an unattended session can
+                // never wait on a TUI/ACP response.
+                if let Some(autonomy) = &self.autonomy {
+                    let mut state = autonomy.lock();
+                    // Phase 4D: an approved item pre-authorizes this exact
+                    // request. Consume the approval and let the call run
+                    // through the normal typed executor (one approval, one
+                    // execution). This is checked before classification so an
+                    // approved retry is not re-deferred.
+                    if let Some(_approved_id) =
+                        state.take_approved_match(&self.session_id, &request)
+                    {
+                        return Ok(());
+                    }
+                    if state.is_active(&self.session_id) {
+                        let risk = clawde_core::action_risk::classify_action(
+                            &request.tool_name,
+                            &request.description,
+                            request.permission_level,
+                            request.path.as_deref(),
+                            request.network_capable,
+                            request.stateful,
+                        );
+                        match risk {
+                            clawde_core::action_risk::ActionRisk::Safe => return Ok(()),
+                            clawde_core::action_risk::ActionRisk::Irreversible => {
+                                return Err(clawde_core::error::ClaudeError::PermissionDenied(
+                                    format!(
+                                        "Denied: '{}' is classified as irreversible and cannot run under autopilot.",
+                                        request.tool_name
+                                    ),
+                                ));
+                            }
+                            clawde_core::action_risk::ActionRisk::ReviewRequired => {
+                                let project_root = request
+                                    .working_dir
+                                    .as_deref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| self.working_dir.display().to_string());
+                                let reason_text =
+                                    interactive_reason.clone().unwrap_or_else(|| reason.clone());
+                                match state.enqueue_tool_call(
+                                    &self.session_id,
+                                    &project_root,
+                                    &request.tool_name,
+                                    request.clone(),
+                                    risk,
+                                    reason_text,
+                                ) {
+                                    Some(item) => {
+                                        return Err(clawde_core::error::ClaudeError::PermissionDenied(
+                                            format!(
+                                                "Deferred for user review as {}. Continue with safe work; do not retry this exact action until the user reviews it.",
+                                                item.id
+                                            ),
+                                        ));
+                                    }
+                                    None => {
+                                        return Err(clawde_core::error::ClaudeError::PermissionDenied(
+                                            format!(
+                                                "Denied: the autopilot review queue is full ({} items). Continue with safe work; do not retry this exact action.",
+                                                state.capacity
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.non_interactive {
+                    Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
+                        "Permission denied for tool '{}': {}",
+                        request.tool_name,
+                        interactive_reason.unwrap_or(reason)
+                    )))
+                } else {
+                    let Some(queue) = &self.pending_permissions else {
+                        return Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
+                            "Permission denied for tool '{}'",
+                            request.tool_name
+                        )));
+                    };
 
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                queue.lock().queue.push_back(PendingPermissionRequest {
-                    tool_use_id: format!(
-                        "perm-{}-{}",
-                        self.session_id,
-                        self.current_turn.fetch_add(1, Ordering::Relaxed)
-                    ),
-                    request,
-                    reason: interactive_reason.unwrap_or(reason),
-                    decision_tx: Some(tx),
-                });
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    queue.lock().queue.push_back(PendingPermissionRequest {
+                        tool_use_id: format!(
+                            "perm-{}-{}",
+                            self.session_id,
+                            self.current_turn.fetch_add(1, Ordering::Relaxed)
+                        ),
+                        request,
+                        reason: interactive_reason.unwrap_or(reason),
+                        decision_tx: Some(tx),
+                    });
 
-                let decision = tokio::task::block_in_place(|| rx.blocking_recv());
-                match decision {
-                    Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => Ok(()),
-                    _ => Err(clawde_core::error::ClaudeError::PermissionDenied(
-                        "Permission denied by user".to_string(),
-                    )),
+                    let decision = tokio::task::block_in_place(|| rx.blocking_recv());
+                    match decision {
+                        Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => {
+                            Ok(())
+                        }
+                        _ => Err(clawde_core::error::ClaudeError::PermissionDenied(
+                            "Permission denied by user".to_string(),
+                        )),
+                    }
                 }
             }
             _ => Err(clawde_core::error::ClaudeError::PermissionDenied(format!(
@@ -684,12 +765,25 @@ impl ToolContext {
                 stateful: tool.stateful(),
             },
         );
-        self.request_permission_inner(request).map_err(|_| {
-            clawde_core::error::ClaudeError::PermissionDenied(format!(
-                "Permission denied for tool '{}': {}",
-                tool.name(),
-                details
-            ))
+        self.request_permission_inner(request).map_err(|e| {
+            // Normalize only the bare interactive denial ("Permission denied by
+            // user") so the tool name + details are attached. Every other inner
+            // error — explicit deny, network isolation, autopilot deferral with
+            // its stable id, irreversible denial — must survive verbatim so the
+            // model sees the actionable message (e.g. "Deferred for user review
+            // as AP-001 …").
+            match e {
+                clawde_core::error::ClaudeError::PermissionDenied(ref msg)
+                    if msg == "Permission denied by user" =>
+                {
+                    clawde_core::error::ClaudeError::PermissionDenied(format!(
+                        "Permission denied for tool '{}': {}",
+                        tool.name(),
+                        details
+                    ))
+                }
+                other => other,
+            }
         })
     }
 
@@ -1073,6 +1167,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            autonomy: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1252,6 +1347,200 @@ mod tests {
         }
     }
 
+    // ---- Autopilot deferral tests (Phase 4B) -------------------------------
+
+    fn autopilot_context() -> (
+        ToolContext,
+        Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>,
+    ) {
+        let handler = Arc::new(AskPermissionHandler {
+            reason: "needs review".to_string(),
+        });
+        let mut ctx = test_tool_context(handler);
+        ctx.non_interactive = false;
+        ctx.session_id = "sess-1".to_string();
+        let state = Arc::new(parking_lot::Mutex::new(
+            clawde_core::autonomy::AutonomyState::new("sess-1"),
+        ));
+        state.lock().start_autopilot("sess-1");
+        ctx.autonomy = Some(state.clone());
+        (ctx, state)
+    }
+
+    #[test]
+    fn autopilot_defers_review_required_actions_with_stable_id() {
+        let (ctx, state) = autopilot_context();
+        let err = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Deferred for user review as AP-001"),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("do not retry this exact action"));
+        assert_eq!(state.lock().pending_count(), 1);
+        let item = &state.lock().items[0];
+        assert_eq!(item.id, "AP-001");
+        assert_eq!(item.session_id, "sess-1");
+    }
+
+    #[test]
+    fn autopilot_allows_safe_actions_without_enqueueing() {
+        let (ctx, state) = autopilot_context();
+        assert!(ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "ls",
+                std::path::PathBuf::from("ls"),
+                false,
+                None,
+            )
+            .is_ok());
+        assert_eq!(state.lock().pending_count(), 0);
+    }
+
+    #[test]
+    fn autopilot_denies_irreversible_actions_without_enqueueing() {
+        let (ctx, state) = autopilot_context();
+        let err = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "rm -rf /",
+                std::path::PathBuf::from("rm -rf /"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("irreversible"),
+            "{}",
+            err.to_string()
+        );
+        assert_eq!(state.lock().pending_count(), 0);
+    }
+
+    #[test]
+    fn approved_item_allows_exact_retry_and_is_consumed() {
+        use clawde_core::autonomy::DeferredState;
+        let (ctx, state) = autopilot_context();
+        // First call defers.
+        let err = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("AP-001"));
+        assert_eq!(state.lock().pending_count(), 1);
+
+        // User approves the item.
+        state
+            .lock()
+            .approve_item("sess-1", "AP-001", |_| Ok(()))
+            .unwrap();
+        assert_eq!(state.lock().items[0].state, DeferredState::Approved);
+
+        // The model retries the exact call: pre-authorized, runs, consumed.
+        assert!(ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .is_ok());
+        assert_eq!(state.lock().items[0].state, DeferredState::Completed);
+
+        // A third attempt has no approval left -> deferred again (new id).
+        let err = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("AP-002"), "{}", err);
+    }
+
+    #[test]
+    fn approved_item_does_not_authorize_changed_request() {
+        use clawde_core::autonomy::DeferredState;
+        let (ctx, state) = autopilot_context();
+        let _ = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        state
+            .lock()
+            .approve_item("sess-1", "AP-001", |_| Ok(()))
+            .unwrap();
+
+        // A different command must NOT consume the approval; it is deferred
+        // again instead of running.
+        let err = ctx
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git commit -m x",
+                std::path::PathBuf::from("git commit -m x"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("AP-002"),
+            "changed command must be re-deferred, got {}",
+            err
+        );
+        assert_eq!(state.lock().items[0].state, DeferredState::Approved);
+    }
+
+    #[test]
+    fn autopilot_falls_back_when_session_does_not_match() {
+        let (ctx, _state) = autopilot_context();
+        let mut mismatched = ctx.clone();
+        mismatched.session_id = "other-session".to_string();
+        let err = mismatched
+            .check_permission_with_details_and_path_for_tool(
+                &crate::pty_bash::PtyBashTool,
+                "execute",
+                "git push",
+                std::path::PathBuf::from("git push"),
+                false,
+                None,
+            )
+            .unwrap_err();
+        // No autonomy handle for this session -> ordinary interactive path with
+        // no pending-permission store -> plain denial, never a deferral.
+        assert!(!err.to_string().contains("Deferred for user review"));
+    }
+
     // ---- ToolResult tests ---------------------------------------------------
 
     #[test]
@@ -1363,6 +1652,7 @@ mod tests {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            autonomy: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         };
 

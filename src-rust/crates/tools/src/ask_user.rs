@@ -70,6 +70,39 @@ impl Tool for AskUserQuestionTool {
             );
         }
 
+        // Autopilot (Phase 4B): never block on a dialog. Record the question
+        // as a deferred item and return immediately; the user answers it later.
+        if let Some(autonomy) = &ctx.autonomy {
+            let mut state = autonomy.lock();
+            if state.is_active(&ctx.session_id) {
+                let project_root = ctx.working_dir.display().to_string();
+                return match state.enqueue_question(
+                    &ctx.session_id,
+                    &project_root,
+                    params.question.clone(),
+                    params.options.clone(),
+                ) {
+                    Some(item) => {
+                        let meta = json!({
+                            "type": "ask_user_deferred",
+                            "id": item.id,
+                            "question": params.question,
+                            "options": params.options,
+                        });
+                        ToolResult::success(format!(
+                            "Question deferred for user review as {}. Continue with safe work; the user will answer it when they return.",
+                            item.id
+                        ))
+                        .with_metadata(meta)
+                    }
+                    None => ToolResult::error(
+                        "Denied: the autopilot review queue is full. Continue with safe work; do not ask again."
+                            .to_string(),
+                    ),
+                };
+            }
+        }
+
         // Route through the TUI side-channel when available.
         if let Some(ref tx) = ctx.user_question_tx {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<String>();
@@ -106,6 +139,7 @@ impl Tool for AskUserQuestionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn interactive_ctx() -> ToolContext {
         let mut ctx = crate::test_support::allow_all_context(std::path::PathBuf::from("."));
@@ -152,6 +186,54 @@ mod tests {
             .await;
         assert!(res.is_error);
         assert!(res.content.contains("Invalid input"), "{}", res.content);
+    }
+
+    #[tokio::test]
+    async fn autopilot_defers_question_without_awaiting_reply() {
+        let mut ctx = interactive_ctx();
+        ctx.session_id = "sess-1".to_string();
+        let state = Arc::new(parking_lot::Mutex::new(
+            clawde_core::autonomy::AutonomyState::new("sess-1"),
+        ));
+        state.lock().start_autopilot("sess-1");
+        ctx.autonomy = Some(state.clone());
+
+        // A live question channel exists, but autopilot must NOT use it.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UserQuestionEvent>();
+        ctx.user_question_tx = Some(tx);
+
+        let res = AskUserQuestionTool
+            .execute(
+                json!({ "question": "continue?", "options": ["yes", "no"] }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.contains("AP-001"), "{}", res.content);
+
+        // No UserQuestionEvent may be emitted to the TUI channel.
+        let channel_used = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+            .await
+            .is_ok();
+        assert!(
+            !channel_used,
+            "autopilot must not block on a question channel"
+        );
+
+        let state = state.lock();
+        assert_eq!(state.pending_count(), 1);
+        let item = &state.items[0];
+        assert_eq!(item.kind, clawde_core::autonomy::DeferredKind::UserQuestion);
+        match &item.payload {
+            clawde_core::autonomy::DeferredPayload::UserQuestion { question, options } => {
+                assert_eq!(question, "continue?");
+                assert_eq!(
+                    options.as_ref(),
+                    Some(&vec!["yes".to_string(), "no".to_string()])
+                );
+            }
+            other => panic!("expected UserQuestion payload, got {:?}", other),
+        }
     }
 
     #[tokio::test]

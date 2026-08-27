@@ -110,6 +110,7 @@ mod tests {
             test_provider: None,
             effort: None,
             tool_use_tracker: None,
+            autonomy: None,
         }
     }
 

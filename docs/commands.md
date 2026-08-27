@@ -9,7 +9,7 @@ This document is the complete reference for every slash command available in Cla
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation)
 3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
-4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
+4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/autopilot`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
 5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/spec`, `/spec-mode`, `/spec-review`, `/security-review`, `/init`, `/search`
 6. [Search & Files](#search--files) — `/files`, `/context`
 7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
@@ -499,6 +499,30 @@ View and manage tool permission rules. Permissions control which tools can run w
 /permissions deny <tool-name>
 /permissions reset
 ```
+
+---
+
+### /autopilot
+
+Toggle unattended execution and review the deferred-action queue for the current session. Autopilot runs only actions classified **safe**; review-required actions are deferred with a stable id (`AP-001`, …) and the agent continues without waiting; **irreversible** actions are always denied. Nothing deferred executes until you explicitly approve it.
+
+```
+/autopilot                  toggle autopilot on/off for this session
+/autopilot status           show posture, pending count, and queue usage
+/autopilot list             list pending deferred items (alias: /autopilot ls)
+/autopilot reject <id>      reject a deferred item
+/autopilot approve <id>     approve a deferred tool call for replay; the
+                            approval is consumed when the agent retries the
+                            exact call
+/autopilot answer <id> <text>  answer a deferred question; the answer is
+                               injected into the next model turn
+```
+
+Approving a deferred tool call pre-authorizes exactly that call: the agent is prompted to retry it, and the approval is consumed on that one execution (a changed command or path is deferred again rather than run). Approvals expire after 24 hours.
+
+The deferred queue is persisted per session (under the Clawde config dir). Resuming a session restores its deferred items as **stale** — visible for review but never executable until you re-approve them; approvals never survive a restart and autopilot never auto-reactivates.
+
+While autopilot is active, the status bar shows `autopilot · N pending`, and deferrals/denials appear as dimmed annotations in the transcript. The review queue is session-local and in-memory; `/new` (and other session changes) clear it. Autopilot is unavailable in headless mode. **Bypass permissions and autopilot are separate postures** — bypass still requires confirmation and autopilot never silently bypasses safety boundaries.
 
 ---
 

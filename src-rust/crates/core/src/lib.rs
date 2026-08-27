@@ -49,6 +49,13 @@ pub use auth_store::{AuthStore, StoredCredential};
 pub mod device_code;
 
 // Utility modules ported from src/utils/
+pub mod action_risk;
+pub use action_risk::{classify_action, ActionRisk};
+pub mod autonomy;
+pub use autonomy::{
+    AutonomyMode, AutonomyState, DeferredItem, DeferredKind, DeferredPayload, DeferredState,
+    DEFAULT_QUEUE_CAPACITY,
+};
 pub mod auto_mode;
 pub mod crypto_utils;
 pub mod format_utils;
@@ -4795,6 +4802,17 @@ pub mod permissions {
             }
 
             if self.mode == PermissionMode::BypassPermissions {
+                let risk = crate::action_risk::classify_action(
+                    tool_name,
+                    description,
+                    level,
+                    path,
+                    network_capable,
+                    stateful,
+                );
+                if risk == crate::action_risk::ActionRisk::Irreversible {
+                    return PermissionDecision::Deny;
+                }
                 return PermissionDecision::Allow;
             }
 
@@ -5001,7 +5019,7 @@ pub mod permissions {
     // PermissionRequest (passed to handlers & TUI)
     // -----------------------------------------------------------------------
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PermissionRequest {
         pub tool_name: String,
         pub description: String,
@@ -5237,11 +5255,15 @@ pub mod permissions {
         }
 
         #[test]
-        fn bypass_always_allows() {
+        fn bypass_allows_ordinary_actions_but_denies_irreversible_shell() {
             let m = mgr(PermissionMode::BypassPermissions);
             assert_eq!(
-                m.evaluate("Bash", "rm -rf /", None, None, &[]),
+                m.evaluate("Bash", "ls", Some("ls"), None, &[]),
                 PermissionDecision::Allow
+            );
+            assert_eq!(
+                m.evaluate("Bash", "rm -rf /", Some("rm -rf /"), None, &[]),
+                PermissionDecision::Deny
             );
         }
 

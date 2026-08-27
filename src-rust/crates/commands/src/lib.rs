@@ -123,6 +123,10 @@ pub struct CommandContext {
     /// Live tool-use tracker for the current session. Exposes per-model
     /// tool-use success rates so `/stats` can surface reliability data.
     pub tool_use_tracker: Option<clawde_query::tool_use_tracker::ToolUseTracker>,
+    /// Session-scoped autonomy state (autopilot), shared with `ToolContext` and
+    /// the TUI `App`. `None` in headless sessions — `/autopilot` then fails
+    /// closed with a clear error.
+    pub autonomy: Option<std::sync::Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>>,
 }
 
 /// Session-scoped action requested by `/thinking`.
@@ -498,6 +502,8 @@ pub use providers::*;
 mod usage;
 pub mod verify_cmd;
 pub use usage::*;
+mod autopilot;
+pub use autopilot::AutopilotCommand;
 pub use verify_cmd::*;
 mod extras;
 pub use extras::*;
@@ -2360,6 +2366,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ManagedAgentsCommand),
         // Durable long-running goals
         Box::new(GoalCommand),
+        // Session-scoped autopilot posture and deferred review queue
+        Box::new(AutopilotCommand),
         // Multi-key management
         Box::new(KeysCommand),
         // Rate-limit query
@@ -2846,6 +2854,7 @@ mod tests {
             test_provider: None,
             effort: None,
             tool_use_tracker: None,
+            autonomy: None,
         }
     }
 

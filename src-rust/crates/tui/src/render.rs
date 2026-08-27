@@ -4023,6 +4023,35 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
+        // Autopilot badge (Phase 4C) — shown only while autopilot is active,
+        // with the session's pending count read from the shared autonomy state.
+        if let Some(autonomy) = &app.autonomy {
+            let active = {
+                let state = autonomy.lock();
+                state.is_active(&app.session_id)
+            };
+            if active {
+                let pending = {
+                    let state = autonomy.lock();
+                    state.pending_count()
+                };
+                if !spans.is_empty() {
+                    spans.push(Span::raw("  "));
+                }
+                let (label, style) = if pending == 0 {
+                    ("autopilot".to_string(), Style::default().fg(Color::Magenta))
+                } else {
+                    (
+                        format!("autopilot · {} pending", pending),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                };
+                spans.push(Span::styled(label, style));
+            }
+        }
+
         // During streaming show "esc to interrupt". The "? shortcuts" hint is
         // rendered in the top-right status bar (see render_prompt area), so do
         // not duplicate it here (issue #149 follow-up).

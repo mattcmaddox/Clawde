@@ -736,6 +736,7 @@ async fn main() -> anyhow::Result<()> {
                     provider_registry: None,
                     test_provider: None,
                     tool_use_tracker: None,
+                    autonomy: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -1194,6 +1195,23 @@ async fn main() -> anyhow::Result<()> {
         Some(user_question_rx)
     };
 
+    // Session-scoped autonomy state (autopilot). Interactive sessions wire it
+    // so autopilot can defer review-required actions; headless fails closed
+    // (None) rather than deferring into an invisible queue.
+    let autonomy = if is_non_interactive {
+        None
+    } else {
+        // Interactive sessions persist the deferred-queue snapshot under the
+        // config dir so a resumed session can review (and re-approve) items
+        // deferred before a restart. Restored items are Stale (review-only);
+        // autopilot never auto-reactivates and approvals never survive a
+        // restart (Phase 4E). Headless fails closed (None).
+        let mut autonomy_state = clawde_core::autonomy::AutonomyState::new(&session_id);
+        autonomy_state.set_persistence_dir(clawde_core::paths::clawde_home().join("autonomy"));
+        autonomy_state.load_persisted();
+        Some(Arc::new(ParkingMutex::new(autonomy_state)))
+    };
+
     // `provider_registry` here is the raw (pre-Arc) registry; the canonical
     // Arc is created below. The ToolContext's handle is filled in right after
     // that wrap so the UpstreamHealth tool shares the SAME instance the query
@@ -1221,6 +1239,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Some(user_question_tx)
         },
+        autonomy: autonomy.clone(),
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -3114,6 +3133,21 @@ fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::Conti
     clawde_query::ContinuationMode::Default
 }
 
+/// Rebind session-scoped autonomy state after a session change (`/new`,
+/// resume, or opencode-style swap). The state is bound to a session id and
+/// fails closed on mismatch; an explicit reset prevents stale queue items
+/// from leaking into the new session's review surface.
+fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
+    if let Some(autonomy) = &tool_ctx.autonomy {
+        let mut state = autonomy.lock();
+        state.reset();
+        state.session_id = session_id.to_string();
+        // Restore the new session's persisted queue (no-op for a brand-new
+        // session id; restores a resumed session's deferred items as Stale).
+        state.load_persisted();
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: clawde_core::config::Settings,
@@ -3174,6 +3208,7 @@ async fn run_interactive(
                     }
                 }
                 tool_ctx.session_id = session.id.clone();
+                reset_autonomy_for_session(&mut tool_ctx, &session.id);
 
                 // Auto-compact on resume if session is stale or large
                 // Note: Actual compaction happens after provider_registry is available
@@ -3272,6 +3307,7 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.autonomy = tool_ctx.autonomy.clone();
     app.set_working_directory(&tool_ctx.working_dir);
     app.session_id = session.id.clone();
     app.spec_review.set_session_id(session.id.clone());
@@ -3630,6 +3666,9 @@ async fn run_interactive(
         // so seed the context with the same value and keep it in sync per turn.
         effort: session.effort,
         tool_use_tracker: base_query_config.tool_use_tracker.clone(),
+        // Shared with `tool_ctx` so `/autopilot` sees the same session state
+        // the tool executor defers into.
+        autonomy: tool_ctx.autonomy.clone(),
     };
 
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
@@ -4160,6 +4199,7 @@ async fn run_interactive(
                                     messages.clear();
                                     app.replace_messages(Vec::new());
                                     tool_ctx.session_id = session.id.clone();
+                                    reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
                                     // Reset per-turn diff/turn bookkeeping, as
@@ -4262,6 +4302,7 @@ async fn run_interactive(
                                     tool_ctx.config.model = Some(session.model.clone());
                                     app.model_name = session.model.clone();
                                     tool_ctx.session_id = session.id.clone();
+                                    reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
                                         clawde_core::file_history::FileHistory::new(),
                                     ));
@@ -5382,6 +5423,7 @@ async fn run_interactive(
                         tool_ctx.config.model = Some(session.model.clone());
                         app.model_name = session.model.clone();
                         tool_ctx.session_id = session.id.clone();
+                        reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
                         app.spec_review.set_session_id(session.id.clone());
                         tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -5427,6 +5469,7 @@ async fn run_interactive(
                         tool_ctx.config.model = Some(session.model.clone());
                         app.model_name = session.model.clone();
                         tool_ctx.session_id = session.id.clone();
+                        reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
                         app.spec_review.set_session_id(session.id.clone());
                         tool_ctx.file_history = Arc::new(ParkingMutex::new(

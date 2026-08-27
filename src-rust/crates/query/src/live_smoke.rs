@@ -462,6 +462,7 @@ fn production_tool_context(
         pending_permissions: None,
         permission_manager: None,
         user_question_tx: None,
+        autonomy: None,
         cancel_token: tokio_util::sync::CancellationToken::new(),
     }
 }

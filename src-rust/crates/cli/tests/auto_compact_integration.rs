@@ -35,6 +35,7 @@ fn default_command_context() -> CommandContext {
         test_provider: None,
         effort: None,
         tool_use_tracker: None,
+        autonomy: None,
     }
 }
 

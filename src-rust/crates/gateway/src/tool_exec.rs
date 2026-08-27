@@ -144,6 +144,7 @@ impl GatewayToolExecutor {
             pending_permissions: None,
             permission_manager: None,
             user_question_tx: None,
+            autonomy: None,
             cancel_token: cancel,
         };
 

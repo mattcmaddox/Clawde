@@ -941,6 +941,14 @@ pub fn render_transcript_assistant_message_tagged(
             } => {
                 flush_text(&mut pending_text, &mut out, ctx.width);
                 let text = tool_result_text(&content);
+                // Autopilot deferrals/denials render as dimmed system
+                // annotations rather than red errors (Phase 4C).
+                if let Some(annotation) = autopilot_annotation(&text) {
+                    for line in annotation {
+                        out.push((line, None));
+                    }
+                    continue;
+                }
                 let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
                 // LSP diagnostics collapse to a one-line summary (spec's
                 // DiagnosticsDisplay): "Found N diagnostic issue(s) in M file(s)"
@@ -1192,6 +1200,10 @@ pub fn render_transcript_assistant_message(
             } => {
                 flush_text(&mut pending_text, &mut lines);
                 let text = tool_result_text(&content);
+                if let Some(annotation) = autopilot_annotation(&text) {
+                    lines.extend(annotation);
+                    continue;
+                }
                 let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
                 let rendered = if is_error.unwrap_or(false) {
                     render_tool_result_error(&text)
@@ -1541,6 +1553,39 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
 }
 
 /// Render a tool result (error variant).
+/// Render an autopilot deferral/denial tool result as a dimmed system
+/// annotation instead of a red error block (Phase 4C). Returns `None` when the
+/// text is not an autopilot marker, so ordinary errors keep their normal
+/// rendering.
+pub fn autopilot_annotation(text: &str) -> Option<Vec<Line<'static>>> {
+    let trimmed = text.trim();
+    let (tag, rest) = if let Some(rest) = trimmed
+        .strip_prefix("Deferred for user review as ")
+        .or_else(|| trimmed.strip_prefix("Question deferred for user review as "))
+    {
+        let id = rest.split('.').next().unwrap_or("?").trim();
+        let suffix = rest.split_once('.').map(|(_, s)| s).unwrap_or("").trim();
+        (format!("Autopilot deferred {id}"), suffix)
+    } else if trimmed.contains("is classified as irreversible and cannot run under autopilot")
+        || trimmed.contains("the autopilot review queue is full")
+    {
+        ("Autopilot denied".to_string(), trimmed)
+    } else {
+        return None;
+    };
+
+    let style = Style::default()
+        .fg(TRANSCRIPT_MUTED)
+        .add_modifier(Modifier::DIM);
+    let mut lines = vec![Line::from(vec![Span::styled(format!("  [{tag}]"), style)])];
+    if !rest.is_empty() {
+        for line in rest.lines().take(3) {
+            lines.push(Line::from(vec![Span::styled(format!("    {line}"), style)]));
+        }
+    }
+    Some(lines)
+}
+
 pub fn render_tool_result_error(error: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     // Use orange instead of red for color-blind accessibility
@@ -2576,6 +2621,7 @@ pub fn render_goal_event(text: &str, _width: u16) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn line_text(line: &Line<'_>) -> String {
@@ -2583,6 +2629,55 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect::<String>()
+    }
+
+    #[test]
+    fn autopilot_annotation_renders_deferral_and_denial() {
+        let deferred = autopilot_annotation(
+            "Deferred for user review as AP-001. Continue with safe work; do not retry this \
+             exact action until the user reviews it.",
+        )
+        .expect("deferral marker renders");
+        let text = deferred
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("[Autopilot deferred AP-001]"), "{text}");
+
+        let question = autopilot_annotation(
+            "Question deferred for user review as AP-002. Continue with safe work; the user \
+             will answer it when they return.",
+        )
+        .expect("question marker renders");
+        let text = question
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("[Autopilot deferred AP-002]"), "{text}");
+
+        let denied = autopilot_annotation(
+            "Denied: 'Bash' is classified as irreversible and cannot run under autopilot.",
+        )
+        .expect("denial marker renders");
+        let text = denied.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[Autopilot denied]"), "{text}");
+
+        let queue_full = autopilot_annotation(
+            "Denied: the autopilot review queue is full (64 items). Continue with safe work.",
+        )
+        .expect("queue-full marker renders");
+        let text = queue_full
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("[Autopilot denied]"), "{text}");
+
+        // Ordinary tool errors must NOT be intercepted.
+        assert!(autopilot_annotation("command exited with status 1").is_none());
+        assert!(autopilot_annotation("").is_none());
     }
 
     #[test]

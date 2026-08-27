@@ -117,15 +117,19 @@ pub fn render_bypass_permissions_dialog(
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "This mode should only be used in a sandboxed container or VM",
+        "Hard safety boundaries still block forbidden, isolated-network,",
+        Style::default().fg(Color::Yellow),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "explicitly denied, and irreversible actions.",
+        Style::default().fg(Color::Yellow),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "Use this only in a sandboxed container or VM. Snapshots cover",
         Style::default().fg(Color::DarkGray),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        "that has restricted internet access and can easily be restored",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "if damaged.",
+        "tracked workspace changes only; they do not undo external effects.",
         Style::default().fg(Color::DarkGray),
     )]));
     lines.push(Line::from(""));

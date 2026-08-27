@@ -1535,6 +1535,12 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// Whether the bypass-permissions dialog has been shown this session.
     pub bypass_permissions_dialog_shown: bool,
+    /// Session-scoped autonomy state (autopilot) shared with the tool executor
+    /// and command context. `None` in headless sessions; drives the status-bar
+    /// badge (`AUTOPILOT ACTIVE · N pending`). The pending count is read
+    /// directly at render time — the queue is small and bounded.
+    pub autonomy: Option<std::sync::Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>>,
+
     /// File injection warning dialog.
     /// Shown when oversized or binary files are detected in @refs.
     pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
@@ -2185,6 +2191,7 @@ impl App {
             bypass_permissions_dialog:
                 crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
+            autonomy: None,
             file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
