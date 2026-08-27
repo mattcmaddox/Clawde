@@ -55,6 +55,11 @@ impl SlashCommand for ModeCommand {
                 description: "Low reasoning effort, minimal check-ins".to_string(),
                 available: true,
             },
+            crate::ArgCompletion {
+                value: "walkaway".to_string(),
+                description: "Auto-approve file edits, minimal narration".to_string(),
+                available: true,
+            },
         ]
     }
 

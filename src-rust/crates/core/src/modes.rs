@@ -184,6 +184,30 @@ impl ModeDef {
             checkin_cadence: CheckinCadence::Rare,
         }
     }
+
+    /// Walk-away mode: auto-approve file edits, minimal narration,
+    /// no asks. The agent operates autonomously — file writes and
+    /// safe bash commands are auto-approved; dangerous operations
+    /// still require explicit approval via the permission dialog.
+    /// Activate autopilot separately via `/autopilot on` for the
+    /// full deferred-review loop.
+    pub fn builtin_walkaway() -> Self {
+        Self {
+            name: "walkaway".to_string(),
+            label: "Walk Away".to_string(),
+            description: "Auto-approve file edits, minimal narration, no asks. Activate \
+                          autopilot for full deferred-review autonomy."
+                .to_string(),
+            model: None,
+            effort: None,
+            permission_mode: Some(crate::PermissionMode::AcceptEdits),
+            output_style: None,
+            allowed_tools: None,
+            plan: PlanKnobs::Default,
+            ask_on_ambiguity: AskAmbiguityMode::Off,
+            checkin_cadence: CheckinCadence::Rare,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +220,7 @@ pub fn builtin_modes() -> Vec<ModeDef> {
         ModeDef::builtin_default(),
         ModeDef::builtin_careful(),
         ModeDef::builtin_fast(),
+        ModeDef::builtin_walkaway(),
     ]
 }
 
@@ -564,7 +589,7 @@ mod tests {
         assert_eq!(fast.checkin_cadence, CheckinCadence::EveryTurn);
         assert!(find_mode(&modes, "zen").is_some());
         assert!(find_mode(&modes, "careful").is_some());
-        assert_eq!(modes.len(), 4);
+        assert_eq!(modes.len(), 5);
     }
 
     #[test]
@@ -605,6 +630,22 @@ mod tests {
             block.is_none(),
             "custom careful with Off+Rare injects nothing"
         );
+    }
+
+    #[test]
+    fn walkaway_mode_binds_accept_edits_and_injects_nothing() {
+        let mut cfg = crate::Config::default();
+        let walkaway = ModeDef::builtin_walkaway();
+        apply_mode(&mut cfg, &walkaway);
+        assert_eq!(cfg.permission_mode, crate::PermissionMode::AcceptEdits);
+        // No prompt guidance — walkaway is silent by design.
+        assert!(mode_prompt_block(&walkaway).is_none());
+    }
+
+    #[test]
+    fn walkaway_mode_in_builtin_list() {
+        let modes = builtin_modes();
+        assert!(modes.iter().any(|m| m.name == "walkaway"));
     }
 
     #[test]
