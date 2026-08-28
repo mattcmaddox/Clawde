@@ -33,6 +33,7 @@ use crate::messages::{
     render_transcript_assistant_meta, render_transcript_live_text, render_transcript_user_message,
     RenderContext,
 };
+use crate::mode_panel::render_mode_panel;
 use crate::model_picker::render_model_picker;
 use crate::notifications::{render_notification_banner, Notification, NotificationKind};
 use crate::ollama_config_dialog::render_ollama_config_dialog;
@@ -893,6 +894,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Theme picker overlay
     if app.theme_screen.visible {
         render_theme_screen(frame, &app.theme_screen, size);
+    }
+    // Mode picker overlay
+    if app.mode_panel.visible {
+        render_mode_panel(frame, &app.mode_panel, size);
     }
     // Theme creator overlay
     if app.theme_creator.visible {

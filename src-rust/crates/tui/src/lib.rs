@@ -138,6 +138,8 @@ pub mod memory_update_notification;
 pub mod message_copy;
 /// Message type renderers (assistant, user, tool use, etc.).
 pub mod messages;
+/// Mode-preset quick-pick overlay (/mode).
+pub mod mode_panel;
 /// Model picker overlay (/model command).
 pub mod model_picker;
 /// Notification / banner system.

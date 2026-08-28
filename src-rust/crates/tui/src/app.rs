@@ -1485,6 +1485,8 @@ pub struct App {
     pub settings_screen: SettingsScreen,
     /// Theme quick-pick overlay (/theme).
     pub theme_screen: ThemeScreen,
+    /// Mode-preset quick-pick overlay (/mode).
+    pub mode_panel: crate::mode_panel::ModePanel,
     pub rustail_editor: RustailEditor,
     /// Interactive theme creator + CRUD manager (/theme create).
     pub theme_creator: ThemeCreator,
@@ -2206,6 +2208,7 @@ impl App {
             stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
+            mode_panel: crate::mode_panel::ModePanel::new(),
             rustail_editor: RustailEditor::new(),
             theme_creator: ThemeCreator::new(),
             palette: ColorPalette::for_theme("default"),
@@ -3812,6 +3815,38 @@ impl App {
         self.status_message = Some(format!("Theme set to: {}", theme_name));
     }
 
+    /// Apply a mode preset selected from the TUI quick-pick. Resolves the mode
+    /// exactly as `/mode <name>` does and binds its knobs onto the live config
+    /// via `clawde_core::modes::apply_mode`, then persists the selection.
+    /// The deep sync (tool rebuild, permission manager, bypass warning) happens
+    /// in the CLI loop's per-frame handling of `app.config` — identical to how
+    /// in-session `/theme` and effort-picker changes propagate.
+    fn apply_mode_from_picker(&mut self, mode_name: &str) {
+        let global_dir = clawde_core::config::Settings::config_dir();
+        let cwd = self
+            .current_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let project_dir = clawde_core::git_utils::project_root(cwd);
+        let modes = clawde_core::modes::all_modes_for_project(&global_dir, &project_dir);
+        let Some(mode) = clawde_core::modes::find_mode(&modes, mode_name) else {
+            self.status_message = Some(format!("Unknown mode '{}'.", mode_name));
+            return;
+        };
+        clawde_core::modes::apply_mode(&mut self.config, mode);
+        self.config.mode = Some(mode.name.clone());
+        // Persist the selection so it survives restarts (mirrors /mode).
+        let mode_name = mode.name.clone();
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        settings.config.mode = Some(mode_name.clone());
+        let _ = settings.save_sync();
+        self.status_message = Some(format!(
+            "Mode set to '{}' — {}",
+            mode.label, mode.description
+        ));
+    }
+
     pub fn apply_provider_refresh(
         &mut self,
         config: Config,
@@ -3885,6 +3920,13 @@ impl App {
         // Ollama endpoint; leave it for the commands/CLI layer instead of
         // treating it as the mode toggle.
         if cmd == "ollama" && args.trim().eq_ignore_ascii_case("status") {
+            return false;
+        }
+        // `/mode <name>` (with args) still goes to the CLI command executor so
+        // the full config/tool/permission sync runs. Bare `/mode` (no args)
+        // falls through to `intercept_slash_command("mode")`, which opens the
+        // TUI quick-pick.
+        if cmd == "mode" && !args.trim().is_empty() {
             return false;
         }
         // /compare and its nested aliases open the shared comparison dialog.
@@ -4267,6 +4309,24 @@ impl App {
                 // /theme (no args): quick-pick list. The interactive creator
                 // is opened via /theme create (see intercept_slash_command_with_args).
                 self.theme_screen.open(current);
+                true
+            }
+            "mode" | "preset" => {
+                // Bare /mode: visual quick-pick of the mode presets (built-in
+                // + custom), marking the active one. `/mode <name>` keeps the
+                // text command path (see intercept_slash_command_with_args).
+                let global_dir = clawde_core::config::Settings::config_dir();
+                let cwd = self
+                    .current_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let current = self.config.mode.as_deref().unwrap_or("default");
+                self.mode_panel.open(
+                    current,
+                    &global_dir,
+                    &clawde_core::git_utils::project_root(cwd),
+                );
                 true
             }
             "rustail" => {
@@ -4680,6 +4740,7 @@ impl App {
         self.settings_screen.close();
         self.theme_screen.close();
         self.theme_creator.close();
+        self.mode_panel.close();
         self.rustail_editor.close();
     }
 
@@ -4695,6 +4756,7 @@ impl App {
             || self.settings_screen.visible
             || self.theme_screen.visible
             || self.theme_creator.visible
+            || self.mode_panel.visible
             || self.rustail_editor.visible
             || self.stats_dialog.visible
             || self.mcp_view.visible
@@ -7829,6 +7891,16 @@ impl App {
                     self.theme_creator.open_new_theme();
                 }
                 None => {}
+            }
+            return false;
+        }
+
+        // Mode picker intercepts keys
+        if self.mode_panel.visible {
+            if let Some(crate::mode_panel::ModePickAction::Apply(name)) =
+                crate::mode_panel::handle_mode_key(&mut self.mode_panel, key)
+            {
+                self.apply_mode_from_picker(&name);
             }
             return false;
         }
@@ -13409,6 +13481,40 @@ mod tests {
             "Browse and manage sessions".to_string(),
         )];
         assert!(!app.intercept_slash_command_with_args("not-an-alias", ""));
+    }
+
+    #[test]
+    fn test_bare_mode_opens_picker() {
+        let mut app = make_app();
+        assert!(!app.mode_panel.visible);
+        assert!(app.intercept_slash_command_with_args("mode", ""));
+        assert!(app.mode_panel.visible, "bare /mode opens the quick-pick");
+        assert!(
+            app.mode_panel.modes.iter().any(|m| m.name == "fast"),
+            "built-in presets listed"
+        );
+    }
+
+    #[test]
+    fn test_mode_with_args_not_intercepted() {
+        // `/mode <name>` must keep the text command path (the CLI executor
+        // runs the full config/tool/permission sync), not open the picker.
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("mode", "fast"));
+        assert!(!app.mode_panel.visible);
+    }
+
+    #[test]
+    fn test_preset_alias_opens_picker() {
+        // /preset is an alias for /mode; bare form resolves and opens the picker.
+        let mut app = make_app();
+        app.slash_aliases = vec![(
+            "preset".to_string(),
+            "mode".to_string(),
+            "Switch mode preset".to_string(),
+        )];
+        assert!(app.intercept_slash_command_with_args("preset", ""));
+        assert!(app.mode_panel.visible);
     }
 
     #[test]
