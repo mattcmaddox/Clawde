@@ -3,7 +3,10 @@
 use std::cell::RefCell;
 
 use crate::agents_view::render_agents_menu;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{
+    App, ContextMenuKind, FollowupRowTarget, FollowupSource, SystemAnnotation, SystemMessageStyle,
+    ToolStatus,
+};
 use crate::ask_user_dialog::render_ask_user_dialog;
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
 use crate::context_viz::{key_ring_rows_from_registry, render_context_viz};
@@ -532,6 +535,9 @@ struct RenderedLineItem {
     message_index: Option<usize>,
     /// If this line is the clickable header of a thinking block, its hash.
     thinking_hash: Option<u64>,
+    /// If this line is a ranked followup, its index in the current followups list.
+    #[allow(dead_code)]
+    followup_target: Option<FollowupRowTarget>,
 }
 
 impl VirtualItem for RenderedLineItem {
@@ -569,6 +575,14 @@ struct MessageLinesCacheKey {
     annotations_ptr: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
+    // Followup state changes (mode toggle, clear) without touching the
+    // transcript, but the appended followup rows are part of the cached lines.
+    // Key on identity + mode so stale lists never render from the cache.
+    followup_history_mode: bool,
+    current_followups_ptr: usize,
+    current_followups_len: usize,
+    persisted_followups_ptr: usize,
+    persisted_followups_len: usize,
 }
 
 #[derive(Clone)]
@@ -1571,6 +1585,16 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         lines
     };
 
+    // Append persisted followups when in history mode (Alt+F toggle). Current
+    // followups are appended by `build_all_items` / `render_streaming_items`;
+    // history rows are appended here so every render path shows exactly one
+    // followup list.
+    let mut items = lines;
+    if app.followup_history_mode {
+        append_history_followup_items(app, &mut items, msg_area.width);
+    }
+    let lines = items;
+
     // Compute total virtual height and apply scroll clamping.
     // When auto_scroll is on we always show the tail; otherwise we respect
     // the user's scroll_offset.
@@ -1611,6 +1635,34 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     }
     *app.message_row_map.borrow_mut() = visible_rows;
     *app.thinking_row_map.borrow_mut() = thinking_rows;
+
+    // Track visible followup rows for click-to-insert using explicit targets
+    // attached during rendering; this remains correct when lists are mixed.
+    let mut followup_rows: std::collections::HashMap<u16, FollowupRowTarget> =
+        std::collections::HashMap::new();
+    let active_followup_count = if app.followup_history_mode {
+        app.persisted_followups.len()
+    } else {
+        app.current_followups.len()
+    };
+    if active_followup_count > 0 {
+        for (idx, item) in lines
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(msg_area.height as usize)
+        {
+            let screen_row = msg_area
+                .y
+                .saturating_add((idx.saturating_sub(scroll)) as u16);
+            if let Some(target) = item.followup_target {
+                if target.index < active_followup_count {
+                    followup_rows.insert(screen_row, target);
+                }
+            }
+        }
+    }
+    *app.followup_row_map.borrow_mut() = followup_rows;
 
     // No border — messages render directly into the area.
     let mut list = VirtualList::new();
@@ -1702,6 +1754,7 @@ fn push_rendered_items(
             is_header: mark_first_header && index == 0,
             message_index,
             thinking_hash: None,
+            followup_target: None,
             line,
         });
     }
@@ -1720,6 +1773,7 @@ fn push_rendered_items_tagged(
             is_header: false,
             message_index,
             thinking_hash,
+            followup_target: None,
             line,
         });
     }
@@ -1945,6 +1999,7 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         show_thinking: false,
         tool_names: &tool_names,
         expanded_thinking: &app.thinking_expanded,
+        followup_selected: app.followup_selected,
     };
     let turns = build_transcript_turns(app);
     let mut turn_map = std::collections::HashMap::new();
@@ -1959,6 +2014,7 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     // (issue #310).
     push_rendered_items(&mut items, welcome_banner_lines(app, width), None, false);
     build_message_items_range(app, width, &ctx, &turn_map, 0, total, true, &mut items);
+    append_current_followup_items(app, &mut items, width);
 
     if total == 0 && !app.tool_use_blocks.is_empty() {
         for block in &app.tool_use_blocks {
@@ -1997,6 +2053,14 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
+        followup_history_mode: app.followup_history_mode,
+        current_followups_ptr: app.current_followups.as_ptr() as usize,
+        current_followups_len: app.current_followups.len(),
+        persisted_followups_ptr: app
+            .persisted_followups
+            .front()
+            .map_or(0, |followup| followup as *const _ as usize),
+        persisted_followups_len: app.persisted_followups.len(),
     };
     if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
         cache
@@ -2027,6 +2091,51 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 /// tail. Because `build_message_items_range` splits the exact same linear pass
 /// at a turn boundary, `prefix ++ tail` is identical to `build_all_items` — no
 /// ghosting, no missing content.
+fn append_current_followup_items(app: &App, items: &mut Vec<RenderedLineItem>, width: u16) {
+    if app.followup_history_mode || app.current_followups.is_empty() {
+        return;
+    }
+    for (index, line) in crate::messages::render_ranked_followups_wrapped(
+        &app.current_followups,
+        app.followup_selected,
+        width,
+    ) {
+        items.push(RenderedLineItem {
+            search_text: flatten_line_text(&line),
+            is_header: false,
+            message_index: None,
+            thinking_hash: None,
+            followup_target: (index != usize::MAX).then_some(FollowupRowTarget {
+                source: FollowupSource::Current,
+                index,
+            }),
+            line,
+        });
+    }
+}
+
+fn append_history_followup_items(app: &App, items: &mut Vec<RenderedLineItem>, width: u16) {
+    if !app.followup_history_mode || app.persisted_followups.is_empty() {
+        return;
+    }
+    let followups: Vec<_> = app.persisted_followups.iter().cloned().collect();
+    for (index, line) in
+        crate::messages::render_ranked_followups_wrapped(&followups, app.followup_selected, width)
+    {
+        items.push(RenderedLineItem {
+            search_text: flatten_line_text(&line),
+            is_header: false,
+            message_index: None,
+            thinking_hash: None,
+            followup_target: (index != usize::MAX).then_some(FollowupRowTarget {
+                source: FollowupSource::History,
+                index,
+            }),
+            line,
+        });
+    }
+}
+
 fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let tool_names = build_tool_names(&app.messages);
     let ctx = RenderContext {
@@ -2035,6 +2144,7 @@ fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         show_thinking: false,
         tool_names: &tool_names,
         expanded_thinking: &app.thinking_expanded,
+        followup_selected: app.followup_selected,
     };
     let turns = build_transcript_turns(app);
 
@@ -2109,6 +2219,12 @@ fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     build_message_items_range(
         app, width, &ctx, &turn_map, split_idx, total, true, &mut items,
     );
+    // History rows are appended once by `render_messages` after this function
+    // returns; appending them here too would double-render the list while
+    // streaming in history mode.
+    if !app.followup_history_mode {
+        append_current_followup_items(app, &mut items, width);
+    }
     items
 }
 

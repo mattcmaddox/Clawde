@@ -44,6 +44,8 @@ pub struct RenderContext<'a> {
     pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
     pub expanded_thinking: &'a std::collections::HashSet<u64>,
+    /// Index of the currently highlighted followup (for keyboard nav).
+    pub followup_selected: Option<usize>,
 }
 
 /// Shared empty collections so `RenderContext::default()` can hand out
@@ -61,6 +63,7 @@ impl Default for RenderContext<'static> {
             show_thinking: false,
             tool_names: &EMPTY_TOOL_NAMES,
             expanded_thinking: &EMPTY_EXPANDED_THINKING,
+            followup_selected: None,
         }
     }
 }
@@ -1136,7 +1139,7 @@ pub fn render_transcript_assistant_message_tagged(
     // thinking block followed it.
     flush_text(&mut pending_text, &mut out, ctx.width);
     if !ranked_followups.is_empty() {
-        for line in render_ranked_followups(&ranked_followups) {
+        for line in render_ranked_followups(&ranked_followups, ctx.followup_selected) {
             out.push((line, None));
         }
     }
@@ -2433,14 +2436,42 @@ pub fn render_resource_update(server: &str, uri: &str, reason: &str) -> Vec<Line
 /// The rank remains visible so the user can distinguish required verification
 /// from optional ideas. Undesired items are intentionally dimmed rather than
 /// hidden, matching the feature specification.
-pub fn render_ranked_followups(followups: &[RankedFollowup]) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
-        "  Suggested followups",
-        Style::default()
-            .fg(TRANSCRIPT_MUTED)
-            .add_modifier(Modifier::BOLD),
-    ))];
-    for followup in followups {
+///
+/// When `selected_idx` is `Some(i)`, the i-th followup is rendered with a
+/// highlight background and a `→` prefix so the user can see which followup
+/// will be inserted on Enter.
+pub fn render_ranked_followups(
+    followups: &[RankedFollowup],
+    selected_idx: Option<usize>,
+) -> Vec<Line<'static>> {
+    render_ranked_followups_wrapped(followups, selected_idx, u16::MAX)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// Render followups as visual rows and retain the logical item index for every
+/// row. Long suggestions are wrapped rather than silently treated as one-row
+/// items, so mouse hit-testing can map any wrapped row to the same suggestion.
+/// `usize::MAX` identifies the section header.
+pub fn render_ranked_followups_wrapped(
+    followups: &[RankedFollowup],
+    selected_idx: Option<usize>,
+    width: u16,
+) -> Vec<(usize, Line<'static>)> {
+    let highlight_bg = Color::Rgb(40, 44, 52);
+    let width = usize::from(width).max(1);
+    let mut lines = vec![(
+        usize::MAX,
+        Line::from(Span::styled(
+            "  Suggested followups",
+            Style::default()
+                .fg(TRANSCRIPT_MUTED)
+                .add_modifier(Modifier::BOLD),
+        )),
+    )];
+    for (idx, followup) in followups.iter().enumerate() {
+        let is_selected = selected_idx == Some(idx);
         let (rank_color, modifier) = match followup.rank {
             FollowupRank::HighlyRecommended => (Color::Green, Modifier::BOLD),
             FollowupRank::Recommended => (Color::Cyan, Modifier::BOLD),
@@ -2454,18 +2485,72 @@ pub fn render_ranked_followups(followups: &[RankedFollowup]) -> Vec<Line<'static
         } else {
             format!(" — {}", followup.reason.trim())
         };
-        lines.push(Line::from(vec![
-            Span::styled("  • ", Style::default().fg(rank_color)),
-            Span::styled(
-                format!("{}: ", followup.rank.label()),
-                Style::default().fg(rank_color).add_modifier(modifier),
-            ),
-            Span::styled(
-                followup.text.trim().to_string(),
-                Style::default().fg(TRANSCRIPT_TEXT),
-            ),
-            Span::styled(reason, Style::default().fg(TRANSCRIPT_SUBTLE)),
-        ]));
+        let prefix = if is_selected { "  → " } else { "  • " };
+        let bg = if is_selected {
+            highlight_bg
+        } else {
+            Color::Reset
+        };
+        let text_modifier = if is_selected {
+            modifier | Modifier::BOLD
+        } else {
+            modifier
+        };
+        let full_text = format!(
+            "{}{}: {}{}",
+            prefix,
+            followup.rank.label(),
+            followup.text.trim(),
+            reason
+        );
+        let mut remaining = full_text.as_str();
+        let continuation_prefix = "     ";
+        let continuation_width = UnicodeWidthStr::width(continuation_prefix);
+        let mut first_row = true;
+        while !remaining.is_empty() {
+            // Continuation rows must also fit the indent prefix, otherwise the
+            // tail of the segment gets clipped at the terminal edge and text
+            // is silently lost.
+            let row_width = if first_row {
+                width
+            } else {
+                width.saturating_sub(continuation_width)
+            };
+            let mut split_at = remaining.len();
+            let mut used = 0usize;
+            for (byte_idx, ch) in remaining.char_indices() {
+                let ch_width =
+                    UnicodeWidthStr::width(&remaining[byte_idx..byte_idx + ch.len_utf8()]);
+                if used + ch_width > row_width {
+                    split_at = byte_idx;
+                    break;
+                }
+                used += ch_width;
+            }
+            if split_at == 0 {
+                let Some((byte_idx, ch)) = remaining.char_indices().next() else {
+                    break;
+                };
+                split_at = byte_idx + ch.len_utf8();
+            }
+            let segment = &remaining[..split_at];
+            let display = if first_row {
+                segment.to_string()
+            } else {
+                format!("{}{}", continuation_prefix, segment)
+            };
+            let segment_style = if first_row {
+                Style::default()
+                    .fg(rank_color)
+                    .bg(bg)
+                    .add_modifier(text_modifier)
+            } else {
+                Style::default().fg(TRANSCRIPT_TEXT).bg(bg)
+            };
+            lines.push((idx, Line::from(Span::styled(display, segment_style))));
+            remaining = &remaining[split_at..];
+            first_row = false;
+        }
     }
     lines
 }
@@ -2629,6 +2714,42 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect::<String>()
+    }
+
+    #[test]
+    fn wrapped_followup_rows_keep_the_same_logical_index() {
+        let followups = vec![RankedFollowup {
+            text: "This is a deliberately long followup that must wrap".into(),
+            rank: FollowupRank::Recommended,
+            reason: "because the terminal is narrow".into(),
+        }];
+        let rows = render_ranked_followups_wrapped(&followups, Some(0), 24);
+        assert_eq!(rows.first().map(|(index, _)| *index), Some(usize::MAX));
+        let item_rows: Vec<_> = rows
+            .iter()
+            .filter(|(index, _)| *index != usize::MAX)
+            .collect();
+        assert!(item_rows.len() > 1);
+        assert!(item_rows.iter().all(|(index, _)| *index == 0));
+    }
+
+    #[test]
+    fn wrapped_followup_rows_never_exceed_the_terminal_width() {
+        let followups = vec![RankedFollowup {
+            text: "a deliberately long followup ".repeat(10),
+            rank: FollowupRank::Recommended,
+            reason: "with a long reason that must also wrap".into(),
+        }];
+        let width = 24usize;
+        let rows = render_ranked_followups_wrapped(&followups, Some(0), width as u16);
+        for (index, line) in &rows {
+            let row_width = UnicodeWidthStr::width(line_text(line).as_str());
+            assert!(
+                row_width <= width,
+                "row {index:?} is {row_width} wide (limit {width}): {:?}",
+                line_text(line)
+            );
+        }
     }
 
     #[test]

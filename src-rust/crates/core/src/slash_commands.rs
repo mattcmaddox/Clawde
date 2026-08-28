@@ -128,6 +128,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "skills", description: "Browse available skills", category: "Tools", tui_only: false },
     PromptCommand { name: "files", description: "Browse project files", category: "Project", tui_only: false },
     PromptCommand { name: "summary", description: "Show or create a conversation summary", category: "Conversation", tui_only: false },
+    PromptCommand { name: "followups", description: "Manage saved followup suggestions and usage", category: "Conversation", tui_only: false },
     PromptCommand { name: "commit", description: "Create a commit from current changes", category: "Project", tui_only: false },
     PromptCommand { name: "add-dir", description: "Add an allowed workspace directory", category: "Project", tui_only: false },
     PromptCommand { name: "branch", description: "Manage session branches", category: "Conversation", tui_only: false },

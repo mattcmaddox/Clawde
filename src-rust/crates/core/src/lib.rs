@@ -16,7 +16,11 @@ pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
 
 // Ranked followups emitted by the model and rendered by interactive clients.
+pub mod followup_history;
+pub mod followup_usage;
 pub mod followups;
+pub use followup_history::FollowupHistory;
+pub use followup_usage::FollowupUsage;
 pub use followups::{
     parse_and_strip as parse_ranked_followups, FollowupRank, ParsedFollowups, RankedFollowup,
 };

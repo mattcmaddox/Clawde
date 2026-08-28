@@ -4173,6 +4173,41 @@ async fn run_interactive(
 
                             match cli_result {
                                 Some(CommandResult::Exit) => break 'main,
+                                Some(CommandResult::ClearFollowups { history, usage }) => {
+                                    if history {
+                                        app.followup_history.clear();
+                                        app.persisted_followups.clear();
+                                        app.current_followups.clear();
+                                        app.followup_selected = None;
+                                        app.followup_history_mode = false;
+                                        if let Err(error) =
+                                            app.followup_history.save(&Settings::config_dir())
+                                        {
+                                            tracing::debug!(%error, "failed to clear followup history");
+                                        }
+                                        // Drop cached transcript lines that still
+                                        // show the cleared followup rows.
+                                        app.invalidate_transcript();
+                                    }
+                                    if usage {
+                                        app.followup_usage_counts.clear();
+                                        let usage = clawde_core::FollowupUsage::default();
+                                        if let Err(error) = usage.save(&Settings::config_dir()) {
+                                            tracing::debug!(%error, "failed to clear followup usage");
+                                        }
+                                    }
+                                    let mut cleared = Vec::new();
+                                    if history {
+                                        cleared.push("history");
+                                    }
+                                    if usage {
+                                        cleared.push("usage");
+                                    }
+                                    app.status_message = Some(format!(
+                                        "Cleared followup {}.",
+                                        cleared.join(" and ")
+                                    ));
+                                }
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.replace_messages(Vec::new());
@@ -5084,6 +5119,19 @@ async fn run_interactive(
                         );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
+                        // Inject followup usage feedback so the model learns
+                        // which suggested followups the user actually acts on.
+                        let followup_summary = app.followup_usage_summary();
+                        if !followup_summary.is_empty() {
+                            let addon = format!(
+                                "\n\n[FOLLOWUP USAGE FEEDBACK]\n{}\n[END FEEDBACK]",
+                                followup_summary
+                            );
+                            qcfg.append_system_prompt = Some(match qcfg.append_system_prompt {
+                                Some(existing) => format!("{existing}{addon}"),
+                                None => addon,
+                            });
+                        }
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();

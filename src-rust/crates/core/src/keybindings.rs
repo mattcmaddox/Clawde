@@ -208,6 +208,9 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ("ctrl+d", "exit", KeyContext::Global), // Handled directly in handle_key_event for two-press confirmation
         ("ctrl+l", "redraw", KeyContext::Global),
         ("alt+r", "historySearch", KeyContext::Global),
+        ("alt+f", "toggleFollowupHistory", KeyContext::Chat),
+        ("alt+shift+h", "clearFollowupHistory", KeyContext::Global),
+        ("alt+shift+u", "clearFollowupUsage", KeyContext::Global),
         ("alt+b", "createBranch", KeyContext::Global),
         ("alt+/", "openHelp", KeyContext::Global),
         ("alt+c", "compact", KeyContext::Global),

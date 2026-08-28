@@ -164,6 +164,8 @@ pub enum CommandResult {
     },
     /// Clear the conversation.
     ClearConversation,
+    /// Clear followup history, usage, or both in the active TUI session.
+    ClearFollowups { history: bool, usage: bool },
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
     /// Load a previously saved session into the live REPL.
@@ -540,6 +542,7 @@ pub struct ImportConfigCommand;
 pub struct ThinkingCommand;
 pub struct AutoCompactCommand;
 pub struct TaskCommand;
+pub struct FollowupsCommand;
 // New commands
 // Batch-1 new commands
 // New commands: teleport, btw, ctx-viz, sandbox-toggle
@@ -971,6 +974,43 @@ impl SlashCommand for ClearCommand {
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::ClearConversation
+    }
+}
+
+// ---- /followups ----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for FollowupsCommand {
+    fn name(&self) -> &str {
+        "followups"
+    }
+    fn description(&self) -> &str {
+        "Manage saved followup suggestions and usage"
+    }
+    fn help(&self) -> &str {
+        "Usage: /followups [status|clear-history|clear-usage|clear-all]"
+    }
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        ["status", "clear-history", "clear-usage", "clear-all"]
+            .into_iter()
+            .filter(|value| value.starts_with(partial.trim()))
+            .map(|value| ArgCompletion {
+                value: value.to_string(),
+                description: "Followup data action".to_string(),
+                available: true,
+            })
+            .collect()
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        match args.trim() {
+            "" | "status" => CommandResult::Message(
+                "Followup data is managed by the TUI. Use clear-history, clear-usage, or clear-all.".into(),
+            ),
+            "clear-history" => CommandResult::ClearFollowups { history: true, usage: false },
+            "clear-usage" => CommandResult::ClearFollowups { history: false, usage: true },
+            "clear-all" => CommandResult::ClearFollowups { history: true, usage: true },
+            other => CommandResult::Error(format!("Unknown followups action: {other}")),
+        }
     }
 }
 
@@ -2217,6 +2257,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ThinkingCommand),
         Box::new(AutoCompactCommand),
         Box::new(TaskCommand),
+        Box::new(FollowupsCommand),
         Box::new(UnloadCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),

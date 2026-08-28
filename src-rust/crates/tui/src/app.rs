@@ -1297,6 +1297,18 @@ pub type ArgCompletionsFn = std::sync::Arc<
 /// Parse result of capability filter args: `(parsed_groups, status_label)`.
 pub type CapabilityFilterResult = (Vec<Vec<clawde_api::ModelCapability>>, String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowupRowTarget {
+    pub source: FollowupSource,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupSource {
+    Current,
+    History,
+}
+
 pub struct App {
     // Core state
     pub config: Config,
@@ -1331,6 +1343,10 @@ pub struct App {
     pub is_streaming: bool,
     pub streaming_text: String,
     pub streaming_thinking: String,
+    /// Whether the current turn has produced any assistant text or thinking.
+    /// This survives stream-buffer flushing and is the source of truth for
+    /// followup completion attribution.
+    pub assistant_output_received: bool,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
@@ -1872,9 +1888,9 @@ pub struct App {
     pub followup_selected: Option<usize>,
     /// The most recent followups from the last assistant response.
     pub current_followups: Vec<RankedFollowup>,
-    /// Screen rows → followup index mapping (written by renderer, read on
-    /// mouse click to determine which followup was clicked).
-    pub followup_row_map: RefCell<std::collections::HashMap<u16, usize>>,
+    /// Screen rows → followup target mapping (written by renderer, read on
+    /// mouse click to determine which list and item were clicked).
+    pub followup_row_map: RefCell<std::collections::HashMap<u16, FollowupRowTarget>>,
     /// Persistent followup history for cross-turn recall (Gap #2).
     /// Capped at 20 entries; oldest evicted first.
     pub persisted_followups: std::collections::VecDeque<RankedFollowup>,
@@ -2118,6 +2134,7 @@ impl App {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            assistant_output_received: false,
             status_message: None,
             spinner_verb: None,
             should_exit: false,
@@ -2496,6 +2513,7 @@ impl App {
         // measures actual round-trip time even when the provider buffers its
         // full response before yielding any stream events (e.g. Gemini flash).
         self.turn_start = Some(std::time::Instant::now());
+        self.assistant_output_received = false;
         self.last_turn_elapsed = None;
         self.last_turn_verb = None;
     }
@@ -5053,6 +5071,7 @@ impl App {
     pub fn invalidate_transcript(&self) {
         self.transcript_version
             .set(self.transcript_version.get().wrapping_add(1));
+        self.followup_row_map.borrow_mut().clear();
     }
 
     /// Check current token usage and push token warning notifications as
@@ -5236,7 +5255,6 @@ impl App {
 
     pub fn set_prompt_text(&mut self, text: String) {
         self.prompt_input.replace_text(text.clone());
-        self.pending_followup_text = Some(text);
         self.refresh_prompt_input();
     }
 
@@ -8160,6 +8178,7 @@ impl App {
                 self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.assistant_output_received = false;
                 self.tool_use_blocks.clear();
                 self.status_message = Some("Cancelled.".to_string());
                 self.complete_current_turn_snapshot(true);
@@ -8192,6 +8211,7 @@ impl App {
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.assistant_output_received = false;
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                     self.complete_current_turn_snapshot(true);
@@ -9047,6 +9067,7 @@ impl App {
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.assistant_output_received = false;
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -9553,6 +9574,9 @@ impl App {
                 if let Err(error) = self.followup_history.save(&Settings::config_dir()) {
                     debug!(%error, "failed to clear persisted followup history");
                 }
+                // Drop any cached transcript lines that still show the old
+                // followup rows and the stale row map built from them.
+                self.invalidate_transcript();
                 self.status_message = Some("Saved followup history cleared.".to_string());
                 false
             }
@@ -9573,6 +9597,10 @@ impl App {
                     } else {
                         None
                     };
+                    // The cached transcript lines were built for the previous
+                    // mode (current vs history list); force a rebuild so the
+                    // two lists never render side by side.
+                    self.invalidate_transcript();
                 }
                 false
             }
@@ -9632,6 +9660,7 @@ impl App {
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
+                    self.assistant_output_received = false;
                     self.tool_use_blocks.clear();
                     self.status_message =
                         Some("Aborted — retry or resubmit to try next upstream".to_string());
@@ -10810,10 +10839,13 @@ impl App {
                     .borrow()
                     .get(&mouse_event.row)
                     .copied();
-                if let Some(idx) = clicked_followup {
-                    if self.select_followup_at(idx) {
+                if let Some(target) = clicked_followup {
+                    let history_mode = self.followup_history_mode;
+                    self.followup_history_mode = matches!(target.source, FollowupSource::History);
+                    if self.select_followup_at(target.index) {
                         return;
                     }
+                    self.followup_history_mode = history_mode;
                 }
 
                 let input_area = self.last_input_area.get();
@@ -11033,11 +11065,13 @@ impl App {
                         match delta {
                             clawde_api::streaming::ContentDelta::TextDelta { text } => {
                                 self.streaming_text.push_str(&text);
+                                self.assistant_output_received = true;
                                 self.invalidate_transcript();
                             }
                             clawde_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
                                 self.streaming_thinking.push_str(&thinking);
+                                self.assistant_output_received = true;
                                 self.invalidate_transcript();
                             }
                             _ => {}
@@ -11158,7 +11192,8 @@ impl App {
                 // A completed followup requires an actual assistant response;
                 // cancellation and error paths must not claim success. The
                 // stream text is still flushed below for normal completion.
-                let has_assistant_output = !self.streaming_text.trim().is_empty()
+                let has_assistant_output = self.assistant_output_received
+                    || !self.streaming_text.trim().is_empty()
                     || !self.streaming_thinking.trim().is_empty();
                 let successful_stop = !matches!(
                     stop_reason.to_ascii_lowercase().as_str(),
@@ -11178,6 +11213,7 @@ impl App {
                 } else {
                     self.pending_followup_text = None;
                 }
+                self.assistant_output_received = false;
                 self.flush_streamed_assistant_message();
                 // The flushed message was rebuilt from stream text and lost the
                 // per-turn attribution the query loop attached. Restore it from
@@ -11343,6 +11379,7 @@ impl App {
                 self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.assistant_output_received = false;
                 self.pending_followup_text = None;
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
@@ -11936,6 +11973,32 @@ mod tests {
     }
 
     #[test]
+    fn followup_completion_survives_stream_flush() {
+        let mut app = make_app();
+        app.pending_followup_text = Some("Run tests".into());
+        app.is_streaming = true;
+        app.handle_query_event(QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: clawde_api::streaming::ContentDelta::TextDelta {
+                    text: "passed".into(),
+                },
+            },
+        ));
+        app.handle_query_event(QueryEvent::Stream(
+            clawde_api::AnthropicStreamEvent::MessageStop,
+        ));
+        assert!(app.streaming_text.is_empty());
+        app.handle_query_event(QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".into(),
+            usage: None,
+            observability: None,
+        });
+        assert_eq!(app.followup_completed_counts.get("Run tests"), Some(&1));
+    }
+
+    #[test]
     fn followup_completion_is_recorded_only_after_successful_turn() {
         let mut app = make_app();
         app.pending_followup_text = Some("Run tests".into());
@@ -11960,6 +12023,37 @@ mod tests {
             observability: None,
         });
         assert!(!app.followup_completed_counts.contains_key("Empty response"));
+    }
+
+    #[test]
+    fn set_prompt_text_does_not_credit_followup_submission() {
+        // Restoring input from history search, global search, or the file
+        // injection dialog is not a followup selection. It must not be counted
+        // as a followup submission even when the text happens to match one.
+        let mut app = make_app();
+        app.set_prompt_text("Run tests".into());
+        assert!(app.pending_followup_text.is_none());
+        assert_eq!(app.take_input(), "Run tests");
+        assert!(!app.followup_submitted_counts.contains_key("Run tests"));
+    }
+
+    #[test]
+    fn followup_mode_toggle_invalidates_cached_transcript_lines() {
+        let mut app = make_app();
+        app.persisted_followups.push_back(RankedFollowup {
+            text: "Old suggestion".into(),
+            rank: clawde_core::FollowupRank::Optional,
+            reason: String::new(),
+        });
+        app.followup_history_mode = false;
+        let version_before = app.transcript_version.get();
+        app.handle_keybinding_action("toggleFollowupHistory");
+        assert!(app.followup_history_mode);
+        assert!(
+            app.transcript_version.get() > version_before,
+            "toggling history mode must invalidate cached transcript lines"
+        );
+        assert!(app.followup_row_map.borrow().is_empty());
     }
 
     #[test]
