@@ -1361,6 +1361,7 @@ impl Tool for AgentTool {
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
+            output_style_name: ctx.config.output_style.clone(),
             ranked_followups: true,
             mode: ctx.config.mode.clone(),
             modes: None, // built-in fallback; the parent registry is not threaded here (v1)

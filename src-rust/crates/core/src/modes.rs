@@ -343,9 +343,14 @@ pub fn apply_mode(config: &mut crate::Config, mode: &ModeDef) {
 /// model-disciplined (spec §7.2/§7.3 honest limitation): it instructs the
 /// model and gates the existing `AskUserQuestion` tool — the loop is not
 /// paused by code.
-pub fn mode_prompt_block(mode: &ModeDef) -> Option<String> {
+/// Build the shared decision-rule guidance text from cadence + ask knobs.
+///
+/// Used by both [`mode_prompt_block`] and output styles that declare decision
+/// knobs (personas), so a persona's cadence/ask guidance reads identically to
+/// a mode's. Returns `None` when neither knob adds guidance.
+pub fn decision_guidance_block(cadence: CheckinCadence, ask: AskAmbiguityMode) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    match mode.checkin_cadence {
+    match cadence {
         CheckinCadence::Rare => {}
         CheckinCadence::Milestone => parts.push(
             "Check-in cadence: before the first file write and at tool-round \
@@ -361,7 +366,7 @@ pub fn mode_prompt_block(mode: &ModeDef) -> Option<String> {
                 .to_string(),
         ),
     }
-    match mode.ask_on_ambiguity {
+    match ask {
         AskAmbiguityMode::Off => {}
         AskAmbiguityMode::Balanced => parts.push(
             "Asking on ambiguity: when requirements conflict or are \
@@ -388,6 +393,10 @@ pub fn mode_prompt_block(mode: &ModeDef) -> Option<String> {
     } else {
         Some(format!("## Active Mode\n{}", parts.join("\n")))
     }
+}
+
+pub fn mode_prompt_block(mode: &ModeDef) -> Option<String> {
+    decision_guidance_block(mode.checkin_cadence, mode.ask_on_ambiguity)
 }
 
 /// Resolve a mode's synthesized prompt block by name.

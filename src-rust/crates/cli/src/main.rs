@@ -921,6 +921,14 @@ async fn main() -> anyhow::Result<()> {
         config.auto_commits = Some(true);
     }
     config.project_dir = Some(clawde_core::git_utils::project_root(&cwd));
+    // After the active mode preset (if any) is applied above, let the active
+    // output-style persona fill decision knobs the mode did NOT bind — effort,
+    // plan posture. Mode > persona precedence. Cadence/ask surface per-turn in
+    // the query loop. No-op when the style declares no knobs.
+    clawde_core::output_styles::apply_persona_knobs(
+        &mut config,
+        &clawde_core::config::Settings::config_dir(),
+    );
     if let Some(p) = &cli.provider {
         config.provider = Some(p.clone());
     }
@@ -4525,6 +4533,19 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // Re-apply persona decision knobs (effort, plan)
+                                    // with mode > persona precedence after /mode,
+                                    // /output-style, and the mode picker. project_dir
+                                    // may be unset on a fresh change; inherit from the
+                                    // pre-change session config for mode resolution.
+                                    if applied_cfg.project_dir.is_none() {
+                                        applied_cfg.project_dir =
+                                            cmd_ctx.config.project_dir.clone();
+                                    }
+                                    clawde_core::output_styles::apply_persona_knobs(
+                                        &mut applied_cfg,
+                                        &clawde_core::config::Settings::config_dir(),
+                                    );
                                     // Captured BEFORE assigning cmd_ctx.config so the
                                     // comparison sees the pre-change strategy.
                                     let routing_changed =

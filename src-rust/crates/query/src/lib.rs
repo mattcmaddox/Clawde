@@ -126,6 +126,10 @@ pub struct QueryConfig {
     pub append_system_prompt: Option<String>,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
+    /// Persisted output-style / persona name (e.g. `"cathead"`) from the core
+    /// `Config::output_style`. Used to resolve persona-declared decision knobs
+    /// (cadence/ask) per turn; `None` means the default (no persona).
+    pub output_style_name: Option<String>,
     /// Enable strict ranked followups in final model responses.
     pub ranked_followups: bool,
     /// Persisted active mode preset name (e.g. `"careful"`). An inline
@@ -254,6 +258,7 @@ impl Default for QueryConfig {
             append_system_prompt: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            output_style_name: None,
             ranked_followups: true,
             mode: None,
             modes: None,
@@ -295,6 +300,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            output_style_name: cfg.output_style.clone(),
             ranked_followups: true,
             mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
@@ -321,6 +327,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
+            output_style_name: cfg.output_style.clone(),
             ranked_followups: true,
             mode: cfg.mode.clone(),
             working_directory: cfg.project_dir.clone(),
@@ -797,6 +804,38 @@ fn effective_mode_name_for_turn(config: &QueryConfig, messages: &[Message]) -> O
         }
     }
     config.mode.clone()
+}
+
+/// Resolve the persona decision-guidance block for this turn.
+///
+/// An inline `cathead` / `caveman` keyword in the latest user message wins
+/// (transient); otherwise the persisted `config.output_style_name` stands.
+/// Returns the synthesized cadence/ask block only when the effective style
+/// declares those knobs; `None` for voice-only personas and the default
+/// style. Callers append this ONLY when the active mode produced no block of
+/// its own (mode > persona precedence).
+fn resolve_persona_guidance_block(
+    config: &QueryConfig,
+    messages: &[Message],
+    config_dir: &std::path::Path,
+) -> Option<String> {
+    let style_name = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .and_then(|m| clawde_core::keywords::inline_persona_style(&m.get_all_text()))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            config
+                .output_style_name
+                .clone()
+                .unwrap_or_else(|| "default".to_string())
+        });
+    clawde_core::output_styles::find_style(
+        &clawde_core::output_styles::all_styles(config_dir),
+        &style_name,
+    )
+    .and_then(clawde_core::output_styles::persona_guidance_block)
 }
 
 /// Materialize the bounded turn-change context from the shadow snapshot.
@@ -2341,6 +2380,7 @@ pub async fn run_query_loop(
             // persisted selection stands. The block is synthesized from the
             // mode's cadence/ask knobs — prompt-level guidance only, the loop
             // and safety rails are untouched (spec §7.2/§7.3).
+            let mut mode_block_appended = false;
             if let Some(mode_name) = effective_mode_name_for_turn(config, messages.as_slice()) {
                 // `resolve_mode_block` itself falls back to the built-ins, so
                 // an empty registry (tests / sub-agents) still resolves the
@@ -2350,6 +2390,27 @@ pub async fn run_query_loop(
                     &mode_name,
                 );
                 if let Some(block) = block {
+                    mode_block_appended = true;
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{existing}\n\n{block}"),
+                            None => block,
+                        });
+                }
+            }
+
+            // Persona decision guidance for THIS turn. When the active mode
+            // produced no guidance block, a persona that declares cadence/ask
+            // knobs fills the gap with the same block text modes produce
+            // (mode > persona precedence — the mode block, when present, wins
+            // entirely). The effective style may be an inline `cathead` /
+            // `caveman` keyword (this turn only) or the persisted selection.
+            if !mode_block_appended {
+                if let Some(block) = resolve_persona_guidance_block(
+                    config,
+                    messages.as_slice(),
+                    &clawde_core::config::Settings::config_dir(),
+                ) {
                     patched.append_system_prompt =
                         Some(match patched.append_system_prompt.take() {
                             Some(existing) => format!("{existing}\n\n{block}"),
@@ -4961,6 +5022,7 @@ mod tests {
             append_system_prompt: append.map(String::from),
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
+            output_style_name: None,
             ranked_followups: true,
             mode: None,
             modes: None,
@@ -6886,6 +6948,84 @@ mod tests {
         let msgs = vec![Message::user("cathead, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.unwrap().contains("purr"));
+    }
+
+    // ---- persona decision guidance block --------------------------------
+
+    fn persona_config_dir_with_knobs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("persona config dir");
+        let styles = dir.path().join("output-styles");
+        std::fs::create_dir_all(&styles).unwrap();
+        std::fs::write(
+            styles.join("deliberate.json"),
+            r#"{"name":"deliberate","label":"Deliberate","description":"d","prompt":"p","checkinCadence":"milestone","askOnAmbiguity":"balanced"}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn persona_guidance_block_resolves_from_persisted_style() {
+        let dir = persona_config_dir_with_knobs();
+        let cfg = QueryConfig {
+            output_style_name: Some("deliberate".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("review this design")];
+        let block = resolve_persona_guidance_block(&cfg, &msgs, dir.path());
+        let block = block.expect("deliberate persona declares cadence/ask");
+        assert!(
+            block.contains("milestone") || block.contains("narrate"),
+            "{block}"
+        );
+        assert!(block.contains("ask one clarifying question"), "{block}");
+    }
+
+    #[test]
+    fn persona_guidance_block_none_for_voice_only_style() {
+        let dir = persona_config_dir_with_knobs();
+        // 'concise' is a built-in voice-only style — no knobs → no block.
+        let cfg = QueryConfig {
+            output_style_name: Some("concise".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("hello")];
+        assert_eq!(
+            resolve_persona_guidance_block(&cfg, &msgs, dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_normal_resets_persisted_persona_knobs() {
+        let dir = persona_config_dir_with_knobs();
+        // Persisted 'deliberate' (declares cadence/ask), but an inline `normal`
+        // keyword resets the persona to default for this turn → no block.
+        let cfg = QueryConfig {
+            output_style_name: Some("deliberate".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("normal, just answer quickly")];
+        assert_eq!(
+            resolve_persona_guidance_block(&cfg, &msgs, dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn inline_cathead_is_voice_only_no_knobs_block() {
+        let dir = persona_config_dir_with_knobs();
+        // Built-in personas (cathead etc.) are voice-only: an inline keyword
+        // resolves to them, but they declare no cadence/ask knobs → no block.
+        let cfg = QueryConfig {
+            output_style_name: Some("deliberate".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("cathead, fix this please")];
+        assert_eq!(
+            resolve_persona_guidance_block(&cfg, &msgs, dir.path()),
+            None
+        );
     }
 
     // ---- mode preset (transient vs persistent) ---------------------------

@@ -21,7 +21,17 @@ use std::sync::Mutex;
 // ---------------------------------------------------------------------------
 
 /// A single output style definition.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// A style is primarily a **voice** layer: `prompt` text injected into the
+/// system prompt. A style may *additionally* declare decision knobs (`effort`,
+/// `plan`, `ask_on_ambiguity`, `checkin_cadence`) so a persona can influence
+/// how the agent works, not just how it talks. Decision knobs are **always
+/// lower precedence than the active mode preset** — when a mode binds the same
+/// knob, the mode's value wins (see [`crate::modes::apply_mode`] and
+/// [`Config::apply_persona_knobs`]). `permission_mode` and `allowed_tools` are
+/// deliberately NOT offered here: they are safety-boundary settings owned by
+/// modes only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct OutputStyleDef {
     /// Machine-readable identifier (e.g. `"concise"`).
     pub name: String,
@@ -32,6 +42,22 @@ pub struct OutputStyleDef {
     /// Text injected into the system prompt when this style is active.
     /// Empty string for the default style (no extra injection).
     pub prompt: String,
+    /// Optional default reasoning effort bound when this style is active.
+    /// `None` (or absent) leaves effort untouched. Lower precedence than a
+    /// mode that binds effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::effort::EffortLevel>,
+    /// Optional plan-vs-execute posture. `PlanKnobs::Default` (or absent)
+    /// leaves posture untouched. Lower precedence than a mode that binds
+    /// a plan posture.
+    #[serde(default)]
+    pub plan: crate::modes::PlanKnobs,
+    /// Optional ask-on-ambiguity guidance. `Off` (or absent) adds none.
+    #[serde(default, rename = "askOnAmbiguity", alias = "ask_on_ambiguity")]
+    pub ask_on_ambiguity: crate::modes::AskAmbiguityMode,
+    /// Optional check-in cadence guidance. `Rare` (or absent) adds none.
+    #[serde(default, rename = "checkinCadence", alias = "checkin_cadence")]
+    pub checkin_cadence: crate::modes::CheckinCadence,
 }
 
 impl OutputStyleDef {
@@ -43,6 +69,7 @@ impl OutputStyleDef {
             label: "Default".to_string(),
             description: "Standard Clawde responses.".to_string(),
             prompt: String::new(),
+            ..Default::default()
         }
     }
 
@@ -54,6 +81,7 @@ impl OutputStyleDef {
             prompt: "Be maximally concise. Skip preamble, summaries, and filler. \
                      Lead with the answer."
                 .to_string(),
+            ..Default::default()
         }
     }
 
@@ -66,6 +94,7 @@ impl OutputStyleDef {
                      Include reasoning, alternatives considered, and potential pitfalls. \
                      Err on the side of over-explaining."
                 .to_string(),
+            ..Default::default()
         }
     }
 
@@ -78,6 +107,7 @@ impl OutputStyleDef {
                      Point out patterns, best practices, and why you made each decision. \
                      Use analogies when helpful."
                 .to_string(),
+            ..Default::default()
         }
     }
 
@@ -115,6 +145,7 @@ impl OutputStyleDef {
                 "Example: 'The issue is that you create a new object reference each render cycle, which triggers re-renders.' → 'New object ref each render triggers re-render. Wrap in useMemo.'",
             )
             .to_string(),
+            ..Default::default()
         }
     }
 
@@ -148,6 +179,7 @@ impl OutputStyleDef {
                 "immutable borrow out of scope before taking the mutable one. Purrr-fect, compiles clean.'",
             )
             .to_string(),
+            ..Default::default()
         }
     }
 }
@@ -246,6 +278,7 @@ fn load_style_file(path: &Path) -> Option<OutputStyleDef> {
         label,
         description,
         prompt,
+        ..Default::default()
     })
 }
 
@@ -267,6 +300,76 @@ pub fn all_styles(config_dir: &Path) -> Vec<OutputStyleDef> {
 /// Find a style by its `name` field.
 pub fn find_style<'a>(styles: &'a [OutputStyleDef], name: &str) -> Option<&'a OutputStyleDef> {
     styles.iter().find(|s| s.name == name)
+}
+
+/// Apply the active output style's decision knobs onto `config`, filling only
+/// the knobs the active mode preset did NOT bind (mode wins over persona).
+///
+/// - `effort`: applied only when the mode leaves `default_effort` unset.
+/// - `plan`: applied only when the mode declares no plan posture.
+/// - `checkin_cadence` / `ask_on_ambiguity`: NOT config knobs — they surface
+///   per-turn via [`crate::modes::decision_guidance_block`] in the query loop.
+///
+/// No-op when no style is active, the style declares no knobs, or a mode
+/// already bound the same knob. Call this after mode application (e.g. session
+/// start and after `/mode`/`/output-style`/picker changes) so precedence is
+/// always mode > persona. `config_dir` is the global config dir (typically
+/// `~/.clawde`) used to resolve styles and modes.
+pub fn apply_persona_knobs(config: &mut crate::Config, config_dir: &Path) {
+    let style_name = config.output_style.as_deref().unwrap_or("default");
+    let styles = all_styles(config_dir);
+    let Some(style) = find_style(&styles, style_name) else {
+        return;
+    };
+
+    // Resolve the active mode def (if any) to know which knobs it bound.
+    // Copy out the two knob values we consult so no borrow outlives the
+    // locally-built modes vec.
+    let mode_effort = config.mode.as_deref().and_then(|name| {
+        let project_dir = config
+            .project_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let modes = crate::modes::all_modes_for_project(config_dir, &project_dir);
+        crate::modes::find_mode(&modes, name).and_then(|m| m.effort)
+    });
+    // The persona's plan posture may only fill when the mode declared neither
+    // a plan posture NOR a permission mode — a mode that binds AcceptEdits /
+    // Bypass must not have its boundary silently flipped by a persona.
+    let mode_plan_default = config.mode.as_deref().is_none_or(|name| {
+        let project_dir = config
+            .project_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let modes = crate::modes::all_modes_for_project(config_dir, &project_dir);
+        crate::modes::find_mode(&modes, name).is_none_or(|m| {
+            m.plan == crate::modes::PlanKnobs::Default && m.permission_mode.is_none()
+        })
+    });
+
+    // Effort: fill only if the mode did not bind one.
+    if style.effort.is_some() && mode_effort.is_none() {
+        config.default_effort = style.effort;
+    }
+
+    // Plan posture: fill only if the mode declared no plan.
+    if mode_plan_default {
+        match style.plan {
+            crate::modes::PlanKnobs::Default => {}
+            crate::modes::PlanKnobs::SpecMode => config.spec_mode = true,
+            crate::modes::PlanKnobs::AlwaysPlan => {
+                config.permission_mode = crate::PermissionMode::Plan
+            }
+        }
+    }
+}
+
+/// Synthesize the decision-rule guidance block for a style's cadence/ask
+/// knobs, reusing the exact text modes produce (via
+/// [`crate::modes::decision_guidance_block`]). Returns `None` when the style
+/// declares neither knob, so callers can skip injection.
+pub fn persona_guidance_block(style: &OutputStyleDef) -> Option<String> {
+    crate::modes::decision_guidance_block(style.checkin_cadence, style.ask_on_ambiguity)
 }
 
 // ---------------------------------------------------------------------------
@@ -504,5 +607,128 @@ mod tests {
         assert!(styles.iter().any(|s| s.name == "pirate"));
         // Built-ins still present.
         assert!(styles.iter().any(|s| s.name == "default"));
+    }
+
+    // ---- persona decision knobs -------------------------------------------
+
+    #[test]
+    fn json_style_without_knobs_parses_to_defaults() {
+        // Backward compat: a style file that predates decision knobs must
+        // parse with all knobs at their no-op defaults.
+        let def: OutputStyleDef = serde_json::from_str(
+            r#"{"name":"formal","label":"Formal","description":"Formal tone.","prompt":"Use formal language."}"#,
+        )
+        .expect("old-style JSON parses");
+        assert_eq!(def.name, "formal");
+        assert_eq!(def.effort, None);
+        assert_eq!(def.plan, crate::modes::PlanKnobs::Default);
+        assert_eq!(def.ask_on_ambiguity, crate::modes::AskAmbiguityMode::Off);
+        assert_eq!(def.checkin_cadence, crate::modes::CheckinCadence::Rare);
+    }
+
+    #[test]
+    fn json_style_with_knobs_parses() {
+        let def: OutputStyleDef = serde_json::from_str(
+            r#"{"name":"deliberate","label":"Deliberate","description":"d","prompt":"p","effort":"high","plan":"alwaysPlan","askOnAmbiguity":"askOnDesign","checkinCadence":"milestone"}"#,
+        )
+        .expect("knobs JSON parses");
+        assert_eq!(def.effort, Some(crate::effort::EffortLevel::High));
+        assert_eq!(def.plan, crate::modes::PlanKnobs::AlwaysPlan);
+        assert_eq!(
+            def.ask_on_ambiguity,
+            crate::modes::AskAmbiguityMode::AskOnDesign
+        );
+        assert_eq!(def.checkin_cadence, crate::modes::CheckinCadence::Milestone);
+    }
+
+    fn deliberate_style_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("output-styles")).unwrap();
+        let mut f = std::fs::File::create(dir.path().join("output-styles").join("deliberate.json"))
+            .unwrap();
+        f.write_all(
+            br#"{"name":"deliberate","label":"Deliberate","description":"d","prompt":"p","effort":"high","plan":"alwaysPlan","askOnAmbiguity":"askOnDesign","checkinCadence":"milestone"}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn apply_persona_knobs_fills_effort_when_no_mode() {
+        let dir = deliberate_style_dir();
+        let mut cfg = crate::Config {
+            output_style: Some("deliberate".to_string()),
+            ..Default::default()
+        };
+        apply_persona_knobs(&mut cfg, dir.path());
+        assert_eq!(cfg.default_effort, Some(crate::effort::EffortLevel::High));
+    }
+
+    #[test]
+    fn apply_persona_knobs_mode_wins_over_persona_effort() {
+        // Mode 'fast' binds effort=Low; a persona binding effort=High must NOT
+        // override it (mode > persona).
+        let dir = deliberate_style_dir();
+        let mut cfg = crate::Config {
+            mode: Some("fast".to_string()),
+            output_style: Some("deliberate".to_string()),
+            ..Default::default()
+        };
+        // Simulate mode application as main.rs does.
+        let modes = crate::modes::all_modes_for_project(dir.path(), std::path::Path::new("."));
+        let fast = crate::modes::find_mode(&modes, "fast")
+            .expect("fast built-in")
+            .clone();
+        crate::modes::apply_mode(&mut cfg, &fast);
+        apply_persona_knobs(&mut cfg, dir.path());
+        assert_eq!(cfg.default_effort, Some(crate::effort::EffortLevel::Low));
+    }
+
+    #[test]
+    fn apply_persona_knobs_fills_plan_when_mode_binds_none() {
+        let dir = deliberate_style_dir();
+        let mut cfg = crate::Config {
+            output_style: Some("deliberate".to_string()),
+            ..Default::default()
+        };
+        apply_persona_knobs(&mut cfg, dir.path());
+        assert_eq!(cfg.permission_mode, crate::PermissionMode::Plan);
+    }
+
+    #[test]
+    fn apply_persona_knobs_mode_plan_wins_over_persona() {
+        // Mode 'walkaway' binds permission_mode=AcceptEdits; a persona
+        // AlwaysPlan must NOT override it (mode > persona).
+        let dir = deliberate_style_dir();
+        let mut cfg = crate::Config {
+            mode: Some("walkaway".to_string()),
+            output_style: Some("deliberate".to_string()),
+            ..Default::default()
+        };
+        let modes = crate::modes::all_modes_for_project(dir.path(), std::path::Path::new("."));
+        let walkaway = crate::modes::find_mode(&modes, "walkaway")
+            .expect("walkaway built-in")
+            .clone();
+        crate::modes::apply_mode(&mut cfg, &walkaway);
+        apply_persona_knobs(&mut cfg, dir.path());
+        assert_eq!(cfg.permission_mode, crate::PermissionMode::AcceptEdits);
+    }
+
+    #[test]
+    fn persona_guidance_block_none_for_default_knobs() {
+        let style = OutputStyleDef::default();
+        assert_eq!(persona_guidance_block(&style), None);
+    }
+
+    #[test]
+    fn persona_guidance_block_synthesizes_cadence_ask() {
+        let style = OutputStyleDef {
+            checkin_cadence: crate::modes::CheckinCadence::EveryTurn,
+            ask_on_ambiguity: crate::modes::AskAmbiguityMode::Balanced,
+            ..Default::default()
+        };
+        let block = persona_guidance_block(&style).expect("guidance block");
+        assert!(block.contains("narrate your plan"), "{block}");
+        assert!(block.contains("ask one clarifying question"), "{block}");
     }
 }
