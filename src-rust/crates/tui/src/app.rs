@@ -1900,15 +1900,9 @@ pub struct App {
     /// Directory holding project-scoped followup data: `.clawde/` in the
     /// project root, or the global config dir when no project is known.
     followup_dir: std::path::PathBuf,
-    /// How many times each followup text was selected by the user.
-    /// Keys are normalized followup text, values are use counts. Bounded to
-    /// avoid untrusted model output growing process memory indefinitely.
-    pub followup_usage_counts: std::collections::HashMap<String, u32>,
+    /// Persisted per-text lifecycle counts (selected / submitted / completed),
+    /// project-scoped and bounded. Single source of truth for usage feedback.
     pub followup_usage: clawde_core::FollowupUsage,
-    /// Number of selected followups that were submitted as prompts.
-    pub followup_submitted_counts: std::collections::HashMap<String, u32>,
-    /// Number of submitted followups whose turn completed successfully.
-    pub followup_completed_counts: std::collections::HashMap<String, u32>,
     /// Most recently selected followup awaiting submission.
     pub pending_followup_text: Option<String>,
 
@@ -2401,13 +2395,10 @@ impl App {
                 &Settings::config_dir(),
             ),
             followup_history_mode: false,
-            followup_usage_counts: std::collections::HashMap::new(),
             followup_usage: clawde_core::FollowupUsage::load_preferring(
                 &followup_dir,
                 &Settings::config_dir(),
             ),
-            followup_submitted_counts: std::collections::HashMap::new(),
-            followup_completed_counts: std::collections::HashMap::new(),
             pending_followup_text: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
@@ -2599,32 +2590,12 @@ impl App {
 
     /// Record that the user selected a followup (Gap #4: feedback loop).
     fn record_followup_used(&mut self, followup: &RankedFollowup) {
-        const MAX_TRACKED_FOLLOWUPS: usize = 64;
-        const MAX_FOLLOWUP_CHARS: usize = 256;
-        let text: String = followup
-            .text
-            .trim()
-            .chars()
-            .take(MAX_FOLLOWUP_CHARS)
-            .collect();
-        if text.is_empty() {
-            return;
-        }
-        if !self.followup_usage_counts.contains_key(&text)
-            && self.followup_usage_counts.len() >= MAX_TRACKED_FOLLOWUPS
-        {
-            if let Some(oldest) = self
-                .followup_usage_counts
-                .iter()
-                .min_by_key(|(_, count)| *count)
-                .map(|(text, _)| text.clone())
-            {
-                self.followup_usage_counts.remove(&oldest);
-            }
-        }
-        let count = self.followup_usage_counts.entry(text.clone()).or_insert(0);
-        *count = count.saturating_add(1);
-        self.followup_usage.record(&text);
+        self.followup_usage.record(&followup.text);
+        self.save_followup_usage();
+    }
+
+    /// Persist the lifecycle store and refresh the markdown mirror.
+    fn save_followup_usage(&self) {
         if let Err(error) = self
             .followup_usage
             .save_migrating(&self.followup_dir, &Settings::config_dir())
@@ -2636,18 +2607,17 @@ impl App {
 
     /// Return a summary of followup usage for the system prompt.
     /// Shows the top-5 most-used followups so the model can learn which
-    /// suggestions the user actually acts on.
+    /// suggestions the user actually acts on. Counts come from the persisted
+    /// lifecycle store, so restarts never reset them to a misleading zero.
     pub fn followup_usage_summary(&self) -> String {
-        if self.followup_usage_counts.is_empty() {
-            return self.followup_usage.summary();
+        if self.followup_usage.is_empty() {
+            return String::new();
         }
         const MAX_SUMMARY_CHARS: usize = 1_500;
-        let mut counts: Vec<_> = self.followup_usage_counts.iter().collect();
-        counts.sort_by(|(text_a, count_a), (text_b, count_b)| {
-            count_b.cmp(count_a).then_with(|| text_a.cmp(text_b))
-        });
         let mut summary = String::from("Followup outcomes (selected/submitted/completed): ");
-        for (position, (text, count)) in counts.iter().take(5).enumerate() {
+        for (position, (text, lifecycle)) in
+            self.followup_usage.sorted().into_iter().take(5).enumerate()
+        {
             let escaped: String = text
                 .chars()
                 .flat_map(|c| match c {
@@ -2664,15 +2634,9 @@ impl App {
                 "{}\"{}\" (selected {} times, submitted {}, completed {})",
                 if position == 0 { "" } else { ", " },
                 escaped,
-                count,
-                self.followup_submitted_counts
-                    .get(*text)
-                    .copied()
-                    .unwrap_or(0),
-                self.followup_completed_counts
-                    .get(*text)
-                    .copied()
-                    .unwrap_or(0)
+                lifecycle.selected,
+                lifecycle.submitted,
+                lifecycle.completed
             );
             if summary.chars().count() + item.chars().count() > MAX_SUMMARY_CHARS {
                 break;
@@ -2685,32 +2649,23 @@ impl App {
     /// Build the `/followups status` report: current and saved counts, usage
     /// totals, top lifecycle rows, and the storage location.
     pub fn followup_status_report(&self) -> String {
-        let mut counts: Vec<_> = self.followup_usage_counts.iter().collect();
-        counts.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
         let mut out = format!(
             "Followup suggestions — {} current, {} saved, {} tracked usage text(s)\n",
             self.current_followups.len(),
             self.persisted_followups.len(),
-            self.followup_usage_counts.len()
+            self.followup_usage.len()
         );
-        if counts.is_empty() {
+        if self.followup_usage.is_empty() {
             out.push_str("  No followup usage recorded yet.\n");
         } else {
             out.push_str("  Most-used followups (selected / submitted / completed):\n");
-            for (text, selected) in counts.into_iter().take(5) {
-                let submitted = self
-                    .followup_submitted_counts
-                    .get(text)
-                    .copied()
-                    .unwrap_or(0);
-                let completed = self
-                    .followup_completed_counts
-                    .get(text)
-                    .copied()
-                    .unwrap_or(0);
+            for (text, lifecycle) in self.followup_usage.sorted().into_iter().take(5) {
                 out.push_str(&format!(
-                    "    - \"{}\" {selected} / {submitted} / {completed}\n",
-                    text.replace('\\', "\\\\").replace('"', "\\\"")
+                    "    - \"{}\" {} / {} / {}\n",
+                    text.replace('\\', "\\\\").replace('"', "\\\""),
+                    lifecycle.selected,
+                    lifecycle.submitted,
+                    lifecycle.completed
                 ));
             }
         }
@@ -2750,25 +2705,17 @@ impl App {
             ));
         }
         out.push_str("\n## Usage\n");
-        let mut rows: Vec<_> = self.followup_usage_counts.iter().collect();
-        rows.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
+        let rows: Vec<_> = self.followup_usage.sorted();
         if rows.is_empty() {
             out.push_str("_none_\n");
         }
-        for (text, selected) in rows.into_iter().take(20) {
-            let submitted = self
-                .followup_submitted_counts
-                .get(text)
-                .copied()
-                .unwrap_or(0);
-            let completed = self
-                .followup_completed_counts
-                .get(text)
-                .copied()
-                .unwrap_or(0);
+        for (text, lifecycle) in rows.into_iter().take(20) {
             out.push_str(&format!(
-                "- \"{}\": selected {selected}, submitted {submitted}, completed {completed}\n",
-                text.replace('\\', "\\\\").replace('"', "\\\"")
+                "- \"{}\": selected {}, submitted {}, completed {}\n",
+                text.replace('\\', "\\\\").replace('"', "\\\""),
+                lifecycle.selected,
+                lifecycle.submitted,
+                lifecycle.completed
             ));
         }
         if let Err(error) = std::fs::write(self.followup_dir.join("followups.md"), out) {
@@ -2794,9 +2741,6 @@ impl App {
             }
         }
         if usage {
-            self.followup_usage_counts.clear();
-            self.followup_submitted_counts.clear();
-            self.followup_completed_counts.clear();
             self.followup_usage = clawde_core::FollowupUsage::default();
             if let Err(error) = self
                 .followup_usage
@@ -5279,11 +5223,8 @@ impl App {
         if let Some(followup) = self.pending_followup_text.take() {
             let normalized = followup.trim().to_string();
             if !normalized.is_empty() && input.trim() == normalized {
-                let count = self
-                    .followup_submitted_counts
-                    .entry(normalized)
-                    .or_insert(0);
-                *count = count.saturating_add(1);
+                self.followup_usage.record_submitted(&normalized);
+                self.save_followup_usage();
             }
         }
         if !input.is_empty() {
@@ -11359,11 +11300,8 @@ impl App {
                     if let Some(followup) = self.pending_followup_text.take() {
                         let normalized = followup.trim().to_string();
                         if !normalized.is_empty() {
-                            let count = self
-                                .followup_completed_counts
-                                .entry(normalized)
-                                .or_insert(0);
-                            *count = count.saturating_add(1);
+                            self.followup_usage.record_completed(&normalized);
+                            self.save_followup_usage();
                         }
                     }
                 } else {
@@ -12112,9 +12050,21 @@ mod tests {
         app.followup_selected = Some(0);
         assert!(app.select_followup_at(0));
         assert_eq!(app.prompt_input.text, "Run tests");
-        assert_eq!(app.followup_usage_counts.get("Run tests"), Some(&1));
+        assert_eq!(
+            app.followup_usage
+                .lifecycle_for("Run tests")
+                .unwrap()
+                .selected,
+            1
+        );
         assert_eq!(app.take_input(), "Run tests");
-        assert_eq!(app.followup_submitted_counts.get("Run tests"), Some(&1));
+        assert_eq!(
+            app.followup_usage
+                .lifecycle_for("Run tests")
+                .unwrap()
+                .submitted,
+            1
+        );
 
         app.current_followups = vec![RankedFollowup {
             text: "Review diff".into(),
@@ -12127,7 +12077,14 @@ mod tests {
             .replace_text("Review diff carefully".to_string());
         app.refresh_prompt_input();
         assert_eq!(app.take_input(), "Review diff carefully");
-        assert!(!app.followup_submitted_counts.contains_key("Review diff"));
+        // The edited text was selected but never submitted as-is.
+        assert_eq!(
+            app.followup_usage
+                .lifecycle_for("Review diff")
+                .unwrap()
+                .submitted,
+            0
+        );
     }
 
     #[test]
@@ -12153,7 +12110,13 @@ mod tests {
             usage: None,
             observability: None,
         });
-        assert_eq!(app.followup_completed_counts.get("Run tests"), Some(&1));
+        assert_eq!(
+            app.followup_usage
+                .lifecycle_for("Run tests")
+                .unwrap()
+                .completed,
+            1
+        );
     }
 
     #[test]
@@ -12163,13 +12126,17 @@ mod tests {
         app.is_streaming = true;
         app.handle_query_event(clawde_query::QueryEvent::Error("failed".into()));
         assert!(app.pending_followup_text.is_none());
-        assert!(app.followup_completed_counts.is_empty());
+        assert!(app.followup_usage.is_empty());
 
         app.pending_followup_text = Some("Run tests".into());
-        app.followup_completed_counts
-            .entry("Run tests".into())
-            .or_insert(0);
-        assert_eq!(app.followup_completed_counts.get("Run tests"), Some(&0));
+        app.followup_usage.record_submitted("Run tests");
+        assert_eq!(
+            app.followup_usage
+                .lifecycle_for("Run tests")
+                .unwrap()
+                .completed,
+            0
+        );
 
         // A successful stop without any assistant output must not count.
         app.pending_followup_text = Some("Empty response".into());
@@ -12180,7 +12147,7 @@ mod tests {
             usage: None,
             observability: None,
         });
-        assert!(!app.followup_completed_counts.contains_key("Empty response"));
+        assert!(app.followup_usage.lifecycle_for("Empty response").is_none());
     }
 
     #[test]
@@ -12192,7 +12159,7 @@ mod tests {
         app.set_prompt_text("Run tests".into());
         assert!(app.pending_followup_text.is_none());
         assert_eq!(app.take_input(), "Run tests");
-        assert!(!app.followup_submitted_counts.contains_key("Run tests"));
+        assert!(app.followup_usage.lifecycle_for("Run tests").is_none());
     }
 
     #[test]
@@ -12231,9 +12198,12 @@ mod tests {
             rank: clawde_core::FollowupRank::Recommended,
             reason: "verify".into(),
         });
-        app.followup_usage_counts.insert("Run tests".into(), 3);
-        app.followup_submitted_counts.insert("Run tests".into(), 2);
-        app.followup_completed_counts.insert("Run tests".into(), 1);
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record_submitted("Run tests");
+        app.followup_usage.record_submitted("Run tests");
+        app.followup_usage.record_completed("Run tests");
         app.write_followup_markdown();
         let md = std::fs::read_to_string(project.path().join(".clawde/followups.md"))
             .expect("markdown mirror written");
@@ -12269,15 +12239,13 @@ mod tests {
             reason: String::new(),
         });
         app.persisted_followups = app.followup_history.items().clone();
-        app.followup_usage_counts.insert("Old".into(), 1);
-        app.followup_submitted_counts.insert("Old".into(), 1);
-        app.followup_completed_counts.insert("Old".into(), 1);
+        app.followup_usage.record("Old");
+        app.followup_usage.record_submitted("Old");
+        app.followup_usage.record_completed("Old");
         app.clear_followups(true, true);
         assert!(app.followup_history.items().is_empty());
         assert!(app.persisted_followups.is_empty());
-        assert!(app.followup_usage_counts.is_empty());
-        assert!(app.followup_submitted_counts.is_empty());
-        assert!(app.followup_completed_counts.is_empty());
+        assert!(app.followup_usage.is_empty());
         assert!(app.status_message.as_deref().unwrap().contains("history")); // The persisted usage file is rewritten empty and the mirror reflects it.
         let data_dir = project.path().join(".clawde");
         assert!(data_dir.join("followup_usage.json").exists());
@@ -12384,9 +12352,12 @@ mod tests {
             rank: clawde_core::FollowupRank::Recommended,
             reason: String::new(),
         });
-        app.followup_usage_counts.insert("Run tests".into(), 3);
-        app.followup_submitted_counts.insert("Run tests".into(), 2);
-        app.followup_completed_counts.insert("Run tests".into(), 1);
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record("Run tests");
+        app.followup_usage.record_submitted("Run tests");
+        app.followup_usage.record_submitted("Run tests");
+        app.followup_usage.record_completed("Run tests");
         let report = app.followup_status_report();
         assert!(report.contains("1 current"), "{report}");
         assert!(report.contains("1 saved"), "{report}");

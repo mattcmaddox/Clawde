@@ -42,9 +42,11 @@ LOCKED by user on 2026-08-28:
 - Followup-usage feedback stays auto-injected into the system prompt on every submit.
 - Lifecycle aggregates persist (project-scoped JSON) so the learning signal survives restarts.
 
-- [ ] Define the lifecycle schema (selected, submitted, completed, failed, cancelled) and persist the counts.
-- [ ] Keep feedback deterministic, bounded, versioned, and safe for system-prompt insertion.
-- [ ] Do not imply that missing lifecycle data means zero when it means unavailable.
+- [x] Lifecycle schema V2: `FollowupLifecycle { selected, submitted, completed }` persisted per text in `followup_usage.json` (version field added — closes the P3 deferral). Legacy V1 files (selection-only counts) migrate on load.
+- [x] Failed/cancelled turns are the complement (`submitted − completed`), not separate counters — the completion guard already excludes error/cancel/abort/interrupt stops.
+- [x] Deterministic, bounded, versioned, prompt-safe: top-5 by selected desc, JSON-escaped + newline-free, 64-entry cap evicting least-used, saturating counters.
+- [x] Missing ≠ zero: counts persist across restarts, so the summary never shows a misleading zero after relaunch; empty stores inject nothing.
+- [x] Summary, markdown mirror, and `/followups status` all read the same sorted lifecycle store (single source of truth).
 
 ## Priority 5: verification and cleanup
 
