@@ -146,6 +146,15 @@ impl SlashCommand for ModeCommand {
             }
         }
 
+        // Snapshot the pre-switch config so the main loop can restore every
+        // knob the mode touched after this one turn. A later persistent
+        // switch clears the pending revert.
+        ctx.transient_prev_config = if transient {
+            Some(ctx.config.clone())
+        } else {
+            None
+        };
+
         // Return ConfigChangeMessage so the CLI propagates the mode to
         // base_query_config.mode, tool_ctx, and app.config immediately.
         CommandResult::ConfigChangeMessage(new_config, msg)
@@ -191,6 +200,7 @@ mod tests {
             effort: None,
             tool_use_tracker: None,
             autonomy: None,
+            transient_prev_config: None,
         }
     }
 
@@ -282,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_mode_flag() {
+    async fn transient_turn_snapshots_prev_config() {
         let mut c = ctx();
         let result = ModeCommand.execute("careful --turn", &mut c).await;
         match result {
@@ -292,6 +302,19 @@ mod tests {
             }
             other => panic!("expected ConfigChangeMessage, got {:?}", other),
         }
+        // The pre-switch config is snapshotted for the main loop's revert.
+        let prev = c.transient_prev_config.expect("revert snapshot captured");
+        assert_ne!(prev.mode.as_deref(), Some("careful"));
+    }
+
+    #[tokio::test]
+    async fn persistent_switch_clears_pending_revert() {
+        let mut c = ctx();
+        let _ = ModeCommand.execute("careful --turn", &mut c).await;
+        assert!(c.transient_prev_config.is_some());
+        // A later persistent switch cancels the pending one-turn revert.
+        let _ = ModeCommand.execute("fast", &mut c).await;
+        assert!(c.transient_prev_config.is_none());
     }
 
     #[test]

@@ -737,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
                     test_provider: None,
                     tool_use_tracker: None,
                     autonomy: None,
+                    transient_prev_config: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -3669,6 +3670,7 @@ async fn run_interactive(
         // Shared with `tool_ctx` so `/autopilot` sees the same session state
         // the tool executor defers into.
         autonomy: tool_ctx.autonomy.clone(),
+        transient_prev_config: None,
     };
 
     // Keep the complete runtime registry (built-ins + Agent + MCP wrappers) so
@@ -5386,6 +5388,19 @@ async fn run_interactive(
                         messages = app.messages.clone();
                         session.messages = messages.clone();
                         session.updated_at = chrono::Utc::now();
+                    }
+                    // Transient mode revert: /mode X --turn snapshotted the
+                    // pre-switch config; restore every knob it touched across
+                    // all contexts and re-sync the permission manager.
+                    if let Some(prev_config) = cmd_ctx.transient_prev_config.take() {
+                        cmd_ctx.config = prev_config.clone();
+                        tool_ctx.config = prev_config.clone();
+                        app.config = prev_config.clone();
+                        if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                            if let Ok(mut manager) = manager.lock() {
+                                manager.mode = tool_ctx.config.permission_mode.clone();
+                            }
+                        }
                     }
                 }
                 Event::Paste(data) => {

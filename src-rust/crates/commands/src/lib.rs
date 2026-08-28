@@ -127,6 +127,10 @@ pub struct CommandContext {
     /// the TUI `App`. `None` in headless sessions — `/autopilot` then fails
     /// closed with a clear error.
     pub autonomy: Option<std::sync::Arc<parking_lot::Mutex<clawde_core::autonomy::AutonomyState>>>,
+    /// Set by `/mode X --turn`: the full config snapshot taken right before
+    /// the transient switch, so the main loop can restore every knob the mode
+    /// touched (model, effort, permission mode, tools, …) after the turn.
+    pub transient_prev_config: Option<Config>,
 }
 
 /// Session-scoped action requested by `/thinking`.
@@ -2910,6 +2914,7 @@ mod tests {
             effort: None,
             tool_use_tracker: None,
             autonomy: None,
+            transient_prev_config: None,
         }
     }
 

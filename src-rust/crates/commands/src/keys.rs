@@ -1798,6 +1798,7 @@ pub(crate) mod tests {
             effort: None,
             tool_use_tracker: None,
             autonomy: None,
+            transient_prev_config: None,
         }
     }
 

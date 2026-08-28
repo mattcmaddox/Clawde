@@ -454,6 +454,7 @@ mod tests {
             effort: None,
             tool_use_tracker: None,
             autonomy: None,
+            transient_prev_config: None,
         };
         let state = Arc::new(parking_lot::Mutex::new(AutonomyState::new("s1")));
         ctx.autonomy = Some(state.clone());
@@ -665,6 +666,7 @@ mod tests {
             effort: None,
             tool_use_tracker: None,
             autonomy: None,
+            transient_prev_config: None,
         };
         let cmd = AutopilotCommand;
         let CommandResult::Error(err) = run(&cmd, "", &mut ctx) else {

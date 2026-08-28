@@ -36,6 +36,7 @@ fn default_command_context() -> CommandContext {
         effort: None,
         tool_use_tracker: None,
         autonomy: None,
+        transient_prev_config: None,
     }
 }
 
