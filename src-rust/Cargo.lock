@@ -749,7 +749,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clawde-acp"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-api"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-bridge"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-buddy"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "chrono",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-cli"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-commands"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "arboard",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-core"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "base64",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-gateway"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-mcp"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-plugins"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1053,7 +1053,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-query"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tools"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "clawde-tui"
-version = "0.2.88"
+version = "0.2.89"
 dependencies = [
  "anyhow",
  "base64",

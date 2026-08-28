@@ -11,8 +11,6 @@
 //!   the whole state inert (`is_active` is false).
 //! - Items are never executed here — replay (Phase 4D) is a separate, later
 //!   authorization decision.
-//! - Items are never executed here — replay (Phase 4D) is a separate, later
-//!   authorization decision.
 //! - Raw secrets are not captured; the queue stores the typed request so a
 //!   review surface can display a redacted summary.
 //! - Optional disk persistence (Phase 4E) is a restart-recovery snapshot only:
