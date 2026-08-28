@@ -14,25 +14,35 @@ Audit and harden the followup suggestion feature without sweeping unrelated work
 - [x] Make completion attribution depend on reliable successful assistant-output state rather than a buffer that may already have been flushed.
 - [x] Ensure error, cancellation, interruption, abort, and empty-output paths clear pending attribution and never increment completion counts.
 
-## Priority 2: command and lifecycle consistency
+## Priority 2: command and lifecycle consistency (blocked on P3 paths)
 
-- [ ] Make `/followups status` report useful bounded state: current/history counts, usage count, and lifecycle counts.
-- [ ] Make keyboard and slash-command clear operations have identical semantics.
+- [ ] Make `/followups status` report useful bounded state: current/history counts, usage count, and lifecycle counts (plus storage location).
+- [ ] Make keyboard and slash-command clear operations have identical semantics — known gap: keybinding `clearFollowupUsage` clears only in-memory counts, `/followups clear-usage` also deletes the persisted file.
 - [ ] Ensure clear operations clear all relevant lifecycle state and durable state.
 - [ ] Add explicit tests for current/history keyboard and mouse selection.
 
-## Priority 3: persistence and privacy
+## Priority 3: persistence and privacy (DECIDED: project-scoped, .clawde/ in project root)
 
-- [ ] Decide and document whether durable history is global, project-scoped, or session-scoped.
-- [ ] Prefer project/session isolation for raw model-generated followup text.
-- [ ] Add bounded retention, opt-out, and clear/reset behavior.
-- [ ] Handle corrupt files, stale temporary files, concurrent processes, and schema evolution safely.
-- [ ] Avoid synchronous filesystem writes on latency-sensitive input paths where practical.
+LOCKED by user on 2026-08-28:
+- Durable history is project-scoped (not global ~/.clawde).
+- Data lives in `.clawde/` inside the project root (git root via `git_utils::project_root`, cwd fallback).
+- Machine-readable JSON is the source of truth; a generated `.clawde/followups.md` is a human-readable mirror (never re-parsed for feedback).
+- Lifecycle aggregates (selected/submitted/completed) persist with the same project scope.
 
-## Priority 4: feedback quality
+- [x] Migrate `followup_history.json` / `followup_usage.json` from `~/.clawde` to the project dir; read fallback when the old global file exists (`load_preferring`), legacy file removed on first project save (`save_migrating`).
+- [x] Write `.clawde/followups.md` mirror on change (history save, usage record, clear) — generated only, never parsed back.
+- [x] Add bounded retention and clear/reset behavior (caps apply: 20 history items, 64 usage entries).
+- [x] Handle corrupt files, stale temporary files, concurrent processes safely (tmp+rename atomic; corrupt JSON degrades to empty, never crashes; stale `.tmp` files are never read).
+- [ ] Schema version field — deferred to P4, when the lifecycle schema actually extends the file shape.
+- [x] Avoid synchronous filesystem writes on latency-sensitive paths (saves are user-initiated: selection, turn end, clear).
 
-- [ ] Define the lifecycle schema for selected, submitted, completed, failed, and cancelled.
-- [ ] Decide whether lifecycle aggregates persist independently of displayed history.
+## Priority 4: feedback quality (DECIDED: aggregates persist per-project, injection stays automatic)
+
+LOCKED by user on 2026-08-28:
+- Followup-usage feedback stays auto-injected into the system prompt on every submit.
+- Lifecycle aggregates persist (project-scoped JSON) so the learning signal survives restarts.
+
+- [ ] Define the lifecycle schema (selected, submitted, completed, failed, cancelled) and persist the counts.
 - [ ] Keep feedback deterministic, bounded, versioned, and safe for system-prompt insertion.
 - [ ] Do not imply that missing lifecycle data means zero when it means unavailable.
 

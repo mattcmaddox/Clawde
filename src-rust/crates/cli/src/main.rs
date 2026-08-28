@@ -4174,39 +4174,7 @@ async fn run_interactive(
                             match cli_result {
                                 Some(CommandResult::Exit) => break 'main,
                                 Some(CommandResult::ClearFollowups { history, usage }) => {
-                                    if history {
-                                        app.followup_history.clear();
-                                        app.persisted_followups.clear();
-                                        app.current_followups.clear();
-                                        app.followup_selected = None;
-                                        app.followup_history_mode = false;
-                                        if let Err(error) =
-                                            app.followup_history.save(&Settings::config_dir())
-                                        {
-                                            tracing::debug!(%error, "failed to clear followup history");
-                                        }
-                                        // Drop cached transcript lines that still
-                                        // show the cleared followup rows.
-                                        app.invalidate_transcript();
-                                    }
-                                    if usage {
-                                        app.followup_usage_counts.clear();
-                                        let usage = clawde_core::FollowupUsage::default();
-                                        if let Err(error) = usage.save(&Settings::config_dir()) {
-                                            tracing::debug!(%error, "failed to clear followup usage");
-                                        }
-                                    }
-                                    let mut cleared = Vec::new();
-                                    if history {
-                                        cleared.push("history");
-                                    }
-                                    if usage {
-                                        cleared.push("usage");
-                                    }
-                                    app.status_message = Some(format!(
-                                        "Cleared followup {}.",
-                                        cleared.join(" and ")
-                                    ));
+                                    app.clear_followups(history, usage);
                                 }
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();

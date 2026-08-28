@@ -1897,6 +1897,9 @@ pub struct App {
     pub followup_history: clawde_core::FollowupHistory,
     /// When true, Up/Down navigates persisted followups instead of current.
     pub followup_history_mode: bool,
+    /// Directory holding project-scoped followup data: `.clawde/` in the
+    /// project root, or the global config dir when no project is known.
+    followup_dir: std::path::PathBuf,
     /// How many times each followup text was selected by the user.
     /// Keys are normalized followup text, values are use counts. Bounded to
     /// avoid untrusted model output growing process memory indefinitely.
@@ -2116,6 +2119,16 @@ impl App {
             reg.apply_model_overrides(&config.model_overrides);
             reg
         };
+        // Project-scoped followup data lives in `<project_root>/.clawde/`. The
+        // root is normalized through `git_utils::project_root` (the canonical
+        // per-project key used by transcripts, memory dirs, and stats) so the
+        // location is stable regardless of how `config.project_dir` was set.
+        let followup_root = config
+            .project_dir
+            .as_ref()
+            .map(|dir| clawde_core::git_utils::project_root(dir));
+        let followup_dir =
+            clawde_core::followup_history::followup_data_dir(followup_root.as_deref());
         Self {
             config,
             cost_tracker,
@@ -2382,10 +2395,17 @@ impl App {
             current_followups: Vec::new(),
             followup_row_map: RefCell::new(std::collections::HashMap::new()),
             persisted_followups: std::collections::VecDeque::new(),
-            followup_history: clawde_core::FollowupHistory::load(&Settings::config_dir()),
+            followup_dir: followup_dir.clone(),
+            followup_history: clawde_core::FollowupHistory::load_preferring(
+                &followup_dir,
+                &Settings::config_dir(),
+            ),
             followup_history_mode: false,
             followup_usage_counts: std::collections::HashMap::new(),
-            followup_usage: clawde_core::FollowupUsage::load(&Settings::config_dir()),
+            followup_usage: clawde_core::FollowupUsage::load_preferring(
+                &followup_dir,
+                &Settings::config_dir(),
+            ),
             followup_submitted_counts: std::collections::HashMap::new(),
             followup_completed_counts: std::collections::HashMap::new(),
             pending_followup_text: None,
@@ -2605,9 +2625,13 @@ impl App {
         let count = self.followup_usage_counts.entry(text.clone()).or_insert(0);
         *count = count.saturating_add(1);
         self.followup_usage.record(&text);
-        if let Err(error) = self.followup_usage.save(&Settings::config_dir()) {
+        if let Err(error) = self
+            .followup_usage
+            .save_migrating(&self.followup_dir, &Settings::config_dir())
+        {
             debug!(%error, "failed to persist followup usage");
         }
+        self.write_followup_markdown();
     }
 
     /// Return a summary of followup usage for the system prompt.
@@ -2658,6 +2682,106 @@ impl App {
         summary
     }
 
+    /// Write the human-readable `.clawde/followups.md` mirror of the current
+    /// followup state (saved suggestions + usage). Generated, never parsed
+    /// back — the JSON files in the same directory are the source of truth.
+    fn write_followup_markdown(&self) {
+        if let Err(error) = std::fs::create_dir_all(&self.followup_dir) {
+            debug!(%error, "failed to create followup data dir");
+            return;
+        }
+        let mut out = String::new();
+        out.push_str("# Clawde followup suggestions\n\n");
+        out.push_str(&format!(
+            "_Generated {}. Read-only summary; the JSON files in this directory are authoritative._\n\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+        out.push_str("## Saved suggestions\n");
+        if self.followup_history.items().is_empty() {
+            out.push_str("_none_\n");
+        }
+        for followup in self.followup_history.items() {
+            let rank = followup.rank.label();
+            let reason = if followup.reason.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", followup.reason.trim())
+            };
+            out.push_str(&format!(
+                "- **{rank}** {}{}\n",
+                followup.text.trim(),
+                reason
+            ));
+        }
+        out.push_str("\n## Usage\n");
+        let mut rows: Vec<_> = self.followup_usage_counts.iter().collect();
+        rows.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
+        if rows.is_empty() {
+            out.push_str("_none_\n");
+        }
+        for (text, selected) in rows.into_iter().take(20) {
+            let submitted = self
+                .followup_submitted_counts
+                .get(text)
+                .copied()
+                .unwrap_or(0);
+            let completed = self
+                .followup_completed_counts
+                .get(text)
+                .copied()
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "- \"{}\": selected {selected}, submitted {submitted}, completed {completed}\n",
+                text.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        }
+        if let Err(error) = std::fs::write(self.followup_dir.join("followups.md"), out) {
+            debug!(%error, "failed to write followup markdown");
+        }
+    }
+
+    /// Clear followup history, usage, or both. Shared by `/followups` and the
+    /// keyboard shortcuts so every path clears identical state (in-memory
+    /// lists, lifecycle counts, persisted files, and the markdown mirror).
+    pub fn clear_followups(&mut self, history: bool, usage: bool) {
+        if history {
+            self.followup_history.clear();
+            self.persisted_followups.clear();
+            self.current_followups.clear();
+            self.followup_selected = None;
+            self.followup_history_mode = false;
+            if let Err(error) = self
+                .followup_history
+                .save_migrating(&self.followup_dir, &Settings::config_dir())
+            {
+                debug!(%error, "failed to clear followup history");
+            }
+        }
+        if usage {
+            self.followup_usage_counts.clear();
+            self.followup_submitted_counts.clear();
+            self.followup_completed_counts.clear();
+            self.followup_usage = clawde_core::FollowupUsage::default();
+            if let Err(error) = self
+                .followup_usage
+                .save_migrating(&self.followup_dir, &Settings::config_dir())
+            {
+                debug!(%error, "failed to clear followup usage");
+            }
+        }
+        // Drop any cached transcript lines that still show the cleared rows.
+        self.invalidate_transcript();
+        self.write_followup_markdown();
+        let mut cleared = Vec::new();
+        if history {
+            cleared.push("history");
+        }
+        if usage {
+            cleared.push("usage");
+        }
+        self.status_message = Some(format!("Cleared followup {}.", cleared.join(" and ")));
+    }
+
     fn flush_streamed_assistant_message(&mut self) {
         if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
             self.streaming_text.clear();
@@ -2683,9 +2807,13 @@ impl App {
                 self.followup_history.insert(f);
                 self.persisted_followups = self.followup_history.items().clone();
             }
-            if let Err(error) = self.followup_history.save(&Settings::config_dir()) {
+            if let Err(error) = self
+                .followup_history
+                .save_migrating(&self.followup_dir, &Settings::config_dir())
+            {
                 debug!(%error, "failed to persist followup history");
             }
+            self.write_followup_markdown();
         } else {
             // No followups in this response — clear current selection.
             self.current_followups.clear();
@@ -9566,24 +9694,11 @@ impl App {
                 false
             }
             "clearFollowupHistory" => {
-                self.followup_history.clear();
-                self.persisted_followups.clear();
-                self.current_followups.clear();
-                self.followup_selected = None;
-                self.followup_history_mode = false;
-                if let Err(error) = self.followup_history.save(&Settings::config_dir()) {
-                    debug!(%error, "failed to clear persisted followup history");
-                }
-                // Drop any cached transcript lines that still show the old
-                // followup rows and the stale row map built from them.
-                self.invalidate_transcript();
-                self.status_message = Some("Saved followup history cleared.".to_string());
+                self.clear_followups(true, false);
                 false
             }
             "clearFollowupUsage" => {
-                self.followup_usage_counts.clear();
-                self.status_message =
-                    Some("Followup usage data cleared for this session.".to_string());
+                self.clear_followups(false, true);
                 false
             }
             "toggleFollowupHistory" => {
@@ -12054,6 +12169,81 @@ mod tests {
             "toggling history mode must invalidate cached transcript lines"
         );
         assert!(app.followup_row_map.borrow().is_empty());
+    }
+
+    #[test]
+    fn followup_data_is_project_scoped_with_markdown_mirror() {
+        let _home = TestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let config = Config {
+            project_dir: Some(project.path().to_path_buf()),
+            ..Config::default()
+        };
+        let mut app = App::new(config, clawde_core::cost::CostTracker::new());
+        // Data dir is `.clawde/` under the project root.
+        assert_eq!(app.followup_dir, project.path().join(".clawde"));
+        // Seed state and write the mirror.
+        app.followup_history.insert(&RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: "verify".into(),
+        });
+        app.followup_usage_counts.insert("Run tests".into(), 3);
+        app.followup_submitted_counts.insert("Run tests".into(), 2);
+        app.followup_completed_counts.insert("Run tests".into(), 1);
+        app.write_followup_markdown();
+        let md = std::fs::read_to_string(project.path().join(".clawde/followups.md"))
+            .expect("markdown mirror written");
+        assert!(md.contains("Run tests"));
+        assert!(md.contains("selected 3"));
+        assert!(md.contains("submitted 2"));
+        assert!(md.contains("completed 1"));
+        // History persists to the project dir, not the global config dir.
+        app.followup_history
+            .save_migrating(&app.followup_dir, &Settings::config_dir())
+            .expect("history saves to project dir");
+        assert!(project
+            .path()
+            .join(".clawde/followup_history.json")
+            .exists());
+        assert!(!Settings::config_dir()
+            .join("followup_history.json")
+            .exists());
+    }
+
+    #[test]
+    fn clear_followups_clears_lifecycle_and_persisted_state() {
+        let _home = TestHome::acquire();
+        let project = tempfile::tempdir().unwrap();
+        let config = Config {
+            project_dir: Some(project.path().to_path_buf()),
+            ..Config::default()
+        };
+        let mut app = App::new(config, clawde_core::cost::CostTracker::new());
+        app.followup_history.insert(&RankedFollowup {
+            text: "Old".into(),
+            rank: clawde_core::FollowupRank::Optional,
+            reason: String::new(),
+        });
+        app.persisted_followups = app.followup_history.items().clone();
+        app.followup_usage_counts.insert("Old".into(), 1);
+        app.followup_submitted_counts.insert("Old".into(), 1);
+        app.followup_completed_counts.insert("Old".into(), 1);
+        app.clear_followups(true, true);
+        assert!(app.followup_history.items().is_empty());
+        assert!(app.persisted_followups.is_empty());
+        assert!(app.followup_usage_counts.is_empty());
+        assert!(app.followup_submitted_counts.is_empty());
+        assert!(app.followup_completed_counts.is_empty());
+        assert!(app.status_message.as_deref().unwrap().contains("history"));
+        // The persisted usage file is rewritten empty and the mirror reflects it.
+        let data_dir = project.path().join(".clawde");
+        assert!(data_dir.join("followup_usage.json").exists());
+        assert!(clawde_core::FollowupUsage::load(&data_dir)
+            .summary()
+            .is_empty());
+        let md = std::fs::read_to_string(data_dir.join("followups.md")).unwrap();
+        assert!(md.contains("_none_"));
     }
 
     #[test]

@@ -28,6 +28,27 @@ impl FollowupHistory {
         history
     }
 
+    /// Load preferring the project-scoped `primary_dir`, falling back to the
+    /// legacy global `fallback_dir` when no project file exists yet (one-way
+    /// migration; the legacy file is removed on the next successful save).
+    pub fn load_preferring(primary_dir: &Path, fallback_dir: &Path) -> Self {
+        if primary_dir.join(FILE_NAME).exists() {
+            Self::load(primary_dir)
+        } else {
+            Self::load(fallback_dir)
+        }
+    }
+
+    /// Save to `primary_dir` and, on success, remove the legacy global file.
+    pub fn save_migrating(&self, primary_dir: &Path, legacy_dir: &Path) -> anyhow::Result<()> {
+        self.save(primary_dir)?;
+        let legacy = legacy_dir.join(FILE_NAME);
+        if legacy.exists() {
+            let _ = std::fs::remove_file(legacy);
+        }
+        Ok(())
+    }
+
     pub fn items(&self) -> &VecDeque<RankedFollowup> {
         &self.items
     }
@@ -109,6 +130,17 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension("json.tmp")
 }
 
+/// Directory holding project-scoped followup data: `<project_root>/.clawde/`,
+/// falling back to the global config dir when no project root is known. This
+/// mirrors the per-project `.clawde/` convention already used for custom modes
+/// and memory dirs, so followup data never leaks across projects.
+pub fn followup_data_dir(project_root: Option<&Path>) -> PathBuf {
+    match project_root {
+        Some(root) => root.join(".clawde"),
+        None => crate::config::Settings::config_dir(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +183,55 @@ mod tests {
         history.insert(&item("run tests", FollowupRank::Undesired, "later"));
         assert_eq!(history.items()[0].rank, FollowupRank::HighlyRecommended);
         assert_eq!(history.items()[0].reason, "later");
+    }
+
+    #[test]
+    fn load_preferring_falls_back_to_legacy_and_migrates_one_way() {
+        let primary = tempdir().unwrap();
+        let legacy = tempdir().unwrap();
+        // Legacy-only: load falls back to the global file.
+        let mut history = FollowupHistory::default();
+        history.insert(&item("legacy item", FollowupRank::Optional, ""));
+        history.save(legacy.path()).unwrap();
+        let loaded = FollowupHistory::load_preferring(primary.path(), legacy.path());
+        assert_eq!(loaded.items().len(), 1);
+        assert_eq!(loaded.items()[0].text, "legacy item");
+        // Saving migrates to the project dir and removes the legacy file.
+        loaded
+            .save_migrating(primary.path(), legacy.path())
+            .unwrap();
+        assert!(primary.path().join(FILE_NAME).exists());
+        assert!(!legacy.path().join(FILE_NAME).exists());
+        // The project file now wins on subsequent loads.
+        let again = FollowupHistory::load_preferring(primary.path(), legacy.path());
+        assert_eq!(again.items().len(), 1);
+    }
+
+    #[test]
+    fn load_preferring_prefers_an_existing_project_file() {
+        let primary = tempdir().unwrap();
+        let legacy = tempdir().unwrap();
+        let mut history = FollowupHistory::default();
+        history.insert(&item("project item", FollowupRank::Optional, ""));
+        history.save(primary.path()).unwrap();
+        let mut legacy_history = FollowupHistory::default();
+        legacy_history.insert(&item("legacy item", FollowupRank::Optional, ""));
+        legacy_history.save(legacy.path()).unwrap();
+        let loaded = FollowupHistory::load_preferring(primary.path(), legacy.path());
+        assert_eq!(loaded.items().len(), 1);
+        assert_eq!(loaded.items()[0].text, "project item");
+    }
+
+    #[test]
+    fn followup_data_dir_resolves_per_project_and_global_fallback() {
+        let project = tempdir().unwrap();
+        assert_eq!(
+            followup_data_dir(Some(project.path())),
+            project.path().join(".clawde")
+        );
+        assert_eq!(
+            followup_data_dir(None),
+            crate::config::Settings::config_dir()
+        );
     }
 }

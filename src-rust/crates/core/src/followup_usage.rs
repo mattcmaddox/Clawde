@@ -26,6 +26,27 @@ impl FollowupUsage {
         usage
     }
 
+    /// Load preferring the project-scoped `primary_dir`, falling back to the
+    /// legacy global `fallback_dir` when no project file exists yet (one-way
+    /// migration; the legacy file is removed on the next successful save).
+    pub fn load_preferring(primary_dir: &Path, fallback_dir: &Path) -> Self {
+        if primary_dir.join(FILE_NAME).exists() {
+            Self::load(primary_dir)
+        } else {
+            Self::load(fallback_dir)
+        }
+    }
+
+    /// Save to `primary_dir` and, on success, remove the legacy global file.
+    pub fn save_migrating(&self, primary_dir: &Path, legacy_dir: &Path) -> anyhow::Result<()> {
+        self.save(primary_dir)?;
+        let legacy = legacy_dir.join(FILE_NAME);
+        if legacy.exists() {
+            let _ = std::fs::remove_file(legacy);
+        }
+        Ok(())
+    }
+
     pub fn record(&mut self, text: &str) {
         let text: String = text.trim().chars().take(MAX_TEXT_CHARS).collect();
         if text.is_empty() {
@@ -108,5 +129,21 @@ mod tests {
         assert_eq!(usage.len(), MAX_ENTRIES);
         assert!(!usage.summary().contains('\n'));
         assert!(usage.summary().contains("\\\"quoted\\\""));
+    }
+
+    #[test]
+    fn load_preferring_migrates_legacy_usage_one_way() {
+        let primary = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let mut usage = FollowupUsage::default();
+        usage.record("legacy usage");
+        usage.save(legacy.path()).unwrap();
+        let loaded = FollowupUsage::load_preferring(primary.path(), legacy.path());
+        assert_eq!(loaded.len(), 1);
+        loaded
+            .save_migrating(primary.path(), legacy.path())
+            .unwrap();
+        assert!(primary.path().join(FILE_NAME).exists());
+        assert!(!legacy.path().join(FILE_NAME).exists());
     }
 }
