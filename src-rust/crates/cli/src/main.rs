@@ -15,6 +15,7 @@
 mod build;
 mod codex_oauth_flow;
 mod diagnostics;
+mod disk_hygiene;
 mod oauth_flow;
 mod upgrade;
 
@@ -3424,6 +3425,19 @@ async fn run_interactive(
     // from disk whenever the /model picker opens. Non-blocking.
     {
         spawn_models_cache_refresh_loop();
+    }
+
+    // Background: automatic disk hygiene for the cargo debug build tree. Only
+    // acts on a source checkout whose `target/debug` has grown past the
+    // `diskCleanThreshold` (default 40 GiB); runs `cargo clean --profile dev`
+    // in the background and preserves release/cross artifacts. A fast no-op
+    // otherwise. Disable via `diskCleanThreshold: 0` or
+    // `CLAWDE_DISABLE_DISK_CLEAN=1`.
+    {
+        let hygiene_threshold_gib = live_config
+            .disk_clean_threshold
+            .unwrap_or(disk_hygiene::DEFAULT_DISK_CLEAN_THRESHOLD_GIB);
+        disk_hygiene::spawn(hygiene_threshold_gib);
     }
 
     // Background: zero-token health poller — probes every configured free

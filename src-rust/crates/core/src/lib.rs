@@ -1695,6 +1695,14 @@ pub mod config {
         /// the user can review (Accept/Edit/Reject) it before implementation.
         #[serde(default, rename = "specMode")]
         pub spec_mode: bool,
+        /// Threshold (in GiB) at which the cargo debug build tree's accumulated
+        /// size triggers an automatic background `cargo clean --profile dev`.
+        /// `None` (or absent) uses the built-in default (~40 GiB); `Some(0)`
+        /// disables hygiene entirely; `Some(n)` sets a custom threshold. Only
+        /// applies to source checkouts (a `target/debug` exists next to this
+        /// binary); release and cross-compile artifacts are never touched.
+        #[serde(default, rename = "diskCleanThreshold", alias = "disk_clean_threshold")]
+        pub disk_clean_threshold: Option<u64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -3365,6 +3373,10 @@ pub mod config {
                 verify: over.config.verify,
                 semantic_verify: over.config.semantic_verify.or(base.config.semantic_verify),
                 spec_mode: over.config.spec_mode || base.config.spec_mode,
+                disk_clean_threshold: over
+                    .config
+                    .disk_clean_threshold
+                    .or(base.config.disk_clean_threshold),
                 memory: MemoryConfig {
                     max_tokens: over
                         .config
@@ -3662,6 +3674,37 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
             assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn merge_disk_clean_threshold_project_overrides_global() {
+            // Default global vs. an explicit project threshold: project wins.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.disk_clean_threshold = Some(120);
+            let merged = Settings::merge(base, over);
+            assert_eq!(merged.config.disk_clean_threshold, Some(120));
+        }
+
+        #[test]
+        fn merge_disk_clean_threshold_zero_disables() {
+            // An explicit project `Some(0)` must disable hygiene even when the
+            // global left the knob unset.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.disk_clean_threshold = Some(0);
+            let merged = Settings::merge(base, over);
+            assert_eq!(merged.config.disk_clean_threshold, Some(0));
+        }
+
+        #[test]
+        fn merge_disk_clean_threshold_inherits_global_when_project_unspecified() {
+            // Global tuned to 90, project left unset: global value wins.
+            let mut base = Settings::default();
+            base.config.disk_clean_threshold = Some(90);
+            let over = Settings::default();
+            let merged = Settings::merge(base, over);
+            assert_eq!(merged.config.disk_clean_threshold, Some(90));
         }
 
         #[test]
