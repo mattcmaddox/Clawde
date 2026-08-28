@@ -814,6 +814,16 @@ fn effective_mode_name_for_turn(config: &QueryConfig, messages: &[Message]) -> O
 /// declares those knobs; `None` for voice-only personas and the default
 /// style. Callers append this ONLY when the active mode produced no block of
 /// its own (mode > persona precedence).
+/// Whether a persona's cadence/ask guidance applies for this turn.
+///
+/// Modes always win over personas: when ANY mode preset is active (persisted
+/// or via an inline `mode:<name>` keyword in this turn's last user message),
+/// the persona's decision guidance is suppressed — even for a guidance-free
+/// mode like `fast`, whose rare/off posture is an explicit "no check-ins".
+fn persona_guidance_applies(config: &QueryConfig, messages: &[Message]) -> bool {
+    effective_mode_name_for_turn(config, messages).is_none()
+}
+
 fn resolve_persona_guidance_block(
     config: &QueryConfig,
     messages: &[Message],
@@ -2379,8 +2389,10 @@ pub async fn run_query_loop(
             // transiently (used for this turn, then reverts); otherwise the
             // persisted selection stands. The block is synthesized from the
             // mode's cadence/ask knobs — prompt-level guidance only, the loop
-            // and safety rails are untouched (spec §7.2/§7.3).
-            let mut mode_block_appended = false;
+            // and safety rails are untouched (spec §7.2/§7.3). `mode_active` is
+            // true whenever ANY mode preset is in effect (an active mode always
+            // asserts a cadence/ask posture — even a guidance-less one like
+            // `fast`, whose Rare/Off is an explicit "no check-ins").
             if let Some(mode_name) = effective_mode_name_for_turn(config, messages.as_slice()) {
                 // `resolve_mode_block` itself falls back to the built-ins, so
                 // an empty registry (tests / sub-agents) still resolves the
@@ -2390,7 +2402,6 @@ pub async fn run_query_loop(
                     &mode_name,
                 );
                 if let Some(block) = block {
-                    mode_block_appended = true;
                     patched.append_system_prompt =
                         Some(match patched.append_system_prompt.take() {
                             Some(existing) => format!("{existing}\n\n{block}"),
@@ -2399,13 +2410,13 @@ pub async fn run_query_loop(
                 }
             }
 
-            // Persona decision guidance for THIS turn. When the active mode
-            // produced no guidance block, a persona that declares cadence/ask
-            // knobs fills the gap with the same block text modes produce
-            // (mode > persona precedence — the mode block, when present, wins
-            // entirely). The effective style may be an inline `cathead` /
-            // `caveman` keyword (this turn only) or the persisted selection.
-            if !mode_block_appended {
+            // Persona decision guidance for THIS turn. Only when NO mode preset
+            // is active does a persona's cadence/ask knobs apply — an active
+            // mode always wins over a persona, including when that mode asserts
+            // a deliberately guidance-free posture (rare/off). The effective
+            // style may be an inline `cathead` / `caveman` keyword (this turn
+            // only) or the persisted selection.
+            if persona_guidance_applies(config, messages.as_slice()) {
                 if let Some(block) = resolve_persona_guidance_block(
                     config,
                     messages.as_slice(),
@@ -7088,6 +7099,47 @@ mod tests {
             Message::user("now just tidy the docs"),
         ];
         assert_eq!(effective_mode_name_for_turn(&cfg, &msgs), None);
+    }
+
+    #[test]
+    fn persona_guidance_applies_when_no_mode_active() {
+        let cfg = QueryConfig::default();
+        let msgs = vec![Message::user("review this design")];
+        assert!(persona_guidance_applies(&cfg, &msgs));
+    }
+
+    #[test]
+    fn persona_guidance_suppressed_when_mode_active() {
+        // A persisted mode — even a guidance-free one like fast — must
+        // suppress the persona's cadence/ask block (mode > persona).
+        let cfg = QueryConfig {
+            mode: Some("fast".to_string()),
+            ..QueryConfig::default()
+        };
+        let msgs = vec![Message::user("review this design")];
+        assert!(!persona_guidance_applies(&cfg, &msgs));
+    }
+
+    #[test]
+    fn persona_guidance_suppressed_when_inline_mode() {
+        // An inline `mode:` keyword on this turn suppresses it too, even with
+        // no persisted mode.
+        let cfg = QueryConfig::default();
+        let msgs = vec![Message::user("mode:fast, just do a quick pass")];
+        assert!(!persona_guidance_applies(&cfg, &msgs));
+    }
+
+    #[test]
+    fn persona_guidance_reapplies_after_inline_mode_turn() {
+        // Inline modes are transient — a later plain turn has no mode, so the
+        // persona's guidance applies again.
+        let cfg = QueryConfig::default();
+        let msgs = vec![
+            Message::user("mode:fast, quick pass"),
+            Message::assistant("done"),
+            Message::user("now full review"),
+        ];
+        assert!(persona_guidance_applies(&cfg, &msgs));
     }
 
     #[test]

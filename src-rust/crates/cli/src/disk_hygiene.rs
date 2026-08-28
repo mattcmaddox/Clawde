@@ -51,12 +51,40 @@ fn workspace_root() -> Option<PathBuf> {
     Some(workspace)
 }
 
-/// Cheap, early-bail scan of a directory tree's total size in bytes.
+/// Compute a path's on-disk block allocation in bytes using `st_blocks`.
+///
+/// Returns `0` when the filesystem reports no block info (or for symlinks,
+/// whose own small allocation is negligible next to a multi-GiB tree).
+#[cfg(unix)]
+fn allocated_bytes(md: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    // `st_blocks` is in 512-byte units; that is the value `du -sk` totals,
+    // so this matches what the OS actually charges the disk (block-allocated,
+    // not the logical file size).
+    md.blocks().saturating_mul(512)
+}
+
+/// Non-unix fallback: we can't read allocation, so fall back to logical size
+/// (an underestimate, but syscalls here still bound the walk correctly).
+#[cfg(not(unix))]
+fn allocated_bytes(md: &std::fs::Metadata) -> u64 {
+    md.len()
+}
+
+/// Cheap, early-bail scan of a directory tree's on-disk size in bytes.
 ///
 /// Uses an explicit stack rather than recursion so arbitrarily deep trees
 /// cannot overflow the call stack. Stops accumulating (and returns `true`)
 /// as soon as the running total exceeds `limit` — it never needs to enumerate
 /// the remainder of an oversized tree to know it is oversized.
+///
+/// Sizes use filesystem *block allocation* (`st_blocks`), not logical `len`:
+/// cargo's `incremental`/`.fingerprint` dirs hold hundreds of thousands of
+/// tiny files that each occupy a 4 KiB block despite tiny logical sizes, so a
+/// logical scan would under-report real disk pressure by an order of magnitude
+/// — meaning hygiene would only trigger after the disk was already nearly
+/// full. Directories themselves allocate negligible blocks and are skipped;
+/// symlinks are not followed (their own small allocation is ignored).
 fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
     let mut stack: Vec<PathBuf> = roots.to_vec();
     let mut total: u64 = 0;
@@ -72,8 +100,8 @@ fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
                     stack.push(entry.path());
                 }
             }
-        } else {
-            total = total.saturating_add(md.len());
+        } else if !md.is_symlink() {
+            total = total.saturating_add(allocated_bytes(&md));
             if total > limit {
                 return true;
             }
@@ -82,18 +110,16 @@ fn tree_exceeds(roots: &[PathBuf], limit: u64) -> bool {
     false
 }
 
-/// Decide whether the debug target tree is oversized relative to `threshold_gib`.
+/// Decide whether the debug target tree is oversized relative to `limit_bytes`.
 /// `None` when there is no source-checkout debug dir to manage.
-fn oversized_debug_target(workspace: &Path, threshold_gib: u64) -> Option<bool> {
-    if threshold_gib == 0 {
-        return None; // disabled
-    }
+///
+/// Byte-native (not GiB) so it stays directly testable with small limits.
+fn oversized_debug_target(workspace: &Path, limit_bytes: u64) -> Option<bool> {
     let debug = workspace.join("target").join("debug");
     if !debug.is_dir() {
         return None; // not a debug source checkout (already cleaned or release-only)
     }
-    let limit = threshold_gib.saturating_mul(1024 * 1024 * 1024);
-    Some(tree_exceeds(&[debug], limit))
+    Some(tree_exceeds(&[debug], limit_bytes))
 }
 
 /// Perform automatic debug-target hygiene if warranted. Idempotent, silent on
@@ -125,9 +151,26 @@ pub async fn run(threshold_gib: u64) {
         }
     };
 
-    let oversize = match oversized_debug_target(&workspace, threshold_gib) {
-        Some(o) => o,
-        None => return, // disabled or no debug dir
+    if threshold_gib == 0 {
+        tracing::debug!("disk clean threshold is 0 — hygiene disabled");
+        return;
+    }
+
+    // The size probe walks the whole (potentially multi-GiB) tree with
+    // blocking `std::fs` reads. Run it on the blocking threadpool so it cannot
+    // stall a runtime worker, then act on the result.
+    let probe = workspace.clone();
+    let limit_bytes = threshold_gib.saturating_mul(1024 * 1024 * 1024);
+    let oversize = match tokio::task::spawn_blocking(move || {
+        oversized_debug_target(&probe, limit_bytes)
+    })
+    .await
+    {
+        Ok(r) => match r {
+            Some(o) => o,
+            None => return, // no debug dir
+        },
+        Err(_) => return, // probe panicked — never fail the process
     };
 
     if !oversize {
@@ -179,8 +222,6 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const GIB: u64 = 1024 * 1024 * 1024;
-
     fn tmp_workspace() -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -199,37 +240,39 @@ mod tests {
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        let fd = fs::File::create(p).unwrap();
-        fd.set_len(bytes).unwrap();
+        let mut fd = fs::File::create(p).unwrap();
+        // Write real (non-sparse) bytes in chunks so the blocks are actually
+        // allocated — `set_len` would create a sparse file that occupies
+        // almost no disk, defeating the block-allocation probe it exercises.
+        const CHUNK: usize = 64 * 1024;
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let n = remaining.min(CHUNK as u64) as usize;
+            use std::io::Write;
+            fd.write_all(&vec![0x5au8; n]).unwrap();
+            remaining -= n as u64;
+        }
+        fd.sync_all().unwrap();
     }
+
+    const MIB: u64 = 1024 * 1024;
 
     #[test]
     fn empty_or_small_tree_is_not_oversized() {
         let ws = tmp_workspace();
         add_file(&ws, "deps/foo", 1024);
-        let result = oversized_debug_target(&ws, 40).unwrap();
-        assert!(!result, "1 KiB under a 40 GiB threshold must not trigger");
+        let result = oversized_debug_target(&ws, 100 * MIB).unwrap();
+        assert!(!result, "1 KiB under a 100 MiB threshold must not trigger");
         fs::remove_dir_all(&ws).unwrap();
     }
 
     #[test]
     fn tree_over_threshold_triggers() {
         let ws = tmp_workspace();
-        // 2 GiB of fake deps vs a 1 GiB threshold → over.
-        add_file(&ws, "deps/big", 2 * GIB);
-        let result = oversized_debug_target(&ws, 1).unwrap();
-        assert!(result, "2 GiB over a 1 GiB threshold must trigger");
-        fs::remove_dir_all(&ws).unwrap();
-    }
-
-    #[test]
-    fn zero_threshold_disables() {
-        let ws = tmp_workspace();
-        add_file(&ws, "deps/big", 2 * GIB);
-        assert!(
-            oversized_debug_target(&ws, 0).is_none(),
-            "0 threshold = disable"
-        );
+        // 2 MiB of fake deps vs a 1 MiB threshold → over.
+        add_file(&ws, "deps/big", 2 * MIB);
+        let result = oversized_debug_target(&ws, MIB).unwrap();
+        assert!(result, "2 MiB over a 1 MiB threshold must trigger");
         fs::remove_dir_all(&ws).unwrap();
     }
 
@@ -237,18 +280,44 @@ mod tests {
     fn missing_debug_dir_is_noop() {
         let ws = tmp_workspace();
         fs::remove_dir_all(ws.join("target").join("debug")).unwrap();
-        assert!(oversized_debug_target(&ws, 40).is_none());
+        assert!(oversized_debug_target(&ws, 100 * MIB).is_none());
         fs::remove_dir_all(&ws).unwrap();
     }
 
     #[test]
     fn nested_tree_is_measured_recursively() {
         let ws = tmp_workspace();
-        add_file(&ws, "a/b/c/deep", GIB + 1); // strictly over the 1 GiB threshold
+        add_file(&ws, "a/b/c/deep", MIB + 1); // strictly over the 1 MiB threshold
         assert!(
-            oversized_debug_target(&ws, 1).unwrap(),
+            oversized_debug_target(&ws, MIB).unwrap(),
             "nested tree counts too"
         );
+        fs::remove_dir_all(&ws).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn many_small_files_measured_by_block_allocation() {
+        // Regression: the probe must charge per-file block allocation, not
+        // logical size. Cargo's incremental dirs hold hundreds of thousands of
+        // tiny files — if we summed logical `len`, 40 × 1-byte files would
+        // measure 40 bytes and under-report real disk pressure by an order of
+        // magnitude. The probe must instead measure the same `du -sk` total.
+        let ws = tmp_workspace();
+        for i in 0..40 {
+            add_file(&ws, &format!("incremental/unit-{i}"), 1); // 1 logical byte each
+        }
+
+        // 40 files × ≤4 KiB alloc ≈ ≥160 KiB. A threshold slightly below the
+        // block total MUST trip even though logical bytes are only 40 —
+        // proving allocation, not logical size, is what's measured.
+        let tight = 1024 * 21; // ~21 KiB mouth allocations
+        assert!(oversized_debug_target(&ws, tight).unwrap());
+
+        // A generous threshold well above the block total does not trip.
+        let loose = 8 * MIB;
+        assert!(!oversized_debug_target(&ws, loose).unwrap());
+
         fs::remove_dir_all(&ws).unwrap();
     }
 }
