@@ -6035,6 +6035,44 @@ mod status_row_badge_tests {
             out
         );
     }
+
+    #[test]
+    fn followup_row_map_only_tracks_visible_rows_under_scroll() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        // Long transcript: enough turns that the followup block sits below the
+        // 24-row viewport when scrolled to the top.
+        for i in 0..30 {
+            app.messages
+                .push(clawde_core::types::Message::assistant(format!(
+                    "filler message {i}"
+                )));
+        }
+        app.current_followups = vec![clawde_core::RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        // Scrolled to the top (scroll_offset counts lines above the bottom, so
+        // a large offset pins the viewport to the start): the followups are
+        // below the fold and must not be clickable (no row-map entries).
+        app.auto_scroll = false;
+        app.scroll_offset = 1000;
+        render_screen(&app);
+        assert!(
+            app.followup_row_map.borrow().is_empty(),
+            "followups below the fold must not be in the row map"
+        );
+        // Pinned to the bottom: the followups are visible and every row maps
+        // back to the same current-response item.
+        app.auto_scroll = true;
+        app.scroll_offset = 0;
+        render_screen(&app);
+        let map = app.followup_row_map.borrow();
+        assert!(!map.is_empty(), "visible followups must be in the row map");
+        assert!(map
+            .values()
+            .all(|t| t.source == FollowupSource::Current && t.index == 0));
+    }
 }
 
 #[cfg(test)]
