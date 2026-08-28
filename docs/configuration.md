@@ -147,7 +147,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
-| `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.clawde/output-styles/`. |
+| `output_style` | string \| null | null | Named output style (persona). Built-in values: `"default"`, `"concise"`, `"explanatory"`, `"learning"`, `"caveman"`, `"cathead"`. Custom styles can be added as Markdown or JSON files under `~/.clawde/output-styles/`; a JSON style may additionally declare decision knobs (`effort`, `plan`, `askOnAmbiguity`, `checkinCadence`). See [Output styles (personas)](advanced.md#output-styles-personas). |
 | `output_format` | string | `"text"` | Output format for headless (`--print`) mode. One of `"text"`, `"json"`, `"stream-json"`. |
 | `verbose` | boolean | false | Enable debug-level log output. |
 

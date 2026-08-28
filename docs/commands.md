@@ -567,13 +567,23 @@ Configure and manage Model Context Protocol (MCP) servers. MCP servers expose ad
 
 ### /output-style
 
-Select how the model's output is rendered in the terminal. Choices include `auto`, `plain`, `markdown`, `streaming`, and others depending on terminal capabilities.
+Select the active output style (persona) — the voice layer that controls how
+Clawde talks. Terminal rendering (markdown, code blocks, tool summaries) is
+separate and unaffected. Built-in styles: `default`, `concise`, `explanatory`,
+`learning`, `caveman`, `cathead`. Custom styles can be defined as `.md` or
+`.json` files in `~/.clawde/output-styles/` (global) or `.clawde/output-styles/`
+(project-local). See [Output styles (personas)](advanced.md#output-styles-personas)
+for the file format, including how a custom persona can optionally declare
+decision knobs (effort, plan posture, ask-on-ambiguity, check-in cadence).
 
 ```
 /output-style
-/output-style plain
-/output-style markdown
+/output-style concise
+/output-style cathead
 ```
+
+With no argument, lists available styles and shows the current one; in the TUI
+this opens an interactive picker. With a name, switches persistently.
 
 ---
 

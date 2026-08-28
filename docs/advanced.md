@@ -566,15 +566,76 @@ The `PermissionRequest` hook can intercept any tool call before the user prompt 
 
 ---
 
-## Output styles
+## Output styles (personas)
 
 ```
 /output-style [style]
 ```
 
-Controls how Clawde formats its responses. Available styles vary by configuration; the command opens an interactive picker when called without arguments.
+Output styles are **personas** — a voice layer that controls how Clawde talks,
+not how the terminal renders text. Selecting a style injects its `prompt` text
+into the system prompt so every response carries that persona's tone. Terminal
+rendering (markdown, code blocks, tool summaries) is controlled separately and
+is unaffected by output styles.
 
-Output styles affect markdown rendering, code block formatting, and verbosity of tool call summaries in the terminal UI.
+Built-in styles: `default`, `concise`, `explanatory`, `learning`, `caveman`,
+`cathead`. Personas (`caveman`/`cathead`) are also reachable via `/caveman`,
+`/cathead`, `/normal`, and by typing the single word inline in a prompt (that
+applies it for just that one turn). `/output-style` with no argument lists the
+available styles and shows the current one; with a name it switches
+persistently. The command opens an interactive picker when called from the TUI
+with no arguments.
+
+Custom styles live in `~/.clawde/output-styles/` (global) or
+`.clawde/output-styles/` (project-local). Each file is one style.
+
+### Markdown format
+
+```markdown
+# <Label>
+Short description.
+
+Voice prompt text injected into the system prompt when this style is active.
+```
+
+The filename (minus `.md`) becomes the style name.
+
+### JSON format (with optional decision knobs)
+
+```json
+{
+  "name": "architect",
+  "label": "Architect",
+  "description": "Design-first engineering with milestone check-ins.",
+  "prompt": "Think in terms of interfaces and tradeoffs...",
+  "effort": "high",
+  "plan": "alwaysPlan",
+  "askOnAmbiguity": "balanced",
+  "checkinCadence": "milestone"
+}
+```
+
+The `name`, `label`, `description`, and `prompt` fields work exactly like the
+Markdown format. The four decision-knob fields are **optional** and let a
+persona influence how the agent *works*, not just how it talks:
+
+| Field | Values | Effect |
+|-------|--------|--------|
+| `effort` | `none`, `minimal`, `low`, `medium` (alias `normal`), `high`, `xhigh`, `max`, `ultracode` | Default reasoning effort for sessions using this persona. |
+| `plan` | `default`, `specMode`, `alwaysPlan` | Posture: `specMode` enforces the spec-mode write gate; `alwaysPlan` puts the session in read-only plan mode. |
+| `askOnAmbiguity` | `off`, `balanced`, `askOnDesign` | How eagerly the agent pauses to ask one clarifying question on ambiguous requirements. |
+| `checkinCadence` | `rare`, `milestone`, `everyTurn` | How often the agent narrates a plan and checks in with you. |
+
+**Precedence: mode wins over persona.** When the active mode preset binds the
+same knob (for example `fast` sets `effort: low`, or `walkaway` sets its
+permission mode), the mode's value wins and the persona's knob is ignored for
+that knob. Persona knobs only fill in where the active mode left a knob unset.
+For safety, personas can never set a permission mode or an allowed-tool list —
+those boundaries belong to modes only. When no mode is active, persona knobs
+apply in full.
+
+Cadence/ask guidance from a persona renders in the same block format modes
+use, and only when the active mode produced no guidance of its own.
 
 ---
 
