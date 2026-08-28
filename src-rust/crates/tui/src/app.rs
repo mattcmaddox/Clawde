@@ -39,6 +39,7 @@ use clawde_core::keybindings::{
     UserKeybindings,
 };
 use clawde_core::types::{ContentBlock, Message, Role};
+use clawde_core::RankedFollowup;
 use clawde_core::{sample_completion_verb, sample_spinner_verb};
 use clawde_query::QueryEvent;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -1865,6 +1866,33 @@ pub struct App {
     /// Context menu state: position and selected index.
     pub context_menu_state: Option<ContextMenuState>,
 
+    // ---- Ranked followup interaction state -------------------------------
+    /// Index of the currently highlighted followup (for keyboard nav).
+    /// `None` when followup navigation is inactive.
+    pub followup_selected: Option<usize>,
+    /// The most recent followups from the last assistant response.
+    pub current_followups: Vec<RankedFollowup>,
+    /// Screen rows → followup index mapping (written by renderer, read on
+    /// mouse click to determine which followup was clicked).
+    pub followup_row_map: RefCell<std::collections::HashMap<u16, usize>>,
+    /// Persistent followup history for cross-turn recall (Gap #2).
+    /// Capped at 20 entries; oldest evicted first.
+    pub persisted_followups: std::collections::VecDeque<RankedFollowup>,
+    pub followup_history: clawde_core::FollowupHistory,
+    /// When true, Up/Down navigates persisted followups instead of current.
+    pub followup_history_mode: bool,
+    /// How many times each followup text was selected by the user.
+    /// Keys are normalized followup text, values are use counts. Bounded to
+    /// avoid untrusted model output growing process memory indefinitely.
+    pub followup_usage_counts: std::collections::HashMap<String, u32>,
+    pub followup_usage: clawde_core::FollowupUsage,
+    /// Number of selected followups that were submitted as prompts.
+    pub followup_submitted_counts: std::collections::HashMap<String, u32>,
+    /// Number of submitted followups whose turn completed successfully.
+    pub followup_completed_counts: std::collections::HashMap<String, u32>,
+    /// Most recently selected followup awaiting submission.
+    pub pending_followup_text: Option<String>,
+
     // ---- Scroll acceleration state (trackpad feel) -----------------------
     /// Current acceleration multiplier for scroll events.
     scroll_accel: f32,
@@ -2333,6 +2361,17 @@ impl App {
             last_click_position: None,
             click_count: 0,
             context_menu_state: None,
+            followup_selected: None,
+            current_followups: Vec::new(),
+            followup_row_map: RefCell::new(std::collections::HashMap::new()),
+            persisted_followups: std::collections::VecDeque::new(),
+            followup_history: clawde_core::FollowupHistory::load(&Settings::config_dir()),
+            followup_history_mode: false,
+            followup_usage_counts: std::collections::HashMap::new(),
+            followup_usage: clawde_core::FollowupUsage::load(&Settings::config_dir()),
+            followup_submitted_counts: std::collections::HashMap::new(),
+            followup_completed_counts: std::collections::HashMap::new(),
+            pending_followup_text: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
@@ -2499,6 +2538,108 @@ impl App {
         }
     }
 
+    /// Select and insert a followup from either the current response or history.
+    fn select_followup_at(&mut self, index: usize) -> bool {
+        let followup = if self.followup_history_mode {
+            self.persisted_followups.get(index)
+        } else {
+            self.current_followups.get(index)
+        };
+        let Some(followup) = followup else {
+            return false;
+        };
+        let followup = followup.clone();
+        let text = followup.text.trim().to_string();
+        self.record_followup_used(&followup);
+        self.prompt_input.replace_text(text.clone());
+        self.pending_followup_text = Some(text);
+        self.refresh_prompt_input();
+        self.followup_selected = None;
+        self.followup_history_mode = false;
+        true
+    }
+
+    /// Record that the user selected a followup (Gap #4: feedback loop).
+    fn record_followup_used(&mut self, followup: &RankedFollowup) {
+        const MAX_TRACKED_FOLLOWUPS: usize = 64;
+        const MAX_FOLLOWUP_CHARS: usize = 256;
+        let text: String = followup
+            .text
+            .trim()
+            .chars()
+            .take(MAX_FOLLOWUP_CHARS)
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        if !self.followup_usage_counts.contains_key(&text)
+            && self.followup_usage_counts.len() >= MAX_TRACKED_FOLLOWUPS
+        {
+            if let Some(oldest) = self
+                .followup_usage_counts
+                .iter()
+                .min_by_key(|(_, count)| *count)
+                .map(|(text, _)| text.clone())
+            {
+                self.followup_usage_counts.remove(&oldest);
+            }
+        }
+        let count = self.followup_usage_counts.entry(text.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        self.followup_usage.record(&text);
+        if let Err(error) = self.followup_usage.save(&Settings::config_dir()) {
+            debug!(%error, "failed to persist followup usage");
+        }
+    }
+
+    /// Return a summary of followup usage for the system prompt.
+    /// Shows the top-5 most-used followups so the model can learn which
+    /// suggestions the user actually acts on.
+    pub fn followup_usage_summary(&self) -> String {
+        if self.followup_usage_counts.is_empty() {
+            return self.followup_usage.summary();
+        }
+        const MAX_SUMMARY_CHARS: usize = 1_500;
+        let mut counts: Vec<_> = self.followup_usage_counts.iter().collect();
+        counts.sort_by(|(text_a, count_a), (text_b, count_b)| {
+            count_b.cmp(count_a).then_with(|| text_a.cmp(text_b))
+        });
+        let mut summary = String::from("Followup outcomes (selected/submitted/completed): ");
+        for (position, (text, count)) in counts.iter().take(5).enumerate() {
+            let escaped: String = text
+                .chars()
+                .flat_map(|c| match c {
+                    '\\' => ['\\', '\\'].into_iter().collect::<Vec<_>>(),
+                    '"' => ['\\', '"'].into_iter().collect::<Vec<_>>(),
+                    '\n' => ['\\', 'n'].into_iter().collect::<Vec<_>>(),
+                    '\r' => ['\\', 'r'].into_iter().collect::<Vec<_>>(),
+                    '\t' => ['\\', 't'].into_iter().collect::<Vec<_>>(),
+                    c if c.is_control() => ['?'].into_iter().collect::<Vec<_>>(),
+                    c => [c].into_iter().collect::<Vec<_>>(),
+                })
+                .collect();
+            let item = format!(
+                "{}\"{}\" (selected {} times, submitted {}, completed {})",
+                if position == 0 { "" } else { ", " },
+                escaped,
+                count,
+                self.followup_submitted_counts
+                    .get(*text)
+                    .copied()
+                    .unwrap_or(0),
+                self.followup_completed_counts
+                    .get(*text)
+                    .copied()
+                    .unwrap_or(0)
+            );
+            if summary.chars().count() + item.chars().count() > MAX_SUMMARY_CHARS {
+                break;
+            }
+            summary.push_str(&item);
+        }
+        summary
+    }
+
     fn flush_streamed_assistant_message(&mut self) {
         if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
             self.streaming_text.clear();
@@ -2509,6 +2650,30 @@ impl App {
         let thinking = std::mem::take(&mut self.streaming_thinking);
         let text = std::mem::take(&mut self.streaming_text);
 
+        // Extract ranked followups from the response text before building
+        // the message.  The parser strips the <clawde_followups> block from
+        // visible text.
+        let parsed = clawde_core::parse_ranked_followups(&text);
+        if parsed.had_block && !parsed.followups.is_empty() {
+            // Store as current followups for keyboard/mouse interaction.
+            self.current_followups = parsed.followups.clone();
+            self.followup_selected = None;
+            // Persist for cross-turn recall (Gap #2), capped at 20 entries.
+            // Deduplicate by text (Gap #3) — if the same followup already
+            // exists, move it to the end instead of creating a duplicate.
+            for f in &parsed.followups {
+                self.followup_history.insert(f);
+                self.persisted_followups = self.followup_history.items().clone();
+            }
+            if let Err(error) = self.followup_history.save(&Settings::config_dir()) {
+                debug!(%error, "failed to persist followup history");
+            }
+        } else {
+            // No followups in this response — clear current selection.
+            self.current_followups.clear();
+            self.followup_selected = None;
+        }
+
         let mut blocks = Vec::new();
         if !thinking.trim().is_empty() {
             blocks.push(ContentBlock::Thinking {
@@ -2516,8 +2681,10 @@ impl App {
                 signature: String::new(),
             });
         }
-        if !text.is_empty() {
-            blocks.push(ContentBlock::Text { text });
+        if !parsed.visible_text.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: parsed.visible_text,
+            });
         }
 
         let msg = match blocks.len() {
@@ -4926,6 +5093,16 @@ impl App {
     /// Take the current input buffer, push it to history, and return it.
     pub fn take_input(&mut self) -> String {
         let input = self.prompt_input.take();
+        if let Some(followup) = self.pending_followup_text.take() {
+            let normalized = followup.trim().to_string();
+            if !normalized.is_empty() && input.trim() == normalized {
+                let count = self
+                    .followup_submitted_counts
+                    .entry(normalized)
+                    .or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        }
         if !input.is_empty() {
             self.prompt_input.history.push(input.clone());
             self.prompt_input.history_pos = None;
@@ -5058,7 +5235,8 @@ impl App {
     }
 
     pub fn set_prompt_text(&mut self, text: String) {
-        self.prompt_input.replace_text(text);
+        self.prompt_input.replace_text(text.clone());
+        self.pending_followup_text = Some(text);
         self.refresh_prompt_input();
     }
 
@@ -7731,16 +7909,98 @@ impl App {
                 }
                 _ => return false,
             }
+        } // ---- Followup navigation (Up/Down/Enter when followups visible) ----
+          // When the assistant response included ranked followups and the prompt
+          // is empty, arrow keys navigate the followup list and Enter inserts
+          // the selected followup text.
+          // Alt+F toggles history mode: shows persisted followups from prior turns.
+        let followups_active = if self.followup_history_mode {
+            !self.persisted_followups.is_empty()
+        } else {
+            !self.current_followups.is_empty()
+        };
+        if followups_active && self.prompt_input.is_empty() && !self.is_streaming {
+            let count = if self.followup_history_mode {
+                self.persisted_followups.len()
+            } else {
+                self.current_followups.len()
+            };
+            match key.code {
+                KeyCode::Up => {
+                    let idx = self.followup_selected.unwrap_or(count);
+                    self.followup_selected = Some(idx.saturating_sub(1));
+                    return false;
+                }
+                KeyCode::Down => {
+                    let idx = self.followup_selected.unwrap_or(0);
+                    if idx + 1 < count {
+                        self.followup_selected = Some(idx + 1);
+                    } else {
+                        self.followup_selected = None;
+                    }
+                    return false;
+                }
+                KeyCode::Enter => {
+                    if let Some(idx) = self.followup_selected {
+                        if self.select_followup_at(idx) {
+                            return false;
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.followup_selected = None;
+                    self.followup_history_mode = false;
+                    return false;
+                }
+                _ => {
+                    // Any other key clears followup selection and falls through
+                    // to normal key handling (typing into prompt).
+                    self.followup_selected = None;
+                    self.followup_history_mode = false;
+                }
+            }
         }
 
         // ---- Keybinding processor (runs AFTER all dialog checks) ----------
+        // When there are active autocomplete suggestions, Tab should accept
+        // the suggestion immediately — bypass the keybinding resolver so the
+        // chord-pending mechanism doesn't swallow the keystroke.
+        if key.code == KeyCode::Tab
+            && !self.prompt_input.suggestions.is_empty()
+            && !self.is_streaming
+        {
+            self.keybindings.cancel_chord();
+            if self.prompt_input.suggestion_index.is_none() {
+                self.prompt_input.suggestion_index = Some(0);
+            }
+            self.prompt_input.accept_suggestion_with_auto_space();
+            self.refresh_prompt_input();
+            return false;
+        }
         if let Some(keystroke) = key_event_to_keystroke(&key) {
+            // Before processing, check if a held single-key action has
+            // timed out (e.g. Tab pressed alone, no chord follow-up).
+            if let Some(action) = self.keybindings.check_timeout() {
+                return self.handle_keybinding_action(&action);
+            }
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
                 KeybindingResult::Action(action) => {
+                    // If there's a held single-key action that was waiting on
+                    // a chord, the chord resolved — discard the held action.
+                    self.keybindings.cancel_pending_single();
                     return self.handle_keybinding_action(&action);
                 }
-                KeybindingResult::Pending => return false,
+                KeybindingResult::PendingSingle(_action) => {
+                    // A single-key matched but might be a chord prefix.
+                    // Don't fire yet — wait for next keystroke or timeout.
+                    return false;
+                }
+                KeybindingResult::Pending => {
+                    // Chord in progress. The timeout for any pending single
+                    // was already checked above.
+                    return false;
+                }
                 KeybindingResult::NoMatch if had_pending_chord => return false,
                 KeybindingResult::Unbound | KeybindingResult::NoMatch => {
                     // Fall through to hardcoded keybinding handlers
@@ -9284,6 +9544,38 @@ impl App {
                 }
                 false
             }
+            "clearFollowupHistory" => {
+                self.followup_history.clear();
+                self.persisted_followups.clear();
+                self.current_followups.clear();
+                self.followup_selected = None;
+                self.followup_history_mode = false;
+                if let Err(error) = self.followup_history.save(&Settings::config_dir()) {
+                    debug!(%error, "failed to clear persisted followup history");
+                }
+                self.status_message = Some("Saved followup history cleared.".to_string());
+                false
+            }
+            "clearFollowupUsage" => {
+                self.followup_usage_counts.clear();
+                self.status_message =
+                    Some("Followup usage data cleared for this session.".to_string());
+                false
+            }
+            "toggleFollowupHistory" => {
+                if !self.persisted_followups.is_empty()
+                    && self.prompt_input.is_empty()
+                    && !self.is_streaming
+                {
+                    self.followup_history_mode = !self.followup_history_mode;
+                    self.followup_selected = if self.followup_history_mode {
+                        Some(0)
+                    } else {
+                        None
+                    };
+                }
+                false
+            }
             "showKeybindings" => {
                 self.keybindings_overlay.toggle();
                 if self.keybindings_overlay.visible {
@@ -10512,6 +10804,18 @@ impl App {
                     }
                 }
 
+                // Click on a ranked followup: insert its text into the prompt.
+                let clicked_followup = self
+                    .followup_row_map
+                    .borrow()
+                    .get(&mouse_event.row)
+                    .copied();
+                if let Some(idx) = clicked_followup {
+                    if self.select_followup_at(idx) {
+                        return;
+                    }
+                }
+
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
@@ -10851,6 +11155,29 @@ impl App {
                     .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
                 self.last_turn_elapsed = Some(elapsed.unwrap_or_else(|| "0s".to_string()));
                 self.last_turn_verb = Some(sample_completion_verb(seed));
+                // A completed followup requires an actual assistant response;
+                // cancellation and error paths must not claim success. The
+                // stream text is still flushed below for normal completion.
+                let has_assistant_output = !self.streaming_text.trim().is_empty()
+                    || !self.streaming_thinking.trim().is_empty();
+                let successful_stop = !matches!(
+                    stop_reason.to_ascii_lowercase().as_str(),
+                    "error" | "cancelled" | "aborted" | "interrupted"
+                );
+                if successful_stop && has_assistant_output {
+                    if let Some(followup) = self.pending_followup_text.take() {
+                        let normalized = followup.trim().to_string();
+                        if !normalized.is_empty() {
+                            let count = self
+                                .followup_completed_counts
+                                .entry(normalized)
+                                .or_insert(0);
+                            *count = count.saturating_add(1);
+                        }
+                    }
+                } else {
+                    self.pending_followup_text = None;
+                }
                 self.flush_streamed_assistant_message();
                 // The flushed message was rebuilt from stream text and lost the
                 // per-turn attribution the query loop attached. Restore it from
@@ -11016,6 +11343,7 @@ impl App {
                 self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.pending_followup_text = None;
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
@@ -11576,6 +11904,62 @@ mod tests {
         let config = Config::default();
         let cost_tracker = clawde_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    #[test]
+    fn followup_selection_tracks_submission_only_when_unchanged() {
+        let mut app = make_app();
+        app.current_followups = vec![RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        app.followup_selected = Some(0);
+        assert!(app.select_followup_at(0));
+        assert_eq!(app.prompt_input.text, "Run tests");
+        assert_eq!(app.followup_usage_counts.get("Run tests"), Some(&1));
+        assert_eq!(app.take_input(), "Run tests");
+        assert_eq!(app.followup_submitted_counts.get("Run tests"), Some(&1));
+
+        app.current_followups = vec![RankedFollowup {
+            text: "Review diff".into(),
+            rank: clawde_core::FollowupRank::Optional,
+            reason: String::new(),
+        }];
+        app.followup_selected = Some(0);
+        assert!(app.select_followup_at(0));
+        app.prompt_input
+            .replace_text("Review diff carefully".to_string());
+        app.refresh_prompt_input();
+        assert_eq!(app.take_input(), "Review diff carefully");
+        assert!(!app.followup_submitted_counts.contains_key("Review diff"));
+    }
+
+    #[test]
+    fn followup_completion_is_recorded_only_after_successful_turn() {
+        let mut app = make_app();
+        app.pending_followup_text = Some("Run tests".into());
+        app.is_streaming = true;
+        app.handle_query_event(clawde_query::QueryEvent::Error("failed".into()));
+        assert!(app.pending_followup_text.is_none());
+        assert!(app.followup_completed_counts.is_empty());
+
+        app.pending_followup_text = Some("Run tests".into());
+        app.followup_completed_counts
+            .entry("Run tests".into())
+            .or_insert(0);
+        assert_eq!(app.followup_completed_counts.get("Run tests"), Some(&0));
+
+        // A successful stop without any assistant output must not count.
+        app.pending_followup_text = Some("Empty response".into());
+        app.is_streaming = true;
+        app.handle_query_event(clawde_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".into(),
+            usage: None,
+            observability: None,
+        });
+        assert!(!app.followup_completed_counts.contains_key("Empty response"));
     }
 
     #[test]
