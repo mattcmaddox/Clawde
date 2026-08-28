@@ -748,9 +748,9 @@ pub(crate) fn deterministic_check_observation(
 
 /// Resolve the effective output-style persona for a turn.
 ///
-/// Personas (`rocky` / `caveman` / `normal`) mirror the ultracode keyword: an
+/// Personas (`cathead` / `caveman` / `normal`) mirror the ultracode keyword: an
 /// **inline** persona word in the most recent user message applies to *that one
-/// turn* (transient) and then reverts, while the persona chosen via `/rocky`,
+/// turn* (transient) and then reverts, while the persona chosen via `/cathead`,
 /// `/caveman`, or `/output-style` lives in `config` and **persists** until
 /// changed. Inline `normal` resets to the default (no persona) for the turn.
 ///
@@ -2325,7 +2325,7 @@ pub async fn run_query_loop(
                 });
             }
 
-            // Output-style persona for THIS turn. An inline `rocky` / `caveman`
+            // Output-style persona for THIS turn. An inline `cathead` / `caveman`
             // / `normal` keyword in the latest user message overrides the
             // persisted output style transiently (used for this turn, then
             // reverts); otherwise the persisted selection stands. Mirrors the
@@ -6816,13 +6816,13 @@ mod tests {
 
     #[test]
     fn inline_persona_keyword_applies_transiently_for_the_turn() {
-        // No persisted persona; an inline `rocky` selects the rocky prompt for
-        // this turn only.
+        // No persisted persona; an inline `cathead` selects the cathead prompt
+        // for this turn only.
         let cfg = QueryConfig::default();
-        let msgs = vec![Message::user("please rocky explain this borrow error")];
+        let msgs = vec![Message::user("please cathead explain this borrow error")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
-        let prompt = prompt.expect("inline rocky should resolve a persona prompt");
-        assert!(prompt.contains("Project Hail Mary"));
+        let prompt = prompt.expect("inline cathead should resolve a persona prompt");
+        assert!(prompt.contains("purr"));
 
         // Caveman likewise.
         let msgs = vec![Message::user("caveman summarize the diff")];
@@ -6836,8 +6836,8 @@ mod tests {
         // plain turn (transient, like ultracode).
         let cfg = QueryConfig::default();
         let msgs = vec![
-            Message::user("rocky kick things off"),
-            Message::assistant("good good good"),
+            Message::user("cathead kick things off"),
+            Message::assistant("purrr"),
             Message::user("now just tidy the docs"),
         ];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
@@ -6849,7 +6849,7 @@ mod tests {
 
     #[test]
     fn persisted_persona_stands_without_an_inline_keyword() {
-        // A persona chosen via /rocky or /output-style lives in the config and
+        // A persona chosen via /cathead or /output-style lives in the config and
         // persists across plain turns.
         let cfg = QueryConfig {
             output_style_prompt: Some("PERSISTED PERSONA".to_string()),
@@ -6875,17 +6875,17 @@ mod tests {
 
     #[test]
     fn inline_persona_overrides_a_different_persisted_persona() {
-        // Persisted caveman, but this turn asks for rocky inline → rocky wins
-        // transiently.
+        // Persisted caveman, but this turn asks for cathead inline → cathead
+        // wins transiently.
         let cfg = QueryConfig {
             output_style_prompt: Some(
                 clawde_core::output_styles::OutputStyleDef::builtin_caveman().prompt,
             ),
             ..QueryConfig::default()
         };
-        let msgs = vec![Message::user("rocky, review this function")];
+        let msgs = vec![Message::user("cathead, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
-        assert!(prompt.unwrap().contains("Project Hail Mary"));
+        assert!(prompt.unwrap().contains("purr"));
     }
 
     // ---- mode preset (transient vs persistent) ---------------------------

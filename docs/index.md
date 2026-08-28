@@ -4,7 +4,7 @@
 
 Clawde is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
-**Version:** 0.2.80 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/mattcmaddox/Clawde)
+**Version:** 0.2.81 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/mattcmaddox/Clawde)
 
 </div>
 
@@ -61,7 +61,7 @@ Set a durable objective with `/goal` and Clawde works autonomously across turns 
 Configure a manager-executor architecture with `/managed-agents` where a manager model delegates subtasks to parallel executor agents with full budget split controls.
 
 ### Speech modes
-Activate `/caveman` or `/rocky` to compress model responses by 40–85%, saving tokens in long sessions. Deactivate with `/normal`.
+Activate `/caveman` to compress model responses by 40–85%, saving tokens in long sessions, or `/cathead` for a cat persona with puns, purrs, and the occasional meow. Deactivate with `/normal`.
 
 ---
 
@@ -168,7 +168,7 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 | `/cost` | Token usage and cost for this session |
 | `/insights` | Session statistics and tool usage report |
 | `/caveman` | Activate telegraphic speech mode (save tokens) |
-| `/rocky` | Activate Rocky (Project Hail Mary) speech mode |
+| `/cathead` | Activate the Cathead cat persona (puns, purrs, meows) |
 | `/normal` | Deactivate speech modes |
 | `/rewind` | Go back to a previous message |
 | `/copy` | Copy last response to clipboard |

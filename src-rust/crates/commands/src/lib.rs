@@ -2253,7 +2253,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SwitchCommand),
         Box::new(RefreshCommand),
         Box::new(CavemanCommand),
-        Box::new(RockyCommand),
+        Box::new(CatheadCommand),
         Box::new(NormalCommand),
         Box::new(InitCommand),
         Box::new(ReviewCommand),
@@ -3418,7 +3418,7 @@ mod tests {
             text.contains("caveman"),
             "personas must appear in the list: {text}"
         );
-        assert!(text.contains("rocky"));
+        assert!(text.contains("cathead"));
         assert!(text.contains("default"));
         // Default config → default is the current style.
         assert!(text.contains("Current output style: default"));
@@ -3435,7 +3435,7 @@ mod tests {
     #[test]
     fn available_output_styles_include_personas() {
         let names = available_output_style_names();
-        for expected in ["default", "concise", "caveman", "rocky"] {
+        for expected in ["default", "concise", "caveman", "cathead"] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "output style '{expected}' should be available"
@@ -3445,17 +3445,17 @@ mod tests {
 
     #[test]
     fn persisted_persona_resolves_to_its_prompt() {
-        // End-to-end of the persist path: /output-style / /rocky set
+        // End-to-end of the persist path: /output-style / /cathead set
         // config.output_style, which resolves to the persona's prompt text for
         // the system prompt.
         let config = clawde_core::config::Config {
-            output_style: Some("rocky".to_string()),
+            output_style: Some("cathead".to_string()),
             ..clawde_core::config::Config::default()
         };
         let prompt = config
             .resolve_output_style_prompt()
-            .expect("rocky must resolve to a prompt");
-        assert!(prompt.contains("Project Hail Mary"));
+            .expect("cathead must resolve to a prompt");
+        assert!(prompt.contains("purr"));
     }
 
     #[test]

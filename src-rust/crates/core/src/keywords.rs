@@ -4,7 +4,7 @@
 // changes how *that one turn* behaves (transient), mirroring how the `/effort`
 // or `/output-style` selectors change it *persistently*. `ultracode` was the
 // first of these; this module generalises the mechanism so personas
-// (`rocky`, `caveman`, `normal`) ride the exact same rails.
+// (`cathead`, `caveman`, `normal`) ride the exact same rails.
 //
 // This registry is the single source of truth shared across the workspace:
 //   - the TUI prompt box highlights each keyword with its themed gradient
@@ -81,8 +81,8 @@ pub const INLINE_KEYWORDS: &[InlineKeyword] = &[
         gradient: true,
     },
     InlineKeyword {
-        keyword: "rocky",
-        effect: InlineEffect::Persona("rocky"),
+        keyword: "cathead",
+        effect: InlineEffect::Persona("cathead"),
         gradient: true,
     },
     InlineKeyword {
@@ -206,7 +206,7 @@ pub fn inline_mode_name(text: &str) -> Option<&str> {
 /// Returns the output-style name to use for *this turn* — which may be
 /// `"default"` (the reset produced by `normal`). When several persona keywords
 /// appear, the one whose last occurrence is **latest** in the text wins, so a
-/// trailing `normal` reliably clears an earlier `rocky`. Effort keywords (like
+/// trailing `normal` reliably clears an earlier `cathead`. Effort keywords (like
 /// `ultracode`) are ignored here — they are resolved separately by the effort
 /// path.
 pub fn inline_persona_style(text: &str) -> Option<&'static str> {
@@ -243,13 +243,13 @@ mod tests {
 
     #[test]
     fn generic_matcher_is_case_insensitive() {
-        assert_eq!(keyword_match_ranges("RoCkY now", "rocky").len(), 1);
+        assert_eq!(keyword_match_ranges("CaThEaD now", "cathead").len(), 1);
         assert_eq!(keyword_match_ranges("CAVEMAN mode", "caveman").len(), 1);
     }
 
     #[test]
     fn generic_matcher_respects_word_boundaries() {
-        assert!(keyword_match_ranges("rockyroad", "rocky").is_empty());
+        assert!(keyword_match_ranges("catheadphones", "cathead").is_empty());
         assert!(keyword_match_ranges("cavemanic", "caveman").is_empty());
         assert!(keyword_match_ranges("abnormal", "normal").is_empty());
     }
@@ -266,8 +266,8 @@ mod tests {
             Some(InlineEffect::Effort(EffortLevel::Ultracode))
         ));
         assert_eq!(
-            find_inline_keyword("rocky").unwrap().persona_style(),
-            Some("rocky")
+            find_inline_keyword("cathead").unwrap().persona_style(),
+            Some("cathead")
         );
         assert_eq!(
             find_inline_keyword("caveman").unwrap().persona_style(),
@@ -284,14 +284,14 @@ mod tests {
     #[test]
     fn normal_has_no_gradient_but_personas_do() {
         assert!(!find_inline_keyword("normal").unwrap().gradient);
-        assert!(find_inline_keyword("rocky").unwrap().gradient);
+        assert!(find_inline_keyword("cathead").unwrap().gradient);
         assert!(find_inline_keyword("caveman").unwrap().gradient);
         assert!(find_inline_keyword("ultracode").unwrap().gradient);
     }
 
     #[test]
     fn inline_persona_style_picks_persona_keyword() {
-        assert_eq!(inline_persona_style("please rocky this"), Some("rocky"));
+        assert_eq!(inline_persona_style("please cathead this"), Some("cathead"));
         assert_eq!(inline_persona_style("caveman it up"), Some("caveman"));
         assert_eq!(
             inline_persona_style("back to normal please"),
@@ -309,13 +309,13 @@ mod tests {
 
     #[test]
     fn inline_persona_style_last_wins() {
-        // A trailing `normal` clears an earlier `rocky`.
+        // A trailing `normal` clears an earlier `cathead`.
         assert_eq!(
-            inline_persona_style("rocky then back to normal"),
+            inline_persona_style("cathead then back to normal"),
             Some("default")
         );
         // ...and vice-versa.
-        assert_eq!(inline_persona_style("normal then rocky"), Some("rocky"));
+        assert_eq!(inline_persona_style("normal then cathead"), Some("cathead"));
     }
 
     #[test]

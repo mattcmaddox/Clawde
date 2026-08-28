@@ -3696,8 +3696,8 @@ struct KeywordGradient {
     start: (u8, u8, u8),
     end: (u8, u8, u8),
     /// When true, apply a small deterministic per-character offset so the run
-    /// looks textured/dithered (stony) rather than a smooth fade — used by
-    /// `rocky` for a granite look.
+    /// looks textured/dithered rather than a smooth fade. Currently unused by
+    /// built-in keywords (kept for custom-gradient extensibility).
     dither: bool,
 }
 
@@ -3709,12 +3709,12 @@ const ULTRACODE_GRADIENT: KeywordGradient = KeywordGradient {
     dither: false,
 };
 
-/// Stony grey gradient for the `rocky` persona — light granite fading to dark
-/// stone, dithered per character for a textured rock face.
-const ROCKY_GRADIENT: KeywordGradient = KeywordGradient {
-    start: (176, 176, 182),
-    end: (92, 92, 100),
-    dither: true,
+/// Ginger tabby gradient for the `cathead` persona — warm cream fading to
+/// tabby orange-brown, like a well-loved orange cat.
+const CATHEAD_GRADIENT: KeywordGradient = KeywordGradient {
+    start: (250, 220, 170),
+    end: (200, 120, 40),
+    dither: false,
 };
 
 /// Earthy gradient for the `caveman` persona — tree-root brown fading to leaf
@@ -3730,7 +3730,7 @@ const CAVEMAN_GRADIENT: KeywordGradient = KeywordGradient {
 fn keyword_gradient_for(keyword: &str) -> Option<KeywordGradient> {
     match keyword.to_ascii_lowercase().as_str() {
         "ultracode" => Some(ULTRACODE_GRADIENT),
-        "rocky" => Some(ROCKY_GRADIENT),
+        "cathead" => Some(CATHEAD_GRADIENT),
         "caveman" => Some(CAVEMAN_GRADIENT),
         _ => None,
     }
@@ -3765,7 +3765,7 @@ fn keyword_gradient_color(grad: &KeywordGradient, t: f32, i: usize) -> Color {
 }
 
 /// Build the styled spans for a single display-line `text`, painting every
-/// inline keyword occurrence (`ultracode`, `rocky`, `caveman` — the single
+/// inline keyword occurrence (`ultracode`, `cathead`, `caveman` — the single
 /// word, case-insensitive, whole-word) with its own themed per-character
 /// gradient, bold. `normal` is a reset and is intentionally not painted.
 ///
@@ -6594,22 +6594,31 @@ mod tests {
     }
 
     #[test]
-    fn rocky_and_caveman_get_their_own_gradients() {
+    fn cathead_and_caveman_get_their_own_gradients() {
         let base = Style::default().fg(Color::White);
 
-        // Rocky: grey/stone, dithered — one bold span per char, colors vary.
-        let rocky = styled_spans_with_keyword_gradient("go rocky mode", base);
-        let (bold, colors) = bold_rgb_stats(&rocky);
-        assert_eq!(bold, "rocky".len());
-        assert!(colors.len() > 1, "rocky gradient should vary per character");
-        // Greyish: for at least one painted char, the channels are close together.
+        // Cathead: ginger/tabby orange — one bold span per char, colors vary.
+        let cathead = styled_spans_with_keyword_gradient("go cathead mode", base);
+        let (bold, colors) = bold_rgb_stats(&cathead);
+        assert_eq!(bold, "cathead".len());
         assert!(
-            colors.iter().any(|(r, g, b)| {
-                let max = *r.max(g).max(b) as i16;
-                let min = *r.min(g).min(b) as i16;
-                (max - min) < 40
-            }),
-            "rocky should look grey/stony"
+            colors.len() > 1,
+            "cathead gradient should vary per character"
+        );
+        // First painted char leans orange (red + green channels dominant over
+        // blue); the run ends deeper/more orange.
+        let first_painted = cathead
+            .iter()
+            .find_map(|s| match s.style.fg {
+                Some(Color::Rgb(r, g, b)) if s.style.add_modifier.contains(Modifier::BOLD) => {
+                    Some((r, g, b))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            first_painted.0 > first_painted.2 && first_painted.1 > first_painted.2,
+            "cathead should start warm cream (r,g > b)"
         );
 
         // Caveman: brown → green.
@@ -6637,12 +6646,12 @@ mod tests {
     #[test]
     fn gradient_handles_multiple_keywords_and_preserves_text() {
         let base = Style::default().fg(Color::White);
-        let text = "ultracode then rocky again";
+        let text = "ultracode then cathead again";
         let spans = styled_spans_with_keyword_gradient(text, base);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, text, "text preserved across multiple matches");
         let (bold, _) = bold_rgb_stats(&spans);
-        // "ultracode" (9) + "rocky" (5) painted chars.
-        assert_eq!(bold, "ultracode".len() + "rocky".len());
+        // "ultracode" (9) + "cathead" (7) painted chars.
+        assert_eq!(bold, "ultracode".len() + "cathead".len());
     }
 }

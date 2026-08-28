@@ -1,4 +1,4 @@
-// Persona commands: `/caveman`, `/rocky`, `/normal`.
+// Persona commands: `/caveman`, `/cathead`, `/normal`.
 //
 // Personas used to be a bespoke "speech mode" mechanism that returned
 // `CommandResult::SpeechMode` and stored the prompt text in the TUI. They now
@@ -8,14 +8,14 @@
 // (exactly like `/output-style <name>`); `/normal` resets to `default`.
 //
 // The same personas are also reachable *transiently* by typing the single word
-// `caveman` / `rocky` / `normal` inline in a prompt (see
+// `caveman` / `cathead` / `normal` inline in a prompt (see
 // `clawde_core::keywords`) — that applies to one turn only.
 
 use super::*;
 use async_trait::async_trait;
 
 pub struct CavemanCommand;
-pub struct RockyCommand;
+pub struct CatheadCommand;
 pub struct NormalCommand;
 
 /// Select an output-style persona persistently and persist it to settings.
@@ -38,7 +38,7 @@ fn apply_persona(ctx: &CommandContext, style: &str, confirm: &str) -> CommandRes
     CommandResult::ConfigChangeMessage(new_config, confirm.to_string())
 }
 
-// ---- /caveman, /rocky, /normal -------------------------------------------
+// ---- /caveman, /cathead, /normal -----------------------------------------
 
 #[async_trait]
 impl SlashCommand for CavemanCommand {
@@ -61,22 +61,22 @@ impl SlashCommand for CavemanCommand {
 }
 
 #[async_trait]
-impl SlashCommand for RockyCommand {
+impl SlashCommand for CatheadCommand {
     fn name(&self) -> &str {
-        "rocky"
+        "cathead"
     }
     fn description(&self) -> &str {
-        "Rocky persona — Eridian engineer from Project Hail Mary. Good good good."
+        "Cathead persona — cat puns, purrs on success, meows on questions"
     }
     fn help(&self) -> &str {
-        "Usage: /rocky\n\n\
-         Switch the output style to the Rocky persona (Project Hail Mary's Eridian \
-         engineer) and keep it until you change it. Equivalent to /output-style rocky.\n\n\
-         Tip: type `rocky` inline in a prompt to use it for just that one turn.\n\
+        "Usage: /cathead\n\n\
+         Switch the output style to the Cathead persona (a cat who is also a coding \
+         assistant) and keep it until you change it. Equivalent to /output-style cathead.\n\n\
+         Tip: type `cathead` inline in a prompt to use it for just that one turn.\n\
          Use /normal to deactivate."
     }
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        apply_persona(ctx, "rocky", "Rocky mode. Full. Good good good.")
+        apply_persona(ctx, "cathead", "Cathead mode. Purrr.")
     }
 }
 
@@ -104,7 +104,7 @@ mod tests {
         // The command targets must exist as built-in output styles so
         // /output-style and the inline keywords resolve the same prompt text.
         let styles = clawde_core::output_styles::builtin_styles();
-        for name in ["caveman", "rocky"] {
+        for name in ["caveman", "cathead"] {
             assert!(
                 clawde_core::output_styles::find_style(&styles, name).is_some(),
                 "persona command target '{name}' must be a built-in output style"

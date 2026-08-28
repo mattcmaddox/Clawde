@@ -84,7 +84,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "plugin", description: "Manage plugins (list/info/enable/disable/reload)", category: "Tools", tui_only: false },
     PromptCommand { name: "providers", description: "List available AI providers and their status", category: "Model & Provider", tui_only: false },
     PromptCommand { name: "caveman", description: "Caveman persona output style — save big token", category: "Commands", tui_only: false },
-    PromptCommand { name: "rocky", description: "Rocky persona output style — amaze amaze amaze", category: "Commands", tui_only: false },
+    PromptCommand { name: "cathead", description: "Cathead persona output style — cat puns and purrs", category: "Commands", tui_only: false },
     PromptCommand { name: "normal", description: "Reset persona / output style to default", category: "Commands", tui_only: false },
     PromptCommand { name: "quit", description: "Exit Clawde", category: "Session", tui_only: false },
     PromptCommand { name: "refresh", description: "Clear saved provider auth and model caches", category: "Model & Provider", tui_only: false },

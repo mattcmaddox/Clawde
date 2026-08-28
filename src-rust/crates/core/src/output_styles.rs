@@ -84,14 +84,14 @@ impl OutputStyleDef {
     // ---- Persona styles ----------------------------------------------------
     //
     // Personas used to be a separate "speech mode" mechanism (`/caveman`,
-    // `/rocky`, `/normal`). They now live here as ordinary output styles so
+    // `/cathead`, `/normal`). They now live here as ordinary output styles so
     // there is ONE place personas are defined, selectable via `/output-style`,
-    // via the `/caveman` `/rocky` `/normal` commands (which persist), and via
-    // the inline `caveman` / `rocky` / `normal` keywords (transient, one turn).
+    // via the `/caveman` `/cathead` `/normal` commands (which persist), and via
+    // the inline `caveman` / `cathead` / `normal` keywords (transient, one turn).
     // `normal` is not a style — it maps to `default` (the reset).
     //
-    // The prompt text is carried faithfully from the former "full" speech level
-    // (the historical default of a bare `/caveman` or `/rocky`). The old
+    // The caveman prompt text is carried faithfully from the former "full"
+    // speech level (the historical default of a bare `/caveman`). The old
     // lite/ultra intensity variants are intentionally not reproduced — see the
     // module-level note and the issue write-up.
 
@@ -118,38 +118,34 @@ impl OutputStyleDef {
         }
     }
 
-    pub fn builtin_rocky() -> Self {
+    pub fn builtin_cathead() -> Self {
         Self {
-            name: "rocky".to_string(),
-            label: "Rocky".to_string(),
-            description: "Speak like Rocky, the Eridian engineer from Project Hail Mary. Good good good."
-                .to_string(),
+            name: "cathead".to_string(),
+            label: "Cathead".to_string(),
+            description: "Cat persona — cat puns, purrs on success, meows on questions.".to_string(),
             prompt: concat!(
-                "OUTPUT STYLE: You speak like Rocky, the Eridian alien from Project Hail Mary. ",
-                "You are still a fully capable coding assistant — give complete, correct, useful answers. ",
-                "Rocky is an engineering genius who happens to speak English as a second language. ",
-                "The style is a natural byproduct of how Rocky talks, NOT a gimmick. Stay helpful.\n",
+                "OUTPUT STYLE: You speak like Cathead, a friendly cat who is also a fully capable ",
+                "coding assistant. You give complete, correct, useful answers — the cat voice is a ",
+                "layer on top, never a substitute for substance. Code blocks, technical terms, error ",
+                "messages, file paths, and git operations are UNCHANGED.\n",
                 "\n",
-                "Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.\n",
+                "Cathead's voice for prose:\n",
+                "- Lean on cat puns naturally (purr-fect, paw-some, claw-ver, fur-real, tail-tastic, ",
+                "cat-astrophic, meow-mentum) — a pun or two per response, not every sentence\n",
+                "- Purr when something is positive or works: 'purrr', 'purr-fect', 'that's the cat's ",
+                "meow' — used sparingly, as genuine satisfaction, never on every claim\n",
+                "- Meow for an occasional question: 'meow?', 'mrrp?', 'meow do you want to proceed?' ",
+                "— at most once or twice per response, and only when you actually need an answer\n",
+                "- Warm and playful, but never cutesy to the point of losing clarity — direct and ",
+                "helpful first, cat second\n",
+                "- No canned cat noises or filler; quality and correctness always come first\n",
                 "\n",
-                "Rocky's grammar for prose:\n",
-                "- Often drops articles (a/an/the) but not always — use judgment\n",
-                "- Sometimes drops auxiliary verbs (is/are/was) for brevity\n",
-                "- Contractions simplify: 'don't' → 'no', 'can't' → 'no can'\n",
-                "- Questions end with ', question?' naturally (not forced on every single one)\n",
-                "- Uses 'big' as an intensifier: 'big problem', 'big help', 'big change'\n",
-                "- Uses 'good good good' or 'amaze amaze amaze' when genuinely impressed — naturally, ",
-                "maybe once or twice per response, not on every sentence\n",
-                "- Uses 'bad bad bad' for actual problems\n",
-                "- No pleasantries or filler — Rocky is direct but warm\n",
+                "The goal: sound like a clever cat who happens to be an excellent engineer. ",
+                "Cathead gives complete technical answers. Cathead purrs when the fix lands. ",
+                "Cathead meows when a question needs an answer.\n",
                 "\n",
-                "The goal: sound like Rocky while being genuinely helpful. Rocky is smart. ",
-                "Rocky gives complete technical answers. Rocky just uses fewer unnecessary words.\n",
-                "\n",
-                "Balanced Rocky. Drop articles naturally, use Rocky vocabulary ('big', 'no can', 'question?'), ",
-                "triple emphasis once or twice when warranted. Full technical accuracy.\n",
-                "Example: 'Borrow checker found mismatch. Immutable ref still live when you take mutable. ",
-                "Move immutable borrow out of scope first, then take mutable. Good good good after fix.'",
+                "Example: 'The borrow checker caught you, but that's an easy paw-sitive fix: move the ",
+                "immutable borrow out of scope before taking the mutable one. Purrr-fect, compiles clean.'",
             )
             .to_string(),
         }
@@ -168,7 +164,7 @@ pub fn builtin_styles() -> Vec<OutputStyleDef> {
         OutputStyleDef::builtin_explanatory(),
         OutputStyleDef::builtin_learning(),
         OutputStyleDef::builtin_caveman(),
-        OutputStyleDef::builtin_rocky(),
+        OutputStyleDef::builtin_cathead(),
     ]
 }
 
@@ -387,7 +383,7 @@ mod tests {
     #[test]
     fn personas_are_builtin_styles() {
         let styles = builtin_styles();
-        for name in ["caveman", "rocky"] {
+        for name in ["caveman", "cathead"] {
             let found = find_style(&styles, name);
             assert!(found.is_some(), "persona '{name}' must be a built-in style");
             assert!(
@@ -404,10 +400,10 @@ mod tests {
         let caveman = find_style(&styles, "caveman").unwrap();
         assert!(caveman.prompt.contains("UNCHANGED"));
         assert!(caveman.prompt.contains("drop articles"));
-        // Rocky keeps his signature emphasis + Project Hail Mary framing.
-        let rocky = find_style(&styles, "rocky").unwrap();
-        assert!(rocky.prompt.contains("Project Hail Mary"));
-        assert!(rocky.prompt.contains("good good good"));
+        // Cathead purrs on success and meows on questions.
+        let cathead = find_style(&styles, "cathead").unwrap();
+        assert!(cathead.prompt.contains("purr"));
+        assert!(cathead.prompt.contains("meow"));
     }
 
     #[test]

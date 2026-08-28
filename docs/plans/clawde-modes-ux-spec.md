@@ -57,11 +57,11 @@ Grounding for everything below — do not re-litigate these in implementation.
   aspirationally; there is no `ExecuteCommand`. This matters for §7.1:
   a preset cannot tune a `decide_mode` threshold because nothing calls
   `decide_mode`.
-- **Personas are pure prompt text**: `rocky`/`caveman`/`normal` are output
+- **Personas are pure prompt text**: `cathead`/`caveman`/`normal` are output
   styles (`crates/core/src/output_styles.rs`) injected as an
   `## Output Style` system-prompt section. They never change the engine —
-  only tone. Inline keywords (`rocky`, `caveman`, `ultracode`) are transient
-  per-turn (`crates/core/src/keywords.rs`); `/output-style` and `/rocky`
+  only tone. Inline keywords (`cathead`, `caveman`, `ultracode`) are transient
+  per-turn (`crates/core/src/keywords.rs`); `/output-style` and `/cathead`
   etc. persist.
 
 ### 2.2 Config surface (what a preset can already control)

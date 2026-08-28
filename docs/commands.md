@@ -17,7 +17,7 @@ This document is the complete reference for every slash command available in Cla
 9. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
 10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
 11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
-12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/rocky`, `/normal`, `/mobile`, `/color`, `/stickers`
+12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/cathead`, `/normal`, `/mobile`, `/color`, `/stickers`
 13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
 14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
 15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
@@ -1308,15 +1308,12 @@ Deactivate with `/normal`.
 
 ---
 
-### /rocky
+### /cathead
 
-Activate Rocky speech mode. Rocky is the Eridian alien engineer from *Project Hail Mary* who communicates in a distinctive pidgin English with specific grammar rules and expressive emphasis. In rocky mode the model adopts Rocky's communication style.
+Activate the Cathead cat persona. Cathead is a friendly cat who is also a fully capable coding assistant: the model keeps full technical accuracy but leans on cat puns, purrs when something is positive or works, and meows for the occasional question.
 
 ```
-/rocky             — activate full Rocky mode (~75% token reduction)
-/rocky lite        — grammar rules only, minimal emphasis (~40% reduction)
-/rocky full        — full Rocky grammar + regular emphasis (default, ~75% reduction)
-/rocky ultra       — maximum Rocky personality, frequent emphasis, alien observations
+/cathead           — activate the Cathead persona (persisted)
 ```
 
 Deactivate with `/normal`.
@@ -1325,7 +1322,7 @@ Deactivate with `/normal`.
 
 ### /normal
 
-Deactivate any active speech mode (caveman or rocky) and return the model to its standard response style.
+Deactivate any active speech mode (caveman or cathead) and return the model to its standard response style.
 
 ```
 /normal

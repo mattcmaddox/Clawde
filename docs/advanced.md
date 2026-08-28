@@ -335,19 +335,16 @@ Strips pleasantries, hedging phrases, transitional sentences, and articles. Outp
 **Example (caveman full):**
 > "Look at file. Make changes."
 
-### Rocky mode
+### Cathead mode
 
-The model adopts the communication style of Rocky from *Project Hail Mary* — an Eridian alien engineer with a distinctive grammar, heavy emphasis, and alien perspective on human tasks.
+The model adopts the voice of Cathead, a friendly cat who is also a fully capable coding assistant. Technical content (code, paths, errors) stays unchanged; prose leans on cat puns, purrs when something is positive or works, and meows for the occasional question.
 
 ```
-/rocky             — full Rocky mode (~75% token reduction)
-/rocky lite        — grammar rules only, minimal emphasis (~40% reduction)
-/rocky full        — full grammar + regular emphasis (~75% reduction, default)
-/rocky ultra       — maximum personality, frequent emphasis, alien observations
+/cathead           — activate the Cathead persona (persisted)
 ```
 
-**Example (rocky full):**
-> "Read file. *Yes!* Change function. Return value wrong! Fix now. *Eridians not make this mistake.*"
+**Example (cathead):**
+> "The borrow checker caught you, but that's an easy paw-sitive fix: move the immutable borrow out of scope first. Purrr-fect, compiles clean."
 
 ### Deactivating speech modes
 
@@ -355,7 +352,7 @@ The model adopts the communication style of Rocky from *Project Hail Mary* — a
 /normal
 ```
 
-Resets to the model's standard response style. Any active mode (caveman or rocky) is immediately deactivated.
+Resets to the model's standard response style. Any active mode (caveman or cathead) is immediately deactivated.
 
 ---
 
