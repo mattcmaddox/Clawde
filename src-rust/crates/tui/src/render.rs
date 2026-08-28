@@ -583,6 +583,10 @@ struct MessageLinesCacheKey {
     current_followups_len: usize,
     persisted_followups_ptr: usize,
     persisted_followups_len: usize,
+    // Arrow-key navigation changes the highlighted followup without touching
+    // the transcript or the list identity; without this the cache would serve
+    // stale lines and the selection highlight would never appear.
+    followup_selected: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -2061,6 +2065,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
             .front()
             .map_or(0, |followup| followup as *const _ as usize),
         persisted_followups_len: app.persisted_followups.len(),
+        followup_selected: app.followup_selected,
     };
     if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
         cache
@@ -6072,6 +6077,37 @@ mod status_row_badge_tests {
         assert!(map
             .values()
             .all(|t| t.source == FollowupSource::Current && t.index == 0));
+    }
+
+    #[test]
+    fn followup_arrow_selection_invalidates_cached_lines() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        // One message so the transcript (not the welcome box) renders.
+        app.messages
+            .push(clawde_core::types::Message::assistant("hello"));
+        app.current_followups = vec![clawde_core::RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        // First render populates the message-lines cache with no selection.
+        let plain = render_screen(&app);
+        assert!(
+            !plain.contains('→'),
+            "unselected followups must not render the highlight marker"
+        );
+        // Arrow-key navigation changes only `followup_selected` — the cache
+        // must not serve the stale unselected lines.
+        app.followup_selected = Some(0);
+        let selected = render_screen(&app);
+        assert!(
+            selected.contains('→'),
+            "selected followup must render the highlight marker"
+        );
+        // And deselecting restores the plain rendering.
+        app.followup_selected = None;
+        let deselected = render_screen(&app);
+        assert!(!deselected.contains('→'));
     }
 }
 

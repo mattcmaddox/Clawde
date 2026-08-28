@@ -3989,6 +3989,13 @@ async fn run_interactive(
                         continue;
                     }
                     if plain_enter && !app.is_streaming && !any_dialog_open {
+                        // A followup is highlighted with the arrow keys: Enter must
+                        // insert it into the prompt (handled in the TUI) rather than
+                        // submitting the empty prompt below.
+                        if app.followup_selected.is_some() {
+                            app.handle_key_event(key);
+                            continue;
+                        }
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some()
