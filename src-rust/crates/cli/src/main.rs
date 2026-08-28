@@ -4176,6 +4176,11 @@ async fn run_interactive(
                                 Some(CommandResult::ClearFollowups { history, usage }) => {
                                     app.clear_followups(history, usage);
                                 }
+                                Some(CommandResult::FollowupStatus) => {
+                                    app.push_message(clawde_core::types::Message::assistant(
+                                        app.followup_status_report(),
+                                    ));
+                                }
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.replace_messages(Vec::new());

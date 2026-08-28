@@ -2682,6 +2682,42 @@ impl App {
         summary
     }
 
+    /// Build the `/followups status` report: current and saved counts, usage
+    /// totals, top lifecycle rows, and the storage location.
+    pub fn followup_status_report(&self) -> String {
+        let mut counts: Vec<_> = self.followup_usage_counts.iter().collect();
+        counts.sort_by(|(a, ac), (b, bc)| bc.cmp(ac).then_with(|| a.cmp(b)));
+        let mut out = format!(
+            "Followup suggestions — {} current, {} saved, {} tracked usage text(s)\n",
+            self.current_followups.len(),
+            self.persisted_followups.len(),
+            self.followup_usage_counts.len()
+        );
+        if counts.is_empty() {
+            out.push_str("  No followup usage recorded yet.\n");
+        } else {
+            out.push_str("  Most-used followups (selected / submitted / completed):\n");
+            for (text, selected) in counts.into_iter().take(5) {
+                let submitted = self
+                    .followup_submitted_counts
+                    .get(text)
+                    .copied()
+                    .unwrap_or(0);
+                let completed = self
+                    .followup_completed_counts
+                    .get(text)
+                    .copied()
+                    .unwrap_or(0);
+                out.push_str(&format!(
+                    "    - \"{}\" {selected} / {submitted} / {completed}\n",
+                    text.replace('\\', "\\\\").replace('"', "\\\"")
+                ));
+            }
+        }
+        out.push_str(&format!("  Data: {}", self.followup_dir.display()));
+        out
+    }
+
     /// Write the human-readable `.clawde/followups.md` mirror of the current
     /// followup state (saved suggestions + usage). Generated, never parsed
     /// back — the JSON files in the same directory are the source of truth.
@@ -8078,8 +8114,13 @@ impl App {
                     return false;
                 }
                 KeyCode::Down => {
-                    let idx = self.followup_selected.unwrap_or(0);
-                    if idx + 1 < count {
+                    // From no selection, Down lands on the first followup; from
+                    // a selection it advances, and past the end it deselects
+                    // so the user can resume typing.
+                    if self.followup_selected.is_none() {
+                        self.followup_selected = Some(0);
+                    } else if self.followup_selected.unwrap_or(0) + 1 < count {
+                        let idx = self.followup_selected.unwrap_or(0);
                         self.followup_selected = Some(idx + 1);
                     } else {
                         self.followup_selected = None;
@@ -12050,7 +12091,9 @@ pub(crate) fn open_file_externally(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+    };
 
     fn make_app() -> App {
         let config = Config::default();
@@ -12235,8 +12278,7 @@ mod tests {
         assert!(app.followup_usage_counts.is_empty());
         assert!(app.followup_submitted_counts.is_empty());
         assert!(app.followup_completed_counts.is_empty());
-        assert!(app.status_message.as_deref().unwrap().contains("history"));
-        // The persisted usage file is rewritten empty and the mirror reflects it.
+        assert!(app.status_message.as_deref().unwrap().contains("history")); // The persisted usage file is rewritten empty and the mirror reflects it.
         let data_dir = project.path().join(".clawde");
         assert!(data_dir.join("followup_usage.json").exists());
         assert!(clawde_core::FollowupUsage::load(&data_dir)
@@ -12244,6 +12286,113 @@ mod tests {
             .is_empty());
         let md = std::fs::read_to_string(data_dir.join("followups.md")).unwrap();
         assert!(md.contains("_none_"));
+    }
+
+    #[test]
+    fn followup_keyboard_navigation_selects_current_and_history() {
+        // Current-mode keyboard: Down selects, Enter inserts.
+        let mut app = make_app();
+        app.current_followups = vec![RankedFollowup {
+            text: "Current one".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.followup_selected, Some(0));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.prompt_input.text, "Current one");
+        assert_eq!(app.pending_followup_text.as_deref(), Some("Current one"));
+        assert!(!app.followup_history_mode);
+
+        // History-mode keyboard: same navigation reads the persisted list.
+        let mut app = make_app();
+        app.persisted_followups.push_back(RankedFollowup {
+            text: "History one".into(),
+            rank: clawde_core::FollowupRank::Optional,
+            reason: String::new(),
+        });
+        app.followup_history_mode = true;
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.followup_selected, Some(0));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.prompt_input.text, "History one");
+        assert_eq!(app.pending_followup_text.as_deref(), Some("History one"));
+        // Selecting from history exits history mode (current-response mode).
+        assert!(!app.followup_history_mode);
+    }
+
+    #[test]
+    fn followup_mouse_click_resolves_current_vs_history_source() {
+        // A click on a current-response row inserts that followup.
+        let mut app = make_app();
+        app.current_followups = vec![RankedFollowup {
+            text: "Mouse current".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        app.followup_row_map.borrow_mut().insert(
+            3,
+            FollowupRowTarget {
+                source: FollowupSource::Current,
+                index: 0,
+            },
+        );
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.prompt_input.text, "Mouse current");
+        assert!(!app.followup_history_mode);
+
+        // A click on a history row (visible in history mode) inserts that item.
+        let mut app = make_app();
+        app.persisted_followups.push_back(RankedFollowup {
+            text: "Mouse history".into(),
+            rank: clawde_core::FollowupRank::Optional,
+            reason: String::new(),
+        });
+        app.followup_history_mode = true;
+        app.followup_row_map.borrow_mut().insert(
+            3,
+            FollowupRowTarget {
+                source: FollowupSource::History,
+                index: 0,
+            },
+        );
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.prompt_input.text, "Mouse history");
+        assert!(!app.followup_history_mode);
+    }
+
+    #[test]
+    fn followup_status_report_includes_counts_and_lifecycle() {
+        let mut app = make_app();
+        app.current_followups = vec![RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        }];
+        app.persisted_followups.push_back(RankedFollowup {
+            text: "Run tests".into(),
+            rank: clawde_core::FollowupRank::Recommended,
+            reason: String::new(),
+        });
+        app.followup_usage_counts.insert("Run tests".into(), 3);
+        app.followup_submitted_counts.insert("Run tests".into(), 2);
+        app.followup_completed_counts.insert("Run tests".into(), 1);
+        let report = app.followup_status_report();
+        assert!(report.contains("1 current"), "{report}");
+        assert!(report.contains("1 saved"), "{report}");
+        assert!(report.contains("Run tests"), "{report}");
+        assert!(report.contains("3 / 2 / 1"), "{report}");
+        assert!(report.contains("Data:"), "{report}");
     }
 
     #[test]

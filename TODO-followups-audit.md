@@ -14,12 +14,12 @@ Audit and harden the followup suggestion feature without sweeping unrelated work
 - [x] Make completion attribution depend on reliable successful assistant-output state rather than a buffer that may already have been flushed.
 - [x] Ensure error, cancellation, interruption, abort, and empty-output paths clear pending attribution and never increment completion counts.
 
-## Priority 2: command and lifecycle consistency (blocked on P3 paths)
+## Priority 2: command and lifecycle consistency
 
-- [ ] Make `/followups status` report useful bounded state: current/history counts, usage count, and lifecycle counts (plus storage location).
-- [ ] Make keyboard and slash-command clear operations have identical semantics — known gap: keybinding `clearFollowupUsage` clears only in-memory counts, `/followups clear-usage` also deletes the persisted file.
-- [ ] Ensure clear operations clear all relevant lifecycle state and durable state.
-- [ ] Add explicit tests for current/history keyboard and mouse selection.
+- [x] `/followups status` reports real bounded state: current/saved/usage counts, top-5 lifecycle rows, and storage location (`App::followup_status_report`).
+- [x] Keyboard and slash-command clear operations share identical semantics via `App::clear_followups` (in-memory lists, lifecycle counts, persisted files, md mirror).
+- [x] Clear operations clear all relevant lifecycle + durable state.
+- [x] Explicit tests for current/history keyboard + mouse selection; also fixed Down-from-no-selection skipping the first followup.
 
 ## Priority 3: persistence and privacy (DECIDED: project-scoped, .clawde/ in project root)
 

@@ -166,6 +166,9 @@ pub enum CommandResult {
     ClearConversation,
     /// Clear followup history, usage, or both in the active TUI session.
     ClearFollowups { history: bool, usage: bool },
+    /// Report live followup state (counts, lifecycle, storage location).
+    /// Rendered by the TUI from its own state.
+    FollowupStatus,
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
     /// Load a previously saved session into the live REPL.
@@ -1003,12 +1006,19 @@ impl SlashCommand for FollowupsCommand {
     }
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         match args.trim() {
-            "" | "status" => CommandResult::Message(
-                "Followup data is managed by the TUI. Use clear-history, clear-usage, or clear-all.".into(),
-            ),
-            "clear-history" => CommandResult::ClearFollowups { history: true, usage: false },
-            "clear-usage" => CommandResult::ClearFollowups { history: false, usage: true },
-            "clear-all" => CommandResult::ClearFollowups { history: true, usage: true },
+            "" | "status" => CommandResult::FollowupStatus,
+            "clear-history" => CommandResult::ClearFollowups {
+                history: true,
+                usage: false,
+            },
+            "clear-usage" => CommandResult::ClearFollowups {
+                history: false,
+                usage: true,
+            },
+            "clear-all" => CommandResult::ClearFollowups {
+                history: true,
+                usage: true,
+            },
             other => CommandResult::Error(format!("Unknown followups action: {other}")),
         }
     }
