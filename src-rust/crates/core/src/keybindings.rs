@@ -3,6 +3,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Named keybinding presets.
@@ -310,9 +311,13 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== EFFORT ==========
         // Alt+H/L step reasoning up/down along the model's supported ladder
         // (clamped — never wraps). Alt+E opens the visual effort picker.
+        // Tab+H/L are chord-prefix aliases: press Tab then H/L within the
+        // chord window to step effort without releasing to Alt.
         ("alt+h", "effortDecrease", KeyContext::Chat),
         ("alt+l", "effortIncrease", KeyContext::Chat),
         ("alt+e", "openEffort", KeyContext::Chat),
+        ("tab h", "effortDecrease", KeyContext::Chat),
+        ("tab l", "effortIncrease", KeyContext::Chat),
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
         ("enter", "yes", KeyContext::Confirmation),
@@ -699,10 +704,20 @@ impl UserKeybindings {
     }
 }
 
+/// Timeout before a single-key chord prefix fires its standalone action.
+/// If the user presses Tab and then H within this window, the Tab action
+/// is suppressed and the chord fires instead.
+const CHORD_TIMEOUT_MS: u64 = 200;
+
 /// Resolved keybindings (defaults merged with user overrides)
 pub struct KeybindingResolver {
     bindings: Vec<ParsedBinding>,
     pending_chord: Vec<ParsedKeystroke>,
+    /// When a `PendingSingle` was returned, this records when it was emitted.
+    /// `check_timeout()` fires the held action once this exceeds
+    /// [`CHORD_TIMEOUT_MS`].
+    pending_single_action: Option<String>,
+    pending_single_started: Option<Instant>,
 }
 
 impl KeybindingResolver {
@@ -729,11 +744,65 @@ impl KeybindingResolver {
         Self {
             bindings,
             pending_chord: Vec::new(),
+            pending_single_action: None,
+            pending_single_started: None,
         }
     }
 
     /// Process a keystroke, returns action if binding matches
     pub fn process(
+        &mut self,
+        keystroke: ParsedKeystroke,
+        context: &KeyContext,
+    ) -> KeybindingResult {
+        // If we have a pending single-key action (from a previous keystroke
+        // that matched both a single-key binding and a chord prefix), check
+        // whether this keystroke completes the chord.
+        if let Some(held_action) = self.pending_single_action.take() {
+            self.pending_single_started = None;
+            // The pending chord already contains the first keystroke.
+            self.pending_chord.push(keystroke);
+
+            let matches: Vec<&ParsedBinding> = self
+                .bindings
+                .iter()
+                .filter(|b| &b.context == context || b.context == KeyContext::Global)
+                .filter(|b| b.chord.starts_with(self.pending_chord.as_slice()))
+                .collect();
+
+            if !matches.is_empty() {
+                let exact: Vec<&ParsedBinding> = matches
+                    .iter()
+                    .copied()
+                    .filter(|b| b.chord.len() == self.pending_chord.len())
+                    .collect();
+
+                if !exact.is_empty() {
+                    // Chord completed — fire the chord action, discard held.
+                    let binding = exact.last().unwrap();
+                    self.pending_chord.clear();
+                    return match &binding.action {
+                        Some(action) => KeybindingResult::Action(action.clone()),
+                        None => KeybindingResult::Unbound,
+                    };
+                }
+                // Longer chord in progress
+                return KeybindingResult::Pending;
+            }
+
+            // Keystroke did not complete any chord — fire the held single-key
+            // action.  The chord timeout expired or the second key was
+            // unrelated; treat the original key as a standalone press.
+            self.pending_chord.clear();
+            return KeybindingResult::Action(held_action);
+        }
+
+        self.process_fresh(keystroke, context)
+    }
+
+    /// Inner dispatch that handles a single keystroke without pending-single
+    /// state.
+    fn process_fresh(
         &mut self,
         keystroke: ParsedKeystroke,
         context: &KeyContext,
@@ -760,6 +829,22 @@ impl KeybindingResolver {
             .collect();
 
         if !exact.is_empty() {
+            // Check if this exact match is ALSO a chord prefix (i.e. there
+            // are longer bindings that start with this chord).  If so, hold
+            // the action so the next keystroke can complete the chord.
+            let is_chord_prefix = matches
+                .iter()
+                .any(|b| b.chord.len() > self.pending_chord.len());
+            if is_chord_prefix {
+                let binding = exact.last().unwrap();
+                if let Some(action) = &binding.action {
+                    self.pending_single_action = Some(action.clone());
+                    self.pending_single_started = Some(Instant::now());
+                    // Don't clear pending_chord — keep it for the next keystroke.
+                    return KeybindingResult::PendingSingle(action.clone());
+                }
+            }
+
             // Last match wins (user overrides)
             let binding = exact.last().unwrap();
             self.pending_chord.clear();
@@ -771,6 +856,26 @@ impl KeybindingResolver {
 
         // Chord in progress
         KeybindingResult::Pending
+    }
+
+    /// Check whether a held single-key action has timed out.
+    ///
+    /// Call this after each keystroke that returned [`KeybindingResult::Pending`]
+    /// or [`KeybindingResult::PendingSingle`].  Returns `Some(action)` when the
+    /// chord window has expired and the single-key action should fire.
+    pub fn check_timeout(&mut self) -> Option<String> {
+        if let (Some(action), Some(started)) =
+            (&self.pending_single_action, self.pending_single_started)
+        {
+            if started.elapsed() >= Duration::from_millis(CHORD_TIMEOUT_MS) {
+                let action = action.clone();
+                self.pending_single_action = None;
+                self.pending_single_started = None;
+                self.pending_chord.clear();
+                return Some(action);
+            }
+        }
+        None
     }
 
     /// Resolve an exact single-key binding without changing pending chord state.
@@ -799,6 +904,16 @@ impl KeybindingResolver {
 
     pub fn cancel_chord(&mut self) {
         self.pending_chord.clear();
+        // A held single-key action is part of the same wait; cancelling the
+        // chord must not leave it behind to fire on a later keystroke.
+        self.pending_single_action = None;
+        self.pending_single_started = None;
+    }
+
+    /// Discard a held single-key action without firing it.
+    pub fn cancel_pending_single(&mut self) {
+        self.pending_single_action = None;
+        self.pending_single_started = None;
     }
 
     pub fn has_pending_chord(&self) -> bool {
@@ -821,6 +936,10 @@ pub enum KeybindingResult {
     Action(String),
     Unbound,
     Pending,
+    /// A single-key action fired, but the key is also a chord prefix.
+    /// The caller should start a short timeout; if the next keystroke
+    /// completes the chord within the window, discard this action.
+    PendingSingle(String),
     NoMatch,
 }
 
@@ -1281,12 +1400,19 @@ mod tests {
         });
         assert_eq!(h.and_then(|b| b.action.as_deref()), Some("prev"));
         assert_eq!(l.and_then(|b| b.action.as_deref()), Some("next"));
-        // No two-key chords: `gg`/`G` would be dead config because the
-        // transcript context is never the active resolver context.
-        assert!(
-            bindings.iter().all(|b| b.chord.len() == 1),
-            "vim preset must only add single-key chords"
-        );
+        // Vim extras must only add single-key chords: `gg`/`G` would be
+        // dead config because the transcript context is never the active
+        // resolver context.  (Default bindings may include multi-key chords
+        // like `tab h` / `tab l` for effort stepping.)
+        for (chord_str, _action, _ctx) in VIM_PRESET_EXTRAS {
+            let chord = parse_chord(chord_str).expect("vim extra must parse");
+            assert_eq!(
+                chord.len(),
+                1,
+                "vim preset extra '{}' must be a single-key chord",
+                chord_str
+            );
+        }
         // No vim bindings may bind a bare letter in Chat context (letters must
         // keep typing into the prompt).  Stock defaults may bind unmodified
         // non-letter keys (up/down/home/enter/tab) in Chat, so only flag
@@ -1464,6 +1590,116 @@ mod tests {
                 assert_eq!(action, "goLineStart", "CMD+Left should map to goLineStart");
             }
             other => panic!("Expected Action(\"goLineStart\"), got {:?}", other),
+        }
+    }
+
+    // ---- Tab+H / Tab+L chord tests ----
+
+    fn ks(key: &str) -> ParsedKeystroke {
+        ParsedKeystroke {
+            key: key.to_string(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            meta: false,
+        }
+    }
+
+    #[test]
+    fn test_tab_h_chord_resolves_to_effort_decrease() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        // Tab pressed → PendingSingle("indent")
+        match resolver.process(ks("tab"), &KeyContext::Chat) {
+            KeybindingResult::PendingSingle(action) => assert_eq!(action, "indent"),
+            other => panic!("Expected PendingSingle, got {:?}", other),
+        }
+        // H completes the chord → effortDecrease
+        match resolver.process(ks("h"), &KeyContext::Chat) {
+            KeybindingResult::Action(action) => assert_eq!(action, "effortDecrease"),
+            other => panic!("Expected Action(effortDecrease), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tab_l_chord_resolves_to_effort_increase() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        match resolver.process(ks("tab"), &KeyContext::Chat) {
+            KeybindingResult::PendingSingle(_) => {}
+            other => panic!("Expected PendingSingle, got {:?}", other),
+        }
+        match resolver.process(ks("l"), &KeyContext::Chat) {
+            KeybindingResult::Action(action) => assert_eq!(action, "effortIncrease"),
+            other => panic!("Expected Action(effortIncrease), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tab_followed_by_unrelated_key_fires_indent() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        match resolver.process(ks("tab"), &KeyContext::Chat) {
+            KeybindingResult::PendingSingle(_) => {}
+            other => panic!("Expected PendingSingle, got {:?}", other),
+        }
+        // Pressing 'a' doesn't complete any chord → fires held indent action
+        match resolver.process(ks("a"), &KeyContext::Chat) {
+            KeybindingResult::Action(action) => assert_eq!(action, "indent"),
+            other => panic!("Expected Action(indent), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tab_timeout_fires_indent() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        match resolver.process(ks("tab"), &KeyContext::Chat) {
+            KeybindingResult::PendingSingle(_) => {}
+            other => panic!("Expected PendingSingle, got {:?}", other),
+        }
+        // Simulate timeout by manually advancing the started time
+        resolver.pending_single_started =
+            Some(Instant::now() - Duration::from_millis(CHORD_TIMEOUT_MS + 1));
+        let action = resolver.check_timeout().expect("timeout should fire");
+        assert_eq!(action, "indent");
+    }
+
+    #[test]
+    fn test_cancel_chord_clears_held_single_action() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        match resolver.process(ks("tab"), &KeyContext::Chat) {
+            KeybindingResult::PendingSingle(_) => {}
+            other => panic!("Expected PendingSingle, got {:?}", other),
+        }
+        // Cancelling the chord (e.g. the Tab-with-suggestions bypass) must
+        // also drop the held action so it cannot fire on a later keystroke.
+        resolver.cancel_chord();
+        assert!(resolver.pending_single_action.is_none());
+        assert!(resolver.pending_single_started.is_none());
+        assert!(!resolver.has_pending_chord());
+        assert!(resolver.check_timeout().is_none());
+        // The next keystroke is processed fresh and never fires the held
+        // indent action.
+        let result = resolver.process(ks("h"), &KeyContext::Chat);
+        assert!(!matches!(result, KeybindingResult::Action(action) if action == "indent"));
+    }
+
+    #[test]
+    fn test_alt_h_still_works_as_effort_decrease() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = ParsedKeystroke {
+            key: "h".to_string(),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            meta: false,
+        };
+        match resolver.process(ks, &KeyContext::Chat) {
+            KeybindingResult::Action(action) => assert_eq!(action, "effortDecrease"),
+            other => panic!("Expected Action(effortDecrease), got {:?}", other),
         }
     }
 }

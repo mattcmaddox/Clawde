@@ -5430,6 +5430,12 @@ async fn run_interactive(
                 }
                 _ => {}
             }
+        } else {
+            // Idle poll ticked with no event: a held chord-prefix key (e.g.
+            // Tab) whose follow-up never arrived fires its single-key action
+            // here, from the poll, rather than on the next keystroke — so a
+            // later key is processed fresh instead of being swallowed.
+            app.fire_pending_keybinding_timeout();
         }
 
         // Handle click on a recent session entry in the welcome screen's right

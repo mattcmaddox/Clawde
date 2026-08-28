@@ -4865,6 +4865,10 @@ impl App {
             || self.is_verifying
             || self.is_compacting
             || self.effort_picker.wants_animation()
+            // A held chord-prefix key (Tab) waits for a follow-up keystroke
+            // within a short window; poll fast so the timeout fires promptly
+            // instead of up to 250 ms late.
+            || self.keybindings.has_pending_chord()
         // Intentionally NOT including `any_modal_open()` here.  Most modals
         // are static forms (onboarding, settings, connect, model picker, …)
         // that don't need 60fps.  The effort picker is the one exception and
@@ -8107,9 +8111,11 @@ impl App {
         }
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             // Before processing, check if a held single-key action has
-            // timed out (e.g. Tab pressed alone, no chord follow-up).
+            // timed out (e.g. Tab pressed alone, no chord follow-up). Fire
+            // it but DO NOT consume this keystroke — it is fresh and must
+            // still be processed normally.
             if let Some(action) = self.keybindings.check_timeout() {
-                return self.handle_keybinding_action(&action);
+                self.handle_keybinding_action(&action);
             }
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
@@ -9167,6 +9173,17 @@ impl App {
         );
         self.last_exit_key_warning = Some(std::time::Instant::now());
         self.exit_key_sequence_start = Some(key_char);
+    }
+
+    /// Fire a held chord-prefix action whose window expired. Called from the
+    /// main loop's idle poll so Tab-alone fires even without a next keystroke,
+    /// and a later keystroke is never swallowed by the timeout.
+    pub fn fire_pending_keybinding_timeout(&mut self) -> bool {
+        if let Some(action) = self.keybindings.check_timeout() {
+            self.handle_keybinding_action(&action);
+            return true;
+        }
+        false
     }
 
     fn handle_keybinding_action(&mut self, action: &str) -> bool {
