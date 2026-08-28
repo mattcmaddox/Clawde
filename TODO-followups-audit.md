@@ -48,16 +48,18 @@ LOCKED by user on 2026-08-28:
 - [x] Missing ≠ zero: counts persist across restarts, so the summary never shows a misleading zero after relaunch; empty stores inject nothing.
 - [x] Summary, markdown mirror, and `/followups status` all read the same sorted lifecycle store (single source of truth).
 
-## Priority 5: verification and cleanup
+## Priority 5: verification and cleanup — DONE (faa8d05, 0.2.78)
 
-- [ ] Add regression tests for wrapping, scrolling, stale row maps, persistence reload, clear parity, and completion lifecycle.
-- [ ] Test Tab chord behavior separately from followup behavior.
-- [ ] Remove unnecessary `allow(dead_code)` annotations and rename inconsistent test identifiers.
-- [ ] Run `cargo fmt --all`.
-- [ ] Run `cargo check --workspace`.
-- [ ] Run `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Run `cargo test --workspace`.
-- [ ] Commit only reviewed files belonging to this remediation.
+- [x] Add regression tests for wrapping, scrolling, stale row maps, persistence reload, clear parity, and completion lifecycle.
+- [x] Test Tab chord behavior separately from followup behavior (committed with the Tab-chord feature, 8a20865).
+- [x] Remove unnecessary `allow(dead_code)` annotations and rename inconsistent test identifiers.
+- [x] Run `cargo fmt --all`.
+- [x] Run `cargo check --workspace`.
+- [x] Run `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Run `cargo test --workspace` (TUI 1,106 passed, 0 failures).
+- [x] Commit only reviewed files belonging to this remediation.
+
+## Immediate implementation order
 
 ## Immediate implementation order
 
