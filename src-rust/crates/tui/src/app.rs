@@ -9675,6 +9675,12 @@ impl App {
                 }
                 false
             }
+            "openModePicker" => {
+                if !self.is_streaming {
+                    self.intercept_slash_command("mode");
+                }
+                false
+            }
             "openSettings" => {
                 self.intercept_slash_command("settings");
                 false
@@ -13493,6 +13499,27 @@ mod tests {
             app.mode_panel.modes.iter().any(|m| m.name == "fast"),
             "built-in presets listed"
         );
+    }
+
+    #[test]
+    fn test_open_mode_picker_keybinding_action() {
+        // Alt+Shift+M (openModePicker) routes to the same picker as bare /mode.
+        let mut app = make_app();
+        assert!(!app.mode_panel.visible);
+        app.handle_keybinding_action("openModePicker");
+        assert!(
+            app.mode_panel.visible,
+            "openModePicker opens the quick-pick"
+        );
+    }
+
+    #[test]
+    fn test_open_mode_picker_blocked_while_streaming() {
+        // Mirror openModelPicker/openEffort: pickers don't open mid-stream.
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.handle_keybinding_action("openModePicker");
+        assert!(!app.mode_panel.visible, "picker suppressed while streaming");
     }
 
     #[test]

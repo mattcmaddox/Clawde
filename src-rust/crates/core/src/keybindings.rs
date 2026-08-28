@@ -296,6 +296,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "scrollDown", KeyContext::Chat),
         // App shortcuts
         ("alt+m", "openModelPicker", KeyContext::Chat),
+        ("alt+shift+m", "openModePicker", KeyContext::Chat),
         ("ctrl+,", "openSettings", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
         // ========== FREE MODE UPSTREAM CYCLE ==========
@@ -1097,6 +1098,24 @@ mod tests {
         assert_eq!(
             find("u").and_then(|b| b.action.as_deref()),
             Some("cycleFreeUpstream")
+        );
+    }
+
+    #[test]
+    fn test_mode_picker_binding_on_alt_shift_m() {
+        // Alt+Shift+M opens the mode quick-pick (Alt+M is the model picker,
+        // so the mode picker is the shifted twin).
+        let bindings = default_bindings();
+        let binding = bindings.iter().find(|b| {
+            b.chord.len() == 1
+                && b.chord[0].alt
+                && b.chord[0].shift
+                && b.chord[0].key == "m"
+                && b.context == KeyContext::Chat
+        });
+        assert_eq!(
+            binding.and_then(|b| b.action.as_deref()),
+            Some("openModePicker")
         );
     }
 

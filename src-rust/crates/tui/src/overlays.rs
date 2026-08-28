@@ -2392,6 +2392,7 @@ pub fn render_keybindings_overlay(
             "scrollUp" => "Scroll up",
             "scrollDown" => "Scroll down",
             "openModelPicker" => "Model picker",
+            "openModePicker" => "Mode picker",
             "openCommandPalette" => "Command palette",
             _ => &action,
         };
