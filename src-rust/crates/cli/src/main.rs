@@ -3143,19 +3143,34 @@ fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::Conti
     clawde_query::ContinuationMode::Default
 }
 
-/// Rebind session-scoped autonomy state after a session change (`/new`,
-/// resume, or opencode-style swap). The state is bound to a session id and
-/// fails closed on mismatch; an explicit reset prevents stale queue items
-/// from leaking into the new session's review surface.
+/// True when a session swap actually switches sessions. A self-resume (next
+/// id equals the current id) is not a swap: tearing down the session we are
+/// staying in would kill its live REPL interpreters and wipe its shell state
+/// (cwd/env) for no benefit.
+fn session_swap_changes_sessions(current: &str, next: &str) -> bool {
+    current != next
+}
+
 /// Tear down per-session process/state owned by the *previous* session before
 /// swapping in a new session id (`/new`, session resume). Without this, the
 /// old session's REPL interpreters and shell state (cwd/env) leak until the
 /// process exits, because the process-exit teardown only covers the final id.
-async fn teardown_previous_session(tool_ctx: &ToolContext) {
+///
+/// Self-guarding: resuming the session we are already in (`next_session_id`
+/// equals the current id) is a no-op. Callers must invoke this BEFORE
+/// overwriting `tool_ctx.session_id`.
+async fn teardown_previous_session(tool_ctx: &ToolContext, next_session_id: &str) {
     let previous = tool_ctx.session_id.clone();
+    if !session_swap_changes_sessions(&previous, next_session_id) {
+        return;
+    }
     clawde_tools::teardown_session(&previous).await;
 }
 
+/// Rebind session-scoped autonomy state after a session change (`/new`,
+/// resume, or opencode-style swap). The state is bound to a session id and
+/// fails closed on mismatch; an explicit reset prevents stale queue items
+/// from leaking into the new session's review surface.
 fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
     if let Some(autonomy) = &tool_ctx.autonomy {
         let mut state = autonomy.lock();
@@ -4249,7 +4264,7 @@ async fn run_interactive(
                                     // Release the previous session's REPL
                                     // interpreters + shell state before adopting
                                     // the brand-new id.
-                                    teardown_previous_session(&tool_ctx).await;
+                                    teardown_previous_session(&tool_ctx, &session.id).await;
                                     tool_ctx.session_id = session.id.clone();
                                     reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     cmd_ctx.session_id = session.id.clone();
@@ -4356,7 +4371,7 @@ async fn run_interactive(
                                     // Release the current session's REPL
                                     // interpreters + shell state before
                                     // adopting the resumed session id.
-                                    teardown_previous_session(&tool_ctx).await;
+                                    teardown_previous_session(&tool_ctx, &session.id).await;
                                     tool_ctx.session_id = session.id.clone();
                                     reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -5529,7 +5544,7 @@ async fn run_interactive(
                         app.model_name = session.model.clone();
                         // Release the current session's REPL interpreters +
                         // shell state before adopting the resumed session id.
-                        teardown_previous_session(&tool_ctx).await;
+                        teardown_previous_session(&tool_ctx, &session.id).await;
                         tool_ctx.session_id = session.id.clone();
                         reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
@@ -5578,7 +5593,7 @@ async fn run_interactive(
                         app.model_name = session.model.clone();
                         // Release the current session's REPL interpreters +
                         // shell state before adopting the resumed session id.
-                        teardown_previous_session(&tool_ctx).await;
+                        teardown_previous_session(&tool_ctx, &session.id).await;
                         tool_ctx.session_id = session.id.clone();
                         reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
@@ -8240,5 +8255,25 @@ mod continuation_mode_tests {
                 clawde_query::ContinuationMode::SemanticVerify(_)
             ));
         });
+    }
+}
+
+#[cfg(test)]
+mod session_swap_tests {
+    use super::session_swap_changes_sessions;
+
+    #[test]
+    fn self_resume_is_not_a_swap() {
+        // Resuming the session we are already in must NOT tear anything down:
+        // teardown_previous_session relies on this guard to keep a self-resume
+        // from killing the active session's REPL interpreters and shell state.
+        assert!(!session_swap_changes_sessions("session-a", "session-a"));
+    }
+
+    #[test]
+    fn different_session_is_a_swap() {
+        assert!(session_swap_changes_sessions("session-a", "session-b"));
+        // /new always generates a fresh id, so it always counts as a swap.
+        assert!(session_swap_changes_sessions("", "session-c"));
     }
 }

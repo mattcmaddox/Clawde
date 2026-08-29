@@ -32,13 +32,21 @@ use tracing::debug;
 // Session registry
 // ---------------------------------------------------------------------------
 
-struct ReplSession {
-    // We hold the Child handle so that the process is not killed when the
-    // session is dropped.  We don't read from it directly after spawn, but it
-    // is needed for session-end teardown (`kill_repl_sessions`).
-    child: Child,
+/// The interpreter's stdin/stdout pipes. Guarded by its own mutex so an
+/// in-flight command's read loop (which holds the lock across `.await` for
+/// the whole read timeout) never contends with session teardown.
+struct ReplStreams {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct ReplSession {
+    // Process handle, guarded by its own mutex. Nothing but teardown ever
+    // locks it, so `kill_repl_sessions` kills the interpreter immediately
+    // without waiting on an in-flight command. The two locks are deliberately
+    // split so teardown can never block on a read loop awaiting up to 30s.
+    child: Mutex<Child>,
+    streams: Mutex<ReplStreams>,
 }
 
 /// Key: (session_id, language)
@@ -49,7 +57,7 @@ struct ReplSession {
 // leftover interpreters for a finished session, so we do not attempt it here.
 // When such a hook exists, drain REPL_SESSIONS for the ending session_id and
 // kill each child. The security gate above is the priority for #209.
-static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<Mutex<ReplSession>>>>> =
+static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<ReplSession>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Kill every live interpreter owned by `session_id` and drop its entry.
@@ -66,12 +74,14 @@ pub async fn kill_repl_sessions(session_id: &str) {
 
     for key in keys {
         if let Some((_, session)) = REPL_SESSIONS.remove(&key) {
-            // Await the lock rather than try_lock: a REPL command may still be
-            // holding it, and we must always kill the interpreter rather than
-            // silently leak it. kill() sends the signal then reaps the child
-            // (matching pty_bash / run_tests / powershell).
-            let mut guard = session.lock().await;
-            let _ = guard.child.kill().await;
+            // Lock only the child handle: an in-flight command may be holding
+            // the `streams` lock (its read loop awaits up to the 30s timeout),
+            // but nothing else ever locks `child`, so this acquires
+            // immediately and we always kill — no try_lock, no silent leak.
+            // kill() sends the signal then reaps the child (matching
+            // pty_bash / run_tests / powershell).
+            let mut guard = session.child.lock().await;
+            let _ = guard.kill().await;
         }
     }
 }
@@ -122,7 +132,7 @@ fn wrap_code(language: &str, code: &str) -> String {
 async fn get_or_spawn_session(
     session_id: &str,
     language: &str,
-) -> Result<Arc<Mutex<ReplSession>>, String> {
+) -> Result<Arc<ReplSession>, String> {
     let key = (session_id.to_string(), language.to_string());
 
     // Fast path: session already exists
@@ -145,11 +155,13 @@ async fn get_or_spawn_session(
     let stdin = child.stdin.take().ok_or("No stdin")?;
     let stdout = child.stdout.take().ok_or("No stdout")?;
 
-    let session = Arc::new(Mutex::new(ReplSession {
-        child,
-        stdin,
-        stdout: BufReader::new(stdout),
-    }));
+    let session = Arc::new(ReplSession {
+        child: Mutex::new(child),
+        streams: Mutex::new(ReplStreams {
+            stdin,
+            stdout: BufReader::new(stdout),
+        }),
+    });
 
     REPL_SESSIONS.insert(key, session.clone());
     Ok(session)
@@ -157,13 +169,13 @@ async fn get_or_spawn_session(
 
 /// Execute code in a session, returning collected output up to the sentinel.
 async fn run_in_session(
-    session: &Arc<Mutex<ReplSession>>,
+    session: &Arc<ReplSession>,
     language: &str,
     code: &str,
 ) -> Result<String, String> {
     let wrapped = wrap_code(language, code);
 
-    let mut guard = session.lock().await;
+    let mut guard = session.streams.lock().await;
     guard
         .stdin
         .write_all(wrapped.as_bytes())
@@ -475,10 +487,38 @@ mod tests {
 
         // Holding the same Arc the tool had, the child must now be reaped:
         // try_wait() returns the exit status instead of None.
-        let mut guard = session.lock().await;
+        let mut guard = session.child.lock().await;
         assert!(
-            guard.child.try_wait().unwrap().is_some(),
+            guard.try_wait().unwrap().is_some(),
             "interpreter must actually be terminated by teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_repl_sessions_does_not_block_on_inflight_command() {
+        // Regression test for the split-lock design: an in-flight command
+        // holds the `streams` lock across its read timeout, but teardown only
+        // touches the `child` lock, so killing must never wait on the command.
+        let session_id = "repl-kill-nonblock-test";
+        let session = get_or_spawn_session(session_id, "python").await.unwrap();
+
+        // Simulate an in-flight command that is mid-read (holds the streams
+        // lock) while teardown runs.
+        let _streams_guard = session.streams.lock().await;
+
+        super::kill_repl_sessions(session_id).await;
+
+        assert!(
+            REPL_SESSIONS
+                .get(&(session_id.to_string(), "python".to_string()))
+                .is_none(),
+            "teardown must remove the session from the registry"
+        );
+
+        let mut guard = session.child.lock().await;
+        assert!(
+            guard.try_wait().unwrap().is_some(),
+            "interpreter must be killed even while a command holds the streams lock"
         );
     }
 }
