@@ -5,7 +5,7 @@
 
 use clawde_core::types::Message;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Correction patterns that indicate the user is correcting the agent.
 /// Based on Claude Code's auto-memory system with more specific patterns
@@ -109,33 +109,6 @@ pub async fn save_correction_memory(memory: &str, working_dir: &Path) -> anyhow:
 
     info!(filename, "Saved correction memory");
     Ok(())
-}
-
-/// Process a user message for correction detection and memory saving.
-#[allow(dead_code)]
-pub async fn process_correction(
-    user_message: &Message,
-    agent_response: Option<&Message>,
-    working_dir: &Path,
-) -> bool {
-    if !is_correction(user_message, agent_response) {
-        return false;
-    }
-
-    if let Some(memory) = extract_correction_memory(user_message, agent_response) {
-        match save_correction_memory(&memory, working_dir).await {
-            Ok(()) => {
-                debug!("Saved correction memory");
-                true
-            }
-            Err(e) => {
-                debug!("Failed to save correction memory: {}", e);
-                false
-            }
-        }
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]

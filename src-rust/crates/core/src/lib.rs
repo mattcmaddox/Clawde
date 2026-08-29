@@ -71,10 +71,6 @@ pub use spinner::{
     sample_completion_verb, sample_spinner_verb, SPINNER_VERBS, TURN_COMPLETION_VERBS,
 };
 
-// Remote session sync and cloud session API (T3-1, T3-2).
-pub mod cloud_session;
-pub mod remote_session;
-
 // AGENTS.md hierarchical memory loading (T4-1).
 pub mod claudemd;
 
@@ -93,9 +89,6 @@ pub use goal::{
     goal_continuation_message, goal_kickoff_message, goal_system_prompt_addendum, goals_enabled,
     Goal, GoalError, GoalStatus, GoalStore, MAX_GOAL_TURNS, MAX_OBJECTIVE_CHARS,
 };
-
-// Feature flag management via GrowthBook.
-pub mod feature_flags;
 
 // MCP resource prompt template rendering with variable substitution.
 pub mod mcp_templates;
@@ -159,7 +152,6 @@ pub use plan::{
 // discover nested routes without introducing a commands↔TUI dependency cycle.
 pub mod slash_commands;
 pub use cost::CostTracker;
-pub use feature_flags::FeatureFlagManager;
 pub use history::ConversationSession;
 pub use paths::clawde_home;
 pub use permissions::{
@@ -6702,9 +6694,7 @@ pub mod output_styles;
 pub mod paths;
 pub mod prompt_history;
 pub mod ps_classifier;
-pub mod remote_settings;
 pub mod session_tracing;
-pub mod settings_sync;
 pub mod system_prompt;
 pub mod team_memory_sync;
 pub mod tips;

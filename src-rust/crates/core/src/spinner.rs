@@ -3,8 +3,6 @@
 /// Categorised into two groups:
 /// 1. Cat-related — actions cats literally do
 /// 2. Possibly cat-related — could pass as a cat behaviour with a creative eye
-///
-/// Retired non-cat verbs live in `spinner_verbs_backup.rs`.
 pub const SPINNER_VERBS: &[&str] = &[
     // ── Cat-related ───────────────────────────────────────────────
     "Basking",

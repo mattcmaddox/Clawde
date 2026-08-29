@@ -7061,6 +7061,12 @@ async fn run_interactive(
     let mut guard = lsp_mgr.lock().await;
     guard.shutdown_all().await;
 
+    // Session teardown: kill leftover REPL interpreters and drop persisted
+    // shell state (cwd + env) for the ending session so nothing leaks across
+    // an exit or `--resume` of the same id. Shadow snapshots are intentionally
+    // untouched (they are keyed by working_dir and shared across sessions).
+    clawde_tools::teardown_session(&tool_ctx.session_id);
+
     restore_terminal(&mut terminal)?;
     Ok(())
 }

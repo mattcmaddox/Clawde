@@ -34,8 +34,8 @@ use tracing::debug;
 
 struct ReplSession {
     // We hold the Child handle so that the process is not killed when the
-    // session is dropped.  We don't read from it directly after spawn.
-    #[allow(dead_code)]
+    // session is dropped.  We don't read from it directly after spawn, but it
+    // is needed for session-end teardown (`kill_repl_sessions`).
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -51,6 +51,30 @@ struct ReplSession {
 // kill each child. The security gate above is the priority for #209.
 static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<Mutex<ReplSession>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Kill every live interpreter owned by `session_id` and drop its entry.
+///
+/// Called on session-end teardown so a finished session never leaks an
+/// orphaned interpreter process. Safe to call repeatedly / with unknown ids.
+/// #[209]: wires the session-end hook the registry comment below asks for.
+pub fn kill_repl_sessions(session_id: &str) {
+    let keys: Vec<(String, String)> = REPL_SESSIONS
+        .iter()
+        .filter(|ref_multi| ref_multi.key().0 == session_id)
+        .map(|ref_multi| ref_multi.key().clone())
+        .collect();
+
+    for key in keys {
+        if let Some((_, session)) = REPL_SESSIONS.remove(&key) {
+            tokio::spawn(async move {
+                if let Ok(mut guard) = session.try_lock() {
+                    let _ = guard.child.start_kill();
+                    let _ = guard.child.wait().await;
+                }
+            });
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Sentinel values

@@ -276,100 +276,6 @@ pub fn group_messages_for_compact(messages: &[Message]) -> Vec<MessageGroup> {
 }
 
 // ---------------------------------------------------------------------------
-// MicroCompact configuration & logic
-// ---------------------------------------------------------------------------
-
-/// Configuration for micro-compaction (partial, proactive summarisation).
-#[derive(Debug, Clone)]
-pub struct MicroCompactConfig {
-    /// Compact when context is this fraction full (e.g. 0.75 = 75 %).
-    pub trigger_threshold: f32,
-    /// Always keep this many recent messages verbatim.
-    pub keep_recent_messages: usize,
-    /// Target token count for the generated summary.
-    pub summary_target_tokens: usize,
-}
-
-impl Default for MicroCompactConfig {
-    fn default() -> Self {
-        Self {
-            trigger_threshold: 0.75,
-            keep_recent_messages: 10,
-            summary_target_tokens: 2048,
-        }
-    }
-}
-
-/// Attempt a micro-compact if the context is above `config.trigger_threshold`.
-///
-/// Returns `Ok(Some(new_messages))` when compaction occurred, `Ok(None)` when
-/// no compaction was needed or the provider failed, and `Err(Cancelled)` when
-/// the caller interrupted the operation.
-pub async fn micro_compact_if_needed(
-    provider: &dyn LlmProvider,
-    messages: &[Message],
-    input_tokens: u64,
-    model: &str,
-    config: &MicroCompactConfig,
-    cancel: &CancellationToken,
-) -> Result<Option<Vec<Message>>, ClaudeError> {
-    if cancel.is_cancelled() {
-        return Err(ClaudeError::Cancelled);
-    }
-
-    let window = context_window_for_model(model);
-    let pct_used = input_tokens as f64 / window as f64;
-
-    if pct_used < config.trigger_threshold as f64 {
-        return Ok(None);
-    }
-
-    let total = messages.len();
-    if total <= config.keep_recent_messages + 1 {
-        return Ok(None);
-    }
-
-    let split_at = total.saturating_sub(config.keep_recent_messages);
-
-    info!(
-        input_tokens,
-        pct_used = format!("{:.1}%", pct_used * 100.0),
-        split_at,
-        keep = config.keep_recent_messages,
-        "MicroCompact triggered"
-    );
-
-    let target_tokens = config.summary_target_tokens as u32;
-    // Micro-compact is not yet wired to a live QueryConfig; it runs with no
-    // effort override (provider/model default) until a caller supplies one.
-    match summarise_head(
-        provider,
-        messages,
-        split_at,
-        model,
-        target_tokens,
-        None,
-        cancel,
-    )
-    .await
-    {
-        Ok(new_msgs) => {
-            info!(
-                original = total,
-                compacted = new_msgs.len(),
-                "MicroCompact complete"
-            );
-            Ok(Some(new_msgs))
-        }
-        Err(ClaudeError::Cancelled) => Err(ClaudeError::Cancelled),
-        Err(e) => {
-            warn!(error = %e, "MicroCompact failed");
-            Ok(None)
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Compaction prompt (matches TypeScript prompt.ts)
 // ---------------------------------------------------------------------------
 
@@ -1303,27 +1209,6 @@ pub async fn compact_conversation(
 
 /// Compact conversation with memory extraction before compaction.
 /// This ensures important facts are preserved before the context is summarized.
-#[allow(dead_code)]
-pub async fn compact_with_memory_extraction(
-    provider: &dyn LlmProvider,
-    messages: &[Message],
-    model: &str,
-    effort: Option<EffortLevel>,
-    cancel: &CancellationToken,
-    _working_dir: &std::path::Path,
-    auto_memory_enabled: bool,
-) -> Result<Vec<Message>, ClaudeError> {
-    // Extract memories before compaction if enabled
-    // Note: Memory extraction requires an API client, which is not available here.
-    // The extraction will be handled by the caller (CLI) after compaction.
-    if auto_memory_enabled && messages.len() >= 10 {
-        info!("Memory extraction recommended before compaction");
-    }
-
-    // Proceed with normal compaction
-    compact_conversation(provider, messages, model, effort, cancel).await
-}
-
 /// Compact on resume using Aider's recursive summarization approach.
 /// This is used when resuming a stale session to reduce token usage.
 #[allow(dead_code)]

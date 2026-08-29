@@ -47,11 +47,10 @@ pub use compact::{
     calculate_token_warning_state_for_window, collapse_read_tool_results, collapse_search_results,
     compact_conversation, context_collapse, context_window_for_model, estimate_context_tokens,
     format_compact_summary, get_compact_prompt, group_messages_for_compact,
-    micro_compact_if_needed, prune_oversized_tool_results, reactive_compact,
-    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, should_prune, snip_compact, AutoCompactState, CompactResult,
-    CompactTrigger, MessageGroup, MicroCompactConfig, PruneOutcome, TokenWarningState,
-    ToolResultPrunerConfig,
+    prune_oversized_tool_results, reactive_compact, resolve_context_window, should_auto_compact,
+    should_auto_compact_for_window, should_compact, should_context_collapse, should_prune,
+    snip_compact, AutoCompactState, CompactResult, CompactTrigger, MessageGroup, PruneOutcome,
+    TokenWarningState, ToolResultPrunerConfig,
 };
 pub use continuation::{
     parse_semantic_verify_response, semantic_read_only_tool_names, ContinuationDecision,

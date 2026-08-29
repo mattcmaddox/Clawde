@@ -100,7 +100,7 @@ pub use notebook_edit::NotebookEditTool;
 pub use powershell::PowerShellTool;
 pub use pty_bash::PtyBashTool;
 pub use remote_trigger::RemoteTriggerTool;
-pub use repl_tool::ReplTool;
+pub use repl_tool::{kill_repl_sessions, ReplTool};
 pub use resolve_memory_conflict::ResolveMemoryConflictTool;
 pub use run_lints::RunLintsTool;
 pub use run_tests::RunTestsTool;
@@ -364,24 +364,21 @@ pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellStat
 }
 
 /// Remove the shell state for a session (e.g. when the session ends).
-#[allow(dead_code)]
 pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATE_REGISTRY.remove(session_id);
 }
 
-/// Return the `ShadowSnapshot` for `working_dir`, creating it on first call.
-/// Returns `None` when git is unavailable or the directory is not in a git repo.
-#[allow(dead_code)]
-pub fn session_shadow(
-    working_dir: &std::path::Path,
-) -> Option<Arc<clawde_core::snapshot::ShadowSnapshot>> {
-    clawde_core::snapshot::get_or_create(working_dir)
-}
-
-/// Drop the cached shadow snapshot for `working_dir` (e.g. when a session ends).
-#[allow(dead_code)]
-pub fn clear_session_shadow(working_dir: &std::path::Path) {
-    clawde_core::snapshot::remove(working_dir);
+/// Best-effort teardown of all per-session process/state held by the tools
+/// crate: kill leftover REPL interpreters and drop the persisted shell state
+/// (cwd + exported env) for `session_id`.
+///
+/// Deliberately does NOT touch shadow snapshots: those are keyed by
+/// `working_dir` and shared across sessions (`/undo`, `/revert`, `/checkpoints`),
+/// so clearing them on one session's exit would destroy another session's
+/// rollback state.
+pub fn teardown_session(session_id: &str) {
+    kill_repl_sessions(session_id);
+    clear_session_shell_state(session_id);
 }
 
 /// Write `contents` to `path` atomically: write to a temp file in the same
