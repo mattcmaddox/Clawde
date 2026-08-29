@@ -376,8 +376,8 @@ pub fn clear_session_shell_state(session_id: &str) {
 /// `working_dir` and shared across sessions (`/undo`, `/revert`, `/checkpoints`),
 /// so clearing them on one session's exit would destroy another session's
 /// rollback state.
-pub fn teardown_session(session_id: &str) {
-    kill_repl_sessions(session_id);
+pub async fn teardown_session(session_id: &str) {
+    kill_repl_sessions(session_id).await;
     clear_session_shell_state(session_id);
 }
 

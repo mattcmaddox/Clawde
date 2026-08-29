@@ -57,7 +57,7 @@ static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<Mutex<ReplSession>>
 /// Called on session-end teardown so a finished session never leaks an
 /// orphaned interpreter process. Safe to call repeatedly / with unknown ids.
 /// #[209]: wires the session-end hook the registry comment below asks for.
-pub fn kill_repl_sessions(session_id: &str) {
+pub async fn kill_repl_sessions(session_id: &str) {
     let keys: Vec<(String, String)> = REPL_SESSIONS
         .iter()
         .filter(|ref_multi| ref_multi.key().0 == session_id)
@@ -66,12 +66,12 @@ pub fn kill_repl_sessions(session_id: &str) {
 
     for key in keys {
         if let Some((_, session)) = REPL_SESSIONS.remove(&key) {
-            tokio::spawn(async move {
-                if let Ok(mut guard) = session.try_lock() {
-                    let _ = guard.child.start_kill();
-                    let _ = guard.child.wait().await;
-                }
-            });
+            // Await the lock rather than try_lock: a REPL command may still be
+            // holding it, and we must always kill the interpreter rather than
+            // silently leak it. kill() sends the signal then reaps the child
+            // (matching pty_bash / run_tests / powershell).
+            let mut guard = session.lock().await;
+            let _ = guard.child.kill().await;
         }
     }
 }
@@ -445,6 +445,40 @@ mod tests {
                 .get(&("repl-critical-test".to_string(), "bash".to_string()))
                 .is_none(),
             "no bash REPL session must be spawned for a Critical command"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_repl_sessions_terminates_spawned_interpreter() {
+        // Spawn a real interpreter through the registry, then assert that
+        // teardown both removes the map entry AND actually reaps the child.
+        // Regression test for the fire-and-forget `tokio::spawn` that returned
+        // before the kill ran (resulting in a leaked orphaned interpreter).
+        let session_id = "repl-kill-test";
+        let session = get_or_spawn_session(session_id, "python").await.unwrap();
+
+        assert!(
+            REPL_SESSIONS
+                .get(&(session_id.to_string(), "python".to_string()))
+                .is_some(),
+            "interpreter must be registered before teardown"
+        );
+
+        super::kill_repl_sessions(session_id).await;
+
+        assert!(
+            REPL_SESSIONS
+                .get(&(session_id.to_string(), "python".to_string()))
+                .is_none(),
+            "teardown must remove the session from the registry"
+        );
+
+        // Holding the same Arc the tool had, the child must now be reaped:
+        // try_wait() returns the exit status instead of None.
+        let mut guard = session.lock().await;
+        assert!(
+            guard.child.try_wait().unwrap().is_some(),
+            "interpreter must actually be terminated by teardown"
         );
     }
 }

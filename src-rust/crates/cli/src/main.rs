@@ -3147,6 +3147,15 @@ fn derive_continuation_mode(config: &clawde_core::Config) -> clawde_query::Conti
 /// resume, or opencode-style swap). The state is bound to a session id and
 /// fails closed on mismatch; an explicit reset prevents stale queue items
 /// from leaking into the new session's review surface.
+/// Tear down per-session process/state owned by the *previous* session before
+/// swapping in a new session id (`/new`, session resume). Without this, the
+/// old session's REPL interpreters and shell state (cwd/env) leak until the
+/// process exits, because the process-exit teardown only covers the final id.
+async fn teardown_previous_session(tool_ctx: &ToolContext) {
+    let previous = tool_ctx.session_id.clone();
+    clawde_tools::teardown_session(&previous).await;
+}
+
 fn reset_autonomy_for_session(tool_ctx: &mut ToolContext, session_id: &str) {
     if let Some(autonomy) = &tool_ctx.autonomy {
         let mut state = autonomy.lock();
@@ -4237,6 +4246,10 @@ async fn run_interactive(
                                     session.effort = current_effort;
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    // Release the previous session's REPL
+                                    // interpreters + shell state before adopting
+                                    // the brand-new id.
+                                    teardown_previous_session(&tool_ctx).await;
                                     tool_ctx.session_id = session.id.clone();
                                     reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     cmd_ctx.session_id = session.id.clone();
@@ -4340,6 +4353,10 @@ async fn run_interactive(
                                     app.config.model = Some(session.model.clone());
                                     tool_ctx.config.model = Some(session.model.clone());
                                     app.model_name = session.model.clone();
+                                    // Release the current session's REPL
+                                    // interpreters + shell state before
+                                    // adopting the resumed session id.
+                                    teardown_previous_session(&tool_ctx).await;
                                     tool_ctx.session_id = session.id.clone();
                                     reset_autonomy_for_session(&mut tool_ctx, &session.id);
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -5510,6 +5527,9 @@ async fn run_interactive(
                         app.config.model = Some(session.model.clone());
                         tool_ctx.config.model = Some(session.model.clone());
                         app.model_name = session.model.clone();
+                        // Release the current session's REPL interpreters +
+                        // shell state before adopting the resumed session id.
+                        teardown_previous_session(&tool_ctx).await;
                         tool_ctx.session_id = session.id.clone();
                         reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
@@ -5556,6 +5576,9 @@ async fn run_interactive(
                         app.config.model = Some(session.model.clone());
                         tool_ctx.config.model = Some(session.model.clone());
                         app.model_name = session.model.clone();
+                        // Release the current session's REPL interpreters +
+                        // shell state before adopting the resumed session id.
+                        teardown_previous_session(&tool_ctx).await;
                         tool_ctx.session_id = session.id.clone();
                         reset_autonomy_for_session(&mut tool_ctx, &session.id);
                         app.session_id = session.id.clone();
@@ -7063,9 +7086,9 @@ async fn run_interactive(
 
     // Session teardown: kill leftover REPL interpreters and drop persisted
     // shell state (cwd + env) for the ending session so nothing leaks across
-    // an exit or `--resume` of the same id. Shadow snapshots are intentionally
-    // untouched (they are keyed by working_dir and shared across sessions).
-    clawde_tools::teardown_session(&tool_ctx.session_id);
+    // an exit. Shadow snapshots are intentionally untouched (they are keyed
+    // by working_dir and shared across sessions).
+    clawde_tools::teardown_session(&tool_ctx.session_id).await;
 
     restore_terminal(&mut terminal)?;
     Ok(())
