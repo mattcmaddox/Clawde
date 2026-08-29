@@ -51,12 +51,13 @@ struct ReplSession {
 
 /// Key: (session_id, language)
 ///
-// TODO(#209): interpreter processes are intentionally kept alive across tool
-// calls and are only removed here when they die or on the next call. There is
-// currently no session-end teardown hook wired into the app that could kill
-// leftover interpreters for a finished session, so we do not attempt it here.
-// When such a hook exists, drain REPL_SESSIONS for the ending session_id and
-// kill each child. The security gate above is the priority for #209.
+/// Interpreter processes are intentionally kept alive across tool calls so
+/// variables/state persist. Entries are removed when an interpreter dies, on
+/// the error path of the next call, or by `kill_repl_sessions` — which is
+/// wired into the app's session-end teardown (`teardown_session` in lib.rs),
+/// so a finished session's interpreters are killed and never leak. The
+/// permission gate in `execute` (#209) runs before any interpreter is
+/// spawned.
 static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<ReplSession>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -64,7 +65,12 @@ static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<ReplSession>>>> =
 ///
 /// Called on session-end teardown so a finished session never leaks an
 /// orphaned interpreter process. Safe to call repeatedly / with unknown ids.
-/// #[209]: wires the session-end hook the registry comment below asks for.
+///
+/// Snapshot-based: entries are collected up front, so an interpreter spawned
+/// concurrently with this call (after the snapshot) survives this pass. Not
+/// reachable in the current flows — teardown runs between user turns (`/new`,
+/// resume) or after the main loop ends (exit) — but a future caller that
+/// tears down while tools can be mid-flight must account for it.
 pub async fn kill_repl_sessions(session_id: &str) {
     let keys: Vec<(String, String)> = REPL_SESSIONS
         .iter()
@@ -333,9 +339,18 @@ impl Tool for ReplTool {
         match run_in_session(&session, &language, &params.code).await {
             Ok(output) => ToolResult::success(output),
             Err(e) => {
-                // Remove the dead session so next call spawns a fresh one
+                // Drop the dead/timed-out session so the next call spawns a
+                // fresh interpreter — and best-effort kill the old one. On a
+                // read timeout the interpreter is still alive, and dropping
+                // the Child handle without kill() would orphan a live
+                // process; killing an already-dead child is a no-op. The
+                // entry is removed atomically, so we only ever touch the
+                // session this call ran on, never a freshly spawned one.
                 let key = (ctx.session_id.clone(), language.clone());
-                REPL_SESSIONS.remove(&key);
+                if let Some((_, session)) = REPL_SESSIONS.remove(&key) {
+                    let mut guard = session.child.lock().await;
+                    let _ = guard.kill().await;
+                }
                 ToolResult::error(format!("REPL error: {}", e))
             }
         }
@@ -506,7 +521,14 @@ mod tests {
         // lock) while teardown runs.
         let _streams_guard = session.streams.lock().await;
 
-        super::kill_repl_sessions(session_id).await;
+        // Bound the teardown so a regression to lock contention fails loudly
+        // instead of deadlocking the test runtime forever.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::kill_repl_sessions(session_id),
+        )
+        .await
+        .expect("teardown must not block on an in-flight command's streams lock");
 
         assert!(
             REPL_SESSIONS
