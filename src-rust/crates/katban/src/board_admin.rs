@@ -19,10 +19,16 @@ use crate::guest::{apply_failed_attempt, hash, now_secs, random_hex, Device, Loc
 use crate::guest_server::MAX_DEVICES_PER_LINK;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 pub const ADMIN_VERSION: u32 = 1;
+/// Sentinel `--run all`: when `AdminStore::runner_projects` holds exactly
+/// `[RUN_ALL]`, the always-on runner re-resolves the registered project set at
+/// serve time and live-joins newly-registered projects (the refresh path),
+/// rather than pinning a concrete list. Kept here (not in the CLI) so both the
+/// board web server and the CLI interpret the same sentinel.
+pub const RUN_ALL: &str = "all";
 /// Cookie that carries the admin session token. Distinct from the guest cookie.
 pub const ADMIN_COOKIE: &str = "katban_admin";
 /// Session lifetime; sessions are re-minted on each successful login.
@@ -51,11 +57,12 @@ pub struct AdminStore {
     /// caddy block with the same port.
     #[serde(default)]
     pub board_port: Option<u16>,
-    /// Project the always-on unit runs (`board expose --run <PROJECT>` — one
-    /// unit per project). Persisted so a later expose keeps rendering the
-    /// board unit; `None` renders no board unit (board not always-on).
+    /// Projects the always-on unit schedules (`board expose --run <NAME,...>`
+    /// or `--run all`). Resolved to concrete project names at expose time and
+    /// persisted so a later expose keeps rendering the board unit. An empty
+    /// list renders no board unit (board not always-on).
     #[serde(default)]
-    pub runner_project: Option<String>,
+    pub runner_projects: Vec<String>,
 }
 
 impl Default for AdminStore {
@@ -68,7 +75,7 @@ impl Default for AdminStore {
             failed_attempts: HashMap::new(),
             public_subdomain: None,
             board_port: None,
-            runner_project: None,
+            runner_projects: Vec::new(),
         }
     }
 }
@@ -178,6 +185,74 @@ impl AdminStore {
     }
 }
 
+/// The always-on runner's web-facing state: what it is scheduling (or would,
+/// for `--run all`) and what it is *waiting to join*. Derived from the
+/// persisted `AdminStore::runner_projects` plus the live board/project
+/// registries, so the web board can show the admin which projects are being
+/// executed and which would join if registered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerState {
+    /// Whether the board is configured to be always-on with a runner at all
+    /// (`runner_projects` is non-empty). When false, nothing is scheduled and
+    /// the board only serves on demand.
+    pub configured: bool,
+    /// `all` (schedules every registered project, live-joining new ones) or
+    /// `list` (only the pinned projects).
+    pub mode: String,
+    /// Projects the runner actively schedules right now (resolved from
+    /// `runner_projects`): for `all` this is the current registered set; for
+    /// `list` it is the pinned names.
+    pub scheduled: Vec<String>,
+    /// Projects that will be picked up *without a restart* once they are
+    /// ready: in `all` mode, every registered project that exists as a board;
+    /// in `list` mode, none (a list pins exactly those named).
+    pub waiting: Vec<String>,
+}
+
+/// Compute `RunnerState` from the persisted admin store.
+pub fn runner_state(store: &AdminStore) -> RunnerState {
+    let projects = &store.runner_projects;
+    if projects.is_empty() {
+        return RunnerState {
+            configured: false,
+            mode: "none".to_string(),
+            scheduled: Vec::new(),
+            waiting: Vec::new(),
+        };
+    }
+    let is_all = projects.len() == 1 && projects[0] == RUN_ALL;
+
+    // `all` = every registered project (those with a git repo). For display we
+    // mark an unregistered board as "waiting to join" only when it can be
+    // picked up live (all mode).
+    if is_all {
+        let registered: HashSet<String> =
+            crate::projects::registered_projects().into_iter().collect();
+        let boards: HashSet<String> = crate::board::existing_projects().into_iter().collect();
+        let scheduled: Vec<String> = registered.iter().cloned().collect();
+        let waiting: Vec<String> = boards.difference(&registered).cloned().collect::<Vec<_>>();
+        return RunnerState {
+            configured: true,
+            mode: "all".to_string(),
+            scheduled: sorted(scheduled),
+            waiting: sorted(waiting),
+        };
+    }
+
+    RunnerState {
+        configured: true,
+        mode: "list".to_string(),
+        scheduled: sorted(projects.clone()),
+        waiting: Vec::new(),
+    }
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +313,59 @@ mod tests {
         assert!(matches!(locked, LockoutResult::Temporary(_)));
         assert!(store.locked_until(ip, now).is_some());
         store.failed_attempts.clear();
+    }
+
+    #[test]
+    fn runner_state_reports_scheduled_and_waiting() {
+        // Serialize CLAWDE_HOME mutation on the crate lock (repo rule).
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+
+        // A board-only project (registered as a repo -> will be scheduled),
+        // and a board-only project with no registered repo -> "waiting to
+        // join" under --run all.
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        crate::projects::set_repo_root("app", repo.path()).unwrap();
+        let mut board = crate::board::Board::new();
+        board.add_card("task");
+        crate::board::save_board(&board, "app").unwrap();
+        crate::board::save_board(&board, "docs").unwrap();
+
+        // No runner configured -> configured:false, nothing scheduled.
+        let state = runner_state(&AdminStore::default());
+        assert!(!state.configured);
+        assert!(state.scheduled.is_empty());
+        assert!(state.waiting.is_empty());
+
+        // --run all: 'app' is registered+scheduled; 'docs' is a board with no
+        // repo -> waiting to join.
+        let store = AdminStore {
+            runner_projects: vec![RUN_ALL.to_string()],
+            ..Default::default()
+        };
+        let state = runner_state(&store);
+        assert!(state.configured);
+        assert_eq!(state.mode, "all");
+        assert_eq!(state.scheduled, vec!["app"]);
+        assert_eq!(state.waiting, vec!["docs"]);
+
+        // Explicit list: only the pinned projects are scheduled; a board not
+        // in the list is not running and not reported as live-joinable.
+        let store = AdminStore {
+            runner_projects: vec!["app".to_string()],
+            ..Default::default()
+        };
+        let state = runner_state(&store);
+        assert_eq!(state.mode, "list");
+        assert_eq!(state.scheduled, vec!["app"]);
+        assert!(state.waiting.is_empty());
+
+        std::env::remove_var("CLAWDE_HOME");
     }
 }

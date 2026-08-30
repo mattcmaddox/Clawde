@@ -496,7 +496,7 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
     let guest_port = clawde_katban::guest::load()?
         .guest_port
         .unwrap_or(clawde_katban::guest_server::DEFAULT_GUEST_PORT);
-    let units_dir = write_systemd_units(&caddy_dir, guest_port, None)?;
+    let units_dir = write_systemd_units(&caddy_dir, guest_port, (&[], 0))?;
 
     println!();
     println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
@@ -527,13 +527,15 @@ async fn site_expose(opts: SiteOpts) -> anyhow::Result<()> {
 
 const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAME]
 
-  serve [--port N] [--host IP] [--allow-non-loopback] [--run PROJECT]
+  serve [--port N] [--host IP] [--allow-non-loopback] [--run NAME,...|all]
                                          Run the admin board web UI (loopback);
-                                         --run also schedules PROJECT's cards
+                                         --run also schedules the listed projects'
+                                         cards ('all' = every registered project)
   expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
-                [--duckdns-token TOKEN] [--run PROJECT]
+                [--duckdns-token TOKEN] [--run NAME,...|all]
                                          Publish the board behind caddy (https);
                                          --run renders the always-on board unit
+                                         with one scheduler per listed project
   password <PASSWORD>                    Set/rotate the admin write password
   init                                   Create/ensure the board file
   card add <PROMPT>                      Add a card
@@ -544,7 +546,7 @@ const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAM
   link <A> <B>                           B must finish before A starts (cycle-checked)
   unlink <A> <B>
   ready [--cap N]                        Cards that can start now (queue order)
-  run [--project NAME]                   Run the scheduler (executes ready cards)
+  run [--project NAME]                   Run the scheduler for one project (executes ready cards)
 
 The board UI serves on 127.0.0.1:<port> (default 8790). Binding a
 non-loopback address requires --allow-non-loopback.
@@ -560,18 +562,19 @@ To execute cards automatically, register the board to a git repo with
 with auto-retry up to the board's cap).
 "#;
 
-/// Run the admin board web UI, optionally with the card scheduler for one
-/// project in the same process (`--run PROJECT` — the always-on unit's
-/// command; one unit per project until a multi-project scheduler lands).
-/// Mirrors `guest serve`'s flag parsing and loopback guard; refuses
-/// non-loopback unless `--allow-non-loopback` (the board is admin-only).
+/// Run the admin board web UI, optionally with the card schedulers in the
+/// same process (`--run NAME,...` schedules those projects; `--run all`
+/// schedules every registered project now and live-joins new ones as they are
+/// registered — the always-on unit's command). Mirrors `guest serve`'s flag
+/// parsing and loopback guard; refuses non-loopback unless
+/// `--allow-non-loopback` (the board is admin-only).
 async fn board_serve(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::board_server::DEFAULT_BOARD_PORT;
 
     let mut port = DEFAULT_BOARD_PORT;
     let mut host = "127.0.0.1".to_string();
     let mut allow_non_loopback = false;
-    let mut run_project: Option<String> = None;
+    let mut run_arg: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -594,10 +597,9 @@ async fn board_serve(args: &[String]) -> anyhow::Result<()> {
             "--run" => {
                 let value = args
                     .get(index + 1)
-                    .context("--run needs a project name")?
+                    .context("--run needs project names (or 'all')")?
                     .to_string();
-                validate_runner_project(&value)?;
-                run_project = Some(value);
+                run_arg = Some(value);
                 index += 1;
             }
             flag if flag.starts_with("--port=") => {
@@ -609,9 +611,7 @@ async fn board_serve(args: &[String]) -> anyhow::Result<()> {
                 host = flag["--host=".len()..].to_string();
             }
             flag if flag.starts_with("--run=") => {
-                let value = flag["--run=".len()..].to_string();
-                validate_runner_project(&value)?;
-                run_project = Some(value);
+                run_arg = Some(flag["--run=".len()..].to_string());
             }
             flag => anyhow::bail!("unknown option: {flag}\n\n{BOARD_USAGE}"),
         }
@@ -624,23 +624,59 @@ async fn board_serve(args: &[String]) -> anyhow::Result<()> {
             "refusing to bind {addr} — pass --allow-non-loopback to serve beyond loopback"
         );
     }
-    if let Some(project) = &run_project {
-        if clawde_katban::projects::repo_root(project).is_none() {
-            println!(
-                "warning: no git repo registered for '{project}' — cards will run in empty scratch dirs. Register one with: clawde katban project set {project} <DIR>"
-            );
-        }
-        println!("runner        scheduling '{project}' (Ctrl-C to stop)");
+    if let Some(arg) = &run_arg {
         let executor = std::sync::Arc::new(clawde_katban::runner::ClawdeExecutor::new());
-        let project = project.clone();
-        // The runner runs alongside the web server; if it exits (e.g. its
-        // start-up recovery hit a held lock) the board stays up and the error
-        // lands in the journal — the unit's Restart=always covers process death.
-        tokio::spawn(async move {
-            if let Err(error) = clawde_katban::runner::run_loop(&project, executor).await {
-                tracing::error!(project = %project, error = %error, "board runner exited");
+        if arg.trim().eq_ignore_ascii_case("all") {
+            // Live-join mode (`--run all`, the always-on path): resolve what's
+            // registered now, warn about any that can't run, and hand the whole
+            // set to the coordinator which keeps joining newly-registered
+            // projects without a restart. A project with no repo is skipped by
+            // `registered_projects()` (it must be `project set` first) — if the
+            // set is empty we print a hint, not an error, because new
+            // registrations will be picked up live.
+            println!(
+                "runner        scheduling all registered projects (new ones join as registered)"
+            );
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                if let Err(error) = clawde_katban::runner::run_all(executor).await {
+                    tracing::error!(error = %error, "board runner (all) exited");
+                }
+            });
+        } else {
+            let projects = resolve_runner_projects(arg)?;
+            if projects.is_empty() {
+                anyhow::bail!("no projects to schedule — '{arg}' matched none");
             }
-        });
+            for project in &projects {
+                if clawde_katban::projects::repo_root(project).is_none() {
+                    println!(
+                        "warning: no git repo registered for '{project}' — cards will run in empty scratch dirs. Register one with: clawde katban project set {project} <DIR>"
+                    );
+                }
+            }
+            println!(
+                "runner        scheduling {} (Ctrl-C to stop): {}",
+                if projects.len() == 1 {
+                    "1 project".to_string()
+                } else {
+                    format!("{} projects", projects.len())
+                },
+                projects.join(", ")
+            );
+            // One scheduler process per project, all inside this same
+            // unit/process. Each exits independently (e.g. a held lock during
+            // start-up recovery); the board stays up and the unit's
+            // Restart=always covers a full crash.
+            for project in projects {
+                let executor = executor.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = clawde_katban::runner::run_loop(&project, executor).await {
+                        tracing::error!(project = %project, error = %error, "board runner exited");
+                    }
+                });
+            }
+        }
     }
     println!("board UI      at http://{addr}/  (Ctrl-C to stop)");
     if !clawde_katban::host::is_loopback(addr) {
@@ -703,7 +739,7 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     let mut dry_run = false;
     let mut caddy_dir: Option<PathBuf> = None;
     let mut duckdns_token: Option<String> = None;
-    let mut runner_project: Option<String> = None;
+    let mut run_spec: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -738,15 +774,32 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
                 duckdns_token = Some(flag["--duckdns-token=".len()..].to_string());
             }
             flag if flag.starts_with("--run=") => {
-                let value = flag["--run=".len()..].to_string();
-                validate_runner_project(&value)?;
-                runner_project = Some(value);
+                run_spec = Some(flag["--run=".len()..].to_string());
+            }
+            "--run" => {
+                let value = take_value("--run")?;
+                run_spec = Some(value);
             }
             flag => anyhow::bail!("unknown option: {flag}\n\n{BOARD_USAGE}"),
         }
         index += 1;
     }
 
+    // Persist the `--run` value exactly as given: a concrete comma-list stays
+    // concrete so the unit schedules exactly those projects; the sentinel
+    // `all` stays the sentinel so the unit keeps the live-join path (it
+    // re-resolves every registered project at serve time and picks up new
+    // ones without a re-expose). Validate the list form eagerly here so a bad
+    // name can never be persisted.
+    let runner_spec = if let Some(spec) = &run_spec {
+        if spec.trim().eq_ignore_ascii_case(RUN_ALL) {
+            vec![RUN_ALL.to_string()]
+        } else {
+            resolve_runner_projects(spec)?
+        }
+    } else {
+        Vec::new()
+    };
     let mut store = clawde_katban::board_admin::load().context("load admin store")?;
     if let Some(subdomain) = subdomain {
         store.public_subdomain = Some(subdomain);
@@ -757,10 +810,11 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     check_hostname("public subdomain", &subdomain)?;
     store.board_port = Some(port);
     // Additive, like the subdomain: once set, re-exposes keep the runner unit.
-    if let Some(project) = runner_project {
-        store.runner_project = Some(project);
+    if !runner_spec.is_empty() {
+        store.runner_projects = runner_spec.clone();
     }
-    let runner_project = store.runner_project.clone();
+    let runner_projects = store.runner_projects.clone();
+    let runner_is_all = store.runner_projects.len() == 1 && store.runner_projects[0] == RUN_ALL;
     if !dry_run {
         clawde_katban::board_admin::save(&store)?;
     }
@@ -793,13 +847,23 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     let managed_path = caddy_dir.join(DEFAULT_INCLUDE_NAME);
 
     println!("exposing admin board at https://{subdomain}");
-    match &runner_project {
-        Some(project) => println!(
-            "always-on: board + runner for '{project}' via katban-board.service (one unit per project)"
-        ),
-        None => println!(
-            "note: the board is only reachable while `clawde katban board serve --port {port}` is running — pass --run <PROJECT> to render the always-on unit that also runs the card scheduler"
-        ),
+    if runner_projects.is_empty() {
+        println!(
+            "note: the board is only reachable while `clawde katban board serve --port {port}` is running — pass --run <NAME,...> or --run all to render the always-on unit that also runs the card scheduler"
+        );
+    } else if runner_is_all {
+        println!("always-on: board + runner for ALL registered projects via katban-board.service (new projects join live)");
+    } else if runner_projects.len() == 1 {
+        println!(
+            "always-on: board + runner for '{}' via katban-board.service",
+            runner_projects[0]
+        );
+    } else {
+        println!(
+            "always-on: board + runner for {} projects via katban-board.service (one scheduler per project): {}",
+            runner_projects.len(),
+            runner_projects.join(", ")
+        );
     }
     println!(
         "Managed caddy block (written to {}):",
@@ -815,25 +879,26 @@ async fn board_expose(args: &[String]) -> anyhow::Result<()> {
     write_atomic(&managed_path, &text)?;
 
     // Reloader units watch the managed file; the board unit is rendered when
-    // a runner project is configured (`--run <PROJECT>`, one unit per project).
+    // runner projects are configured (`--run <NAME,...>` / `--run all`).
     let units_dir = write_systemd_units(
         &caddy_dir,
         guest
             .as_ref()
             .map(|(_, p)| *p)
             .unwrap_or(clawde_katban::guest_server::DEFAULT_GUEST_PORT),
-        runner_project.as_deref().map(|project| (project, port)),
+        (&runner_projects, port),
     )?;
     println!();
     println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
-    if let Some(project) = &runner_project {
+    let run_list = runner_projects.join(",");
+    if !runner_projects.is_empty() {
         println!(
             "\nAlways-on board unit (install once; board + runner survive reboots):\n\
              \n\
                sudo install -m 644 {} /etc/systemd/system/katban-board.service\n\
                sudo systemctl daemon-reload\n\
                sudo systemctl enable --now katban-board.service\n\
-             (runs `board serve --port {port} --run {project}` — one unit per project)",
+             (runs `board serve --port {port} --run {run_list}`)",
             units_dir.join("katban-board.service").display()
         );
     }
@@ -1185,15 +1250,52 @@ fn validate_runner_project(project: &str) -> anyhow::Result<()> {
         || project.chars().any(|c| {
             matches!(
                 c,
-                '"' | '\'' | '\\' | '$' | '`' | ';' | '&' | '|' | '>' | '<' | '(' | ')'
+                '"' | '\'' | '\\' | '$' | '`' | ';' | '&' | '|' | '>' | '<' | '(' | ')' | ','
             )
         })
     {
         anyhow::bail!(
-            "--run project name cannot contain spaces or shell metacharacters: '{project}'"
+            "--run project name cannot contain spaces, commas, or shell metacharacters: '{project}'"
         );
     }
     Ok(())
+}
+
+/// Sentinel `--run all`: defined in the katban crate (shared with the board web
+/// server) and re-exported here so the CLI, its tests, and the web board all
+/// agree on the one value.
+pub use clawde_katban::board_admin::RUN_ALL;
+
+/// Resolve a `--run` value (a comma-separated project list, or `all`) to the
+/// concrete project names the scheduler should run. `all` means every project
+/// with a registered git repo — so the always-on unit picks up new projects
+/// without editing the unit, and the scheduler only ever touches boards that
+/// can actually execute.
+fn resolve_runner_projects(value: &str) -> anyhow::Result<Vec<String>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("all") {
+        // Resolve to everything the runner can execute, in registry order.
+        let registered = clawde_katban::projects::registered_projects();
+        if registered.is_empty() {
+            anyhow::bail!(
+                "--run all: no projects have a registered git repo. Register one with: clawde katban project set <NAME> <DIR>"
+            );
+        }
+        return Ok(registered);
+    }
+    let mut projects = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            anyhow::bail!("--run has an empty project name in the list '{value}'");
+        }
+        validate_runner_project(part)?;
+        projects.push(part.to_string());
+    }
+    if projects.is_empty() {
+        anyhow::bail!("--run needs a project name, a comma-separated list, or 'all'");
+    }
+    Ok(projects)
 }
 
 /// Validate a value before it is embedded in the managed caddy config.
@@ -1254,12 +1356,13 @@ fn unit_user() -> anyhow::Result<String> {
 /// is where the managed include lives (the reloader must watch that exact
 /// file) and `guest_port` is the port the service runs the guest server on.
 /// Write the systemd units the expose flow installs. `board` is the runner
-/// project + board port when the board should be always-on (`board expose
-/// --run <PROJECT>`); `None` keeps the units guest-only (board not always-on).
+/// project list + board port when the board should be always-on (`board
+/// expose --run <NAME,...>` / `--run all`); an empty list keeps the units
+/// guest-only (board not always-on).
 fn write_systemd_units(
     caddy_dir: &Path,
     guest_port: u16,
-    board: Option<(&str, u16)>,
+    board: (&[String], u16),
 ) -> anyhow::Result<PathBuf> {
     let dir = units_dir();
     std::fs::create_dir_all(&dir)?;
@@ -1281,13 +1384,14 @@ fn write_systemd_units(
         dir.join("katban-reload.service"),
         clawde_katban::caddy::render_reloader_service_unit("systemctl reload caddy"),
     )?;
-    if let Some((project, board_port)) = board {
+    let (projects, board_port) = board;
+    if !projects.is_empty() {
         std::fs::write(
             dir.join("katban-board.service"),
             clawde_katban::caddy::render_board_service_unit(
                 &binary.display().to_string(),
                 &user,
-                project,
+                projects,
                 board_port,
             ),
         )?;
@@ -1693,10 +1797,9 @@ async fn guest_expose(args: &[String]) -> anyhow::Result<()> {
     if let Some(subdomain) = subdomain {
         store.public_subdomain = Some(subdomain);
     }
-    let subdomain = store
-        .public_subdomain
-        .clone()
-        .context("guest chat has no public subdomain — pass --subdomain HOST (e.g. chat.example.com)")?;
+    let subdomain = store.public_subdomain.clone().context(
+        "guest chat has no public subdomain — pass --subdomain HOST (e.g. chat.example.com)",
+    )?;
     check_hostname("public subdomain", &subdomain)?;
     // Record the port the caddy block proxies to so the always-on unit is
     // regenerated with the same port on every future expose.
@@ -1744,7 +1847,7 @@ async fn guest_expose(args: &[String]) -> anyhow::Result<()> {
     // install them; the instructions reference these files. The reloader
     // watches the actual managed file (honoring --caddy-dir) and the service
     // runs `guest serve` on the port just rendered.
-    let units_dir = write_systemd_units(&caddy_dir, port, None)?;
+    let units_dir = write_systemd_units(&caddy_dir, port, (&[], 0))?;
     println!();
     println!("{}", bootstrap_instructions(&units_dir, &caddy_dir));
 
@@ -1868,7 +1971,7 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
         let result = (|| -> anyhow::Result<()> {
             let caddy_dir = tmp.path().join("custom-caddy");
-            let units = write_systemd_units(&caddy_dir, 9000, None)?;
+            let units = write_systemd_units(&caddy_dir, 9000, (&[], 0))?;
             let service = std::fs::read_to_string(units.join("katban.service"))?;
             assert!(
                 service.contains("katban guest serve --port 9000"),
@@ -1902,7 +2005,8 @@ mod tests {
         std::env::set_var("CLAWDE_HOME", tmp.path());
         let result = (|| -> anyhow::Result<()> {
             let caddy_dir = tmp.path().join("caddy");
-            let units = write_systemd_units(&caddy_dir, 9000, Some(("demo", 8790)))?;
+            // Single project -> clean description + ExecStart.
+            let units = write_systemd_units(&caddy_dir, 9000, (&[String::from("demo")], 8790))?;
             let board = std::fs::read_to_string(units.join("katban-board.service"))?;
             assert!(
                 board.contains("ExecStart=clawde katban board serve --port 8790 --run demo")
@@ -1923,6 +2027,35 @@ mod tests {
     }
 
     #[test]
+    fn systemd_units_render_board_unit_for_multiple_projects() {
+        // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = (|| -> anyhow::Result<()> {
+            let caddy_dir = tmp.path().join("caddy");
+            let units = write_systemd_units(
+                &caddy_dir,
+                9000,
+                (&[String::from("app"), String::from("api")], 8790),
+            )?;
+            let board = std::fs::read_to_string(units.join("katban-board.service"))?;
+            assert!(
+                board.contains("board serve --port 8790 --run app,api"),
+                "board unit must schedule both projects: {board}"
+            );
+            assert!(board.contains("Description=Katban admin board + runner (2 projects)"));
+            Ok(())
+        })();
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        result.unwrap();
+    }
+
+    #[test]
     fn validate_runner_project_rejects_execstart_injection() {
         assert!(validate_runner_project("demo").is_ok());
         assert!(validate_runner_project("my-board").is_ok());
@@ -1932,6 +2065,89 @@ mod tests {
         assert!(validate_runner_project("demo;rm -rf /").is_err());
         assert!(validate_runner_project("demo`id`").is_err());
         assert!(validate_runner_project("$(x)").is_err());
+        // A comma now belongs to the list separator, never inside a name.
+        assert!(validate_runner_project("de,mo").is_err());
+    }
+
+    #[test]
+    fn resolve_runner_projects_parses_lists_and_all() {
+        // Comma-separated list: split and validated individually.
+        let projects = resolve_runner_projects("app, api,batch").unwrap();
+        assert_eq!(projects, vec!["app", "api", "batch"]);
+        // A name carrying a shell metacharacter is rejected before it ever
+        // reaches an ExecStart slot (commas split the list, so they cannot
+        // appear inside a name).
+        assert!(resolve_runner_projects("app,de;mo").is_err());
+        // Empty components / empty input are rejected.
+        assert!(resolve_runner_projects("app,,api").is_err());
+        assert!(resolve_runner_projects("  ").is_err());
+        // `all` resolves via the registry (empty here -> error).
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        assert!(resolve_runner_projects("all").is_err()); // no registered projects
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        clawde_katban::projects::set_repo_root("app", repo.path()).unwrap();
+        clawde_katban::projects::set_repo_root("api", repo.path()).unwrap();
+        let all = resolve_runner_projects("all").unwrap();
+        assert!(all.contains(&"app".to_string()));
+        assert!(all.contains(&"api".to_string()));
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[test]
+    fn board_expose_run_all_persists_the_refresh_sentinel() {
+        // `board expose --run all` must store the `all` sentinel (not a baked
+        // project list) so a re-expose keeps the unit on the live-join path,
+        // which resolves every registered project at serve time.
+        // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+
+        // A sync current-thread runtime so the async expose call runs without
+        // an active tokio runtime for the env-guard's blocking_lock above.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let args = vec![
+            "--run=all".to_string(),
+            "--subdomain=board.example.com".to_string(),
+            format!("--caddy-dir={}", tmp.path().join("caddy").display()),
+        ];
+        let exposed = rt.block_on(board_expose(&args));
+        // Assert while CLAWDE_HOME still points at the sandbox -- the load()
+        // and unit path resolve via the env at call time.
+        let store = clawde_katban::board_admin::load().unwrap();
+        let unit_path = clawde_katban::config::katban_data_dir().join("caddy/katban-board.service");
+        let unit = std::fs::read_to_string(unit_path).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        drop(_guard);
+        assert!(exposed.is_ok(), "board expose should succeed: {exposed:?}");
+
+        // The persisted store holds the `all` sentinel, so a later re-expose
+        // keeps the live-join path.
+        assert_eq!(store.runner_projects, vec![RUN_ALL.to_string()]);
+        // The rendered always-on unit schedules `--run all` (re-resolved at
+        // serve time), not a baked project list.
+        assert!(
+            unit.contains("--run all"),
+            "unit must keep --run all, got: {unit}"
+        );
     }
 
     #[test]

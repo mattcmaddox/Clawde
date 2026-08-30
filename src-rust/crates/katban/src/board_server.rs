@@ -105,6 +105,7 @@ impl BoardServer {
         Router::new()
             .route("/", get(admin_page))
             .route("/api/projects", get(api_projects))
+            .route("/api/runner", get(api_runner))
             .route("/api/board/{project}", get(api_board))
             .route("/api/board/events", get(api_board_events))
             .route("/api/me", get(api_me))
@@ -185,8 +186,21 @@ struct CardApi {
     result: Option<String>,
     diff: Option<String>,
     commit: Option<String>,
+    reviews: Vec<ReviewCommentApi>,
+    followup_feedback: Option<String>,
     created_at: u64,
     updated_at: u64,
+}
+
+/// Serialize a review comment for the web board (id, optional diff-line
+/// anchor, text).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewCommentApi {
+    id: String,
+    location: Option<String>,
+    text: String,
+    created_at: u64,
 }
 
 /// Serve the admin board app on `addr` until Ctrl-C / SIGTERM. The write API
@@ -228,6 +242,24 @@ async fn api_projects(
         return json_message(StatusCode::UNAUTHORIZED, "login required");
     }
     no_cache_nosniff((Json(board::existing_projects()),).into_response())
+}
+
+/// Always-on runner status: which projects the runner schedules right now and
+/// which it is waiting to join (all-mode boards that are registered but not
+/// yet being scheduled). Derived from the persisted `AdminStore` via
+/// `maybe_reload_store`, so a `board expose --run` change shows up without a
+/// board server restart.
+async fn api_runner(
+    State(state): State<BoardState>,
+    headers: HeaderMap,
+    peer: PeerAddr,
+) -> Response {
+    if exposed_request(peer.0, &headers) && authenticated(&state, &headers).is_none() {
+        return json_message(StatusCode::UNAUTHORIZED, "login required");
+    }
+    maybe_reload_store(&state);
+    let store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+    no_cache_nosniff((Json(crate::board_admin::runner_state(&store)),).into_response())
 }
 
 async fn api_board(
@@ -803,6 +835,8 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
             result: card.result.clone(),
             diff: card.diff.clone(),
             commit: card.commit.clone(),
+            reviews: card.reviews.iter().map(review_to_api).collect(),
+            followup_feedback: card.followup_feedback.clone(),
             created_at: card.created_at,
             updated_at: card.updated_at,
         })
@@ -814,6 +848,15 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
         parallel_cap: board.parallel_cap,
         auto_retry: board.auto_retry,
         ready,
+    }
+}
+
+fn review_to_api(r: &crate::board::ReviewComment) -> ReviewCommentApi {
+    ReviewCommentApi {
+        id: r.id.clone(),
+        location: r.location.clone(),
+        text: r.text.clone(),
+        created_at: r.created_at,
     }
 }
 
@@ -862,6 +905,10 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   .card .actions select { font-size:12px; padding:2px 4px; background:#242a33; color:#e7ebf0; border:1px solid #3a424e; border-radius:6px; }
   .card details.diff summary { font-size:12px; color:#8b96a5; cursor:pointer; margin-top:4px; }
   .card details.diff pre { font-size:11px; background:#15181d; border:1px solid #2a2f37; border-radius:6px; padding:6px; overflow:auto; max-height:220px; white-space:pre-wrap; color:#c8d0da; }
+  #runner { font-size:12px; color:#8b96a5; }
+  #runner .r-ok { color:#b8e8c9; }
+  #runner .r-wait { color:#ffb36b; }
+  #runner .r-off { color:#ff6b6b; }
 </style>
 </head>
 <body>
@@ -870,6 +917,7 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   <select id="project" title="Board project"></select>
   <button id="refresh">Refresh</button>
   <span class="muted" id="meta"></span>
+  <span id="runner" title="Always-on runner state"></span>
   <span class="auth">
     <input id="password" type="password" placeholder="admin password" autocomplete="current-password" hidden>
     <button id="login">Sign in</button>
@@ -891,6 +939,29 @@ const ADMIN_HTML: &str = r##"<!doctype html>
 // manually-held cards would be invisible on the board.
 const COLS = ["backlog","queued","running","blocked","review","failed","done"];
 const $ = (s) => document.querySelector(s);
+
+// Always-on runner indicator: which projects the runner schedules right now
+// and which it is waiting to join (`--run all` boards with no registered
+// git repo). Rendered into the `#runner` header span.
+async function loadRunner() {
+  let st;
+  try { st = await (await fetch("/api/runner")).json(); }
+  catch (e) { return; }
+  const el = $("#runner");
+  if (!st.configured) {
+    el.innerHTML = '<span class="r-off" title="The board isn\'t always-on: run `clawde katban board expose --run <NAME,...|all>` to schedule card execution.">runner: not configured</span>';
+    return;
+  }
+  if (st.mode === "all") {
+    let parts = 'runner: <span class="r-ok">all (' + st.scheduled.length + ' scheduled)</span>';
+    if (st.waiting.length) {
+      parts += ' <span class="r-wait" title="Registered as boards but no git repo yet — they join automatically once `clawde katban project set <NAME> <DIR>` runs.">' + st.waiting.length + ' waiting to join</span>';
+    }
+    el.innerHTML = parts;
+  } else {
+    el.innerHTML = 'runner: <span class="r-ok">' + esc(st.scheduled.length ? st.scheduled.join(", ") : "no projects") + '</span>';
+  }
+}
 
 async function loadProjects() {
   const res = await fetch("/api/projects");
@@ -1125,7 +1196,7 @@ $("#board").addEventListener("change", (e) => {
 });
 
 $("#project").addEventListener("change", (e) => loadBoard(e.target.value));
-$("#refresh").addEventListener("click", loadProjects);
+$("#refresh").addEventListener("click", () => { loadProjects(); loadRunner(); });
 
 // Live updates: any board change (this server's writes or CLI//katban//TUI
 // edits) pushes an SSE event. Re-fetch the project list + current board so a
@@ -1138,7 +1209,7 @@ let events = null;
 function wireEvents() {
   if (events) events.close();
   events = new EventSource("/api/board/events");
-  events.onmessage = () => loadProjects();
+  events.onmessage = () => { loadProjects(); loadRunner(); };
 }
 function stopEvents() {
   if (events) { events.close(); events = null; }
@@ -1150,6 +1221,7 @@ function stopEvents() {
   const me = await fetch("/api/me", { credentials: "same-origin" });
   setAuth(me.ok);
   loadProjects();
+  loadRunner();
 })();
 </script>
 </body>
@@ -1262,6 +1334,64 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("nosniff")
         );
+    }
+
+    #[tokio::test]
+    async fn runner_api_reports_configured_and_all_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed an empty admin store BEFORE the server is built so admin.json
+        // exists and the server caches its mtime (the live-reload path below
+        // compares against it). Pin CLAWDE_HOME, save, then release the lock
+        // before router_with_home re-acquires it (std mutex isn't reentrant).
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            crate::board_admin::save(&crate::board_admin::AdminStore::default()).unwrap();
+        }
+        let (app, _guard) = router_with_home(tmp.path(), None, None);
+
+        // Not configured -> configured:false.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runner")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["configured"], false);
+
+        // Configure --run all and reach the API again: maybe_reload_store
+        // picks up the admin.json change, so the already-running BoardState
+        // reports the new runner config without a restart.
+        let mut store = crate::board_admin::load().unwrap();
+        store.runner_projects = vec![crate::board_admin::RUN_ALL.to_string()];
+        crate::board_admin::save(&store).unwrap();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runner")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::OK);
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["configured"], true);
+        assert_eq!(json["mode"], "all");
     }
 
     #[tokio::test]

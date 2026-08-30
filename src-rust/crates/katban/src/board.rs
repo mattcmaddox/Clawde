@@ -102,10 +102,34 @@ pub struct Card {
     /// a real commit an admin can merge into the project or throw away.
     #[serde(default)]
     pub commit: Option<String>,
+    /// Review comments on this card's diff (spec §16a E5). Comments are the
+    /// admin's diff-review record; `followup_feedback` is their composed text
+    /// handed to the agent on a follow-up run (`send_feedback_to_agent`).
+    #[serde(default)]
+    pub reviews: Vec<ReviewComment>,
+    /// Composed review-feedback block for the card's next run, set by
+    /// `send_feedback_to_agent` and cleared when the follow-up run finishes
+    /// (it becomes `result`/`diff` of the new review). `None` = no pending
+    /// feedback; a review card's agent re-runs only when this is set.
+    #[serde(default)]
+    pub followup_feedback: Option<String>,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
     pub updated_at: u64,
+}
+
+/// A diff-review comment on a card (spec §16a E5). `location` is an optional
+/// diff line or range the comment anchors to (1-based diff-line number, e.g.
+/// "12" or "14-16"); it is advisory to the agent, never a hard file pointer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComment {
+    pub id: String,
+    #[serde(default)]
+    pub location: Option<String>,
+    pub text: String,
+    pub created_at: u64,
 }
 
 /// `from` may only start once `to` is Done.
@@ -171,6 +195,8 @@ impl Board {
             result: None,
             diff: None,
             commit: None,
+            reviews: Vec::new(),
+            followup_feedback: None,
             created_at: now,
             updated_at: now,
         });
@@ -493,6 +519,110 @@ pub fn load_board(project: &str) -> anyhow::Result<Option<Board>> {
     let board: Board =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     Ok(Some(board))
+}
+
+/// Append a diff-review comment to a card (spec §16a E5). The comment is
+/// recorded on the card for display; it is folded into the agent's next run
+/// only when `send_feedback_to_agent` is called. Lock-protected like every
+/// other read-modify-write so the CLI / web / runner never race. Returns the
+/// new comment id, or an error naming the card if it is missing.
+pub fn add_review(
+    project: &str,
+    card_id: &str,
+    location: Option<String>,
+    text: &str,
+) -> Result<String, String> {
+    let _guard = BoardLock::acquire(project).map_err(|e| e.to_string())?;
+    let mut board = load_board(project)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no board for project '{project}'"))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("comment text must not be empty".to_string());
+    }
+    let now = now_secs();
+    let id = random_hex(8);
+    let card = board
+        .cards
+        .iter_mut()
+        .find(|c| c.id == card_id)
+        .ok_or_else(|| format!("no card with id '{card_id}'"))?;
+    card.reviews.push(ReviewComment {
+        id: id.clone(),
+        location,
+        text: text.to_string(),
+        created_at: now,
+    });
+    card.updated_at = now;
+    save_board(&board, project).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Send a review card's comments back to the agent as a follow-up run (spec
+/// §16a E5's "steer the agent"). Requires the card to be in `review` with at
+/// least one comment. Composes the comment text into `followup_feedback` and
+/// moves the card to `queued` so the runner's `queued_ids`/`ready_to_run`
+/// re-spawns it — the agent then runs the *same* worktree brand but against a
+/// prompt that includes the feedback and the prior pinned commit.
+///
+/// Returns the number of comments folded into the follow-up, or an error
+/// explaining why the card can't be re-sent.
+pub fn send_feedback_to_agent(project: &str, card_id: &str) -> Result<usize, String> {
+    let _guard = BoardLock::acquire(project).map_err(|e| e.to_string())?;
+    let mut board = load_board(project)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no board for project '{project}'"))?;
+    let now = now_secs();
+    let card = board
+        .cards
+        .iter_mut()
+        .find(|c| c.id == card_id)
+        .ok_or_else(|| format!("no card with id '{card_id}'"))?;
+    if card.status != CardStatus::Review {
+        return Err(format!(
+            "card is not in review ({}) — only reviewed cards can be sent back to the agent",
+            status_display(card.status)
+        ));
+    }
+    if card.reviews.is_empty() {
+        return Err("card has no review comments to send — comment on the diff first".to_string());
+    }
+
+    // Compose the pending feedback into a single block the follow-up run's
+    // prompt will append. Each comment carries an optional diff-line anchor.
+    let mut lines: Vec<String> = card
+        .reviews
+        .iter()
+        .map(|r| match &r.location {
+            Some(loc) => format!("[diff line {loc}] {}", r.text),
+            None => r.text.clone(),
+        })
+        .collect();
+    // Drop leading/trailing blank lines the way `text.trim()` would.
+    let count = lines.len();
+    lines.push(String::new()); // trailing newline so the agent sees a clean block
+    card.followup_feedback = Some(lines.join("\n"));
+    // Reset to queued (deps met) so the runner picks the card up again; clear
+    // the transient-retry counter — a review follow-up is a new deliberate
+    // attempt, not a failure retry.
+    card.status = CardStatus::Queued;
+    card.retries = 0;
+    card.updated_at = now;
+    save_board(&board, project).map_err(|e| e.to_string())?;
+    Ok(count)
+}
+
+/// Human label for a card status (used in follow-up errors).
+fn status_display(status: CardStatus) -> &'static str {
+    match status {
+        CardStatus::Backlog => "backlog",
+        CardStatus::Queued => "queued",
+        CardStatus::Running => "running",
+        CardStatus::Blocked => "blocked",
+        CardStatus::Review => "review",
+        CardStatus::Failed => "failed",
+        CardStatus::Done => "done",
+    }
 }
 
 /// Project names that have a board file under the data dir.

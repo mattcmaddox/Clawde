@@ -120,6 +120,46 @@ pub async fn run_loop(project: &str, spawn_fn: Arc<dyn CardExecutor>) -> anyhow:
     }
 }
 
+/// Run one scheduler per *registered* project and keep picking up new ones as
+/// they are registered — the `board serve --run all` refresh path.
+///
+/// Unlike `run_loop` (which owns a single project forever), this coordinator
+/// resolves the current registry, spawns one `run_loop` per project, and then
+/// reconciles on every poll: a project newly registered (e.g. via `clawde
+/// katban project set`) gets a scheduler within a poll cycle, with no restart
+/// and no re-`expose`. The initial empty set is fine — if nothing is
+/// registered yet it just waits and joins the first registration. Schedulers
+/// are never torn down (a removed project's loop just goes idle); the unit's
+/// `Restart=always` covers the whole process on a real crash.
+pub async fn run_all(spawn_fn: Arc<dyn CardExecutor>) -> anyhow::Result<()> {
+    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        // Reap finished agents (a scheduler exits only on a hard error; keep
+        // the board process healthy by not wedging on a zombie handle).
+        running.retain(|_, handle| !handle.is_finished());
+
+        // `registered_projects()` is already filtered to projects with a
+        // valid git repo, so anything returned here is immediately runnable.
+        for project in crate::projects::registered_projects() {
+            if running.contains_key(&project) {
+                continue;
+            }
+            tracing::info!(project = %project, "board runner joining project (--run all)");
+            let executor = spawn_fn.clone();
+            let name = project.clone();
+            let log_name = project.clone();
+            let handle = tokio::spawn(async move {
+                if let Err(error) = run_loop(&name, executor).await {
+                    tracing::error!(project = %log_name, error = %error, "board runner exited");
+                }
+            });
+            running.insert(project, handle);
+        }
+    }
+}
+
 /// Reset any card stuck in `running` to `queued` at runner start (crash
 /// recovery) — a fresh process holds no handle for it, so it would pin a slot
 /// forever.
@@ -163,7 +203,7 @@ async fn spawn_ready(
     executor: &Arc<dyn CardExecutor>,
 ) {
     // Guard held only for the load->select->reserve->save section.
-    let to_spawn: Vec<(String, PathBuf)> = {
+    let to_spawn: Vec<(String, PathBuf, Option<String>)> = {
         let _guard = match BoardLock::acquire(project) {
             Ok(g) => g,
             Err(_) => return,
@@ -211,9 +251,22 @@ async fn spawn_ready(
                 }
             }
         }
-        let spawned: Vec<(String, PathBuf)> = candidates
+        // For each spawn we also record the card's pinned branch when this is a
+        // real follow-up (review feedback was sent) so `run_one_card` bases the
+        // new worktree on the card's own prior commit — the agent iterates on
+        // its work, not from HEAD. On a *first* run the branch name is invented
+        // here purely as a placeholder and does not exist yet in git, so we
+        // must NOT base on it: only use the branch when `followup_feedback` is
+        // set (which `send_feedback_to_agent` stores on the card).
+        let spawned: Vec<(String, PathBuf, Option<String>)> = candidates
             .iter()
-            .map(|id| (id.clone(), git::card_worktree_dir(project, id)))
+            .map(|id| {
+                let branch = board
+                    .card(id)
+                    .filter(|c| c.followup_feedback.is_some())
+                    .and_then(|c| c.branch.clone());
+                (id.clone(), git::card_worktree_dir(project, id), branch)
+            })
             .collect();
         if !spawned.is_empty() {
             if let Err(e) = board::save_board(&board, project) {
@@ -224,16 +277,28 @@ async fn spawn_ready(
         spawned // _guard drops here, releasing the lock before subprocesses start.
     };
 
-    for (id, work_dir) in to_spawn {
+    for (id, work_dir, base_ref) in to_spawn {
         if inflight.contains_key(&id) {
             continue;
         }
         let _ = std::fs::create_dir_all(&work_dir);
-        // Pull the prompt fresh (the board just persisted it as running).
+        // Pull the prompt fresh (the board just persisted it as running). A
+        // follow-up run appends the review-feedback block so the agent knows
+        // what the reviewer asked it to change.
         let prompt = board::load_board(project)
             .ok()
             .flatten()
-            .and_then(|b| b.card(&id).map(|c| c.prompt.clone()))
+            .map(|b| match b.card(&id) {
+                Some(c) => match &c.followup_feedback {
+                    Some(fb) if !fb.trim().is_empty() => format!(
+                        "{}\n\n[Katban review — address this, then summarize the change]\n{}",
+                        c.prompt.trim(),
+                        fb.trim()
+                    ),
+                    _ => c.prompt.clone(),
+                },
+                None => String::new(),
+            })
             .unwrap_or_default();
         let project = project.to_string();
         let repo_root = repo_root.map(|p| p.to_path_buf());
@@ -245,6 +310,7 @@ async fn spawn_ready(
                 &work_dir,
                 &prompt,
                 &executor,
+                base_ref,
             )
             .await;
         });
@@ -260,11 +326,17 @@ async fn run_one_card(
     work_dir: &Path,
     prompt: &str,
     executor: &Arc<dyn CardExecutor>,
+    base_ref: Option<String>,
 ) {
     let card_id = work_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+
+    // A follow-up run bases its worktree on the card's own pinned branch (the
+    // prior commit) so the agent iterates on its work rather than restarting
+    // from repo HEAD. `base_ref` is the card branch captured at spawn time.
+    let base_ref = base_ref.as_deref();
 
     // A configured-but-not-a-repo project is a config error: fail the card
     // clearly rather than leaving it running forever.
@@ -279,7 +351,7 @@ async fn run_one_card(
             );
             return;
         }
-        if let Err(e) = git::create_worktree(repo, work_dir, None) {
+        if let Err(e) = git::create_worktree(repo, work_dir, base_ref) {
             finalize(
                 project,
                 &card_id,
@@ -690,6 +762,64 @@ mod tests {
             finalize("default", &a, &wt, true, Some("boom"));
             let b = board::load_board("default").unwrap().unwrap();
             assert_eq!(b.card(&a).unwrap().status, CardStatus::Done);
+        });
+    }
+
+    #[test]
+    fn run_all_live_joins_newly_registered_projects() {
+        // `board serve --run all` refresh path: a project registered *while*
+        // the coordinator is already running must get a scheduler without a
+        // restart. We observe the join via the worktrees a scheduler executes:
+        // `execute` records the project encoding from the worktree path.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        with_home(tmp.path(), || {
+            crate::projects::set_repo_root("app", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.add_card("first task");
+            crate::board::save_board(&board, "app").unwrap();
+
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+            struct Keyed(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+            impl CardExecutor for Keyed {
+                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                    // work_dir is <root>/<project-encoding>/<card>; recover the
+                    // project encoding from the parent's file name.
+                    if let Some(proj) = work_dir.parent().and_then(|p| p.file_name()) {
+                        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                        set.insert(proj.to_string_lossy().into_owned());
+                    }
+                    Ok("done".into())
+                }
+            }
+            let executor: Arc<dyn CardExecutor> = Arc::new(Keyed(seen.clone()));
+
+            let coordinator = rt.spawn(run_all(executor.clone()));
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+
+            // Register a second project live — it must be joined without a
+            // restart and without re-exposing.
+            crate::projects::set_repo_root("api2", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.add_card("api task");
+            crate::board::save_board(&board, "api2").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(3500));
+
+            coordinator.abort();
+            let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+            // Both the initially-registered and the live-registered project
+            // schedulers spawned an execution (observed via their worktree
+            // project encoding).
+            assert!(
+                seen.contains("app") && seen.contains("api2"),
+                "live-join failed — schedulers only saw: {seen:?}"
+            );
         });
     }
 

@@ -175,25 +175,36 @@ WantedBy=multi-user.target
 
 /// The always-on admin board + runner unit (spec §20.7 — the promise "an
 /// always-on unit lands with the runner slice"). Serves the board web UI on
-/// `port` and runs the card scheduler for `project` in the same process, so a
-/// single unit keeps the board reachable *and* executing cards. One unit per
-/// project (the spec leaves a multi-project scheduler open; until then N
-/// boards = N units). `project` must be whitespace-free — it is embedded in
-/// `ExecStart`.
-pub fn render_board_service_unit(binary: &str, user: &str, project: &str, port: u16) -> String {
+/// `port` and runs the card scheduler for `projects` (one scheduler process
+/// per project, all inside the same unit) so a single unit keeps the board
+/// reachable *and* executing cards for every listed project. `projects` must
+/// be non-empty; each name must be whitespace/shell-safe (validated by the
+/// CLI before it reaches here) since they are embedded in `ExecStart`.
+pub fn render_board_service_unit(
+    binary: &str,
+    user: &str,
+    projects: &[String],
+    port: u16,
+) -> String {
+    let project_list = projects.join(",");
+    let description = if projects.len() == 1 {
+        projects[0].clone()
+    } else {
+        format!("{} projects", projects.len())
+    };
     format!(
         "# Installed by clawde katban board expose — the always-on board + runner.
 # Rebuild the binary in place (e.g. `clawded`) and restart to update:
 #   sudo systemctl restart katban-board
 [Unit]
-Description=Katban admin board + runner ({project})
+Description=Katban admin board + runner ({description})
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 User={user}
-ExecStart={binary} katban board serve --port {port} --run {project}
+ExecStart={binary} katban board serve --port {port} --run {project_list}
 Restart=always
 RestartSec=5
 PrivateTmp=true
@@ -378,9 +389,15 @@ mod tests {
     }
 
     #[test]
-    fn board_service_unit_runs_serve_with_runner_project() {
-        let unit =
-            render_board_service_unit("/home/user/.local/bin/clawde", "user", "demo", 8790);
+    fn board_service_unit_runs_serve_with_runner_projects() {
+        // A single project keeps the human-readable description and a clean
+        // `--run <name>`.
+        let unit = render_board_service_unit(
+            "/home/user/.local/bin/clawde",
+            "user",
+            &[String::from("demo")],
+            8790,
+        );
         assert!(unit.contains("Description=Katban admin board + runner (demo)"));
         assert!(unit.contains("User=user"));
         assert!(unit.contains(
@@ -389,6 +406,19 @@ mod tests {
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=multi-user.target"));
         assert!(!unit.contains("User=root"));
+
+        // Multiple projects: one unit schedules all of them, comma-joined in
+        // the ExecStart; the description counts them.
+        let multi = render_board_service_unit(
+            "/home/user/.local/bin/clawde",
+            "user",
+            &[String::from("app"), String::from("api")],
+            8790,
+        );
+        assert!(multi.contains("Description=Katban admin board + runner (2 projects)"));
+        assert!(multi.contains(
+            "ExecStart=/home/user/.local/bin/clawde katban board serve --port 8790 --run app,api"
+        ));
     }
 
     #[test]

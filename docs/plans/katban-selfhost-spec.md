@@ -1521,8 +1521,36 @@ covered by `login_cookie_gets_secure_behind_https_proxy`).
 
 Still to build per this spec (deferred, needs a design call): **diff-review
 line comments + send-to-agent** (§16a E5, the React/escalation slice) and
-**commit / PR + auto-commit chains** (§16a E5/E6). The audit's remaining
-design call is the **multi-project scheduler** (N projects -> N units today).
+**commit / PR + auto-commit chains** (§16a E5/E6).
+
+**Multi-project scheduler + live-join refresh path (done 2026-08-30):** the
+spec's "N projects -> N units" limitation is gone. `board serve --run` /
+`board expose --run` now accept a **comma-separated list** (e.g. `--run
+app,api`) or **`all`** (every project with a registered git repo, resolved at
+start/serve time from the projects registry). One always-on
+`katban-board.service` runs **one scheduler process per project** in the same
+unit (each `runner::run_loop` independent, with its own parallel cap, crash
+recovery, and board lock), so a single unit keeps the board reachable and
+executes cards for every listed project. `--run all` is persisted as the
+**`all` sentinel** (`AdminStore.runner_projects`, was `runner_project`) rather
+than a baked list, so a re-expose keeps the unit on the live-join path; and
+`board serve --run all` runs a coordinator (`runner::run_all`) that
+**re-resolves the registry on every poll and spawns a scheduler for any newly
+registered project without a restart** — `clawde katban project set <NAME>
+<DIR>` alone brings a new project into the running board's execution.
+Scheduler count and per-name shell safety are validated before anything is
+embedded in `ExecStart` (commas are the list separator and forbidden inside a
+name). The **board web UI now shows the runner state** (2026-08-30): a new
+`GET /api/runner` endpoint (origin/auth-gated like the other reads, live
+reloading `AdminStore` so a `board expose --run` change shows without a server
+restart) returns `configured` / `mode` (`all`|`list`) / `scheduled` (the
+projects the runner is executing right now — for `all` the current registered
+set) / `waiting` (all-mode boards registered but with no git repo yet). The
+board's header renders an indicator — a green "all (N scheduled)" / pinned
+list, an amber "M waiting to join" note, or a red "not configured" — refreshed
+on load, on manual Refresh, and on every SSE board-change event. The `all`
+sentinel now lives in `clawde-katban` (`board_admin::RUN_ALL`), shared by the
+CLI and the web server.
 
 ---
 
