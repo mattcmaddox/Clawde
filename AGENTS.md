@@ -180,15 +180,44 @@ If the provider uses an env var (e.g. `FOO_API_KEY`), wire it into the auth-stor
 
 ## Releasing
 
-Clawde uses a **single workspace version** stamped across every surface (Cargo workspace, Cargo.lock entries for the 12 `clawde*` crates, `npm/package.json`, README badge, docs, ACP registry template). Versioning is forward-only — every fix cuts a new version; tags are never force-moved.
+### Versioning scheme
 
-Releases are driven from the local machine by `scripts/build.sh` (the single source of truth — see `docs/build-release-refactor-spec.md`):
+Clawde versioning is **SemVer with build metadata.** There are two layers:
+
+1. **Source version (`vMAJOR.MINOR.PATCH`)** — a clean `X.Y.Z` stamped across
+   every surface (Cargo workspace, Cargo.lock entries for the `clawde*` crates,
+   `npm/package.json`, README badge, docs, ACP registry template) via
+   `scripts/bump-version.py`. It only moves when a release is **cut deliberately**
+   (`scripts/build.sh release --version vX.Y.Z`); it is never auto-incremented.
+2. **Build metadata (`+N`)** — every local build embeds a commit-count suffix
+   (`git rev-list --count HEAD`) at compile time in `crates/cli/build.rs`, so
+   `clawde --version` reports e.g. `0.2.95+972`. `+N` is purely informational
+   SemVer build metadata: it never affects precedence, never resets the patch
+   number, and never collides. Packaged release builds (no git tree) report a
+   clean `X.Y.Z`; `clawde upgrade` compares against the clean version.
+
+There is **no automatic version bump on commit or push.** (The old pre-commit
+hook that auto-bumped `PATCH` on every commit was removed — it burned patch
+numbers pointlessly and let local drift far past tagged releases.) The version
+advances only when you deliberately release.
+
+### Releasing
+
+Releases are driven from the local machine by `scripts/build.sh` (the single
+source of truth — see `docs/build-release-refactor-spec.md`):
 
 ```bash
 scripts/build.sh release --version vX.Y.Z
 ```
 
-This stamps the version (`scripts/bump-version.py`), commits + pushes the bump, builds every platform leg this machine can (native + cross via Docker; macOS/Windows legs are built by running the same script on those machines and copying `dist/` artifacts in), packages archives + `SHA256SUMS` into `dist/`, publishes a GitHub Release via `gh release create`, and dispatches the npm publish workflow. Use `--dry-run` to preview without side effects.
+This stamps the version (`scripts/bump-version.py`, a clean `X.Y.Z` — no `+N`),
+commits + pushes the bump, builds every platform leg this machine can (native +
+cross via Docker; macOS/Windows legs are built by running the same script on
+those machines and copying `dist/` artifacts in), packages archives +
+`SHA256SUMS` into `dist/`, publishes a GitHub Release via `gh release create`,
+and dispatches the npm publish workflow. Use `--dry-run` to preview without
+side effects. Versioning is forward-only — every fix cuts a new version; tags
+are never force-moved.
 
 ## **CRITICAL** Git Rules for Parallel Agents
 

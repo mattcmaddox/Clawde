@@ -50,6 +50,28 @@ pub const FEEDBACK_CHANNEL: &str = env!("FEEDBACK_CHANNEL");
 /// Explanation of issue routing in this build
 pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
+/// SemVer build metadata suffix (`+N`, repo commit count) embedded at compile
+/// time by build.rs. Present on every local build so `--version` reports a
+/// unique version while the source keeps a clean X.Y.Z. Empty on builds where
+/// git metadata was unavailable.
+pub const BUILD_NUMBER: &str = env!("CLAWDE_BUILD_NUMBER");
+
+/// The full display version: `X.Y.Z` plus the `+N` build-suffix when one was
+/// embedded (e.g. `0.2.95+482`). Build metadata is purely informational in
+/// SemVer — it never affects precedence or the clean release tag.
+#[allow(clippy::const_is_empty)]
+// clippy evaluates `env!("CLAWDE_BUILD_NUMBER")` against THIS build's concrete
+// value (always "972" here, empty in packaged release tarballs where git is
+// absent), so it wrongly infers the branch is constant. build.rs intentionally
+// injects a different value per build environment — the lint cannot model that.
+pub fn display_version() -> String {
+    if BUILD_NUMBER.is_empty() {
+        APP_VERSION.to_string()
+    } else {
+        format!("{}+{}", APP_VERSION, BUILD_NUMBER)
+    }
+}
+
 use anyhow::Context;
 use clap::{ArgAction, Parser, ValueEnum};
 use clawde_core::{
@@ -74,7 +96,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(
     name = "clawde",
-    version = APP_VERSION,
+    version = display_version(),
     about = "Clawde - AI-powered coding assistant",
     long_about = None,
 )]
@@ -596,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: handle --version before parsing everything
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("clawde {}", APP_VERSION);
+        println!("clawde {}", display_version());
         return Ok(());
     }
 

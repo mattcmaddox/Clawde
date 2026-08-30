@@ -14,10 +14,11 @@ members = [
     "crates/plugins",
     "crates/acp",
     "crates/gateway",
+    "crates/katban",
 ]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.3.0"
 edition = "2021"
 authors = ["Clawde"]
 license = "GPL-3.0"
@@ -99,7 +100,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 
 # Process execution
-nix = { version = "0.29", features = ["process", "signal", "user"] }
+nix = { version = "0.29", features = ["process", "signal", "user", "fs"] }
 
 # Async channels
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
@@ -130,6 +131,7 @@ clawde-bridge = { path = "crates/bridge" }
 clawde-buddy = { path = "crates/buddy" }
 clawde-plugins = { path = "crates/plugins" }
 clawde-gateway = { path = "crates/gateway" }
+clawde-katban = { path = "crates/katban" }
 
 # Shipped binaries statically link two TLS stacks (rustls + BoringSSL),
 # bundled SQLite, syntect, and image codecs — LTO and symbol stripping cut

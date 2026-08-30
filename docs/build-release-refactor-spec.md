@@ -144,7 +144,7 @@ intentionally excluded from the release flow** (no Apple hardware; decided
 |---|---|
 | Windows leg can't build on this Linux box | `build-one windows-x86_64` on a Windows box; `release --publish-only` assembles from `dist/`. Zero Actions dependency |
 | macOS legs? | Dropped from the release flow entirely (2026-08-22) — no Apple hardware; installers would 404 until a Mac build is added back |
-| ACP registry `agent.json` `website` field | Uses `https://github.com/mattcmaddox/Clawde` (changed from `clawde.example.com` to avoid exposing the home server; 2026-08-22 — see `.local/setup-notes.md`) |
+| ACP registry `agent.json` `website` field | Uses `https://github.com/mattcmaddox/Clawde` (changed from the owner's DuckDNS subdomain to avoid exposing the home server; 2026-08-22 — see `.local/setup-notes.md`) |
 | Should `release` auto-commit the version bump? | Yes by default (mirrors old auto-release); `--no-commit` opt-out |
 | npm publish with provenance needs OIDC (Actions-only) | npm-publish.yml kept with `workflow_dispatch`; the script dispatches it via `gh workflow run` |
 | Fix or delete the dead-package refs in the two release workflows? | Delete the workflows (Phase 3); fix only `ci.yml` which survives |
