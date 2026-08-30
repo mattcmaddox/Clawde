@@ -52,6 +52,7 @@ pub fn merge_card(project: &str, card_id: &str) -> Result<(), String> {
     crate::git::merge_branch(&repo, &branch)?;
 
     // The branch is fully merged (or the merge errored out above); tidy it up.
+    clean_card_worktree(&repo, project, card_id);
     let _ = crate::git::delete_branch(&repo, &branch);
     let short = commit
         .get(..commit.len().min(12))
@@ -77,6 +78,10 @@ pub fn discard_card(project: &str, card_id: &str) -> Result<(), String> {
     let branch = board.card(card_id).and_then(|c| c.branch.clone());
     if let Some(branch) = branch {
         if let Some(repo) = crate::projects::repo_root(project) {
+            // A crashed runner can leave this branch checked out in a registered
+            // worktree; `git branch -D` would refuse and leak the ref forever, so
+            // tear the card's worktree down first (no-op when none exists).
+            clean_card_worktree(&repo, project, card_id);
             let _ = crate::git::delete_branch(&repo, &branch);
         }
     }
@@ -84,6 +89,15 @@ pub fn discard_card(project: &str, card_id: &str) -> Result<(), String> {
         return Err(format!("no card with id '{card_id}'"));
     }
     board::save_board(&board, project).map_err(|e| e.to_string())
+}
+
+/// Best-effort removal of a card's worktree checkout before its branch is
+/// deleted. The runner normally tears the worktree down at finalize; this
+/// covers the crash case (orphaned worktree registered on the card's branch,
+/// which would make `git branch -D` fail and leak the ref). Only ever touches
+/// paths under our owned `worktree_root()` (`remove_worktree` guards that).
+fn clean_card_worktree(repo: &std::path::Path, project: &str, card_id: &str) {
+    crate::git::remove_worktree(repo, &crate::git::card_worktree_dir(project, card_id));
 }
 
 fn status_name(status: CardStatus) -> &'static str {

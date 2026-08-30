@@ -178,6 +178,12 @@ pub struct Board {
     /// stays failed (spec §16a E6 — never retry user/invalid errors).
     #[serde(default = "default_auto_retry")]
     pub auto_retry: u32,
+    /// Run the auto-review pass after a card passes the verification gate: a
+    /// second headless agent reads the card's diff and attaches findings as
+    /// review comments (board audit option 2). Toggle with
+    /// `clawde katban board auto-review on|off`.
+    #[serde(default = "default_true")]
+    pub auto_review: bool,
 }
 
 fn default_parallel_cap() -> usize {
@@ -188,6 +194,10 @@ fn default_auto_retry() -> u32 {
     DEFAULT_AUTO_RETRY
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Board {
     pub fn new() -> Self {
         Board {
@@ -196,6 +206,7 @@ impl Board {
             dependencies: Vec::new(),
             parallel_cap: DEFAULT_PARALLEL_CAP,
             auto_retry: DEFAULT_AUTO_RETRY,
+            auto_review: true,
         }
     }
 

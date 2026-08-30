@@ -358,13 +358,52 @@ async fn run_one_card(
     }
 
     let outcome = executor.execute(work_dir, prompt);
-
-    let note = outcome
+    let mut failed = outcome.is_err();
+    let mut note: Option<String> = outcome
         .as_ref()
         .err()
         .or(outcome.as_ref().ok())
-        .map(|s| s.as_str());
-    finalize(project, &card_id, work_dir, outcome.is_err(), note);
+        .map(|s| s.to_string());
+
+    if !failed {
+        // Verification gate (board audit option 1): the card's work must pass
+        // the project's own checks before it is accepted into review. A failing
+        // check fails the card with the check output in its result.
+        let gate = crate::verify::run_gate(work_dir).await;
+        if !gate.passed {
+            failed = true;
+            note = Some(gate.detail.clone());
+        }
+    }
+
+    if !failed {
+        // Auto-review pass (board audit option 2): a second headless agent
+        // reads the diff and attaches findings as ordinary review comments
+        // (best-effort — any failure just skips the pass). Findings are added
+        // under the board lock while the card is still running, so they ride
+        // into the final review state with it.
+        let auto_review_on = board::load_board(project)
+            .ok()
+            .flatten()
+            .map(|b| b.auto_review)
+            .unwrap_or(false);
+        if auto_review_on {
+            let diff = git::diff_clamped(work_dir);
+            match crate::verify::auto_review(work_dir, prompt, &diff).await {
+                Ok(findings) => {
+                    for finding in findings {
+                        let text = format!("[auto-review] {}", finding.text);
+                        let _ = board::add_review(project, &card_id, finding.line, &text);
+                    }
+                }
+                Err(error) => {
+                    tracing::info!(project, card = %card_id, error = %error, "auto-review skipped");
+                }
+            }
+        }
+    }
+
+    finalize(project, &card_id, work_dir, failed, note.as_deref());
 }
 
 /// Persist a card's final state after its agent exits. Only transitions a card
@@ -762,6 +801,151 @@ mod tests {
             // Pending feedback is consumed now that the follow-up completed.
             assert!(card.followup_feedback.is_none());
         });
+    }
+
+    #[test]
+    fn follow_up_with_no_changes_keeps_prior_commit() {
+        // A follow-up whose agent makes no further change is a no-op, not an
+        // error: the card still reaches review with the prior pinned commit
+        // intact (the net result is unchanged) and the pending feedback is
+        // consumed — no empty commit is attempted, no warning spam.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        with_home(tmp.path(), || {
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+
+            let wt = git::card_worktree_dir("default", &a);
+            let branch = format!("katban/{a}");
+
+            // Run 1: base off HEAD, produces v1, pinned.
+            std::fs::create_dir_all(&wt).unwrap();
+            git::create_worktree(repo.path(), &wt, None).unwrap();
+            std::fs::write(wt.join("feature.txt"), "v1\n").unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(branch.clone());
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+            finalize("default", &a, &wt, false, Some("first run"));
+            let run1_commit = board::load_board("default")
+                .unwrap()
+                .unwrap()
+                .card(&a)
+                .unwrap()
+                .commit
+                .clone()
+                .expect("run 1 pins a commit");
+
+            // Feedback -> requeued.
+            board::add_review("default", &a, None, "make it better").unwrap();
+            board::send_feedback_to_agent("default", &a).unwrap();
+
+            // Run 2: follow-up bases on the branch but the agent changes nothing.
+            std::fs::create_dir_all(&wt).unwrap();
+            git::create_worktree(repo.path(), &wt, Some(&branch)).unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+            finalize("default", &a, &wt, false, Some("second run"));
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            // Net result unchanged: the prior commit is still the branch tip.
+            assert_eq!(card.commit.as_deref(), Some(run1_commit.as_str()));
+            assert_eq!(
+                git::rev_parse(repo.path(), &branch).as_deref(),
+                Some(run1_commit.as_str())
+            );
+            // Feedback consumed even though nothing changed.
+            assert!(card.followup_feedback.is_none());
+        });
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gate_failure_fails_the_card() {
+        // Verification gate (option 1): an agent run that passes but leaves a
+        // project whose checks fail must send the card to Failed — never Review
+        // — with the failing check named in the result.
+        fn node_available() -> bool {
+            std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !node_available() {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        // Env guard held across the await (test-only; same pattern as the
+        // board_server and verify test modules).
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":60}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            struct FailingChecks;
+            impl CardExecutor for FailingChecks {
+                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                    // The agent "writes" a JS project whose test command fails.
+                    std::fs::write(
+                        work_dir.join("package.json"),
+                        r#"{"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+                    )
+                    .unwrap();
+                    Ok("done".into())
+                }
+            }
+            let executor: Arc<dyn CardExecutor> = Arc::new(FailingChecks);
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Failed);
+            let result = card.result.as_deref().unwrap();
+            assert!(result.contains("test: npm test"), "result: {result}");
+            assert!(card.commit.is_none(), "gate failure must not pin a commit");
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
     }
 
     #[test]

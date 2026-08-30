@@ -173,6 +173,7 @@ struct BoardApi {
     dependencies: Vec<Dependency>,
     parallel_cap: usize,
     auto_retry: u32,
+    auto_review: bool,
     /// ids that can start right now (deps met, not running/review/blocked/done).
     ready: Vec<String>,
 }
@@ -943,6 +944,7 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
         dependencies: board.dependencies.clone(),
         parallel_cap: board.parallel_cap,
         auto_retry: board.auto_retry,
+        auto_review: board.auto_review,
         ready,
     }
 }
@@ -1095,7 +1097,7 @@ async function loadBoard(project) {
   const res = await fetch("/api/board/" + encodeURIComponent(project));
   if (!res.ok) { $("#board").innerHTML = '<span class="blocked">' + (await res.text()) + "</span>"; return; }
   const api = await res.json();
-  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry;
+  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "");
   const byStatus = {};
   COLS.forEach((c) => byStatus[c] = []);
   const waitMap = {};
@@ -1158,7 +1160,12 @@ async function loadBoard(project) {
                 (c.status === "review"
                   ? '<button data-mrg="' + c.id + '" style="border-color:#2fbf71;color:#2fbf71" title="Merge the pinned commit into the project & mark done">merge</button>'
                   : '') +
-                '<button data-adv="' + c.id + '">advance</button>' +
+                // Review cards have no generic "advance": moving one to Done is a
+                // merge-or-discard decision, and merge/archive above are the only
+                // (branch-safe) exits. Advance is the silent-discard footgun.
+                (c.status !== "review"
+                  ? '<button data-adv="' + c.id + '">advance</button>'
+                  : '') +
                 '<button data-arc="' + c.id + '">archive</button></div>';
       }
       card.innerHTML = html;

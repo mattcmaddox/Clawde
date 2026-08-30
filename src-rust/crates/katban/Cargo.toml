@@ -18,6 +18,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 clawde-core = { workspace = true }
 clawde-api = { workspace = true }
+clawde-tools = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

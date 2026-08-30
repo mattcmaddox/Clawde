@@ -546,6 +546,7 @@ const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAM
   link <A> <B>                           B must finish before A starts (cycle-checked)
   unlink <A> <B>
   ready [--cap N]                        Cards that can start now (queue order)
+  auto-review on|off                     Toggle the auto-review pass for cards
   run [--project NAME]                   Run the scheduler for one project (executes ready cards)
 
 The board UI serves on 127.0.0.1:<port> (default 8790). Binding a
@@ -1016,6 +1017,21 @@ async fn run_board(args: &[String]) -> anyhow::Result<()> {
             println!(
                 "initialized board for project '{project}' at {}",
                 clawde_katban::board::board_path(project).display()
+            );
+            Ok(())
+        }
+        "auto-review" => {
+            if rest.len() != 1 || !matches!(rest[0].as_str(), "on" | "off") {
+                anyhow::bail!("board auto-review needs on or off");
+            }
+            let enabled = rest[0] == "on";
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            board.auto_review = enabled;
+            save_board(&board, project)?;
+            println!(
+                "auto-review {} for board '{project}'",
+                if enabled { "enabled" } else { "disabled" }
             );
             Ok(())
         }

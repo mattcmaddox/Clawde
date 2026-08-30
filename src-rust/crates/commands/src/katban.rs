@@ -79,6 +79,7 @@ impl SlashCommand for KatbanCommand {
          /katban board card remove <id>  — remove a card (discards its branch)\n\
          /katban board card comment <id> [--line N] <text> — note a diff-review comment\n\
          /katban board card feedback <id> — send the card's review comments to its agent\n\
+         /katban board auto-review on|off — toggle the auto-review pass\n\
          /katban board card show <id>    — show a card's status, result, commit, diff\n\
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
@@ -401,6 +402,10 @@ impl SlashCommand for KatbanCommand {
                     Err(message) => CommandResult::Error(message),
                 }
             }
+            ["board", "auto-review", state] => match board_set_auto_review(project, state) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
             ["board", "card", "merge", id] => {
                 // Option B — pin-commit flow: merge the review card's branch
                 // into the project and close it (dependents then unblock).
@@ -768,6 +773,23 @@ fn board_remove_card(project: Option<&str>, id: &str) -> Result<String, String> 
     // Discard: archive the card AND delete its pinned branch (if any).
     clawde_katban::commit::discard_card(project_name(project), id)?;
     Ok(format!("'{id}' archived (branch cleaned up)"))
+}
+
+/// Toggle the board's auto-review pass (`/katban board auto-review on|off`).
+/// The pass is enabled by default; disabling it skips the second headless
+/// review agent for future cards (the verification gate still runs).
+fn board_set_auto_review(project: Option<&str>, state: &str) -> Result<String, String> {
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        other => return Err(format!("auto-review needs on or off, got '{other}'")),
+    };
+    with_board_lock(project, |board| board.auto_review = enabled)?;
+    Ok(format!(
+        "auto-review {} for board '{}'",
+        if enabled { "enabled" } else { "disabled" },
+        project_name(project)
+    ))
 }
 
 /// Append a diff-review comment (spec §16a E5). `board::add_review` locks

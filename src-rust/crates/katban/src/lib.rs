@@ -24,6 +24,7 @@ pub mod reload;
 pub mod runner;
 pub mod search;
 pub mod status;
+pub mod verify;
 
 /// Serializes `CLAWDE_HOME` mutation across the crate's test modules —
 /// parallel test safety per repo rules (see `crates/core/src/paths.rs`).

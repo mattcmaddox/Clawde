@@ -1005,6 +1005,7 @@ dependencies = [
  "axum",
  "clawde-api",
  "clawde-core",
+ "clawde-tools",
  "hex",
  "nix 0.29.0",
  "rand 0.8.7",
