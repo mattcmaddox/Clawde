@@ -77,16 +77,42 @@ impl NotificationQueue {
             .retain(|n| n.expires_at.is_none_or(|exp| exp > now));
     }
 
-    /// Return the currently visible (most recent) notification, if any.
+    /// Severity priority used for single-toast selection. Higher wins.
+    fn kind_priority(kind: &NotificationKind) -> u8 {
+        match kind {
+            NotificationKind::Error => 3,
+            NotificationKind::Warning => 2,
+            NotificationKind::Success => 1,
+            NotificationKind::Info => 0,
+        }
+    }
+
+    /// Index of the notification to display: the highest-priority visible
+    /// one, newest first on ties. Skipping an already-expired entry keeps a
+    /// timed toast from being shown past its lifetime before an immediate
+    /// re-render tick.
+    fn current_index(&self) -> Option<usize> {
+        let now = Instant::now();
+        self.notifications
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.expires_at.is_none_or(|exp| exp > now))
+            .max_by_key(|(i, n)| (Self::kind_priority(&n.kind), *i))
+            .map(|(i, _)| i)
+    }
+
+    /// Return the notification currently shown (highest-priority visible
+    /// one — an important, non-expiring toast is never hidden behind a newer
+    /// routine one).
     pub fn current(&self) -> Option<&Notification> {
-        self.notifications.back()
+        self.current_index().map(|i| &self.notifications[i])
     }
 
     /// Dismiss the currently visible notification.
     pub fn dismiss_current(&mut self) {
-        if let Some(n) = self.notifications.back().cloned() {
-            if n.dismissible {
-                self.notifications.pop_back();
+        if let Some(i) = self.current_index() {
+            if self.notifications[i].dismissible {
+                self.notifications.remove(i);
             }
         }
     }
@@ -358,9 +384,32 @@ mod tests {
         let mut q = NotificationQueue::new();
         q.push(NotificationKind::Warning, "older".to_string(), None);
         q.push(NotificationKind::Info, "newer".to_string(), Some(3));
-        assert_eq!(q.current().unwrap().message, "newer");
-        q.dismiss_current();
         assert_eq!(q.current().unwrap().message, "older");
+        q.dismiss_current();
+        assert_eq!(q.current().unwrap().message, "newer");
+    }
+
+    #[test]
+    fn important_toast_not_buried_by_newer_routine_toast() {
+        let mut q = NotificationQueue::new();
+        // A persistent (important) error must stay visible even after a
+        // newer, lower-priority routine toast is pushed on top.
+        q.push(NotificationKind::Error, "important".to_string(), None);
+        q.push(NotificationKind::Info, "routine".to_string(), Some(3));
+        assert_eq!(q.current().unwrap().message, "important");
+        // Dismissing the visible error reveals the routine toast.
+        q.dismiss_current();
+        assert_eq!(q.current().unwrap().message, "routine");
+    }
+
+    #[test]
+    fn same_kind_ties_break_to_newest() {
+        let mut q = NotificationQueue::new();
+        q.push(NotificationKind::Warning, "first".to_string(), None);
+        q.push(NotificationKind::Warning, "second".to_string(), None);
+        assert_eq!(q.current().unwrap().message, "second");
+        q.dismiss_current();
+        assert_eq!(q.current().unwrap().message, "first");
     }
 
     #[test]

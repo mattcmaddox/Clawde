@@ -89,6 +89,41 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// Decide how a terminal query error should surface as a TUI toast.
+///
+/// Recoverable, transient conditions — provider rate limits, free-mode
+/// upstream exhaustion (e.g. "free-mode upstreams exhausted: groq
+/// [rate_limited]"), timeouts, and 5xx server errors — surface as a temporary
+/// warning that auto-expires, so a routine throttle isn't a persistent red
+/// alarm. Hard failures (auth, config, tool, malformed requests) stay a
+/// persistent red `Error` that demands an explicit dismiss.
+///
+/// The free-chain exhaustion error arrives wrapped as `Api(String)` with
+/// `is_retryable:false`, so its message text is consulted as a fallback for
+/// the transient set.
+fn outcome_notification_class(
+    err: &clawde_core::error::ClaudeError,
+) -> (clawde_tui::notifications::NotificationKind, Option<u64>) {
+    use clawde_tui::notifications::NotificationKind;
+    let msg = err.to_string().to_ascii_lowercase();
+    let transient = err.is_retryable()
+        || matches!(
+            err,
+            clawde_core::error::ClaudeError::ApiStatus { status, .. }
+                if (500..600).contains(status)
+        )
+        || msg.contains("free-mode upstreams exhausted")
+        || msg.contains("rate limit")
+        || msg.contains("429")
+        || msg.contains("503")
+        || msg.contains("timed out");
+    if transient {
+        (NotificationKind::Warning, Some(5))
+    } else {
+        (NotificationKind::Error, None)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
 // ---------------------------------------------------------------------------
@@ -6778,11 +6813,8 @@ async fn run_interactive(
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
-                    app.notifications.push(
-                        clawde_tui::notifications::NotificationKind::Error,
-                        err.to_string(),
-                        None,
-                    );
+                    let (kind, duration) = outcome_notification_class(&err);
+                    app.notifications.push(kind, err.to_string(), duration);
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();

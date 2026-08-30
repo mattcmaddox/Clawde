@@ -1735,7 +1735,7 @@ impl Stream for RetryingFreeStream {
                             self.upstream_errors.push(reason);
                             if !self.start_next_plan_entry() {
                                 let msg = format!(
-                                    "all free-mode upstreams exhausted: {}",
+                                    "free-mode upstreams exhausted: {}",
                                     join_capped_upstream_errors(&self.upstream_errors)
                                 );
                                 return Poll::Ready(Some(Err(ProviderError::ServerError {
@@ -1770,7 +1770,7 @@ impl Stream for RetryingFreeStream {
                         self.upstream_errors.push(reason);
                         if !self.start_next_plan_entry() {
                             let msg = format!(
-                                "all free-mode upstreams exhausted: {}",
+                                "free-mode upstreams exhausted: {}",
                                 join_capped_upstream_errors(&self.upstream_errors)
                             );
                             return Poll::Ready(Some(Err(ProviderError::ServerError {
@@ -2024,7 +2024,7 @@ impl Stream for RetryingFreeStream {
                         self.upstream_errors.push(reason);
                         if !self.start_next_plan_entry() {
                             let msg = format!(
-                                "all free-mode upstreams exhausted: {}",
+                                "free-mode upstreams exhausted: {}",
                                 join_capped_upstream_errors(&self.upstream_errors)
                             );
                             return Poll::Ready(Some(Err(ProviderError::ServerError {
@@ -2061,7 +2061,7 @@ impl Stream for RetryingFreeStream {
                         }
                         // All exhausted.
                         let msg = format!(
-                            "all free-mode upstreams exhausted: {}",
+                            "free-mode upstreams exhausted: {}",
                             join_capped_upstream_errors(&self.upstream_errors)
                         );
                         return Poll::Ready(Some(Err(ProviderError::ServerError {
@@ -2339,13 +2339,13 @@ impl LlmProvider for FreeProvider {
 
         let err_msg = if !upstream_errors.is_empty() {
             format!(
-                "all free-mode upstreams exhausted: {}",
+                "free-mode upstreams exhausted: {}",
                 join_capped_upstream_errors(&upstream_errors)
             )
         } else if let Some(reason) = self.capability_block_reason(&request) {
-            format!("all free-mode upstreams exhausted: {}", reason)
+            format!("free-mode upstreams exhausted: {}", reason)
         } else {
-            "all free-mode upstreams exhausted — no upstreams had errors, all may be in cooldown"
+            "free-mode upstreams exhausted — no upstreams had errors, all may be in cooldown"
                 .to_string()
         };
         Err(ProviderError::ServerError {
@@ -2543,13 +2543,13 @@ impl LlmProvider for FreeProvider {
 
         let err_msg = if !upstream_errors.is_empty() {
             format!(
-                "all free-mode upstreams exhausted: {}",
+                "free-mode upstreams exhausted: {}",
                 join_capped_upstream_errors(&upstream_errors)
             )
         } else if let Some(reason) = self.capability_block_reason(&request) {
-            format!("all free-mode upstreams exhausted: {}", reason)
+            format!("free-mode upstreams exhausted: {}", reason)
         } else {
-            "all free-mode upstreams exhausted".to_string()
+            "free-mode upstreams exhausted".to_string()
         };
         Err(ProviderError::ServerError {
             provider: self.id.clone(),
@@ -3156,7 +3156,7 @@ mod tests {
         // whose message preserves the ORIGINAL 500 from the mock upstream.
         let text = err.to_string();
         assert!(
-            text.contains("all free-mode upstreams exhausted")
+            text.contains("free-mode upstreams exhausted")
                 && text.contains("groq")
                 && text.contains("Server error 500"),
             "mock 500 should surface in the exhaustion error, got: {text}"
@@ -4570,7 +4570,7 @@ mod tests {
             .unwrap_err();
         let text = err.to_string();
         assert!(
-            text.contains("all free-mode upstreams exhausted"),
+            text.contains("free-mode upstreams exhausted"),
             "got: {text}"
         );
         // The ORIGINAL failures are preserved, with their upstream ids.
@@ -4693,7 +4693,7 @@ mod tests {
         };
         let text = err.to_string();
         assert!(
-            text.contains("all free-mode upstreams exhausted"),
+            text.contains("free-mode upstreams exhausted"),
             "got: {text}"
         );
         assert!(text.contains("poolside"), "got: {text}");

@@ -1620,3 +1620,78 @@ detection + block-dependents failure semantics + transient-only retry, Cline
 admin-API approach due to full-config-replace risk), on-demand session summary,
 opaque server-side tokens, `~/.clawde/katban/katban.json`, multiplexed WS, and
 the admin-only-orchestration confirmation. Smaller items remain in §16b.
+
+---
+
+## 22. Self-host quickstart (verified 2026-08-30)
+
+The exact bootstrap that works end-to-end, plus the honesty about the one
+part that is provider-dependent.
+
+### 22.1 Minimal happy-path bootstrap
+
+All of this runs against the debug binary
+(`src-rust/target/debug/clawde`) from `src-rust/` and honours `CLAWDE_HOME`
+(the sandboxed home used in the live smoke tests). The board stores its config
+under `CLAWDE_HOME/katban/`.
+
+```bash
+# 1. Register a git project (no push needed; the runner uses local worktrees).
+clawde katban project set myproj /path/to/repo
+
+# 2. Add a card asking the agent to do one concrete task.
+clawde katban board card add myproj "fix the failing test in foo_test.py" --project myproj
+
+# 3. Run the scheduler once, or serve/expose for the always-on board.
+clawde katban board run
+#    …or run the web board (port 8790) and let guests drive cards:
+clawde katban board serve
+#    …or make the runner always-on behind caddy:
+clawde katban board expose --run
+```
+
+Notes the smoke run verified the hard way:
+- The `--project` flag must come **after** the card subcommand
+  (`board card add NAME TASK --project NAME`), not before it. Placed before the
+  subcommand the card is silently never added.
+- Toggling the two post-run passes is per-board: `board verify on|off` and
+  `board auto-review on|off`, plus CLI/`/katban`/web parity. Both must be on
+  for the gate and the auto-review pass to run; the card result names which
+  one skipped. Tune the gate via global `settings.json` → `config.verify`
+  (`enabled`, `auto_test`, `auto_lint`, `timeout_secs`, default 180s).
+
+### 22.2 What the runner does end-to-end
+
+The scheduler spawns a worktree for the card → runs the headless agent on the
+card's task → runs the **verification gate** (detected test/lint commands in
+the worktree, after dependency provisioning; any failure → `Failed` with the
+failing check named, no commit) → runs the **auto-review pass** (a second agent
+attaches `[auto-review]` findings as comments) → terminal `Review` state. A
+no-op follow-up with no diff skips both the gate and the commit. Gate artifacts
+(stale `node_modules/`, `target/`, `.venv/`) are excluded from the diff and
+commit via a per-worktree `core.excludesFile`.
+
+### 22.3 The honest caveats (from the live smoke)
+
+**Free-provider reliability is the one unresolved variable — and it is provider
+scope, not a board bug.** In an environment whose only free key is
+`GROQ_API_KEY`, the free chain is exactly `[groq]` — the other free upstreams
+(NVIDIA, Cerebras, Gemini, …) are not added without their own keys, so there is
+no fallback when groq throttles. Groq's free tier is genuinely tiny (~8K TPM,
+1K req/day; Clawde clamps each request to ~7.5K tokens), and a multi-turn agent
+run burns that in under a minute → realistic, intermittent
+`free-mode upstreams exhausted: groq [rate_limited]` failures that send cards
+to `Failed` and auto-retry before giving up. Both an interactive failure path
+and the happy path to `Review` were exercised live.
+
+This is **not** evidence the board can't drive a real project — the runner,
+worktree, agent spawn, error capture, retry, unchanged-tree skip, and web/CLI
+surfaces all worked. To use the board for real you want either a provider that
+reliably performs headless edits, or more configured free upstreams so the
+chain has genuine fallback when one throttles.
+
+**Rate-limit toast behaviour** (TUI, 2026-08-30): a transient throttled turn
+now surfaces as an auto-expiring warning, not a persistent red error, and
+free-mode exhaustion messages name the upstreams actually attempted. See
+`crates/cli/src/main.rs` `outcome_notification_class` and
+`crates/tui/src/notifications.rs`.
