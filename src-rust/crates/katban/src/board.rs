@@ -113,6 +113,13 @@ pub struct Card {
     /// feedback; a review card's agent re-runs only when this is set.
     #[serde(default)]
     pub followup_feedback: Option<String>,
+    /// How many of `reviews` have already been folded into sent feedback
+    /// (sent via `send_feedback_to_agent`). A later feedback round composes
+    /// only the comments past this index, so a second follow-up doesn't re-send
+    /// feedback the agent already addressed. Monotonic — `reviews` never
+    /// shrinks, so this only advances.
+    #[serde(default)]
+    pub review_ack: usize,
     #[serde(default)]
     pub created_at: u64,
     #[serde(default)]
@@ -130,6 +137,23 @@ pub struct ReviewComment {
     pub location: Option<String>,
     pub text: String,
     pub created_at: u64,
+}
+
+impl Card {
+    /// The prompt the card's agent actually runs on the next execution: the
+    /// base prompt plus, when a reviewer sent follow-up feedback
+    /// (`send_feedback_to_agent`), that feedback appended as a review block so
+    /// the agent knows what was asked and can summarize the change.
+    pub fn effective_prompt(&self) -> String {
+        match &self.followup_feedback {
+            Some(fb) if !fb.trim().is_empty() => format!(
+                "{}\n\n[Katban review — address this, then summarize the change]\n{}",
+                self.prompt.trim(),
+                fb.trim()
+            ),
+            _ => self.prompt.clone(),
+        }
+    }
 }
 
 /// `from` may only start once `to` is Done.
@@ -197,6 +221,7 @@ impl Board {
             commit: None,
             reviews: Vec::new(),
             followup_feedback: None,
+            review_ack: 0,
             created_at: now,
             updated_at: now,
         });
@@ -584,15 +609,17 @@ pub fn send_feedback_to_agent(project: &str, card_id: &str) -> Result<usize, Str
             status_display(card.status)
         ));
     }
-    if card.reviews.is_empty() {
-        return Err("card has no review comments to send — comment on the diff first".to_string());
+    // Only comments not yet sent are composed (see `Card::review_ack`): a
+    // second feedback round re-sends the agent only what is genuinely new
+    // since the last send, not everything it already addressed.
+    let start = card.review_ack.min(card.reviews.len());
+    if start >= card.reviews.len() {
+        return Err("no new review comments to send — comment on the diff first".to_string());
     }
-
-    // Compose the pending feedback into a single block the follow-up run's
-    // prompt will append. Each comment carries an optional diff-line anchor.
     let mut lines: Vec<String> = card
         .reviews
         .iter()
+        .skip(start)
         .map(|r| match &r.location {
             Some(loc) => format!("[diff line {loc}] {}", r.text),
             None => r.text.clone(),
@@ -602,6 +629,8 @@ pub fn send_feedback_to_agent(project: &str, card_id: &str) -> Result<usize, Str
     let count = lines.len();
     lines.push(String::new()); // trailing newline so the agent sees a clean block
     card.followup_feedback = Some(lines.join("\n"));
+    // Advance the ack marker so the next send starts after these comments.
+    card.review_ack = card.reviews.len();
     // Reset to queued (deps met) so the runner picks the card up again; clear
     // the transient-retry counter — a review follow-up is a new deliberate
     // attempt, not a failure retry.
@@ -978,6 +1007,111 @@ mod tests {
             save_board(&board, "..").unwrap();
             assert!(path.exists());
             assert!(!clawde_home().join("board.json").exists());
+        });
+    }
+
+    #[test]
+    fn effective_prompt_appends_feedback_when_pending() {
+        let mut board = Board::new();
+        let id = board.add_card("  build the landing page  ");
+        let card = board.card(&id).unwrap();
+        // No feedback -> the trimmed base prompt unchanged.
+        assert_eq!(card.effective_prompt(), "build the landing page");
+        // Once review feedback is pending, it is appended as a review block.
+        let card = board.cards.iter_mut().find(|c| c.id == id).unwrap();
+        card.followup_feedback = Some("[L14] make the header sticky".to_string());
+        let eff = card.effective_prompt();
+        assert!(eff.starts_with("build the landing page"));
+        assert!(eff.contains("[Katban review — address this"));
+        assert!(eff.contains("[L14] make the header sticky"));
+    }
+
+    #[test]
+    fn feedback_rounds_do_not_resend_already_sent_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            let mut board = Board::new();
+            let id = board.add_card("ship the feature");
+            board.set_status(&id, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+
+            // Round 1: two new comments are both folded in.
+            add_review("default", &id, Some("9".to_string()), "first note").unwrap();
+            add_review("default", &id, None, "second note").unwrap();
+            assert_eq!(send_feedback_to_agent("default", &id).unwrap(), 2);
+            let fb = load_board("default")
+                .unwrap()
+                .unwrap()
+                .card(&id)
+                .unwrap()
+                .followup_feedback
+                .clone()
+                .unwrap();
+            assert!(fb.contains("first note") && fb.contains("second note"));
+
+            // Back to review (the follow-up completed), add one brand-new comment,
+            // and send a second round. It must compose only the new comment — a
+            // second follow-up must not re-send what the agent already addressed.
+            board.set_status(&id, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+            add_review("default", &id, Some("12".to_string()), "third note").unwrap();
+            assert_eq!(send_feedback_to_agent("default", &id).unwrap(), 1);
+            let fb = load_board("default")
+                .unwrap()
+                .unwrap()
+                .card(&id)
+                .unwrap()
+                .followup_feedback
+                .clone()
+                .unwrap();
+            assert!(fb.contains("third note"));
+            assert!(!fb.contains("first note") && !fb.contains("second note"));
+
+            // With nothing new left to send, a further round is refused.
+            board.set_status(&id, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+            assert!(send_feedback_to_agent("default", &id).is_err());
+        });
+    }
+
+    #[test]
+    fn review_comment_then_feedback_requeues_for_follow_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            let mut board = Board::new();
+            let id = board.add_card("wire the db");
+            // The runner marks success as review; simulate that.
+            board.set_status(&id, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+
+            // Comment twice: one anchored to a diff line, one free-form.
+            let c1 =
+                add_review("default", &id, Some("12".to_string()), "  add an index  ").unwrap();
+            let c2 = add_review("default", &id, None, "retry on conflict").unwrap();
+            let loaded = load_board("default").unwrap().unwrap();
+            let card = loaded.card(&id).unwrap();
+            assert_eq!(card.reviews.len(), 2);
+            assert_eq!(card.reviews[0].location.as_deref(), Some("12"));
+            assert_eq!(card.reviews[0].text, "add an index"); // trimmed
+            assert_ne!(c1, c2);
+
+            // Sending feedback composes both comments, clears retries, requeues.
+            let count = send_feedback_to_agent("default", &id).unwrap();
+            assert_eq!(count, 2);
+            let loaded = load_board("default").unwrap().unwrap();
+            let card = loaded.card(&id).unwrap();
+            assert_eq!(card.status, CardStatus::Queued);
+            let fb = card.followup_feedback.as_deref().unwrap();
+            assert!(fb.contains("[diff line 12] add an index"));
+            assert!(fb.contains("retry on conflict"));
+
+            // A review card with no comments is refused.
+            let id2 = board.add_card("another");
+            board.set_status(&id2, CardStatus::Review);
+            save_board(&board, "default").unwrap();
+            assert!(send_feedback_to_agent("default", &id2).is_err());
+            // A non-review card is refused too.
+            assert!(send_feedback_to_agent("default", &id).is_err());
         });
     }
 }

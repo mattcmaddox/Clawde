@@ -1111,7 +1111,9 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::board::{load_board, save_board, CardStatus};
 
     let Some(action) = args.first().map(|s| s.as_str()) else {
-        anyhow::bail!("board card needs an action: add|list|set|merge|remove|show");
+        anyhow::bail!(
+            "board card needs an action: add|list|set|merge|remove|comment|feedback|show"
+        );
     };
     let rest = &args[1..];
     match action {
@@ -1149,6 +1151,17 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
             }
             let status = CardStatus::parse(&rest[1])
                 .with_context(|| format!("unknown status '{}'", rest[1]))?;
+            // Setting a card done without merging is an explicit discard: if the
+            // card has a pinned commit (a reviewed card), its `katban/<id>`
+            // branch must be cleaned up too — a bare Done would leak the branch
+            // forever. `discard_card` locks, deletes the branch (if any), and
+            // marks the card done.
+            if status == CardStatus::Done {
+                clawde_katban::commit::discard_card(project, &rest[0])
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("'{}' -> done (branch cleaned up)", rest[0]);
+                return Ok(());
+            }
             let _guard = clawde_katban::board::BoardLock::acquire(project)?;
             let mut board = load_board(project)?.unwrap_or_default();
             if board.set_status(&rest[0], status) {
@@ -1177,6 +1190,59 @@ fn run_card(project: &str, args: &[String]) -> anyhow::Result<()> {
             clawde_katban::commit::discard_card(project, &rest[0])
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("'{}' archived (branch cleaned up)", rest[0]);
+            Ok(())
+        }
+        "comment" => {
+            // `board card comment <ID> [--line N] <TEXT>` — append a diff-review
+            // comment (spec §16a E5). The optional line anchor is advisory; text
+            // is everything after the id and optional --line.
+            if rest.is_empty() {
+                anyhow::bail!(
+                    "board card comment needs an id: board card comment <ID> [--line N] <TEXT>"
+                );
+            }
+            let id = rest[0].clone();
+            let mut index = 1;
+            let mut location = None;
+            let mut text_parts: Vec<&str> = Vec::new();
+            while index < rest.len() {
+                if rest[index] == "--line" {
+                    location = Some(
+                        rest.get(index + 1)
+                            .cloned()
+                            .context("--line needs a value")?,
+                    );
+                    index += 2;
+                } else if let Some(value) = rest[index].strip_prefix("--line=") {
+                    location = Some(value.to_string());
+                    index += 1;
+                } else {
+                    text_parts.push(&rest[index]);
+                    index += 1;
+                }
+            }
+            let text = text_parts.join(" ").trim().to_string();
+            if text.is_empty() {
+                anyhow::bail!("board card comment needs comment text");
+            }
+            let new_id = clawde_katban::board::add_review(project, &id, location, &text)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("comment {new_id} added to '{id}'");
+            Ok(())
+        }
+        "feedback" => {
+            // `board card feedback <ID>` — send the card's review comments back
+            // to its agent as a follow-up run: requeues + appends them to the
+            // prompt (spec §16a E5).
+            if rest.is_empty() {
+                anyhow::bail!("board card feedback needs an id");
+            }
+            let count = clawde_katban::board::send_feedback_to_agent(project, &rest[0])
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "sent {} comment(s) back to '{}' — card requeued for a follow-up run",
+                count, rest[0]
+            );
             Ok(())
         }
         "show" => card_show(project, rest),
@@ -1218,6 +1284,19 @@ fn card_show(project: &str, args: &[String]) -> anyhow::Result<()> {
     if let Some(diff) = &card.diff {
         println!("diff ({} ch):", diff.len());
         println!("{diff}");
+    }
+    if !card.reviews.is_empty() {
+        println!("reviews:");
+        for r in &card.reviews {
+            match &r.location {
+                Some(loc) => println!("  [L{loc}] {}", r.text),
+                None => println!("  {}", r.text),
+            }
+        }
+    }
+    if let Some(fb) = &card.followup_feedback {
+        println!("pending feedback (sent to agent on the next run):");
+        println!("{fb}");
     }
     Ok(())
 }
@@ -2194,5 +2273,130 @@ mod tests {
         let (project, positionals) = parse_project_flag(&["--project=other".to_string()]);
         assert_eq!(project.as_deref(), Some("other"));
         assert!(positionals.is_empty());
+    }
+
+    #[test]
+    fn board_card_set_done_discards_pinned_branch() {
+        // `board card set <id> done` on a reviewed card is an explicit discard:
+        // it must delete the pinned `katban/<id>` branch, not leave it to leak
+        // forever in the repo (advance/set on the web routes the same way).
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = (|| -> anyhow::Result<()> {
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            std::fs::write(repo.path().join("README.md"), "# demo\n").unwrap();
+            std::process::Command::new("git")
+                .args(["add", "."])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "init"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+
+            clawde_katban::projects::set_repo_root("default", repo.path())?;
+            let mut board = clawde_katban::board::Board::new();
+            let id = board.add_card("wire the db");
+            board.set_status(&id, clawde_katban::board::CardStatus::Review);
+            board.cards.iter_mut().find(|c| c.id == id).unwrap().branch =
+                Some(format!("katban/{id}"));
+            clawde_katban::board::save_board(&board, "default")?;
+
+            // Pin a commit on the card's branch like the runner's finalize, then
+            // remove the worktree the way finalize always does.
+            let wt = clawde_katban::git::card_worktree_dir("default", &id);
+            std::fs::create_dir_all(&wt)?;
+            clawde_katban::git::create_worktree(repo.path(), &wt, None)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            std::fs::write(wt.join("feature.txt"), "x\n")?;
+            let sha = clawde_katban::git::commit_card(
+                repo.path(),
+                &wt,
+                &format!("katban/{id}"),
+                "katban: wire",
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            let mut board = clawde_katban::board::load_board("default")?.unwrap();
+            board.cards.iter_mut().find(|c| c.id == id).unwrap().commit = Some(sha);
+            clawde_katban::board::save_board(&board, "default")?;
+            clawde_katban::git::remove_worktree(repo.path(), &wt);
+
+            run_card("default", &["set".into(), id.clone(), "done".into()])?;
+            let board = clawde_katban::board::load_board("default")?.unwrap();
+            assert_eq!(
+                board.card(&id).unwrap().status,
+                clawde_katban::board::CardStatus::Done
+            );
+            assert!(
+                clawde_katban::git::rev_parse(repo.path(), &format!("katban/{id}")).is_none(),
+                "pinned branch leaked after `card set done`"
+            );
+            Ok(())
+        })();
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        result.unwrap();
+    }
+
+    #[test]
+    fn board_card_comment_and_feedback_flow() {
+        // Serialize CLAWDE_HOME mutation on the binary-wide lock (repo rule).
+        let _guard = crate::ENV_LOCK.blocking_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = (|| -> anyhow::Result<()> {
+            // Seed a board with one card in review (the runner marks success
+            // review).
+            let mut board = clawde_katban::board::Board::new();
+            let id = board.add_card("wire up the db");
+            board.set_status(&id, clawde_katban::board::CardStatus::Review);
+            clawde_katban::board::save_board(&board, "default")?;
+
+            // `board card comment <id> --line 12 <text>` appends a comment.
+            run_card(
+                "default",
+                &[
+                    "comment".into(),
+                    id.clone(),
+                    "--line".into(),
+                    "12".into(),
+                    "add an index".into(),
+                ],
+            )?;
+            let loaded = clawde_katban::board::load_board("default")?.unwrap();
+            let card = loaded.card(&id).unwrap();
+            assert_eq!(card.reviews.len(), 1);
+            assert_eq!(card.reviews[0].location.as_deref(), Some("12"));
+            assert_eq!(card.reviews[0].text, "add an index");
+
+            // `board card feedback <id>` requeues it with the composed feedback.
+            run_card("default", &["feedback".into(), id.clone()])?;
+            let loaded = clawde_katban::board::load_board("default")?.unwrap();
+            let card = loaded.card(&id).unwrap();
+            assert_eq!(card.status, clawde_katban::board::CardStatus::Queued);
+            assert!(card
+                .followup_feedback
+                .as_deref()
+                .unwrap()
+                .contains("add an index"));
+            Ok(())
+        })();
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        result.unwrap();
     }
 }

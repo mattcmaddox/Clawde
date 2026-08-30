@@ -283,20 +283,14 @@ async fn spawn_ready(
         }
         let _ = std::fs::create_dir_all(&work_dir);
         // Pull the prompt fresh (the board just persisted it as running). A
-        // follow-up run appends the review-feedback block so the agent knows
-        // what the reviewer asked it to change.
+        // follow-up run appends the review-feedback block (via
+        // `Card::effective_prompt`) so the agent knows what the reviewer asked
+        // it to change.
         let prompt = board::load_board(project)
             .ok()
             .flatten()
             .map(|b| match b.card(&id) {
-                Some(c) => match &c.followup_feedback {
-                    Some(fb) if !fb.trim().is_empty() => format!(
-                        "{}\n\n[Katban review — address this, then summarize the change]\n{}",
-                        c.prompt.trim(),
-                        fb.trim()
-                    ),
-                    _ => c.prompt.clone(),
-                },
+                Some(c) => c.effective_prompt(),
                 None => String::new(),
             })
             .unwrap_or_default();
@@ -398,14 +392,21 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
                 card.retries += 1;
                 card.status = CardStatus::Failed;
             } else {
-                // Option B — pin the commit: commit the worktree to the card's
-                // branch while the checkout still exists, so review has a real
-                // commit to merge or discard. Falls back to diff-only review if
-                // the pin fails (e.g. no registered repo / git hiccup) rather
-                // than failing the card.
-                if let Some(repo) = crate::projects::repo_root(project) {
-                    if let Some(branch) = card.branch.clone() {
-                        if card.commit.is_none() {
+                // Option B — pin (or re-pin) the commit: commit the worktree to
+                // the card's branch while the checkout still exists, so review
+                // has a real, complete commit to merge or discard. `commit_card`
+                // resets the branch to this run's tree (`checkout -B`), so a
+                // follow-up run (review feedback sent back to the agent)
+                // replaces the prior pinned commit — merging a reviewed follow-up
+                // never silently drops the changes the agent made in response to
+                // review. Only when this run actually changed the tree (a
+                // non-empty diff vs its base) do we commit; a no-op follow-up
+                // keeps the prior commit as the net result. Falls back to
+                // diff-only review if the pin fails (no registered repo / git
+                // hiccup) rather than failing the card.
+                if !diff.is_empty() {
+                    if let Some(repo) = crate::projects::repo_root(project) {
+                        if let Some(branch) = card.branch.clone() {
                             match crate::git::commit_card(
                                 &repo,
                                 work_dir,
@@ -427,6 +428,12 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
                         }
                     }
                 }
+                // A review follow-up (feedback was pending when this run started)
+                // is now complete: consume the feedback so a later manual requeue
+                // doesn't re-append stale instructions, and so the next run's
+                // worktree base falls back to HEAD rather than the branch this
+                // run already folded in.
+                card.followup_feedback = None;
                 card.status = CardStatus::Review;
             }
             card.result = Some(note);
@@ -679,6 +686,81 @@ mod tests {
             assert_eq!(card.status, CardStatus::Review);
             let diff = card.diff.as_deref().expect("diff captured");
             assert!(diff.contains("feature"), "diff: {diff}");
+        });
+    }
+
+    #[test]
+    fn follow_up_run_repins_commit_and_consumes_feedback() {
+        // A review follow-up (feedback sent back to the agent) re-runs the card
+        // on top of its own branch. Its new changes must be committed (re-pinned)
+        // on the branch so `merge_card` lands them — not lost in the torn-down
+        // worktree — and the pending feedback must be consumed once the run ends.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        with_home(tmp.path(), || {
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+
+            let wt = git::card_worktree_dir("default", &a);
+            let branch = format!("katban/{a}");
+
+            // ---- Run 1: based off repo HEAD, produces v1 ----
+            std::fs::create_dir_all(&wt).unwrap();
+            git::create_worktree(repo.path(), &wt, None).unwrap();
+            std::fs::write(wt.join("feature.txt"), "v1\n").unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(branch.clone());
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+            finalize("default", &a, &wt, false, Some("first run"));
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            let run1_commit = card.commit.clone().expect("run 1 pins a commit");
+            assert_eq!(
+                git::rev_parse(repo.path(), &branch).as_deref(),
+                Some(run1_commit.as_str())
+            );
+
+            // ---- send feedback -> requeues with follow-up pending ----
+            board::add_review("default", &a, Some("5".to_string()), "make the feature v2").unwrap();
+            board::send_feedback_to_agent("default", &a).unwrap();
+            let b = board::load_board("default").unwrap().unwrap();
+            assert_eq!(b.card(&a).unwrap().status, CardStatus::Queued);
+            assert!(b.card(&a).unwrap().followup_feedback.is_some());
+            assert!(!wt.exists(), "finalize removed the run-1 worktree");
+
+            // ---- Run 2: follow-up bases on the card's branch, produces v2 ----
+            std::fs::create_dir_all(&wt).unwrap();
+            git::create_worktree(repo.path(), &wt, Some(&branch)).unwrap();
+            std::fs::write(wt.join("feature.txt"), "v2\n").unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+            finalize("default", &a, &wt, false, Some("second run"));
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            // The follow-up's changes are re-pinned on the branch (a NEW commit),
+            // so merging lands v2 rather than silently losing the review work.
+            let run2_commit = card.commit.clone().expect("follow-up re-pins a commit");
+            assert_ne!(run2_commit, run1_commit);
+            assert_eq!(
+                git::rev_parse(repo.path(), &branch).as_deref(),
+                Some(run2_commit.as_str())
+            );
+            assert!(card.diff.as_deref().unwrap().contains("v2"));
+            // Pending feedback is consumed now that the follow-up completed.
+            assert!(card.followup_feedback.is_none());
         });
     }
 

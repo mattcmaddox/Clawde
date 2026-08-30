@@ -41,7 +41,18 @@ katban-command + 5 tui dialog + 53 cli tests, clippy + workspace green.
 1 of that web board is now built and verified (see §20.7): a thin read-only
 board server (`clawde katban board serve`, port 8790) with inline HTML UI
 + `/api/projects` and `/api/board/{project}`, tested + clippy-clean
-(+4 board_server tests -> 90 katban total).
+(+4 board_server tests -> 90 katban total). The board web UI has since grown
+the always-on runner indicator (`/api/runner`, §16a) and the **diff-review
+loop (§16a E5)**: `POST /api/board/{project}` `/cards/{id}/comment` appends a
+line-anchored `ReviewComment` (stored on the card, shown in the UI), and
+`/cards/{id}/feedback` composes those comments and requeues the card via
+`send_feedback_to_agent` for a follow-up run whose worktree bases on the
+card's own pinned branch. `Card::effective_prompt()` appends the composed
+feedback block to the agent's prompt. Parity exists in the CLI
+(`board card comment <id> [--line N] <text>`, `board card feedback <id>`, and
+`card show` prints review comments) and in `/katban board card
+comment|feedback`. Review/feedback round-trip is covered from the board model
+(board.rs), the web API, and the CLI (143 katban tests total).
 
 **Build status — guest link feature complete (new crate `clawde-katban`):**
 On top of the earlier slices (site lifecycle + `expose` + caddy include,

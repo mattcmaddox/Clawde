@@ -77,6 +77,8 @@ impl SlashCommand for KatbanCommand {
          /katban board card set <id> <s> — set a card's status\n\
          /katban board card merge <id>   — merge a review card into the project\n\
          /katban board card remove <id>  — remove a card (discards its branch)\n\
+         /katban board card comment <id> [--line N] <text> — note a diff-review comment\n\
+         /katban board card feedback <id> — send the card's review comments to its agent\n\
          /katban board card show <id>    — show a card's status, result, commit, diff\n\
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
@@ -178,6 +180,8 @@ impl SlashCommand for KatbanCommand {
                     ("set", "Set a card's status"),
                     ("merge", "Merge a review card into the project"),
                     ("remove", "Remove a card"),
+                    ("comment", "Note a diff-review comment"),
+                    ("feedback", "Send the card's review comments to its agent"),
                     ("show", "Show a card's status, result, commit, diff"),
                 ] {
                     out.push(ArgCompletion {
@@ -215,7 +219,9 @@ impl SlashCommand for KatbanCommand {
             }
             ["board", "card", "remove"]
             | ["board", "card", "show"]
-            | ["board", "card", "merge"] => {
+            | ["board", "card", "merge"]
+            | ["board", "card", "feedback"]
+            | ["board", "card", "comment"] => {
                 for card in load_board_cards(project) {
                     out.push(ArgCompletion {
                         value: format!("board card {}{proj_seg} {}", rest[2], card.0),
@@ -407,6 +413,43 @@ impl SlashCommand for KatbanCommand {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
             },
+            ["board", "card", "comment", rest @ ..] => {
+                // /katban board card comment <ID> [--line N] <TEXT> — note a diff-review
+                // comment (spec §16a E5) to feed back to the card's agent.
+                if rest.is_empty() {
+                    return CommandResult::Error(
+                        "board card comment needs an id and text: /katban board card comment <ID> [--line N] <TEXT>".to_string(),
+                    );
+                }
+                let id = rest[0];
+                let mut index = 1;
+                let mut location = None;
+                let mut text_parts: Vec<&str> = Vec::new();
+                while index < rest.len() {
+                    if rest[index] == "--line" {
+                        location = rest.get(index + 1).copied();
+                        index += 2;
+                    } else if let Some(value) = rest[index].strip_prefix("--line=") {
+                        location = Some(value);
+                        index += 1;
+                    } else {
+                        text_parts.push(rest[index]);
+                        index += 1;
+                    }
+                }
+                let text = text_parts.join(" ");
+                if text.trim().is_empty() {
+                    return CommandResult::Error("board card comment needs comment text".to_string());
+                }
+                match board_add_comment(project, id, location, &text) {
+                    Ok(text) => CommandResult::Message(text),
+                    Err(message) => CommandResult::Error(message),
+                }
+            }
+            ["board", "card", "feedback", id] => match board_send_feedback(project, id) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
             ["board", "card", "show", id] => match board_show_card(project, id) {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
@@ -424,7 +467,7 @@ impl SlashCommand for KatbanCommand {
             ),
             ["board"] => {
                 CommandResult::Message(
-                    "Usage: /katban board list | board ready | board card add <PROMPT> | board card set <ID> <status> | board card merge <ID> | board card remove <ID> | board link <A> <B> | board unlink <A> <B> — add --project NAME to target another board".to_string(),
+                    "Usage: /katban board list | board ready | board card add <PROMPT> | board card set <ID> <status> | board card merge <ID> | board card remove <ID> | board card comment <ID> [--line N] <TEXT> | board card feedback <ID> | board link <A> <B> | board unlink <A> <B> — add --project NAME to target another board".to_string(),
                 )
             }
             ["link"] | ["guest"] | ["site"] => {
@@ -708,6 +751,13 @@ fn board_add_card(project: Option<&str>, prompt: &str) -> Result<String, String>
 fn board_set_status(project: Option<&str>, id: &str, status: &str) -> Result<String, String> {
     let parsed = clawde_katban::board::CardStatus::parse(status)
         .ok_or_else(|| format!("unknown status '{status}' — try backlog, queued, running, review, done, blocked, failed"))?;
+    // A bare "done" on a card with a pinned commit is an explicit discard: the
+    // `katban/<id>` branch must be cleaned up, not leaked forever. `discard_card`
+    // locks and deletes the branch (if any) + marks the card done.
+    if parsed == clawde_katban::board::CardStatus::Done {
+        clawde_katban::commit::discard_card(project_name(project), id)?;
+        return Ok(format!("'{id}' -> done (branch cleaned up)"));
+    }
     if !with_board_lock(project, |board| board.set_status(id, parsed))? {
         return Err(format!("no card with id '{id}'"));
     }
@@ -718,6 +768,33 @@ fn board_remove_card(project: Option<&str>, id: &str) -> Result<String, String> 
     // Discard: archive the card AND delete its pinned branch (if any).
     clawde_katban::commit::discard_card(project_name(project), id)?;
     Ok(format!("'{id}' archived (branch cleaned up)"))
+}
+
+/// Append a diff-review comment (spec §16a E5). `board::add_review` locks
+/// and saves the board itself, so no board lock is held here.
+fn board_add_comment(
+    project: Option<&str>,
+    card_id: &str,
+    location: Option<&str>,
+    text: &str,
+) -> Result<String, String> {
+    let location = location
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    let comment_id =
+        clawde_katban::board::add_review(project_name(project), card_id, location, text)
+            .map_err(|e| format!("could not comment: {e}"))?;
+    Ok(format!("comment {comment_id} added to '{card_id}'"))
+}
+
+/// Send a review card's comments back to its agent as a follow-up run: requeues
+/// the card and appends the composed feedback to its next prompt (spec §16a E5).
+fn board_send_feedback(project: Option<&str>, card_id: &str) -> Result<String, String> {
+    let count = clawde_katban::board::send_feedback_to_agent(project_name(project), card_id)
+        .map_err(|e| format!("could not send feedback: {e}"))?;
+    Ok(format!(
+        "sent {count} comment(s) back to '{card_id}' — card requeued for a follow-up run"
+    ))
 }
 
 fn board_show_card(project: Option<&str>, id: &str) -> Result<String, String> {
@@ -746,6 +823,20 @@ fn board_show_card(project: Option<&str>, id: &str) -> Result<String, String> {
     }
     if let Some(diff) = &card.diff {
         out.push_str(&format!("\n\ndiff ({} ch):\n{diff}", diff.len()));
+    }
+    if !card.reviews.is_empty() {
+        out.push_str("\n\nreviews:");
+        for r in &card.reviews {
+            match &r.location {
+                Some(loc) => out.push_str(&format!("\n[L{loc}] {}", r.text)),
+                None => out.push_str(&format!("\n  {}", r.text)),
+            }
+        }
+    }
+    if let Some(fb) = &card.followup_feedback {
+        out.push_str(&format!(
+            "\n\npending feedback (sent to agent on the next run):\n{fb}"
+        ));
     }
     Ok(out)
 }

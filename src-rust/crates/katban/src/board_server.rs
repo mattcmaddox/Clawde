@@ -119,6 +119,11 @@ impl BoardServer {
             .route("/api/board/{project}/cards/{id}/advance", post(api_advance))
             .route("/api/board/{project}/cards/{id}/merge", post(api_merge))
             .route("/api/board/{project}/cards/{id}/archive", post(api_archive))
+            .route("/api/board/{project}/cards/{id}/comment", post(api_comment))
+            .route(
+                "/api/board/{project}/cards/{id}/feedback",
+                post(api_send_feedback),
+            )
             .route("/api/board/{project}/link", post(api_link))
             .route("/api/board/{project}/unlink", post(api_unlink))
             .with_state(state)
@@ -621,6 +626,15 @@ async fn api_set_status(
     let Some(status) = CardStatus::parse(&body.status) else {
         return json_message(StatusCode::BAD_REQUEST, "unknown status");
     };
+    // Setting a card done without merging is an explicit discard: clean up any
+    // pinned branch so it isn't leaked forever. `discard_card` locks + deletes
+    // the branch + marks done, so we must not hold `BoardLock` here.
+    if status == CardStatus::Done {
+        return match crate::commit::discard_card(&project, &id) {
+            Ok(()) => fresh_board_response(&project),
+            Err(message) => json_message(StatusCode::CONFLICT, &message),
+        };
+    }
     let _guard = match board::BoardLock::acquire(&project) {
         Ok(guard) => guard,
         Err(error) => return json_message(StatusCode::CONFLICT, &error.to_string()),
@@ -657,6 +671,17 @@ async fn api_advance(
     let Some(next) = card.status.next() else {
         return json_message(StatusCode::BAD_REQUEST, "card is done — nothing to advance");
     };
+    // Advancing a *review* card to Done without merging is an explicit discard:
+    // drop the lock and route through `discard_card` so the pinned `katban/<id>`
+    // branch is deleted rather than leaked forever. (Merge and archive are the
+    // other two review exits and already clean the branch up themselves.)
+    if next == CardStatus::Done {
+        drop(_guard);
+        return match crate::commit::discard_card(&project, &id) {
+            Ok(()) => fresh_board_response(&project),
+            Err(message) => json_message(StatusCode::CONFLICT, &message),
+        };
+    }
     board.set_status(&id, next);
     write_board(&board, &project)
 }
@@ -797,6 +822,77 @@ async fn api_unlink(
     }
 }
 
+#[derive(Default, Deserialize)]
+struct CommentForm {
+    /// Optional diff-line anchor, e.g. "12" or "14-16" (1-based diff line).
+    #[serde(default)]
+    location: Option<String>,
+    text: String,
+}
+
+/// Append a diff-review comment to a card (spec §16a E5). `add_review` is
+/// lock-protected, so this handler doesn't re-acquire `BoardLock`; it reloads
+/// the saved board for the response (matching the SSE-broadcast pattern).
+async fn api_comment(
+    State(state): State<BoardState>,
+    Path((project, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<CommentForm>,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return *response;
+    }
+    let location = body
+        .location
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return json_message(StatusCode::BAD_REQUEST, "comment text must not be empty");
+    }
+    match board::add_review(&project, &id, location, &text) {
+        Ok(_) => fresh_board_response(&project),
+        Err(message) => json_message(
+            StatusCode::BAD_REQUEST,
+            &format!("cannot comment: {message}"),
+        ),
+    }
+}
+
+/// Send a review card's comments back to the agent as a follow-up run.
+/// `send_feedback_to_agent` requeues the card under `BoardLock`, so the
+/// response just reloads the saved board (depending cards then unblock in the
+/// runner and show as ready here).
+async fn api_send_feedback(
+    State(state): State<BoardState>,
+    Path((project, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_auth(&state, &headers) {
+        return *response;
+    }
+    match board::send_feedback_to_agent(&project, &id) {
+        Ok(count) => {
+            no_cache_nosniff((Json(serde_json::json!({ "sent": count })),).into_response())
+        }
+        Err(message) => json_message(
+            StatusCode::CONFLICT,
+            &format!("cannot send feedback: {message}"),
+        ),
+    }
+}
+
+/// Reload a saved board for a write-response (the lock was already held and
+/// released inside the op that saved it), mirroring `load_board_for_write`
+/// without re-acquiring `BoardLock`.
+fn fresh_board_response(project: &str) -> Response {
+    match board::load_board(project) {
+        Ok(Some(board)) => write_board(&board, project),
+        Ok(None) => json_message(StatusCode::NOT_FOUND, "no board for project"),
+        Err(error) => json_message(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
 /// Board state is live and never cacheable, and JSON must never be
 /// MIME-sniffed into HTML. Same hardening the §19.6 site-host audit applied to
 /// the dev-site server (`host.rs`).
@@ -905,6 +1001,12 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   .card .actions select { font-size:12px; padding:2px 4px; background:#242a33; color:#e7ebf0; border:1px solid #3a424e; border-radius:6px; }
   .card details.diff summary { font-size:12px; color:#8b96a5; cursor:pointer; margin-top:4px; }
   .card details.diff pre { font-size:11px; background:#15181d; border:1px solid #2a2f37; border-radius:6px; padding:6px; overflow:auto; max-height:220px; white-space:pre-wrap; color:#c8d0da; }
+  .card .reviews { margin-top:4px; display:flex; flex-direction:column; gap:2px; }
+  .card .review { font-size:12px; color:#ffd479; background:#2a2410aa; border-left:2px solid #ffb36b; padding:2px 6px; border-radius:4px; white-space:pre-wrap; }
+  .card .rform { margin-top:6px; display:flex; gap:4px; }
+  .card .rform input { font-size:12px; background:#15181d; color:#e7ebf0; border:1px solid #3a424e; border-radius:6px; padding:2px 4px; }
+  .card .rform .rline { width:72px; flex:0 0 auto; }
+  .card .rform .rtext { flex:1; min-width:0; }
   #runner { font-size:12px; color:#8b96a5; }
   #runner .r-ok { color:#b8e8c9; }
   #runner .r-wait { color:#ffb36b; }
@@ -1032,6 +1134,19 @@ async function loadBoard(project) {
           "</div>";
       }
       if (c.diff) html += '<details class="diff"><summary>diff (' + (c.diff.length) + ' ch)</summary><pre>' + esc(c.diff) + '</pre></details>';
+      if (c.reviews && c.reviews.length) {
+        html += '<div class="reviews">' + c.reviews.map((r) =>
+          '<div class="review" title="' + (r.createdAt ? "" : "") + '">' +
+          esc((r.location ? "[L" + r.location + "] " : "") + r.text) + "</div>").join("") + "</div>";
+      }
+      if (authed && c.status === "review") {
+        html += '<div class="rform">' +
+                '<input class="rline" data-rline="' + c.id + '" placeholder="line" title="Optional diff line this comment anchors to (e.g. 12 or 14-16)">' +
+                '<input class="rtext" data-rtext="' + c.id + '" placeholder="review comment — send to agent to request a follow-up">' +
+                '<button class="mini" data-comment="' + c.id + '">comment</button>' +
+                '<button class="mini" data-fb="' + c.id + '" title="Re-run this card's agent with its review comments as feedback">send to agent</button>' +
+                "</div>";
+      }
       if (authed && c.status !== "done") {
         html += '<div class="actions">' +
                 '<button data-link="' + c.id + '" title="Link this card to wait on another (enter its id)">link</button>' +
@@ -1155,6 +1270,29 @@ async function unlinkCard(from, to) {
   if (res.ok) loadBoard($("#project").value); else alert("could not unlink cards");
 }
 
+async function postComment(id) {
+  const loc = $('[data-rline="' + id + '"]').value.trim();
+  const text = $('[data-rtext="' + id + '"]').value.trim();
+  if (!text) { alert("comment text is empty"); return; }
+  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/comment", {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ location: loc || null, text })
+  });
+  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
+  if (res.ok) loadBoard($("#project").value);
+  else alert((await res.json()).error || "could not comment");
+}
+
+async function sendFeedback(id) {
+  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/cards/" + id + "/feedback", {
+    method: "POST", credentials: "same-origin"
+  });
+  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
+  if (res.ok) loadBoard($("#project").value);
+  else alert((await res.json()).error || "could not send feedback");
+}
+
 async function newBoard() {
   const name = prompt("New board project name:");
   if (!name || !name.trim()) return;
@@ -1178,6 +1316,10 @@ $("#board").addEventListener("click", (e) => {
   const mrg = e.target.closest("[data-mrg]");
   const link = e.target.closest("[data-link]");
   const unlink = e.target.closest("[data-unlink]");
+  const cmt = e.target.closest("[data-comment]");
+  const fb = e.target.closest("[data-fb]");
+  if (fb && window.confirm("Re-run this card's agent with its review comments as feedback?")) sendFeedback(fb.dataset.fb);
+  if (cmt) postComment(cmt.dataset.comment);
   if (mrg && window.confirm("Merge this card's commit into the project history?")) mergeCard(mrg.dataset.mrg);
   if (adv && window.confirm("Advance this card?")) advanceCard(adv.dataset.adv);
   if (arc && window.confirm("Archive this card (discards its pinned commit/branch)?")) archiveCard(arc.dataset.arc);
@@ -1464,6 +1606,117 @@ mod tests {
         let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         let projects: Vec<String> = serde_json::from_slice(&body).unwrap();
         assert_eq!(projects, vec!["my-repo"]);
+    }
+
+    #[tokio::test]
+    async fn comment_and_feedback_routes_round_trip_under_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _guard) = router_with_home(tmp.path(), Some("default"), Some("hunter2"));
+        let cookie = login_cookie(&app, "hunter2").await.unwrap();
+        // login_cookie already returns the full `katban_admin=<token>` value.
+        let auth = cookie;
+
+        // Move the first card to review (the runner does this on success) so
+        // feedback is allowed.
+        let id = {
+            let _guard = board::BoardLock::acquire("default").unwrap();
+            let mut b = board::load_board("default").unwrap().unwrap();
+            let card_id = b.cards[0].id.clone();
+            b.set_status(&card_id, CardStatus::Review);
+            board::save_board(&b, "default").unwrap();
+            card_id
+        };
+
+        // Unauthenticated writes are refused on the comment route too.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/default/cards/{id}/comment"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        "{\"text\":\"x\",\"location\":\"12\"}".to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::UNAUTHORIZED);
+
+        // Add a review comment with a diff-line anchor; the response board
+        // carries it.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/default/cards/{id}/comment"))
+                    .header("cookie", &auth)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        "{\"text\":\"add an index on user_id\",\"location\":\"12\"}",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::OK);
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let api: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let card = api["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_str() == Some(id.as_str()))
+            .unwrap();
+        let reviews = card["reviews"].as_array().unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["location"], "12");
+        assert_eq!(reviews[0]["text"], "add an index on user_id");
+
+        // Send it back to the agent: the card requeues with the feedback
+        // composed.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/default/cards/{id}/feedback"))
+                    .header("cookie", &auth)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::OK);
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sent"], 1);
+
+        // The board shows the card requeued with pending feedback.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board/default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let api: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let card = api["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"].as_str() == Some(id.as_str()))
+            .unwrap();
+        assert_eq!(card["status"], "queued");
+        assert!(card["followupFeedback"]
+            .as_str()
+            .unwrap()
+            .contains("add an index on user_id"));
     }
 
     // ---- write API + admin auth ----
