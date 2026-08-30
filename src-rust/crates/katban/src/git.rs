@@ -114,27 +114,33 @@ const ARTIFACT_EXCLUDE_MARKER: &str = "# katban: ignore build artifacts";
 /// would otherwise commit `node_modules`/`target` into the card's branch and
 /// into the captured review diff.
 ///
-/// Writes to `.git/info/exclude` (resolved via `git rev-parse --git-path` so
-/// linked worktrees hit the right git dir) instead of a tracked `.gitignore`:
-/// the excludes are local, never appear in the diff, and never get committed.
+/// Scoped per-worktree so the ignore rules never leak into the user's repo:
+/// the excludes are written to this worktree's own git-metadata dir and wired
+/// up via a per-worktree `core.excludesFile` (enabled with the standard
+/// `extensions.worktreeConfig` extension). Nothing is a tracked `.gitignore`
+/// (so excludes never appear in the diff/commit), and the rules vanish when
+/// the worktree is torn down instead of persisting in `.git/info/exclude`.
 /// Idempotent (guarded by the marker); a non-repo scratch dir is a silent
 /// no-op.
 pub fn ensure_artifact_excludes(work_dir: &Path) {
-    let Ok(raw) = git(work_dir, &["rev-parse", "--git-path", "info/exclude"]) else {
+    // `config --worktree` needs the worktreeConfig extension; enabling it is
+    // idempotent and inert on its own, and this is the mechanism git ships for
+    // exactly this. Runs from the worktree root (writes to the common config).
+    let _ = git(work_dir, &["config", "extensions.worktreeConfig", "true"]);
+    // The per-worktree metadata dir (`<common>/worktrees/<name>`) is where
+    // this worktree's own config lives; keep the exclude file there too.
+    let Ok(config_path) = git(work_dir, &["rev-parse", "--git-path", "config.worktree"]) else {
         return; // not a git worktree (scratch dir)
     };
-    let Ok(git_dir) = git(work_dir, &["rev-parse", "--git-dir"]) else {
+    let Some(meta_dir) = Path::new(&config_path).parent() else {
         return;
     };
-    let exclude = if Path::new(&raw).is_absolute() {
-        PathBuf::from(raw)
-    } else if Path::new(&git_dir).is_absolute() {
-        Path::new(&git_dir).join(&raw)
-    } else {
-        work_dir.join(&git_dir).join(&raw)
-    };
-    if exclude.is_dir() {
-        return;
+    let exclude = meta_dir.join("katban.exclude");
+    if let Some(exclude_str) = exclude.to_str() {
+        let _ = git(
+            work_dir,
+            &["config", "--worktree", "core.excludesFile", exclude_str],
+        );
     }
     if let Ok(existing) = std::fs::read_to_string(&exclude) {
         if existing.contains(ARTIFACT_EXCLUDE_MARKER) {
@@ -146,7 +152,7 @@ pub fn ensure_artifact_excludes(work_dir: &Path) {
     }
     use std::io::Write;
     let body = format!(
-        "\n{ARTIFACT_EXCLUDE_MARKER}\nnode_modules/\ntarget/\n__pycache__/\n*.pyc\n.venv/\ndist/\nbuild/\n"
+        "{ARTIFACT_EXCLUDE_MARKER}\nnode_modules/\ntarget/\n__pycache__/\n*.pyc\n.venv/\ndist/\nbuild/\n"
     );
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .append(true)
@@ -456,6 +462,16 @@ mod tests {
             assert!(tree_file("README.md").is_ok());
             assert!(tree_file("node_modules/pkg/index.js").is_err());
             assert!(tree_file(".venv/bin/python3").is_err());
+
+            // The excludes must NEVER leak into the repo's shared
+            // .git/info/exclude (which would affect the user's main checkout):
+            // they live in this worktree's own git-metadata dir instead.
+            let shared =
+                std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap_or_default();
+            assert!(
+                !shared.contains("katban"),
+                "shared info/exclude must not be polluted: {shared}"
+            );
         });
     }
 }

@@ -126,6 +126,11 @@ impl BoardServer {
             )
             .route("/api/board/{project}/link", post(api_link))
             .route("/api/board/{project}/unlink", post(api_unlink))
+            .route("/api/board/{project}/verify", post(api_toggle_verify))
+            .route(
+                "/api/board/{project}/auto-review",
+                post(api_toggle_auto_review),
+            )
             .with_state(state)
     }
 }
@@ -884,6 +889,63 @@ async fn api_send_feedback(
     }
 }
 
+/// Request body for the board-level toggles: the desired state (`enabled`).
+/// Idempotent — setting a flag to its current value is a no-op save.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToggleForm {
+    enabled: bool,
+}
+
+/// Per-board verification gate toggle (`POST /api/board/{project}/verify`).
+/// Auth-gated like every board write. Mirrors `board verify on|off`.
+async fn api_toggle_verify(
+    State(state): State<BoardState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ToggleForm>,
+) -> Response {
+    api_set_board_flag(&state, &project, &headers, |board| {
+        board.verify = body.enabled
+    })
+}
+
+/// Per-board auto-review toggle (`POST /api/board/{project}/auto-review`).
+/// Auth-gated like every board write. Mirrors `board auto-review on|off`.
+async fn api_toggle_auto_review(
+    State(state): State<BoardState>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ToggleForm>,
+) -> Response {
+    api_set_board_flag(&state, &project, &headers, |board| {
+        board.auto_review = body.enabled;
+    })
+}
+
+/// Shared body for the two board-flag toggles: auth-gate, then under
+/// `BoardLock` load, apply `set`, save.
+fn api_set_board_flag(
+    state: &BoardState,
+    project: &str,
+    headers: &HeaderMap,
+    set: impl FnOnce(&mut Board),
+) -> Response {
+    if let Err(response) = require_auth(state, headers) {
+        return *response;
+    }
+    let _guard = match board::BoardLock::acquire(project) {
+        Ok(guard) => guard,
+        Err(error) => return json_message(StatusCode::CONFLICT, &error.to_string()),
+    };
+    let mut board = match load_board_for_write(project) {
+        Ok(board) => board,
+        Err(response) => return *response,
+    };
+    set(&mut board);
+    write_board(&board, project)
+}
+
 /// Reload a saved board for a write-response (the lock was already held and
 /// released inside the op that saved it), mirroring `load_board_for_write`
 /// without re-acquiring `BoardLock`.
@@ -1035,6 +1097,8 @@ const ADMIN_HTML: &str = r##"<!doctype html>
   <div class="toolbar" id="toolbar" hidden>
     <input id="newprompt" type="text" placeholder="new card prompt" autocomplete="off">
     <button id="addcard">Add card</button>
+    <button id="toggleverify" title="Toggle the verification gate: run the project's detected checks in the card's worktree before it reaches review">verify on</button>
+    <button id="toggleautoreview" title="Toggle the auto-review pass: a second agent reviews each card's diff">auto-review on</button>
     <span style="flex:1"></span>
     <button id="newboard" title="Create a board for a new project name">New board</button>
   </div>
@@ -1100,6 +1164,10 @@ async function loadBoard(project) {
   if (!res.ok) { $("#board").innerHTML = '<span class="blocked">' + (await res.text()) + "</span>"; return; }
   const api = await res.json();
   $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "") + " · verify " + (api.verify ? "on" : "off");
+  // Keep the board-level toggle buttons truthful (and clickable when signed in).
+  gateVerify = api.verify; gateAutoReview = api.autoReview;
+  $("#toggleverify").textContent = "verify " + (gateVerify ? "on" : "off");
+  $("#toggleautoreview").textContent = "auto-review " + (gateAutoReview ? "on" : "off");
   const byStatus = {};
   COLS.forEach((c) => byStatus[c] = []);
   const waitMap = {};
@@ -1185,6 +1253,10 @@ function esc(s) {
 }
 
 let authed = false;
+// Board-level toggle state (from the last loaded board), so the toolbar
+// buttons can flip them and stay truthful. `authed` gates the whole toolbar
+// (hidden when signed out), so these are only clickable to an admin.
+let gateVerify = true, gateAutoReview = true;
 
 // ---- admin session / write controls ----
 
@@ -1208,6 +1280,18 @@ function setAuth(ok) {
   $("#toolbar").hidden = !ok;
   if (ok) { loadProjects(); wireEvents(); }
   else stopEvents();
+}
+
+// Flip a board-level toggle (verify | auto-review) via its auth-gated POST
+// route, then reload the board so the toolbar labels + meta line update.
+async function toggleBoardFlag(route, enabled, label) {
+  const res = await fetch("/api/board/" + encodeURIComponent($("#project").value) + "/" + route, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled })
+  });
+  if (res.status === 401) { setAuth(false); alert("session expired — sign in again"); return; }
+  if (res.ok) loadBoard($("#project").value); else alert("could not toggle " + label);
 }
 
 async function addCard() {
@@ -1318,6 +1402,8 @@ $("#login").addEventListener("click", tryLogin);
 $("#password").addEventListener("keydown", (e) => { if (e.key === "Enter") tryLogin(); });
 $("#addcard").addEventListener("click", addCard);
 $("#newprompt").addEventListener("keydown", (e) => { if (e.key === "Enter") addCard(); });
+$("#toggleverify").addEventListener("click", () => toggleBoardFlag("verify", !gateVerify, "the verify gate"));
+$("#toggleautoreview").addEventListener("click", () => toggleBoardFlag("auto-review", !gateAutoReview, "auto-review"));
 
 $("#board").addEventListener("click", (e) => {
   const adv = e.target.closest("[data-adv]");
@@ -1726,6 +1812,103 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("add an index on user_id"));
+    }
+
+    #[tokio::test]
+    async fn board_toggle_routes_round_trip_under_auth() {
+        // The web board's verify/auto-review toggle buttons hit auth-gated POST
+        // routes that mirror `board verify|auto-review on|off`. The board
+        // round-trips through board.json and the API reflects the new state.
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, _guard) = router_with_home(tmp.path(), Some("default"), Some("hunter2"));
+        let cookie = login_cookie(&app, "hunter2").await.unwrap();
+        async fn post_flag(app: &Router, uri: &str, cookie: &str, body: &str) -> Response {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("cookie", cookie)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        // Unauthenticated toggle is refused.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/board/default/verify")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{\"enabled\":false}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), HttpStatus::UNAUTHORIZED);
+
+        // Toggle both gates off, then re-read the board from the API.
+        assert_eq!(
+            post_flag(
+                &app,
+                "/api/board/default/verify",
+                &cookie,
+                "{\"enabled\":false}"
+            )
+            .await
+            .status(),
+            HttpStatus::OK
+        );
+        assert_eq!(
+            post_flag(
+                &app,
+                "/api/board/default/auto-review",
+                &cookie,
+                "{\"enabled\":false}"
+            )
+            .await
+            .status(),
+            HttpStatus::OK
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/board/default")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let api: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(api["verify"], false);
+        assert_eq!(api["autoReview"], false);
+
+        // Toggle verify back on; auto-review stays off.
+        assert_eq!(
+            post_flag(
+                &app,
+                "/api/board/default/verify",
+                &cookie,
+                "{\"enabled\":true}"
+            )
+            .await
+            .status(),
+            HttpStatus::OK
+        );
+        let loaded = board::load_board("default").unwrap().unwrap();
+        assert!(loaded.verify);
+        assert!(
+            !loaded.auto_review,
+            "auto-review toggle must be independent"
+        );
     }
 
     // ---- write API + admin auth ----
