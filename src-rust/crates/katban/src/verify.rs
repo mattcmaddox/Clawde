@@ -174,27 +174,14 @@ pub async fn run_gate(work_dir: &Path, board_verify: bool) -> GateResult {
 async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<PathBuf>, String> {
     let mut venv_bin = None;
     if work_dir.join("package.json").exists() {
-        // `npm ci` needs a lockfile; without one `npm install` is the honest
-        // (network-requiring) fallback. node_modules stays inside the worktree
-        // and is excluded from the pinned commit (#6).
-        let cmd = if work_dir.join("package-lock.json").exists() {
-            "npm ci"
-        } else {
-            "npm install"
-        };
-        if let Some(err) = run_check(work_dir, cmd, timeout_secs, None).await {
+        let cmd = package_install(work_dir);
+        if let Some(err) = run_check(work_dir, &cmd, timeout_secs, None).await {
             return Err(format!("{cmd} failed: {err}"));
         }
     }
-    if work_dir.join("requirements.txt").exists() {
-        // pytest is the detected Python test runner (`python3 -m pytest`), so
-        // install it alongside the project's requirements; the checks then
-        // resolve `python3` to the venv via the prepended PATH.
-        for cmd in [
-            "python3 -m venv .venv",
-            ".venv/bin/pip install -r requirements.txt pytest",
-        ] {
-            if let Some(err) = run_check(work_dir, cmd, timeout_secs, None).await {
+    if work_dir.join("requirements.txt").exists() || work_dir.join("pyproject.toml").exists() {
+        for cmd in python_installs(work_dir) {
+            if let Some(err) = run_check(work_dir, &cmd, timeout_secs, None).await {
                 return Err(format!("{cmd} failed: {err}"));
             }
         }
@@ -209,6 +196,52 @@ async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<Pat
         }
     }
     Ok(venv_bin)
+}
+
+/// Pick the JS/yarn/pnpm install command for a worktree, preferring the
+/// project's own lockfile tool when it is installed (so a yarn or pnpm project
+/// is installed with the resolution the team actually pinned), and falling back
+/// through the npm paths. The no-lockfile case uses `npm install
+/// --no-package-lock`: it installs deps but never writes a `package-lock.json`,
+/// so a card whose project lacks a lockfile isn't handed a gate-generated one
+/// to commit into its branch (audit gap #1).
+fn package_install(work_dir: &Path) -> String {
+    if work_dir.join("yarn.lock").exists() && tool_available("yarn") {
+        "yarn install --frozen-lockfile".to_string()
+    } else if work_dir.join("pnpm-lock.yaml").exists() && tool_available("pnpm") {
+        "pnpm install --frozen-lockfile".to_string()
+    } else if work_dir.join("package-lock.json").exists() {
+        "npm ci".to_string()
+    } else {
+        "npm install --no-package-lock".to_string()
+    }
+}
+
+/// The Python install steps: a throwaway venv inside the worktree (so nothing
+/// outside the card is touched), then the project's dependencies plus pytest —
+/// from `requirements.txt`, or editable-install the project when it uses a
+/// modern `pyproject.toml` (audit gap #2). The checks then resolve `python3`
+/// to the venv via the prepended PATH. Any step failing is an env gap; the
+/// caller skips the gate rather than failing the card.
+fn python_installs(work_dir: &Path) -> Vec<String> {
+    let dep_cmd = if work_dir.join("requirements.txt").exists() {
+        ".venv/bin/pip install -r requirements.txt pytest"
+    } else {
+        ".venv/bin/pip install -e . pytest"
+    };
+    vec!["python3 -m venv .venv".to_string(), dep_cmd.to_string()]
+}
+
+/// Whether a CLI tool resolves on PATH: the package-manager preference used it
+/// so a project's preferred tool is honored when present, with a graceful
+/// fall-back when it isn't (e.g. yarn missing -> npm install instead of a
+/// silent fail-closed empty node_modules).
+fn tool_available(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Run one check command to completion. Returns `Some(err)` when it failed or
@@ -668,6 +701,117 @@ mod tests {
             result.detail.contains("dependency install failed"),
             "detail: {}",
             result.detail
+        );
+    }
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn package_install_prefers_the_repos_lockfile_tool() {
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("package.json"), "{}").unwrap();
+
+        // npm with a lockfile -> npm ci.
+        std::fs::write(work.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(package_install(work.path()), "npm ci");
+
+        // No lockfile -> npm install must never write one (audit gap #1).
+        std::fs::remove_file(work.path().join("package-lock.json")).unwrap();
+        assert_eq!(
+            package_install(work.path()),
+            "npm install --no-package-lock"
+        );
+
+        // yarn.lock -> yarn when present, else the npm no-lockfile fallback.
+        std::fs::write(work.path().join("yarn.lock"), "").unwrap();
+        if tool_available("yarn") {
+            assert!(
+                package_install(work.path()).starts_with("yarn "),
+                "{}",
+                package_install(work.path())
+            );
+        } else {
+            assert_eq!(
+                package_install(work.path()),
+                "npm install --no-package-lock"
+            );
+        }
+
+        // pnpm-lock.yaml -> pnpm when present, else the npm fallback.
+        std::fs::remove_file(work.path().join("yarn.lock")).unwrap();
+        std::fs::write(work.path().join("pnpm-lock.yaml"), "").unwrap();
+        if tool_available("pnpm") {
+            assert!(package_install(work.path()).starts_with("pnpm "));
+        } else {
+            assert_eq!(
+                package_install(work.path()),
+                "npm install --no-package-lock"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_deps_does_not_generate_a_lockfile() {
+        // Audit gap #1: provisioning a JS project WITHOUT a lockfile must not
+        // hand the card a gate-generated package-lock.json (it would ride into
+        // the diff and the pinned commit as non-agent work).
+        if !node_available() {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("helper")).unwrap();
+        std::fs::write(
+            work.path().join("helper/package.json"),
+            r#"{"name":"helper","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            work.path().join("package.json"),
+            r#"{"name":"t","version":"1.0.0","dependencies":{"helper":"file:./helper"}}"#,
+        )
+        .unwrap();
+        provision_deps(work.path(), 120).await.unwrap();
+        assert!(
+            work.path()
+                .join("node_modules/helper/package.json")
+                .exists(),
+            "deps must be installed"
+        );
+        assert!(
+            !work.path().join("package-lock.json").exists(),
+            "provisioning must not generate a lockfile"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_deps_builds_a_venv_for_pyproject_projects() {
+        // Audit gap #2: a modern pyproject.toml-only Python project must hit
+        // the venv+pip branch (vs. being skipped as if it had no Python deps).
+        if !python3_available() {
+            eprintln!("skipping: python3 not installed");
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(
+            work.path().join("pyproject.toml"),
+            "[project]\nname = \"t\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let result = provision_deps(work.path(), 180).await;
+        // The pyproject branch fired: either deps installed cleanly (a Some
+        // venv bin) or the environment lacked the pieces (an Err -> the gate
+        // skips, which is the fail-open contract). It must NOT claim no Python
+        // deps were provisioned (Ok(None)).
+        assert!(
+            matches!(result, Ok(Some(_)) | Err(_)),
+            "pyproject-only project must hit the venv branch: {result:?}"
         );
     }
 }
