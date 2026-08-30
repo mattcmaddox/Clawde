@@ -16,8 +16,20 @@ mod build;
 mod codex_oauth_flow;
 mod diagnostics;
 mod disk_hygiene;
+mod katban;
 mod oauth_flow;
 mod upgrade;
+
+// Env-mutating tests across the whole CLI binary (headless_resume,
+// continuation_mode, katban) serialize on this one lock. Each test module
+// previously declared its own `static ENV_LOCK`, which did NOT serialize
+// against each other — `CLAWDE_HOME` writes in one module raced reads in
+// another under the parallel runner and flaked CI. A tokio mutex lets the
+// async test hold it with `.lock().await`; sync tests use `.blocking_lock()`
+// (never called from inside a runtime, so no panic). Mirror of the commands
+// crate's `crate::tests::CLAWDE_HOME_LOCK` pattern.
+#[cfg(test)]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // Build-time metadata (embedded via build.rs)
@@ -689,6 +701,19 @@ async fn main() -> anyhow::Result<()> {
             return clawde_acp::run_acp_server_tcp(addr, Some(&acp_config), cancel).await;
         }
         return clawde_acp::run_acp_server().await;
+    }
+
+    // Fast-path: `clawde katban` — self-hosted web surface (v0: dev-site
+    // hosting with live reload; board + guest tiers to come).
+    if raw_args.get(1).map(|s| s.as_str()) == Some("katban") {
+        if raw_args[2..]
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h")
+        {
+            print!("{}", katban::USAGE);
+            return Ok(());
+        }
+        return katban::run_command(&raw_args[2..]).await;
     }
 
     // Fast-path: `clawde serve` — start the OpenAI-compatible gateway.
@@ -2423,8 +2448,9 @@ mod headless_resume_tests {
 
     #[tokio::test]
     async fn headless_resume_loads_persisted_tool_result_transcript() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = ENV_LOCK.lock().await;
+        // Shared with every env-mutating test in this binary (see the
+        // crate-root ENV_LOCK) so CLAWDE_HOME writes don't race other tests.
+        let _guard = super::ENV_LOCK.lock().await;
         let home = std::env::temp_dir().join(format!("clawde-cli-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("temporary Clawde home");
         let previous_home = std::env::var_os("CLAWDE_HOME");
@@ -8165,14 +8191,12 @@ mod continuation_mode_tests {
     use super::*;
 
     // goals_enabled() reads the CLAWDE_GOALS env var, so tests that flip it
-    // must serialize on a local mutex to avoid racing other env-dependent
-    // tests in the same binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // must serialize on the binary-wide ENV_LOCK (crate root) to avoid racing
+    // other env-dependent tests in the same binary.
     fn with_goals(goals: bool, f: impl FnOnce()) {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Panics only if a prior test panicked while holding the lock — the
+        // right behavior for a test cascade.
+        let _lock = ENV_LOCK.blocking_lock();
         let prev = std::env::var_os("CLAWDE_GOALS");
         std::env::set_var("CLAWDE_GOALS", if goals { "1" } else { "0" });
         f();

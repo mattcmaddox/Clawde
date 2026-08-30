@@ -526,6 +526,7 @@ mod routing;
 pub use routing::*;
 mod compare;
 pub use compare::*;
+mod katban;
 mod new_move;
 pub use new_move::*;
 
@@ -2286,6 +2287,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(StatsCommand),
         Box::new(FilesCommand),
         Box::new(RenameCommand),
+        Box::new(katban::KatbanCommand),
         Box::new(EffortCommand),
         Box::new(SummaryCommand),
         Box::new(CommitCommand),

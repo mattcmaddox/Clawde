@@ -1118,6 +1118,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_dialog_select(frame, &app.command_palette, size);
     }
 
+    // Alt+G Katban controls menu
+    if app.katban_controls.visible {
+        crate::katban_controls::render_katban_controls(frame, &app.katban_controls);
+    }
+
     // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
     if app.elicitation.visible {
         render_elicitation_dialog(

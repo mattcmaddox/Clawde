@@ -24,6 +24,7 @@ clawde-mcp = { workspace = true }
 clawde-bridge = { workspace = true }
 clawde-plugins = { workspace = true }
 clawde-gateway = { workspace = true }
+clawde-katban = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
@@ -49,3 +50,6 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [build-dependencies]
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

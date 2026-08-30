@@ -217,6 +217,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+c", "compact", KeyContext::Global),
         ("ctrl+/", "showKeybindings", KeyContext::Global),
         ("alt+s", "showSources", KeyContext::Global),
+        // Alt+G: Katban controls menu — a scrollable picker for guest links
+        // (rotate password, revoke, create), unblocking locked IPs, and the
+        // Katban status overview. See openKatbanControls in app.rs.
+        ("alt+g", "openKatbanControls", KeyContext::Global),
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
         ("enter", "submit", KeyContext::Chat),

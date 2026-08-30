@@ -21,7 +21,8 @@ This document is the complete reference for every slash command available in Cla
 13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/health`, `/verify`, `/version`, `/update`
 14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
 15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
-16. [Command Availability](#command-availability)
+16. [Self-Hosting & Katban](#self-hosting--katban) — `/katban`
+17. [Command Availability](#command-availability)
 
 ---
 
@@ -1515,6 +1516,40 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 /copy 2       — copy the second most recent response
 /copy N       — copy the Nth most recent response
 ```
+
+---
+
+## Self-Hosting & Katban
+
+### /katban
+
+Control the self-hosted Katban surface from inside Clawde: guest links
+(share a password-protected chat URL with friends), guest-server lockout
+unblocks, Kanban task boards, hosted sites, and the overall status overview.
+Everything `/katban` does is also reachable from the Katban controls menu
+(`Alt+G` — see [keybindings.md](./keybindings.md)).
+
+```
+/katban                              — status overview
+/katban status                       — status overview
+/katban board list [--project NAME]  — list cards on a board
+/katban board ready [--project NAME] — cards that can start now
+/katban board card add <PROMPT> [--project NAME]
+/katban board card set <ID> <STATUS> [--project NAME]
+/katban board card remove <ID> [--project NAME]
+/katban link list                    — list guest links
+/katban link create <NAME>           — create a link (prints the password once)
+/katban link show <ID>               — link details (devices, expiry)
+/katban link revoke <ID>             — revoke a link (kicks its devices)
+/katban link password <ID>           — rotate a link's password
+/katban guest unblock <IP>           — clear lockouts + permanent blocks
+/katban site list                    — hosted sites
+```
+
+Board commands take `--project NAME` exactly like `clawde katban board ...`
+(default: `default`). Link names may contain spaces. This command mirrors the
+`clawde katban` CLI; see the Katban spec (`docs/plans/katban-selfhost-spec.md`)
+for the full feature plan.
 
 ---
 

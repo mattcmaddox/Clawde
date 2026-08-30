@@ -38,6 +38,7 @@ These bindings are active in all contexts.
 | `Ctrl+L` | redraw | Redraw the terminal screen |
 | `Alt+R` | historySearch | Open interactive history search |
 | `Alt+B` | createBranch | Create a new git branch |
+| `Alt+G` | openKatbanControls | Open the Katban controls menu (links, boards, IPs) |
 | `Alt+/` | openHelp | Open the help panel |
 
 ### Chat Context

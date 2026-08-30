@@ -1596,6 +1596,8 @@ pub struct App {
     pub ollama_ping_for_models: bool,
     /// "Free" composite-provider setup dialog (multi-key health dots).
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
+    /// Alt+G Katban controls menu (guest links, unblock IPs, status).
+    pub katban_controls: crate::katban_controls::KatbanControlsState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -2261,6 +2263,7 @@ impl App {
             ollama_ping_request_id: 0,
             ollama_ping_for_models: false,
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
+            katban_controls: crate::katban_controls::KatbanControlsState::default(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
@@ -4727,6 +4730,7 @@ impl App {
         self.import_config_picker.close();
         self.import_config_dialog.close();
         self.command_palette.close();
+        self.katban_controls.close();
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
         self.ollama_config_dialog.close();
@@ -4784,6 +4788,7 @@ impl App {
             || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible
+            || self.katban_controls.visible
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
@@ -7235,6 +7240,35 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.import_config_dialog.close(),
                 KeyCode::Enter => self.perform_import_config(),
+                _ => {}
+            }
+            return false;
+        }
+
+        // Katban controls menu (Alt+G)
+        if self.katban_controls.visible {
+            match key.code {
+                KeyCode::Esc => self.katban_controls.close(),
+                KeyCode::Up => self.katban_controls.select_prev(),
+                KeyCode::Down => self.katban_controls.select_next(),
+                KeyCode::PageUp => self.katban_controls.page_up(),
+                KeyCode::PageDown => self.katban_controls.page_down(),
+                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    self.katban_controls.select_prev();
+                }
+                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    self.katban_controls.select_next();
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = self.katban_controls.selected_item().cloned() {
+                        self.katban_controls.close();
+                        self.prompt_input.replace_text(item.command);
+                        // Complete commands (a specific link id / IP already in
+                        // the row) submit immediately; incomplete ones (e.g.
+                        // `create `) seed the prompt for the user to finish.
+                        return item.complete;
+                    }
+                }
                 _ => {}
             }
             return false;
@@ -9764,6 +9798,13 @@ impl App {
                 }
                 false
             }
+            "openKatbanControls" => {
+                if !self.is_streaming {
+                    self.close_secondary_views();
+                    self.katban_controls.open();
+                }
+                false
+            }
             "toggleOllama" => {
                 if !self.is_streaming {
                     self.intercept_slash_command("ollama");
@@ -10782,6 +10823,7 @@ impl App {
             || self.free_mode_dialog.visible
             || self.device_auth_dialog.visible
             || self.command_palette.visible
+            || self.katban_controls.visible
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
@@ -15054,6 +15096,149 @@ mod tests {
 
         assert!(app.command_palette.visible);
         assert_eq!(app.prompt_input.text, "hello");
+    }
+
+    #[test]
+    fn test_alt_g_opens_katban_controls_and_enter_seeds_command() {
+        let mut app = make_app();
+        // Katban controls live on Alt+G in the default preset.
+        app.handle_key_event(press_key(KeyCode::Char('g'), KeyModifiers::ALT));
+
+        assert!(app.katban_controls.visible);
+        // Rows are rebuilt from the guest store; there is always at least the
+        // status row even on a cold store.
+        assert!(!app.katban_controls.items.is_empty());
+
+        // Esc closes without touching the prompt.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.katban_controls.visible);
+
+        // Reopen; Enter on the status row seeds + submits the command.
+        app.handle_key_event(press_key(KeyCode::Char('g'), KeyModifiers::ALT));
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(should_submit);
+        assert!(app.prompt_input.text.starts_with("/katban "));
+    }
+
+    #[test]
+    fn test_katban_controls_build_board_advance_rows() {
+        use clawde_katban::board::{save_board, Board};
+
+        // Seed a board with one non-done card, then build the menu rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let mut board = Board::new();
+        let id = board.add_card("build the landing page");
+        save_board(&board, "default").unwrap();
+
+        let items = crate::katban_controls::build_control_items();
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        assert!(
+            titles
+                .iter()
+                .any(|t| t.starts_with("Advance — build the landing")),
+            "titles: {titles:?}"
+        );
+        assert!(titles.contains(&"List cards"));
+        assert!(titles.contains(&"Add a card"));
+        assert!(titles.contains(&"Link cards"));
+
+        // The advance row carries the full command with the next status.
+        let advance = items
+            .iter()
+            .find(|i| i.title.starts_with("Advance"))
+            .unwrap();
+        assert_eq!(
+            advance.command,
+            format!("/katban board card set {id} queued")
+        );
+        assert!(advance.complete);
+
+        // The link row seeds the command for the user to finish.
+        let link = items.iter().find(|i| i.title == "Link cards").unwrap();
+        assert_eq!(link.command, "/katban board link ");
+        assert!(!link.complete);
+
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_katban_controls_skip_revoked_links() {
+        use clawde_katban::guest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+
+        let mut store = guest::GuestStore::default();
+        store.create_link("friends", "pw", None, 2);
+        let dead = store.create_link("old crew", "pw", None, 2);
+        store.revoke_link(&dead);
+        guest::save(&store).unwrap();
+
+        let items = crate::katban_controls::build_control_items();
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        // The live link gets its management rows...
+        assert!(titles.contains(&"Rotate password — friends"));
+        assert!(titles.contains(&"Revoke — friends"));
+        // ...but the revoked one is gone (dead links stay visible via
+        // `/katban link list`, so no footgun rows for them).
+        assert!(!titles.contains(&"Rotate password — old crew"));
+        assert!(!titles.contains(&"Revoke — old crew"));
+
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_katban_controls_skip_section_headers_and_wrap() {
+        let mut state = crate::katban_controls::KatbanControlsState {
+            items: vec![
+                crate::katban_controls::KatbanControlItem {
+                    title: "▸ Status".into(),
+                    subtitle: String::new(),
+                    command: String::new(),
+                    complete: false,
+                },
+                crate::katban_controls::KatbanControlItem {
+                    title: "Katban overview".into(),
+                    subtitle: String::new(),
+                    command: "/katban status".into(),
+                    complete: true,
+                },
+                crate::katban_controls::KatbanControlItem {
+                    title: "List links".into(),
+                    subtitle: String::new(),
+                    command: "/katban link list".into(),
+                    complete: true,
+                },
+            ],
+            selected: 1,
+            ..Default::default()
+        };
+        // Up from the first action row wraps to the last action row, never a
+        // section header.
+        state.select_prev();
+        assert_eq!(state.selected, 2);
+        state.select_next();
+        assert_eq!(state.selected, 1);
+        assert!(state
+            .selected_item()
+            .unwrap()
+            .command
+            .starts_with("/katban"));
     }
 
     // ---- Bash prefix allowlist ----------------------------------------------

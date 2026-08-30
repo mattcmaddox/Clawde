@@ -2394,6 +2394,7 @@ pub fn render_keybindings_overlay(
             "openModelPicker" => "Model picker",
             "openModePicker" => "Mode picker",
             "openCommandPalette" => "Command palette",
+            "openKatbanControls" => "Katban controls",
             _ => &action,
         };
 

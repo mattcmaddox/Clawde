@@ -31,6 +31,7 @@ urlencoding = { workspace = true }
 open = { workspace = true }
 qrcode = { workspace = true }
 clawde-bridge = { workspace = true }
+clawde-katban = { workspace = true }
 hostname = "0.4"
 uuid = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

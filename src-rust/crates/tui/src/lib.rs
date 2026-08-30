@@ -124,6 +124,8 @@ pub mod import_config_dialog;
 pub mod input;
 /// Startup dialog for malformed settings.json or AGENTS.md.
 pub mod invalid_config_dialog;
+/// Scrollable Katban controls menu (Alt+G: guest links, unblock IPs, status).
+pub mod katban_controls;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
 /// Inline image rendering via the Kitty graphics protocol (with text fallback).
@@ -233,6 +235,9 @@ pub use import_config_dialog::{render_import_config_dialog, ImportConfigDialogSt
 pub use input::{is_slash_command, parse_slash_command};
 pub use invalid_config_dialog::{
     render_invalid_config_dialog, InvalidConfigDialogState, InvalidConfigKind,
+};
+pub use katban_controls::{
+    build_control_items, render_katban_controls, KatbanControlItem, KatbanControlsState,
 };
 pub use key_input_dialog::{render_key_input_dialog, KeyInputDialogState};
 pub use mcp_view::{render_mcp_view, McpServerView, McpToolView, McpViewState, McpViewStatus};

@@ -68,6 +68,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "init", description: "Initialize AGENTS.md for this project", category: "Commands", tui_only: false },
     PromptCommand { name: "insights", description: "Generate a session analysis report with conversation statistics", category: "Diagnostics", tui_only: false },
     PromptCommand { name: "keybindings", description: "Show keybinding configuration", category: "Workspace", tui_only: false },
+    PromptCommand { name: "katban", description: "Control Katban: guest links, unblock IPs, status", category: "Commands", tui_only: false },
     PromptCommand { name: "keys", description: "Manage provider API keys and rotation", category: "Auth & Permissions", tui_only: false },
     PromptCommand { name: "links", description: "Open URLs from this session in your browser", category: "Review & History", tui_only: false },
     PromptCommand { name: "login", description: "Log in to Clawde", category: "Commands", tui_only: false },

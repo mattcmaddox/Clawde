@@ -55,6 +55,7 @@ clawde-api = { workspace = true }
 clawde-tools = { workspace = true }
 clawde-query = { workspace = true }
 clawde-mcp = { workspace = true }
+clawde-katban = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
