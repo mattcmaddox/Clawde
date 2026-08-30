@@ -136,20 +136,24 @@ pub async fn run_gate(work_dir: &Path, board_verify: bool) -> GateResult {
             return GateResult::skipped(format!("dependency install failed; gate skipped: {err}"));
         }
     };
+    // #4 — the check environment: the venv's bin dir prepended to PATH (so
+    // `python3 -m pytest` hits the venv's interpreter + pytest) and, for Rust
+    // projects, a per-project shared `CARGO_TARGET_DIR` so cards after the
+    // first reuse the dependency compiles instead of each paying a cold build
+    // (the single biggest per-card install cost).
+    let envs = check_envs(work_dir, venv_bin.as_deref());
     let mut labels: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     if let Some(cmd) = test_cmd {
         let label = format!("test: {cmd}");
-        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, venv_bin.as_deref()).await
-        {
+        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, &envs).await {
             failures.push(format!("{label}: {err}"));
         }
         labels.push(label);
     }
     if let Some(cmd) = lint_cmd {
         let label = format!("lint: {cmd}");
-        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, venv_bin.as_deref()).await
-        {
+        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, &envs).await {
             failures.push(format!("{label}: {err}"));
         }
         labels.push(label);
@@ -159,6 +163,28 @@ pub async fn run_gate(work_dir: &Path, board_verify: bool) -> GateResult {
     } else {
         GateResult::failed(failures.join("; "))
     }
+}
+
+/// Build the env overrides the gate's checks run with. `venv_bin` (the
+/// worktree-local Python venv) is prepended to PATH; a Rust project gets a
+/// per-project shared `CARGO_TARGET_DIR` living beside the card worktrees
+/// under the project's dir, so successive cards reuse each other's compiled
+/// dependencies rather than each recompiling from scratch.
+fn check_envs(work_dir: &Path, venv_bin: Option<&Path>) -> Vec<(&'static str, String)> {
+    let mut envs: Vec<(&'static str, String)> = Vec::new();
+    if let Some(venv_bin) = venv_bin {
+        let old = std::env::var("PATH").unwrap_or_default();
+        envs.push(("PATH", format!("{}:{old}", venv_bin.display())));
+    }
+    if work_dir.join("Cargo.toml").exists() {
+        if let Some(proj_dir) = work_dir.parent() {
+            envs.push((
+                "CARGO_TARGET_DIR",
+                proj_dir.join("cargo-target").to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    envs
 }
 
 /// Install the project's dependencies into the fresh worktree so the checks
@@ -175,13 +201,13 @@ async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<Pat
     let mut venv_bin = None;
     if work_dir.join("package.json").exists() {
         let cmd = package_install(work_dir);
-        if let Some(err) = run_check(work_dir, &cmd, timeout_secs, None).await {
+        if let Some(err) = run_check(work_dir, &cmd, timeout_secs, &[]).await {
             return Err(format!("{cmd} failed: {err}"));
         }
     }
     if work_dir.join("requirements.txt").exists() || work_dir.join("pyproject.toml").exists() {
         for cmd in python_installs(work_dir) {
-            if let Some(err) = run_check(work_dir, &cmd, timeout_secs, None).await {
+            if let Some(err) = run_check(work_dir, &cmd, timeout_secs, &[]).await {
                 return Err(format!("{cmd} failed: {err}"));
             }
         }
@@ -191,7 +217,7 @@ async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<Pat
         // Warm the shared registry cache so the cold `cargo test` compile has
         // its downloads ready; the compile itself is bounded by the check
         // timeout and is the user's knob via `timeout_secs` / `board verify`.
-        if let Some(err) = run_check(work_dir, "cargo fetch", timeout_secs, None).await {
+        if let Some(err) = run_check(work_dir, "cargo fetch", timeout_secs, &[]).await {
             return Err(format!("cargo fetch failed: {err}"));
         }
     }
@@ -254,7 +280,7 @@ async fn run_check(
     work_dir: &Path,
     command: &str,
     timeout_secs: u64,
-    extra_path: Option<&Path>,
+    envs: &[(&str, String)],
 ) -> Option<String> {
     // Detected commands are fixed strings (never user input) without quotes,
     // so a whitespace split is a faithful tokenization.
@@ -263,9 +289,8 @@ async fn run_check(
     let timeout = Duration::from_secs(timeout_secs.max(1));
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).current_dir(work_dir).kill_on_drop(true);
-    if let Some(extra) = extra_path {
-        let old = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{old}", extra.display()));
+    for (key, value) in envs {
+        cmd.env(key, value);
     }
     let child = cmd.spawn().ok()?; // spawn failure = skipped
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -754,6 +779,52 @@ mod tests {
                 "npm install --no-package-lock"
             );
         }
+    }
+
+    #[test]
+    fn check_envs_shares_a_cargo_target_dir_and_venv_path() {
+        // #4 — non-Rust projects get only the venv PATH; Rust projects get a
+        // per-project shared CARGO_TARGET_DIR so successive cards reuse each
+        // other's compiled dependencies (no cold compile per card).
+        let work = tempfile::tempdir().unwrap();
+        // No Cargo.toml: no CARGO_TARGET_DIR.
+        let envs = check_envs(work.path(), None);
+        assert!(
+            !envs.iter().any(|(k, _)| *k == "CARGO_TARGET_DIR"),
+            "no cargo target for non-Rust: {envs:?}"
+        );
+        // A venv bin dir is prepended to PATH.
+        let venv = work.path().join(".venv/bin");
+        let envs = check_envs(work.path(), Some(&venv));
+        let path = envs
+            .iter()
+            .find(|(k, _)| *k == "PATH")
+            .expect("PATH entry")
+            .1
+            .clone();
+        assert!(
+            path.starts_with(&format!("{}:", venv.display())),
+            "path: {path}"
+        );
+
+        // Rust project: CARGO_TARGET_DIR points beside the card worktree, under
+        // the project's dir (never inside a checkout), so it is shared across
+        // that project's cards and never committed.
+        std::fs::write(work.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let envs = check_envs(work.path(), None);
+        let target = envs
+            .iter()
+            .find(|(k, _)| *k == "CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR for Rust")
+            .1
+            .clone();
+        assert!(target.ends_with("cargo-target"), "target: {target}");
+        // It lives in the project dir (work_dir's parent), outside the checkout.
+        assert_eq!(
+            Path::new(&target).parent().unwrap(),
+            work.path().parent().unwrap(),
+            "cargo target must be a per-project sibling, not inside the card"
+        );
     }
 
     #[tokio::test]

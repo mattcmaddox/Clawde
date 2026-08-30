@@ -61,16 +61,30 @@ the card's worktree before review (a failing check sends the card to Failed,
 never Review), and an **auto-review pass** that attaches a second agent's
 structured findings as `[auto-review]` review comments (best-effort; per-board
 toggle `board auto-review on|off`). The gate provisions dependencies into the
-fresh worktree first (`npm ci`/`npm install`, a worktree-local Python venv +
-`pip install -r requirements.txt pytest`, `cargo fetch`) — an install that
-fails is an environment gap, so the gate skips with the reason visible instead
-of fail-closing on a missing-dep error. A card whose tree is unchanged vs.
-its base (a no-op follow-up) skips the gate, and build artifacts are excluded
-from the card's diff and pinned commit via the repo's `.git/info/exclude`
-(never a tracked `.gitignore`, never committed). The gate is a per-board
-master switch too (`board verify on|off`, default on, surfaced in the web
-meta line; the global `config.verify` settings block still applies). Parity
-for both toggles exists in CLI and `/katban`. (162 katban tests total.)
+fresh worktree first — yarn/pnpm projects install with their own frozen
+lockfile, JS without a lockfile uses `npm install --no-package-lock` (never
+writes one to commit as non-agent work), Python gets a worktree-local venv +
+`pip install` (`-r requirements.txt`, or editable-install a `pyproject.toml`),
+Rust warms the registry with `cargo fetch` — and an install that fails is an
+environment gap, so the gate skips with the reason visible instead of
+fail-closing on a missing-dep error. A card whose tree is unchanged vs. its
+base (a no-op follow-up) skips the gate, and build artifacts are excluded from
+the card's diff and pinned commit via per-worktree `core.excludesFile` (never
+a tracked `.gitignore`, never committed, and gone on worktree teardown). The
+gate is a per-board master switch too (`board verify on|off`, default on,
+surfaced in the web meta line and in clickable web toolbar buttons; the
+global `config.verify` settings block still applies). Parity exists in CLI and
+`/katban`. (167 katban tests total.)
+
+**Cold-build caveat (Rust) and the shared deps cache:** `cargo fetch` only
+warms downloads — a first `cargo test` on a large workspace still compiles all
+its dependencies and can exceed the per-command timeout (default 180s from
+`config.verify.timeout_secs`), which skips the gate for that card rather than
+failing it. Two mitigations: bump `settings.json` `config.verify.timeout_secs`
+for a large workspace, or disable the gate per board with `board verify off`
+when you're at a higher-trust point. And since Rust cards share a per-project
+`CARGO_TARGET_DIR` (next to the card worktrees), the expensive cold compile
+happens once per project — later cards reuse the compiled dependencies.
 
 **Build status — guest link feature complete (new crate `clawde-katban`):**
 On top of the earlier slices (site lifecycle + `expose` + caddy include,
