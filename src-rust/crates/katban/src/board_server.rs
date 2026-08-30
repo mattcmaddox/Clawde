@@ -174,6 +174,7 @@ struct BoardApi {
     parallel_cap: usize,
     auto_retry: u32,
     auto_review: bool,
+    verify: bool,
     /// ids that can start right now (deps met, not running/review/blocked/done).
     ready: Vec<String>,
 }
@@ -945,6 +946,7 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
         parallel_cap: board.parallel_cap,
         auto_retry: board.auto_retry,
         auto_review: board.auto_review,
+        verify: board.verify,
         ready,
     }
 }
@@ -1097,7 +1099,7 @@ async function loadBoard(project) {
   const res = await fetch("/api/board/" + encodeURIComponent(project));
   if (!res.ok) { $("#board").innerHTML = '<span class="blocked">' + (await res.text()) + "</span>"; return; }
   const api = await res.json();
-  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "");
+  $("#meta").textContent = api.cards.length + " cards · cap " + api.parallelCap + " · retry " + api.autoRetry + (api.autoReview ? " · auto-review" : "") + " · verify " + (api.verify ? "on" : "off");
   const byStatus = {};
   COLS.forEach((c) => byStatus[c] = []);
   const waitMap = {};

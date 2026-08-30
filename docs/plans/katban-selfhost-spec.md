@@ -54,6 +54,24 @@ feedback block to the agent's prompt. Parity exists in the CLI
 comment|feedback`. Review/feedback round-trip is covered from the board model
 (board.rs), the web API, and the CLI (143 katban tests total).
 
+On top of the review loop sit the two **automated card verification layers**
+(audit options 1+2, `katban/src/verify.rs`, wired into the runner): a
+**verification gate** that runs the project's detected test/lint commands in
+the card's worktree before review (a failing check sends the card to Failed,
+never Review), and an **auto-review pass** that attaches a second agent's
+structured findings as `[auto-review]` review comments (best-effort; per-board
+toggle `board auto-review on|off`). The gate provisions dependencies into the
+fresh worktree first (`npm ci`/`npm install`, a worktree-local Python venv +
+`pip install -r requirements.txt pytest`, `cargo fetch`) — an install that
+fails is an environment gap, so the gate skips with the reason visible instead
+of fail-closing on a missing-dep error. A card whose tree is unchanged vs.
+its base (a no-op follow-up) skips the gate, and build artifacts are excluded
+from the card's diff and pinned commit via the repo's `.git/info/exclude`
+(never a tracked `.gitignore`, never committed). The gate is a per-board
+master switch too (`board verify on|off`, default on, surfaced in the web
+meta line; the global `config.verify` settings block still applies). Parity
+for both toggles exists in CLI and `/katban`. (162 katban tests total.)
+
 **Build status — guest link feature complete (new crate `clawde-katban`):**
 On top of the earlier slices (site lifecycle + `expose` + caddy include,
 board backend, DuckDNS, `status`, LAN exposure flags), the guest tier

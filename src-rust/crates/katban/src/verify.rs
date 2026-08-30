@@ -19,7 +19,7 @@
 //! loop, and mirrors its `skipped` semantics: a check that cannot start
 //! (missing tool) is an environment gap, not a card failure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clawde_core::config::{Settings, VerifyConfig};
@@ -28,6 +28,11 @@ use clawde_core::config::{Settings, VerifyConfig};
 #[derive(Debug, Clone)]
 pub struct GateResult {
     pub passed: bool,
+    /// True when the gate intentionally did not run (board toggle off, verify
+    /// disabled in settings, nothing changed, or dependency install failed —
+    /// an environment gap, not a card failure). The runner surfaces skipped
+    /// reasons on the card's result so a skip is never silent.
+    pub skipped: bool,
     /// Human digest: what ran and how it did (or why nothing ran).
     pub detail: String,
 }
@@ -36,6 +41,15 @@ impl GateResult {
     fn passed(detail: impl Into<String>) -> Self {
         Self {
             passed: true,
+            skipped: false,
+            detail: detail.into(),
+        }
+    }
+
+    fn skipped(detail: impl Into<String>) -> Self {
+        Self {
+            passed: true,
+            skipped: true,
             detail: detail.into(),
         }
     }
@@ -43,6 +57,7 @@ impl GateResult {
     fn failed(detail: impl Into<String>) -> Self {
         Self {
             passed: false,
+            skipped: false,
             detail: detail.into(),
         }
     }
@@ -67,43 +82,77 @@ fn verify_config() -> VerifyConfig {
         .unwrap_or_default()
 }
 
-/// Run the verification gate in the card's worktree: detect the project's
-/// test/lint commands and run them (tests first, then lints), each bounded by
-/// the configured per-command timeout. A project with no detectable commands,
-/// or a card in a non-code directory, passes trivially (nothing to run).
-pub async fn run_gate(work_dir: &Path) -> GateResult {
+/// Run the verification gate in the card's worktree: provision dependencies
+/// (the worktree is a pristine checkout), then detect the project's test/lint
+/// commands and run them (tests first, then lints), each bounded by the
+/// configured per-command timeout. A project with no detectable commands, or a
+/// card in a non-code directory, passes trivially (nothing to run).
+///
+/// `board_verify` is the per-board master switch (`board verify on|off`); the
+/// global `settings.json` `config.verify.enabled` must also be true for the
+/// gate to run. A card whose tree is unchanged vs. its base (e.g. a no-op
+/// follow-up) is skipped — there is nothing new to verify.
+pub async fn run_gate(work_dir: &Path, board_verify: bool) -> GateResult {
     let config = verify_config();
+    if !board_verify {
+        return GateResult::skipped("verification disabled for this board (board verify off)");
+    }
     if !config.enabled {
-        return GateResult::passed(
+        return GateResult::skipped(
             "verification disabled (settings.json \"config.verify.enabled\": false)",
         );
     }
+    // #5 — an unchanged tree has nothing new to verify: re-running the whole
+    // test/lint suite on an identical tree is pure waste (and risks a spurious
+    // timeout failure on a no-op follow-up). Mirrors the interactive loop's
+    // skip-when-no-writes behavior. Only meaningful in a git repo; a scratch
+    // dir's agent work IS the whole tree, so it always runs.
+    if crate::git::is_repo(work_dir) && crate::git::diff_clamped(work_dir).trim().is_empty() {
+        return GateResult::skipped("no changes to verify (tree unchanged)");
+    } // Detect the project's commands BEFORE provisioning: if nothing would run
+      // (no detectable commands, or auto_test/auto_lint both off), there is no
+      // reason to spend a bounded timeout installing dependencies.
     let info = clawde_tools::detect_project::detect_project_info(work_dir);
+    let test_cmd = if config.auto_test {
+        info.test_commands.first().cloned()
+    } else {
+        None
+    };
+    let lint_cmd = if config.auto_lint {
+        info.lint_commands.first().cloned()
+    } else {
+        None
+    };
+    if test_cmd.is_none() && lint_cmd.is_none() {
+        return GateResult::passed("no test/lint commands detected for this project");
+    }
+    // #4 — provision dependencies first (fresh worktree, no node_modules,
+    // no venv, cold registry cache). An install that fails (no network, broken
+    // manifest) is an environment gap, not a card failure: skip the gate with
+    // the reason visible instead of fail-closing on a missing-dep error.
+    let venv_bin = match provision_deps(work_dir, config.timeout_secs).await {
+        Ok(venv_bin) => venv_bin,
+        Err(err) => {
+            return GateResult::skipped(format!("dependency install failed; gate skipped: {err}"));
+        }
+    };
     let mut labels: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut ran = 0usize;
-    if config.auto_test {
-        if let Some(cmd) = info.test_commands.first() {
-            ran += 1;
-            let label = format!("test: {cmd}");
-            if let Some(err) = run_check(work_dir, cmd, config.timeout_secs).await {
-                failures.push(format!("{label}: {err}"));
-            }
-            labels.push(label);
+    if let Some(cmd) = test_cmd {
+        let label = format!("test: {cmd}");
+        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, venv_bin.as_deref()).await
+        {
+            failures.push(format!("{label}: {err}"));
         }
+        labels.push(label);
     }
-    if config.auto_lint {
-        if let Some(cmd) = info.lint_commands.first() {
-            ran += 1;
-            let label = format!("lint: {cmd}");
-            if let Some(err) = run_check(work_dir, cmd, config.timeout_secs).await {
-                failures.push(format!("{label}: {err}"));
-            }
-            labels.push(label);
+    if let Some(cmd) = lint_cmd {
+        let label = format!("lint: {cmd}");
+        if let Some(err) = run_check(work_dir, &cmd, config.timeout_secs, venv_bin.as_deref()).await
+        {
+            failures.push(format!("{label}: {err}"));
         }
-    }
-    if ran == 0 {
-        return GateResult::passed("no test/lint commands detected for this project");
+        labels.push(label);
     }
     if failures.is_empty() {
         GateResult::passed(format!("all checks passed ({})", labels.join(", ")))
@@ -112,22 +161,80 @@ pub async fn run_gate(work_dir: &Path) -> GateResult {
     }
 }
 
+/// Install the project's dependencies into the fresh worktree so the checks
+/// can actually run: `npm ci` (or `npm install` without a lockfile) for JS,
+/// a worktree-local Python venv + `pip install -r requirements.txt pytest`
+/// for Python, and `cargo fetch` to warm the shared registry cache for Rust.
+/// The venv lives inside the throwaway worktree, so nothing outside the card
+/// is touched. Returns the venv's `bin` dir (when one was created) so the
+/// checks run with the venv's `python3` (and its pytest) on PATH. `Err` = an
+/// install failed (caller skips the gate); a tool that cannot even start
+/// (npm/python3 missing) is treated as a successful no-op, so the checks then
+/// fail-or-skip on their own, keeping the fail-open-on-env-gap contract.
+async fn provision_deps(work_dir: &Path, timeout_secs: u64) -> Result<Option<PathBuf>, String> {
+    let mut venv_bin = None;
+    if work_dir.join("package.json").exists() {
+        // `npm ci` needs a lockfile; without one `npm install` is the honest
+        // (network-requiring) fallback. node_modules stays inside the worktree
+        // and is excluded from the pinned commit (#6).
+        let cmd = if work_dir.join("package-lock.json").exists() {
+            "npm ci"
+        } else {
+            "npm install"
+        };
+        if let Some(err) = run_check(work_dir, cmd, timeout_secs, None).await {
+            return Err(format!("{cmd} failed: {err}"));
+        }
+    }
+    if work_dir.join("requirements.txt").exists() {
+        // pytest is the detected Python test runner (`python3 -m pytest`), so
+        // install it alongside the project's requirements; the checks then
+        // resolve `python3` to the venv via the prepended PATH.
+        for cmd in [
+            "python3 -m venv .venv",
+            ".venv/bin/pip install -r requirements.txt pytest",
+        ] {
+            if let Some(err) = run_check(work_dir, cmd, timeout_secs, None).await {
+                return Err(format!("{cmd} failed: {err}"));
+            }
+        }
+        venv_bin = Some(work_dir.join(".venv/bin"));
+    }
+    if work_dir.join("Cargo.toml").exists() {
+        // Warm the shared registry cache so the cold `cargo test` compile has
+        // its downloads ready; the compile itself is bounded by the check
+        // timeout and is the user's knob via `timeout_secs` / `board verify`.
+        if let Some(err) = run_check(work_dir, "cargo fetch", timeout_secs, None).await {
+            return Err(format!("cargo fetch failed: {err}"));
+        }
+    }
+    Ok(venv_bin)
+}
+
 /// Run one check command to completion. Returns `Some(err)` when it failed or
 /// timed out; `None` when it passed or could not start (missing tool — an
 /// environment gap, mirroring the interactive loop's `skipped`). The child is
 /// killed if it exceeds the timeout, so a hung check cannot pin a slot.
-async fn run_check(work_dir: &Path, command: &str, timeout_secs: u64) -> Option<String> {
+/// `extra_path` (the worktree's venv bin dir) is prepended to PATH when set,
+/// so `python3 -m pytest` resolves to the venv's interpreter + pytest.
+async fn run_check(
+    work_dir: &Path,
+    command: &str,
+    timeout_secs: u64,
+    extra_path: Option<&Path>,
+) -> Option<String> {
     // Detected commands are fixed strings (never user input) without quotes,
     // so a whitespace split is a faithful tokenization.
     let parts: Vec<&str> = command.split_whitespace().collect();
     let (program, args) = parts.split_first()?;
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    let child = tokio::process::Command::new(program)
-        .args(args)
-        .current_dir(work_dir)
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?; // spawn failure = skipped
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args).current_dir(work_dir).kill_on_drop(true);
+    if let Some(extra) = extra_path {
+        let old = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{old}", extra.display()));
+    }
+    let child = cmd.spawn().ok()?; // spawn failure = skipped
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
             if output.status.success() {
@@ -163,9 +270,11 @@ async fn run_check(work_dir: &Path, command: &str, timeout_secs: u64) -> Option<
 }
 
 /// Run a second headless agent pass over the card's diff and return structured
-/// findings. Best-effort by contract: a spawn/exit failure returns `Err` (the
-/// runner logs and skips); unparseable output degrades to one free-form
-/// comment via `parse_findings`.
+/// findings. Best-effort by contract: a spawn/exit failure or timeout returns
+/// `Err` (the runner logs and skips — a hung reviewer must not pin the card's
+/// parallel slot, so the pass is bounded by the same per-command timeout as
+/// the gate's checks); unparseable output degrades to one free-form comment
+/// via `parse_findings`.
 pub async fn auto_review(
     work_dir: &Path,
     task_prompt: &str,
@@ -181,13 +290,21 @@ pub async fn auto_review(
          Do not include any text outside the JSON array.",
         task = task_prompt.trim()
     );
-    let output = tokio::process::Command::new(&clawde_bin)
+    let timeout_secs = verify_config().timeout_secs.max(1);
+    let child = tokio::process::Command::new(&clawde_bin)
         .current_dir(work_dir)
         .args(["--print", &reviewer_prompt])
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()
         .map_err(|e| format!("could not start auto-review agent: {e}"))?;
+    let output =
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(format!("auto-review agent wait failed: {e}")),
+            Err(_) => return Err(format!("auto-review agent timed out after {timeout_secs}s")),
+        };
     if !output.status.success() {
         return Err("auto-review agent exited non-zero".to_string());
     }
@@ -234,11 +351,13 @@ fn parse_findings(text: &str) -> Vec<AutoReviewFinding> {
         if text.is_empty() {
             continue;
         }
-        let line = item
-            .get("line")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .filter(|l| !l.trim().is_empty());
+        // The prompt asks for `"line": <number or null>`; a model that answers
+        // with a JSON number must not silently lose its anchor.
+        let line = item.get("line").and_then(|v| match v {
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
         findings.push(AutoReviewFinding { line, text });
     }
     findings
@@ -265,10 +384,12 @@ mod tests {
     // Pin CLAWDE_HOME to a sandbox, optionally seed settings.json, build a
     // scratch project via `setup`, and run the gate — all in one async helper
     // so the env guard stays held across the await (test-only pattern; the
-    // crate's board_server tests do the same).
+    // crate's board_server tests do the same). `board_verify` mirrors the
+    // per-board master toggle.
     #[allow(clippy::await_holding_lock)]
     async fn gate_in_home(
         settings: Option<&str>,
+        board_verify: bool,
         setup: impl FnOnce(&std::path::Path),
     ) -> GateResult {
         let tmp = tempfile::tempdir().unwrap();
@@ -280,7 +401,7 @@ mod tests {
         }
         let work = tempfile::tempdir().unwrap();
         setup(work.path());
-        let result = run_gate(work.path()).await;
+        let result = run_gate(work.path(), board_verify).await;
         match previous {
             Some(value) => std::env::set_var("CLAWDE_HOME", value),
             None => std::env::remove_var("CLAWDE_HOME"),
@@ -288,9 +409,30 @@ mod tests {
         result
     }
 
+    fn init_repo(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
+
     #[tokio::test]
     async fn gate_passes_trivially_with_no_project() {
-        let result = gate_in_home(None, |work| {
+        let result = gate_in_home(None, true, |work| {
             std::fs::write(work.join("notes.txt"), "no code here\n").unwrap();
         })
         .await;
@@ -300,17 +442,43 @@ mod tests {
 
     #[tokio::test]
     async fn gate_passes_when_verify_disabled() {
-        let result = gate_in_home(Some(r#"{"config":{"verify":{"enabled":false}}}"#), |work| {
-            std::fs::create_dir_all(work.join("src")).unwrap();
+        let result = gate_in_home(
+            Some(r#"{"config":{"verify":{"enabled":false}}}"#),
+            true,
+            |work| {
+                std::fs::create_dir_all(work.join("src")).unwrap();
+                std::fs::write(
+                    work.join("Cargo.toml"),
+                    "[package]\nname=\"x\"\nversion=\"0.1.0\"\n",
+                )
+                .unwrap();
+            },
+        )
+        .await;
+        assert!(result.passed);
+        assert!(result.detail.contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn gate_skips_when_board_verify_off() {
+        // #7 — the per-board master switch: `board verify off` must skip the
+        // gate (a pass with a visible reason), even for a project whose checks
+        // would fail.
+        let result = gate_in_home(None, false, |work| {
             std::fs::write(
-                work.join("Cargo.toml"),
-                "[package]\nname=\"x\"\nversion=\"0.1.0\"\n",
+                work.join("package.json"),
+                r#"{"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
             )
             .unwrap();
         })
         .await;
         assert!(result.passed);
-        assert!(result.detail.contains("disabled"));
+        assert!(result.skipped);
+        assert!(
+            result.detail.contains("board verify off"),
+            "detail: {}",
+            result.detail
+        );
     }
 
     #[tokio::test]
@@ -323,6 +491,7 @@ mod tests {
         // can't mask the test result; only the failing test runs.
         let result = gate_in_home(
             Some(r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":60}}}"#),
+            true,
             |work| {
                 std::fs::write(
                     work.join("package.json"),
@@ -348,6 +517,7 @@ mod tests {
         }
         let result = gate_in_home(
             Some(r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":60}}}"#),
+            true,
             |work| {
                 std::fs::write(
                     work.join("package.json"),
@@ -387,5 +557,117 @@ mod tests {
     fn parse_findings_empty_array_is_empty() {
         assert!(parse_findings("[]").is_empty());
         assert!(parse_findings("").is_empty());
+    }
+
+    #[test]
+    fn parse_findings_accepts_numeric_line_anchors() {
+        // The prompt asks the reviewer for `"line": <number or null>`; a model
+        // that answers with a JSON number must not silently lose the anchor.
+        let text =
+            r#"[{"line": 12, "text": "off by one"}, {"line": "14-16", "text": "dup logic"}]"#;
+        let findings = parse_findings(text);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].line.as_deref(), Some("12"));
+        assert_eq!(findings[1].line.as_deref(), Some("14-16"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gate_skips_an_unchanged_tree() {
+        // #5 — a worktree with no changes has nothing new to verify: the gate
+        // must skip (pass with a visible reason) instead of re-running the
+        // whole suite on an identical tree. Only git worktrees qualify; a
+        // scratch dir's work IS the whole tree and always runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let wt = crate::git::card_worktree_dir("default", "abcd1234");
+        crate::git::create_worktree(repo.path(), &wt, None).unwrap();
+        let result = run_gate(&wt, true).await;
+        assert!(result.passed);
+        assert!(result.skipped, "detail: {}", result.detail);
+        assert!(
+            result.detail.contains("no changes"),
+            "detail: {}",
+            result.detail
+        );
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_provisions_deps_before_checks() {
+        // #4 — the fresh worktree has no node_modules; the gate must install
+        // dependencies before running the checks, so a test that requires the
+        // installed dep passes. Uses a `file:` dependency: `npm install`
+        // materializes it into node_modules fully offline (no registry),
+        // deterministic in any environment.
+        if !node_available() {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+        let result = gate_in_home(
+            Some(r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":120}}}"#),
+            true,
+            |work| {
+                std::fs::create_dir_all(work.join("helper")).unwrap();
+                std::fs::write(
+                    work.join("helper/package.json"),
+                    r#"{"name":"helper","version":"1.0.0"}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    work.join("package.json"),
+                    r#"{"name":"t","version":"1.0.0","dependencies":{"helper":"file:./helper"},"scripts":{"test":"node -e \"process.exit(require('fs').existsSync('node_modules/helper') ? 0 : 1)\""}}"#,
+                )
+                .unwrap();
+            },
+        )
+        .await;
+        assert!(result.passed, "detail: {}", result.detail);
+        assert!(!result.skipped, "install must not skip: {}", result.detail);
+    }
+
+    #[tokio::test]
+    async fn gate_skips_when_dependency_install_fails() {
+        // #4 — an install that cannot complete (lockfile out of sync with
+        // package.json, so `npm ci` refuses) is an environment/project gap:
+        // the gate must SKIP with the reason visible, not fail the card on a
+        // missing-dependency error it can do nothing about.
+        if !node_available() {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+        let result = gate_in_home(
+            Some(r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":60}}}"#),
+            true,
+            |work| {
+                std::fs::write(
+                    work.join("package.json"),
+                    r#"{"name":"t","version":"1.0.0","dependencies":{"helper":"file:./helper"},"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+                )
+                .unwrap();
+                // Lockfile missing the declared dep: `npm ci` fails fast with
+                // the sync error, before any network access.
+                std::fs::write(
+                    work.join("package-lock.json"),
+                    r#"{"name":"t","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t","version":"1.0.0"}}}"#,
+                )
+                .unwrap();
+            },
+        )
+        .await;
+        assert!(result.passed, "install failure must not fail the card");
+        assert!(result.skipped, "detail: {}", result.detail);
+        assert!(
+            result.detail.contains("dependency install failed"),
+            "detail: {}",
+            result.detail
+        );
     }
 }

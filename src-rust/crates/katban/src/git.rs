@@ -105,12 +105,67 @@ pub fn remove_worktree(repo_root: &Path, work_dir: &Path) {
 /// card touching a huge generated tree.
 pub const DIFF_CAP: usize = 16 * 1024;
 
+/// Marker line that identifies this file's katban-managed excludes.
+const ARTIFACT_EXCLUDE_MARKER: &str = "# katban: ignore build artifacts";
+
+/// Exclude common build artifacts from the card's diff and pinned commit.
+/// The verification gate provisions dependencies inside the fresh worktree
+/// (`npm ci`, a `.venv`, `cargo` builds), so a project without a `.gitignore`
+/// would otherwise commit `node_modules`/`target` into the card's branch and
+/// into the captured review diff.
+///
+/// Writes to `.git/info/exclude` (resolved via `git rev-parse --git-path` so
+/// linked worktrees hit the right git dir) instead of a tracked `.gitignore`:
+/// the excludes are local, never appear in the diff, and never get committed.
+/// Idempotent (guarded by the marker); a non-repo scratch dir is a silent
+/// no-op.
+pub fn ensure_artifact_excludes(work_dir: &Path) {
+    let Ok(raw) = git(work_dir, &["rev-parse", "--git-path", "info/exclude"]) else {
+        return; // not a git worktree (scratch dir)
+    };
+    let Ok(git_dir) = git(work_dir, &["rev-parse", "--git-dir"]) else {
+        return;
+    };
+    let exclude = if Path::new(&raw).is_absolute() {
+        PathBuf::from(raw)
+    } else if Path::new(&git_dir).is_absolute() {
+        Path::new(&git_dir).join(&raw)
+    } else {
+        work_dir.join(&git_dir).join(&raw)
+    };
+    if exclude.is_dir() {
+        return;
+    }
+    if let Ok(existing) = std::fs::read_to_string(&exclude) {
+        if existing.contains(ARTIFACT_EXCLUDE_MARKER) {
+            return;
+        }
+    }
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    let body = format!(
+        "\n{ARTIFACT_EXCLUDE_MARKER}\nnode_modules/\ntarget/\n__pycache__/\n*.pyc\n.venv/\ndist/\nbuild/\n"
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&exclude)
+    {
+        let _ = file.write_all(body.as_bytes());
+    }
+}
+
 /// `git --no-pager diff HEAD` for the card's worktree, capped at `DIFF_CAP`
 /// chars. Runs inside the worktree (the changes the agent made live there),
 /// and treats untracked files as additions via `git add -N` so they show up
 /// too. Returns an empty string when there's no diff, the command failed, or
 /// the dir doesn't hold a repo (all safe defaults for display).
 pub fn diff_clamped(work_dir: &Path) -> String {
+    // Gate-generated artifacts (node_modules, target, venvs) must never leak
+    // into the captured review diff; excluded first so `git add -N` skips them.
+    ensure_artifact_excludes(work_dir);
     // `git add -N` records intent-to-add so untracked files appear in diff;
     // local to the worktree index and harmless. Best-effort.
     let _ = git(work_dir, &["add", "-N", "."]);
@@ -159,6 +214,9 @@ pub fn commit_card(
 ) -> Result<String, String> {
     validate_branch(branch)?;
     git(work_dir, &["checkout", "-B", branch])?;
+    // Gate-generated artifacts must not be committed into the card's branch;
+    // excluded before `add -A` so it stages everything else.
+    ensure_artifact_excludes(work_dir);
     // `add -A` records additions, modifications, and deletions (where the
     // runner's diff helper used `add -N` intent-to-add for display only).
     git(work_dir, &["add", "-A"])?;
@@ -365,6 +423,39 @@ mod tests {
             assert!(d.contains("changed"), "diff: {d}");
             assert!(d.contains("README.md"), "diff: {d}");
             assert!(!d.contains('\r'));
+        });
+    }
+
+    #[test]
+    fn gate_artifacts_are_excluded_from_diff_and_commit() {
+        // #6 — a repo without a .gitignore: gate-generated artifacts
+        // (node_modules, .venv, build output) must not leak into the captured
+        // diff or the card's pinned commit.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        with_home(tmp.path(), || {
+            let wt = worktree_root().join("t3");
+            create_worktree(repo.path(), &wt, None).unwrap();
+            // The agent's real change plus gate-generated artifacts.
+            std::fs::write(wt.join("README.md"), "# demo\n\nfeature\n").unwrap();
+            std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+            std::fs::write(wt.join("node_modules/pkg/index.js"), "artifact\n").unwrap();
+            std::fs::create_dir_all(wt.join(".venv/bin")).unwrap();
+            std::fs::write(wt.join(".venv/bin/python3"), "artifact\n").unwrap();
+
+            let d = diff_clamped(&wt);
+            assert!(d.contains("feature"), "diff: {d}");
+            assert!(!d.contains("node_modules"), "diff: {d}");
+            assert!(!d.contains(".venv"), "diff: {d}");
+
+            // The pinned commit carries the real change, not the artifacts.
+            let sha = commit_card(repo.path(), &wt, "katban/abcd", "katban: feature").unwrap();
+            let tree_file =
+                |path: &str| git(repo.path(), &["show", &format!("{sha}:{path}")]).map(|_| ());
+            assert!(tree_file("README.md").is_ok());
+            assert!(tree_file("node_modules/pkg/index.js").is_err());
+            assert!(tree_file(".venv/bin/python3").is_err());
         });
     }
 }

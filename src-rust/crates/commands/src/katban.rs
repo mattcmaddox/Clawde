@@ -80,6 +80,7 @@ impl SlashCommand for KatbanCommand {
          /katban board card comment <id> [--line N] <text> — note a diff-review comment\n\
          /katban board card feedback <id> — send the card's review comments to its agent\n\
          /katban board auto-review on|off — toggle the auto-review pass\n\
+         /katban board verify on|off    — toggle the verification gate\n\
          /katban board card show <id>    — show a card's status, result, commit, diff\n\
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
@@ -403,6 +404,10 @@ impl SlashCommand for KatbanCommand {
                 }
             }
             ["board", "auto-review", state] => match board_set_auto_review(project, state) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            },
+            ["board", "verify", state] => match board_set_verify(project, state) {
                 Ok(text) => CommandResult::Message(text),
                 Err(message) => CommandResult::Error(message),
             },
@@ -787,6 +792,24 @@ fn board_set_auto_review(project: Option<&str>, state: &str) -> Result<String, S
     with_board_lock(project, |board| board.auto_review = enabled)?;
     Ok(format!(
         "auto-review {} for board '{}'",
+        if enabled { "enabled" } else { "disabled" },
+        project_name(project)
+    ))
+}
+
+/// Toggle the board's verification gate (`/katban board verify on|off`).
+/// Enabled by default; disabling it lets cards reach review without running
+/// the project's checks in the worktree (the global `config.verify.enabled`
+/// setting must also be on for the gate to run).
+fn board_set_verify(project: Option<&str>, state: &str) -> Result<String, String> {
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        other => return Err(format!("verify needs on or off, got '{other}'")),
+    };
+    with_board_lock(project, |board| board.verify = enabled)?;
+    Ok(format!(
+        "verify {} for board '{}'",
         if enabled { "enabled" } else { "disabled" },
         project_name(project)
     ))

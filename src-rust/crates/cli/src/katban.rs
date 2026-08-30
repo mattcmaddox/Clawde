@@ -547,6 +547,7 @@ const BOARD_USAGE: &str = r#"Usage: clawde katban board <command> [--project NAM
   unlink <A> <B>
   ready [--cap N]                        Cards that can start now (queue order)
   auto-review on|off                     Toggle the auto-review pass for cards
+  verify on|off                          Toggle the verification gate for cards
   run [--project NAME]                   Run the scheduler for one project (executes ready cards)
 
 The board UI serves on 127.0.0.1:<port> (default 8790). Binding a
@@ -1031,6 +1032,21 @@ async fn run_board(args: &[String]) -> anyhow::Result<()> {
             save_board(&board, project)?;
             println!(
                 "auto-review {} for board '{project}'",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            Ok(())
+        }
+        "verify" => {
+            if rest.len() != 1 || !matches!(rest[0].as_str(), "on" | "off") {
+                anyhow::bail!("board verify needs on or off");
+            }
+            let enabled = rest[0] == "on";
+            let _guard = clawde_katban::board::BoardLock::acquire(project)?;
+            let mut board = load_board(project)?.unwrap_or_default();
+            board.verify = enabled;
+            save_board(&board, project)?;
+            println!(
+                "verify {} for board '{project}'",
                 if enabled { "enabled" } else { "disabled" }
             );
             Ok(())
@@ -2409,6 +2425,41 @@ mod tests {
                 .contains("add an index"));
             Ok(())
         })();
+        match previous {
+            Some(value) => std::env::set_var("CLAWDE_HOME", value),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn board_verify_toggle_round_trips() {
+        // `board verify on|off` is the per-board master switch for the
+        // verification gate: it must round-trip through board.json, reject
+        // anything but on/off, and default to on.
+        let _guard = crate::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("CLAWDE_HOME").ok();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let result = async {
+            let board = clawde_katban::board::Board::new();
+            assert!(board.verify, "gate must default to on");
+            clawde_katban::board::save_board(&board, "default")?;
+
+            run_board(&["verify".into(), "off".into()]).await?;
+            assert!(
+                !clawde_katban::board::load_board("default")?.unwrap().verify,
+                "verify off must persist"
+            );
+            run_board(&["verify".into(), "on".into()]).await?;
+            assert!(clawde_katban::board::load_board("default")?.unwrap().verify);
+            assert!(
+                run_board(&["verify".into(), "maybe".into()]).await.is_err(),
+                "board verify rejects anything but on/off"
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
         match previous {
             Some(value) => std::env::set_var("CLAWDE_HOME", value),
             None => std::env::remove_var("CLAWDE_HOME"),

@@ -184,6 +184,13 @@ pub struct Board {
     /// `clawde katban board auto-review on|off`.
     #[serde(default = "default_true")]
     pub auto_review: bool,
+    /// Run the verification gate before a card reaches review: the project's
+    /// detected test/lint commands run in the card's worktree and a failure
+    /// sends the card to Failed. Per-board master switch (the global
+    /// `settings.json` `config.verify.enabled` must also be on). Toggle with
+    /// `clawde katban board verify on|off`.
+    #[serde(default = "default_true")]
+    pub verify: bool,
 }
 
 fn default_parallel_cap() -> usize {
@@ -207,6 +214,7 @@ impl Board {
             parallel_cap: DEFAULT_PARALLEL_CAP,
             auto_retry: DEFAULT_AUTO_RETRY,
             auto_review: true,
+            verify: true,
         }
     }
 

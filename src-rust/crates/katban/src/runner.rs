@@ -365,14 +365,28 @@ async fn run_one_card(
         .or(outcome.as_ref().ok())
         .map(|s| s.to_string());
 
+    // Load the board's per-card toggles once (before either gate): the
+    // verification gate (board audit option 1) and the auto-review pass
+    // (option 2).
+    let (verify_on, auto_review_on) = board::load_board(project)
+        .ok()
+        .flatten()
+        .map(|b| (b.verify, b.auto_review))
+        .unwrap_or((true, false));
+
     if !failed {
-        // Verification gate (board audit option 1): the card's work must pass
-        // the project's own checks before it is accepted into review. A failing
-        // check fails the card with the check output in its result.
-        let gate = crate::verify::run_gate(work_dir).await;
+        // Verification gate: the card's work must pass the project's own
+        // checks before it is accepted into review. A failing check fails the
+        // card with the check output in its result; a skip (board off / tree
+        // unchanged / deps not installable) is surfaced on the result so it is
+        // never silent.
+        let gate = crate::verify::run_gate(work_dir, verify_on).await;
         if !gate.passed {
             failed = true;
             note = Some(gate.detail.clone());
+        } else if gate.skipped {
+            let base = note.clone().unwrap_or_default();
+            note = Some(format!("{base} · gate skipped: {}", gate.detail));
         }
     }
 
@@ -382,22 +396,24 @@ async fn run_one_card(
         // (best-effort — any failure just skips the pass). Findings are added
         // under the board lock while the card is still running, so they ride
         // into the final review state with it.
-        let auto_review_on = board::load_board(project)
-            .ok()
-            .flatten()
-            .map(|b| b.auto_review)
-            .unwrap_or(false);
         if auto_review_on {
             let diff = git::diff_clamped(work_dir);
-            match crate::verify::auto_review(work_dir, prompt, &diff).await {
-                Ok(findings) => {
-                    for finding in findings {
-                        let text = format!("[auto-review] {}", finding.text);
-                        let _ = board::add_review(project, &card_id, finding.line, &text);
+            if diff.trim().is_empty() {
+                // Nothing changed (e.g. a no-op follow-up): there is no diff to
+                // review — skip the pass instead of spawning a reviewer to look
+                // at an empty diff (and potentially attach noise comments).
+                tracing::info!(project, card = %card_id, "auto-review skipped: empty diff");
+            } else {
+                match crate::verify::auto_review(work_dir, prompt, &diff).await {
+                    Ok(findings) => {
+                        for finding in findings {
+                            let text = format!("[auto-review] {}", finding.text);
+                            let _ = board::add_review(project, &card_id, finding.line, &text);
+                        }
                     }
-                }
-                Err(error) => {
-                    tracing::info!(project, card = %card_id, error = %error, "auto-review skipped");
+                    Err(error) => {
+                        tracing::info!(project, card = %card_id, error = %error, "auto-review skipped");
+                    }
                 }
             }
         }
@@ -871,6 +887,64 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn auto_review_skips_empty_diff() {
+        // A run whose agent changes nothing has an empty diff: the auto-review
+        // pass must not spawn a reviewer (nothing to review) and must not
+        // attach `[auto-review]` noise comments to a change-less card.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+            // `run_one_card` creates the worktree itself (the card is marked
+            // running first), so we only reserve the slot.
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            struct Noop;
+            impl CardExecutor for Noop {
+                fn execute(&self, _work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                    Ok("done".into())
+                }
+            }
+            let executor: Arc<dyn CardExecutor> = Arc::new(Noop);
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            assert!(
+                card.reviews.is_empty(),
+                "empty-diff run must not attach auto-review comments"
+            );
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn gate_failure_fails_the_card() {
         // Verification gate (option 1): an agent run that passes but leaves a
         // project whose checks fail must send the card to Failed — never Review
@@ -941,6 +1015,83 @@ mod tests {
             let result = card.result.as_deref().unwrap();
             assert!(result.contains("test: npm test"), "result: {result}");
             assert!(card.commit.is_none(), "gate failure must not pin a commit");
+            match previous {
+                Some(value) => std::env::set_var("CLAWDE_HOME", value),
+                None => std::env::remove_var("CLAWDE_HOME"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn board_verify_off_skips_gate_and_reaches_review() {
+        // #7 — `board verify off` is the per-board master switch: a card whose
+        // project checks would fail must still reach Review (the gate skip is
+        // surfaced on the result, not silent).
+        fn node_available() -> bool {
+            std::process::Command::new("node")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        if !node_available() {
+            eprintln!("skipping: node not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        {
+            let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("CLAWDE_HOME").ok();
+            std::env::set_var("CLAWDE_HOME", tmp.path());
+            std::fs::write(
+                tmp.path().join("settings.json"),
+                r#"{"config":{"verify":{"auto_lint":false,"timeout_secs":60}}}"#,
+            )
+            .unwrap();
+            crate::projects::set_repo_root("default", repo.path()).unwrap();
+            let mut board = Board::new();
+            board.verify = false;
+            board.auto_review = false; // never spawn a reviewer in tests
+            let a = board.add_card("add a feature");
+            board::save_board(&board, "default").unwrap();
+            let wt = git::card_worktree_dir("default", &a);
+            let mut b = board::load_board("default").unwrap().unwrap();
+            b.set_status(&a, CardStatus::Running);
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().branch = Some(format!("katban/{a}"));
+            b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
+                Some(wt.to_string_lossy().into_owned());
+            board::save_board(&b, "default").unwrap();
+
+            struct FailingChecks;
+            impl CardExecutor for FailingChecks {
+                fn execute(&self, work_dir: &Path, _prompt: &str) -> Result<String, String> {
+                    std::fs::write(
+                        work_dir.join("package.json"),
+                        r#"{"scripts":{"test":"node -e \"process.exit(1)\""}}"#,
+                    )
+                    .unwrap();
+                    Ok("done".into())
+                }
+            }
+            let executor: Arc<dyn CardExecutor> = Arc::new(FailingChecks);
+            run_one_card(
+                "default",
+                Some(repo.path()),
+                &wt,
+                "add a feature",
+                &executor,
+                None,
+            )
+            .await;
+
+            let b = board::load_board("default").unwrap().unwrap();
+            let card = b.card(&a).unwrap();
+            assert_eq!(card.status, CardStatus::Review);
+            let result = card.result.as_deref().unwrap();
+            assert!(result.contains("board verify off"), "result: {result}");
             match previous {
                 Some(value) => std::env::set_var("CLAWDE_HOME", value),
                 None => std::env::remove_var("CLAWDE_HOME"),
