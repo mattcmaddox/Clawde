@@ -105,6 +105,22 @@ pub fn remove_worktree(repo_root: &Path, work_dir: &Path) {
 /// card touching a huge generated tree.
 pub const DIFF_CAP: usize = 16 * 1024;
 
+/// Summarize a unified diff without invoking another parser or model.
+/// Binary changes are counted as changed files but contribute no line counts.
+pub fn diff_summary(diff: &str) -> crate::board::DiffSummary {
+    let mut summary = crate::board::DiffSummary::default();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            summary.files_changed += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            summary.additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            summary.deletions += 1;
+        }
+    }
+    summary
+}
+
 /// Marker line that identifies this file's katban-managed excludes.
 const ARTIFACT_EXCLUDE_MARKER: &str = "# katban: ignore build artifacts";
 
@@ -413,6 +429,23 @@ mod tests {
     fn branch_refs_are_validated() {
         assert!(commit_card(Path::new("/tmp"), Path::new("/tmp"), "-x", "m").is_err());
         assert!(commit_card(Path::new("/tmp"), Path::new("/tmp"), "", "m").is_err());
+    }
+
+    #[test]
+    fn diff_summary_counts_unified_diff_lines() {
+        let diff = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n-old\n+new\n+added\n"
+            .to_string();
+        let summary = diff_summary(&diff);
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.additions, 2);
+        assert_eq!(summary.deletions, 1);
+
+        let binary =
+            "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n";
+        let summary = diff_summary(binary);
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.additions, 0);
+        assert_eq!(summary.deletions, 0);
     }
 
     #[test]

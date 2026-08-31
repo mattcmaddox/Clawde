@@ -19,7 +19,7 @@
 //! Reads are lock-free because board saves are atomic (tmp + rename), so a
 //! reader always observes a consistent file.
 
-use crate::board::{self, Board, CardStatus, Dependency};
+use crate::board::{self, Board, CardStatus, Dependency, DiffSummary};
 use crate::board_admin::{AdminStore, ADMIN_COOKIE};
 use crate::guest_server::{client_ip, is_loopback_host, origin_parts, PeerAddr};
 use anyhow::Context;
@@ -197,6 +197,7 @@ struct CardApi {
     retries: u32,
     result: Option<String>,
     diff: Option<String>,
+    diff_summary: Option<DiffSummary>,
     commit: Option<String>,
     reviews: Vec<ReviewCommentApi>,
     followup_feedback: Option<String>,
@@ -994,6 +995,7 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
             retries: card.retries,
             result: card.result.clone(),
             diff: card.diff.clone(),
+            diff_summary: card.diff_summary.clone(),
             commit: card.commit.clone(),
             reviews: card.reviews.iter().map(review_to_api).collect(),
             followup_feedback: card.followup_feedback.clone(),
@@ -1205,6 +1207,7 @@ async function loadBoard(project) {
               : "")).join(", ") +
           "</div>";
       }
+      if (c.diff_summary) html += '<div class="meta">' + c.diff_summary.filesChanged + ' file(s) · +' + c.diff_summary.additions + ' · -' + c.diff_summary.deletions + '</div>';
       if (c.diff) html += '<details class="diff"><summary>diff (' + (c.diff.length) + ' ch)</summary><pre>' + esc(c.diff) + '</pre></details>';
       if (c.reviews && c.reviews.length) {
         html += '<div class="reviews">' + c.reviews.map((r) =>

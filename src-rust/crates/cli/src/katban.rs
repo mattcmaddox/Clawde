@@ -1313,6 +1313,12 @@ fn card_show(project: &str, args: &[String]) -> anyhow::Result<()> {
         println!("result:");
         println!("{result}");
     }
+    if let Some(summary) = &card.diff_summary {
+        println!(
+            "diff summary: {} file(s), +{}, -{}",
+            summary.files_changed, summary.additions, summary.deletions
+        );
+    }
     if let Some(diff) = &card.diff {
         println!("diff ({} ch):", diff.len());
         println!("{diff}");

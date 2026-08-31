@@ -96,6 +96,11 @@ pub struct Card {
     /// worktree is torn down, so review works even after the checkout is gone.
     #[serde(default)]
     pub diff: Option<String>,
+    /// Compact machine-generated summary of the captured diff for fast review.
+    /// Kept separate from `diff` so the UI and CLI can triage without parsing
+    /// patch text on every read.
+    #[serde(default)]
+    pub diff_summary: Option<DiffSummary>,
     /// Option B — the pinned commit hash of this card's branch (`katban/<id>`
     /// in `branch`), written by the runner at finalize before the worktree is
     /// torn down. Review then decides merge-or-discard: `Some` means there is
@@ -137,6 +142,15 @@ pub struct ReviewComment {
     pub location: Option<String>,
     pub text: String,
     pub created_at: u64,
+}
+
+/// Cheap, deterministic diff statistics used by the board UI and CLI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSummary {
+    pub files_changed: usize,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 impl Card {
@@ -237,6 +251,7 @@ impl Board {
             retries: 0,
             result: None,
             diff: None,
+            diff_summary: None,
             commit: None,
             reviews: Vec::new(),
             followup_feedback: None,
@@ -648,8 +663,9 @@ pub fn send_feedback_to_agent(project: &str, card_id: &str) -> Result<usize, Str
     let count = lines.len();
     lines.push(String::new()); // trailing newline so the agent sees a clean block
     card.followup_feedback = Some(lines.join("\n"));
-    // Advance the ack marker so the next send starts after these comments.
-    card.review_ack = card.reviews.len();
+    // Keep `review_ack` unchanged until the follow-up completes successfully.
+    // A crashed or failed agent must be able to receive the same feedback on
+    // retry rather than making the review comments look consumed.
     // Reset to queued (deps met) so the runner picks the card up again; clear
     // the transient-retry counter — a review follow-up is a new deliberate
     // attempt, not a failure retry.

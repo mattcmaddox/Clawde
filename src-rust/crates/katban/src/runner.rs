@@ -484,15 +484,19 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
                     }
                 }
                 // A review follow-up (feedback was pending when this run started)
-                // is now complete: consume the feedback so a later manual requeue
-                // doesn't re-append stale instructions, and so the next run's
-                // worktree base falls back to HEAD rather than the branch this
-                // run already folded in.
-                card.followup_feedback = None;
+                // is now complete: consume the feedback so a later manual
+                // requeue doesn't re-append stale instructions, and acknowledge
+                // exactly the comments included in this follow-up. Failed runs
+                // leave both fields intact so retry can resend the feedback.
+                if card.followup_feedback.is_some() {
+                    card.review_ack = card.reviews.len();
+                    card.followup_feedback = None;
+                }
                 card.status = CardStatus::Review;
             }
             card.result = Some(note);
             if !diff.is_empty() {
+                card.diff_summary = Some(crate::git::diff_summary(&diff));
                 card.diff = Some(diff);
             }
             // The checkout is about to be torn down; drop the stale path.
@@ -816,6 +820,38 @@ mod tests {
             assert!(card.diff.as_deref().unwrap().contains("v2"));
             // Pending feedback is consumed now that the follow-up completed.
             assert!(card.followup_feedback.is_none());
+            assert_eq!(card.review_ack, card.reviews.len());
+        });
+    }
+
+    #[test]
+    fn failed_follow_up_keeps_feedback_for_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            let mut board = Board::new();
+            let id = board.add_card("fix it");
+            board.set_status(&id, CardStatus::Review);
+            board::save_board(&board, "default").unwrap();
+            board::add_review("default", &id, None, "please fix the failure").unwrap();
+            board::send_feedback_to_agent("default", &id).unwrap();
+
+            let queued = board::load_board("default").unwrap().unwrap();
+            let card = queued.card(&id).unwrap();
+            assert_eq!(card.review_ack, 0);
+            assert!(card.followup_feedback.is_some());
+
+            let mut failed = queued;
+            failed.set_status(&id, CardStatus::Running);
+            board::save_board(&failed, "default").unwrap();
+            let wt = git::card_worktree_dir("default", &id);
+            std::fs::create_dir_all(&wt).unwrap();
+            finalize("default", &id, &wt, true, Some("agent failed"));
+
+            let retry = board::load_board("default").unwrap().unwrap();
+            let card = retry.card(&id).unwrap();
+            assert_eq!(card.status, CardStatus::Failed);
+            assert_eq!(card.review_ack, 0);
+            assert!(card.followup_feedback.is_some());
         });
     }
 
