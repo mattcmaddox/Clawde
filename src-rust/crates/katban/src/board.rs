@@ -101,6 +101,10 @@ pub struct Card {
     /// patch text on every read.
     #[serde(default)]
     pub diff_summary: Option<DiffSummary>,
+    /// Why the last attempt failed, when the card is failed. Structured for
+    /// filtering and clear UI messaging; older boards deserialize as None.
+    #[serde(default)]
+    pub failure_kind: Option<FailureKind>,
     /// Option B — the pinned commit hash of this card's branch (`katban/<id>`
     /// in `branch`), written by the runner at finalize before the worktree is
     /// torn down. Review then decides merge-or-discard: `Some` means there is
@@ -151,6 +155,15 @@ pub struct DiffSummary {
     pub files_changed: usize,
     pub additions: usize,
     pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureKind {
+    Agent,
+    Verification,
+    Worktree,
+    Commit,
 }
 
 impl Card {
@@ -252,6 +265,7 @@ impl Board {
             result: None,
             diff: None,
             diff_summary: None,
+            failure_kind: None,
             commit: None,
             reviews: Vec::new(),
             followup_feedback: None,

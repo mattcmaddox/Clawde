@@ -28,7 +28,7 @@
 //!   finalization only fires if the card is *still* running: if the admin
 //!   moved it meanwhile, their edit wins.
 
-use crate::board::{self, BoardLock, CardStatus};
+use crate::board::{self, BoardLock, CardStatus, FailureKind};
 use crate::git;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -342,6 +342,7 @@ async fn run_one_card(
                 work_dir,
                 true,
                 Some("project repo is not a git repository"),
+                Some(FailureKind::Worktree),
             );
             return;
         }
@@ -352,6 +353,7 @@ async fn run_one_card(
                 work_dir,
                 true,
                 Some(&format!("could not create worktree: {e}")),
+                Some(FailureKind::Worktree),
             );
             return;
         }
@@ -359,6 +361,7 @@ async fn run_one_card(
 
     let outcome = executor.execute(work_dir, prompt);
     let mut failed = outcome.is_err();
+    let mut failure_kind = outcome.as_ref().err().map(|_| FailureKind::Agent);
     let mut note: Option<String> = outcome
         .as_ref()
         .err()
@@ -383,6 +386,7 @@ async fn run_one_card(
         let gate = crate::verify::run_gate(work_dir, verify_on).await;
         if !gate.passed {
             failed = true;
+            failure_kind = Some(FailureKind::Verification);
             note = Some(gate.detail.clone());
         } else if gate.skipped {
             let base = note.clone().unwrap_or_default();
@@ -419,7 +423,14 @@ async fn run_one_card(
         }
     }
 
-    finalize(project, &card_id, work_dir, failed, note.as_deref());
+    finalize(
+        project,
+        &card_id,
+        work_dir,
+        failed,
+        note.as_deref(),
+        failure_kind,
+    );
 }
 
 /// Persist a card's final state after its agent exits. Only transitions a card
@@ -427,7 +438,14 @@ async fn run_one_card(
 /// The card's worktree is ALWAYS removed afterwards (best-effort), on every
 /// path — an early return (card moved / lock held / card gone) must not leak
 /// the checkout and its git registration, or they accumulate forever.
-fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: Option<&str>) {
+fn finalize(
+    project: &str,
+    card_id: &str,
+    work_dir: &Path,
+    failed: bool,
+    note: Option<&str>,
+    failure_kind: Option<FailureKind>,
+) {
     {
         // The lock scope is separate so the cleanup below runs unconditionally.
         let _guard = BoardLock::acquire(project).ok();
@@ -445,6 +463,7 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
             let diff = crate::git::diff_clamped(work_dir);
             if failed {
                 card.retries += 1;
+                card.failure_kind = failure_kind;
                 card.status = CardStatus::Failed;
             } else {
                 // Option B — pin (or re-pin) the commit: commit the worktree to
@@ -476,8 +495,10 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
                                         project,
                                         card = %card.id,
                                         error = %e,
-                                        "could not pin card commit — diff-only review"
+                                        "could not pin card commit"
                                     );
+                                    card.failure_kind = Some(FailureKind::Commit);
+                                    card.status = CardStatus::Failed;
                                 }
                             }
                         }
@@ -492,6 +513,7 @@ fn finalize(project: &str, card_id: &str, work_dir: &Path, failed: bool, note: O
                     card.review_ack = card.reviews.len();
                     card.followup_feedback = None;
                 }
+                card.failure_kind = None;
                 card.status = CardStatus::Review;
             }
             card.result = Some(note);
@@ -621,7 +643,14 @@ mod tests {
                 board::save_board(&b, "default").unwrap();
                 let wt = git::card_worktree_dir("default", id);
                 std::fs::create_dir_all(&wt).unwrap();
-                finalize("default", id, &wt, true, Some("boom"));
+                finalize(
+                    "default",
+                    id,
+                    &wt,
+                    true,
+                    Some("boom"),
+                    Some(FailureKind::Agent),
+                );
             };
 
             // Attempt 1 fails -> retries=1, still within budget (1 <= cap 1).
@@ -629,6 +658,7 @@ mod tests {
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
             assert_eq!(card.status, CardStatus::Failed);
+            assert_eq!(card.failure_kind, Some(FailureKind::Agent));
             assert_eq!(card.retries, 1);
             assert_eq!(card.result.as_deref(), Some("boom"));
             assert!(b.ready_to_run(&a), "one retry left");
@@ -655,10 +685,11 @@ mod tests {
 
             let wt = git::card_worktree_dir("default", &a);
             std::fs::create_dir_all(&wt).unwrap();
-            finalize("default", &a, &wt, false, Some("all tests pass"));
+            finalize("default", &a, &wt, false, Some("all tests pass"), None);
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
             assert_eq!(card.status, CardStatus::Review);
+            assert_eq!(card.failure_kind, None);
             assert_eq!(card.result.as_deref(), Some("all tests pass"));
         });
     }
@@ -684,7 +715,14 @@ mod tests {
             let mut b = board::load_board("default").unwrap().unwrap();
             b.set_status(&a, CardStatus::Done);
             board::save_board(&b, "default").unwrap();
-            finalize("default", &a, &wt, true, Some("boom"));
+            finalize(
+                "default",
+                &a,
+                &wt,
+                true,
+                Some("boom"),
+                Some(FailureKind::Agent),
+            );
             assert!(
                 !wt.exists(),
                 "worktree must be cleaned up on the early return"
@@ -739,7 +777,7 @@ mod tests {
             git::create_worktree(repo.path(), &wt, None).unwrap();
             std::fs::write(wt.join("README.md"), "# demo\n\nfeature\n").unwrap();
 
-            finalize("default", &a, &wt, false, Some("done feature"));
+            finalize("default", &a, &wt, false, Some("done feature"), None);
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
             assert_eq!(card.status, CardStatus::Review);
@@ -776,7 +814,7 @@ mod tests {
             b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
                 Some(wt.to_string_lossy().into_owned());
             board::save_board(&b, "default").unwrap();
-            finalize("default", &a, &wt, false, Some("first run"));
+            finalize("default", &a, &wt, false, Some("first run"), None);
 
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
@@ -804,7 +842,7 @@ mod tests {
             b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
                 Some(wt.to_string_lossy().into_owned());
             board::save_board(&b, "default").unwrap();
-            finalize("default", &a, &wt, false, Some("second run"));
+            finalize("default", &a, &wt, false, Some("second run"), None);
 
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
@@ -845,7 +883,14 @@ mod tests {
             board::save_board(&failed, "default").unwrap();
             let wt = git::card_worktree_dir("default", &id);
             std::fs::create_dir_all(&wt).unwrap();
-            finalize("default", &id, &wt, true, Some("agent failed"));
+            finalize(
+                "default",
+                &id,
+                &wt,
+                true,
+                Some("agent failed"),
+                Some(FailureKind::Agent),
+            );
 
             let retry = board::load_board("default").unwrap().unwrap();
             let card = retry.card(&id).unwrap();
@@ -883,7 +928,7 @@ mod tests {
             b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
                 Some(wt.to_string_lossy().into_owned());
             board::save_board(&b, "default").unwrap();
-            finalize("default", &a, &wt, false, Some("first run"));
+            finalize("default", &a, &wt, false, Some("first run"), None);
             let run1_commit = board::load_board("default")
                 .unwrap()
                 .unwrap()
@@ -905,7 +950,7 @@ mod tests {
             b.cards.iter_mut().find(|c| c.id == a).unwrap().work_dir =
                 Some(wt.to_string_lossy().into_owned());
             board::save_board(&b, "default").unwrap();
-            finalize("default", &a, &wt, false, Some("second run"));
+            finalize("default", &a, &wt, false, Some("second run"), None);
 
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
@@ -1158,7 +1203,7 @@ mod tests {
             git::create_worktree(repo.path(), &wt, None).unwrap();
             std::fs::write(wt.join("README.md"), "# demo\n\nfeature\n").unwrap();
 
-            finalize("default", &a, &wt, false, Some("done feature"));
+            finalize("default", &a, &wt, false, Some("done feature"), None);
 
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
@@ -1190,7 +1235,14 @@ mod tests {
             std::fs::create_dir_all(&wt).unwrap();
             std::fs::write(wt.join("README.md"), "# demo\n\nfeature\n").unwrap();
 
-            finalize("default", &a, &wt, true, Some("boom"));
+            finalize(
+                "default",
+                &a,
+                &wt,
+                true,
+                Some("boom"),
+                Some(FailureKind::Agent),
+            );
             let b = board::load_board("default").unwrap().unwrap();
             let card = b.card(&a).unwrap();
             assert_eq!(card.status, CardStatus::Failed);
@@ -1212,7 +1264,14 @@ mod tests {
 
             let wt = git::card_worktree_dir("default", &a);
             std::fs::create_dir_all(&wt).unwrap();
-            finalize("default", &a, &wt, true, Some("boom"));
+            finalize(
+                "default",
+                &a,
+                &wt,
+                true,
+                Some("boom"),
+                Some(FailureKind::Agent),
+            );
             let b = board::load_board("default").unwrap().unwrap();
             assert_eq!(b.card(&a).unwrap().status, CardStatus::Done);
         });

@@ -198,6 +198,7 @@ struct CardApi {
     result: Option<String>,
     diff: Option<String>,
     diff_summary: Option<DiffSummary>,
+    failure_kind: Option<crate::board::FailureKind>,
     commit: Option<String>,
     reviews: Vec<ReviewCommentApi>,
     followup_feedback: Option<String>,
@@ -996,6 +997,7 @@ fn board_to_api(project: &str, board: &Board) -> BoardApi {
             result: card.result.clone(),
             diff: card.diff.clone(),
             diff_summary: card.diff_summary.clone(),
+            failure_kind: card.failure_kind,
             commit: card.commit.clone(),
             reviews: card.reviews.iter().map(review_to_api).collect(),
             followup_feedback: card.followup_feedback.clone(),
@@ -1198,6 +1200,8 @@ async function loadBoard(project) {
               (c.commit ? " · " + c.commit.slice(0,8) : "") + "</span>";
       if (c.blockedReason) html += '<div class="blocked">' + esc(c.blockedReason) + "</div>";
       if (c.result) html += '<div class="blocked" title="last result">' + esc(c.result) + "</div>";
+      if (c.status === "failed") html += '<div class="meta">failure: ' + esc(c.failureKind || "unknown") + '</div>';
+      if (c.diff && !c.commit) html += '<div class="meta">diff only — no mergeable commit</div>';
       const deps = (waitMap[c.id] || []);
       if (deps.length) {
         html += '<div class="deps">waits for: ' +

@@ -1308,6 +1308,11 @@ fn card_show(project: &str, args: &[String]) -> anyhow::Result<()> {
     if let Some(commit) = &card.commit {
         let short = commit.get(..commit.len().min(12)).unwrap_or(commit);
         println!("commit:   {short}");
+    } else if card.diff.is_some() {
+        println!("merge:    unavailable (diff-only review; no pinned commit)");
+    }
+    if let Some(kind) = card.failure_kind {
+        println!("failure:  {}", failure_kind_name(kind));
     }
     if let Some(result) = &card.result {
         println!("result:");
@@ -1337,6 +1342,15 @@ fn card_show(project: &str, args: &[String]) -> anyhow::Result<()> {
         println!("{fb}");
     }
     Ok(())
+}
+
+fn failure_kind_name(kind: clawde_katban::board::FailureKind) -> &'static str {
+    match kind {
+        clawde_katban::board::FailureKind::Agent => "agent",
+        clawde_katban::board::FailureKind::Verification => "verification",
+        clawde_katban::board::FailureKind::Worktree => "worktree",
+        clawde_katban::board::FailureKind::Commit => "commit",
+    }
 }
 
 fn status_name(status: clawde_katban::board::CardStatus) -> &'static str {
