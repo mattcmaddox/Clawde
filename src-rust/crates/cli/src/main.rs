@@ -3584,22 +3584,24 @@ async fn run_interactive(
     // ---- Ollama loaded-models poller ----
     // Periodically queries `/api/ps` to know whether Ollama has a model
     // loaded in VRAM. The result drives the footer badge color/icon.
+    // Re-reads the persisted settings each cycle so `/settings` host edits
+    // and `/ollama` mode changes take effect without a restart.
     let (ollama_loaded_tx, mut ollama_loaded_rx) =
         tokio::sync::mpsc::unbounded_channel::<Vec<clawde_core::OllamaLoadedModel>>();
-    {
-        let config = app.config.clone();
-        tokio::spawn(async move {
-            let poll_interval = std::time::Duration::from_secs(5);
-            loop {
-                tokio::time::sleep(poll_interval).await;
-                let models = match clawde_core::ollama_status_for_config(&config).await {
-                    Ok(status) => status.models,
-                    Err(_) => Vec::new(),
-                };
-                let _ = ollama_loaded_tx.send(models);
-            }
-        });
-    }
+    tokio::spawn(async move {
+        let poll_interval = std::time::Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(poll_interval).await;
+            let config = Settings::load_sync()
+                .map(|settings| settings.effective_config())
+                .unwrap_or_default();
+            let models = match clawde_core::ollama_status_for_config(&config).await {
+                Ok(status) => status.models,
+                Err(_) => Vec::new(),
+            };
+            let _ = ollama_loaded_tx.send(models);
+        }
+    });
 
     // Wire the ask-user question channel into the app so the TUI can show
     // the dialog and return an answer to the query loop.

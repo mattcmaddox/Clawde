@@ -114,14 +114,19 @@ non-loopback remote endpoint. Clawde fails closed rather than using
 `http://localhost:11434`, so it cannot silently run inference on the local CPU.
 The nested `config.provider_configs` value wins when both locations are set.
 
-Normal `ollama:auto` mode keeps tools and web search available. Isolated
-`ollama:offline` mode removes network-capable tools and rejects them at dispatch,
-even under bypass permissions, while still allowing inference through the
-configured Ollama endpoint. Isolated mode also removes shell, interpreter,
-sub-agent, LSP, MCP-resource, test/lint, formatter, and other indirect process
-capabilities from the active tool set. A separate OS/container firewall is still
-recommended for defense in depth. The mode is process-wide, so do not run
-conflicting isolated and normal sessions in the same process.
+Ollama never participates in free-model / auto routing; it is always an
+explicit-selection provider for local/LAN models. The connectivity mode
+controls tool access only:
+
+- `online` (default) — Ollama keeps tools and web search available.
+- `isolated` — network-capable tools are removed and rejected at dispatch,
+  even under bypass permissions, while inference continues through the
+  configured Ollama endpoint. Isolated mode also removes shell, interpreter,
+  sub-agent, LSP, MCP-resource, test/lint, formatter, and other indirect
+  process capabilities from the active tool set. A separate OS/container
+  firewall is still recommended for defense in depth. The mode is
+  process-wide, so do not run conflicting isolated and online sessions in
+  the same process.
 
 ```json
 {

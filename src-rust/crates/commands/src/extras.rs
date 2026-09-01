@@ -332,14 +332,13 @@ impl SlashCommand for OllamaModeCommand {
         "ollama"
     }
     fn description(&self) -> &str {
-        "Toggle Ollama connectivity mode (auto / isolated)"
+        "Toggle Ollama connectivity mode (online / isolated)"
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
             ArgCompletion {
-                value: "auto".into(),
-                description: "Ollama participates in free-model fallback, network tools allowed"
-                    .into(),
+                value: "online".into(),
+                description: "Ollama explicit-only mode; network tools allowed".into(),
                 available: true,
             },
             ArgCompletion {
@@ -391,7 +390,7 @@ impl SlashCommand for OllamaModeCommand {
 
         CommandResult::Message(
             "Ollama mode is toggled in the TUI. Use /ollama without arguments \
-             or press Alt+O to switch between auto and isolated mode.\n\
+             or press Alt+O to switch between online and isolated mode.\n\
              Use /ollama status to see loaded models and reported VRAM."
                 .to_string(),
         )

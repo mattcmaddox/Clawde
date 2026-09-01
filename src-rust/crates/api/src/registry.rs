@@ -278,45 +278,6 @@ pub fn build_free_provider(config: &clawde_core::config::Config) -> Option<Arc<d
         .collect();
     crate::providers::free::store_free_model_lists(model_lists);
 
-    // When Ollama is in Auto mode, append it to the free-model fallback
-    // chain as a local last-resort provider. No API key needed — it uses
-    // the already-built Ollama provider from the registry. In Isolated
-    // mode Ollama stays out of the free chain entirely.
-    //
-    // Only when the chain already has at least one configured upstream:
-    // with zero free keys the chain would otherwise be just [ollama], which
-    // errors `Model not found` on every turn instead of the clearer
-    // "no free upstreams configured" (build_free_provider returns None and
-    // the caller surfaces the no-key message).
-    if !chain.is_empty()
-        && config.resolve_ollama_mode() == clawde_core::OllamaMode::Auto
-        && resolve_provider_api_base(config, "ollama").is_some()
-    {
-        let mut ollama_provider = crate::providers::ollama();
-        if let Some(base) = resolve_provider_api_base(config, "ollama") {
-            ollama_provider = ollama_provider.with_base_url(base);
-        }
-        chain.push(FreeEntry {
-            upstream: crate::providers::FreeUpstream {
-                id: "ollama",
-                title: "Ollama",
-                key_url: "ollama.com",
-                default_model: "llama3.2",
-                note: "local fallback — no key needed",
-                tool_calling: true,
-                vision: false,
-                max_tokens_cap: Some(4_096),
-                context_window: 8_192,
-                fallback_models: &[],
-                model_family: "llama3.2",
-                specialty: "local",
-                usage: "local · 4K",
-            },
-            provider: Arc::new(ollama_provider),
-            effective_model: Some("llama3.2".to_string()),
-        });
-    }
-
     if chain.is_empty() {
         return None;
     }
@@ -1403,9 +1364,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        // Ollama mode defaults to Auto and would be appended to the chain as
-        // a local fallback (masking mistral's transport error with its own
-        // ModelNotFound). Isolated keeps the chain to exactly mistral.
+        // Ollama is never appended to the free chain (explicit-selection
+        // only). This option is set purely for clarity in the test fixture.
         let mut ollama_options = std::collections::HashMap::new();
         ollama_options.insert("mode".to_string(), serde_json::json!("isolated"));
         provider_configs.insert(

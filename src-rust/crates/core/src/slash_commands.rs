@@ -106,7 +106,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "upgrade", description: "Check for updates and upgrade to the latest version", category: "Commands", tui_only: false },
     PromptCommand { name: "vim", description: "Toggle vim keybindings", category: "Commands", tui_only: false },
     PromptCommand { name: "voice", description: "Toggle voice input mode", category: "Model & Provider", tui_only: false },
-    PromptCommand { name: "ollama", description: "Toggle Ollama connectivity mode (auto / isolated)", category: "Model & Provider", tui_only: false },
+    PromptCommand { name: "ollama", description: "Toggle Ollama connectivity mode (online / isolated)", category: "Model & Provider", tui_only: false },
     // Keep every visible executable command discoverable. This block is
     // intentionally explicit so adding a command without adding prompt
     // metadata fails the commands-crate registry audit.

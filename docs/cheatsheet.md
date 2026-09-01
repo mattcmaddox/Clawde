@@ -46,7 +46,7 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 | `/keys` | Add / manage API keys |
 | `/effort` | Set effort level: low / medium / high / max |
 | `/fast` | Toggle fast mode |
-| `/ollama` | Toggle local Ollama mode |
+| `/ollama` | Toggle Ollama connectivity mode (online / isolated) |
 
 ## Code & git
 

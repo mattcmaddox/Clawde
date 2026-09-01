@@ -1022,15 +1022,14 @@ pub mod config {
 
     // ---- OllamaMode -------------------------------------------------------
 
-    /// Controls whether Ollama participates in the free-models fallback chain
-    /// (Auto) or runs standalone with manual selection only (Isolated).
+    /// Controls whether Ollama runs with full network tool access (Online) or
+    /// with network-capable tools blocked for local/LAN privacy (Isolated).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
     #[serde(rename_all = "snake_case")]
     pub enum OllamaMode {
-        /// Ollama is assumed always online and participates in free-models
-        /// fallback routing alongside cloud providers.
+        /// Ollama is explicitly selected and may use network-capable tools.
         #[default]
-        Auto,
+        Online,
         /// Ollama runs in isolation — only reachable via explicit
         /// `--provider ollama`, never automatically selected in free-mode.
         /// When isolated, network-capable tools (WebSearch, WebFetch) are
@@ -2477,10 +2476,9 @@ pub mod config {
     impl Config {
         /// Resolve the Ollama connectivity mode from settings.
         ///
-        /// Reads `providers.ollama.options.mode` — `"auto"` (the default)
-        /// or `"isolated"`. In "auto" mode Ollama participates in the
-        /// free-models fallback chain; in "isolated" mode it only responds
-        /// to explicit `--provider ollama` selection.
+        /// Reads `providers.ollama.options.mode` — `"online"` (the default)
+        /// or `"isolated"`. Ollama is never part of free-model routing and
+        /// always requires explicit provider selection.
         pub fn resolve_ollama_mode(&self) -> OllamaMode {
             self.provider_configs
                 .get("ollama")

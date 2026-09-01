@@ -662,15 +662,19 @@ are rejected. The old `require_explicit_host` option is retained for settings
 compatibility but is no longer needed: remote-only fail-closed behavior is now
 the default.
 
-**Tools and offline mode:**
+**Tools and connectivity modes:**
 
-Normal Ollama mode (`ollama:auto`) keeps Clawde's tools enabled, including
-`WebSearch` and `WebFetch`. Toggle `/ollama` to `ollama:offline` / isolated mode
-when the model must not use online tools. In isolated mode Clawde removes
-network-capable tools (web search/fetch, remote triggers, MCP tools) and blocks
-them again at dispatch, including with `--dangerously-skip-permissions`.
-Ollama inference itself remains available through the configured remote GPU
-endpoint. Isolated mode also removes shell/interpreter execution, sub-agents,
+Ollama never participates in free-model / auto routing; it is always an
+explicit-selection provider for local/LAN models. Connectivity modes control
+tool access only:
+
+- `online` (default) keeps Clawde's tools enabled, including `WebSearch` and
+  `WebFetch`.
+- `isolated` removes network-capable tools (web search/fetch, remote triggers,
+  MCP tools) and blocks them at dispatch, including with
+  `--dangerously-skip-permissions`. Toggle via `/ollama` to `ollama:isolated`.
+Ollama inference itself remains available through the configured endpoint in
+both modes. Isolated mode also removes shell/interpreter execution, sub-agents,
 LSP/MCP resources, test/lint commands, and configured formatter subprocesses;
 use an OS/container firewall as defense in depth for a strict air gap.
 
