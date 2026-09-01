@@ -2766,13 +2766,9 @@ pub mod config {
                             .map(str::to_owned)
                     });
                 let allow_local_host = provider_cfg
-                    .and_then(|provider| provider.options.get("mode"))
-                    .and_then(|value| serde_json::from_value::<OllamaMode>(value.clone()).ok())
-                    == Some(OllamaMode::Isolated)
-                    && provider_cfg
-                        .and_then(|provider| provider.options.get("allow_local_host"))
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
+                    .and_then(|provider| provider.options.get("allow_local_host"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 return candidate.and_then(|base| {
                     normalize_ollama_host_with_local(&substitute_env_vars(&base), allow_local_host)
                 });
