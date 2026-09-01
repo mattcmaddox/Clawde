@@ -4608,11 +4608,11 @@ impl App {
             "ollama" => {
                 use clawde_core::OllamaMode;
                 let next = match self.ollama_mode {
-                    OllamaMode::Auto => OllamaMode::Isolated,
-                    OllamaMode::Isolated => OllamaMode::Auto,
+                    OllamaMode::Online => OllamaMode::Isolated,
+                    OllamaMode::Isolated => OllamaMode::Online,
                 };
                 let mode_val = match next {
-                    OllamaMode::Auto => "auto",
+                    OllamaMode::Online => "online",
                     OllamaMode::Isolated => "isolated",
                 };
                 // Update the live session config before persisting. The CLI
@@ -4650,7 +4650,7 @@ impl App {
                 // Sync the network-block flag so tools are denied immediately.
                 clawde_core::set_ollama_network_blocked(next == OllamaMode::Isolated);
                 let label = match next {
-                    OllamaMode::Auto => "auto (network allowed)",
+                    OllamaMode::Online => "online (network allowed)",
                     OllamaMode::Isolated => "isolated (network blocked)",
                 };
                 self.status_message = Some(format!("Ollama mode: {}.", label));
@@ -14748,7 +14748,7 @@ mod tests {
         let mut app = make_app();
         assert_eq!(
             app.config.resolve_ollama_mode(),
-            clawde_core::OllamaMode::Auto
+            clawde_core::OllamaMode::Online
         );
         assert!(app.intercept_slash_command("ollama"));
         assert_eq!(
@@ -14758,7 +14758,7 @@ mod tests {
         assert!(app.intercept_slash_command("ollama"));
         assert_eq!(
             app.config.resolve_ollama_mode(),
-            clawde_core::OllamaMode::Auto
+            clawde_core::OllamaMode::Online
         );
         clawde_core::set_ollama_network_blocked(was_blocked);
     }
