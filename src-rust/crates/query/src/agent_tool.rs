@@ -1360,6 +1360,8 @@ impl Tool for AgentTool {
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             task_context: None,
+            state_events: Vec::new(),
+            state_snapshot: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             output_style_name: ctx.config.output_style.clone(),
@@ -1399,6 +1401,9 @@ impl Tool for AgentTool {
             semantic_verify_runner: None,
             semantic_fix_runner: None,
             prompt_guard_enabled: false,
+            // Sub-agent loop: shares the parent session id but must neither
+            // write events into the parent's transcript nor replay them.
+            session_state_owner: false,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

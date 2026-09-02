@@ -253,11 +253,7 @@ fn score_group(
             score = (score + 45).min(MAX_SCORE);
         }
     }
-    if group
-        .messages
-        .iter()
-        .any(|message| message_has_error(message))
-    {
+    if group.messages.iter().any(message_has_error) {
         score = (score + 180).min(MAX_SCORE);
     }
     score

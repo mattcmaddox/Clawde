@@ -34,6 +34,7 @@ pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
+pub(crate) mod state_emission;
 pub mod task_state;
 pub(crate) mod tool_exec;
 pub mod tool_use_tracker;
@@ -81,7 +82,10 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
-pub use task_state::{ComplexityLedger, FocusState, TaskDecision, TaskFailure, TaskState};
+pub use task_state::{
+    ComplexityLedger, EvidenceItem, EvidenceSource, EvidenceStatus, FocusState, TaskDecision,
+    TaskFailure, TaskState, UserTurnRelation, ValidationVerdict,
+};
 pub use verify::{CheckResult, VerifyPolicy, VerifyReport, VerifyVerdict};
 
 use clawde_api::{
@@ -253,6 +257,33 @@ pub struct QueryConfig {
     /// the run before any model call if a user TEXT message carries a known
     /// instruction-override phrase. Default off; enabled via `--guard-prompt`.
     pub prompt_guard_enabled: bool,
+    /// Event-persistence Phase 3: runtime state events persisted in the
+    /// session transcript, replayed into `TaskState` at loop start. Callers
+    /// (resume paths) load them via
+    /// `clawde_core::session_storage::state_events_from_transcript`; empty
+    /// means the session has no persisted events and behavior is identical
+    /// to pre-event builds.
+    ///
+    /// When [`Self::state_snapshot`] is set, this list carries only the
+    /// events written AFTER the snapshot (the incremental tail) and the loop
+    /// folds them on top of the snapshot body instead of replaying the full
+    /// event history.
+    pub state_events: Vec<clawde_core::session_storage::StateEvent>,
+    /// Snapshot-based incremental replay: a persisted `state-snapshot` entry
+    /// (plus its tail events in [`Self::state_events`]) for the headless
+    /// `--resume` path, which cannot use the interactive auto-load. `None`
+    /// means resume replays the full event list — identical to pre-snapshot
+    /// builds.
+    pub state_snapshot: Option<clawde_core::session_storage::StateSnapshot>,
+    /// When true, this query loop OWNS the session's transcript state: it may
+    /// auto-load persisted state events at loop start (so interactive prompts
+    /// rebuild verified evidence / counters / plan step from the previous
+    /// prompt's run) and it emits new events as it runs. Set false for nested
+    /// loops (sub-agents, cron jobs) that share the parent session id — they
+    /// must neither pollute the parent's event stream nor replay the parent's
+    /// facts into their own state. Default false; the top-level CLI loops
+    /// enable it.
+    pub session_state_owner: bool,
 }
 
 impl Default for QueryConfig {
@@ -297,6 +328,9 @@ impl Default for QueryConfig {
             semantic_verify_runner: None,
             semantic_fix_runner: None,
             prompt_guard_enabled: false,
+            state_events: Vec::new(),
+            state_snapshot: None,
+            session_state_owner: false,
         }
     }
 }
@@ -1503,7 +1537,88 @@ pub async fn run_query_loop(
     let mut active_task_id = accepted_task_id_from_messages(messages);
     // Loop-local authoritative projection. Unlike transcript-derived context,
     // this survives synthetic messages, compaction, and continuation rounds.
-    let mut task_state = TaskState::from_messages(messages);
+    // Persisted state events (Phase 3) are replayed on top so verified
+    // evidence, counters, decisions, and the plan step survive a restart.
+    // Event-persistence Phase 3 replay: when the loop owns the session and no
+    // explicit events were passed, auto-load what this session already
+    // persisted (the previous prompt's run in interactive mode, or any prior
+    // process's run) so verified evidence, counters, the plan step, and the
+    // simplification flag carry across loop boundaries — not just across
+    // `--resume`. Empty transcript / absent file degrades to the pre-event
+    // `from_messages` path. Sub-agent loops (`session_state_owner` false) skip
+    // this so they never inherit the parent's facts.
+    //
+    // Snapshot-based incremental replay: when the session crossed the snapshot
+    // cadence, the load returns the newest valid state snapshot plus only the
+    // events written after it; replay then folds the snapshot body instead of
+    // the whole event history. No usable snapshot → the full event load (the
+    // pre-snapshot behavior). `initial_event_count` seeds the emitter's
+    // session-global event counter so the snapshot cadence accumulates across
+    // runs; `snapshot_watermark` is the fold base for the next write.
+    //
+    // Four init routes, checked in order:
+    // 1. `config.state_snapshot` set (headless `--resume`): the caller
+    //    already loaded the snapshot + tail, so fold them directly.
+    // 2. session owner, no explicit events (interactive per prompt):
+    //    auto-load snapshot-aware, falling back to the full event load.
+    // 3. no explicit events: pre-event `from_messages` path.
+    // 4. explicit full event list: plain `replay`.
+    let mut initial_event_count: u64 = 0;
+    let mut snapshot_watermark: u64 = 0;
+    let mut task_state = if let Some(snapshot) = config.state_snapshot.as_ref() {
+        // Explicit snapshot path (headless `--resume`): the caller loaded the
+        // persisted snapshot and supplies only the events after it. Must be
+        // checked BEFORE the empty-state_events branches — a fully folded
+        // session has an empty tail.
+        snapshot_watermark = snapshot.event_count;
+        initial_event_count = snapshot.event_count + config.state_events.len() as u64;
+        TaskState::replay_with_snapshot(messages, snapshot, &config.state_events)
+    } else if config.state_events.is_empty() && config.session_state_owner {
+        let loaded = state_emission::load_session_state_snapshot(
+            &tool_ctx.working_dir,
+            &tool_ctx.session_id,
+        )
+        .await;
+        match loaded {
+            Some((snapshot, tail_events)) => {
+                snapshot_watermark = snapshot.event_count;
+                initial_event_count = snapshot.event_count + tail_events.len() as u64;
+                TaskState::replay_with_snapshot(messages, &snapshot, &tail_events)
+            }
+            None => {
+                let persisted = state_emission::load_session_state_events(
+                    &tool_ctx.working_dir,
+                    &tool_ctx.session_id,
+                )
+                .await;
+                initial_event_count = persisted.len() as u64;
+                if persisted.is_empty() {
+                    TaskState::from_messages(messages)
+                } else {
+                    TaskState::replay(messages, &persisted)
+                }
+            }
+        }
+    } else if config.state_events.is_empty() {
+        TaskState::from_messages(messages)
+    } else {
+        initial_event_count = config.state_events.len() as u64;
+        TaskState::replay(messages, &config.state_events)
+    };
+    // Event-persistence Phase 2: best-effort emitter mirroring task-state
+    // updates into the session's JSONL transcript as `state-event` entries so
+    // Phase 3 replay can reconstruct runtime evidence on resume. Only the
+    // session-owning loop emits; sub-agents share the parent session id and
+    // must not write their tool observations into the parent's stream.
+    let mut state_emitter = if config.session_state_owner {
+        state_emission::StateEventEmitter::new(
+            &tool_ctx.working_dir,
+            &tool_ctx.session_id,
+            initial_event_count,
+        )
+    } else {
+        state_emission::StateEventEmitter::disabled()
+    };
 
     // Opt-in prompt-injection guard (decide.rs): block before any model call
     // when a user TEXT message carries an instruction-override phrase.
@@ -1549,6 +1664,13 @@ pub async fn run_query_loop(
     // NO_PROGRESS_STOP_STREAK so a stuck model cannot burn turns to the cap.
     let mut recent_no_progress: std::collections::VecDeque<String> =
         std::collections::VecDeque::new();
+    // Bounded simplification review (complexity budget): fires at most once
+    // per run, after a passing validation round when enough files were touched
+    // to plausibly warrant a consolidation pass. Seed from the replayed state
+    // so the one-shot review stays one-shot across prompts / resumes (Phase 3
+    // persists the flag as a SimplificationReviewed event); a fresh loop would
+    // otherwise re-suggest consolidation after every restart.
+    let mut simplification_reviewed = task_state.simplification_reviewed;
     let mut no_progress_streak: u32 = 0;
     // Per-turn tool-health accumulator (tool_exec.rs, refactor-loop-health
     // Phase A): error counts, deterministic-check flags, and no-progress
@@ -1969,20 +2091,97 @@ pub async fn run_query_loop(
                         .map(|patch| patch.files.clone())
                         .unwrap_or_default(),
                 );
+                // Provenance fix: the earlier `set_runtime_evidence` call above
+                // could only carry a headline string, which records as observed
+                // and can never verify. Promote a deterministic PASS verdict to
+                // Verified evidence here; Fail/Escalate/absent stay unverified.
+                if let Some(report) = verify_report.as_ref() {
+                    match report.verdict {
+                        crate::verify::VerifyVerdict::Pass if !report.unavailable => {
+                            task_state.record_validation(
+                                crate::task_state::ValidationVerdict::Passed,
+                                report.headline.clone(),
+                            );
+                            state_emitter
+                                .record_validation(
+                                    clawde_core::session_storage::StateValidationVerdict::Passed,
+                                    report.headline.clone(),
+                                )
+                                .await;
+                            // Bounded simplification review (one pass per run):
+                            // after validation passes, prompt a single
+                            // consolidation question once the run has touched
+                            // enough files to plausibly need it. Recommendation
+                            // only — never authorizes undo or auto-refactor.
+                            if !simplification_reviewed
+                                && task_state.complexity.files_touched >= 3
+                            {
+                                simplification_reviewed = true;
+                                state_emitter.record_simplification_reviewed().await;
+                                task_state.next_action = Some(
+                                    "Validation passed. Before wrapping up, check whether every changed file is necessary and whether an existing abstraction could be reused instead of a new one — apply only clearly safe simplifications, then re-validate.".to_string(),
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(
+                                        "[simplification review suggested: consolidate changed files before wrapping up]".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        crate::verify::VerifyVerdict::Fixable | crate::verify::VerifyVerdict::Escalate => {
+                            task_state.record_validation(
+                                crate::task_state::ValidationVerdict::Failed,
+                                report.headline.clone(),
+                            );
+                            state_emitter
+                                .record_validation(
+                                    clawde_core::session_storage::StateValidationVerdict::Failed,
+                                    report.headline.clone(),
+                                )
+                                .await;
+                        }
+                        _ => {}
+                    }
+                }
                 // The persistent projection is updated for diagnostics and the
                 // next request; this turn's system prompt was already built
                 // before validation completed.
                 // Keep the latest runtime evidence in the loop-local projection;
                 // the next iteration renders this updated state into its prompt.
+                let patch_files: Vec<std::path::PathBuf> = $assistant_msg
+                    .snapshot_patch
+                    .as_ref()
+                    .map(|patch| patch.files.clone())
+                    .unwrap_or_default();
                 task_state.set_runtime_evidence(
                     task_state.runtime.plan_step.clone(),
                     verify_report.as_ref().map(|report| report.headline.clone()),
-                    $assistant_msg
-                        .snapshot_patch
-                        .as_ref()
-                        .map(|patch| patch.files.clone())
-                        .unwrap_or_default(),
+                    patch_files.clone(),
                 );
+                state_emitter.record_snapshot_files(patch_files).await;
+                state_emitter
+                    .record_plan_step(task_state.runtime.plan_step.clone())
+                    .await;
+                // Snapshot-based incremental replay: when this session has
+                // accumulated another cadence of state events since the newest
+                // snapshot, persist the projected task state at the current
+                // watermark so future loops (and the loop's own next prompt)
+                // replay only the increment. Cache-only — the loader discards
+                // it on any doubt (schema, watermark, leaf) and falls back to
+                // the full event fold.
+                let total_events = state_emitter.total_events();
+                if total_events > snapshot_watermark
+                    && total_events >= snapshot_watermark + state_emission::STATE_SNAPSHOT_INTERVAL
+                {
+                    let snapshot = clawde_core::session_storage::StateSnapshot {
+                        schema_version: clawde_core::session_storage::
+                            STATE_SNAPSHOT_SCHEMA_VERSION,
+                        event_count: total_events,
+                        body: state_emission::build_state_snapshot_body(&task_state),
+                    };
+                    state_emitter.record_state_snapshot(snapshot).await;
+                    snapshot_watermark = total_events;
+                }
 
                 let plan_advance_evidence = clawde_core::PlanAdvanceEvidence {
                     turn_made_writes: wrote_files,
@@ -2300,14 +2499,26 @@ pub async fn run_query_loop(
         // and the compact summary stay clean.
         let instruction_pin = build_instruction_pin(messages);
         // Keep a compact, deterministic task snapshot separate from the
-        // transcript. It is rebuilt every turn so the model retains focus
-        // after compaction without persisting synthetic prompt text.
-        task_state.apply_messages(messages);
+        // transcript. Rebuilt idempotently every turn (runtime evidence
+        // preserved) so the model retains focus after compaction without
+        // persisting synthetic prompt text or double-counting activity.
+        task_state.refresh_from_messages(messages);
+        // Decision persistence (dead-variant fix): when the newest user turn
+        // was a redirect (correction / related subtask / objective replace),
+        // record it as a durable `DecisionRecorded` event so the redirect
+        // survives compaction on resume. Deduped against decisions the replay
+        // already carries, so it emits exactly once per redirect.
+        if let Some(statement) = task_state.catch_up_decisions() {
+            state_emitter.record_decision(statement).await;
+        }
         if let Some(plan_context) = active_plan_context(
             &tool_ctx.working_dir,
             &tool_ctx.session_id,
             active_task_id.as_deref(),
         ) {
+            state_emitter
+                .record_plan_step(Some(plan_context.clone()))
+                .await;
             task_state.set_runtime_evidence(Some(plan_context), None, Vec::new());
         }
         let task_context = task_state.render();
@@ -3667,6 +3878,10 @@ pub async fn run_query_loop(
                     overflow_retries = 0;
 
                     messages.push(assistant_msg.clone());
+                    // Branch anchor for state-event replay: tool/validation
+                    // emissions of this turn carry this message's index, the
+                    // exact coordinate a rewind cuts against.
+                    state_emitter.set_message_index((messages.len() - 1) as u32);
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks
@@ -3751,6 +3966,15 @@ pub async fn run_query_loop(
                             turn_meta: None,
                         };
                         task_state.apply_message(&tool_result_message);
+                        state_emitter
+                            .record_tool_events(state_emission::tool_observed_events(
+                                &tool_use_blocks_back,
+                                match &tool_result_message.content {
+                                    clawde_core::types::MessageContent::Blocks(blocks) => blocks,
+                                    _ => &[],
+                                },
+                            ))
+                            .await;
                         messages.push(tool_result_message);
 
                         // D4/D5 shared within-turn post-steps (real auto-lint
@@ -4080,6 +4304,8 @@ pub async fn run_query_loop(
 
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
+        // Branch anchor for state-event replay (see the tool-use path).
+        state_emitter.set_message_index((messages.len() - 1) as u32);
 
         // If the provider returned an unknown stop reason but the assistant
         // message contains tool_use blocks, treat it as tool_use so we don't
@@ -4720,6 +4946,19 @@ pub async fn run_query_loop(
                     // valid (every tool_use is answered) even on cancellation.
                     let tool_result_message = Message::user_blocks(result_blocks);
                     task_state.apply_message(&tool_result_message);
+                    {
+                        let result_blocks_ref: &[ContentBlock] = match &tool_result_message.content
+                        {
+                            clawde_core::types::MessageContent::Blocks(blocks) => blocks,
+                            _ => &[],
+                        };
+                        state_emitter
+                            .record_tool_events(state_emission::tool_observed_events(
+                                &tool_calls,
+                                result_blocks_ref,
+                            ))
+                            .await;
+                    }
                     messages.push(tool_result_message);
 
                     // If the batch was abandoned due to cancellation, stop the loop
@@ -5161,6 +5400,8 @@ mod tests {
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             task_context: None,
+            state_events: Vec::new(),
+            state_snapshot: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             output_style_name: None,
@@ -5194,6 +5435,7 @@ mod tests {
             semantic_verify_runner: None,
             semantic_fix_runner: None,
             prompt_guard_enabled: false,
+            session_state_owner: false,
         }
     }
 

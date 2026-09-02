@@ -529,6 +529,8 @@ pub use compare::*;
 mod katban;
 mod new_move;
 pub use new_move::*;
+mod state_cmd;
+pub use state_cmd::StateCommand;
 
 // ---------------------------------------------------------------------------
 // Built-in commands
@@ -2243,6 +2245,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ResumeCommand),
         Box::new(ReloadPluginsCommand),
         Box::new(StatusCommand),
+        Box::new(StateCommand),
         Box::new(DiffCommand),
         Box::new(MemoryCommand),
         Box::new(UsageCommand),

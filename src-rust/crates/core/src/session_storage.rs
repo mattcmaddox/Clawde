@@ -71,6 +71,23 @@ pub enum TranscriptEntry {
     /// (identical linear behavior) — see [`active_branch_messages`].
     #[serde(rename = "leaf")]
     Leaf(LeafEntry),
+    /// A runtime agent-state observation (evidence, decisions, validation,
+    /// complexity signals). Append-only; consumed by task-state replay on
+    /// resume. Sessions written before this variant existed contain none,
+    /// and resume identically.
+    #[serde(rename = "state-event")]
+    StateEvent(StateEventEntry),
+    /// A compacted task-state projection at an event watermark (incremental
+    /// replay). Cache-only: validated on read and discarded on any doubt.
+    /// Sessions written before this variant existed contain none, and resume
+    /// identically via the full event replay.
+    #[serde(rename = "state-snapshot")]
+    StateSnapshot(StateSnapshotEntry),
+    /// Marks a rewind point for state-event branch anchoring. Append-only;
+    /// the LAST cut before an event decides its branch membership. Sessions
+    /// written before this variant existed contain none.
+    #[serde(rename = "state-cut")]
+    StateCut(StateCutEntry),
     /// Any other entry type we do not need to inspect — round-tripped verbatim.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -92,6 +109,22 @@ impl TranscriptEntry {
     /// (i.e. contributes to the conversation chain).
     pub fn is_chain_participant(&self) -> bool {
         matches!(self, Self::User(_) | Self::Assistant(_))
+    }
+
+    /// Returns the state event payload if this is a `state-event` entry.
+    pub fn state_event(&self) -> Option<&StateEvent> {
+        match self {
+            Self::StateEvent(entry) => Some(&entry.event),
+            _ => None,
+        }
+    }
+
+    /// Returns the snapshot payload if this is a `state-snapshot` entry.
+    pub fn state_snapshot(&self) -> Option<&StateSnapshot> {
+        match self {
+            Self::StateSnapshot(entry) => Some(&entry.snapshot),
+            _ => None,
+        }
     }
 }
 
@@ -165,6 +198,193 @@ fn default_user_type() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// StateEvent — runtime agent-state events for task-state replay.
+//
+// The transcript stores messages; these events store the OBSERVED runtime
+// facts that a transcript-derived rebuild cannot recover (verified checks,
+// decisions, complexity signals, focus transitions). Events are append-only
+// metadata: a session with zero state events must resume identically to one
+// loaded before this schema existed.
+// ---------------------------------------------------------------------------
+
+/// Verdict carried by a validation event. Mirrors the query crate's
+/// `ValidationVerdict` (core cannot depend on query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateValidationVerdict {
+    Passed,
+    Failed,
+    Unknown,
+}
+
+/// A single runtime observation about agent task state. Serde-tagged with
+/// `snake_case` variant names; unknown future variants round-trip as
+/// [`TranscriptEntry::Unknown`] at the entry level.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateEvent {
+    /// A tool result was observed. Failed results feed retry-loop detection.
+    ToolObserved {
+        failed: bool,
+        /// Bounded summary of the failure (empty on success).
+        #[serde(default)]
+        summary: String,
+        /// File paths referenced by the tool call, when the tool exposed one.
+        #[serde(default)]
+        file_paths: Vec<String>,
+        /// Whether the tool mutates files (drives changed-file tracking).
+        #[serde(default)]
+        mutating: bool,
+    },
+    /// A validation round completed. Only `Passed` may produce Verified
+    /// evidence on replay — the claim/proof boundary is preserved here.
+    ValidationRecorded {
+        verdict: StateValidationVerdict,
+        headline: String,
+    },
+    /// A snapshot observed files changed on disk.
+    SnapshotObserved { files: Vec<String> },
+    /// An explicit user decision was recorded.
+    DecisionRecorded {
+        statement: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+    },
+    /// The focus state changed (blocked/suspended/etc.) with the reason.
+    FocusChanged {
+        /// New focus as the query crate's `FocusState::as_str()`.
+        focus: String,
+        reason: String,
+    },
+    /// The active plan step was set (from the approved-plan harness).
+    PlanStepSet { step: String },
+    /// The one-shot simplification review fired for this run.
+    SimplificationReviewed,
+}
+
+/// Metadata-only entry payload carrying one [`StateEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateEventEntry {
+    pub session_id: String,
+    /// ISO-8601 timestamp when the event was observed.
+    pub timestamp: String,
+    pub event: StateEvent,
+    /// Branch anchor: the index of the assistant message whose tool round
+    /// produced this event, counted in the loop's in-memory `messages` vec —
+    /// the exact vec a rewind truncates. Extraction compares it against the
+    /// `state-cut` marker so events written on an abandoned branch are
+    /// excluded from replay. `None` on legacy events and pre-turn emissions
+    /// (both always kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_index: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// StateSnapshot — compacted task-state projection for incremental replay.
+//
+// A long session accumulates one `state-event` line per tool result; replaying
+// every event from scratch on each resume grows with history. A snapshot is
+// the projected fold of the state events written so far (plus the
+// transcript-derived facts those events depend on), persisted at an event
+// watermark. On load, the snapshot replaces events `0..event_count` and only
+// the events after it are folded — replay cost tracks the increment since the
+// last snapshot, not the whole session.
+//
+// Snapshots are CACHED DERIVED VALUES, never a source of truth: they are
+// validated on read (schema version + event-count watermark against the lines
+// actually present) and silently discarded on any doubt, in which case the
+// caller falls back to the full event replay. Sessions written before this
+// variant existed contain no snapshot and resume identically.
+// ---------------------------------------------------------------------------
+
+/// Version of the state fold the snapshot body represents. Bump whenever
+/// [`crate::session_storage`] fold semantics or the body shape change;
+/// stored snapshots with an older version are discarded on read and
+/// re-derived by full replay. "Wiping every snapshot is always safe" — a
+/// stale snapshot must never outrank the event log.
+pub const STATE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// A single projected task-state snapshot at an event watermark.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshot {
+    /// [`STATE_SNAPSHOT_SCHEMA_VERSION`] this body was folded with. Mismatched
+    /// snapshots are discarded by the loader.
+    pub schema_version: u32,
+    /// Number of `state-event` lines folded into this snapshot. The loader
+    /// counts the events written before the snapshot's line and discards the
+    /// snapshot on mismatch (a rewritten/compacted transcript invalidates it).
+    pub event_count: u64,
+    /// The projected event-derived state.
+    pub body: StateSnapshotBody,
+}
+
+/// Serialized event-derived projection. Plain strings (not enums) keep the
+/// core schema stable and dependency-free; the query crate maps them back to
+/// its typed enums with a safe fallback. Fields are deliberately limited to
+/// what the EVENT fold produces — objective, constraints, scope-expansion
+/// count, and turn are transcript-derived and re-derived from messages on
+/// load, so storing them would only age stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotBody {
+    pub decisions: Vec<StateSnapshotDecision>,
+    pub evidence: Vec<StateSnapshotEvidence>,
+    pub changed_files: Vec<String>,
+    /// Failures are the source of the replayed focus signal: replay() blocks
+    /// focus when any failure event exists and nothing unblocks it, so the
+    /// snapshot needs only the failure set, not a stored focus.
+    pub failures: Vec<StateSnapshotFailure>,
+    pub simplification_reviewed: bool,
+    pub files_touched: u64,
+    pub tool_calls: u64,
+    pub failed_tools: u64,
+    pub repeated_failures_per_target: u64,
+    pub plan_step: Option<String>,
+    pub validation: Option<String>,
+    pub snapshot_files: Vec<String>,
+}
+
+/// Mirror of the query crate's `TaskDecision`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotDecision {
+    pub statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// Mirror of the query crate's `EvidenceItem`; `source` and `status` are the
+/// `as_str()` spellings of its enums.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotEvidence {
+    pub summary: String,
+    pub source: String,
+    pub status: String,
+}
+
+/// Mirror of the query crate's `TaskFailure`; `source` is "tool" or
+/// "validation" (used to restore the validation-failure next-action).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateSnapshotFailure {
+    pub source: String,
+    pub summary: String,
+}
+
+/// Metadata-only entry payload carrying one [`StateSnapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateSnapshotEntry {
+    pub session_id: String,
+    /// ISO-8601 timestamp when the snapshot was written.
+    pub timestamp: String,
+    pub snapshot: StateSnapshot,
+}
+
+// ---------------------------------------------------------------------------
 // Metadata-only entry types
 // ---------------------------------------------------------------------------
 
@@ -220,6 +440,26 @@ pub struct LeafEntry {
     /// message — mirroring pi's nullable leaf pointer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leaf_uuid: Option<String>,
+}
+
+/// Marks a rewind point for state-event replay (abandoned-branch anchoring).
+///
+/// Appended by the CLI when the user rewinds (the conversation shrinks). The
+/// transcript itself is append-only — abandoned-branch entries stay on disk —
+/// but state events carry no uuid chain of their own, so without a cut marker
+/// a rewind's abandoned-branch events would replay onto the rewound branch as
+/// stale failures/evidence.
+///
+/// `active_message_count` is the length of the conversation after the rewind,
+/// in the same in-memory push-order coordinate that [`StateEventEntry`]'s
+/// `msg_index` uses. An event belongs to the active branch iff every cut after
+/// its line has a count greater than the event's index (no later cut → keep).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateCutEntry {
+    /// Number of conversation messages retained by the rewind that wrote this
+    /// cut. Events with `msg_index >= count` are abandoned-branch events.
+    pub active_message_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1058,46 @@ async fn read_session_tail_metadata(
 // Convenience constructor helpers used by main.rs
 // ---------------------------------------------------------------------------
 
+/// Build a `TranscriptEntry::StateEvent` for the given session, without a
+/// branch anchor (legacy shape; such events always replay).
+pub fn make_state_event_entry(session_id: &str, event: StateEvent) -> TranscriptEntry {
+    make_state_event_entry_at(session_id, event, None)
+}
+
+/// Build a `TranscriptEntry::StateEvent` for the given session.
+///
+/// `msg_index` is the loop-side message index anchoring this event to the
+/// active branch (see [`StateEventEntry::msg_index`]); `None` is written for
+/// emissions that cannot be attributed to a specific turn.
+pub fn make_state_event_entry_at(
+    session_id: &str,
+    event: StateEvent,
+    msg_index: Option<u32>,
+) -> TranscriptEntry {
+    TranscriptEntry::StateEvent(StateEventEntry {
+        session_id: session_id.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        event,
+        msg_index,
+    })
+}
+
+/// Build a `TranscriptEntry::StateSnapshot` for the given session.
+pub fn make_state_snapshot_entry(session_id: &str, snapshot: StateSnapshot) -> TranscriptEntry {
+    TranscriptEntry::StateSnapshot(StateSnapshotEntry {
+        session_id: session_id.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        snapshot,
+    })
+}
+
+/// Build a `TranscriptEntry::StateCut` rewind marker.
+pub fn make_state_cut_entry(active_message_count: u32) -> TranscriptEntry {
+    TranscriptEntry::StateCut(StateCutEntry {
+        active_message_count,
+    })
+}
+
 /// Build a `TranscriptEntry::User` from a bare `Message`.
 ///
 /// `parent_uuid` is the UUID of the preceding chain-participant entry.
@@ -993,6 +1273,297 @@ pub fn active_branch_messages(entries: &[TranscriptEntry]) -> Vec<Message> {
         .collect()
 }
 
+/// Extract the state events belonging to the ACTIVE branch of a transcript.
+///
+/// State events carry no uuid/parent chain of their own — they are observed
+/// facts about the run, interleaved with the message entries in file order.
+/// Branch membership is anchored POSITIONALLY: every event written by the
+/// query loop carries a `msg_index` (its assistant turn's index in the
+/// in-memory conversation the loop was building — the exact vec a rewind
+/// truncates), and a rewind appends a [`StateCutEntry`] carrying the retained
+/// message count. An event belongs to the active branch iff the FIRST cut at
+/// or after its line has a count greater than the event's index; an event
+/// with no later cut is unconditionally on the active branch. Events without
+/// an index (legacy sessions, pre-turn emissions) are always kept.
+///
+/// This replaces the earlier timestamp-cutoff approximation (leaf message
+/// timestamp vs event timestamp), which retained abandoned-branch events
+/// written after the rewind point. The `leaf` entry continues to govern
+/// MESSAGE branch reconstruction in [`active_branch_messages`]; only its
+/// reset form (empty active branch) also clears state events.
+///
+/// The returned events are in file (chronological) order, ready to feed the
+/// reducer in [`TaskState::replay`]-style consumption on the query side.
+pub fn state_events_from_transcript(entries: &[TranscriptEntry]) -> Vec<&StateEvent> {
+    // Reset leaf → the active branch is empty, so no events either.
+    if let Some(l) = last_leaf(entries) {
+        if l.leaf_uuid.is_none() {
+            return Vec::new();
+        }
+    }
+
+    // Single ordered pass with a pending buffer: an event is final once the
+    // first cut after its line has been seen (kept) or dropped by it; events
+    // still pending at EOF have no later cut and are kept unconditionally.
+    let mut finalized: Vec<&StateEvent> = Vec::new();
+    let mut pending: Vec<(Option<u32>, &StateEvent)> = Vec::new();
+    for entry in entries {
+        match entry {
+            TranscriptEntry::StateCut(cut) => {
+                for (idx, event) in pending.drain(..) {
+                    if idx.is_none_or(|i| i < cut.active_message_count) {
+                        finalized.push(event);
+                    }
+                }
+            }
+            TranscriptEntry::StateEvent(state) => {
+                pending.push((state.msg_index, &state.event));
+            }
+            _ => {}
+        }
+    }
+    finalized.extend(pending.into_iter().map(|(_, event)| event));
+    finalized
+}
+
+/// Streaming loader: extract owned state events from a transcript file without
+/// parsing the full conversation.
+///
+/// The session-owning query loop calls this once per prompt, so the cost must
+/// track the number of state events (and cut/leaf markers), not the transcript
+/// size. Lines are cheaply pre-filtered by substring before deserialization;
+/// unknown/malformed lines are skipped exactly like `load_transcript`. The
+/// branch-anchoring semantics are identical to [`state_events_from_transcript`]:
+/// events carry a positional `msg_index`, a rewind appends a `state-cut`
+/// marker with the retained count, and the first cut at or after an event's
+/// line decides its membership (no later cut → keep; no index → keep). A
+/// reset leaf (empty active branch) yields no events.
+///
+/// Returns `Ok(empty)` for a missing file so callers can treat absence as a
+/// session with no persisted events.
+pub async fn load_state_events_from_file(path: &Path) -> crate::Result<Vec<StateEvent>> {
+    use tokio::io::AsyncBufReadExt;
+
+    // Fast-path: file absent → no events. Oversized files are read via the
+    // buffered reader below which stops once the cap is exceeded.
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+
+    // Single ordered pass with the same pending buffer as the entry-based
+    // extractor: events finalize when the first cut after their line arrives;
+    // events still pending at EOF have no later cut and are kept.
+    let mut finalized: Vec<StateEvent> = Vec::new();
+    let mut pending: Vec<(Option<u32>, StateEvent)> = Vec::new();
+    let mut reset_leaf = false;
+    let mut bytes_read: u64 = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > MAX_TRANSCRIPT_BYTES {
+            return Err(crate::ClaudeError::Other(
+                "Transcript file too large to load state events (over 50MB cap)".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.contains("\"type\":\"leaf\"") || trimmed.contains("\"type\": \"leaf\"") {
+            if let Ok(TranscriptEntry::Leaf(leaf)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                reset_leaf = leaf.leaf_uuid.is_none();
+            }
+            continue;
+        }
+        if trimmed.contains("state-cut") {
+            if let Ok(TranscriptEntry::StateCut(cut)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                for (idx, event) in pending.drain(..) {
+                    if idx.is_none_or(|i| i < cut.active_message_count) {
+                        finalized.push(event);
+                    }
+                }
+            }
+            continue;
+        }
+        if !trimmed.contains("state-event") {
+            continue;
+        }
+        let Ok(TranscriptEntry::StateEvent(state)) =
+            serde_json::from_str::<TranscriptEntry>(trimmed)
+        else {
+            continue;
+        };
+        pending.push((state.msg_index, state.event));
+    }
+    if reset_leaf {
+        // Reset leaf → empty active branch, so no events either.
+        return Ok(Vec::new());
+    }
+    finalized.extend(pending.into_iter().map(|(_, event)| event));
+    Ok(finalized)
+}
+
+/// Load the newest valid state snapshot plus the events written after it.
+///
+/// Incremental-replay read path: when a session crossed the snapshot cadence,
+/// the snapshot already holds the fold of the kept events `0..event_count`
+/// and only the kept events after its line need replaying. Returns `Ok(None)`
+/// — and the caller falls back to the full event load — when any of the
+/// following hold:
+///
+/// * no snapshot exists (session never crossed the cadence, or predates the
+///   feature),
+/// * a `leaf` entry exists (reset/branch message semantics — the branch-aware
+///   full load owns those sessions),
+/// * the newest snapshot carries a stale [`STATE_SNAPSHOT_SCHEMA_VERSION`],
+/// * the snapshot's `event_count` watermark does not equal the number of
+///   KEPT events written before it — raw lines minus those a `state-cut`
+///   dropped (a rewritten transcript, or a snapshot claiming to fold events
+///   the cut excludes, invalidates the cache),
+/// * the file is absent (empty session) or unreadable.
+///
+/// Cut-awareness: a rewind appends a `state-cut` marker; events it excludes
+/// no longer count toward the watermark and are never returned in the tail.
+/// A snapshot written BEFORE a rewind stays valid — the emitter counts kept
+/// events (its counter is re-seeded per prompt from the cut-filtered load),
+/// so the body folded exactly the kept prefix and only the tail shrinks.
+/// A snapshot whose watermark counts events the cut drops (impossible for a
+/// correctly written file — the emitter never folds dropped events) fails the
+/// watermark check and falls back, honoring delete-on-doubt.
+///
+/// A single forward pass: lines are substring-pre-filtered so only
+/// `state-event` / `state-snapshot` / `state-cut` / `leaf` lines are
+/// deserialized. Unknown or malformed lines are skipped exactly like
+/// `load_transcript`. When multiple valid snapshots exist (one per cadence
+/// crossing), the LAST one wins and only kept events after it are returned.
+pub async fn load_state_snapshot(
+    path: &Path,
+) -> crate::Result<Option<(StateSnapshot, Vec<StateEvent>)>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = tokio::io::BufReader::new(file);
+
+    let mut line = String::new();
+    let mut bytes_read: u64 = 0;
+    let mut saw_leaf = false;
+    // Raw `state-event` lines seen so far.
+    let mut events_seen: u64 = 0;
+    // Events resolved as dropped by the first cut after their line.
+    let mut dropped: u64 = 0;
+    // Anchors of events awaiting their first cut (keptness undecided).
+    let mut pending_indices: Vec<Option<u32>> = Vec::new();
+    // Events after the newest accepted snapshot, awaiting their first cut.
+    let mut pending_tail: Vec<(Option<u32>, StateEvent)> = Vec::new();
+    let mut last_snapshot: Option<StateSnapshot> = None;
+    let mut tail_events: Vec<StateEvent> = Vec::new();
+    // Count of pending events folded into the currently accepted snapshot
+    // (those before its line whose first cut had not yet been seen). Used to
+    // detect a later cut invalidating the snapshot's own fold.
+    let mut pending_snapshot_boundary: Option<usize> = None;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > MAX_TRANSCRIPT_BYTES {
+            return Err(crate::ClaudeError::Other(
+                "Transcript file too large to load state snapshot (over 50MB cap)".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("\"type\":\"leaf\"") || trimmed.contains("\"type\": \"leaf\"") {
+            saw_leaf = true;
+            continue;
+        }
+        if trimmed.contains("state-cut") {
+            if let Ok(TranscriptEntry::StateCut(cut)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                // Resolve every pending event's membership against this cut:
+                // the first cut after an event's line is authoritative.
+                let snapshot_boundary = pending_snapshot_boundary.take();
+                for (position, idx) in pending_indices.drain(..).enumerate() {
+                    if idx.is_none_or(|i| i < cut.active_message_count) {
+                        continue; // kept
+                    }
+                    dropped += 1;
+                    // A cut that drops an event the accepted snapshot folded
+                    // (pending when the snapshot line was read) poisons that
+                    // snapshot: its body contains abandoned-branch facts.
+                    if snapshot_boundary.is_some_and(|boundary| position < boundary) {
+                        last_snapshot = None;
+                        tail_events.clear();
+                        pending_tail.clear();
+                    }
+                }
+                for (idx, event) in pending_tail.drain(..) {
+                    if idx.is_none_or(|i| i < cut.active_message_count) {
+                        tail_events.push(event);
+                    }
+                }
+            }
+            continue;
+        }
+        if trimmed.contains("state-snapshot") {
+            // A snapshot line: keep it only when it is schema-current and its
+            // watermark matches the KEPT events actually written before it.
+            if let Ok(TranscriptEntry::StateSnapshot(entry)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                if entry.snapshot.schema_version == STATE_SNAPSHOT_SCHEMA_VERSION
+                    && entry.snapshot.event_count == events_seen - dropped
+                {
+                    last_snapshot = Some(entry.snapshot);
+                    tail_events.clear();
+                    pending_tail.clear();
+                    // Events still pending at this line belong to the fold.
+                    pending_snapshot_boundary = Some(pending_indices.len());
+                }
+            }
+            continue;
+        }
+        if trimmed.contains("state-event") {
+            if let Ok(TranscriptEntry::StateEvent(entry)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
+                // Membership is not decidable until the first cut after this
+                // line (or EOF, where everything pending is kept).
+                pending_indices.push(entry.msg_index);
+                if last_snapshot.is_some() {
+                    pending_tail.push((entry.msg_index, entry.event));
+                }
+            }
+            events_seen += 1;
+        }
+    }
+    if saw_leaf {
+        return Ok(None);
+    }
+    // EOF with no later cut: every pending event is on the active branch.
+    // Only events pending after the newest snapshot contribute to the tail.
+    tail_events.extend(pending_tail.into_iter().map(|(_, event)| event));
+    Ok(last_snapshot.map(|snapshot| (snapshot, tail_events)))
+}
+
 /// Filter transcript entries by agent role ("manager" or "executor").
 ///
 /// Returns only User and Assistant entries whose `agent_role` matches `role`.
@@ -1050,6 +1621,847 @@ mod tests {
         } else {
             panic!("expected User entry");
         }
+    }
+
+    #[tokio::test]
+    async fn state_event_round_trips_through_transcript() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state-events.jsonl");
+
+        let events = vec![
+            StateEvent::ValidationRecorded {
+                verdict: StateValidationVerdict::Passed,
+                headline: "All checks passed".to_string(),
+            },
+            StateEvent::ToolObserved {
+                failed: true,
+                summary: "connection refused".to_string(),
+                file_paths: vec!["src/auth.rs".to_string()],
+                mutating: false,
+            },
+            StateEvent::SnapshotObserved {
+                files: vec!["src/auth.rs".to_string()],
+            },
+            StateEvent::DecisionRecorded {
+                statement: "Keep state out of the transcript".to_string(),
+                evidence: Some("compaction architecture".to_string()),
+            },
+            StateEvent::FocusChanged {
+                focus: "blocked".to_string(),
+                reason: "tests failed".to_string(),
+            },
+            StateEvent::PlanStepSet {
+                step: "Step 2: patch auth".to_string(),
+            },
+            StateEvent::SimplificationReviewed,
+        ];
+        for event in &events {
+            let entry = make_state_event_entry("sess-events", event.clone());
+            write_transcript_entry(&path, &entry).await.unwrap();
+        }
+
+        let loaded = load_transcript(&path).await.unwrap();
+        assert_eq!(loaded.len(), events.len());
+        for (entry, expected) in loaded.iter().zip(events.iter()) {
+            assert_eq!(entry.state_event(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn state_events_survive_alongside_messages_and_tombstones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+
+        let msg_uuid = uuid::Uuid::new_v4().to_string();
+        let msg = make_msg(Role::User);
+        write_transcript_entry(
+            &path,
+            &make_user_entry(msg, &msg_uuid, None, "sess-mixed", "/proj"),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry(
+                "sess-mixed",
+                StateEvent::ValidationRecorded {
+                    verdict: StateValidationVerdict::Passed,
+                    headline: "ok".to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        let loaded = load_transcript(&path).await.unwrap();
+        assert_eq!(loaded.len(), 2, "message + state event both survive");
+        assert!(loaded[0].state_event().is_none());
+        assert!(loaded[1].state_event().is_some());
+    }
+
+    #[tokio::test]
+    async fn state_events_excluded_from_active_branch_messages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("branch.jsonl");
+
+        let msg_uuid = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(
+            &path,
+            &make_user_entry(make_msg(Role::User), &msg_uuid, None, "sess-b", "/proj"),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-b", StateEvent::SnapshotObserved { files: vec![] }),
+        )
+        .await
+        .unwrap();
+
+        let entries = load_transcript(&path).await.unwrap();
+        let messages = active_branch_messages(&entries);
+        assert_eq!(
+            messages.len(),
+            1,
+            "state events never join the message chain"
+        );
+        assert_eq!(
+            entries.len(),
+            2,
+            "but remain in the raw entry list for replay"
+        );
+    }
+
+    #[test]
+    fn state_event_wire_format_is_stable_snake_case() {
+        let entry = make_state_event_entry(
+            "sess-wire",
+            StateEvent::ValidationRecorded {
+                verdict: StateValidationVerdict::Passed,
+                headline: "ok".to_string(),
+            },
+        );
+        let line = serde_json::to_string(&entry).unwrap();
+        assert!(
+            line.contains("\"type\":\"state-event\""),
+            "entry tag must be state-event: {line}"
+        );
+        assert!(
+            line.contains("\"kind\":\"validation_recorded\""),
+            "event tag must be snake_case: {line}"
+        );
+        assert!(line.contains("\"verdict\":\"passed\""));
+    }
+
+    #[tokio::test]
+    async fn state_events_from_transcript_no_leaf_returns_all() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("linear.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-linear", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry(
+                "sess-linear",
+                StateEvent::SnapshotObserved {
+                    files: vec!["a.rs".to_string()],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(state_events_from_transcript(&entries).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn state_events_from_transcript_reset_leaf_yields_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reset.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-reset", StateEvent::SnapshotObserved { files: vec![] }),
+        )
+        .await
+        .unwrap();
+        set_leaf(&path, None).await.unwrap();
+        let entries = load_transcript(&path).await.unwrap();
+        assert!(state_events_from_transcript(&entries).is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_state_events_from_file_missing_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.jsonl");
+        let events = load_state_events_from_file(&path).await.unwrap();
+        assert!(events.is_empty(), "absent file must read as no events");
+    }
+
+    #[tokio::test]
+    async fn load_state_events_from_file_linear_returns_all_in_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("linear.jsonl");
+        let expected = vec![
+            StateEvent::SimplificationReviewed,
+            StateEvent::SnapshotObserved {
+                files: vec!["a.rs".to_string()],
+            },
+        ];
+        for event in &expected {
+            write_transcript_entry(&path, &make_state_event_entry("sess-lin", event.clone()))
+                .await
+                .unwrap();
+        }
+        // Interleave a message to prove the loader skips non-event lines.
+        let msg_uuid = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(
+            &path,
+            &make_user_entry(make_msg(Role::User), &msg_uuid, None, "sess-lin", "/proj"),
+        )
+        .await
+        .unwrap();
+        let events = load_state_events_from_file(&path).await.unwrap();
+        assert_eq!(events, expected, "all events survive, in file order");
+    }
+
+    #[tokio::test]
+    async fn load_state_events_from_file_matches_entry_extractor() {
+        // Property: the streaming loader must agree with the entry-based
+        // extractor on the same file, both for a linear transcript and for
+        // one with a reset leaf.
+        let dir = tempdir().unwrap();
+        let linear_path = dir.path().join("linear.jsonl");
+        for event in [
+            StateEvent::SimplificationReviewed,
+            StateEvent::SnapshotObserved {
+                files: vec!["b.rs".to_string()],
+            },
+        ] {
+            write_transcript_entry(&linear_path, &make_state_event_entry("sess-prop", event))
+                .await
+                .unwrap();
+        }
+        let entries = load_transcript(&linear_path).await.unwrap();
+        let from_entries: Vec<StateEvent> = state_events_from_transcript(&entries)
+            .into_iter()
+            .cloned()
+            .collect();
+        let from_file = load_state_events_from_file(&linear_path).await.unwrap();
+        assert_eq!(from_file, from_entries, "linear: loaders agree");
+
+        let reset_path = dir.path().join("reset.jsonl");
+        write_transcript_entry(
+            &reset_path,
+            &make_state_event_entry("sess-prop", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        set_leaf(&reset_path, None).await.unwrap();
+        let entries = load_transcript(&reset_path).await.unwrap();
+        let from_entries: Vec<StateEvent> = state_events_from_transcript(&entries)
+            .into_iter()
+            .cloned()
+            .collect();
+        let from_file = load_state_events_from_file(&reset_path).await.unwrap();
+        assert!(from_entries.is_empty(), "reset: entry extractor empty");
+        assert_eq!(from_file, from_entries, "reset: loaders agree");
+    }
+
+    fn tagged_event(tag: &str) -> StateEvent {
+        StateEvent::SnapshotObserved {
+            files: vec![tag.to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn state_cut_excludes_abandoned_branch_events() {
+        // Rewind to message 2: the abandoned branch's event (idx 3) must not
+        // replay; the pre-rewind in-branch event (idx 1) and the post-rewind
+        // event (idx 5) must.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cut.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cut", tagged_event("pre"), Some(1)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cut", tagged_event("abandoned"), Some(3)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cut", tagged_event("post"), Some(5)),
+        )
+        .await
+        .unwrap();
+
+        let entries = load_transcript(&path).await.unwrap();
+        let kept: Vec<String> = state_events_from_transcript(&entries)
+            .into_iter()
+            .map(|e| match e {
+                StateEvent::SnapshotObserved { files } => files[0].clone(),
+                _ => panic!("unexpected variant"),
+            })
+            .collect();
+        assert_eq!(kept, vec!["pre".to_string(), "post".to_string()]);
+
+        let from_file = load_state_events_from_file(&path).await.unwrap();
+        assert_eq!(
+            from_file.len(),
+            2,
+            "streaming loader agrees with the entry extractor"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_cuts_apply_in_order() {
+        // Two rewinds: the first cut drops idx 5, the second (count 3) keeps
+        // idx 1. An event after the last cut has no later cut and is kept.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multi-cut.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-mc", tagged_event("a"), Some(5)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-mc", tagged_event("b"), Some(1)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(3))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-mc", tagged_event("c"), Some(7)),
+        )
+        .await
+        .unwrap();
+
+        let entries = load_transcript(&path).await.unwrap();
+        let kept: Vec<String> = state_events_from_transcript(&entries)
+            .into_iter()
+            .map(|e| match e {
+                StateEvent::SnapshotObserved { files } => files[0].clone(),
+                _ => panic!("unexpected variant"),
+            })
+            .collect();
+        assert_eq!(kept, vec!["b".to_string(), "c".to_string()]);
+        let from_file = load_state_events_from_file(&path).await.unwrap();
+        assert_eq!(from_file.len(), 2, "loaders agree under multiple cuts");
+    }
+
+    #[tokio::test]
+    async fn legacy_unanchored_events_survive_cuts() {
+        // Events written before msg_index existed carry no anchor; the safe
+        // fallback is to keep them (never lose history to a missing field).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-cut.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-lg", tagged_event("old")),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(0))
+            .await
+            .unwrap();
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(
+            state_events_from_transcript(&entries).len(),
+            1,
+            "unanchored events are always kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_loader_survives_cut_before_snapshot() {
+        // A cut before the snapshot line: the dropped event does not count
+        // toward the watermark, and the kept event does. The snapshot written
+        // over the kept prefix stays valid; nothing follows it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cut-snap.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cs", tagged_event("abandoned"), Some(3)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cs", tagged_event("kept"), Some(1)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry(
+                "sess-cs",
+                StateSnapshot {
+                    schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+                    event_count: 1,
+                    body: make_snapshot_body(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path)
+            .await
+            .unwrap()
+            .expect("cut-aware loader accepts the consistent snapshot");
+        assert_eq!(loaded.0.event_count, 1);
+        assert!(loaded.1.is_empty(), "nothing after the snapshot");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_loader_tail_excludes_cut_dropped_events() {
+        // Snapshot first, then a rewind: events after the snapshot line that
+        // the cut drops must not appear in the tail (the emitter never folds
+        // them, so the watermark stays consistent).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cut-tail.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-ct", tagged_event("kept"), Some(1)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry(
+                "sess-ct",
+                StateSnapshot {
+                    schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+                    event_count: 1,
+                    body: make_snapshot_body(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-ct", tagged_event("abandoned"), Some(3)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-ct", tagged_event("post"), Some(5)),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap().expect("snapshot");
+        assert_eq!(loaded.1.len(), 1, "only the post-rewind event tails");
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_loader_poisoned_by_cut_dropping_folded_events() {
+        // A cut that drops events the snapshot already folded (they were
+        // pending when the snapshot line was read) invalidates it: the body
+        // contains abandoned-branch facts. Delete-on-doubt wins.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cut-poison.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cp", tagged_event("a"), Some(1)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cp", tagged_event("b"), Some(3)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry(
+                "sess-cp",
+                StateSnapshot {
+                    schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+                    event_count: 2,
+                    body: make_snapshot_body(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // The rewind drops idx 3 — an event the snapshot folded.
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        assert!(
+            load_state_snapshot(&path).await.unwrap().is_none(),
+            "snapshot whose fold contains dropped events is discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_loader_rejects_watermark_counting_dropped_events() {
+        // A snapshot claiming to fold events the cut drops can only come
+        // from a broken writer: the kept-count watermark check rejects it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cut-wm.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry_at("sess-cw", tagged_event("abandoned"), Some(3)),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(&path, &make_state_cut_entry(2))
+            .await
+            .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry(
+                "sess-cw",
+                StateSnapshot {
+                    schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+                    event_count: 1,
+                    body: make_snapshot_body(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            load_state_snapshot(&path).await.unwrap().is_none(),
+            "watermark must count kept events, not raw lines"
+        );
+    }
+
+    #[test]
+    fn state_event_and_cut_wire_format_round_trip() {
+        let anchored = make_state_event_entry_at("sess-w", tagged_event("f"), Some(7));
+        let line = serde_json::to_string(&anchored).unwrap();
+        assert!(line.contains("\"msgIndex\":7"), "anchored index: {line}");
+        let unanchored = make_state_event_entry("sess-w", tagged_event("g"));
+        let line = serde_json::to_string(&unanchored).unwrap();
+        assert!(!line.contains("msgIndex"), "None omits the field: {line}");
+
+        let cut = make_state_cut_entry(4);
+        let line = serde_json::to_string(&cut).unwrap();
+        assert!(line.contains("\"type\":\"state-cut\""), "{line}");
+        assert!(line.contains("\"activeMessageCount\":4"), "{line}");
+        let parsed: TranscriptEntry = serde_json::from_str(&line).unwrap();
+        match parsed {
+            TranscriptEntry::StateCut(c) => assert_eq!(c.active_message_count, 4),
+            _ => panic!("cut round-trip failed"),
+        }
+    }
+
+    fn make_snapshot_body() -> StateSnapshotBody {
+        StateSnapshotBody {
+            decisions: vec![StateSnapshotDecision {
+                statement: "keep the API stable".to_string(),
+                evidence: None,
+            }],
+            evidence: vec![StateSnapshotEvidence {
+                summary: "3 checks passed".to_string(),
+                source: "validation".to_string(),
+                status: "verified".to_string(),
+            }],
+            changed_files: vec!["src/parser.rs".to_string()],
+            failures: vec![StateSnapshotFailure {
+                source: "tool".to_string(),
+                summary: "connection refused".to_string(),
+            }],
+            simplification_reviewed: true,
+            files_touched: 3,
+            tool_calls: 12,
+            failed_tools: 1,
+            repeated_failures_per_target: 1,
+            plan_step: Some("step 2".to_string()),
+            validation: Some("3 checks passed".to_string()),
+            snapshot_files: vec!["src/parser.rs".to_string()],
+        }
+    }
+
+    fn make_snapshot(event_count: u64) -> StateSnapshot {
+        StateSnapshot {
+            schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+            event_count,
+            body: make_snapshot_body(),
+        }
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_round_trips_through_transcript() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-snap", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-snap", make_snapshot(1)),
+        )
+        .await
+        .unwrap();
+
+        let entries = load_transcript(&path).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].state_snapshot().is_none());
+        let snapshot = entries[1].state_snapshot().expect("snapshot accessor");
+        assert_eq!(snapshot.event_count, 1);
+        assert_eq!(snapshot.body.tool_calls, 12);
+        assert_eq!(snapshot.body.evidence[0].status, "verified");
+        assert!(snapshot.body.simplification_reviewed);
+    }
+
+    #[test]
+    fn state_snapshot_wire_format_is_stable() {
+        let entry = make_state_snapshot_entry("sess-wire", make_snapshot(7));
+        let line = serde_json::to_string(&entry).unwrap();
+        assert!(
+            line.contains("\"type\":\"state-snapshot\""),
+            "entry tag: {line}"
+        );
+        assert!(
+            line.contains("\"event_count\":7"),
+            "watermark field: {line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "\"schema_version\":{STATE_SNAPSHOT_SCHEMA_VERSION}"
+            )),
+            "schema version pinned: {line}"
+        );
+        assert!(line.contains("\"tool_calls\":12"));
+        assert!(line.contains("\"plan_step\":\"step 2\""));
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_none_when_file_has_no_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events-only.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-e", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap();
+        assert!(loaded.is_none(), "no snapshot -> full replay path");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_absent_file_is_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("absent.jsonl");
+        let loaded = load_state_snapshot(&path).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_returns_snapshot_and_tail_events_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("linear.jsonl");
+        let mut tail = Vec::new();
+        // Two events folded into the snapshot (event_count = 2).
+        for event in [
+            StateEvent::SimplificationReviewed,
+            StateEvent::SnapshotObserved {
+                files: vec!["a.rs".to_string()],
+            },
+        ] {
+            write_transcript_entry(&path, &make_state_event_entry("sess-l", event.clone()))
+                .await
+                .unwrap();
+        }
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-l", make_snapshot(2)),
+        )
+        .await
+        .unwrap();
+        // Two events written AFTER the snapshot -> the increment to replay.
+        for event in [
+            StateEvent::PlanStepSet {
+                step: "s3".to_string(),
+            },
+            StateEvent::SimplificationReviewed,
+        ] {
+            tail.push(event.clone());
+            write_transcript_entry(&path, &make_state_event_entry("sess-l", event))
+                .await
+                .unwrap();
+        }
+        let loaded = load_state_snapshot(&path).await.unwrap().expect("snapshot");
+        assert_eq!(loaded.0.event_count, 2);
+        assert_eq!(loaded.0.body.tool_calls, 12);
+        assert_eq!(loaded.1, tail, "only the events after the snapshot replay");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_ignores_interleaved_messages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+        let msg_uuid = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(
+            &path,
+            &make_user_entry(make_msg(Role::User), &msg_uuid, None, "sess-m", "/proj"),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-m", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-m", make_snapshot(1)),
+        )
+        .await
+        .unwrap();
+        let msg_uuid2 = uuid::Uuid::new_v4().to_string();
+        write_transcript_entry(
+            &path,
+            &make_user_entry(make_msg(Role::User), &msg_uuid2, None, "sess-m", "/proj"),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap().expect("snapshot");
+        assert_eq!(loaded.0.event_count, 1);
+        assert!(loaded.1.is_empty(), "messages are not events");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_discards_on_watermark_mismatch() {
+        // A rewritten/compacted transcript that dropped old events leaves the
+        // watermark ahead of the file -> the cache is invalid.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rewritten.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-r", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        // Claims to have folded 5 events, but only 1 was written.
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-r", make_snapshot(5)),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap();
+        assert!(loaded.is_none(), "watermark mismatch must invalidate");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_discards_on_leaf() {
+        // Branch semantics make the linear event count untrustworthy; the
+        // branch-aware full load owns leaf sessions.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("branch.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-b", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-b", make_snapshot(1)),
+        )
+        .await
+        .unwrap();
+        set_leaf(&path, None).await.unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap();
+        assert!(loaded.is_none(), "leaf present -> full replay path");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_discards_on_stale_schema_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("old.jsonl");
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry("sess-o", StateEvent::SimplificationReviewed),
+        )
+        .await
+        .unwrap();
+        let mut stale = make_snapshot(1);
+        stale.schema_version = STATE_SNAPSHOT_SCHEMA_VERSION + 1;
+        write_transcript_entry(&path, &make_state_snapshot_entry("sess-o", stale))
+            .await
+            .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap();
+        assert!(loaded.is_none(), "stale projector version must invalidate");
+    }
+
+    #[tokio::test]
+    async fn load_state_snapshot_last_snapshot_wins() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multi.jsonl");
+        for event in [
+            StateEvent::SimplificationReviewed,
+            StateEvent::SnapshotObserved {
+                files: vec!["a.rs".to_string()],
+            },
+        ] {
+            write_transcript_entry(&path, &make_state_event_entry("sess-m", event))
+                .await
+                .unwrap();
+        }
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-m", make_snapshot(2)),
+        )
+        .await
+        .unwrap();
+        // One more event, then a second snapshot folding all three.
+        write_transcript_entry(
+            &path,
+            &make_state_event_entry(
+                "sess-m",
+                StateEvent::PlanStepSet {
+                    step: "s4".to_string(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        write_transcript_entry(
+            &path,
+            &make_state_snapshot_entry("sess-m", make_snapshot(3)),
+        )
+        .await
+        .unwrap();
+        let loaded = load_state_snapshot(&path).await.unwrap().expect("snapshot");
+        assert_eq!(loaded.0.event_count, 3, "newest snapshot supersedes");
+        assert!(loaded.1.is_empty(), "no events after the newest snapshot");
     }
 
     #[tokio::test]

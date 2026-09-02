@@ -633,3 +633,223 @@ fn headless_effort_precedence_flows_into_provider_request() {
 
     std::fs::remove_dir_all(&base_home).expect("remove effort homes");
 }
+
+/// Snapshot-based incremental replay across a real process boundary.
+///
+/// A state snapshot is only written once a session crosses the 64-event
+/// snapshot cadence, which a single headless subprocess cannot reach (each
+/// event needs a provider round-trip). This test reproduces the artifact a
+/// snapshot-writing process would leave behind: process A (a real binary run)
+/// generates the base transcript and its state events, the test appends a
+/// `state-snapshot` entry at the exact event watermark the periodic writer
+/// would use, and process B (a second real binary run, same session, with
+/// `--resume`) must fold the snapshot into `<task_context>` — proving the
+/// headless resume path consumes snapshots for long sessions.
+///
+/// The snapshot body is richer than the raw events before it (7 tool calls +
+/// a passing validation vs. a single ToolObserved event) — impossible for a
+/// real writer, whose body is the fold of those events — but it is the only
+/// black-box discriminator for which path B took: the loader contract is that
+/// a VALIDATED snapshot is trusted as the compacted fold. If the snapshot
+/// were discarded, B would fall back to the raw event replay and report "1
+/// tool calls" with no Verified evidence.
+#[test]
+fn headless_snapshot_projection_survives_process_boundary() {
+    use clawde_core::session_storage::{
+        make_state_snapshot_entry, transcript_dir_in, StateSnapshot, StateSnapshotBody,
+        StateSnapshotDecision, StateSnapshotEvidence, STATE_SNAPSHOT_SCHEMA_VERSION,
+    };
+
+    let fixture =
+        std::env::temp_dir().join(format!("clawde-snapshot-fixture-{}", uuid::Uuid::new_v4()));
+    let home = std::env::temp_dir().join(format!("clawde-snapshot-home-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(fixture.join("src")).expect("fixture src");
+    std::fs::create_dir_all(&home).expect("home");
+    let session_id = "snapshot-process-boundary-session";
+    let project_root = clawde_core::git_utils::project_root(&fixture);
+    let transcript_path =
+        transcript_dir_in(&home, &project_root).join(format!("{session_id}.jsonl"));
+
+    // --- Process A: a real headless run generates the base transcript. ---
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind seed fixture");
+    listener
+        .set_nonblocking(false)
+        .expect("configure seed fixture");
+    let address = listener.local_addr().expect("seed fixture address");
+    let seed_write_path = fixture.join("src/process-a.rs");
+    let server = thread::spawn(move || {
+        let mut tool_sent = false;
+        for mut stream in listener.incoming().flatten() {
+            let body = read_request(&mut stream);
+            if body.contains("SNAPSHOT_SEED_PROCESS") {
+                if !tool_sent {
+                    tool_sent = true;
+                    let response =
+                        tool_response(Path::new("src/process-a.rs"), "SNAPSHOT_SEEDED_WRITE\n");
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    // Model turn after the tool result: end the conversation.
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        resumed_response(),
+                        "text/event-stream",
+                    );
+                    // Process A is done — exit so the thread can join.
+                    break;
+                }
+            } else {
+                write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "unexpected request",
+                    "text/plain",
+                );
+            }
+        }
+    });
+    let api_base = format!("http://{}", address);
+    let first_args = common_args(&api_base, &fixture, session_id);
+    let first = run_child(
+        spawn_child(
+            &first_args,
+            "SNAPSHOT_SEED_PROCESS write the seed file",
+            &home,
+        ),
+        Duration::from_secs(60),
+    );
+    assert!(
+        first.status.success(),
+        "process A must complete its seed turn; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&seed_write_path).ok().as_deref(),
+        Some("SNAPSHOT_SEEDED_WRITE\n"),
+        "process A did not materialize its tool call; stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    server.join().expect("seed fixture server");
+
+    // The seed run persisted at least one state event; a snapshot entry is
+    // only valid at that exact watermark (the loader counts the lines).
+    let raw = std::fs::read_to_string(&transcript_path).expect("read seeded transcript");
+    let event_count = raw
+        .lines()
+        .filter(|line| line.contains("state-event"))
+        .count() as u64;
+    assert!(event_count > 0, "process A wrote no state events");
+
+    // The periodic snapshot write a long-running process would append once
+    // its session crossed the cadence.
+    let snapshot = StateSnapshot {
+        schema_version: STATE_SNAPSHOT_SCHEMA_VERSION,
+        event_count,
+        body: StateSnapshotBody {
+            decisions: vec![StateSnapshotDecision {
+                statement: "Keep the public API stable".to_string(),
+                evidence: None,
+            }],
+            evidence: vec![StateSnapshotEvidence {
+                summary: "3 checks passed".to_string(),
+                source: "validation".to_string(),
+                status: "verified".to_string(),
+            }],
+            changed_files: vec!["src/snapshot.rs".to_string()],
+            failures: Vec::new(),
+            simplification_reviewed: true,
+            files_touched: 2,
+            tool_calls: 7,
+            failed_tools: 0,
+            repeated_failures_per_target: 0,
+            plan_step: Some("Step 2: verify the snapshot projection".to_string()),
+            validation: Some("3 checks passed".to_string()),
+            snapshot_files: vec!["src/snapshot.rs".to_string()],
+        },
+    };
+    let line = serde_json::to_string(&make_state_snapshot_entry(session_id, snapshot))
+        .expect("serialize snapshot entry");
+    let mut transcript = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&transcript_path)
+        .expect("open transcript for snapshot append");
+    writeln!(transcript, "{line}").expect("append snapshot entry");
+    drop(transcript);
+
+    // --- Process B: a fresh process resumes the session and must fold the
+    // persisted snapshot (not the raw event list) into the model context.
+    let probe_listener = TcpListener::bind("127.0.0.1:0").expect("bind probe fixture");
+    let probe_address = probe_listener.local_addr().expect("probe fixture address");
+    let request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let bodies_for_server = request_bodies.clone();
+    // Detached: blocks on `incoming()` until the test process exits, so it
+    // is never joined.
+    let _probe_server = thread::spawn(move || {
+        for mut stream in probe_listener.incoming().flatten() {
+            let body = read_request(&mut stream);
+            bodies_for_server.lock().unwrap().push(body.clone());
+            write_response(
+                &mut stream,
+                "200 OK",
+                "data: {\"id\":\"snapshot-probe\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"SNAPSHOT_PROBE_OK\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"snapshot-probe\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            );
+        }
+    });
+    let mut second_args = common_args(&format!("http://{}", probe_address), &fixture, session_id);
+    second_args.extend(["--resume".to_string(), session_id.to_string()]);
+    let second = run_child(
+        spawn_child(&second_args, "SNAPSHOT_PROBE verify the projection", &home),
+        Duration::from_secs(60),
+    );
+    assert!(
+        second.status.success(),
+        "process B must complete; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&second.stderr),
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("SNAPSHOT_PROBE_OK"),
+        "process B response missing from stream: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    // The provider request must carry the SNAPSHOT-derived facts in
+    // <task_context>: verified evidence and counters that the single raw
+    // state event before the snapshot cannot produce.
+    let probe_body = request_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|body| body.contains("SNAPSHOT_PROBE"))
+        .cloned()
+        .expect("process B request must reach the probe fixture");
+    for marker in [
+        "<task_context>",
+        "Verified: 3 checks passed",
+        "Activity: 7 tool calls, 0 failed",
+        "Step 2: verify the snapshot projection",
+        "Changed files: src/snapshot.rs",
+    ] {
+        assert!(
+            probe_body.contains(marker),
+            "process B request must fold the snapshot body; missing '{marker}': {probe_body}"
+        );
+    }
+    assert!(
+        !probe_body.contains("Activity: 1 tool calls"),
+        "process B must honor the validated snapshot instead of falling back \
+         to the raw event replay: {probe_body}"
+    );
+    // The transcript still holds the snapshot entry for future loads.
+    let after = std::fs::read_to_string(&transcript_path).expect("re-read transcript");
+    assert!(
+        after.lines().any(|line| line.contains("state-snapshot")),
+        "snapshot entry must survive process B's writes"
+    );
+
+    std::fs::remove_dir_all(fixture).expect("remove fixture");
+    std::fs::remove_dir_all(home).expect("remove home");
+}

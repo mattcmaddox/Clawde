@@ -1420,6 +1420,12 @@ async fn main() -> anyhow::Result<()> {
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.clone());
+    // The top-level CLI loop owns the session transcript's state-event stream:
+    // it emits events and auto-replays them at every loop start so verified
+    // evidence / counters / plan step survive across prompts in the SAME
+    // interactive session (not just across --resume). Sub-agent and cron loops
+    // keep the default `false` and neither emit nor replay.
+    query_config.session_state_owner = true;
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -2701,6 +2707,39 @@ async fn run_headless(
         }
         if !session.model.is_empty() {
             qcfg.model = session.model.clone();
+        }
+        // Event-persistence Phase 3: replay persisted runtime state events
+        // into the loop's TaskState so verified evidence, counters, decisions,
+        // and the plan step survive the process boundary. Best-effort: a
+        // transcript read failure simply means no events replay.
+        //
+        // Snapshot-first: when the session crossed the snapshot cadence, load
+        // the persisted state snapshot plus only the events after it so the
+        // loop folds the increment instead of re-parsing and re-folding the
+        // whole event history on every resume. Falls back to the full
+        // branch-aware event extraction when no usable snapshot exists (leaf /
+        // branch sessions, stale schema, cadence never crossed) — the
+        // pre-snapshot behavior, unchanged.
+        if let Ok(path) = clawde_core::session_storage::transcript_path(
+            &clawde_core::git_utils::project_root(&tool_ctx.working_dir),
+            &session.id,
+        ) {
+            match clawde_core::session_storage::load_state_snapshot(&path).await {
+                Ok(Some((snapshot, tail_events))) => {
+                    qcfg.state_snapshot = Some(snapshot);
+                    qcfg.state_events = tail_events;
+                }
+                _ => {
+                    if let Ok(entries) = clawde_core::session_storage::load_transcript(&path).await
+                    {
+                        qcfg.state_events =
+                            clawde_core::session_storage::state_events_from_transcript(&entries)
+                                .into_iter()
+                                .cloned()
+                                .collect();
+                    }
+                }
+            }
         }
     }
     let tracker_clone = cost_tracker.clone();
@@ -4326,6 +4365,11 @@ async fn run_interactive(
                                     app.replace_messages(Vec::new());
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
+                                    // /clear keeps the session id, so prior
+                                    // state events must not replay onto the
+                                    // empty conversation: anchor them all out
+                                    // with a zero-count cut.
+                                    app.pending_state_cut = Some(0);
                                     app.status_message = Some("Conversation cleared.".to_string());
                                 }
                                 Some(CommandResult::NewSession) => {
@@ -4410,6 +4454,9 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed = messages.len().saturating_sub(new_msgs.len());
+                                    if removed > 0 {
+                                        app.pending_state_cut = Some(new_msgs.len() as u32);
+                                    }
                                     messages = new_msgs.clone();
                                     app.replace_messages(new_msgs);
                                     session.messages = messages.clone();
@@ -7076,6 +7123,23 @@ async fn run_interactive(
         // modals don't fight over the screen.
         if !app.is_streaming && current_query.is_none() && !app.bypass_permissions_dialog.visible {
             app.maybe_prompt_next_mcp_server();
+        }
+
+        // Rewind anchoring: drain any pending state-cut marker left by a
+        // rewind//clear and append it to the transcript. The marker carries
+        // the retained message count so state-event replay can exclude the
+        // abandoned branch's events. Also re-anchors the mirror watermark:
+        // retained messages are already mirrored on disk, so writes resume
+        // from the cut count, not the pre-rewind length (which would strand
+        // every new message unmirrored until exit).
+        if let Some(cut) = app.pending_state_cut.take() {
+            if let Ok(path) =
+                clawde_core::session_storage::transcript_path(&transcript_project_root, &session.id)
+            {
+                let entry = clawde_core::session_storage::make_state_cut_entry(cut);
+                let _ = clawde_core::session_storage::write_transcript_entry(&path, &entry).await;
+            }
+            transcript_written = transcript_written.min(cut as usize);
         }
 
         // Periodic auto-save every 30 seconds (protects against crashes)

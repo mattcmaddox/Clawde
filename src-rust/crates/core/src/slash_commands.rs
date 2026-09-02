@@ -114,6 +114,7 @@ pub const PROMPT_COMMANDS: &[PromptCommand] = &[
     PromptCommand { name: "version", description: "Show version information", category: "System", tui_only: false },
     PromptCommand { name: "reload-plugins", description: "Reload installed plugins", category: "Tools", tui_only: false },
     PromptCommand { name: "status", description: "Show provider and session status", category: "System", tui_only: false },
+    PromptCommand { name: "state", description: "Show the agent's tracked task state (objective, focus, evidence)", category: "System", tui_only: false },
     PromptCommand { name: "usage", description: "Show usage statistics", category: "Usage & Cost", tui_only: false },
     PromptCommand { name: "accounts", description: "Manage provider accounts", category: "Auth & Permissions", tui_only: false },
     PromptCommand { name: "switch", description: "Switch the active provider account", category: "Auth & Permissions", tui_only: false },

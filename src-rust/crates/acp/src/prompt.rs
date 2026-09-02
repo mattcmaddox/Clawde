@@ -122,6 +122,12 @@ pub async fn handle(
     // prompt/tool metadata as well as the ToolContext.
     let mut query_config = runtime.query_config.clone();
     query_config.working_directory = Some(session.cwd.clone());
+    // Task-state ownership: this session owns its event stream, so the loop
+    // emits state events to (and replays them from) the project-scoped
+    // transcript named by the ACP session id — the same objective/focus/
+    // evidence persistence the CLI loop gets. Session ids are unique per ACP
+    // session, so concurrent editor sessions never share an event stream.
+    query_config.session_state_owner = true;
     let outcome = clawde_query::run_query_loop(
         runtime.api_client.as_ref(),
         &mut messages,

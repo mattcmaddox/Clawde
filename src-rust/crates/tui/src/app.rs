@@ -1444,6 +1444,12 @@ pub struct App {
     pub global_search: GlobalSearchState,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
+    /// Rewind point awaiting its transcript `state-cut` marker (the TUI owns
+    /// no transcript path). Set when a rewind shrinks the conversation, with
+    /// the retained message count; the CLI drains it on the next main-loop
+    /// pass and appends the marker, anchoring state events to the active
+    /// branch. `None` when no rewind happened.
+    pub pending_state_cut: Option<u32>,
     /// Bridge connection state.
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
@@ -2193,6 +2199,7 @@ impl App {
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
             rewind_flow: RewindFlowOverlay::new(),
+            pending_state_cut: None,
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
             error_modal_scroll_offset: 0,
