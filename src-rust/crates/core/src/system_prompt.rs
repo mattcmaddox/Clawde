@@ -223,6 +223,10 @@ pub struct SystemPromptOptions {
     pub skip_env_info: bool,
     /// Active goal addendum (injected in dynamic section when a goal is running).
     pub active_goal_addendum: Option<String>,
+    /// Compact, structured working memory for the active task. This is kept
+    /// separate from the transcript so the model can recover focus after
+    /// compaction or a topic switch.
+    pub task_context: Option<String>,
     /// Names of the tools actually enabled for this session (issue #233).
     ///
     /// When `Some`, the "Tool use guidelines" section only emits the
@@ -343,7 +347,19 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(goal_text.clone());
     }
 
-    // 14. Appended system prompt (--append-system-prompt)
+    // 14. Structured working memory (dynamic — changes as the task progresses).
+    // Keep this explicit and bounded at the caller so it remains useful rather
+    // than becoming a second unstructured transcript.
+    if let Some(task_context) = &opts.task_context {
+        if !task_context.trim().is_empty() {
+            parts.push(format!(
+                "\n<task_context>\n{}\n</task_context>",
+                task_context.trim()
+            ));
+        }
+    }
+
+    // 15. Appended system prompt (--append-system-prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
@@ -360,7 +376,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         );
     }
 
-    // 16. Tool-retry and output-deadline hints.
+    // 17. Tool-retry and output-deadline hints.
     // When a tool call fails (malformed JSON, permission denied, etc.), the
     // error is returned as a tool_result. The model MUST retry the failed
     // tool call with corrected arguments — do not abandon the task.
@@ -736,6 +752,19 @@ mod tests {
             cwd_pos > boundary_pos,
             "Working directory must appear after the dynamic boundary"
         );
+    }
+
+    #[test]
+    fn test_task_context_in_dynamic_section() {
+        let opts = SystemPromptOptions {
+            task_context: Some("Current objective: fix context handling".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let context_pos = prompt.find("<task_context>").unwrap();
+        assert!(context_pos > boundary_pos);
+        assert!(prompt.contains("Current objective: fix context handling"));
     }
 
     #[test]

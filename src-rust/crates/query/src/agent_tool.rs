@@ -1359,6 +1359,7 @@ impl Tool for AgentTool {
             max_turns: resolved_max_turns,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
+            task_context: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             output_style_name: ctx.config.output_style.clone(),

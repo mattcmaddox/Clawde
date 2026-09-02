@@ -28,11 +28,13 @@ pub mod diagnostics;
 pub mod goal_loop;
 pub mod live_smoke;
 pub mod managed_orchestrator;
+pub mod relevant_context;
 pub(crate) mod repeat_guard;
 pub mod sanitize;
 pub mod session_memory;
 pub mod session_title;
 pub mod skill_prefetch;
+pub mod task_state;
 pub(crate) mod tool_exec;
 pub mod tool_use_tracker;
 pub mod verify;
@@ -68,6 +70,9 @@ pub use goal_loop::{
 pub use live_smoke::{
     run_live_semantic_smoke, run_live_semantic_smoke_with_config, LiveSmokeReport,
 };
+pub use relevant_context::{
+    build_request_context, select_relevant_context, ContextSelection, RequestContext,
+};
 pub use runner::*;
 pub use sanitize::sanitize_history;
 pub use session_memory::{
@@ -76,6 +81,7 @@ pub use session_memory::{
 pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
+pub use task_state::{ComplexityLedger, FocusState, TaskDecision, TaskFailure, TaskState};
 pub use verify::{CheckResult, VerifyPolicy, VerifyReport, VerifyVerdict};
 
 use clawde_api::{
@@ -123,6 +129,8 @@ pub struct QueryConfig {
     pub max_turns: u32,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Structured working memory for the current task, injected on every turn.
+    pub task_context: Option<String>,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     /// Persisted output-style / persona name (e.g. `"cathead"`) from the core
@@ -255,6 +263,7 @@ impl Default for QueryConfig {
             max_turns: clawde_core::constants::MAX_TURNS_DEFAULT,
             system_prompt: None,
             append_system_prompt: None,
+            task_context: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             output_style_name: None,
@@ -1410,6 +1419,52 @@ fn build_instruction_pin(messages: &[Message]) -> Option<String> {
     Some(truncate_instruction_pin(text))
 }
 
+/// Build a bounded task snapshot from the latest instruction and recent
+/// observable tool activity. This is intentionally deterministic: it provides
+/// continuity without asking a second model to summarize every turn.
+#[allow(dead_code)]
+fn build_task_context(messages: &[Message], instruction: &Option<String>) -> String {
+    let mut lines = Vec::new();
+    if let Some(instruction) = instruction {
+        lines.push(format!("Current objective: {}", instruction));
+    }
+
+    let mut recent_tools = Vec::new();
+    for message in messages.iter().rev() {
+        if let clawde_core::types::MessageContent::Blocks(blocks) = &message.content {
+            for block in blocks.iter().rev() {
+                if let ContentBlock::ToolUse { name, .. } = block {
+                    recent_tools.push(name.as_str());
+                    if recent_tools.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+        }
+        if recent_tools.len() >= 5 {
+            break;
+        }
+    }
+    if !recent_tools.is_empty() {
+        recent_tools.reverse();
+        lines.push(format!("Recent tools: {}", recent_tools.join(", ")));
+    }
+
+    let pending = messages
+        .iter()
+        .filter(|message| message.has_tool_use())
+        .count();
+    if pending > 0 {
+        lines.push(format!("Tool-bearing turns in context: {}", pending));
+    }
+
+    lines.push(
+        "Preserve the objective, use existing evidence, and do not restart completed exploration."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1446,6 +1501,9 @@ pub async fn run_query_loop(
     // last user message would lose the marker after the first tool round or on
     // resume — deactivating the plan gate and context.
     let mut active_task_id = accepted_task_id_from_messages(messages);
+    // Loop-local authoritative projection. Unlike transcript-derived context,
+    // this survives synthetic messages, compaction, and continuation rounds.
+    let mut task_state = TaskState::from_messages(messages);
 
     // Opt-in prompt-injection guard (decide.rs): block before any model call
     // when a user TEXT message carries an instruction-override phrase.
@@ -1897,6 +1955,35 @@ pub async fn run_query_loop(
                         let _ = tx.send(QueryEvent::Status(note));
                     }
                 }
+                let validation_context = verify_report.as_ref().map(|report| report.headline.clone());
+                task_state.set_runtime_evidence(
+                    active_plan_context(
+                        &tool_ctx.working_dir,
+                        &tool_ctx.session_id,
+                        active_task_id.as_deref(),
+                    ),
+                    validation_context,
+                    $assistant_msg
+                        .snapshot_patch
+                        .as_ref()
+                        .map(|patch| patch.files.clone())
+                        .unwrap_or_default(),
+                );
+                // The persistent projection is updated for diagnostics and the
+                // next request; this turn's system prompt was already built
+                // before validation completed.
+                // Keep the latest runtime evidence in the loop-local projection;
+                // the next iteration renders this updated state into its prompt.
+                task_state.set_runtime_evidence(
+                    task_state.runtime.plan_step.clone(),
+                    verify_report.as_ref().map(|report| report.headline.clone()),
+                    $assistant_msg
+                        .snapshot_patch
+                        .as_ref()
+                        .map(|patch| patch.files.clone())
+                        .unwrap_or_default(),
+                );
+
                 let plan_advance_evidence = clawde_core::PlanAdvanceEvidence {
                     turn_made_writes: wrote_files,
                     has_scoped_diff: $assistant_msg.snapshot_patch.is_some()
@@ -2212,6 +2299,18 @@ pub async fn run_query_loop(
         // api/provider message vectors below, never to `messages`, so history
         // and the compact summary stay clean.
         let instruction_pin = build_instruction_pin(messages);
+        // Keep a compact, deterministic task snapshot separate from the
+        // transcript. It is rebuilt every turn so the model retains focus
+        // after compaction without persisting synthetic prompt text.
+        task_state.apply_messages(messages);
+        if let Some(plan_context) = active_plan_context(
+            &tool_ctx.working_dir,
+            &tool_ctx.session_id,
+            active_task_id.as_deref(),
+        ) {
+            task_state.set_runtime_evidence(Some(plan_context), None, Vec::new());
+        }
+        let task_context = task_state.render();
 
         // Goal re-anchoring (arXiv 2505.02709, Zylos 2026): every N tool calls,
         // restate the current task at the END of the request — the position
@@ -2239,8 +2338,27 @@ pub async fn run_query_loop(
             }
         }
 
+        // Build a provider-safe request view. The durable transcript remains
+        // untouched; only completed older rounds may be omitted.
+        let request_context = build_request_context(
+            messages,
+            instruction_pin.as_deref().unwrap_or_default(),
+            &task_state
+                .changed_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            compact::resolve_context_window(
+                config.model_registry.as_deref(),
+                "anthropic",
+                &config.model,
+            ),
+        );
+        let request_messages = &request_context.messages;
+
         // Build API request
-        let mut api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+        let mut api_messages: Vec<ApiMessage> =
+            request_messages.iter().map(ApiMessage::from).collect();
         if let Some(ref pin) = instruction_pin {
             api_messages.push(ApiMessage::from(&Message::user(format!(
                 "## Current task\n{}\n\nThis is the user's latest instruction — stay on it. If a later user message changes it, the later message wins.",
@@ -2275,6 +2393,7 @@ pub async fn run_query_loop(
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
             let mut patched = config.clone();
+            patched.task_context = Some(task_context.clone());
 
             // Progressive tool disclosure (issue #233 completion): populate
             // `enabled_tools` from the live tool set this run exposes so
@@ -2883,6 +3002,7 @@ pub async fn run_query_loop(
                     {
                         let mut patched_sys = config.clone();
                         patched_sys.enabled_tools = Some(vec![]);
+                        patched_sys.task_context = Some(task_state.render());
                         system_for_provider = build_system_prompt(&patched_sys);
                     }
                     let effective_max_tokens = provider
@@ -2900,7 +3020,7 @@ pub async fn run_query_loop(
                         };
                     // Capture before provider_tools is moved into ProviderRequest.
                     let had_tools_for_turn = !provider_tools.is_empty();
-                    let mut provider_messages: Vec<clawde_core::types::Message> = messages
+                    let mut provider_messages: Vec<clawde_core::types::Message> = request_messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
@@ -3622,14 +3742,16 @@ pub async fn run_query_loop(
                         if batch_cancelled {
                             return QueryOutcome::Cancelled;
                         }
-                        messages.push(Message {
+                        let tool_result_message = Message {
                             role: clawde_core::types::Role::User,
                             content: clawde_core::types::MessageContent::Blocks(tool_results),
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
                             turn_meta: None,
-                        });
+                        };
+                        task_state.apply_message(&tool_result_message);
+                        messages.push(tool_result_message);
 
                         // D4/D5 shared within-turn post-steps (real auto-lint
                         // after edits + context-refresh read tracking) — see
@@ -4596,7 +4718,9 @@ pub async fn run_query_loop(
 
                     // Append tool results as a user message so the history remains
                     // valid (every tool_use is answered) even on cancellation.
-                    messages.push(Message::user_blocks(result_blocks));
+                    let tool_result_message = Message::user_blocks(result_blocks);
+                    task_state.apply_message(&tool_result_message);
+                    messages.push(tool_result_message);
 
                     // If the batch was abandoned due to cancellation, stop the loop
                     // now rather than sending the (cancelled) results back to the model.
@@ -4613,6 +4737,12 @@ pub async fn run_query_loop(
                         &mut file_tracker,
                         &mut context_files,
                         event_tx.as_ref(),
+                    );
+                    // Preserve runtime evidence for the next provider request.
+                    task_state.set_runtime_evidence(
+                        task_state.runtime.plan_step.clone(),
+                        task_state.runtime.validation.clone(),
+                        context_files.clone(),
                     );
 
                     // Continue the loop to send results back to the model
@@ -5030,6 +5160,7 @@ mod tests {
             max_turns: 10,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
+            task_context: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             output_style_name: None,
