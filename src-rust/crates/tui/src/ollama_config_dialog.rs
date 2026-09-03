@@ -99,6 +99,10 @@ pub struct OllamaConfigDialogState {
     pub models: Vec<OllamaModel>,
     pub selected_model_idx: usize,
     pub model_scroll_offset: usize,
+    /// Exact model names currently loaded in the server's VRAM (from the
+    /// periodic `/api/ps` poll). Drives the loaded-state markers in the
+    /// model picker; kept outside `models` so it survives refreshes.
+    pub loaded_model_names: Vec<String>,
     pub health: HealthStatus,
     /// Vim-modal insert state (only used when vim is enabled).
     pub vim_search: VimSearch,
@@ -123,9 +127,31 @@ impl OllamaConfigDialogState {
             models: Vec::new(),
             selected_model_idx: 0,
             model_scroll_offset: 0,
+            loaded_model_names: Vec::new(),
             health: HealthStatus::Untested,
             vim_search: VimSearch::new(),
         }
+    }
+
+    /// Replace the loaded-in-VRAM snapshot (exact model names from
+    /// `/api/ps`). Called on screen open and when a poll updates.
+    pub fn set_loaded_model_names(&mut self, names: Vec<String>) {
+        self.loaded_model_names = names;
+    }
+
+    /// Whether an exact model tag is currently loaded in VRAM. Ollama treats
+    /// a bare tag as `:latest`, so `foo` and `foo:latest` are the same model;
+    /// any other explicit tag (`foo:7b`) is distinct.
+    pub fn is_model_loaded(&self, name: &str) -> bool {
+        let canonical = |tag: &str| {
+            tag.strip_suffix(":latest")
+                .map(|bare| bare.to_string())
+                .unwrap_or_else(|| tag.to_string())
+        };
+        let wanted = canonical(name);
+        self.loaded_model_names
+            .iter()
+            .any(|loaded| canonical(loaded) == wanted)
     }
 
     /// Open the dialog with optional current values.
@@ -448,12 +474,13 @@ fn render_default_view(
 ) {
     let pink = Color::Rgb(233, 30, 99);
     let dim = Color::Rgb(90, 90, 90);
+    let muted = Color::Rgb(180, 180, 180);
     let dialog_bg = CLAWDE_PANEL_BG;
 
     render_dark_overlay(frame, area);
 
     let width = 56u16.min(area.width.saturating_sub(4));
-    let height = 11u16;
+    let height = 12u16;
     let dialog_area = centered_rect(width, height, area);
     state.last_rect.set(dialog_area);
     render_dialog_bg(frame, dialog_area);
@@ -535,13 +562,49 @@ fn render_default_view(
     ]));
 
     lines.push(Line::from(""));
+    // Loaded-models summary (spec §Model/server behavior: use /api/ps to
+    // mark loaded models). Surfaced even in the fast-path view so the user
+    // sees what the server is holding before connecting.
+    let loaded_count = state.loaded_model_names.len();
+    let loaded_line = if loaded_count == 0 {
+        Line::from(Span::styled(
+            "   No models loaded in VRAM",
+            Style::default().fg(dim),
+        ))
+    } else {
+        let preview = state
+            .loaded_model_names
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = loaded_count.saturating_sub(2);
+        let more_str = if more > 0 {
+            format!(" +{} more", more)
+        } else {
+            String::new()
+        };
+        Line::from(vec![
+            Span::styled("   ● ", Style::default().fg(Color::Rgb(76, 175, 80))),
+            Span::styled(
+                format!("{loaded_count} loaded in VRAM: {preview}{more_str}"),
+                Style::default().fg(muted),
+            ),
+        ])
+    };
+    lines.push(loaded_line);
     let mut hint_spans = vec![
         Span::styled("enter", Style::default().fg(dim)),
         Span::styled(" connect  ", Style::default().fg(dim)),
         Span::styled("j/k", Style::default().fg(dim)),
         Span::styled(" navigate  ", Style::default().fg(dim)),
         Span::styled("e", Style::default().fg(dim)),
-        Span::styled(" edit", Style::default().fg(dim)),
+        Span::styled(" edit  ", Style::default().fg(dim)),
+        Span::styled("t", Style::default().fg(dim)),
+        Span::styled(" test  ", Style::default().fg(dim)),
+        Span::styled("r", Style::default().fg(dim)),
+        Span::styled(" refresh", Style::default().fg(dim)),
     ];
     if _vim_enabled {
         hint_spans.push(Span::styled("   -- NORMAL --", Style::default().fg(dim)));
@@ -913,6 +976,13 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
         {
             let is_selected = i == state.selected_model_idx;
             let indicator = if is_selected { "▸" } else { " " };
+            // Loaded-state marker (spec §TUI layout): "●" green when the
+            // model is resident in VRAM, "○" dim when installed only.
+            let (loaded_marker, marker_color) = if state.is_model_loaded(&model.name) {
+                ("●", Color::Rgb(76, 175, 80))
+            } else {
+                ("○", dim)
+            };
 
             let row_style = if is_selected {
                 Style::default()
@@ -929,6 +999,14 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
 
             lines.push(Line::from(vec![
                 Span::styled(format!(" {} ", indicator), row_style),
+                Span::styled(
+                    loaded_marker.to_string(),
+                    if is_selected {
+                        Style::default().bg(highlight_bg).fg(marker_color)
+                    } else {
+                        Style::default().fg(marker_color)
+                    },
+                ),
                 Span::styled(format!("{:<30}", model.name), row_style),
                 Span::styled(
                     format!("{:>6}  {:<8}  {:<6}", size_str, quant_str, params_str),
@@ -943,14 +1021,33 @@ fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area:
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let loaded_count = state
+        .models
+        .iter()
+        .filter(|model| state.is_model_loaded(&model.name))
+        .count();
+    let mut hint_spans = vec![
         Span::styled("j/k", Style::default().fg(dim)),
         Span::styled(" select  ", Style::default().fg(dim)),
         Span::styled("enter", Style::default().fg(dim)),
         Span::styled(" confirm  ", Style::default().fg(dim)),
+        Span::styled("r", Style::default().fg(dim)),
+        Span::styled(" refresh  ", Style::default().fg(dim)),
         Span::styled("esc", Style::default().fg(dim)),
         Span::styled(" back", Style::default().fg(dim)),
-    ]));
+    ];
+    if loaded_count > 0 {
+        hint_spans.push(Span::styled(
+            format!("   ● loaded in VRAM ({loaded_count})"),
+            Style::default().fg(Color::Rgb(76, 175, 80)),
+        ));
+    } else {
+        hint_spans.push(Span::styled(
+            "   ○ = installed only",
+            Style::default().fg(dim),
+        ));
+    }
+    lines.push(Line::from(hint_spans));
 
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);
@@ -1291,6 +1388,42 @@ mod tests {
         state.phase = OllamaConfigPhase::EditField(OllamaConfigField::Host);
         state.insert_char('x');
         assert_eq!(state.health, HealthStatus::Untested);
+    }
+
+    #[test]
+    fn test_loaded_model_markers() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+        state.set_loaded_model_names(vec!["qwen2.5-coder:7b".to_string()]);
+
+        let models = vec![
+            OllamaModel {
+                name: "qwen2.5-coder:7b".to_string(),
+                size: 4_700_000_000,
+                quantization: "Q4_K_M".to_string(),
+                parameter_size: "7B".to_string(),
+            },
+            OllamaModel {
+                name: "llama3:8b".to_string(),
+                size: 4_000_000_000,
+                quantization: "Q4_0".to_string(),
+                parameter_size: "8B".to_string(),
+            },
+        ];
+        state.ping_success(models);
+        assert!(state.is_model_loaded("qwen2.5-coder:7b"));
+        // Bare tag and `:latest` are the same model to Ollama...
+        state.set_loaded_model_names(vec!["llama3:latest".to_string()]);
+        assert!(state.is_model_loaded("llama3"));
+        assert!(state.is_model_loaded("llama3:latest"));
+        // ...but a versioned tag is distinct from any other tag.
+        assert!(!state.is_model_loaded("llama3:8b"));
+        assert!(!state.is_model_loaded("qwen2.5-coder:7b"));
+
+        // The snapshot survives a refresh cycle (models replaced, loaded
+        // names kept) — this is why it lives outside `models`.
+        state.set_loaded_model_names(vec![]);
+        assert!(!state.is_model_loaded("qwen2.5-coder:7b"));
     }
 
     #[test]

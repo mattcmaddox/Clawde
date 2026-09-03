@@ -311,8 +311,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+k", "openFreeModelPopup", KeyContext::Chat),
         ("alt+u", "cycleFreeUpstream", KeyContext::Chat),
         ("alt+t", "cycleFreeTask", KeyContext::Chat),
-        // ========== OLLAMA MODE TOGGLE ==========
-        ("alt+o", "toggleOllama", KeyContext::Chat),
+        // ========== OLLAMA ==========
+        // Alt+O opens the centralized Ollama configuration screen
+        // (host, model, mode). Mode switching lives inside the screen
+        // and at /ollama online|isolated.
+        ("alt+o", "openOllamaConfig", KeyContext::Chat),
         // ========== EFFORT ==========
         // Alt+H/L step reasoning up/down along the model's supported ladder
         // (clamped — never wraps). Alt+E opens the visual effort picker.

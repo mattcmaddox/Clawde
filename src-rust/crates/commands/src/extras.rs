@@ -337,13 +337,8 @@ impl SlashCommand for OllamaModeCommand {
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
             ArgCompletion {
-                value: "online".into(),
-                description: "Ollama explicit-only mode; network tools allowed".into(),
-                available: true,
-            },
-            ArgCompletion {
-                value: "isolated".into(),
-                description: "Ollama isolated — network tools blocked for privacy".into(),
+                value: "config".into(),
+                description: "Open the Ollama configuration screen".into(),
                 available: true,
             },
             ArgCompletion {
@@ -352,18 +347,13 @@ impl SlashCommand for OllamaModeCommand {
                 available: true,
             },
             ArgCompletion {
-                value: "config".into(),
-                description: "Open the Ollama configuration screen".into(),
-                available: true,
-            },
-            ArgCompletion {
                 value: "online".into(),
-                description: "Allow network-capable tools".into(),
+                description: "Apply and persist Online mode (network tools allowed)".into(),
                 available: true,
             },
             ArgCompletion {
                 value: "isolated".into(),
-                description: "Block network-capable tools".into(),
+                description: "Apply and persist Isolated mode (network tools blocked)".into(),
                 available: true,
             },
         ]
@@ -406,13 +396,13 @@ impl SlashCommand for OllamaModeCommand {
 
         if arg.eq_ignore_ascii_case("config") || arg.is_empty() {
             return CommandResult::Message(
-                "Open the Ollama configuration screen to set the remote host, select an installed model, and tune context, keep-alive, and output limits.".to_string(),
+                "Open the Ollama configuration screen with /ollama to set the remote host, select an installed model, and tune context, keep-alive, and output limits.".to_string(),
             );
         }
 
         match arg.to_ascii_lowercase().as_str() {
             "online" | "isolated" => CommandResult::Message(format!(
-                "Ollama mode change requested: {arg}. Use Alt+O or the TUI Ollama configuration screen to apply it."
+                "Ollama mode is applied from the TUI with /ollama {arg} (or Alt+O, then switch mode inside the screen)."
             )),
             _ => CommandResult::Message(
                 "Usage: /ollama [config|status|online|isolated]. The TUI configuration screen is the centralized place for Ollama host, installed-model selection, and inference options.".to_string(),

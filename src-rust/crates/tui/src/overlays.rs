@@ -2395,6 +2395,7 @@ pub fn render_keybindings_overlay(
             "openModePicker" => "Mode picker",
             "openCommandPalette" => "Command palette",
             "openKatbanControls" => "Katban controls",
+            "openOllamaConfig" => "Ollama config screen",
             _ => &action,
         };
 

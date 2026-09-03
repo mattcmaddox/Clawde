@@ -3080,6 +3080,99 @@ impl App {
         let _ = settings.save_sync();
     }
 
+    /// Open the centralized Ollama configuration screen, prepopulated from
+    /// the effective settings, with a background health check when a host is
+    /// already saved. Single entry point shared by `/ollama`, `/ollama
+    /// config`, `/connect ollama`, and Alt+O (spec §Canonical entry point).
+    fn open_ollama_config_screen(&mut self) {
+        // Use the same merged settings view as runtime provider resolution so
+        // both the documented top-level `providers` location and the TUI's
+        // nested `config.provider_configs` location populate this dialog
+        // consistently.
+        let effective_config = Settings::load_sync()
+            .ok()
+            .map(|settings| settings.effective_config())
+            .unwrap_or_else(|| self.config.clone());
+        let ollama_config = effective_config.provider_configs.get("ollama");
+        let current_url = ollama_config.and_then(|config| config.api_base.clone());
+        let current_model = if effective_config.provider.as_deref() == Some("ollama") {
+            effective_config
+                .model
+                .as_deref()
+                .map(|model| model.strip_prefix("ollama/").unwrap_or(model).to_string())
+        } else {
+            ollama_config
+                .and_then(|config| config.options.get("model"))
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        };
+        let has_saved_host = current_url.is_some();
+        // Seed the loaded-in-VRAM markers from the footer poll so the model
+        // list shows them immediately, before the next poll tick.
+        let loaded = self
+            .ollama_loaded_models
+            .iter()
+            .map(|model| model.name.clone())
+            .collect();
+        self.ollama_config_dialog.set_loaded_model_names(loaded);
+        self.ollama_config_dialog.open(current_url, current_model);
+        if has_saved_host {
+            // Refresh the health dot in the background while keeping the
+            // fast Enter-to-connect view available.
+            self.start_ollama_ping(false);
+        }
+    }
+
+    /// Apply an Ollama Online/Isolated mode immediately: update the live
+    /// session config, persist to settings, rebuild the free chain, and sync
+    /// the network-block flag. Shared by `/ollama online|isolated` (command
+    /// consolidation) and the Alt+O toggle path.
+    fn apply_ollama_mode(&mut self, mode: clawde_core::OllamaMode) {
+        let mode_val = match mode {
+            clawde_core::OllamaMode::Online => "online",
+            clawde_core::OllamaMode::Isolated => "isolated",
+        };
+        // Update the live session config before persisting. The CLI copies
+        // App.config into ToolContext before the next turn; without this, the
+        // global flag would be the only live signal and could leak one
+        // session's isolation state into another.
+        self.config
+            .provider_configs
+            .entry("ollama".to_string())
+            .or_default()
+            .options
+            .insert(
+                "mode".to_string(),
+                serde_json::Value::String(mode_val.to_string()),
+            );
+        // Persist to settings so the choice survives restarts.
+        if let Ok(mut settings) = Settings::load_sync() {
+            settings
+                .providers
+                .entry("ollama".to_string())
+                .or_default()
+                .options
+                .insert(
+                    "mode".to_string(),
+                    serde_json::Value::String(mode_val.to_string()),
+                );
+            let _ = settings.save_sync();
+            // Rebuild the free provider chain so the mode change takes effect
+            // immediately without a restart, and refresh the TUI's free-model
+            // upstream list so the status bar and /ctx-viz reflect the
+            // rebuilt chain.
+            self.refresh_free_provider();
+        }
+        self.ollama_mode = mode;
+        // Sync the network-block flag so tools are denied immediately.
+        clawde_core::set_ollama_network_blocked(mode == clawde_core::OllamaMode::Isolated);
+        let label = match mode {
+            clawde_core::OllamaMode::Online => "online (network allowed)",
+            clawde_core::OllamaMode::Isolated => "isolated (network blocked)",
+        };
+        self.status_message = Some(format!("Ollama mode: {}.", label));
+    }
+
     /// Start an asynchronous Ollama request and invalidate older results.
     fn start_ollama_ping(&mut self, for_model_picker: bool) {
         self.ollama_ping_request_id = self.ollama_ping_request_id.wrapping_add(1);
@@ -3933,6 +4026,29 @@ impl App {
         if cmd == "ollama" && args.trim().eq_ignore_ascii_case("status") {
             return false;
         }
+        // `/ollama` consolidation (spec §Canonical entry point): the screen
+        // is the single entry point. Bare `/ollama` and `/ollama config`
+        // open it; `online`/`isolated` apply and persist the mode
+        // immediately; `status` and unknown args stay at the commands layer.
+        if cmd == "ollama" {
+            match args.trim().to_ascii_lowercase().as_str() {
+                "" | "config" => {
+                    self.close_secondary_views();
+                    self.open_ollama_config_screen();
+                    return true;
+                }
+                "online" | "isolated" => {
+                    let mode = if args.trim().eq_ignore_ascii_case("online") {
+                        clawde_core::OllamaMode::Online
+                    } else {
+                        clawde_core::OllamaMode::Isolated
+                    };
+                    self.apply_ollama_mode(mode);
+                    return true;
+                }
+                _ => {}
+            }
+        }
         // `/mode <name>` (with args) still goes to the CLI command executor so
         // the full config/tool/permission sync runs. Bare `/mode` (no args)
         // falls through to `intercept_slash_command("mode")`, which opens the
@@ -4277,6 +4393,15 @@ impl App {
             }
         }
 
+        // `/connect ollama` reuses the Ollama configuration screen directly
+        // (spec §Canonical entry point) instead of routing through the
+        // provider list. Bare `/connect` opens the list.
+        if cmd == "connect" && args.trim().eq_ignore_ascii_case("ollama") {
+            self.close_secondary_views();
+            self.open_ollama_config_screen();
+            return true;
+        }
+
         // /theme create: open the interactive theme creator (list + editor +
         // 256-color grid). Plain /theme keeps the quick-pick list.
         if cmd == "theme" && args.trim() == "create" {
@@ -4614,54 +4739,13 @@ impl App {
                 true
             }
             "ollama" => {
-                use clawde_core::OllamaMode;
-                let next = match self.ollama_mode {
-                    OllamaMode::Online => OllamaMode::Isolated,
-                    OllamaMode::Isolated => OllamaMode::Online,
-                };
-                let mode_val = match next {
-                    OllamaMode::Online => "online",
-                    OllamaMode::Isolated => "isolated",
-                };
-                // Update the live session config before persisting. The CLI
-                // copies App.config into ToolContext before the next turn;
-                // without this, the global flag would be the only live signal
-                // and could leak one session's isolation state into another.
-                self.config
-                    .provider_configs
-                    .entry("ollama".to_string())
-                    .or_default()
-                    .options
-                    .insert(
-                        "mode".to_string(),
-                        serde_json::Value::String(mode_val.to_string()),
-                    );
-                // Persist to settings so the choice survives restarts.
-                if let Ok(mut settings) = Settings::load_sync() {
-                    settings
-                        .providers
-                        .entry("ollama".to_string())
-                        .or_default()
-                        .options
-                        .insert(
-                            "mode".to_string(),
-                            serde_json::Value::String(mode_val.to_string()),
-                        );
-                    let _ = settings.save_sync();
-                    // Rebuild the free provider chain so the mode change takes
-                    // effect immediately without a restart, and refresh the
-                    // TUI's free-model upstream list so the status bar and
-                    // /ctx-viz reflect the rebuilt chain.
-                    self.refresh_free_provider();
-                }
-                self.ollama_mode = next;
-                // Sync the network-block flag so tools are denied immediately.
-                clawde_core::set_ollama_network_blocked(next == OllamaMode::Isolated);
-                let label = match next {
-                    OllamaMode::Online => "online (network allowed)",
-                    OllamaMode::Isolated => "isolated (network blocked)",
-                };
-                self.status_message = Some(format!("Ollama mode: {}.", label));
+                // Consolidated (spec §Canonical entry point): the config
+                // screen is the canonical destination for bare `/ollama`
+                // (this arm — also Alt+O). `/ollama <arg>` variants are
+                // handled in `intercept_slash_command_with_args` before this
+                // match, except `/ollama status`, which stays at the
+                // commands layer for its async query.
+                self.open_ollama_config_screen();
                 true
             }
             "doctor" => {
@@ -6800,6 +6884,19 @@ impl App {
                                 self.start_ollama_ping(true);
                             }
                         }
+                        KeyCode::Char('t') => {
+                            // Explicit connection test: background health
+                            // probe, dot updates in place (no phase change).
+                            if self.ollama_config_dialog.can_connect() {
+                                self.start_ollama_ping(false);
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            // Refresh: re-ping and reopen the model list.
+                            if self.ollama_config_dialog.can_connect() {
+                                self.start_ollama_ping(true);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -6896,6 +6993,12 @@ impl App {
                         KeyCode::Esc => {
                             // Go back to default view instead of closing
                             self.ollama_config_dialog.back_to_default();
+                        }
+                        KeyCode::Char('r') => {
+                            // Refresh the installed-model list in place.
+                            if self.ollama_config_dialog.can_connect() {
+                                self.start_ollama_ping(true);
+                            }
                         }
                         KeyCode::Up => {
                             self.ollama_config_dialog.move_model_up();
@@ -7007,38 +7110,10 @@ impl App {
                         }
 
                         match selected.id.as_str() {
-                            // Ollama — open config dialog for host URL + model
+                            // Ollama — reuse the centralized configuration
+                            // screen (spec §Canonical entry point).
                             "ollama" => {
-                                // Use the same merged settings view as runtime provider
-                                // resolution so both the documented top-level `providers`
-                                // location and the TUI's nested `config.provider_configs`
-                                // location populate this dialog consistently.
-                                let effective_config = Settings::load_sync()
-                                    .ok()
-                                    .map(|settings| settings.effective_config())
-                                    .unwrap_or_else(|| self.config.clone());
-                                let ollama_config = effective_config.provider_configs.get("ollama");
-                                let current_url =
-                                    ollama_config.and_then(|config| config.api_base.clone());
-                                let current_model = if effective_config.provider.as_deref()
-                                    == Some("ollama")
-                                {
-                                    effective_config.model.as_deref().map(|model| {
-                                        model.strip_prefix("ollama/").unwrap_or(model).to_string()
-                                    })
-                                } else {
-                                    ollama_config
-                                        .and_then(|config| config.options.get("model"))
-                                        .and_then(|value| value.as_str())
-                                        .map(str::to_owned)
-                                };
-                                let has_saved_host = current_url.is_some();
-                                self.ollama_config_dialog.open(current_url, current_model);
-                                if has_saved_host {
-                                    // Refresh the health dot in the background while
-                                    // keeping the fast Enter-to-connect view available.
-                                    self.start_ollama_ping(false);
-                                }
+                                self.open_ollama_config_screen();
                             }
                             // Other local providers — activate immediately, no key needed
                             "lmstudio" | "llamacpp" => {
@@ -9818,7 +9893,7 @@ impl App {
                 }
                 false
             }
-            "toggleOllama" => {
+            "openOllamaConfig" => {
                 if !self.is_streaming {
                     self.intercept_slash_command("ollama");
                 }
@@ -14755,7 +14830,7 @@ mod tests {
     }
 
     #[test]
-    fn ollama_toggle_updates_live_session_config() {
+    fn ollama_mode_args_apply_and_persist_immediately() {
         let _home = TestHome::acquire();
         let was_blocked = clawde_core::is_ollama_network_blocked();
         let mut app = make_app();
@@ -14763,17 +14838,68 @@ mod tests {
             app.config.resolve_ollama_mode(),
             clawde_core::OllamaMode::Online
         );
-        assert!(app.intercept_slash_command("ollama"));
+        assert!(app.intercept_slash_command_with_args("ollama", "isolated"));
         assert_eq!(
             app.config.resolve_ollama_mode(),
             clawde_core::OllamaMode::Isolated
         );
-        assert!(app.intercept_slash_command("ollama"));
+        assert!(clawde_core::is_ollama_network_blocked());
+        assert!(app.intercept_slash_command_with_args("ollama", "online"));
         assert_eq!(
             app.config.resolve_ollama_mode(),
             clawde_core::OllamaMode::Online
         );
+        assert!(!clawde_core::is_ollama_network_blocked());
+        // The mode was persisted to settings.
+        let persisted = Settings::load_sync()
+            .expect("settings load")
+            .providers
+            .get("ollama")
+            .and_then(|c| c.options.get("mode"))
+            .and_then(|v| v.as_str().map(str::to_owned));
+        assert_eq!(persisted.as_deref(), Some("online"));
         clawde_core::set_ollama_network_blocked(was_blocked);
+    }
+
+    #[test]
+    fn bare_ollama_command_opens_config_screen() {
+        let mut app = make_app();
+        assert!(!app.ollama_config_dialog.visible);
+        assert!(app.intercept_slash_command("ollama"));
+        assert!(app.ollama_config_dialog.visible);
+        app.ollama_config_dialog.close();
+
+        // `/ollama config` opens the same screen (spec §Canonical entry
+        // point), consumed via the with-args dispatcher.
+        assert!(app.intercept_slash_command_with_args("ollama", "config"));
+        assert!(app.ollama_config_dialog.visible);
+    }
+
+    #[test]
+    fn ollama_test_and_refresh_keys_ping_server() {
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+
+        // `t` — explicit connection test: pings in the background without
+        // leaving the fast-path view.
+        app.handle_key_event(press_key(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.ollama_ping_pending);
+        assert!(!app.ollama_ping_for_models);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Default
+        );
+
+        // Drain the pending flag, then `r` — refresh opens the model list.
+        app.ollama_ping_pending = false;
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.ollama_ping_pending);
+        assert!(app.ollama_ping_for_models);
+        assert_eq!(
+            app.ollama_config_dialog.phase,
+            crate::ollama_config_dialog::OllamaConfigPhase::Pinging
+        );
     }
 
     #[test]

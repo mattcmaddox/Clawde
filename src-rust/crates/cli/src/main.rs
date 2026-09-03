@@ -6730,6 +6730,10 @@ async fn run_interactive(
             ollama_latest = Some(models);
         }
         if let Some(models) = ollama_latest {
+            // Keep the Ollama config screen's loaded-in-VRAM markers in sync
+            // with the footer poll so an open screen refreshes live.
+            app.ollama_config_dialog
+                .set_loaded_model_names(models.iter().map(|m| m.name.clone()).collect());
             app.ollama_loaded_models = models;
         }
 
