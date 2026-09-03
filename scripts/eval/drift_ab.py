@@ -35,6 +35,7 @@ direction), 2 = runs were not evaluable (infra flakiness).
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import statistics
@@ -221,6 +222,32 @@ def write_pin_settings(home: Path, pin_upstream: str) -> None:
     settings_path.write_text(json.dumps(settings, indent=2))
 
 
+def apply_local_model_settings(home: Path, model: str) -> None:
+    """Seed provider options a remote-GPU Ollama needs that defaults don't cover.
+
+    Ollama serves requests with num_ctx=2048 unless the request overrides it,
+    which would silently truncate Clawde's ~12K-token system prompt (tools
+    included) before <task_context> — the same failure mode as the Groq
+    max_total_tokens quirk. Pin the context window in the seeded settings so
+    every request carries it.
+
+    The host itself is NOT seeded: Clawde resolves Ollama hosts from
+    OLLAMA_HOST / settings api_base and deliberately rejects loopback —
+    Ollama is remote-GPU-only. Set OLLAMA_HOST to the GPU machine when
+    launching the eval; a seeded eval home has no host of its own.
+    """
+    provider = model.split("/", 1)[0] if "/" in model else None
+    if provider != "ollama":
+        return
+    settings_path = home / "settings.json"
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    providers = settings.setdefault("providers", {})
+    ollama = providers.setdefault("ollama", {})
+    options = ollama.setdefault("options", {})
+    options["num_ctx"] = 16_384
+    settings_path.write_text(json.dumps(settings, indent=2))
+
+
 def run_arm(
     scenario: str,
     turns: list[str],
@@ -247,6 +274,7 @@ def run_arm(
     }
     try:
         seed_home(home, auth_file, sabotage=[])
+        apply_local_model_settings(home, model)
         if pin_upstream:
             write_pin_settings(home, pin_upstream)
         for rel, content in SCENARIO_FILES.get(scenario, {}).items():
@@ -265,7 +293,10 @@ def run_arm(
                 max_turns=max_turns,
                 timeout=timeout,
                 session_id=run_id,
-                permission_mode=None,
+                # Eval runs execute real Write/Edit/Bash in throwaway cwds;
+                # without a mode, gated tools auto-deny in headless mode and
+                # the metrics measure permission failures instead of drift.
+                permission_mode="bypass-permissions",
                 resume=turn_index > 0,
             )
             this_run, _ = run_headless(turn_prompt, **cmd_args)
