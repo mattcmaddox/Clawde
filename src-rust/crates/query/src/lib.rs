@@ -647,6 +647,143 @@ fn sanitize_thinking_from_trajectory(messages: &mut [Message]) {
     }
 }
 
+/// Parse the tool-call payloads a broken local server delivers as plain text.
+///
+/// Accepts either the bare form (the whole message is one JSON object) or the
+/// wrapped form (one or more `<tool_call>…</tool_call>` sections). Returns a
+/// non-empty list only when the text is *entirely* tool-call payloads — any
+/// mixed prose invalidates the lift so ordinary output is never misread.
+fn parse_text_tool_payloads(text: &str) -> Vec<(String, serde_json::Value)> {
+    fn parse_single(s: &str) -> Option<(String, serde_json::Value)> {
+        let obj = serde_json::from_str::<serde_json::Value>(s.trim())
+            .ok()?
+            .as_object()
+            .cloned()?;
+        let name = obj.get("name").and_then(|n| n.as_str())?.to_string();
+        if name.is_empty() {
+            return None;
+        }
+        // `arguments` is the OpenAI shape; `parameters` is a common alias.
+        let args = obj
+            .get("arguments")
+            .or_else(|| obj.get("parameters"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !args.is_object() {
+            return None;
+        }
+        Some((name, args))
+    }
+
+    let mut trimmed = text.trim();
+    // Local models frequently wrap the payload in a Markdown code fence
+    // (```json … ```). Strip one fence before parsing — the full-message-only
+    // rule still applies to the interior.
+    if let Some(after) = trimmed.strip_prefix("`") {
+        let first_line_end = trimmed.find('\n').unwrap_or(0);
+        let (first_line, rest) = trimmed.split_at(first_line_end);
+        if first_line.trim_start().starts_with("```") {
+            let body = rest.trim();
+            if let Some(stripped) = body.strip_suffix("```") {
+                trimmed = stripped.trim();
+            }
+        }
+        let _ = after;
+    }
+    if let Some(rest) = trimmed.strip_prefix("<tool_call>") {
+        let mut out = Vec::new();
+        let mut rest = rest;
+        loop {
+            let Some(end) = rest.find("</tool_call>") else {
+                out.clear();
+                return out;
+            };
+            match parse_single(&rest[..end]) {
+                Some(p) => out.push(p),
+                None => {
+                    out.clear();
+                    return out;
+                }
+            }
+            rest = &rest[end + "</tool_call>".len()..];
+            match rest.trim_start().strip_prefix("<tool_call>") {
+                Some(next) => rest = next,
+                None => break,
+            }
+        }
+        if !rest.trim().is_empty() {
+            out.clear();
+        }
+        return out;
+    }
+    parse_single(trimmed).into_iter().collect()
+}
+
+/// Lift a text-encoded tool call into a real ToolUse block.
+///
+/// Some OpenAI-compatible local servers (observed on Ollama 0.33.x serving
+/// Qwen2.5-Coder templates) report the `tools` capability but never run their
+/// tool-call parser: the model's call arrives as *content* — a perfectly
+/// formed `{"name": …, "arguments": …}` JSON object — with the response's
+/// `tool_calls` absent on every transport (native and /v1, streaming and
+/// not). The wire intent is unambiguous, so at assembly time, when the turn
+/// produced no native tool calls, a message consisting solely of such a
+/// payload is lifted into real blocks. Guards keep the repair surgical:
+/// exactly one text block, full-message payload only, and every named tool
+/// must be one this turn actually advertised.
+fn lift_text_tool_calls(
+    content_blocks: &mut Vec<ContentBlock>,
+    known_tools: &[Box<dyn Tool>],
+) -> usize {
+    if content_blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+    {
+        return 0;
+    }
+    let text_positions: Vec<usize> = content_blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| matches!(b, ContentBlock::Text { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if text_positions.len() != 1 {
+        return 0;
+    }
+    let pos = text_positions[0];
+    let ContentBlock::Text { text } = &content_blocks[pos] else {
+        return 0;
+    };
+    let payloads = parse_text_tool_payloads(text);
+    if payloads.is_empty()
+        || !payloads
+            .iter()
+            .all(|(name, _)| known_tools.iter().any(|t| t.name() == name))
+    {
+        return 0;
+    }
+    let lifted: Vec<ContentBlock> = payloads
+        .into_iter()
+        .map(|(name, args)| ContentBlock::ToolUse {
+            id: format!("txtcall_{}", uuid::Uuid::new_v4()),
+            name,
+            input: args,
+            thought_signature: None,
+        })
+        .collect();
+    let count = lifted.len();
+    let mut rebuilt = Vec::with_capacity(content_blocks.len() - 1 + count);
+    for (i, block) in content_blocks.drain(..).enumerate() {
+        if i == pos {
+            rebuilt.extend(lifted.iter().cloned());
+        } else {
+            rebuilt.push(block);
+        }
+    }
+    *content_blocks = rebuilt;
+    count
+}
+
 /// Resolve the effective effort level for a turn.
 ///
 /// Ultracode is a keyword-activated effort: if the most recent user message
@@ -3854,6 +3991,18 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    // Text-to-tool lift: broken local servers deliver tool
+                    // calls as plain-text JSON with no native tool_calls —
+                    // repair the block list now that it is fully assembled,
+                    // before the tool-use branch decides the next turn.
+                    let lifted_calls = lift_text_tool_calls(&mut content_blocks, tools);
+                    if lifted_calls > 0 {
+                        info!(
+                            count = lifted_calls,
+                            "Lifted text-encoded tool call(s) into native tool_use blocks"
+                        );
+                    }
+
                     let mut assistant_msg = Message {
                         role: clawde_core::types::Role::Assistant,
                         content: clawde_core::types::MessageContent::Blocks(content_blocks.clone()),
@@ -5062,6 +5211,110 @@ impl StreamHandler for ChannelStreamHandler {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod text_tool_lift_tests {
+    use super::{lift_text_tool_calls, parse_text_tool_payloads};
+    use async_trait::async_trait;
+    use clawde_core::types::ContentBlock;
+    use clawde_tools::{PermissionLevel, Tool};
+
+    struct FakeTool {
+        name: &'static str,
+    }
+    #[async_trait]
+    impl Tool for FakeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "fake"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &clawde_tools::ToolContext,
+        ) -> clawde_tools::ToolResult {
+            clawde_tools::ToolResult::success("fake")
+        }
+    }
+
+    fn write_tool() -> FakeTool {
+        FakeTool { name: "Write" }
+    }
+
+    #[test]
+    fn bare_json_payload_parses() {
+        let parsed = parse_text_tool_payloads(
+            r#"{"name": "Write", "arguments": {"path": "/tmp/a", "content": "hi"}}"#,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "Write");
+        assert_eq!(parsed[0].1["path"], "/tmp/a");
+    }
+
+    #[test]
+    fn wrapped_payloads_parse_and_mixed_prose_rejects() {
+        let wrapped = "<tool_call>\n{\"name\": \"Write\", \"arguments\": {\"path\": \"/tmp/a\", \"content\": \"x\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"Write\", \"arguments\": {\"path\": \"/tmp/b\", \"content\": \"y\"}}\n</tool_call>";
+        assert_eq!(parse_text_tool_payloads(wrapped).len(), 2);
+        // Mixed prose invalidates the whole lift — never misread ordinary text.
+        assert!(parse_text_tool_payloads("I'll write that now: {\"name\": \"Write\"}").is_empty());
+        assert!(parse_text_tool_payloads("just a normal sentence").is_empty());
+    }
+
+    #[test]
+    fn fenced_payload_parses() {
+        let fenced = "```json\n{\"name\": \"Write\", \"arguments\": {\"path\": \"/tmp/a\", \"content\": \"hi\"}}\n```";
+        let parsed = parse_text_tool_payloads(fenced);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "Write");
+    }
+
+    #[test]
+    fn lift_replaces_text_with_tool_use_only_for_known_tools() {
+        let known = [Box::new(write_tool()) as Box<dyn Tool>];
+        let mut blocks = vec![ContentBlock::Text {
+            text: r#"{"name": "Write", "arguments": {"path": "/tmp/a", "content": "hi"}}"#.into(),
+        }];
+        assert_eq!(lift_text_tool_calls(&mut blocks, &known), 1);
+        assert!(matches!(&blocks[0], ContentBlock::ToolUse { name, .. } if name == "Write"));
+
+        // Unknown tool name: untouched.
+        let mut unknown = vec![ContentBlock::Text {
+            text: r#"{"name": "NotExist", "arguments": {}}"#.into(),
+        }];
+        assert_eq!(lift_text_tool_calls(&mut unknown, &known), 0);
+
+        // Native tool calls already present: untouched.
+        let mut native = vec![
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "Write".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+        ];
+        assert_eq!(lift_text_tool_calls(&mut native, &known), 0);
+
+        // Multiple text blocks (real prose around a JSON snippet): untouched.
+        let mut multi = vec![
+            ContentBlock::Text {
+                text: "step 1".into(),
+            },
+            ContentBlock::Text {
+                text: r#"{"name": "Write", "arguments": {}}"#.into(),
+            },
+        ];
+        assert_eq!(lift_text_tool_calls(&mut multi, &known), 0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
