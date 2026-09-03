@@ -650,6 +650,14 @@ pub async fn write_transcript_entry(path: &Path, entry: &TranscriptEntry) -> cra
         .await?;
 
     file.write_all(line.as_bytes()).await?;
+    // flush() is REQUIRED here, not optional hygiene: tokio's `fs::File`
+    // returns Ok from `write_all` once the bytes are queued to a blocking
+    // task, and dropping the file detaches that task (tokio fs/file.rs has
+    // no Drop impl; its docs require `flush` before drop). Without this,
+    // appends are fire-and-forget and lose ~1-2% of lines under load —
+    // observed as `Ok`-returned writes whose line never reached the file.
+    // flush() completes the pending write before returning.
+    file.flush().await?;
     // Transcripts may contain secrets read into context; keep them
     // owner-only (issue #212).
     crate::accounts::set_user_only_perms(path);
@@ -1592,6 +1600,30 @@ mod tests {
     use super::*;
     use crate::types::{Message, MessageContent, Role};
     use tempfile::tempdir;
+
+    /// Regression test for silent append loss in `write_transcript_entry`:
+    /// tokio's `fs::File` returns Ok from `write_all` once bytes are queued
+    /// to a blocking task, and dropping the file detaches that task. Before
+    /// the `flush()` fix, ~1-2% of appends under load were acknowledged but
+    /// never reached the file (observed: 299/300 lines with zero errors).
+    /// 500 sequential appends must land 500 lines, every run.
+    #[tokio::test]
+    async fn write_transcript_entry_never_silently_drops_appends() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append-reliability.jsonl");
+        for i in 0..500 {
+            let entry = make_state_event_entry(
+                "sess-reliability",
+                StateEvent::ValidationRecorded {
+                    verdict: StateValidationVerdict::Passed,
+                    headline: format!("append-{i}"),
+                },
+            );
+            write_transcript_entry(&path, &entry).await.unwrap();
+        }
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, 500, "every acknowledged append must be durable");
+    }
 
     fn make_msg(role: Role) -> Message {
         Message {
