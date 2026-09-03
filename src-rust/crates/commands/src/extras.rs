@@ -324,7 +324,7 @@ impl SlashCommand for ColorSetCommand {
     }
 }
 
-// ---- /ollama (tab completion only — intercepted by the TUI) --------------
+// ---- /ollama --------------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for OllamaModeCommand {
@@ -332,7 +332,7 @@ impl SlashCommand for OllamaModeCommand {
         "ollama"
     }
     fn description(&self) -> &str {
-        "Toggle Ollama connectivity mode (online / isolated)"
+        "Configure Ollama mode, remote host, and inference options"
     }
     fn arg_completions(&self, _partial: &str) -> Vec<ArgCompletion> {
         vec![
@@ -351,11 +351,27 @@ impl SlashCommand for OllamaModeCommand {
                 description: "Show loaded models and reported VRAM usage".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "config".into(),
+                description: "Open the Ollama configuration screen".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "online".into(),
+                description: "Allow network-capable tools".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "isolated".into(),
+                description: "Block network-capable tools".into(),
+                available: true,
+            },
         ]
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        if args.trim().eq_ignore_ascii_case("status") {
+        let arg = args.trim();
+        if arg.eq_ignore_ascii_case("status") {
             return match clawde_core::ollama_status_for_config(&ctx.config).await {
                 Ok(status) if status.models.is_empty() => CommandResult::Message(
                     "Ollama is reachable; no models are loaded in VRAM.".to_string(),
@@ -388,11 +404,19 @@ impl SlashCommand for OllamaModeCommand {
             };
         }
 
-        CommandResult::Message(
-            "Ollama mode is toggled in the TUI. Use /ollama without arguments \
-             or press Alt+O to switch between online and isolated mode.\n\
-             Use /ollama status to see loaded models and reported VRAM."
-                .to_string(),
-        )
+        if arg.eq_ignore_ascii_case("config") || arg.is_empty() {
+            return CommandResult::Message(
+                "Open the Ollama configuration screen to set the remote host, select an installed model, and tune context, keep-alive, and output limits.".to_string(),
+            );
+        }
+
+        match arg.to_ascii_lowercase().as_str() {
+            "online" | "isolated" => CommandResult::Message(format!(
+                "Ollama mode change requested: {arg}. Use Alt+O or the TUI Ollama configuration screen to apply it."
+            )),
+            _ => CommandResult::Message(
+                "Usage: /ollama [config|status|online|isolated]. The TUI configuration screen is the centralized place for Ollama host, installed-model selection, and inference options.".to_string(),
+            ),
+        }
     }
 }

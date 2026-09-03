@@ -1131,8 +1131,7 @@ pub mod config {
                     .map(str::to_owned)
             });
 
-        let allow_local_host = ollama_local_host_allowed(settings);
-        explicit_host.and_then(|host| normalize_ollama_host_with_local(&host, allow_local_host))
+        explicit_host.and_then(|host| normalize_ollama_host_with_local(&host))
     }
 
     /// Normalize and validate an Ollama endpoint.
@@ -1143,14 +1142,12 @@ pub mod config {
     /// inference on the local CPU. The returned URL is the native Ollama root;
     /// `/v1` is removed because the OpenAI-compatible provider appends it.
     pub fn normalize_ollama_host(raw: &str) -> Option<String> {
-        normalize_ollama_host_with_local(raw, false)
+        normalize_ollama_host_with_local(raw)
     }
 
-    /// Normalize an Ollama endpoint, optionally allowing an explicitly approved
-    /// loopback target for an isolated local profile. The caller must enforce
-    /// the profile-level opt-in; ordinary automatic/remote resolution uses
-    /// [`normalize_ollama_host`] and remains fail-closed.
-    fn normalize_ollama_host_with_local(raw: &str, allow_local: bool) -> Option<String> {
+    /// Normalize an Ollama endpoint. Loopback and unspecified addresses are
+    /// always rejected; Ollama is supported only on another computer's GPU.
+    fn normalize_ollama_host_with_local(raw: &str) -> Option<String> {
         let mut host = raw.trim().trim_end_matches('/').to_string();
         // Strip common API path variants that users may accidentally include.
         // Order matters: check longer suffixes first to avoid partial matches.
@@ -1180,28 +1177,15 @@ pub mod config {
             return None;
         }
         let hostname = parsed.host_str()?.to_ascii_lowercase();
-        if !allow_local && matches!(hostname.as_str(), "localhost" | "localhost.localdomain") {
+        if matches!(hostname.as_str(), "localhost" | "localhost.localdomain") {
             return None;
         }
         if let Ok(address) = hostname.parse::<std::net::IpAddr>() {
-            if address.is_unspecified() || (!allow_local && address.is_loopback()) {
+            if address.is_unspecified() || address.is_loopback() {
                 return None;
             }
         }
         Some(host)
-    }
-
-    /// Local Ollama is permitted only for an explicitly isolated profile. A
-    /// bare `allow_local_host` flag in the default/automatic mode is ignored so
-    /// automatic free-mode routing can never fall back to local CPU inference.
-    fn ollama_local_host_allowed(settings: &Settings) -> bool {
-        let isolated = ollama_option(settings, "mode")
-            .and_then(|value| serde_json::from_value::<OllamaMode>(value.clone()).ok())
-            == Some(OllamaMode::Isolated);
-        isolated
-            && ollama_option(settings, "allow_local_host")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
     }
 
     /// Look up one Ollama `options` value from either the embedded config's
@@ -2765,12 +2749,11 @@ pub mod config {
                             .filter(|base| !base.trim().is_empty())
                             .map(str::to_owned)
                     });
-                let allow_local_host = provider_cfg
-                    .and_then(|provider| provider.options.get("allow_local_host"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                // Local Ollama is an explicit isolated-profile exception only.
+                // Keep this path consistent with `resolve_ollama_host_from` so
+                // Online mode cannot accidentally target a local CPU daemon.
                 return candidate.and_then(|base| {
-                    normalize_ollama_host_with_local(&substitute_env_vars(&base), allow_local_host)
+                    normalize_ollama_host_with_local(&substitute_env_vars(&base))
                 });
             }
 
@@ -4046,6 +4029,24 @@ pub mod config {
                 normalize_ollama_host("http://user:pass@gpu.example.test:11434"),
                 None
             );
+        }
+
+        #[test]
+        fn resolve_provider_api_base_rejects_loopback_in_online_mode() {
+            let mut config = Config::default();
+            let provider = config
+                .provider_configs
+                .entry("ollama".to_string())
+                .or_default();
+            provider.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+            provider
+                .options
+                .insert("mode".to_string(), serde_json::json!("online"));
+            provider
+                .options
+                .insert("allow_local_host".to_string(), serde_json::json!(true));
+
+            assert_eq!(config.resolve_provider_api_base("ollama"), None);
         }
 
         #[test]

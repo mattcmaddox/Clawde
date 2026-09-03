@@ -283,11 +283,14 @@ impl OllamaConfigDialogState {
             return Err("Host URL is required".to_string());
         }
         // Try to normalize the URL
+        if url.contains("[::1]") || url.contains("::1") {
+            return Err("Ollama must run on another computer's GPU".to_string());
+        }
         let normalized = clawde_core::config::normalize_ollama_host(url).ok_or_else(|| {
             if !url.starts_with("http://") && !url.starts_with("https://") {
                 "URL must start with http:// or https://".to_string()
             } else {
-                "Invalid host URL".to_string()
+                "Ollama must run on another computer's GPU or use a remote hostname".to_string()
             }
         })?;
         Ok(normalized)
@@ -1238,6 +1241,24 @@ mod tests {
         let result = state.validate_host_url();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "http://gpu-host.example:11434");
+    }
+
+    #[test]
+    fn test_validate_host_url_rejects_local_ollama() {
+        let mut state = OllamaConfigDialogState::new();
+        state.open(None, None);
+
+        for host in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434",
+        ] {
+            state.host_url_input = host.to_string();
+            assert!(
+                state.validate_host_url().is_err(),
+                "accepted local host {host}"
+            );
+        }
     }
 
     #[test]

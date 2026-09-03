@@ -3096,9 +3096,10 @@ impl App {
         let mut settings =
             Settings::load_sync().map_err(|e| format!("Failed to load settings: {}", e))?;
 
-        // Normalize the host URL (strip /v1 if present)
+        // Validate again at persistence time so every TUI path remains
+        // remote-only, even if called without the normal dialog validation.
         let normalized_host = clawde_core::config::normalize_ollama_host(host_url)
-            .unwrap_or_else(|| host_url.to_string());
+            .ok_or_else(|| "Ollama must run on another computer's GPU".to_string())?;
 
         let provider = settings
             .config
