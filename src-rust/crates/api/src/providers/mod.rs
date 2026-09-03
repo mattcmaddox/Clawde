@@ -30,6 +30,11 @@ pub use openai_compat_providers::{
     vultr_ai, xai, zai, zhipu,
 };
 
+pub mod ollama_native;
+pub use ollama_native::{ollama_native, OllamaNativeProvider};
+
+pub mod ollama_options;
+
 pub mod metadata;
 pub use metadata::{env_var_for, key_url_for, provider_metadata, MetaLookup, ProviderMetadata};
 

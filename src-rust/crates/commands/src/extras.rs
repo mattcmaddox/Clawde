@@ -356,6 +356,16 @@ impl SlashCommand for OllamaModeCommand {
                 description: "Apply and persist Isolated mode (network tools blocked)".into(),
                 available: true,
             },
+            ArgCompletion {
+                value: "refresh".into(),
+                description: "Re-probe the configured host and refresh its model list".into(),
+                available: true,
+            },
+            ArgCompletion {
+                value: "discover".into(),
+                description: "Scan the LAN for Ollama servers (bounded, remote-only)".into(),
+                available: true,
+            },
         ]
     }
 

@@ -984,37 +984,29 @@ impl Default for SettingsScreen {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Ollama preset helpers — map human labels to/from raw API values
+// Ollama preset helpers — thin wrappers over the centralized conversion
+// module (clawde_api::providers::ollama_options) so the /settings screen and
+// the Ollama screen can never drift apart. The settings screen keeps the
+// legacy "model default" first-entry convention; the canonical tables live
+// in the api crate.
 // ---------------------------------------------------------------------------
 
-const OLLAMA_CTX_PRESETS: &[(&str, u64)] = &[
-    ("model default", 0),
-    ("4K", 4_096),
-    ("8K", 8_192),
-    ("12K", 12_288),
-    ("16K", 16_384),
-    ("24K", 24_576),
-    ("32K", 32_768),
-    ("64K", 65_536),
-    ("128K", 131_072),
-];
+use clawde_api::providers::ollama_options as oo;
+use std::sync::LazyLock;
 
-const OLLAMA_PREDICT_PRESETS: &[(&str, u64)] = &[
-    ("512", 512),
-    ("1K", 1_024),
-    ("2K", 2_048),
-    ("4K", 4_096),
-    ("8K", 8_192),
-];
+static OLLAMA_CTX_PRESETS: LazyLock<&[(&str, u64)]> = LazyLock::new(|| {
+    let mut all: Vec<(&str, u64)> = vec![("model default", 0)];
+    all.extend(oo::OLLAMA_CTX_PRESETS.iter().copied());
+    all.leak()
+});
 
-const OLLAMA_KEEP_ALIVE_PRESETS: &[(&str, i64)] = &[
-    ("unload after request", 0),
-    ("5 min", 300),
-    ("10 min", 600),
-    ("30 min", 1_800),
-    ("1 hour", 3_600),
-    ("forever", -1),
-];
+static OLLAMA_PREDICT_PRESETS: LazyLock<&[(&str, u64)]> = LazyLock::new(|| {
+    let mut all: Vec<(&str, u64)> = vec![("model default", 0)];
+    all.extend(oo::OLLAMA_PREDICT_PRESETS.iter().copied());
+    all.leak()
+});
+
+const OLLAMA_KEEP_ALIVE_PRESETS: &[(&str, i64)] = oo::OLLAMA_KEEP_ALIVE_PRESETS;
 
 fn keep_alive_value_to_i64(v: &serde_json::Value) -> Option<i64> {
     v.as_i64()
@@ -1022,16 +1014,14 @@ fn keep_alive_value_to_i64(v: &serde_json::Value) -> Option<i64> {
 }
 
 fn num_ctx_to_preset(n: u64) -> String {
-    for (label, val) in OLLAMA_CTX_PRESETS {
-        if *val == n {
-            return label.to_string();
-        }
+    if n == 0 {
+        return "model default".to_string();
     }
-    format!("{}K (custom)", n / 1024)
+    oo::num_ctx_to_label(n)
 }
 
 fn preset_to_num_ctx(preset: &str) -> Option<u64> {
-    for (label, val) in OLLAMA_CTX_PRESETS {
+    for (label, val) in OLLAMA_CTX_PRESETS.iter() {
         if *label == preset {
             return (*val != 0).then_some(*val);
         }
@@ -1040,16 +1030,14 @@ fn preset_to_num_ctx(preset: &str) -> Option<u64> {
 }
 
 fn num_predict_to_preset(n: u64) -> String {
-    for (label, val) in OLLAMA_PREDICT_PRESETS {
-        if *val == n {
-            return label.to_string();
-        }
+    if n == 0 {
+        return "model default".to_string();
     }
-    format!("{}", n)
+    oo::num_predict_to_label(n)
 }
 
 fn preset_to_num_predict(preset: &str) -> u64 {
-    for (label, val) in OLLAMA_PREDICT_PRESETS {
+    for (label, val) in OLLAMA_PREDICT_PRESETS.iter() {
         if *label == preset {
             return *val;
         }
@@ -1058,19 +1046,11 @@ fn preset_to_num_predict(preset: &str) -> u64 {
 }
 
 fn keep_alive_to_preset(n: i64) -> String {
-    for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
-        if *val == n {
-            return label.to_string();
-        }
-    }
-    if n < 0 {
-        return "forever".to_string();
-    }
-    format!("{}s (custom)", n)
+    oo::keep_alive_to_label(n)
 }
 
 fn preset_to_keep_alive(preset: &str) -> i64 {
-    for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS {
+    for (label, val) in OLLAMA_KEEP_ALIVE_PRESETS.iter() {
         if *label == preset {
             return *val;
         }

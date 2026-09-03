@@ -5,7 +5,7 @@ completions API** (`POST /v1/chat/completions`). That includes:
 
 - **llama.cpp** (`llama-server`) — provider id `llamacpp`
 - **LM Studio** — provider id `lmstudio`
-- **Ollama** (via its `/v1` OpenAI shim) — provider id `ollama`; Clawde requires a non-loopback remote endpoint by default and never falls back to local CPU Ollama. An explicitly isolated profile may opt into a loopback server.
+- **Ollama** (via its native `/api/chat` endpoint) — provider id `ollama`; Clawde requires a non-loopback remote endpoint unconditionally and never falls back to local CPU Ollama. Loopback is rejected in every mode, including isolated profiles with `allow_local_host` set.
 - **vLLM**, **text-generation-webui**, **LocalAI**, and anything else that
   exposes `/v1/chat/completions` — use the generic `openai` provider with a
   custom base URL

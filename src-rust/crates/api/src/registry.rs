@@ -352,10 +352,13 @@ pub fn provider_from_config(
             }
         }
         "ollama" => {
-            let mut provider = providers::ollama();
-            let base = api_base?;
-            provider = provider.with_base_url(base);
-            Some(Arc::new(provider))
+            let host = clawde_core::config::resolve_ollama_host()?;
+            let inner = providers::ollama().with_base_url(
+                clawde_core::config::normalize_ollama_host(&host)
+                    .map(|h| format!("{h}/v1"))
+                    .unwrap_or_else(|| "http://0.0.0.0:1/v1".to_string()),
+            );
+            Some(Arc::new(providers::OllamaNativeProvider::new(inner, host)))
         }
         "lmstudio" | "lm-studio" => {
             let mut provider = providers::lm_studio();
@@ -436,10 +439,8 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     // TUI / connect dialog.
     match provider_id {
         "ollama" => {
-            let settings = clawde_core::config::Settings::load_sync().unwrap_or_default();
-            let config = settings.effective_config();
-            let base = resolve_provider_api_base(&config, "ollama")?;
-            return Some(Arc::new(p::ollama().with_base_url(base)));
+            return crate::providers::ollama_native()
+                .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>);
         }
         "lmstudio" | "lm-studio" => return Some(Arc::new(p::lm_studio())),
         // "llama-server" is the binary name for the modern llama.cpp server.
@@ -1006,12 +1007,8 @@ impl ProviderRegistry {
 
         // Ollama is remote-only and fail-closed. Do not register a dummy
         // localhost provider when no valid remote endpoint is configured.
-        if let Some(base) = clawde_core::config::Settings::load_sync()
-            .ok()
-            .map(|settings| settings.effective_config())
-            .and_then(|config| resolve_provider_api_base(&config, "ollama"))
-        {
-            self.register(Arc::new(p::ollama().with_base_url(base)));
+        if let Some(provider) = crate::providers::ollama_native() {
+            self.register(Arc::new(provider));
         }
         self.register(Arc::new(p::lm_studio()));
         self.register(Arc::new(p::llama_cpp()));

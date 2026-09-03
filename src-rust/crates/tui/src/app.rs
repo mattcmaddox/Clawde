@@ -1600,6 +1600,11 @@ pub struct App {
     /// Whether the active ping should populate the model picker. A background
     /// health refresh leaves the dialog in its current Default phase.
     pub ollama_ping_for_models: bool,
+    /// Monotonic identity for `/ollama discover` LAN scans; stale results are
+    /// dropped by comparing against this counter.
+    pub ollama_discovery_request_id: u64,
+    /// When `true`, the main loop should spawn the bounded LAN discovery scan.
+    pub ollama_discovery_pending: bool,
     /// "Free" composite-provider setup dialog (multi-key health dots).
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Alt+G Katban controls menu (guest links, unblock IPs, status).
@@ -2269,6 +2274,8 @@ impl App {
             ollama_ping_pending: false,
             ollama_ping_request_id: 0,
             ollama_ping_for_models: false,
+            ollama_discovery_request_id: 0,
+            ollama_discovery_pending: false,
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             katban_controls: crate::katban_controls::KatbanControlsState::default(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
@@ -3115,6 +3122,16 @@ impl App {
             .map(|model| model.name.clone())
             .collect();
         self.ollama_config_dialog.set_loaded_model_names(loaded);
+        // Seed mode + canonical request options from the effective settings
+        // through the centralized helper so the screen and the request
+        // pipeline can never disagree.
+        let canonical = clawde_api::providers::ollama_options::canonical_options(
+            &Settings::load_sync().unwrap_or_default(),
+        );
+        self.ollama_config_dialog.set_mode_and_options(
+            self.config.resolve_ollama_mode() == clawde_core::OllamaMode::Isolated,
+            &canonical,
+        );
         self.ollama_config_dialog.open(current_url, current_model);
         if has_saved_host {
             // Refresh the health dot in the background while keeping the
@@ -3183,9 +3200,21 @@ impl App {
         self.ollama_ping_pending = true;
     }
 
-    /// Persist Ollama host URL and model to settings.json.
+    /// Start the bounded LAN discovery scan (spec §Discovery constraints:
+    /// explicit action only, bounded concurrency/duration, never loopback,
+    /// never silent). The main loop spawns the scan; results arrive as
+    /// `QueryEvent::OllamaDiscoveryResult`.
+    fn start_ollama_discovery(&mut self) {
+        self.ollama_discovery_request_id = self.ollama_discovery_request_id.wrapping_add(1);
+        self.ollama_discovery_pending = true;
+        self.status_message = Some("Discovering Ollama servers on the LAN…".to_string());
+    }
+
+    /// Persist Ollama host URL, model, and the screen's canonical request
+    /// options to settings.json.
     /// Returns Ok(()) on success, or Err(message) on failure.
     fn persist_ollama_config(&mut self, host_url: &str, model: &str) -> Result<(), String> {
+        use clawde_api::providers::ollama_options as oo;
         let mut settings =
             Settings::load_sync().map_err(|e| format!("Failed to load settings: {}", e))?;
 
@@ -3208,6 +3237,48 @@ impl App {
         provider
             .options
             .insert("model".to_string(), serde_json::json!(model));
+
+        // Canonical request options: write only explicitly-set values (spec:
+        // "omit unless explicitly set"), converting preset labels back to
+        // raw values through the centralized helper.
+        let dialog = &self.ollama_config_dialog;
+        let set = |options: &mut std::collections::HashMap<String, serde_json::Value>,
+                   key: &str,
+                   value: Option<serde_json::Value>| {
+            match value {
+                Some(v) => {
+                    options.insert(key.to_string(), v);
+                }
+                None => {
+                    options.remove(key);
+                }
+            }
+        };
+        set(
+            &mut provider.options,
+            "num_ctx",
+            oo::label_to_num_ctx(&dialog.num_ctx_label).map(serde_json::Value::from),
+        );
+        set(
+            &mut provider.options,
+            "num_predict",
+            oo::label_to_num_predict(&dialog.num_predict_label).map(serde_json::Value::from),
+        );
+        set(
+            &mut provider.options,
+            "keep_alive",
+            oo::label_to_keep_alive(&dialog.keep_alive_label).map(serde_json::Value::from),
+        );
+        set(
+            &mut provider.options,
+            "temperature",
+            oo::label_to_temperature(&dialog.temperature_label).map(serde_json::Value::from),
+        );
+        set(
+            &mut provider.options,
+            "top_p",
+            oo::label_to_top_p(&dialog.top_p_label).map(serde_json::Value::from),
+        );
 
         settings
             .save_sync()
@@ -4029,7 +4100,8 @@ impl App {
         // `/ollama` consolidation (spec §Canonical entry point): the screen
         // is the single entry point. Bare `/ollama` and `/ollama config`
         // open it; `online`/`isolated` apply and persist the mode
-        // immediately; `status` and unknown args stay at the commands layer.
+        // immediately; `refresh` re-probes the configured host; `status`
+        // and unknown args stay at the commands layer.
         if cmd == "ollama" {
             match args.trim().to_ascii_lowercase().as_str() {
                 "" | "config" => {
@@ -4044,6 +4116,30 @@ impl App {
                         clawde_core::OllamaMode::Isolated
                     };
                     self.apply_ollama_mode(mode);
+                    return true;
+                }
+                "refresh" => {
+                    // Spec §Model/server behavior: refresh on explicit
+                    // action. Re-probe the configured host and open the
+                    // refreshed model list.
+                    self.close_secondary_views();
+                    self.open_ollama_config_screen();
+                    if self.ollama_config_dialog.can_connect() {
+                        self.start_ollama_ping(true);
+                    } else {
+                        self.status_message =
+                            Some("No Ollama host configured — set one in the screen.".to_string());
+                    }
+                    return true;
+                }
+                "discover" => {
+                    // Spec §Discovery constraints: explicit action only,
+                    // bounded concurrency and duration, never loopback,
+                    // never silent. Runs the scan and reports candidates;
+                    // the Ollama screen (already open) receives the winner.
+                    self.close_secondary_views();
+                    self.open_ollama_config_screen();
+                    self.start_ollama_discovery();
                     return true;
                 }
                 _ => {}
@@ -6819,9 +6915,56 @@ impl App {
         if self.ollama_config_dialog.visible {
             match &self.ollama_config_dialog.phase {
                 crate::ollama_config_dialog::OllamaConfigPhase::Default => {
+                    use crate::ollama_config_dialog::OllamaConfigField;
+                    let active_field = self.ollama_config_dialog.active_field;
                     match key.code {
                         KeyCode::Esc => {
                             self.ollama_config_dialog.close();
+                        }
+                        // Mode row: toggle Online/Isolated and apply
+                        // immediately through the shared helper (spec: mode
+                        // changes apply immediately and persist). Arms below
+                        // the generic Enter (connect) arm are unreachable, so
+                        // the Mode/Options value-row arms come FIRST.
+                        KeyCode::Enter if active_field == OllamaConfigField::Mode => {
+                            self.ollama_config_dialog.toggle_mode();
+                            let mode = if self.ollama_config_dialog.mode_isolated {
+                                clawde_core::OllamaMode::Isolated
+                            } else {
+                                clawde_core::OllamaMode::Online
+                            };
+                            self.apply_ollama_mode(mode);
+                        }
+                        KeyCode::Left | KeyCode::Right
+                            if active_field == OllamaConfigField::Mode =>
+                        {
+                            self.ollama_config_dialog.toggle_mode();
+                            let mode = if self.ollama_config_dialog.mode_isolated {
+                                clawde_core::OllamaMode::Isolated
+                            } else {
+                                clawde_core::OllamaMode::Online
+                            };
+                            self.apply_ollama_mode(mode);
+                        }
+                        // Options rows: ←/→ cycles the focused option's
+                        // value through its presets.
+                        KeyCode::Left if active_field == OllamaConfigField::Options => {
+                            self.ollama_config_dialog.cycle_option_value(-1);
+                        }
+                        KeyCode::Right if active_field == OllamaConfigField::Options => {
+                            self.ollama_config_dialog.cycle_option_value(1);
+                        }
+                        KeyCode::Char('h')
+                            if self.prompt_input.vim_enabled
+                                && active_field == OllamaConfigField::Options =>
+                        {
+                            self.ollama_config_dialog.cycle_option_value(-1);
+                        }
+                        KeyCode::Char('l')
+                            if self.prompt_input.vim_enabled
+                                && active_field == OllamaConfigField::Options =>
+                        {
+                            self.ollama_config_dialog.cycle_option_value(1);
                         }
                         KeyCode::Enter => {
                             // Fast path: connect with an existing model. A first-time
@@ -6866,16 +7009,25 @@ impl App {
                             self.ollama_config_dialog.move_next_field();
                         }
                         KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                            self.ollama_config_dialog.move_next_field();
+                            if active_field == OllamaConfigField::Options {
+                                self.ollama_config_dialog.move_option_key(1);
+                            } else {
+                                self.ollama_config_dialog.move_next_field();
+                            }
                         }
                         KeyCode::Up => {
                             self.ollama_config_dialog.move_prev_field();
                         }
                         KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                            self.ollama_config_dialog.move_prev_field();
+                            if active_field == OllamaConfigField::Options {
+                                self.ollama_config_dialog.move_option_key(-1);
+                            } else {
+                                self.ollama_config_dialog.move_prev_field();
+                            }
                         }
                         KeyCode::Char('e') => {
-                            // Enter edit mode for the active field
+                            // Enter edit mode for the active field (no-op on
+                            // Mode/Options value rows)
                             self.ollama_config_dialog.start_edit();
                         }
                         KeyCode::Char('m') => {
@@ -11768,7 +11920,7 @@ impl App {
                 {
                     match result {
                         Ok(models) => {
-                            self.ollama_config_dialog.ping_success(
+                            let removed = self.ollama_config_dialog.ping_success(
                                 models
                                     .into_iter()
                                     .map(|m| crate::ollama_config_dialog::OllamaModel {
@@ -11779,6 +11931,15 @@ impl App {
                                     })
                                     .collect(),
                             );
+                            // Spec §Model/server behavior: when the selected
+                            // model disappeared, we chose the first available
+                            // — say so instead of swapping silently.
+                            if let Some(removed_model) = removed {
+                                let replacement = self.ollama_config_dialog.model_input.clone();
+                                self.status_message = Some(format!(
+                                    "Model '{removed_model}' not found on the server — selected '{replacement}' instead."
+                                ));
+                            }
                         }
                         Err(e) => {
                             self.ollama_config_dialog.ping_failed(e);
@@ -11793,6 +11954,44 @@ impl App {
                         Ok(_) => self.ollama_config_dialog.health_check_succeeded(),
                         Err(_) => self.ollama_config_dialog.health_check_failed(),
                     }
+                }
+            }
+            QueryEvent::OllamaDiscoveryResult {
+                request_id,
+                candidates,
+                scanned,
+            } => {
+                if request_id != self.ollama_discovery_request_id {
+                    return;
+                }
+                if candidates.is_empty() {
+                    self.status_message = Some(format!(
+                        "Ollama discovery: no servers answered on the LAN ({scanned} hosts scanned). Manual entry remains available."
+                    ));
+                    return;
+                }
+                let best = &candidates[0];
+                let listing = candidates
+                    .iter()
+                    .take(3)
+                    .map(|(host, latency, models)| format!("{host} ({models} models, {latency}ms)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if self.ollama_config_dialog.host_url_input.trim().is_empty() {
+                    // Never choose silently (spec): prefill the screen with
+                    // the best candidate but say what happened.
+                    self.ollama_config_dialog.host_url_input = best.0.clone();
+                    self.status_message = Some(format!(
+                        "Ollama discovery found {0}: {1}. Review the host, then press Enter to connect.",
+                        candidates.len(),
+                        listing
+                    ));
+                } else {
+                    self.status_message = Some(format!(
+                        "Ollama discovery found {0}: {1}. Current host kept — edit the Host field to switch.",
+                        candidates.len(),
+                        listing
+                    ));
                 }
             }
         }
@@ -14900,6 +15099,99 @@ mod tests {
             app.ollama_config_dialog.phase,
             crate::ollama_config_dialog::OllamaConfigPhase::Pinging
         );
+    }
+
+    #[test]
+    fn ollama_screen_mode_row_applies_immediately() {
+        let _home = TestHome::acquire();
+        let was_blocked = clawde_core::is_ollama_network_blocked();
+        let mut app = make_app();
+        app.ollama_config_dialog
+            .open(Some("http://gpu.example.test:11434".to_string()), None);
+        // Navigate to the Mode row and flip it in place.
+        app.ollama_config_dialog.move_next_field(); // Model
+        app.ollama_config_dialog.move_next_field(); // Mode
+        app.handle_key_event(press_key(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.ollama_config_dialog.mode_isolated);
+        assert_eq!(
+            app.config.resolve_ollama_mode(),
+            clawde_core::OllamaMode::Isolated
+        );
+        assert!(clawde_core::is_ollama_network_blocked());
+        // Screen stays open after the flip (no connect was triggered).
+        assert!(app.ollama_config_dialog.visible);
+        clawde_core::set_ollama_network_blocked(was_blocked);
+    }
+
+    #[test]
+    fn ollama_discovery_result_updates_status_not_silently_host() {
+        let mut app = make_app();
+        app.ollama_discovery_request_id = 5;
+        // Nothing found: a clear negative result, manual entry remains.
+        app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
+            request_id: 5,
+            candidates: vec![],
+            scanned: 254,
+        });
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no servers answered"));
+
+        // Found candidates with no configured host: prefill + announce —
+        // never a silent switch (spec §Model/server behavior).
+        app.ollama_discovery_request_id = 6;
+        app.ollama_config_dialog.open(None, None);
+        app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
+            request_id: 6,
+            candidates: vec![("http://192.168.1.45:11434".to_string(), 12, 2)],
+            scanned: 254,
+        });
+        assert_eq!(
+            app.ollama_config_dialog.host_url_input,
+            "http://192.168.1.45:11434"
+        );
+        assert!(app
+            .status_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Review the host"));
+
+        // An already-configured host is never overwritten.
+        app.ollama_discovery_request_id = 7;
+        app.ollama_config_dialog.host_url_input = "http://gpu.example.test:11434".to_string();
+        app.handle_query_event(QueryEvent::OllamaDiscoveryResult {
+            request_id: 7,
+            candidates: vec![("http://192.168.1.99:11434".to_string(), 5, 1)],
+            scanned: 254,
+        });
+        assert_eq!(
+            app.ollama_config_dialog.host_url_input,
+            "http://gpu.example.test:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_discover_command_opens_screen_and_requests_scan() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("ollama", "discover"));
+        assert!(app.ollama_discovery_pending);
+        assert!(app.ollama_config_dialog.visible);
+
+        let _home = TestHome::acquire();
+        let mut settings = Settings::default();
+        settings
+            .config
+            .provider_configs
+            .entry("ollama".to_string())
+            .or_default()
+            .api_base = Some("http://gpu.example.test:11434/v1".to_string());
+        settings.save_sync().expect("save settings");
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("ollama", "refresh"));
+        assert!(app.ollama_ping_pending);
+        assert!(app.ollama_ping_for_models);
     }
 
     #[test]

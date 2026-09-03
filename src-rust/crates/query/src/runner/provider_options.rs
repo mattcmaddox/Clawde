@@ -163,6 +163,18 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // Ollama: route the canonical options through the centralized conversion
+    // helper. Chat runs on the native `/api/chat` transport, which honors
+    // every canonical option (`options.num_ctx`, `num_predict`, sampling
+    // controls, top-level `keep_alive`), so the full set rides to dispatch.
+    if provider_id == "ollama" {
+        let canonical: serde_json::Map<String, Value> = options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        return clawde_api::providers::ollama_options::native_options_value(&canonical);
+    }
+
     if options.is_empty() {
         Value::Null
     } else {

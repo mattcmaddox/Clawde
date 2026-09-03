@@ -592,9 +592,9 @@ server. No API key is required. Clawde does **not** fall back to
 unavailable, preventing accidental local CPU inference.
 
 **Base URL:** Reads `providers.ollama.api_base`, then `OLLAMA_HOST`, then
-`providers.ollama.options.default_host`. Clawde appends `/v1` to construct the
-OpenAI-compatible endpoint. Use a DNS name or non-loopback IP for the remote
-GPU host.
+`providers.ollama.options.default_host`. Chat runs on the native
+`/api/chat` route of that host. Use a DNS name or non-loopback IP for the
+remote GPU host.
 
 **Default model:** `llama3.2`
 
@@ -618,6 +618,52 @@ Then run the explicitly configured remote model:
 ```
 clawde --provider ollama --model llama3.2 "explain this code"
 ```
+
+**Command surface (TUI):**
+
+- `/ollama`, `/ollama config`, `/connect ollama`, and Alt+O all open the
+  same Ollama configuration screen: host, installed-model picker with
+  loaded-in-VRAM markers, connectivity mode, and common request options.
+- `/ollama status` reports loaded models and the VRAM sizes reported by
+  Ollama (headless-safe text output).
+- `/ollama online` / `/ollama isolated` apply and persist the connectivity
+  mode immediately.
+- `/ollama refresh` re-probes the configured host and reopens the model
+  list.
+- `/ollama discover` runs a bounded LAN scan for Ollama servers (never
+  loopback, bounded concurrency, per-host timeout) and reports candidates
+  with latency and model counts. It prefills the screen with the best
+  candidate but never switches your configured host silently.
+
+Inside the screen: `t` runs a connection test, `r` refreshes the model
+list, the Mode row toggles Online/Isolated in place, and the Options rows
+cycle `num_ctx`, `num_predict`, `keep_alive`, `temperature`, and `top_p`
+through presets (Left/Right), including "Ollama/model default". The
+effective-options preview shows every set option as applied — the native
+transport honors them all.
+
+**Request options and the native transport:**
+
+Clawde talks to Ollama through the native `/api/chat` endpoint (since
+2026-09; the OpenAI-compatible `/v1` shim is no longer used for chat). The
+native endpoint honors every canonical option, so the screen's options all
+take real effect:
+
+| Option | Stored under | Effect over `/api/chat` |
+|---|---|---|
+| context size | `options.num_ctx` | applied (`options.num_ctx`) |
+| max output | `options.num_predict` | applied (`options.num_predict`) |
+| keep-alive | `options.keep_alive` | applied (top-level `keep_alive`; unload semantics) |
+| temperature | `options.temperature` | applied (`options.temperature`) |
+| top_p | `options.top_p` | applied (`options.top_p`) |
+| stop sequences | `options.stop` | applied (`options.stop`) |
+| seed | `options.seed` | applied (`options.seed`) |
+| repeat/min-p/typical-p/tfs-z/mirostat | `options.*` | applied (`options.*`) |
+
+Unset options are omitted entirely — the Ollama/model default remains
+authoritative. Tool calls use Ollama's native shape (results keyed by
+`tool_name`, history arguments as JSON objects); Clawde converts
+automatically.
 
 **VRAM controls:**
 
@@ -672,7 +718,8 @@ tool access only:
   `WebFetch`.
 - `isolated` removes network-capable tools (web search/fetch, remote triggers,
   MCP tools) and blocks them at dispatch, including with
-  `--dangerously-skip-permissions`. Toggle via `/ollama` to `ollama:isolated`.
+  `--dangerously-skip-permissions`. Toggle with `/ollama isolated` or the
+  Mode row in the Ollama screen.
 Ollama inference itself remains available through the configured endpoint in
 both modes. Isolated mode also removes shell/interpreter execution, sub-agents,
 LSP/MCP resources, test/lint commands, and configured formatter subprocesses;

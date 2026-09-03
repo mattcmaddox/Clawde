@@ -6864,6 +6864,21 @@ async fn run_interactive(
             });
         }
 
+        // ---- Ollama LAN discovery: spawn bounded scan when pending ----
+        if app.ollama_discovery_pending {
+            app.ollama_discovery_pending = false;
+            let request_id = app.ollama_discovery_request_id;
+            let tx = event_tx.clone();
+            tokio::spawn(async move {
+                let (candidates, scanned) = discover_ollama_servers().await;
+                let _ = tx.send(QueryEvent::OllamaDiscoveryResult {
+                    request_id,
+                    candidates,
+                    scanned,
+                });
+            });
+        }
+
         // ---- Drain device auth events from the background task ----
         while let Ok(evt) = device_auth_rx.try_recv() {
             match evt {
@@ -8004,6 +8019,101 @@ async fn ping_ollama_and_fetch_models(
         .ok_or_else(|| "Ollama must run on another computer's GPU".to_string())?;
     let client = reqwest::Client::new();
     fetch_ollama_models_at(&client, &normalized, std::time::Duration::from_secs(5)).await
+}
+
+/// OLLAMA_DISCOVERY_PORT is the well-known Ollama native-API port.
+const OLLAMA_DISCOVERY_PORT: u16 = 11434;
+
+/// Probe one candidate host for an Ollama server.
+/// Returns `(host_url, latency_ms, model_count)` on success.
+async fn probe_ollama_candidate(
+    client: &reqwest::Client,
+    address: std::net::IpAddr,
+) -> Option<(String, u128, usize)> {
+    if address.is_loopback() || address.is_unspecified() {
+        return None;
+    }
+    let host_url = format!("http://{address}:{OLLAMA_DISCOVERY_PORT}");
+    let start = std::time::Instant::now();
+    // Candidate validation (spec §Discovery constraints): remote-host
+    // validation plus a successful /api/tags.
+    let normalized = clawde_core::config::normalize_ollama_host(&host_url)?;
+    let tags_url = format!("{normalized}/api/tags");
+    let response = client
+        .get(&tags_url)
+        .timeout(std::time::Duration::from_millis(1_500))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    let model_count = body
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    Some((host_url, start.elapsed().as_millis(), model_count))
+}
+
+/// Bounded LAN discovery scan for Ollama servers (spec §Discovery
+/// constraints): only the local /24, bounded concurrency, per-host timeout,
+/// no loopback/unspecified/public ranges, no credentials. Returns candidates
+/// sorted by latency plus the number of hosts probed.
+async fn discover_ollama_servers() -> (Vec<(String, u128, usize)>, usize) {
+    // Determine the local /24 from the routing table via a UDP "connect"
+    // (no packets are sent; this just asks the OS which interface would be
+    // used to reach a LAN peer).
+    let local_address = match tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await {
+        Ok(socket) => socket
+            .connect("192.168.1.1:80")
+            .await
+            .and_then(|_| socket.local_addr())
+            .ok(),
+        Err(_) => None,
+    };
+    let Some(local_address) = local_address else {
+        return (Vec::new(), 0);
+    };
+    let std::net::IpAddr::V4(local_v4) = local_address.ip() else {
+        return (Vec::new(), 0);
+    };
+    // Never scan loopback or unspecified ranges.
+    if local_v4.is_loopback() || local_v4.is_unspecified() {
+        return (Vec::new(), 0);
+    }
+    let octets = local_v4.octets();
+    let prefix = format!("{}.{}.{}.", octets[0], octets[1], octets[2]);
+    let local_last = octets[3];
+
+    let client = reqwest::Client::new();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+    let mut handles = Vec::with_capacity(254);
+    for last in 1..=254u8 {
+        if last == local_last {
+            // This machine's own LAN address — its loopback-side daemon is
+            // not a remote GPU host.
+            continue;
+        }
+        let address: std::net::IpAddr = format!("{prefix}{last}").parse().expect("valid IPv4");
+        let client = client.clone();
+        let semaphore = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire().await;
+            probe_ollama_candidate(&client, address).await
+        }));
+    }
+    let mut candidates = Vec::new();
+    let mut scanned = 0usize;
+    for handle in handles {
+        scanned += 1;
+        if let Ok(Some(candidate)) = handle.await {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|(_, latency, _)| *latency);
+    (candidates, scanned)
 }
 
 /// Fetch models from an already-normalized Ollama host.

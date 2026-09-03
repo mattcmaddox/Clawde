@@ -555,6 +555,14 @@ pub enum QueryEvent {
         for_model_picker: bool,
         result: Result<Vec<OllamaPingModel>, String>,
     },
+    /// Result of an explicit `/ollama discover` LAN scan. Candidates are
+    /// `(host_url, latency_ms, model_count)` for every host that answered
+    /// Ollama's `/api/tags`, sorted by latency. Empty when nothing was found.
+    OllamaDiscoveryResult {
+        request_id: u64,
+        candidates: Vec<(String, u128, usize)>,
+        scanned: usize,
+    },
 }
 
 /// A model returned by Ollama's `/api/tags` endpoint.
