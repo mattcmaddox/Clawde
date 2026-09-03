@@ -1304,7 +1304,19 @@ pub mod config {
             return Ok(0);
         };
         let client = reqwest::Client::new();
-        let initial = ollama_status_at(&client, &base_url).await?;
+        ollama_unload_models_at(&client, &base_url, model).await
+    }
+
+    /// Unload already-loaded models at an Ollama base URL that has passed
+    /// validation. Keeping transport separate from URL validation lets the
+    /// HTTP behavior be tested against an ephemeral loopback server without
+    /// routing loopback through the remote-only host resolver.
+    async fn ollama_unload_models_at(
+        client: &reqwest::Client,
+        base_url: &str,
+        model: Option<&str>,
+    ) -> Result<usize, String> {
+        let initial = ollama_status_at(client, base_url).await?;
         let targets: Vec<String> = match model {
             Some(model) => initial
                 .models
@@ -1365,7 +1377,7 @@ pub mod config {
         // not report success while the model is still resident in VRAM.
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let remaining = ollama_status_at(&client, &base_url).await?.models;
+            let remaining = ollama_status_at(client, base_url).await?.models;
             let still_loaded = match model {
                 Some(_) => remaining
                     .iter()
@@ -3786,20 +3798,16 @@ pub mod config {
                 }
             });
 
-            let mut config = Config::default();
-            let provider = config
-                .provider_configs
-                .entry("ollama".to_string())
-                .or_default();
-            provider.api_base = Some(format!("http://{address}/v1"));
-            provider
-                .options
-                .insert("mode".to_string(), serde_json::json!("isolated"));
-            provider
-                .options
-                .insert("allow_local_host".to_string(), serde_json::json!(true));
-            let unload_result =
-                ollama_unload_models_for_config(&config, Some("qwen2.5-coder:7b")).await;
+            let client = reqwest::Client::new();
+            // Transport is exercised directly at the loopback mock; host
+            // validation is covered separately by the resolver tests because
+            // the resolver rejects loopback unconditionally (remote-GPU-only).
+            let unload_result = ollama_unload_models_at(
+                &client,
+                &format!("http://{address}"),
+                Some("qwen2.5-coder:7b"),
+            )
+            .await;
             let server_result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
             assert!(
@@ -3840,20 +3848,13 @@ pub mod config {
                 }
             });
 
-            let mut config = Config::default();
-            let provider = config
-                .provider_configs
-                .entry("ollama".to_string())
-                .or_default();
-            provider.api_base = Some(format!("http://{address}"));
-            provider
-                .options
-                .insert("mode".to_string(), serde_json::json!("isolated"));
-            provider
-                .options
-                .insert("allow_local_host".to_string(), serde_json::json!(true));
-
-            let result = ollama_unload_models_for_config(&config, Some("qwen2.5-coder:7b")).await;
+            let client = reqwest::Client::new();
+            let result = ollama_unload_models_at(
+                &client,
+                &format!("http://{address}"),
+                Some("qwen2.5-coder:7b"),
+            )
+            .await;
             let server_result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
             assert!(server_result.is_ok());
@@ -4050,7 +4051,10 @@ pub mod config {
         }
 
         #[test]
-        fn resolve_ollama_host_allows_loopback_only_for_isolated_explicit_profile() {
+        fn resolve_ollama_host_rejects_loopback_even_for_isolated_profile() {
+            // Remote-GPU-only is unconditional: `allow_local_host` must not
+            // bypass the loopback rejection in any mode (spec §Remote-only
+            // behavior).
             let mut settings = Settings::default();
             let provider = settings
                 .config
@@ -4065,10 +4069,7 @@ pub mod config {
                 .options
                 .insert("allow_local_host".to_string(), serde_json::json!(true));
 
-            assert_eq!(
-                resolve_ollama_host_from(&settings),
-                Some("http://127.0.0.1:11434".to_string())
-            );
+            assert_eq!(resolve_ollama_host_from(&settings), None);
         }
 
         #[test]
@@ -4088,7 +4089,10 @@ pub mod config {
         }
 
         #[test]
-        fn config_provider_base_matches_isolated_local_ollama_profile() {
+        fn config_provider_base_rejects_isolated_local_ollama_profile() {
+            // Mirrors the settings-level rejection: even an explicit isolated
+            // profile with allow_local_host cannot point the provider at a
+            // loopback daemon.
             let mut config = Config::default();
             let provider = config
                 .provider_configs
@@ -4102,10 +4106,7 @@ pub mod config {
                 .options
                 .insert("allow_local_host".to_string(), serde_json::json!(true));
 
-            assert_eq!(
-                config.resolve_provider_api_base("ollama"),
-                Some("http://127.0.0.1:11434".to_string())
-            );
+            assert_eq!(config.resolve_provider_api_base("ollama"), None);
         }
 
         #[test]
