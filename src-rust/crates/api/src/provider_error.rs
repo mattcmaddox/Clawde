@@ -163,6 +163,17 @@ pub enum ProviderError {
 // ---------------------------------------------------------------------------
 
 impl ProviderError {
+    /// Server-provided retry hint in seconds, when the error carries one.
+    ///
+    /// Currently only [`ProviderError::RateLimited`] transports it (from the
+    /// `Retry-After` header or the error body). Callers pace a same-upstream
+    /// retry with it instead of guessing a backoff schedule.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            ProviderError::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
     /// Classify this error for routing, key rotation, and agent recovery.
     pub fn recovery_class(&self) -> RecoveryClass {
         match self {

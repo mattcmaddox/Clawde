@@ -26,6 +26,11 @@ use rand::seq::SliceRandom;
 
 use super::*;
 
+/// Upper bound for honoring a server `Retry-After` hint on a same-upstream
+/// retry (2 minutes). Longer hints (hourly quotas) exceed any reasonable
+/// request budget — fall through instead of stalling the stream.
+const MAX_RETRY_AFTER_WAIT_SECS: u64 = 120;
+
 /// Exponential backoff delay for same-upstream retries (500ms base, 2x,
 /// capped at 8s). Mirrors sub2api's `sameAccountRetryDelayFor` pattern:
 /// transient errors get a short backoff on the same upstream before the
@@ -39,6 +44,50 @@ fn same_upstream_retry_delay_ms(retry_count: u32) -> u64 {
     // 500ms * 2^retry_count, capped at 8s.
     let shift = retry_count.min(4); // 2^4 = 16, 500ms * 16 = 8s
     BASE_MS.saturating_mul(1_u64 << shift).min(MAX_MS)
+}
+
+/// Delay for a same-upstream retry of a rate-limited request that carried no
+/// server hint. Free tiers commonly enforce per-minute token/request windows
+/// and omit `Retry-After` (verified live against Mistral: HTTP 429 code 1300,
+/// no header); the 0.5–8s exponential schedule cannot clear such a window.
+/// Start at 20s and double, capped at 60s — one cleared window is usually
+/// enough. Only reached when same-upstream retries are configured
+/// (`fallback_retries > 0`), i.e. pinned/single-entry chains.
+fn rate_limit_retry_delay_ms(retry_count: u32) -> u64 {
+    const BASE_MS: u64 = 20_000;
+    const MAX_MS: u64 = 60_000;
+    let shift = retry_count.min(2); // 20s -> 40s -> 60s (capped)
+    BASE_MS.saturating_mul(1_u64 << shift).min(MAX_MS)
+}
+
+/// Which backoff schedule a same-upstream retry should use.
+enum SameRetryDelay {
+    /// The upstream rate-limited the request. Uses the server's hint when it
+    /// sent one (capped), otherwise the window-scale schedule.
+    RateLimited { hint_secs: Option<u64> },
+    /// Any other transient failure (5xx, timeout, empty completion) — the
+    /// short exponential schedule.
+    Transient,
+}
+
+impl SameRetryDelay {
+    fn resolve(&self, retry_count: u32) -> u64 {
+        match self {
+            Self::RateLimited { hint_secs: Some(s) } => s
+                .saturating_mul(1000)
+                .clamp(1_000, MAX_RETRY_AFTER_WAIT_SECS * 1000),
+            Self::RateLimited { hint_secs: None } => rate_limit_retry_delay_ms(retry_count),
+            Self::Transient => same_upstream_retry_delay_ms(retry_count),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::RateLimited { hint_secs: Some(_) } => " (honoring Retry-After)",
+            Self::RateLimited { hint_secs: None } => " (rate-limit window wait)",
+            Self::Transient => "",
+        }
+    }
 }
 
 impl FreeProvider {
@@ -1398,17 +1447,25 @@ impl RetryingFreeStream {
     /// Called when a transient failure occurs before first byte and retries
     /// remain. The sleep future is polled at the top of `poll_next` and
     /// launches the retry when it fires.
-    fn schedule_same_upstream_retry(&mut self, idx: usize, model: String) {
+    ///
+    /// `delay` selects the schedule: a rate limit waits on the server's
+    /// `Retry-After` hint when present (capped to [`MAX_RETRY_AFTER_WAIT_SECS`]
+    /// — a bounded wait is strictly better on a pinned/single-entry chain,
+    /// where falling through is impossible and a short fixed backoff cannot
+    /// clear a tokens-per-minute window), or the window-scale schedule when
+    /// the server sent no hint.
+    fn schedule_same_upstream_retry(&mut self, idx: usize, model: String, delay: SameRetryDelay) {
         let retry_count = self.same_upstream_retries.get(&idx).copied().unwrap_or(0);
         self.same_upstream_retries.insert(idx, retry_count + 1);
-        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+        let delay_ms = delay.resolve(retry_count);
         let uid = self.chain[idx].upstream.id;
         tracing::warn!(
-            "FreeProvider: {} failed — same-upstream retry ({}/{}) in {}ms",
+            "FreeProvider: {} failed — same-upstream retry ({}/{}) in {}ms{}",
             uid,
             retry_count + 1,
             self.routing.fallback_retries,
             delay_ms,
+            delay.label(),
         );
         self.retry_sleep = Some(Box::pin(tokio::time::sleep(
             std::time::Duration::from_millis(delay_ms),
@@ -1649,7 +1706,7 @@ impl RetryingFreeStream {
         // advancing to the next provider.
         if self.can_retry_same_upstream(prev_chain_idx) {
             let model = self.current_model.clone();
-            self.schedule_same_upstream_retry(prev_chain_idx, model);
+            self.schedule_same_upstream_retry(prev_chain_idx, model, SameRetryDelay::Transient);
             return true;
         }
         self.upstream_errors.push(reason);
@@ -1729,7 +1786,14 @@ impl Stream for RetryingFreeStream {
                             {
                                 let model = self.current_model.clone();
                                 let idx = self.current_idx;
-                                self.schedule_same_upstream_retry(idx, model);
+                                let delay = if matches!(err, ProviderError::RateLimited { .. }) {
+                                    SameRetryDelay::RateLimited {
+                                        hint_secs: err.retry_after_secs(),
+                                    }
+                                } else {
+                                    SameRetryDelay::Transient
+                                };
+                                self.schedule_same_upstream_retry(idx, model, delay);
                                 continue;
                             }
                             self.upstream_errors.push(reason);
@@ -1764,7 +1828,11 @@ impl Stream for RetryingFreeStream {
                         if self.can_retry_same_upstream(self.current_idx) {
                             let model = self.current_model.clone();
                             let idx = self.current_idx;
-                            self.schedule_same_upstream_retry(idx, model);
+                            self.schedule_same_upstream_retry(
+                                idx,
+                                model,
+                                SameRetryDelay::Transient,
+                            );
                             continue;
                         }
                         self.upstream_errors.push(reason);
@@ -2018,7 +2086,14 @@ impl Stream for RetryingFreeStream {
                         {
                             let model = self.current_model.clone();
                             let idx = self.current_idx;
-                            self.schedule_same_upstream_retry(idx, model);
+                            let delay = if matches!(err, ProviderError::RateLimited { .. }) {
+                                SameRetryDelay::RateLimited {
+                                    hint_secs: err.retry_after_secs(),
+                                }
+                            } else {
+                                SameRetryDelay::Transient
+                            };
+                            self.schedule_same_upstream_retry(idx, model, delay);
                             continue;
                         }
                         self.upstream_errors.push(reason);
@@ -2259,14 +2334,22 @@ impl LlmProvider for FreeProvider {
                         && err.recovery_class().may_retry_same_provider();
                     if can_retry_same {
                         same_upstream_retries.insert(idx, retry_count + 1);
-                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        let delay = if matches!(err, ProviderError::RateLimited { .. }) {
+                            SameRetryDelay::RateLimited {
+                                hint_secs: err.retry_after_secs(),
+                            }
+                        } else {
+                            SameRetryDelay::Transient
+                        };
+                        let delay_ms = delay.resolve(retry_count);
                         tracing::warn!(
-                            "FreeProvider: {} failed ({}s): {} — retrying same upstream ({}/{})",
+                            "FreeProvider: {} failed ({}s): {} — retrying same upstream ({}/{}){}",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
                             err,
                             retry_count + 1,
                             max_same_retries,
+                            delay.label(),
                         );
                         self.record_failure_reason(
                             idx,
@@ -2467,14 +2550,22 @@ impl LlmProvider for FreeProvider {
                         && err.recovery_class().may_retry_same_provider();
                     if can_retry_same {
                         same_upstream_retries.insert(idx, retry_count + 1);
-                        let delay_ms = same_upstream_retry_delay_ms(retry_count);
+                        let delay = if matches!(err, ProviderError::RateLimited { .. }) {
+                            SameRetryDelay::RateLimited {
+                                hint_secs: err.retry_after_secs(),
+                            }
+                        } else {
+                            SameRetryDelay::Transient
+                        };
+                        let delay_ms = delay.resolve(retry_count);
                         tracing::warn!(
-                            "FreeProvider: {} stream failed ({}s): {} — retrying same upstream ({}/{})",
+                            "FreeProvider: {} stream failed ({}s): {} — retrying same upstream ({}/{}){}",
                             entry.upstream.id,
                             self.routing.upstream_timeout_secs,
                             err,
                             retry_count + 1,
                             max_same_retries,
+                            delay.label(),
                         );
                         self.record_failure_reason(
                             idx,
