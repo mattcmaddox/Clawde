@@ -853,3 +853,135 @@ fn headless_snapshot_projection_survives_process_boundary() {
     std::fs::remove_dir_all(fixture).expect("remove fixture");
     std::fs::remove_dir_all(home).expect("remove home");
 }
+
+/// CI harness for the task_context drift eval: proves the MECHANISM end to end
+/// on the live path — a turn-1 Write tool call is folded into the projection
+/// and reaches the provider's request-2 system prompt inside <task_context> —
+/// and that the eval's control arm (`--no-task-context`) suppresses exactly
+/// that block while everything else about the run is identical.
+#[test]
+fn headless_task_context_reaches_provider_and_eval_toggle_suppresses_it() {
+    let fixture = std::env::temp_dir().join(format!(
+        "clawde-tc-harness-fixture-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let home =
+        std::env::temp_dir().join(format!("clawde-tc-harness-home-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(fixture.join("src")).expect("fixture src");
+    std::fs::create_dir_all(&home).expect("home");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tc-harness fixture");
+    let address = listener.local_addr().expect("tc-harness fixture address");
+    let request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let bodies_for_server = request_bodies.clone();
+    // Detached: blocks on `incoming()` until the test process exits, so it is
+    // never joined. Dispatch: the first TC_TREATMENT request gets a Write tool
+    // call, every later TC_TREATMENT request gets the final text; the control
+    // probe always gets the final text (it never needs a tool turn).
+    let _server = thread::spawn(move || {
+        let mut treatment_tool_sent = false;
+        for mut stream in listener.incoming().flatten() {
+            let body = read_request(&mut stream);
+            bodies_for_server.lock().unwrap().push(body.clone());
+            if body.contains("TC_TREATMENT") {
+                if !treatment_tool_sent {
+                    treatment_tool_sent = true;
+                    let response = tool_response(Path::new("src/tc.rs"), "TC_TREATMENT_WRITE\n");
+                    write_response(&mut stream, "200 OK", &response, "text/event-stream");
+                } else {
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        resumed_response(),
+                        "text/event-stream",
+                    );
+                }
+            } else if body.contains("TC_CONTROL_PROBE") {
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    resumed_response(),
+                    "text/event-stream",
+                );
+            } else {
+                write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "unexpected request",
+                    "text/plain",
+                );
+            }
+        }
+    });
+
+    let api_base = format!("http://{}", address);
+
+    // Treatment arm (default): --max-turns 2 gives turn 1 = tool call, turn 2
+    // = final text, so request 2 is built AFTER the projection observed the
+    // Write — the exact delta the eval attributes drift differences to.
+    let treatment_args = common_args(&api_base, &fixture, "tc-treatment-session");
+    let treatment = run_child(
+        spawn_child(
+            &treatment_args,
+            "TC_TREATMENT write the harness file",
+            &home,
+        ),
+        Duration::from_secs(60),
+    );
+    assert!(
+        treatment.status.success(),
+        "treatment run must complete; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&treatment.stderr),
+        String::from_utf8_lossy(&treatment.stdout)
+    );
+
+    // Control arm: identical binary/config, only the eval toggle differs.
+    let mut control_args = common_args(&api_base, &fixture, "tc-control-session");
+    control_args.extend(["--no-task-context".to_string()]);
+    let control = run_child(
+        spawn_child(&control_args, "TC_CONTROL_PROBE baseline run", &home),
+        Duration::from_secs(60),
+    );
+    assert!(
+        control.status.success(),
+        "control run must complete; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&control.stderr),
+        String::from_utf8_lossy(&control.stdout)
+    );
+
+    let bodies = request_bodies.lock().unwrap();
+    let treatment_second = bodies
+        .iter()
+        .filter(|body| body.contains("TC_TREATMENT"))
+        .nth(1)
+        .cloned()
+        .expect("treatment run must reach the fixture twice (tool turn + final turn)");
+    for marker in [
+        "<task_context>",
+        "Objective: TC_TREATMENT",
+        "Changed files: src/tc.rs",
+        "Activity: 1 tool calls, 0 failed",
+    ] {
+        assert!(
+            treatment_second.contains(marker),
+            "treatment request 2 must fold the live projection (turn-1 Write \\\n             observed by the loop) into <task_context>; missing '{marker}': {treatment_second}"
+        );
+    }
+
+    let control_body = bodies
+        .iter()
+        .find(|body| body.contains("TC_CONTROL_PROBE"))
+        .cloned()
+        .expect("control run request must reach the fixture");
+    assert!(
+        !control_body.contains("<task_context>"),
+        "--no-task-context (eval control arm) must suppress the block while \\\n         the projection machinery stays live: {control_body}"
+    );
+    assert!(
+        control_body.contains("TC_CONTROL_PROBE"),
+        "control run must otherwise be a normal request: {control_body}"
+    );
+
+    std::fs::remove_dir_all(fixture).expect("remove fixture");
+    std::fs::remove_dir_all(home).expect("remove home");
+}

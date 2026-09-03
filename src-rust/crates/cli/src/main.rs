@@ -204,6 +204,19 @@ struct Cli {
     #[arg(long = "dump-system-prompt", action = ArgAction::SetTrue, hide = true)]
     dump_system_prompt: bool,
 
+    /// Reconstruct the task-state projection from a session's transcript and
+    /// print it as JSON (drift metrics + rendered <task_context>), then exit.
+    /// Eval tooling: reads the session JSONL the way the query loop's init
+    /// does — snapshot-aware, cut-aware — with no provider call.
+    #[arg(long = "dump-task-state", value_name = "SESSION_ID", hide = true)]
+    dump_task_state: Option<String>,
+
+    /// Eval control arm (task_context A/B): suppress <task_context> injection
+    /// into the system prompt while keeping the state-projection machinery
+    /// running, so control and treatment runs differ only by the treatment.
+    #[arg(long = "no-task-context", action = ArgAction::SetTrue, hide = true)]
+    no_task_context: bool,
+
     /// MCP config JSON string (inline server definitions)
     #[arg(long = "mcp-config")]
     mcp_config: Option<String>,
@@ -1045,6 +1058,12 @@ async fn main() -> anyhow::Result<()> {
         clawde_api::providers::free::force_refresh_discovery_caches();
     }
 
+    // --dump-task-state fast path: eval tooling reads a finished run's
+    // persisted projection without a provider call.
+    if let Some(session_id) = cli.dump_task_state.as_deref() {
+        return dump_task_state(&cwd, session_id).await;
+    }
+
     // --dump-system-prompt fast path
     if cli.dump_system_prompt {
         let ctx = ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
@@ -1426,6 +1445,11 @@ async fn main() -> anyhow::Result<()> {
     // interactive session (not just across --resume). Sub-agent and cron loops
     // keep the default `false` and neither emit nor replay.
     query_config.session_state_owner = true;
+    // Eval A/B toggle: the control arm runs the identical loop minus the
+    // <task_context> injection (projection/events still live for the dump).
+    if cli.no_task_context {
+        query_config.disable_task_context = true;
+    }
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -3177,6 +3201,59 @@ fn permission_request_from_core(
         pending.request.stateful,
         pending.request.network_isolated,
     )
+}
+
+/// `--dump-task-state <SESSION_ID>`: reconstruct the task-state projection
+/// from the session's transcript — the same snapshot-aware, cut-aware load
+/// the query loop's init performs — and print drift metrics plus the rendered
+/// `<task_context>` as JSON. Eval tooling for the task_context A/B: a run's
+/// transcript is its scorecard, no provider call needed.
+async fn dump_task_state(cwd: &std::path::Path, session_id: &str) -> anyhow::Result<()> {
+    // The projection is message-derived; the session JSON holds the canonical
+    // message list (the JSONL mirror can lag on crashed runs).
+    let messages = if session_id == "-" {
+        Vec::new()
+    } else {
+        match clawde_core::history::load_session(session_id).await {
+            Ok(session) => session.messages,
+            Err(_) => Vec::new(),
+        }
+    };
+    let project_root = clawde_core::git_utils::project_root(cwd);
+    let state = match clawde_core::session_storage::transcript_path(&project_root, session_id) {
+        Ok(path) => match clawde_core::session_storage::load_state_snapshot(&path).await {
+            Ok(Some((snapshot, tail))) => {
+                clawde_query::TaskState::replay_with_snapshot(&messages, &snapshot, &tail)
+            }
+            _ => {
+                let events: Vec<clawde_core::session_storage::StateEvent> =
+                    match clawde_core::session_storage::load_transcript(&path).await {
+                        Ok(entries) => {
+                            clawde_core::session_storage::state_events_from_transcript(&entries)
+                                .into_iter()
+                                .cloned()
+                                .collect()
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                if events.is_empty() {
+                    clawde_query::TaskState::from_messages(&messages)
+                } else {
+                    clawde_query::TaskState::replay(&messages, &events)
+                }
+            }
+        },
+        Err(_) => clawde_query::TaskState::from_messages(&messages),
+    };
+    let metrics = clawde_query::drift::DriftMetrics::from_state(&state);
+    let output = serde_json::json!({
+        "session_id": session_id,
+        "messages": messages.len(),
+        "metrics": metrics,
+        "task_context": state.render(),
+    });
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 /// Append any session messages not yet mirrored to the per-project JSONL
@@ -7920,7 +7997,7 @@ async fn ping_ollama_and_fetch_models(
     host_url: &str,
 ) -> Result<Vec<clawde_query::OllamaPingModel>, String> {
     let normalized = clawde_core::config::normalize_ollama_host(host_url)
-        .ok_or_else(|| "Invalid URL: could not normalize host".to_string())?;
+        .ok_or_else(|| "Ollama must run on another computer's GPU".to_string())?;
     let client = reqwest::Client::new();
     fetch_ollama_models_at(&client, &normalized, std::time::Duration::from_secs(5)).await
 }

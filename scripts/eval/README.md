@@ -46,6 +46,12 @@ python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/catalog-order -
 python3 scripts/eval/run_eval.py --fixture scripts/eval/fixtures/fallback-behavior \
     --judge --judge-model free/groq/meta-llama/llama-4-scout-17b-16e-instruct
 
+# Drift A/B: does <task_context> reduce drift? Runs each scenario twice per
+# repeat (control `--no-task-context` vs treatment), scores every finished
+# session with the deterministic drift metric via the hidden
+# `--dump-task-state` fast path, and reports paired medians:
+python3 scripts/eval/drift_ab.py --repeats 3 --tag tc-ab
+
 # Trend report over all recorded runs (TTFT, cost, score — by tag/fixture/upstream):
 python3 scripts/eval/summarize.py
 

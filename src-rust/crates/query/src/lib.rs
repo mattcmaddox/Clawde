@@ -25,6 +25,7 @@ pub mod correction_detector;
 pub mod cron_scheduler;
 pub mod decide;
 pub mod diagnostics;
+pub mod drift;
 pub mod goal_loop;
 pub mod live_smoke;
 pub mod managed_orchestrator;
@@ -135,6 +136,10 @@ pub struct QueryConfig {
     pub append_system_prompt: Option<String>,
     /// Structured working memory for the current task, injected on every turn.
     pub task_context: Option<String>,
+    /// Eval toggle (task_context A/B): suppress `<task_context>` injection
+    /// while keeping the projection/emitter machinery live, so the control arm
+    /// of the drift eval runs the identical code path minus the treatment.
+    pub disable_task_context: bool,
     pub output_style: clawde_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     /// Persisted output-style / persona name (e.g. `"cathead"`) from the core
@@ -295,6 +300,7 @@ impl Default for QueryConfig {
             system_prompt: None,
             append_system_prompt: None,
             task_context: None,
+            disable_task_context: false,
             output_style: clawde_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             output_style_name: None,
@@ -2604,7 +2610,9 @@ pub async fn run_query_loop(
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
             let mut patched = config.clone();
-            patched.task_context = Some(task_context.clone());
+            if !config.disable_task_context {
+                patched.task_context = Some(task_context.clone());
+            }
 
             // Progressive tool disclosure (issue #233 completion): populate
             // `enabled_tools` from the live tool set this run exposes so
@@ -3213,7 +3221,9 @@ pub async fn run_query_loop(
                     {
                         let mut patched_sys = config.clone();
                         patched_sys.enabled_tools = Some(vec![]);
-                        patched_sys.task_context = Some(task_state.render());
+                        if !config.disable_task_context {
+                            patched_sys.task_context = Some(task_state.render());
+                        }
                         system_for_provider = build_system_prompt(&patched_sys);
                     }
                     let effective_max_tokens = provider
@@ -3882,6 +3892,12 @@ pub async fn run_query_loop(
                     // emissions of this turn carry this message's index, the
                     // exact coordinate a rewind cuts against.
                     state_emitter.set_message_index((messages.len() - 1) as u32);
+                    // Live projection fidelity: fold the assistant turn (tool
+                    // calls -> counters/changed files; text -> proposal
+                    // evidence) into the state exactly as the replay pass
+                    // will next prompt, so <task_context> reflects THIS turn
+                    // instead of lagging one prompt behind.
+                    task_state.apply_message(&assistant_msg);
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks
@@ -4306,6 +4322,8 @@ pub async fn run_query_loop(
         messages.push(assistant_msg.clone());
         // Branch anchor for state-event replay (see the tool-use path).
         state_emitter.set_message_index((messages.len() - 1) as u32);
+        // Live projection fidelity (see the tool-use path's twin).
+        task_state.apply_message(&assistant_msg);
 
         // If the provider returned an unknown stop reason but the assistant
         // message contains tool_use blocks, treat it as tool_use so we don't
@@ -5400,6 +5418,7 @@ mod tests {
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             task_context: None,
+            disable_task_context: false,
             state_events: Vec::new(),
             state_snapshot: None,
             output_style: clawde_core::system_prompt::OutputStyle::Default,

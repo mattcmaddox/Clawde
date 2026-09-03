@@ -1360,6 +1360,7 @@ impl Tool for AgentTool {
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             task_context: None,
+            disable_task_context: false,
             state_events: Vec::new(),
             state_snapshot: None,
             output_style: ctx.config.effective_output_style(),
