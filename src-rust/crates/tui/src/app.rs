@@ -9183,6 +9183,11 @@ impl App {
                     if let Some(idx) = self.rewind_flow.accept_confirm() {
                         // Truncate conversation to the selected message index.
                         self.messages.truncate(idx);
+                        // Anchor state events: persist the retained count so
+                        // the state-event extractor can drop the abandoned
+                        // branch's events on replay. Drained by the CLI's
+                        // main loop, which owns the transcript path.
+                        self.pending_state_cut = Some(idx as u32);
                         // Remove system annotations placed after the truncation point.
                         self.system_annotations.retain(|a| a.after_index <= idx);
                         self.push_notification(
