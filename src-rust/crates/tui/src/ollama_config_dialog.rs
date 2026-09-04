@@ -15,7 +15,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_PANEL_BG};
+use crate::overlays::{
+    centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_ACCENT, CLAWDE_PANEL_BG,
+};
 use crate::vim_search::VimSearch;
 use std::cell::Cell;
 
@@ -674,7 +676,7 @@ fn render_default_view(
     _vim_enabled: bool,
     area: Rect,
 ) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let dialog_bg = CLAWDE_PANEL_BG;
@@ -910,7 +912,7 @@ fn render_edit_mode(
     _vim_enabled: bool,
     area: Rect,
 ) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let dialog_bg = CLAWDE_PANEL_BG;
@@ -1042,7 +1044,7 @@ fn render_edit_mode(
 }
 
 fn render_pinging(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let dialog_bg = CLAWDE_PANEL_BG;
@@ -1088,7 +1090,7 @@ fn render_pinging(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect
 }
 
 fn render_ping_failed(frame: &mut Frame, state: &OllamaConfigDialogState, error: &str, area: Rect) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let red = Color::Rgb(220, 50, 50);
     let muted = Color::Rgb(180, 180, 180);
@@ -1146,7 +1148,7 @@ fn render_ping_failed(frame: &mut Frame, state: &OllamaConfigDialogState, error:
 }
 
 fn render_no_models(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let dialog_bg = CLAWDE_PANEL_BG;
@@ -1203,10 +1205,10 @@ fn render_no_models(frame: &mut Frame, state: &OllamaConfigDialogState, area: Re
 }
 
 fn render_model_picker(frame: &mut Frame, state: &OllamaConfigDialogState, area: Rect) {
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
-    let highlight_bg = Color::Rgb(233, 30, 99);
+    let highlight_bg = CLAWDE_ACCENT;
     let highlight_fg = Color::White;
     let dialog_bg = CLAWDE_PANEL_BG;
 

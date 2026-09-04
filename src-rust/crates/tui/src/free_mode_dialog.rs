@@ -45,7 +45,9 @@ use ratatui::Frame;
 
 use clawde_api::{FreeUpstream, FREE_CATALOG};
 
-use crate::overlays::{centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_PANEL_BG};
+use crate::overlays::{
+    centered_rect, render_dark_overlay, render_dialog_bg, CLAWDE_ACCENT, CLAWDE_PANEL_BG,
+};
 use crate::vim_search::VimSearch;
 use std::cell::Cell;
 
@@ -918,7 +920,7 @@ pub fn render_free_mode_dialog(
         return;
     }
 
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
     let muted = Color::Rgb(180, 180, 180);
     let tip = Color::Rgb(120, 210, 150);
@@ -1307,7 +1309,7 @@ fn render_delete_confirm(frame: &mut Frame, state: &FreeModeDialogState, area: R
         "Delete this key?"
     };
 
-    let pink = Color::Rgb(233, 30, 99);
+    let pink = CLAWDE_ACCENT;
     let dim = Color::Rgb(90, 90, 90);
 
     let width = 56u16.min(area.width.saturating_sub(4));

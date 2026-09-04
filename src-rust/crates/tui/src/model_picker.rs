@@ -1393,10 +1393,9 @@ pub fn render_model_picker(
     use ratatui::prelude::Stylize;
     use ratatui::widgets::Widget;
 
-    let _pink = Color::Rgb(233, 30, 99);
     let dim = Color::Rgb(90, 90, 90);
     let dialog_bg = CLAWDE_PANEL_BG;
-    let highlight_bg = Color::Rgb(233, 30, 99);
+    let highlight_bg = crate::overlays::CLAWDE_ACCENT;
     let highlight_fg = Color::White;
 
     // ── Dark overlay ──
@@ -1818,7 +1817,7 @@ pub fn render_model_picker(
     footer_spans.push(Span::raw("  "));
     footer_spans.push(Span::styled(
         " /connect",
-        Style::default().fg(Color::Rgb(233, 30, 99)),
+        Style::default().fg(crate::overlays::CLAWDE_ACCENT),
     ));
     footer_spans.push(Span::styled(" providers", Style::default().fg(dim)));
     let mut footer_lines = vec![Line::from(footer_spans)];
@@ -1839,7 +1838,7 @@ pub fn render_model_picker(
             None => String::new(),
         };
         let insp_fg = if inspector.map(|i| !i.warnings.is_empty()).unwrap_or(false) {
-            Color::Rgb(233, 30, 99)
+            crate::overlays::CLAWDE_ACCENT
         } else {
             dim
         };

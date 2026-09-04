@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::theme_colors::current_palette;
 use crate::vim_search::VimSearch;
 
-pub const CLAWDE_ACCENT: Color = Color::Rgb(233, 30, 99);
+pub const CLAWDE_ACCENT: Color = crate::app::ACCENT_BUILD;
 pub const CLAWDE_PANEL_BG: Color = Color::Rgb(20, 20, 28);
 pub const CLAWDE_PANEL_BORDER: Color = Color::Rgb(72, 72, 80);
 pub const CLAWDE_TEXT: Color = Color::Rgb(235, 235, 240);
