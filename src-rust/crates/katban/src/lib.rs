@@ -17,6 +17,7 @@ pub mod config;
 pub mod duckdns;
 pub mod git;
 pub mod guest;
+pub mod guest_pages;
 pub mod guest_server;
 pub mod host;
 pub mod projects;

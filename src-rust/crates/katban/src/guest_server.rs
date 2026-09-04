@@ -689,74 +689,10 @@ async fn api_summary(
     }
 }
 
-const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Katban Guest</title>
-<style>
-  body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-  .card{background:#1a1e26;border:1px solid #2c3340;border-radius:12px;padding:32px;width:320px}
-  h1{font-size:20px;margin:0 0 4px} p{color:#9aa4b2;margin:0 0 20px;font-size:14px}
-  input{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid #2c3340;background:#0f1115;color:#e6e6e6;margin-bottom:12px}
-  button{width:100%;padding:10px;border:0;border-radius:8px;background:#4c6ef5;color:#fff;font-weight:600;cursor:pointer}
-  button:hover{background:#3b5bdb}
-</style></head>
-<body><div class="card">
-<h1>Katban Guest</h1><p>Enter the password your host shared with you.</p>
-<form id="f"><input type="password" id="pw" placeholder="password" autofocus autocomplete="current-password">
-<button type="submit">Join</button></form>
-<p id="err" style="color:#fa5252;display:none"></p>
-</div>
-<script>
-const f=document.getElementById('f');
-f.addEventListener('submit',async e=>{e.preventDefault();
-  const err=document.getElementById('err');err.style.display='none';
-  const res=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({password:document.getElementById('pw').value})});
-  if(res.ok){location.href='/chat'}else{err.textContent=await res.text();err.style.display='block'}});
-</script></body></html>"#;
-
-const CHAT_PAGE: &str = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Katban Guest Chat</title>
-<style>
-  body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;height:100vh;display:flex;flex-direction:column}
-  header{padding:12px 20px;border-bottom:1px solid #2c3340;display:flex;justify-content:space-between;align-items:center}
-  header h1{font-size:16px;margin:0} header button{background:none;border:1px solid #2c3340;color:#9aa4b2;border-radius:6px;padding:6px 10px;cursor:pointer}
-  #log{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-  .msg{max-width:75%;padding:10px 14px;border-radius:10px;white-space:pre-wrap;line-height:1.45}
-  .user{align-self:flex-end;background:#4c6ef5} .bot{align-self:flex-start;background:#1a1e26;border:1px solid #2c3340}
-  .note{align-self:center;color:#9aa4b2;font-size:12px}
-  form{display:flex;gap:8px;padding:14px 20px;border-top:1px solid #2c3340}
-  input{flex:1;padding:10px 12px;border-radius:8px;border:1px solid #2c3340;background:#0f1115;color:#e6e6e6}
-  button{padding:10px 18px;border:0;border-radius:8px;background:#4c6ef5;color:#fff;font-weight:600;cursor:pointer}
-  #summary{display:none;white-space:pre-wrap;padding:12px;margin:12px 20px;background:#1a1e26;border:1px solid #2c3340;border-radius:8px;font-size:13px}
-</style></head>
-<body>
-<header><h1>Katban Guest</h1><button id="sumBtn">Download session summary</button></header>
-<div id="log"><div class="note">Chat with Clawde — web search available, nothing else.</div></div>
-<div id="summary"></div>
-<form id="f"><input id="msg" placeholder="Ask anything…" autocomplete="off"><button id="send" type="submit">Send</button></form>
-<script>
-const log=document.getElementById('log'),form=document.getElementById('f'),msg=document.getElementById('msg'),send=document.getElementById('send');
-function add(text,cls){const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight}
-form.addEventListener('submit',async e=>{e.preventDefault();
-  const text=msg.value.trim();if(!text)return;msg.value='';add(text,'user');
-  send.disabled=true;const n=document.createElement('div');n.className='note';n.textContent='thinking…';log.appendChild(n);
-  try{
-    const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
-    n.remove();
-    if(res.ok){const data=await res.json();add(data.reply,'bot')}
-    else{add('Sorry — '+await res.text(),'bot')}
-  }catch(err){n.remove();add('Network error — try again.','bot')}
-  send.disabled=false;msg.focus()});
-document.getElementById('sumBtn').addEventListener('click',async()=>{
-  const res=await fetch('/api/summary',{method:'POST'});
-  if(!res.ok){alert('Summary unavailable right now.');return}
-  const data=await res.json();const s=document.getElementById('summary');
-  s.textContent=data.summary;s.style.display='block';
-  const blob=new Blob([data.summary],{type:'text/markdown'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='katban-session-summary.md';a.click()});
-</script></body></html>"#;
+// Login and chat pages live in `guest_pages.rs` so the markup stays readable
+// next to the design-language comments. Rendered through `Html` unchanged.
+const LOGIN_PAGE: &str = crate::guest_pages::LOGIN_PAGE;
+const CHAT_PAGE: &str = crate::guest_pages::CHAT_PAGE;
 
 #[cfg(test)]
 mod tests {
@@ -862,6 +798,37 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_text(response).await.contains("Katban Guest"));
+    }
+
+    /// Both guest pages carry the Clawde TUI design language (crates/tui
+    /// constants: ACCENT_BUILD, panel/border/text/muted RGB values) so a
+    /// future re-theme cannot silently regress to generic-web styling.
+    #[test]
+    fn guest_pages_use_tui_design_language() {
+        // JetBrains Mono — the TUI's font.
+        assert!(crate::guest_pages::LOGIN_PAGE.contains("JetBrains Mono"));
+        assert!(crate::guest_pages::CHAT_PAGE.contains("JetBrains Mono"));
+        // ACCENT_BUILD green (app.rs) — not the old generic blue.
+        assert!(crate::guest_pages::LOGIN_PAGE.contains("#39d353"));
+        assert!(crate::guest_pages::CHAT_PAGE.contains("#39d353"));
+        assert!(!crate::guest_pages::LOGIN_PAGE.contains("#4c6ef5"));
+        assert!(!crate::guest_pages::CHAT_PAGE.contains("#4c6ef5"));
+        // Panel / border / text / muted from overlays.rs + messages/mod.rs.
+        for color in ["#14141c", "#484850", "#ebebf0", "#8b8b99", "#17171f"] {
+            assert!(
+                crate::guest_pages::CHAT_PAGE.contains(color),
+                "chat page missing TUI color {color}"
+            );
+        }
+        // Transcript affordances: "› " user prefix and "▸" assistant marker.
+        assert!(crate::guest_pages::CHAT_PAGE.contains("\\203A"));
+        assert!(crate::guest_pages::CHAT_PAGE.contains("\\25B8"));
+        // Square corners — the TUI has no rounded cards.
+        assert!(!crate::guest_pages::LOGIN_PAGE.contains("border-radius:12px"));
+        assert!(!crate::guest_pages::CHAT_PAGE.contains("border-radius:10px"));
+        // Cat-verb spinner verbs, straight from clawde-core's spinner pool.
+        assert!(crate::guest_pages::CHAT_PAGE.contains("'Purring'"));
+        assert!(crate::guest_pages::CHAT_PAGE.contains("'Loafing'"));
     }
 
     #[tokio::test]
