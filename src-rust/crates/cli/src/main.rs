@@ -3759,6 +3759,10 @@ async fn run_interactive(
     // Set agent mode from the --agent flag (carried on query_config).
     if let Some(ref agent_name) = base_query_config.agent_name {
         app.agent_mode = Some(agent_name.clone());
+        // Sync the mode accent: App::new defaults to the build accent, so a
+        // session launched with --agent plan/image would otherwise show the
+        // build color until the first explicit mode switch.
+        app.accent_color = clawde_tui::app::accent_for_mode(Some(agent_name));
     }
 
     // Mirror TS BypassPermissionsModeDialog.tsx startup gate

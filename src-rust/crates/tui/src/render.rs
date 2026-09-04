@@ -89,7 +89,7 @@ const SPINNER: &[char] = &[
 const SPINNER_SNOWFLAKE: &[char] = &[
     '\u{00b7}', '\u{2722}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}', '\u{2722}', '\u{00b7}',
 ];
-const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
+const CLAUDE_ORANGE: Color = crate::app::ACCENT_BUILD;
 const WELCOME_BOX_HEIGHT: u16 = 12;
 const STATUS_THINKING: &str = "thinking";
 const STATUS_THINKING_ELLIPSIS: &str = "thinking\u{2026}";

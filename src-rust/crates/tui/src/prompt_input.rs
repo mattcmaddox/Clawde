@@ -18,7 +18,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
+const CLAUDE_ORANGE: Color = crate::app::ACCENT_BUILD;
 const PROMPT_POINTER: &str = "\u{276f}";
 
 // ---------------------------------------------------------------------------
