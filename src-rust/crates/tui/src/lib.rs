@@ -82,6 +82,7 @@ pub mod ask_user_dialog;
 pub mod bridge_state;
 /// Startup confirmation dialog for --dangerously-skip-permissions mode.
 pub mod bypass_permissions_dialog;
+pub mod cat_chat;
 pub mod compare_dialog;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
@@ -214,6 +215,7 @@ pub use app::{try_copy_to_clipboard, App};
 pub use bypass_permissions_dialog::{
     render_bypass_permissions_dialog, BypassPermissionsDialogState,
 };
+pub use cat_chat::{build_cat_chat_items, render_cat_chat, CatChatItem, CatChatState};
 pub use custom_provider_dialog::{
     render_custom_provider_dialog, CustomProviderDialogState, CustomProviderField,
 };

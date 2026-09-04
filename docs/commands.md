@@ -1521,13 +1521,36 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 
 ## Self-Hosting & Katban
 
+### /chat
+
+Cat Chat — the password-protected guest chat you share with friends. Bare
+`/chat` opens the link-manager popup in the TUI; the subcommands manage guest
+links directly. This is the chat-facing surface; the Kanban board stays under
+[`/katban`](#katban).
+
+```
+/chat                       — open the Cat Chat link-manager popup
+/chat status                — links, devices, exposure, lockouts
+/chat links                 — list guest links
+/chat create <NAME>         — create a link (prints the password once)
+/chat show <ID>             — link details (devices, expiry)
+/chat revoke <ID>           — revoke a link (kicks its devices)
+/chat password <ID>         — rotate a link's password
+/chat unblock <IP>          — clear lockouts + permanent blocks
+```
+
+The server itself is managed from the shell: `clawde catchat serve|expose`.
+
+---
+
 ### /katban
 
-Control the self-hosted Katban surface from inside Clawde: guest links
-(share a password-protected chat URL with friends), guest-server lockout
-unblocks, Kanban task boards, hosted sites, and the overall status overview.
-Everything `/katban` does is also reachable from the Katban controls menu
-(`Alt+G` — see [keybindings.md](./keybindings.md)).
+Control the Kanban/agent-board surface from inside Clawde: task boards
+(cards, statuses, dependencies), the board → git project registry, hosted
+dev sites, and the status overview. Everything `/katban` does is also
+reachable from the Katban controls menu (`Alt+G` — see
+[keybindings.md](./keybindings.md)). Guest-chat management is the separate
+[`/chat`](#chat) command (Cat Chat).
 
 ```
 /katban                              — status overview
@@ -1537,19 +1560,13 @@ Everything `/katban` does is also reachable from the Katban controls menu
 /katban board card add <PROMPT> [--project NAME]
 /katban board card set <ID> <STATUS> [--project NAME]
 /katban board card remove <ID> [--project NAME]
-/katban link list                    — list guest links
-/katban link create <NAME>           — create a link (prints the password once)
-/katban link show <ID>               — link details (devices, expiry)
-/katban link revoke <ID>             — revoke a link (kicks its devices)
-/katban link password <ID>           — rotate a link's password
-/katban guest unblock <IP>           — clear lockouts + permanent blocks
+/katban project list                 — board -> git repo registry
 /katban site list                    — hosted sites
 ```
 
 Board commands take `--project NAME` exactly like `clawde katban board ...`
-(default: `default`). Link names may contain spaces. This command mirrors the
-`clawde katban` CLI; see the Katban spec (`docs/plans/katban-selfhost-spec.md`)
-for the full feature plan.
+(default: `default`). This command mirrors the `clawde katban` CLI; see the
+Katban spec (`docs/plans/katban-selfhost-spec.md`) for the full feature plan.
 
 ---
 

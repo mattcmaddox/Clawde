@@ -1,22 +1,18 @@
-// katban_controls.rs — scrollable Katban controls menu.
+// cat_chat.rs — the Cat Chat guest-link manager popup.
 //
-// Opened by Alt+G (`openKatbanControls`, see app.rs): a compact popup listing
-// the Kanban/agent-board operations the user most often needs without leaving
-// the TUI — status overview, Kanban board control (list / ready / add /
-// per-card advance), and unblocking locked or permanently-blocked IPs.
-// Guest-chat link management is NOT here: that surface is the chat-focused
-// Cat Chat popup, opened by `/chat` (see cat_chat.rs).
+// Opened by `/chat` in the TUI: a compact popup for managing the guest chat
+// ("Cat Chat") links without leaving the conversation. Lists every guest link
+// from the live store (`~/.clawde/katban/links.json`) with its state, expiry,
+// and device count, plus fixed rows to generate a new link (which prints a
+// fresh password once) and to list full details.
 //
-// The menu is built live from the guest + board stores each time it opens,
-// so it always reflects the real state: one row per card (with its status),
-// one row per locked/blocked IP, plus the fixed actions. Selecting a row
-// seeds the prompt with the matching `/katban ...` command; rows whose
-// command is complete (e.g. a specific card id or IP) are submitted
-// immediately on Enter, while rows that need more input (e.g. a card prompt)
-// just seed the prompt and let the user finish.
+// Selecting a row seeds the prompt with the matching `/chat ...` command;
+// complete rows (revoke/rotate with a specific link id) submit immediately on
+// Enter, while rows needing more input (a new link's name) just seed the
+// prompt and let the user finish.
 //
-// This is the "living" surface: as Katban gains features, add a menu row that
-// maps to the new `/katban` subcommand and it shows up here automatically.
+// This is the chat-focused sibling of the Alt+G Katban controls menu: that
+// menu stays Kanban-centric, this one owns the chat links.
 
 use clawde_katban::guest;
 use ratatui::layout::Rect;
@@ -29,32 +25,32 @@ use crate::overlays::{
     CLAWDE_ACCENT, CLAWDE_MUTED, CLAWDE_PANEL_BG, CLAWDE_PANEL_BORDER, CLAWDE_TEXT,
 };
 
-/// One row in the controls menu.
+/// One row in the Cat Chat popup.
 #[derive(Debug, Clone)]
-pub struct KatbanControlItem {
-    /// Primary label (e.g. "Rotate password — friends").
+pub struct CatChatItem {
+    /// Primary label (e.g. "Revoke — friends").
     pub title: String,
-    /// Secondary, dimmer line (e.g. "expires never · 2 devices").
+    /// Secondary, dimmer line (e.g. "active · never expires · 2 devices").
     pub subtitle: String,
-    /// The `/katban ...` command this row runs.
+    /// The `/chat ...` command this row runs.
     pub command: String,
     /// True when `command` is complete and should submit on Enter; false when
     /// the row only seeds the prompt for the user to finish (e.g. a name).
     pub complete: bool,
 }
 
-/// State for the Katban controls menu.
+/// State for the Cat Chat popup.
 #[derive(Default)]
-pub struct KatbanControlsState {
+pub struct CatChatState {
     pub visible: bool,
-    pub items: Vec<KatbanControlItem>,
+    pub items: Vec<CatChatItem>,
     pub selected: usize,
     /// First visible item index (scroll position).
     pub scroll: usize,
 }
 
-/// Max popup height (rows + chrome); longer menus scroll.
-const MAX_HEIGHT: u16 = 24;
+/// Max popup height (rows + chrome); longer lists scroll.
+const MAX_HEIGHT: u16 = 22;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -63,21 +59,9 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn board_status_name(status: clawde_katban::board::CardStatus) -> &'static str {
-    match status {
-        clawde_katban::board::CardStatus::Backlog => "backlog",
-        clawde_katban::board::CardStatus::Queued => "queued",
-        clawde_katban::board::CardStatus::Running => "running",
-        clawde_katban::board::CardStatus::Blocked => "blocked",
-        clawde_katban::board::CardStatus::Review => "review",
-        clawde_katban::board::CardStatus::Failed => "failed",
-        clawde_katban::board::CardStatus::Done => "done",
-    }
-}
-
 /// Section header helper — a row that is never selectable.
-fn section(title: &str) -> KatbanControlItem {
-    KatbanControlItem {
+fn section(title: &str) -> CatChatItem {
+    CatChatItem {
         title: format!("▸ {title}"),
         subtitle: String::new(),
         command: String::new(),
@@ -85,101 +69,73 @@ fn section(title: &str) -> KatbanControlItem {
     }
 }
 
-/// Build the menu from the live guest store. Empty (but still visible) when
-/// the store cannot be read, so the dialog degrades gracefully.
-pub fn build_control_items() -> Vec<KatbanControlItem> {
+/// Build the popup rows from the live guest store. Always includes the fixed
+/// action rows so the popup is never empty, even on a cold store.
+pub fn build_cat_chat_items() -> Vec<CatChatItem> {
     let store = guest::load().unwrap_or_default();
     let now = now_secs();
     let mut items = vec![
-        section("Status"),
-        KatbanControlItem {
-            title: "Katban overview".into(),
-            subtitle: "sites, boards, guest links, caddy".into(),
-            command: "/katban status".into(),
+        section("Guest links"),
+        CatChatItem {
+            title: "Generate a new link + password".into(),
+            subtitle: "prints the password once — /chat create".into(),
+            command: "/chat create ".into(),
+            complete: false,
+        },
+        CatChatItem {
+            title: "List all links".into(),
+            subtitle: "ids, names, states, expiry".into(),
+            command: "/chat links".into(),
             complete: true,
         },
     ];
-
-    // ---- Boards (cards + statuses) ------------------------------------------
-    let board = clawde_katban::board::load_board("default")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    items.push(section("Boards"));
-    items.push(KatbanControlItem {
-        title: "List cards".into(),
-        subtitle: "default board".into(),
-        command: "/katban board list".into(),
-        complete: true,
-    });
-    items.push(KatbanControlItem {
-        title: "Cards ready to run".into(),
-        subtitle: "respects the parallel cap".into(),
-        command: "/katban board ready".into(),
-        complete: true,
-    });
-    items.push(KatbanControlItem {
-        title: "Add a card".into(),
-        subtitle: "prompt is the card's task".into(),
-        command: "/katban board card add ".into(),
-        complete: false,
-    });
-    items.push(KatbanControlItem {
-        title: "Link cards".into(),
-        subtitle: "one card waits on another (cycle-checked)".into(),
-        command: "/katban board link ".into(),
-        complete: false,
-    });
-    for card in &board.cards {
-        if card.status == clawde_katban::board::CardStatus::Done {
-            continue;
-        }
-        let status = board_status_name(card.status);
-        let next = card.status.next().map(board_status_name).unwrap_or(status);
-        let preview: String = card.prompt.chars().take(32).collect();
-        items.push(KatbanControlItem {
-            title: format!("Advance — {preview}"),
-            subtitle: format!("{status} → {next}"),
-            command: format!("/katban board card set {} {next}", card.id),
+    // Every link (including revoked/expired ones) gets a detail row; only
+    // live links get the destructive rotate/revoke rows — rotating or
+    // revoking a dead link succeeds silently and is a footgun. Dead links
+    // remain visible here so they can still be inspected.
+    for link in &store.links {
+        let state = if link.revoked {
+            "revoked"
+        } else if link.expires_at.is_some_and(|expiry| expiry <= now) {
+            "expired"
+        } else {
+            "active"
+        };
+        let expiry = match link.expires_at {
+            Some(unix) => format!("expires in {}d", unix.saturating_sub(now) / 86400),
+            None => "never expires".to_string(),
+        };
+        let devices = store.devices.get(&link.id).map(|d| d.len()).unwrap_or(0);
+        let live = guest::link_active(link, now);
+        items.push(CatChatItem {
+            title: format!("{} — {}", link.name, link.id),
+            subtitle: format!("{state} · {expiry} · {devices} devices"),
+            command: format!("/chat show {}", link.id),
             complete: true,
         });
-    }
-
-    let blocked: Vec<(&String, &guest::FailedAttempt)> = store
-        .failed_attempts
-        .iter()
-        .filter(|(_, attempt)| {
-            attempt.permanently_blocked || attempt.locked_until.is_some_and(|u| u > now)
-        })
-        .collect();
-    if !blocked.is_empty() {
-        items.push(section("Locked IPs"));
-        for (ip, attempt) in blocked {
-            let subtitle = if attempt.permanently_blocked {
-                "permanently blocked".to_string()
-            } else {
-                format!(
-                    "locked {}s",
-                    attempt.locked_until.unwrap_or(now).saturating_sub(now)
-                )
-            };
-            items.push(KatbanControlItem {
-                title: format!("Unblock {ip}"),
-                subtitle,
-                command: format!("/chat unblock {ip}"),
+        if live {
+            items.push(CatChatItem {
+                title: format!("New password — {}", link.name),
+                subtitle: "old password stops working; devices stay logged in".into(),
+                command: format!("/chat password {}", link.id),
+                complete: true,
+            });
+            items.push(CatChatItem {
+                title: format!("Delete link — {}", link.name),
+                subtitle: "revoke: all its devices stop chatting immediately".into(),
+                command: format!("/chat revoke {}", link.id),
                 complete: true,
             });
         }
     }
-
     items
 }
 
-impl KatbanControlsState {
-    /// Open the menu, rebuilding rows from the live store.
+impl CatChatState {
+    /// Open the popup, rebuilding rows from the live store.
     pub fn open(&mut self) {
-        self.items = build_control_items();
-        self.selected = 1; // first action row, skipping the "Status" header
+        self.items = build_cat_chat_items();
+        self.selected = 1; // first action row, skipping the section header
         self.scroll = 0;
         self.visible = true;
     }
@@ -188,7 +144,7 @@ impl KatbanControlsState {
         self.visible = false;
     }
 
-    pub fn selected_item(&self) -> Option<&KatbanControlItem> {
+    pub fn selected_item(&self) -> Option<&CatChatItem> {
         self.items.get(self.selected)
     }
 
@@ -217,7 +173,7 @@ impl KatbanControlsState {
         }
         // Keep the selection inside a fixed scroll window so it stays
         // visible in any viewport at least SCROLL_WINDOW rows tall.
-        const SCROLL_WINDOW: usize = 18;
+        const SCROLL_WINDOW: usize = 16;
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + SCROLL_WINDOW {
@@ -238,8 +194,8 @@ impl KatbanControlsState {
     }
 }
 
-/// Render the Katban controls popup centered over the chat area.
-pub fn render_katban_controls(frame: &mut Frame, state: &KatbanControlsState) {
+/// Render the Cat Chat popup centered over the chat area.
+pub fn render_cat_chat(frame: &mut Frame, state: &CatChatState) {
     if !state.visible {
         return;
     }
@@ -272,8 +228,10 @@ pub fn render_katban_controls(frame: &mut Frame, state: &KatbanControlsState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(CLAWDE_PANEL_BORDER))
         .title(Span::styled(
-            " Katban controls ",
-            Style::default().fg(CLAWDE_ACCENT),
+            " 🐾 Cat Chat — guest links ",
+            Style::default()
+                .fg(CLAWDE_ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
     block.render(rect, buf);
 

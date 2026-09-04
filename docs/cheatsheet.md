@@ -68,6 +68,24 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 | `/status` | Provider and session status |
 | `/doctor` | Run diagnostics if something's wrong |
 
+## Self-hosting: Cat Chat & Katban
+
+Two separate surfaces: **Cat Chat** is the password-protected guest chat you share with friends; **Katban** is the agent Kanban board (cards, dependencies, hosted dev sites).
+
+| Command | What it does |
+|---------|--------------|
+| `/chat` | Open the Cat Chat link manager (popup) |
+| `/chat create <NAME>` | Create a guest link — prints the password once |
+| `/chat links` / `/chat show <ID>` | List links / link details |
+| `/chat password <ID>` | Rotate a link's password |
+| `/chat revoke <ID>` | Delete a link (kicks its devices) |
+| `/chat unblock <IP>` | Clear login lockouts for an IP |
+| `/chat status` | Links, devices, exposure, lockouts |
+| `/katban ...` | Kanban boards: `board list`, `card add`, `project list`, `site list` |
+| `Alt+G` | Katban controls menu (board quick actions) |
+
+Guest-link management lives under `/chat`, not `/katban` — old `/katban link ...` commands redirect there.
+
 ## Shell (outside Clawde)
 
 | Command | What it does |
@@ -77,6 +95,11 @@ The essentials. Type `/command` at the prompt. For everything else, type `/help`
 | `clawde build` | Rebuild from source + update the running binary |
 | `clawde stats` | Session stats without launching the TUI |
 | `clawde --cwd <dir>` | Start in a specific directory |
+| `clawde catchat serve` | Run the Cat Chat server (guest chat) |
+| `clawde catchat expose` | Put Cat Chat on a public domain via caddy |
+| `clawde catchat links ...` | Manage guest links from the shell |
+| `clawde catchat status` | Cat Chat overview (links, devices, exposure) |
+| `clawde katban ...` | Kanban board + site hosting from the shell |
 
 **Build & update:** after changing code, run `clawde build` — it compiles the local source and replaces itself, so `clawde` from any directory is current. Add `--debug` for a fast dev build, `--no-install` to only compile.
 

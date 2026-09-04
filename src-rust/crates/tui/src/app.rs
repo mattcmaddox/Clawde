@@ -1609,6 +1609,8 @@ pub struct App {
     pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Alt+G Katban controls menu (guest links, unblock IPs, status).
     pub katban_controls: crate::katban_controls::KatbanControlsState,
+    /// /chat Cat Chat popup (guest-link manager: list, new password, delete).
+    pub cat_chat: crate::cat_chat::CatChatState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -2279,6 +2281,7 @@ impl App {
             ollama_discovery_pending: false,
             free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             katban_controls: crate::katban_controls::KatbanControlsState::default(),
+            cat_chat: crate::cat_chat::CatChatState::default(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
@@ -4883,6 +4886,11 @@ impl App {
                 self.open_rewind_flow();
                 true
             }
+            "chat" => {
+                // Cat Chat: guest-link manager (list, new password, delete).
+                self.cat_chat.open();
+                true
+            }
             "export" => {
                 self.export_dialog.open();
                 true
@@ -4943,6 +4951,7 @@ impl App {
         self.import_config_dialog.close();
         self.command_palette.close();
         self.katban_controls.close();
+        self.cat_chat.close();
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
         self.ollama_config_dialog.close();
@@ -5001,6 +5010,7 @@ impl App {
             || self.device_auth_dialog.visible
             || self.command_palette.visible
             || self.katban_controls.visible
+            || self.cat_chat.visible
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
@@ -7522,6 +7532,31 @@ impl App {
                         // Complete commands (a specific link id / IP already in
                         // the row) submit immediately; incomplete ones (e.g.
                         // `create `) seed the prompt for the user to finish.
+                        return item.complete;
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Cat Chat popup (/chat)
+        if self.cat_chat.visible {
+            match key.code {
+                KeyCode::Esc => self.cat_chat.close(),
+                KeyCode::Up => self.cat_chat.select_prev(),
+                KeyCode::Down => self.cat_chat.select_next(),
+                KeyCode::PageUp => self.cat_chat.page_up(),
+                KeyCode::PageDown => self.cat_chat.page_down(),
+                KeyCode::Char('k') => self.cat_chat.select_prev(),
+                KeyCode::Char('j') => self.cat_chat.select_next(),
+                KeyCode::Enter => {
+                    if let Some(item) = self.cat_chat.selected_item().cloned() {
+                        self.cat_chat.close();
+                        self.prompt_input.replace_text(item.command);
+                        // Complete rows (rotate/revoke/show with a link id)
+                        // submit immediately; `link create ` seeds the prompt
+                        // so the user types the link name.
                         return item.complete;
                     }
                 }
@@ -11148,6 +11183,7 @@ impl App {
             || self.device_auth_dialog.visible
             || self.command_palette.visible
             || self.katban_controls.visible
+            || self.cat_chat.visible
             || self.elicitation.visible
             || self.model_picker.visible
             || self.effort_picker.visible
@@ -15952,7 +15988,7 @@ mod tests {
     }
 
     #[test]
-    fn test_katban_controls_skip_revoked_links() {
+    fn test_cat_chat_build_rows_and_skip_dead_link_actions() {
         use clawde_katban::guest;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15968,20 +16004,55 @@ mod tests {
         store.revoke_link(&dead);
         guest::save(&store).unwrap();
 
-        let items = crate::katban_controls::build_control_items();
+        let items = crate::cat_chat::build_cat_chat_items();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
-        // The live link gets its management rows...
-        assert!(titles.contains(&"Rotate password — friends"));
-        assert!(titles.contains(&"Revoke — friends"));
-        // ...but the revoked one is gone (dead links stay visible via
-        // `/katban link list`, so no footgun rows for them).
-        assert!(!titles.contains(&"Rotate password — old crew"));
-        assert!(!titles.contains(&"Revoke — old crew"));
+        // Fixed action rows are always present.
+        assert!(titles.contains(&"Generate a new link + password"));
+        assert!(titles.contains(&"List all links"));
+        // Both links get a detail row (dead links stay inspectable)...
+        assert!(titles.iter().any(|t| t.starts_with("friends — ")));
+        assert!(titles.iter().any(|t| t.starts_with("old crew — ")));
+        // ...but only the live link gets the destructive rotate/delete rows.
+        assert!(titles.contains(&"New password — friends"));
+        assert!(titles.contains(&"Delete link — friends"));
+        assert!(!titles.contains(&"New password — old crew"));
+        assert!(!titles.contains(&"Delete link — old crew")); // The generate row seeds the prompt for the user to type a name.
+        let generate = items
+            .iter()
+            .find(|i| i.title == "Generate a new link + password")
+            .unwrap();
+        assert_eq!(generate.command, "/chat create ");
+        assert!(!generate.complete);
+        // The delete row is complete and submits immediately.
+        let delete = items
+            .iter()
+            .find(|i| i.title == "Delete link — friends")
+            .unwrap();
+        assert!(delete.command.starts_with("/chat revoke "));
+        assert!(delete.complete);
 
         match previous {
             Some(value) => std::env::set_var("CLAWDE_HOME", value),
             None => std::env::remove_var("CLAWDE_HOME"),
         }
+    }
+
+    #[test]
+    fn test_cat_chat_open_skips_section_headers_and_esc_closes() {
+        let mut app = make_app();
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::NONE));
+        app.prompt_input.replace_text("/chat".to_string());
+        assert!(app.intercept_slash_command("chat"));
+        assert!(app.cat_chat.visible);
+        // Selection starts on the first action row (index 1), never the
+        // section header.
+        assert_eq!(app.cat_chat.selected, 1);
+
+        // j/k navigate without closing; Esc closes.
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(app.cat_chat.visible);
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.cat_chat.visible);
     }
 
     #[test]
@@ -16001,9 +16072,9 @@ mod tests {
                     complete: true,
                 },
                 crate::katban_controls::KatbanControlItem {
-                    title: "List links".into(),
+                    title: "List cards".into(),
                     subtitle: String::new(),
-                    command: "/katban link list".into(),
+                    command: "/katban board list".into(),
                     complete: true,
                 },
             ],

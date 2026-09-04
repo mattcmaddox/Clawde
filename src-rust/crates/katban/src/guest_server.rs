@@ -798,7 +798,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(body_text(response).await.contains("Katban Guest"));
+        assert!(body_text(response).await.contains("Cat Chat"));
     }
 
     /// Both guest pages carry the Clawde TUI design language (crates/tui
@@ -828,6 +828,11 @@ mod tests {
         // Cat-verb spinner verbs, straight from clawde-core's spinner pool.
         assert!(chat.contains("'Purring'"));
         assert!(chat.contains("'Loafing'"));
+        // Paw favicon in the accent green on both pages.
+        assert!(crate::guest_pages::LOGIN_PAGE.contains("rel=\"icon\""));
+        assert!(chat.contains("rel=\"icon\""));
+        assert!(crate::guest_pages::LOGIN_PAGE.contains("%2339d353"));
+        assert!(chat.contains("%2339d353"));
     }
 
     /// The chat page mirrors the TUI startup screen (crates/tui render.rs +
@@ -868,7 +873,7 @@ mod tests {
             "&#9680; medium",
             "class=\"rule\"",
             "ctx: 0%",
-            "&#8806; katban",
+            "&#8806; catchat",
         ] {
             assert!(page.contains(marker), "chat page missing {marker}");
         }
@@ -893,8 +898,8 @@ mod tests {
                 "{page} missing crosshair line marks"
             );
             assert!(
-                markup.contains("class=\"dots\""),
-                "{page} missing terminal traffic dots"
+                markup.contains("\u{1f43e}"),
+                "{page} missing the paw brand glyph"
             );
             assert!(
                 markup.contains("fade-in"),

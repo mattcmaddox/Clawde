@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use clawde_core::config::{Config, Settings, Theme};
 use clawde_core::cost::CostTracker;
 use clawde_core::types::{ContentBlock, Message};
+use clawde_katban::guest;
 use std::collections::BTreeMap;
 #[allow(unused_imports)]
 use std::path::PathBuf;
@@ -207,6 +208,9 @@ pub enum CommandResult {
     OpenHooksOverlay,
     /// Open the import-config overlay in the TUI.
     OpenImportConfigOverlay,
+    /// Open the Cat Chat guest-link manager popup in the TUI (via `/chat`).
+    /// Falls back to a text listing in non-TUI contexts.
+    OpenCatChatOverlay,
     /// Render a verification-round report as the boxed verify indicator
     /// (the same box the auto-verify loop draws after writing turns).
     Verify(clawde_query::VerifyReport),
@@ -1901,6 +1905,292 @@ impl SlashCommand for ImportConfigCommand {
     }
 }
 
+// ---- /chat ---------------------------------------------------------------
+
+/// `/chat` — the Cat Chat command group (guest chat links + manager popup).
+///
+/// Bare `/chat` opens the Cat Chat link-manager popup in the TUI (headless:
+/// the text equivalent of `/chat links`). With subcommands it manages guest
+/// links directly: `/chat links`, `/chat create <name>`, `/chat revoke <id>`,
+/// `/chat password <id>`, `/chat show <id>`, `/chat unblock <ip>`,
+/// `/chat status`. This is the chat-facing surface; the Kanban board stays
+/// under `/katban`.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatCommand;
+
+#[async_trait]
+impl SlashCommand for ChatCommand {
+    fn name(&self) -> &str {
+        "chat"
+    }
+    fn description(&self) -> &str {
+        "Cat Chat: guest links, popup manager, unblock IPs"
+    }
+    fn help(&self) -> &str {
+        "Usage: /chat [subcommand]\n\
+         \n\
+         /chat                       — open the Cat Chat link-manager popup\n\
+         /chat status                — links, devices, exposure, lockouts\n\
+         /chat links                 — list guest links\n\
+         /chat create <NAME>         — create a link (prints the password once)\n\
+         /chat show <ID>             — link details (devices, expiry)\n\
+         /chat revoke <ID>           — revoke a link (kicks its devices)\n\
+         /chat password <ID>         — rotate a link's password\n\
+         /chat unblock <IP>          — clear lockouts + permanent blocks\n\n\
+         The Kanban board lives under /katban — /chat is the guest chat."
+    }
+
+    fn arg_completions(&self, partial: &str) -> Vec<ArgCompletion> {
+        let mut out = Vec::new();
+        let args: Vec<&str> = partial.split_whitespace().collect();
+        match args.as_slice() {
+            [] | ["status"] => {
+                for (value, description) in [
+                    ("status", "Links, devices, exposure, lockouts"),
+                    ("links", "List guest links"),
+                    ("create", "Create a guest link"),
+                    ("show", "Show link details"),
+                    ("revoke", "Revoke a guest link"),
+                    ("password", "Rotate a link's password"),
+                    ("unblock", "Clear lockouts for an IP"),
+                ] {
+                    out.push(ArgCompletion {
+                        value: value.into(),
+                        description: description.into(),
+                        available: true,
+                    });
+                }
+            }
+            ["show"] | ["revoke"] | ["password"] => {
+                let sub = args[0];
+                let store = chat_load_store();
+                for link in &store.links {
+                    out.push(ArgCompletion {
+                        value: format!("{sub} {}", link.id),
+                        description: link.name.clone(),
+                        available: !link.revoked,
+                    });
+                }
+            }
+            ["create"] => {
+                out.push(ArgCompletion {
+                    value: "create <name>".into(),
+                    description: "Link name shown to friends".into(),
+                    available: false,
+                });
+            }
+            ["unblock"] => {
+                let store = chat_load_store();
+                let now = chat_now_secs();
+                for (ip, attempt) in &store.failed_attempts {
+                    let locked = attempt.locked_until.is_some_and(|until| until > now)
+                        || attempt.permanently_blocked;
+                    out.push(ArgCompletion {
+                        value: format!("unblock {ip}"),
+                        description: if attempt.permanently_blocked {
+                            "permanently blocked".into()
+                        } else {
+                            "locked out".into()
+                        },
+                        available: locked,
+                    });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        chat_execute(args)
+    }
+}
+
+/// Shared `/chat` dispatch (used by the command and its arg-completions).
+fn chat_execute(args: &str) -> CommandResult {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => CommandResult::OpenCatChatOverlay,
+        ["status"] => CommandResult::Message(chat_status_text()),
+        ["links"] => CommandResult::Message(chat_link_list_text()),
+        ["create", name @ ..] => {
+            let name = name.join(" ").trim().to_string();
+            if name.is_empty() {
+                return CommandResult::Error(
+                    "create needs a name: /chat create <NAME>".to_string(),
+                );
+            }
+            match chat_create_link(&name) {
+                Ok(text) => CommandResult::Message(text),
+                Err(message) => CommandResult::Error(message),
+            }
+        }
+        ["show", id] => match chat_link_show_text(id) {
+            Ok(text) => CommandResult::Message(text),
+            Err(message) => CommandResult::Error(message),
+        },
+        ["revoke", id] => {
+            let mut store = chat_load_store();
+            if store.revoke_link(id) {
+                if let Err(error) = guest::save(&store) {
+                    return CommandResult::Error(format!("could not save: {error:#}"));
+                }
+                CommandResult::Message(format!(
+                    "revoked guest link '{id}' — its devices can no longer chat"
+                ))
+            } else {
+                CommandResult::Error(format!("no guest link '{id}'"))
+            }
+        }
+        ["password", id] => match chat_rotate_password(id) {
+            Ok(text) => CommandResult::Message(text),
+            Err(message) => CommandResult::Error(message),
+        },
+        ["unblock", ip] => {
+            let mut store = chat_load_store();
+            store.reset_failed_attempts(ip);
+            if let Err(error) = guest::save(&store) {
+                return CommandResult::Error(format!("could not save: {error:#}"));
+            }
+            CommandResult::Message(format!(
+                "cleared lockouts and permanent blocks for '{ip}'"
+            ))
+        }
+        _ => CommandResult::Error(
+            "Unknown /chat subcommand. Try /chat, /chat links, /chat create <NAME>, or /chat status."
+                .to_string(),
+        ),
+    }
+}
+
+// ---- /chat helpers (Cat Chat guest-link operations) -----------------------
+
+/// Read the live guest store from disk (empty store when absent).
+fn chat_load_store() -> clawde_katban::guest::GuestStore {
+    guest::load().unwrap_or_default()
+}
+
+fn chat_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Cat Chat status: link/device counts, public exposure, lockout state.
+fn chat_status_text() -> String {
+    let store = chat_load_store();
+    let now = chat_now_secs();
+    let active = store
+        .links
+        .iter()
+        .filter(|l| guest::link_active(l, now))
+        .count();
+    let devices: usize = store.devices.values().map(|d| d.len()).sum();
+    let mut out = format!(
+        "links:      {active} active / {} total\ndevices:    {devices} authenticated",
+        store.links.len()
+    );
+    out.push_str(&match &store.public_subdomain {
+        Some(sub) => format!("\npublic:     https://{sub} (via caddy)"),
+        None => "\npublic:     (local only — serve with: clawde catchat serve)".to_string(),
+    });
+    let blocked = store
+        .failed_attempts
+        .iter()
+        .filter(|(_, a)| a.permanently_blocked || a.locked_until.is_some_and(|u| u > now))
+        .count();
+    if blocked == 0 {
+        out.push_str("\nlockouts:   none");
+    } else {
+        out.push_str(&format!(
+            "\nlockouts:   {blocked} IP(s) — clear with: /chat unblock <IP>"
+        ));
+    }
+    out
+}
+
+fn chat_link_list_text() -> String {
+    let store = chat_load_store();
+    if store.links.is_empty() {
+        return "no guest links — create one with /chat create <name>".to_string();
+    }
+    let now = chat_now_secs();
+    let mut out = format!("{:<8} {:<20} {:<10} EXPIRES\n", "ID", "NAME", "STATE");
+    for link in &store.links {
+        let state = if link.revoked {
+            "revoked"
+        } else if link.expires_at.is_some_and(|expiry| expiry <= now) {
+            "expired"
+        } else {
+            "active"
+        };
+        let expiry = match link.expires_at {
+            Some(unix) => format!("in {}d", unix.saturating_sub(now) / 86400),
+            None => "never".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<8} {:<20} {:<10} {}\n",
+            link.id, link.name, state, expiry
+        ));
+    }
+    out
+}
+
+fn chat_create_link(name: &str) -> Result<String, String> {
+    let password = guest::generate_password();
+    let mut store = chat_load_store();
+    store.prune(chat_now_secs());
+    let id = store.create_link(name, &password, None, 0);
+    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
+    Ok(format!(
+        "created guest link '{name}' ({id})\n\
+         password: {password}\n\
+         expires:  never\n\
+         max chat: {} at once\n\n\
+         share the password with friends. The password is shown once — keep it safe.",
+        store.link(&id).map(|l| l.max_concurrent).unwrap_or(0)
+    ))
+}
+
+fn chat_link_show_text(id: &str) -> Result<String, String> {
+    let store = chat_load_store();
+    let link = store
+        .link(id)
+        .ok_or_else(|| format!("no guest link '{id}'"))?;
+    let now = chat_now_secs();
+    let devices = store.devices.get(id).map(|d| d.len()).unwrap_or(0);
+    Ok(format!(
+        "id:          {}\n\
+         name:        {}\n\
+         state:       {}\n\
+         expires:     {}\n\
+         devices:     {devices}\n\
+         max chat:    {}",
+        link.id,
+        link.name,
+        if link.revoked { "revoked" } else { "active" },
+        link.expires_at
+            .map(|unix| format!("in {}d", unix.saturating_sub(now) / 86400))
+            .unwrap_or_else(|| "never".to_string()),
+        link.max_concurrent,
+    ))
+}
+
+fn chat_rotate_password(id: &str) -> Result<String, String> {
+    let password = guest::generate_password();
+    let mut store = chat_load_store();
+    if !store.set_password(id, &password) {
+        return Err(format!("no guest link '{id}'"));
+    }
+    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
+    Ok(format!(
+        "rotated password for guest link '{id}'\n\
+         new password: {password}\n\n\
+         The old password no longer works. The new one is shown once — keep it safe."
+    ))
+}
+
 // ---- /hooks --------------------------------------------------------------
 
 #[async_trait]
@@ -2265,6 +2555,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SpecModeCommand),
         Box::new(HooksCommand),
         Box::new(ImportConfigCommand),
+        Box::new(ChatCommand),
         Box::new(McpCommand),
         Box::new(PermissionsCommand),
         Box::new(PlanCommand),
@@ -3688,6 +3979,128 @@ mod tests {
         let cmd = find_command("web-setup").unwrap();
         let result = cmd.execute("", &mut ctx).await;
         assert!(matches!(result, CommandResult::Message(_)));
+    }
+
+    #[tokio::test]
+    async fn test_chat_command_opens_cat_chat_overlay() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("chat").expect("/chat must be registered");
+        let result = cmd.execute("", &mut ctx).await;
+        assert!(matches!(result, CommandResult::OpenCatChatOverlay));
+    }
+
+    /// Run an async test body with `CLAWDE_HOME` pointed at a fresh temp
+    /// dir, sharing the crate's `CLAWDE_HOME_LOCK` with every other
+    /// env-mutating test (same convention as goal.rs's `with_temp_home`).
+    #[allow(clippy::await_holding_lock)]
+    // The guard must span the whole future: it serialises the CLAWDE_HOME
+    // mutation against all other env-mutating tests in this crate. Test-only.
+    async fn with_chat_temp_home<T, F>(f: F) -> T
+    where
+        F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = T>>>,
+    {
+        let _lock = CLAWDE_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var_os("CLAWDE_HOME");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAWDE_HOME", tmp.path());
+        let out = f().await;
+        match prev {
+            Some(v) => std::env::set_var("CLAWDE_HOME", v),
+            None => std::env::remove_var("CLAWDE_HOME"),
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_chat_links_round_trip() {
+        with_chat_temp_home(|| {
+            Box::pin(async {
+                let cmd = find_command("chat").unwrap();
+                let mut ctx = make_ctx();
+
+                // Create with a multi-word name.
+                let result = cmd.execute("create summer crew friends", &mut ctx).await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                assert!(
+                    text.contains("'summer crew friends'"),
+                    "name should be the full multi-word string: {text}"
+                );
+                let id = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("created guest link 'summer crew friends' ("))
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap()
+                    .to_string();
+
+                // List shows it.
+                let result = cmd.execute("links", &mut ctx).await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                assert!(text.contains("summer crew friends"));
+
+                // Rotate the password: old fails, new verifies.
+                let result = cmd.execute(&format!("password {id}"), &mut ctx).await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                let new_password = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("new password: "))
+                    .unwrap()
+                    .to_string();
+                assert_eq!(new_password.len(), 12);
+                let store = clawde_katban::guest::load().unwrap();
+                let link = store.link(&id).unwrap();
+                assert!(!store.verify_password(link, "anything-before"));
+                assert!(store.verify_password(link, &new_password));
+
+                // Show + revoke.
+                let result = cmd.execute(&format!("show {id}"), &mut ctx).await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                assert!(text.contains(&id));
+                let result = cmd.execute(&format!("revoke {id}"), &mut ctx).await;
+                assert!(matches!(result, CommandResult::Message(_)));
+                let store = clawde_katban::guest::load().unwrap();
+                assert!(store.link(&id).unwrap().revoked);
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_chat_status_and_unblock() {
+        with_chat_temp_home(|| {
+            Box::pin(async {
+                let cmd = find_command("chat").unwrap();
+                let mut ctx = make_ctx();
+
+                let result = cmd.execute("status", &mut ctx).await;
+                let CommandResult::Message(text) = result else {
+                    panic!("expected message, got {result:?}");
+                };
+                assert!(text.contains("links:"));
+
+                // Lock out an IP, then clear it via /chat unblock.
+                let mut store = clawde_katban::guest::GuestStore::default();
+                for _ in 0..5 {
+                    store.record_failed_attempt("1.2.3.4");
+                }
+                clawde_katban::guest::save(&store).unwrap();
+                let result = cmd.execute("unblock 1.2.3.4", &mut ctx).await;
+                assert!(matches!(result, CommandResult::Message(_)));
+                let store = clawde_katban::guest::load().unwrap();
+                assert!(store.failed_attempts.is_empty());
+            })
+        })
+        .await;
     }
 
     #[tokio::test]

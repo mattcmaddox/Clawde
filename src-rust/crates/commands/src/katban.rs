@@ -1,18 +1,17 @@
-// `/katban` command — control the self-hosted Katban surface from inside the
-// TUI: guest links (list/create/revoke/rotate password), guest lockout
-// unblocks, site list, and the overall status overview. The TUI's Katban
-// controls dialog (Alt+G, `openKatbanControls`) builds its scrollable menu
-// from the same store this command operates on, so both surfaces stay in
-// sync. Subcommands mirror the `clawde katban` CLI 1:1:
+// `/katban` command — control the Kanban/agent-board surface from inside the
+// TUI: boards (cards, statuses, dependencies), the board -> git project
+// registry, hosted sites, and the status overview. The TUI's Katban controls
+// dialog (Alt+G, `openKatbanControls`) builds its scrollable menu from the
+// same stores this command operates on, so both surfaces stay in sync.
+//
+// The guest chat (Cat Chat) is a separate surface: `/chat` (popup +
+// links/create/revoke/password/unblock/status) and the `clawde catchat` CLI.
+// Subcommands mirror the `clawde katban` CLI 1:1:
 //
 //   /katban                         — status overview
 //   /katban status                  — status overview
-//   /katban link list               — list guest links
-//   /katban link create <name>      — create a link (prints password once)
-//   /katban link show <id>          — link details (devices, expiry)
-//   /katban link revoke <id>        — revoke a link
-//   /katban link password <id>      — rotate a link's password
-//   /katban guest unblock <ip>      — clear lockouts + permanent blocks
+//   /katban board list              — list cards on a board
+//   /katban project list            — board -> git repo registry
 //   /katban site list               — hosted sites
 
 use super::*;
@@ -65,7 +64,7 @@ impl SlashCommand for KatbanCommand {
         "katban"
     }
     fn description(&self) -> &str {
-        "Control Katban: guest links, unblock IPs, status"
+        "Control Katban: boards, projects, sites, status"
     }
     fn help(&self) -> &str {
         "Usage: /katban [subcommand [args...]]\n\n\
@@ -85,15 +84,10 @@ impl SlashCommand for KatbanCommand {
          /katban board link <a> <b>      — make <a> wait for <b> (cycle-checked)\n\
          /katban board unlink <a> <b>    — remove that dependency\n\
          /katban project list            — board -> git repo registry\n\
-         /katban link list               — list guest links\n\
-         /katban link create <name>      — create a link (prints the password once)\n\
-         /katban link show <id>          — link details (devices, expiry)\n\
-         /katban link revoke <id>        — revoke a link\n\
-         /katban link password <id>      — rotate a link's password\n\
-         /katban guest unblock <ip>      — clear lockouts + permanent blocks\n\
          /katban site list               — hosted sites\n\n\
          Board commands take an optional `--project NAME` (default: 'default'),\n\
          matching the CLI: e.g. /katban board list --project my-repo\n\
+         Guest chat management is the /chat command (Cat Chat), not /katban.\n\
          Everything this command can do is also reachable from the Katban\n\
          controls menu (Alt+G in the TUI)."
     }
@@ -151,8 +145,6 @@ impl SlashCommand for KatbanCommand {
                     ("status", "Katban status overview"),
                     ("board", "Kanban boards (cards, statuses)"),
                     ("project", "Board -> git repo registry"),
-                    ("link", "Guest links"),
-                    ("guest", "Guest server controls"),
                     ("site", "Hosted sites"),
                 ] {
                     out.push(ArgCompletion {
@@ -251,68 +243,6 @@ impl SlashCommand for KatbanCommand {
                     });
                 }
             }
-            ["link"] => {
-                for (value, description) in [
-                    ("link list", "List guest links"),
-                    ("link create", "Create a new guest link"),
-                    ("link show", "Show link details"),
-                    ("link revoke", "Revoke a guest link"),
-                    ("link password", "Rotate a link's password"),
-                ] {
-                    out.push(ArgCompletion {
-                        value: value.into(),
-                        description: description.into(),
-                        available: true,
-                    });
-                }
-            }
-            ["link", sub] if matches!(*sub, "show" | "revoke" | "password") => {
-                let store = load_store();
-                for link in &store.links {
-                    out.push(ArgCompletion {
-                        value: format!("link {sub} {}", link.id),
-                        description: link.name.clone(),
-                        available: !link.revoked,
-                    });
-                }
-            }
-            ["link", "create"] => {
-                out.push(ArgCompletion {
-                    value: "link create <name>".into(),
-                    description: "Link name shown to friends".into(),
-                    available: false,
-                });
-            }
-            ["guest"] => {
-                out.push(ArgCompletion {
-                    value: "guest unblock".into(),
-                    description: "Clear lockouts + permanent blocks for an IP".into(),
-                    available: true,
-                });
-            }
-            ["guest", "unblock"] => {
-                let store = load_store();
-                let now = now_secs();
-                for (ip, attempt) in &store.failed_attempts {
-                    let locked = attempt.locked_until.is_some_and(|until| until > now)
-                        || attempt.permanently_blocked;
-                    out.push(ArgCompletion {
-                        value: format!("guest unblock {ip}"),
-                        description: if attempt.permanently_blocked {
-                            "permanently blocked".into()
-                        } else if attempt.locked_until.is_some_and(|u| u > now) {
-                            format!(
-                                "locked {}s — {} wrong attempts",
-                                attempt.locked_until.unwrap_or(now).saturating_sub(now),
-                                attempt.count
-                            )
-                        } else {
-                            "no active lockout".into()
-                        },
-                        available: locked,
-                    });
-                }
-            }
             ["site"] => {
                 out.push(ArgCompletion {
                     value: "site list".into(),
@@ -338,50 +268,6 @@ impl SlashCommand for KatbanCommand {
         match parts.as_slice() {
         [] | ["status"] => CommandResult::Message(status_text()),
         ["project", "list"] => CommandResult::Message(project_list_text()),
-        ["link", "list"] => CommandResult::Message(link_list_text()),
-            ["link", "create", name @ ..] => {
-                let name = name.join(" ").trim().to_string();
-                if name.is_empty() {
-                    return CommandResult::Error(
-                        "link create needs a name: /katban link create <NAME>".to_string(),
-                    );
-                }
-                match create_link(&name) {
-                    Ok(text) => CommandResult::Message(text),
-                    Err(message) => CommandResult::Error(message),
-                }
-            }
-            ["link", "show", id] => match link_show_text(id) {
-                Ok(text) => CommandResult::Message(text),
-                Err(message) => CommandResult::Error(message),
-            },
-            ["link", "revoke", id] => {
-                let mut store = load_store();
-                if store.revoke_link(id) {
-                    if let Err(error) = guest::save(&store) {
-                        return CommandResult::Error(format!("could not save: {error:#}"));
-                    }
-                    CommandResult::Message(format!(
-                        "revoked guest link '{id}' — its devices can no longer chat"
-                    ))
-                } else {
-                    CommandResult::Error(format!("no guest link '{id}'"))
-                }
-            }
-            ["link", "password", id] => match rotate_password(id) {
-                Ok(text) => CommandResult::Message(text),
-                Err(message) => CommandResult::Error(message),
-            },
-            ["guest", "unblock", ip] => {
-                let mut store = load_store();
-                store.reset_failed_attempts(ip);
-                if let Err(error) = guest::save(&store) {
-                    return CommandResult::Error(format!("could not save: {error:#}"));
-                }
-                CommandResult::Message(format!(
-                    "cleared lockouts and permanent blocks for '{ip}'"
-                ))
-            }
             ["site", "list"] => CommandResult::Message(site_list_text()),
             ["board", "list"] => CommandResult::Message(board_list_text(project)),
             ["board", "ready"] => CommandResult::Message(board_ready_text(project)),
@@ -480,11 +366,14 @@ impl SlashCommand for KatbanCommand {
                     "Usage: /katban board list | board ready | board card add <PROMPT> | board card set <ID> <status> | board card merge <ID> | board card remove <ID> | board card comment <ID> [--line N] <TEXT> | board card feedback <ID> | board link <A> <B> | board unlink <A> <B> — add --project NAME to target another board".to_string(),
                 )
             }
-            ["link"] | ["guest"] | ["site"] => {
-                CommandResult::Message("Usage: /katban link list|create|show|revoke|password — or /katban guest unblock <ip>, /katban site list, /katban board ...".to_string())
+            ["site"] => {
+                CommandResult::Message("Usage: /katban site list".to_string())
             }
+            ["link", ..] | ["guest", ..] => CommandResult::Error(
+                "guest links moved to Cat Chat: /chat, /chat links, /chat create <NAME>, /chat unblock <IP>".to_string(),
+            ),
             _ => CommandResult::Error(
-                "Unknown /katban subcommand. Try /katban, /katban link list, /katban board list, or /katban help."
+                "Unknown /katban subcommand. Try /katban, /katban board list, or /katban help."
                     .to_string(),
             ),
         }
@@ -530,7 +419,9 @@ fn status_text() -> String {
             status.runnable_projects.join(", ")
         }
     ));
-    out.push_str(&format!("guest links: {active_links} active\n"));
+    out.push_str(&format!(
+        "guest links: {active_links} active (manage with /chat — Cat Chat)\n"
+    ));
     out.push_str(&format!(
         "locked IPs:  {}\n",
         if blocked.is_empty() {
@@ -548,89 +439,8 @@ fn status_text() -> String {
             "missing — run an expose command to write it"
         }
     ));
-    out.push_str("\nTry /katban link list, /katban site list, or Alt+G for the controls menu.");
+    out.push_str("\nTry /katban board list, /katban site list, or Alt+G for the controls menu.");
     out
-}
-
-fn link_list_text() -> String {
-    let store = load_store();
-    if store.links.is_empty() {
-        return "no guest links — create one with /katban link create <name>".to_string();
-    }
-    let now = now_secs();
-    let mut out = format!("{:<8} {:<20} {:<10} EXPIRES\n", "ID", "NAME", "STATE");
-    for link in &store.links {
-        let state = if link.revoked {
-            "revoked"
-        } else if link.expires_at.is_some_and(|expiry| expiry <= now) {
-            "expired"
-        } else {
-            "active"
-        };
-        let expiry = match link.expires_at {
-            Some(unix) => format!("in {}d", unix.saturating_sub(now) / 86400),
-            None => "never".to_string(),
-        };
-        out.push_str(&format!(
-            "{:<8} {:<20} {:<10} {}\n",
-            link.id, link.name, state, expiry
-        ));
-    }
-    out
-}
-
-fn create_link(name: &str) -> Result<String, String> {
-    let password = guest::generate_password();
-    let mut store = load_store();
-    store.prune(now_secs());
-    let id = store.create_link(name, &password, None, 0);
-    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
-    Ok(format!(
-        "created guest link '{name}' ({id})\n\
-         password: {password}\n\
-         expires:  never\n\
-         max chat: {} at once\n\n\
-         share the password with friends. The password is shown once — keep it safe.",
-        store.link(&id).map(|l| l.max_concurrent).unwrap_or(0)
-    ))
-}
-
-fn link_show_text(id: &str) -> Result<String, String> {
-    let store = load_store();
-    let link = store
-        .link(id)
-        .ok_or_else(|| format!("no guest link '{id}'"))?;
-    let now = now_secs();
-    let devices = store.devices.get(id).map(|d| d.len()).unwrap_or(0);
-    Ok(format!(
-        "id:          {}\n\
-         name:        {}\n\
-         state:       {}\n\
-         expires:     {}\n\
-         devices:     {devices}\n\
-         max chat:    {}",
-        link.id,
-        link.name,
-        if link.revoked { "revoked" } else { "active" },
-        link.expires_at
-            .map(|unix| format!("in {}d", unix.saturating_sub(now) / 86400))
-            .unwrap_or_else(|| "never".to_string()),
-        link.max_concurrent,
-    ))
-}
-
-fn rotate_password(id: &str) -> Result<String, String> {
-    let password = guest::generate_password();
-    let mut store = load_store();
-    if !store.set_password(id, &password) {
-        return Err(format!("no guest link '{id}'"));
-    }
-    guest::save(&store).map_err(|e| format!("could not save: {e:#}"))?;
-    Ok(format!(
-        "rotated password for guest link '{id}'\n\
-         new password: {password}\n\n\
-         The old password no longer works. The new one is shown once — keep it safe."
-    ))
 }
 
 fn site_list_text() -> String {
@@ -960,93 +770,39 @@ mod tests {
     }
 
     #[test]
-    fn arg_completions_offer_subcommands_and_live_link_ids() {
+    fn arg_completions_offer_subcommands() {
         with_home(|_| {
-            // Cold store: link ids come from nothing, subcommands still show.
+            // Katban is board/project/site only — guest-link subcommands
+            // moved to /chat.
             let completions = crate::get_arg_completions("katban", "");
             let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
             assert!(values.contains(&"status"));
-            assert!(values.contains(&"link"));
-            assert!(values.contains(&"guest"));
-
-            // Seed one link, then `link revoke ` completes its id.
-            let mut store = GuestStore::default();
-            let id = store.create_link("friends", "pw", None, 2);
-            guest::save(&store).unwrap();
-            let completions = crate::get_arg_completions("katban", "link revoke ");
-            let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
-            assert!(
-                values.contains(&format!("link revoke {id}").as_str()),
-                "completions: {values:?}"
-            );
+            assert!(values.contains(&"board"));
+            assert!(values.contains(&"project"));
+            assert!(values.contains(&"site"));
+            assert!(!values.contains(&"link"));
+            assert!(!values.contains(&"guest"));
         });
     }
 
     #[test]
-    fn create_list_rotate_revoke_round_trip() {
+    fn katban_link_and_guest_redirect_to_chat() {
         with_home(|tmp| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            let cmd = KatbanCommand;
             let mut ctx = test_context(tmp);
-            let result = rt.block_on(cmd.execute("link create friends", &mut ctx));
-            let CommandResult::Message(text) = result else {
-                panic!("expected message, got {result:?}");
-            };
-            let id = text
-                .lines()
-                .find_map(|l| l.strip_prefix("created guest link 'friends' ("))
-                .and_then(|rest| rest.strip_suffix(')'))
-                .unwrap()
-                .to_string();
-
-            let result = rt.block_on(cmd.execute(&format!("link password {id}"), &mut ctx));
-            let CommandResult::Message(text) = result else {
-                panic!("expected message, got {result:?}");
-            };
-            let new_password = text
-                .lines()
-                .find_map(|l| l.strip_prefix("new password: "))
-                .unwrap()
-                .to_string();
-            assert_eq!(new_password.len(), 12);
-
-            // Old password fails, new one verifies.
-            let store = guest::load().unwrap();
-            let link = store.link(&id).unwrap();
-            assert!(!store.verify_password(link, "anything-before"));
-            assert!(store.verify_password(link, &new_password));
-
-            let result = rt.block_on(cmd.execute(&format!("link revoke {id}"), &mut ctx));
-            assert!(matches!(result, CommandResult::Message(_)));
-            let store = guest::load().unwrap();
-            assert!(store.link(&id).unwrap().revoked);
-        });
-    }
-
-    #[test]
-    fn unblock_clears_lockouts() {
-        with_home(|tmp| {
-            let mut store = GuestStore::default();
-            store.record_failed_attempt("1.2.3.4");
-            store.record_failed_attempt("1.2.3.4");
-            store.record_failed_attempt("1.2.3.4");
-            store.record_failed_attempt("1.2.3.4");
-            store.record_failed_attempt("1.2.3.4");
-            assert!(store.locked_until("1.2.3.4", now_secs()).is_some());
-            guest::save(&store).unwrap();
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let mut ctx = test_context(tmp);
-            let result = rt.block_on(KatbanCommand.execute("guest unblock 1.2.3.4", &mut ctx));
-            assert!(matches!(result, CommandResult::Message(_)));
-            let store = guest::load().unwrap();
-            assert!(store.failed_attempts.is_empty());
+            for args in ["link list", "guest unblock 1.2.3.4"] {
+                let result = rt.block_on(KatbanCommand.execute(args, &mut ctx));
+                let CommandResult::Error(text) = result else {
+                    panic!("expected redirect error for '{args}', got {result:?}");
+                };
+                assert!(
+                    text.contains("/chat"),
+                    "redirect must point at /chat: {text}"
+                );
+            }
         });
     }
 
@@ -1147,32 +903,6 @@ mod tests {
                 values.contains(&format!("board card set {id}")),
                 "completions: {values:?}"
             );
-        });
-    }
-
-    #[test]
-    fn link_create_accepts_multi_word_names() {
-        with_home(|tmp| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let mut ctx = test_context(tmp);
-            let result =
-                rt.block_on(KatbanCommand.execute("link create summer crew friends", &mut ctx));
-            let CommandResult::Message(text) = result else {
-                panic!("expected message, got {result:?}");
-            };
-            assert!(
-                text.contains("'summer crew friends'"),
-                "name should be the full multi-word string: {text}"
-            );
-            let store = guest::load().unwrap();
-            assert!(store.links.iter().any(|l| l.name == "summer crew friends"));
-
-            // No name at all -> helpful error, not "unknown subcommand".
-            let result = rt.block_on(KatbanCommand.execute("link create", &mut ctx));
-            assert!(matches!(result, CommandResult::Error(_)));
         });
     }
 

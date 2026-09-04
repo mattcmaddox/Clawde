@@ -22,11 +22,11 @@ Commands:
                 [--kind static|live] [--duckdns-token TOKEN]
   board ...                                   Kanban-style task board (cards, links)
   project ...                                 Register a board to a git repo (for running)
-  link ...                                    Guest links (share a chat URL with friends)
-  guest serve [--port N] [--host IP] [--allow-non-loopback]
-                                              Run the guest chat server
   status                                      Overview of sites, boards, caddy config
   help                                        Show this help
+
+The guest chat (Cat Chat) lives under its own command:
+  clawde catchat serve|expose|unblock|links ...
 
 Defaults: state lives in ~/.clawde/katban/ (CLAWDE_HOME overrides); sites
 and the guest server serve on 127.0.0.1. Binding a non-loopback address
@@ -68,6 +68,9 @@ pub async fn run_command(args: &[String]) -> anyhow::Result<()> {
         "site" => run_site(&args[1..]).await,
         "board" => run_board(&args[1..]).await,
         "project" => run_project(&args[1..]),
+        // Legacy aliases: the guest-chat surface moved to `clawde catchat`.
+        // Kept so existing scripts and the generated systemd unit
+        // (`katban guest serve --port N`) keep working.
         "link" => run_link(&args[1..]),
         "guest" => run_guest(&args[1..]).await,
         "status" => run_status(),
@@ -77,6 +80,89 @@ pub async fn run_command(args: &[String]) -> anyhow::Result<()> {
         }
         other => anyhow::bail!("unknown katban command: {other}\n\n{USAGE}"),
     }
+}
+
+/// `clawde catchat` — the Cat Chat (guest chat) command group. Owns the
+/// chat-facing surface: the guest server, its public exposure, lockout
+/// unblocks, and link management. `clawde katban` keeps only the Kanban
+/// board/project/site surface (its `link`/`guest` entries are aliases).
+pub(crate) const CATCHAT_USAGE: &str = r#"Usage: clawde catchat <command> [OPTIONS]
+
+Cat Chat: the password-protected guest chat you share with friends.
+
+Commands:
+  serve [--port N] [--host IP] [--allow-non-loopback]
+                                              Run the Cat Chat server
+  expose [--subdomain HOST] [--port N] [--dry-run] [--caddy-dir DIR]
+         [--duckdns-token TOKEN]              Put Cat Chat behind caddy
+                                              (writes the managed katban.conf)
+  links create <NAME> [--expires-in DAYS|never] [--max-concurrent N]
+                                              Create a guest link (prints the URL + one-time password)
+  links list                                  List guest links
+  links show <ID>                             Show one link (URL, expiry, devices)
+  links revoke <ID>                           Revoke a link (kicks its devices)
+  links password <ID>                         Rotate a link's password (prints the new one once)
+  unblock <IP>                                Clear an IP's lockouts / permanent block
+  status                                      Overview of links, exposure, lockouts
+  help                                        Show this help
+
+Friends open the URL, type the shared password, and chat with Clawde (chat
++ web search only — no files, no shell, nothing else). Cat Chat rides the
+host's free/limited providers; if none are configured the chat explains
+that politely.
+"#;
+
+pub async fn run_catchat_command(args: &[String]) -> anyhow::Result<()> {
+    let Some(command) = args.first().map(|s| s.as_str()) else {
+        print!("{CATCHAT_USAGE}");
+        return Ok(());
+    };
+    match command {
+        "serve" => run_guest(&args[1..]).await,
+        "expose" => run_guest_expose(&args[1..]).await,
+        "links" => run_link(&args[1..]),
+        "unblock" => run_guest_unblock(&args[1..]),
+        "status" => catchat_status(),
+        "help" | "--help" | "-h" => {
+            print!("{CATCHAT_USAGE}");
+            Ok(())
+        }
+        other => anyhow::bail!("unknown catchat command: {other}\n\n{CATCHAT_USAGE}"),
+    }
+}
+
+/// Cat Chat status overview: links, public exposure, lockout state.
+fn catchat_status() -> anyhow::Result<()> {
+    use clawde_katban::guest::{self, load};
+    let store = load()?;
+    let now = now_secs();
+    let active = store
+        .links
+        .iter()
+        .filter(|l| guest::link_active(l, now))
+        .count();
+    let total = store.links.len();
+    let devices: usize = store.devices.values().map(|d| d.len()).sum();
+    println!("links:      {active} active / {total} total");
+    println!("devices:    {devices} authenticated");
+    match &store.public_subdomain {
+        Some(sub) => println!("public:     https://{sub} (via caddy)"),
+        None => println!("public:     (local only — run: clawde catchat expose)"),
+    }
+    let blocked: Vec<_> = store
+        .failed_attempts
+        .iter()
+        .filter(|(_, a)| a.permanently_blocked || a.locked_until.is_some_and(|u| u > now))
+        .collect();
+    if blocked.is_empty() {
+        println!("lockouts:   none");
+    } else {
+        println!(
+            "lockouts:   {} IP(s) — clear with: clawde catchat unblock <IP>",
+            blocked.len()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1562,7 +1648,7 @@ fn run_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-const LINK_USAGE: &str = r#"Usage: clawde katban link <command>
+const LINK_USAGE: &str = r#"Usage: clawde catchat links <command>
 
   create <NAME> [--expires-in DAYS|never] [--max-concurrent N]
                                              Create a guest link (prints the URL + one-time password)
@@ -1573,6 +1659,7 @@ const LINK_USAGE: &str = r#"Usage: clawde katban link <command>
 "#;
 
 const GUEST_USAGE: &str = r#"Usage: clawde katban guest <command> [OPTIONS]
+(alias of: clawde catchat serve|expose|unblock)
 
   serve [--port N] [--host IP] [--allow-non-loopback]
                                               Run the guest chat server
@@ -1613,7 +1700,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             }
             let name = name_parts.join(" ");
             if name.trim().is_empty() {
-                anyhow::bail!("link create needs a name: clawde katban link create <NAME>");
+                anyhow::bail!("link create needs a name: clawde catchat links create <NAME>");
             }
             let mut expires_at = None;
             let mut max_concurrent = clawde_katban::guest::DEFAULT_MAX_CONCURRENT;
@@ -1684,13 +1771,13 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
             println!("max chat: {max_concurrent} at once");
             println!();
             println!("share the URL + password with friends. The password is shown once — ");
-            println!("keep it safe. Serve the link with: clawde katban guest serve");
+            println!("keep it safe. Serve the link with: clawde catchat serve");
             Ok(())
         }
         "list" => {
             let store = load()?;
             if store.links.is_empty() {
-                println!("no guest links — create one with: clawde katban link create <NAME>");
+                println!("no guest links — create one with: clawde catchat links create <NAME>");
                 return Ok(());
             }
             println!("{:<8} {:<20} {:<10} EXPIRES", "ID", "NAME", "STATE");
@@ -1713,7 +1800,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
         "show" => {
             let id = args
                 .get(1)
-                .context("link show needs an id: clawde katban link show <ID>")?;
+                .context("link show needs an id: clawde catchat links show <ID>")?;
             let store = load()?;
             let link = store
                 .link(id)
@@ -1742,7 +1829,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
         "revoke" => {
             let id = args
                 .get(1)
-                .context("link revoke needs an id: clawde katban link revoke <ID>")?;
+                .context("link revoke needs an id: clawde catchat links revoke <ID>")?;
             let mut store = load()?;
             if store.revoke_link(id) {
                 save(&store)?;
@@ -1755,7 +1842,7 @@ fn run_link(args: &[String]) -> anyhow::Result<()> {
         "password" => {
             let id = args
                 .get(1)
-                .context("link password needs an id: clawde katban link password <ID>")?;
+                .context("link password needs an id: clawde catchat links password <ID>")?;
             let password = generate_password();
             let mut store = load()?;
             if !store.set_password(id, &password) {
@@ -1783,8 +1870,8 @@ async fn run_guest(args: &[String]) -> anyhow::Result<()> {
     };
     match subcommand {
         "serve" => guest_serve(&args[1..]).await,
-        "expose" => guest_expose(&args[1..]).await,
-        "unblock" => guest_unblock(&args[1..]),
+        "expose" => run_guest_expose(&args[1..]).await,
+        "unblock" => run_guest_unblock(&args[1..]),
         "help" | "--help" | "-h" => {
             print!("{GUEST_USAGE}");
             Ok(())
@@ -1841,7 +1928,9 @@ async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
 
     let mut store = clawde_katban::guest::load()?;
     if store.links.is_empty() {
-        println!("WARNING: no guest links yet — create one with: clawde katban link create <NAME>");
+        println!(
+            "WARNING: no guest links yet — create one with: clawde catchat links create <NAME>"
+        );
     }
     let public_url = store.public_subdomain.clone();
     store.prune(now_secs());
@@ -1874,7 +1963,7 @@ async fn guest_serve(args: &[String]) -> anyhow::Result<()> {
 /// Put the guest chat behind caddy: writes the managed `katban.conf` (all
 /// exposed sites + the guest block), emits the reloader units, prints the
 /// one-time bootstrap, and best-effort updates the DuckDNS subdomain.
-async fn guest_expose(args: &[String]) -> anyhow::Result<()> {
+async fn run_guest_expose(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::caddy::{
         bootstrap_instructions, render_config, write_atomic, DEFAULT_INCLUDE_NAME,
     };
@@ -2002,12 +2091,12 @@ async fn guest_expose(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn guest_unblock(args: &[String]) -> anyhow::Result<()> {
+fn run_guest_unblock(args: &[String]) -> anyhow::Result<()> {
     use clawde_katban::guest::{load, save};
 
     let ip = args
         .first()
-        .context("guest unblock needs an IP: clawde katban guest unblock <IP>")?;
+        .context("unblock needs an IP: clawde catchat unblock <IP>")?;
     let mut store = load()?;
     store.reset_failed_attempts(ip);
     save(&store)?;

@@ -1123,6 +1123,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         crate::katban_controls::render_katban_controls(frame, &app.katban_controls);
     }
 
+    // /chat Cat Chat popup (guest-link manager)
+    if app.cat_chat.visible {
+        crate::cat_chat::render_cat_chat(frame, &app.cat_chat);
+    }
+
     // MCP elicitation dialog (highest priority modal — rendered last to sit on top)
     if app.elicitation.visible {
         render_elicitation_dialog(

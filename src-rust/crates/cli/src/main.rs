@@ -786,6 +786,20 @@ async fn main() -> anyhow::Result<()> {
         return katban::run_command(&raw_args[2..]).await;
     }
 
+    // Fast-path: `clawde catchat` — the Cat Chat guest chat (server, public
+    // exposure, guest links, lockout unblocks). Split from `clawde katban`
+    // so the Kanban board surface and the chat surface are separate.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("catchat") {
+        if raw_args[2..]
+            .iter()
+            .any(|arg| arg == "--help" || arg == "-h")
+        {
+            print!("{}", katban::CATCHAT_USAGE);
+            return Ok(());
+        }
+        return katban::run_catchat_command(&raw_args[2..]).await;
+    }
+
     // Fast-path: `clawde serve` — start the OpenAI-compatible gateway.
     // `--port N` overrides the listen address; `--allow-non-loopback` opts
     // into binding a non-loopback address; `--key K` adds a bearer key;
@@ -1556,6 +1570,7 @@ async fn main() -> anyhow::Result<()> {
             client,
             tools,
             tool_ctx,
+            config,
             query_config,
             cost_tracker,
             headless_resume_id.as_deref(),
@@ -2604,6 +2619,7 @@ async fn run_headless(
     client: Arc<clawde_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn clawde_tools::Tool>>>,
     tool_ctx: ToolContext,
+    config: Config,
     query_config: clawde_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<&str>,
@@ -2707,6 +2723,82 @@ async fn run_headless(
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
         std::process::exit(1);
+    }
+
+    // Headless slash-command execution: when the single-shot prompt IS a
+    // known slash command, run it through the real command registry (the
+    // same one the TUI drives) and print the result — do not send the
+    // command text to the LLM. This makes `clawde --print "/chat status"`
+    // deterministic for agent harnesses (AGENTS.md directs agents at --print
+    // for testing) instead of silently turning the command into model input.
+    // Unknown `/...` input still errors (it was never a valid prompt), and
+    // ordinary prompts are untouched. Overlay-only results degrade to a
+    // short text pointer since there is no TUI here.
+    if let Some(
+        message @ clawde_core::types::Message {
+            role: clawde_core::types::Role::User,
+            ..
+        },
+    ) = messages.last()
+    {
+        let prompt_text = message.get_all_text();
+        if clawde_tui::input::is_slash_command(&prompt_text) {
+            let (cmd_name, cmd_args) = clawde_tui::input::parse_slash_command(&prompt_text);
+            if let Some(cmd) = clawde_commands::find_command(cmd_name) {
+                let mut cmd_ctx = clawde_commands::CommandContext {
+                    config: config.clone(),
+                    cost_tracker: cost_tracker.clone(),
+                    messages: messages.clone(),
+                    working_dir: tool_ctx.working_dir.clone(),
+                    session_id: tool_ctx.session_id.clone(),
+                    session_title: None,
+                    remote_session_url: None,
+                    mcp_manager: tool_ctx.mcp_manager.clone(),
+                    mcp_auth_runner: None,
+                    provider_registry: query_config.provider_registry.clone(),
+                    test_provider: None,
+                    effort: None,
+                    tool_use_tracker: None,
+                    autonomy: None,
+                    transient_prev_config: None,
+                };
+                let result = cmd.execute(cmd_args, &mut cmd_ctx).await;
+                let text = match result {
+                    clawde_commands::CommandResult::Message(text) => text,
+                    clawde_commands::CommandResult::Error(text) => {
+                        eprintln!("Error: {text}");
+                        std::process::exit(1);
+                    }
+                    clawde_commands::CommandResult::Silent => String::new(),
+                    // TUI-only results: no overlay exists headless, print a
+                    // pointer instead.
+                    clawde_commands::CommandResult::OpenCatChatOverlay => {
+                        "Cat Chat link manager is a TUI popup. Headless equivalents:\n\
+                         /chat links | /chat create <NAME> | /chat show <ID> |\n\
+                         /chat revoke <ID> | /chat password <ID> | /chat unblock <IP> | /chat status"
+                            .to_string()
+                    }
+                    clawde_commands::CommandResult::OpenHooksOverlay => "Hooks browser is a TUI overlay — use /hooks help or read ~/.clawde/settings.json".to_string(),
+                    clawde_commands::CommandResult::OpenRewindOverlay => "Rewind is an interactive TUI overlay".to_string(),
+                    clawde_commands::CommandResult::OpenImportConfigOverlay => "Import-config is an interactive TUI overlay".to_string(),
+                    other => {
+                        eprintln!(
+                            "headless: /{cmd_name} returned {:?} which has no headless rendering — ignoring",
+                            other
+                        );
+                        String::new()
+                    }
+                };
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+                return Ok(());
+            }
+            // Slash-shaped but unknown: fail loudly rather than sending
+            // "/nosuchcmd" to the model as if it were a prompt.
+            eprintln!("Error: unknown command: /{cmd_name}");
+            std::process::exit(1);
+        }
     }
 
     let is_json_output = matches!(
@@ -4568,6 +4660,16 @@ async fn run_interactive(
                                     app.open_import_config_picker();
                                     app.status_message =
                                         Some("Select what to import from ~/.claude.".to_string());
+                                }
+                                Some(CommandResult::OpenCatChatOverlay) => {
+                                    // Open the Cat Chat guest-link manager popup.
+                                    // intercept_slash_command("chat") already does
+                                    // this when the user types /chat in the TUI
+                                    // prompt, so this branch only triggers when the
+                                    // command returns the variant explicitly (e.g.
+                                    // from a non-prompt context).
+                                    app.cat_chat.open();
+                                    app.status_message = Some("Cat Chat — guest links".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;

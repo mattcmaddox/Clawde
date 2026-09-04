@@ -1,9 +1,9 @@
 // The two guest-server pages: the Clawde TUI's design language (ACCENT_BUILD
 // green, square corners, JetBrains Mono, transcript rows) framed in the
 // retro-terminal structure of the original Clawde landing page — 1px section
-// lines with crosshair `+` marks at the intersections, a terminal-window
-// header with traffic dots, staggered fade-in entrances, a blinking block
-// cursor in the prompt, and a subtle CRT scanline overlay.
+// lines with crosshair `+` marks at the intersections, a 🐾 Cat Chat header,
+// staggered fade-in entrances, a blinking block cursor in the prompt, and a
+// subtle CRT scanline overlay.
 //
 // The chat page additionally mirrors the TUI *startup screen* (crates/tui
 // render.rs + rustail.rs): the two-column welcome box with the animated
@@ -23,10 +23,13 @@
 // the guest-server tests assert on their content.
 pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Katban Guest</title>
+<title>Cat Chat</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<!-- Favicon: a paw drawn in the ACCENT_BUILD green so it matches the
+     design language (an emoji glyph would depend on system emoji fonts). -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%2339d353'><ellipse cx='50' cy='66' rx='27' ry='21'/><ellipse cx='22' cy='40' rx='10' ry='12'/><ellipse cx='41' cy='27' rx='10' ry='12'/><ellipse cx='59' cy='27' rx='10' ry='12'/><ellipse cx='78' cy='40' rx='10' ry='12'/></g></svg>">
 <style>
   /* Base palette: the TUI's colors (crates/tui constants) on the landing
      page's deep #030303; --line/crosshair are the landing's section lines. */
@@ -81,17 +84,11 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
     z-index:10}
   .cross-tl{top:-5px;left:-5px}
   .cross-tr{top:-5px;right:-5px}
-  .bar{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;gap:12px}
-  .dots{display:flex;align-items:center;gap:8px}
-  .dots span{width:11px;height:11px;border-radius:50%}
-  .dots span:nth-child(1){background:#ff5f56}
-  .dots span:nth-child(2){background:#ffbd2e}
-  .dots span:nth-child(3){background:#27c93f}
-  .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1rem}
-  .brand .glyph{color:var(--accent)}
-  .card-tag{font-size:.7rem;color:var(--subtle);text-transform:uppercase;letter-spacing:.1em}
+  .bar{display:flex;justify-content:center;align-items:center;padding:14px 20px}
+  .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1.25rem}
+  /* Emoji font stack so the 🐾 renders in color on every platform. */
+  .brand .glyph{font-family:'Noto Color Emoji','Apple Color Emoji','Segoe UI Emoji','Noto Emoji',sans-serif}
   .body{padding:28px 24px}
-  h1{font-size:15px;margin:0 0 4px;font-weight:500;letter-spacing:-.01em}
   p{color:var(--muted);margin:0 0 20px;font-size:13px}
   /* Rustail mascot — drawn as an inline SVG (block glyphs mapped to
      quadrant rects) so alignment never depends on webfont fallback for
@@ -100,7 +97,7 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   :root{--mascot:#00ff00}
   .mascot{width:100%;max-width:232px;height:128px;margin:0 auto 4px;color:var(--mascot);user-select:none}
   .mascot svg{display:block;width:100%;height:100%}
-  .tagline{font-size:11px;color:var(--accent);text-align:center;margin:0 0 18px;letter-spacing:.02em}
+  .tagline{font-size:14px;color:var(--accent);text-align:center;margin:0 0 18px;letter-spacing:.02em}
   .field{display:flex;align-items:center;border:1px solid var(--border);background:#0f0f16;margin-bottom:14px}
   .field:focus-within{border-color:var(--accent)}
   .field .glyph{padding:0 0 0 12px;color:var(--accent);font-weight:700;user-select:none}
@@ -114,8 +111,6 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   button:hover{background:#4ce06a}
   button:disabled{opacity:.6;cursor:wait}
   #err{color:var(--error);display:none;font-size:12px;margin:12px 0 0}
-  .foot{border-bottom:none}
-  .hint{margin:0;padding:12px 20px;font-size:11px;color:var(--subtle);text-align:center}
   .fade-in{opacity:0;animation:fadeIn .8s ease forwards}
   .d-1{animation-delay:.1s}
   .d-2{animation-delay:.25s}
@@ -131,26 +126,19 @@ pub(crate) const LOGIN_PAGE: &str = r#"<!DOCTYPE html>
   <div class="section top">
     <div class="cross-tl"></div><div class="cross-tr"></div>
     <div class="bar">
-      <div class="dots"><span></span><span></span><span></span></div>
-      <div class="brand"><span class="glyph">&#9656;</span> Katban Guest</div>
-      <div class="card-tag">guest access</div>
+      <div class="brand"><span class="glyph">🐾</span> Cat Chat</div>
     </div>
   </div>
   <div class="section">
     <div class="body fade-in d-2">
       <div class="mascot" id="mascot" aria-hidden="true"></div>
       <div class="tagline">All borders Are porous to cats</div>
-      <h1>Enter the password your host shared with you.</h1>
-      <p>Authenticate to open the guest chat.</p>
       <form id="f">
         <div class="field"><span class="glyph">&#10095;</span><span class="cursor"></span><input type="password" id="pw" placeholder="password" autofocus autocomplete="current-password"></div>
         <button type="submit" id="join">Join</button>
       </form>
       <p id="err"></p>
     </div>
-  </div>
-  <div class="section foot fade-in d-3">
-    <div class="hint">protected surface &#183; attempts are logged</div>
   </div>
 </div>
 <script>
@@ -192,16 +180,19 @@ f.addEventListener('submit',async e=>{e.preventDefault();
 /// replaced once at first render by `chat_page_html()`.
 const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Katban Guest Chat</title>
+<title>Cat Chat</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<!-- Favicon: a paw drawn in the ACCENT_BUILD green so it matches the
+     design language (an emoji glyph would depend on system emoji fonts). -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%2339d353'><ellipse cx='50' cy='66' rx='27' ry='21'/><ellipse cx='22' cy='40' rx='10' ry='12'/><ellipse cx='41' cy='27' rx='10' ry='12'/><ellipse cx='59' cy='27' rx='10' ry='12'/><ellipse cx='78' cy='40' rx='10' ry='12'/></g></svg>">
 <style>
   /* Transcript rows keep the TUI language: bold green "&#8250; " user prefix
      on a raised #17171f block, plain "&#9656; " assistant rows. The frame,
-     section lines, crosshairs, dots, scanlines and fades are the landing
-     page's retro-terminal structure; the welcome box, modeline, accent rules
-     and status bar mirror the TUI startup screen (render.rs + rustail.rs). */
+     section lines, crosshairs, scanlines and fades are the landing page's
+     retro-terminal structure; the welcome box, modeline, accent rules and
+     status bar mirror the TUI startup screen (render.rs + rustail.rs). */
   :root{
     --bg:#030303;
     --panel:#14141c;
@@ -254,14 +245,10 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
     z-index:10}
   .cross-tl{top:-5px;left:-5px}
   .cross-tr{top:-5px;right:-5px}
-  header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:var(--panel);gap:12px}
-  .dots{display:flex;align-items:center;gap:8px}
-  .dots span{width:11px;height:11px;border-radius:50%}
-  .dots span:nth-child(1){background:#ff5f56}
-  .dots span:nth-child(2){background:#ffbd2e}
-  .dots span:nth-child(3){background:#27c93f}
-  .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1rem}
-  .brand .glyph{color:var(--accent)}
+  header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:var(--bg);gap:12px}
+  .brand{display:flex;align-items:center;gap:.8rem;font-weight:700;letter-spacing:.05em;font-size:1.25rem}
+  /* Emoji font stack so the 🐾 renders in color on every platform. */
+  .brand .glyph{font-family:'Noto Color Emoji','Apple Color Emoji','Segoe UI Emoji','Noto Emoji',sans-serif}
   header button{background:transparent;border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:12px;border-radius:0;padding:6px 12px;cursor:pointer;transition:border-color .15s,color .15s}
   header button:hover{border-color:rgba(57,211,83,.4);color:var(--text)}
 
@@ -279,7 +266,9 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   :root{--mascot:#00ff00}
   .mascot{width:100%;max-width:232px;height:128px;margin:0 0 4px;color:var(--mascot);user-select:none}
   .mascot svg{display:block;width:100%;height:100%}
-  .tagline{font-size:11.5px;color:var(--accent)}
+  /* 14px overflows the 226px left column on one line, so let it wrap into
+     two balanced lines ("All borders Are" / "porous to cats"). */
+  .tagline{font-size:14px;color:var(--accent);line-height:1.35;text-wrap:balance}
   .r-h{font-weight:700;color:var(--accent);font-size:13px}
   .r-t{color:var(--text)}
   .r-sec{margin-top:12px}
@@ -351,8 +340,7 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
 <div class="frame">
   <header class="section top fade-in d-1">
     <div class="cross-tl"></div><div class="cross-tr"></div>
-    <div class="dots"><span></span><span></span><span></span></div>
-    <div class="brand"><span class="glyph">&#9656;</span> Katban Guest</div>
+    <div class="brand"><span class="glyph">🐾</span> Cat Chat</div>
     <button id="sumBtn">Download session summary</button>
   </header>
   <div class="welcome section fade-in d-2">
@@ -371,7 +359,7 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
       </div>
     </div>
   </div>
-  <div id="log" class="section fade-in d-3"><div class="note">Chat with Clawde &#8212; web search available, nothing else.</div></div>
+  <div id="log" class="section fade-in d-3"><div class="note">Chat with Clawde</div></div>
   <div class="summary-row"><div id="summary"><div class="summary-head"><span>session summary</span><button id="sumClose" title="Close">&times;</button></div><span id="sumBody"></span></div></div>
   <div class="modeline">
     <span><span class="pill">BUILD</span> <span class="ml-model">auto</span> <span class="ml-dim">&#183; guest</span> <span class="ml-effort">&#183; &#9680; medium</span></span>
@@ -381,8 +369,8 @@ const CHAT_PAGE_HEAD: &str = r#"<!DOCTYPE html>
   <form id="f" class="section"><div class="field"><span class="glyph">&#10095;</span><span class="cursor"></span><input id="msg" placeholder="Ask anything&#8230;" autocomplete="off"></div><button id="send" type="submit">Send</button></form>
   <div class="rule"></div>
   <div class="statusbar">
-    <div class="sb-cwd"><span>~/katban</span><span class="sb-pill on">guest:online</span></div>
-    <div class="sb-right"><span class="sb-ctx">ctx: 0%</span><span class="sb-branch">&#8806; katban</span></div>
+    <div class="sb-cwd"><span>~/catchat</span><span class="sb-pill on">guest:online</span></div>
+    <div class="sb-right"><span class="sb-ctx">ctx: 0%</span><span class="sb-branch">&#8806; catchat</span></div>
   </div>
 </div>
 <script>
@@ -470,7 +458,7 @@ document.getElementById('sumBtn').addEventListener('click',async()=>{
   const data=await res.json();const s=document.getElementById('summary');
   document.getElementById('sumBody').textContent=data.summary;s.style.display='block';
   const blob=new Blob([data.summary],{type:'text/markdown'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='katban-session-summary.md';a.click()});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='cat-chat-session-summary.md';a.click()});
 document.getElementById('sumClose').addEventListener('click',()=>{document.getElementById('summary').style.display='none'});
 </script></body></html>"#;
 

@@ -11,6 +11,8 @@
 //! - Sessions are ephemeral in-memory state (message history + working notes);
 //!   nothing is written to the host filesystem.
 //! - `summarize` produces the optional downloadable AI session summary.
+//! - The guest voice defaults to the Cathead persona (same prompt text as the
+//!   TUI's `/cathead`), composed behind the fixed guest contract.
 
 use crate::search::{GuestSearch, SearchResult};
 use clawde_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition};
@@ -21,12 +23,24 @@ pub const GUEST_MODEL: &str = "free/auto";
 pub const MAX_TOOL_ROUNDS: usize = 4;
 pub const MAX_HISTORY_MESSAGES: usize = 40;
 
-/// The guest system prompt is fixed and minimal: a general assistant with one
-/// tool, no filesystem, no host access. Guests cannot influence it.
-pub const GUEST_SYSTEM_PROMPT: &str = r#"You are Katban Guest, a friendly general-purpose assistant.
+/// The guest contract: a general assistant with one tool, no filesystem, no
+/// host access. This part is fixed — guests cannot influence it.
+pub const GUEST_CONTRACT_PROMPT: &str = r#"You are Cat Chat, a friendly general-purpose assistant.
 You can use the web_search tool to look up current information.
 You have no access to files, terminals, or any host system — never claim otherwise.
 Keep answers clear and reasonably concise. Cite the source URLs from web search results when you use them."#;
+
+/// The Cathead voice text, single-sourced from `clawde-core`'s built-in
+/// persona — the same prompt `/cathead` activates in the TUI. The dependency
+/// on `builtin_cathead` is structural (this fails to compile if the core API
+/// changes) and the voice-marker assertion lives in
+/// `guest_prompt_carries_the_cathead_voice` (mirroring core's
+/// `persona_prompts_carry_signature_voice`), so a rewrite of the persona that
+/// drops the cat voice fails tests here and in core instead of drifting
+/// silently.
+fn cathead_voice() -> String {
+    clawde_core::output_styles::OutputStyleDef::builtin_cathead().prompt
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatError {
@@ -315,7 +329,7 @@ impl ChatEngine {
             model: GUEST_MODEL.to_string(),
             messages: history.to_vec(),
             system_prompt: Some(clawde_api::provider_types::SystemPrompt::Text(
-                GUEST_SYSTEM_PROMPT.to_string(),
+                guest_system_prompt(),
             )),
             tools,
             max_tokens: 1024,
@@ -329,6 +343,14 @@ impl ChatEngine {
             strict_route: false,
         }
     }
+}
+
+/// The effective guest system prompt: the fixed guest contract first (the
+/// security posture — no host access, cite sources), then the Cathead voice.
+/// The host controls this composition; a guest's message text can never alter
+/// either half.
+pub fn guest_system_prompt() -> String {
+    format!("{}\n\n{}", GUEST_CONTRACT_PROMPT, cathead_voice())
 }
 
 pub fn web_search_definition() -> ToolDefinition {
@@ -448,6 +470,43 @@ mod tests {
         async fn search(&self, _query: &str) -> Result<Vec<SearchResult>, String> {
             Ok(self.results.clone())
         }
+    }
+
+    #[test]
+    fn guest_prompt_carries_the_cathead_voice() {
+        // The guest default persona is Cathead, single-sourced from core's
+        // builtin — the same prompt `/cathead` activates in the TUI. Assert
+        // the signature voice markers (mirroring core's
+        // `persona_prompts_carry_signature_voice`) so a persona rewrite that
+        // drops the cat voice fails here instead of drifting silently.
+        let prompt = guest_system_prompt();
+        assert!(prompt.contains("Cathead"), "missing Cathead persona text");
+        assert!(prompt.contains("purr"), "missing the purr voice marker");
+        assert!(prompt.contains("meow"), "missing the meow voice marker");
+        // The guest contract must survive the composition verbatim — the
+        // security posture comes first and is never rewritten by the voice.
+        assert!(prompt.starts_with(GUEST_CONTRACT_PROMPT));
+        assert!(prompt.contains("web_search"));
+        assert!(prompt.contains("no access to files, terminals, or any host system"));
+        // Identity is blended, not replaced: the guest stays Cat Chat.
+        assert!(prompt.contains("Cat Chat"));
+    }
+
+    #[test]
+    fn guest_prompt_matches_core_cathead_prompt_exactly() {
+        // Single-sourcing check: the voice half of the guest prompt must be
+        // byte-identical to core's builtin cathead prompt, so a change in one
+        // place is a change in both.
+        let prompt = guest_system_prompt();
+        let voice = cathead_voice();
+        assert!(
+            prompt.ends_with(&voice),
+            "guest prompt must end with core's cathead voice verbatim"
+        );
+        assert_eq!(
+            voice,
+            clawde_core::output_styles::OutputStyleDef::builtin_cathead().prompt
+        );
     }
 
     #[tokio::test]
