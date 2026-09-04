@@ -663,6 +663,10 @@ impl OpenAiCompatProvider {
             })?;
 
         let status = resp.status().as_u16();
+        // Extract the server's retry hint before the body is consumed so a
+        // 429 carries it (mirrors openai.rs; `parse_error_response` alone
+        // leaves `retry_after: None`, losing the hint).
+        let retry_after_hint = crate::error_handling::extract_retry_after(&resp);
         let rate_limit = {
             let headers = resp.headers();
             let tokens = crate::client::extract_rate_limit_pct(
@@ -755,7 +759,15 @@ impl OpenAiCompatProvider {
                     })?;
                 return OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id);
             }
-            return Err(self.map_http_error(status, &text));
+            let mut err = self.map_http_error(status, &text);
+            if let ProviderError::RateLimited {
+                retry_after: ref mut ra,
+                ..
+            } = &mut err
+            {
+                *ra = retry_after_hint;
+            }
+            return Err(err);
         }
 
         let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
@@ -921,6 +933,9 @@ impl OpenAiCompatProvider {
             })?;
 
         let status = resp.status().as_u16();
+        // Extract the server's retry hint before the body is consumed so a
+        // 429 carries it (mirrors the non-streaming path and openai.rs).
+        let retry_after_hint = crate::error_handling::extract_retry_after(&resp);
         if !(200..300).contains(&(status as usize)) {
             let text = resp.text().await.unwrap_or_default();
             if status == 404 {
@@ -956,7 +971,15 @@ impl OpenAiCompatProvider {
                 }
                 return Ok(retry_resp);
             }
-            return Err(self.map_http_error(status, &text));
+            let mut err = self.map_http_error(status, &text);
+            if let ProviderError::RateLimited {
+                retry_after: ref mut ra,
+                ..
+            } = &mut err
+            {
+                *ra = retry_after_hint;
+            }
+            return Err(err);
         }
 
         Ok(resp)

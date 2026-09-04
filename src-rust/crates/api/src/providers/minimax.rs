@@ -386,13 +386,16 @@ impl LlmProvider for MinimaxProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            // Route through the shared classifier so 429/401/402/413/5xx map
+            // to their proper recovery classes (rotation, cooldown, and
+            // fallback decisions depend on the taxonomy — a raw `Other` here
+            // would fall through as Unknown and never cool the key).
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other {
-                provider: provider_id.clone(),
-                message: format!("API error: {}", error_body),
-                status: Some(status),
-                body: Some(error_body),
-            });
+            return Err(crate::error_handling::parse_error_response(
+                status,
+                &error_body,
+                &provider_id,
+            ));
         }
 
         let provider_id_inner = provider_id.clone();
@@ -604,5 +607,25 @@ mod tests {
         .expect("request should serialize");
 
         assert!(body.get("thinking").is_none());
+    }
+
+    /// Regression: HTTP error bodies must go through the shared classifier so
+    /// a 429 becomes `RateLimited` (key rotation + cooldown), not an
+    /// unclassifiable `Other { status }` that the recovery policy reads as
+    /// `Unknown`.
+    #[test]
+    fn http_error_paths_route_through_the_shared_classifier() {
+        let provider = MinimaxProvider::new("test-key".to_string());
+        let err = provider.map_http_error(429, r#"{"error":{"message":"slow down"}}"#);
+        assert!(
+            matches!(err, ProviderError::RateLimited { .. }),
+            "got: {err:?}"
+        );
+
+        let err = provider.map_http_error(401, r#"{"error":{"message":"bad key"}}"#);
+        assert!(
+            matches!(err, ProviderError::AuthFailed { .. }),
+            "got: {err:?}"
+        );
     }
 }
