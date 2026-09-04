@@ -1350,14 +1350,18 @@ pub fn render_mcp_approval_dialog_frame(state: &McpApprovalDialogState, frame: &
 pub fn handle_mcp_approval_key(
     state: &mut McpApprovalDialogState,
     key: KeyEvent,
-    vim_enabled: bool,
+    // Kept for signature stability; the approval dialog is a pure choice list,
+    // so j/k are always-on and no longer depend on vim mode.
+    _vim_enabled: bool,
 ) -> Option<McpApprovalChoice> {
     match key.code {
         KeyCode::Up => {
             state.select_prev();
             None
         }
-        KeyCode::Char('k') if vim_enabled => {
+        // Always-on j/k (the Ollama dialog pattern): the approval dialog is a
+        // pure choice list with no text entry.
+        KeyCode::Char('k') => {
             state.select_prev();
             None
         }
@@ -1365,7 +1369,7 @@ pub fn handle_mcp_approval_key(
             state.select_next();
             None
         }
-        KeyCode::Char('j') if vim_enabled => {
+        KeyCode::Char('j') => {
             state.select_next();
             None
         }
@@ -1855,19 +1859,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_approval_jk_navigation_requires_vim_mode() {
-        // Without vim mode, j/k are not navigation — selection is unchanged.
+    fn mcp_approval_jk_navigation_is_always_on() {
+        // Always-on j/k (the Ollama dialog pattern): the approval dialog is a
+        // pure choice list, so j/k navigate with or without vim mode.
         let mut state = McpApprovalDialogState::new();
         state.show("s", None, None, vec![]);
         assert_eq!(state.selected, McpApprovalChoice::AllowSession);
         let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('j')), false);
         assert_eq!(r, None);
-        assert_eq!(state.selected, McpApprovalChoice::AllowSession);
+        assert_eq!(state.selected, McpApprovalChoice::AllowAlways);
         let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('k')), false);
         assert_eq!(r, None);
         assert_eq!(state.selected, McpApprovalChoice::AllowSession);
 
-        // With vim mode on, j moves to the next choice, k to the previous.
+        // Vim mode behaves identically.
         let r = handle_mcp_approval_key(&mut state, key(KeyCode::Char('j')), true);
         assert_eq!(r, None);
         assert_eq!(state.selected, McpApprovalChoice::AllowAlways);

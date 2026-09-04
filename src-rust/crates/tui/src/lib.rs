@@ -1450,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_connect_dialog_jk_navigation_requires_vim_mode() {
+    fn test_connect_dialog_jk_always_on_when_filter_empty() {
         let mut app = make_app();
         let items = app.connect_dialog.items.len();
         assert!(
@@ -1458,30 +1458,33 @@ mod tests {
             "connect dialog needs at least 2 items to navigate"
         );
 
-        // Without vim, j/k are ordinary characters: they type into the
-        // filter instead of navigating (they would previously navigate
-        // unconditionally). Selection must not move.
-        app.connect_dialog.open();
-        app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.connect_dialog.filter, "j");
-        assert_eq!(app.connect_dialog.selected_index, 0);
-        app.handle_key_event(key(KeyCode::Char('k')));
-        assert_eq!(app.connect_dialog.filter, "jk");
-        assert_eq!(app.connect_dialog.selected_index, 0);
-
-        // With vim mode on, j/k navigate. Re-open to reset the filter so the
-        // list is fully populated.
-        app.prompt_input.vim_enabled = true;
+        // Always-on j/k (the Ollama dialog pattern): with an empty filter
+        // there is nothing to type into, so j/k navigate regardless of vim
+        // mode.
         app.connect_dialog.open();
         app.handle_key_event(key(KeyCode::Char('j')));
         assert_eq!(app.connect_dialog.selected_index, 1);
         assert_eq!(app.connect_dialog.filter, "", "j navigated, did not type");
         app.handle_key_event(key(KeyCode::Char('k')));
         assert_eq!(app.connect_dialog.selected_index, 0);
+
+        // Once the filter has text, letters type into it instead.
+        app.handle_key_event(key(KeyCode::Char('f')));
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.connect_dialog.filter, "fj");
+
+        // With vim mode on, j/k navigate even with a filter (normal mode is
+        // explicitly a navigation state; typing needs `i`).
+        app.prompt_input.vim_enabled = true;
+        app.connect_dialog.open();
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.connect_dialog.selected_index, 1);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.connect_dialog.selected_index, 0);
     }
 
     #[test]
-    fn test_tasks_overlay_jk_navigation_requires_vim_mode() {
+    fn test_tasks_overlay_jk_navigation_is_always_on() {
         let mut app = make_app();
         app.tasks_overlay.toggle();
         app.tasks_overlay.tasks = vec![
@@ -1497,19 +1500,62 @@ mod tests {
             },
         ];
 
-        // Without vim, j/k are no-ops here (this overlay has no filter bar,
-        // so there is nothing for them to type into) — selection stays put.
+        // Always-on j/k (the Ollama dialog pattern): the overlay has no
+        // text-entry state, so j/k navigate with or without vim mode.
         app.handle_key_event(key(KeyCode::Char('j')));
-        assert_eq!(app.tasks_overlay.selected_idx, 0);
+        assert_eq!(app.tasks_overlay.selected_idx, 1);
         app.handle_key_event(key(KeyCode::Char('k')));
         assert_eq!(app.tasks_overlay.selected_idx, 0);
 
-        // With vim on, j/k navigate.
+        // Vim mode behaves identically.
         app.prompt_input.vim_enabled = true;
         app.handle_key_event(key(KeyCode::Char('j')));
         assert_eq!(app.tasks_overlay.selected_idx, 1);
         app.handle_key_event(key(KeyCode::Char('k')));
         assert_eq!(app.tasks_overlay.selected_idx, 0);
+    }
+
+    #[test]
+    fn test_stats_dialog_jk_scroll_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.stats_dialog.open();
+
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.stats_dialog.scroll, 1);
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.stats_dialog.scroll, 0);
+    }
+
+    #[test]
+    fn test_global_search_jk_navigates_when_query_empty_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.global_search.open();
+        assert!(app.global_search.query.is_empty());
+
+        app.handle_key_event(key(KeyCode::Char('j')));
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.global_search.query, "");
+
+        // Once the query has text, letters type into it.
+        app.handle_key_event(key(KeyCode::Char('f')));
+        app.handle_key_event(key(KeyCode::Char('j')));
+        assert_eq!(app.global_search.query, "fj");
+    }
+
+    #[test]
+    fn test_session_branching_jk_navigates_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.session_branching.open(vec![], 0);
+        let before = app.session_branching.selected_idx;
+
+        app.handle_key_event(key(KeyCode::Char('j')));
+        let after_j = app.session_branching.selected_idx;
+        assert!(after_j >= before); // navigates (or clamps on a short list)
+        app.handle_key_event(key(KeyCode::Char('k')));
+        assert_eq!(app.session_branching.selected_idx, before);
     }
 
     #[test]

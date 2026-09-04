@@ -1953,8 +1953,9 @@ pub struct App {
 // Format a duration in milliseconds to a human-readable string.
 // Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
 // durations under a minute, "Xm Ys" for longer ones.
-/// Accent color for build mode (default pink).
-pub const ACCENT_BUILD: Color = Color::Rgb(233, 30, 99);
+/// Accent color for build mode (GitHub-contribution green, perceptually
+/// near-equidistant from ACCENT_PLAN and ACCENT_IMAGE).
+pub const ACCENT_BUILD: Color = Color::Rgb(57, 211, 83);
 /// Accent color for plan mode (blue).
 pub const ACCENT_PLAN: Color = Color::Rgb(66, 135, 245);
 /// Accent color for image mode (cyan).
@@ -3101,7 +3102,13 @@ impl App {
             .map(|settings| settings.effective_config())
             .unwrap_or_else(|| self.config.clone());
         let ollama_config = effective_config.provider_configs.get("ollama");
-        let current_url = ollama_config.and_then(|config| config.api_base.clone());
+        // Persisted api_base carries the "/v1" suffix the OpenAI-compat path
+        // appends; display the clean native host instead. Fall back to the raw
+        // value if it fails validation so the user always sees what is saved.
+        let current_url = ollama_config
+            .and_then(|config| config.api_base.clone())
+            .and_then(|url| clawde_core::config::normalize_ollama_host(&url))
+            .or_else(|| ollama_config.and_then(|config| config.api_base.clone()));
         let current_model = if effective_config.provider.as_deref() == Some("ollama") {
             effective_config
                 .model
@@ -3283,6 +3290,16 @@ impl App {
         settings
             .save_sync()
             .map_err(|e| format!("Failed to save settings: {}", e))?;
+        // Mirror the persisted entry into the live session config. Without
+        // this, paths that resolve through the in-memory snapshot (`/ollama
+        // status`, `/unload`, auto-unload on model switch, the per-turn
+        // tool-registry sync) see no host until the next restart, while chat
+        // works because the registry path re-reads settings from disk.
+        if let Some(saved) = settings.config.provider_configs.get("ollama") {
+            self.config
+                .provider_configs
+                .insert("ollama".to_string(), saved.clone());
+        }
         self.auth_store.reload();
         Ok(())
     }
@@ -3983,6 +4000,13 @@ impl App {
         };
         self.config.theme = theme;
         self.palette = ColorPalette::for_theme(theme_name);
+        // Re-derive the mode accent so a theme switch never leaves a stale
+        // accent from the previous session state. Mode accents are fixed RGB
+        // constants (mode identity, not theme slots), so this resets to the
+        // same value for the current mode — the fix matters for a session
+        // that started before a mode was set and carried a hand-edited
+        // accent, and it keeps the derivation single-sourced.
+        self.accent_color = accent_for_mode(self.agent_mode.as_deref());
         // Persist to settings file
         let mut settings = Settings::load_sync().unwrap_or_default();
         settings.config.theme = self.config.theme.clone();
@@ -6020,13 +6044,9 @@ impl App {
                     let _ = Self::persist_bypass_permissions_accepted();
                 }
                 KeyCode::Up => self.bypass_permissions_dialog.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.bypass_permissions_dialog.select_prev()
-                }
+                KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
                 KeyCode::Down => self.bypass_permissions_dialog.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.bypass_permissions_dialog.select_next()
-                }
+                KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
                 KeyCode::Enter => {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
@@ -6068,7 +6088,7 @@ impl App {
                     self.file_injection_dialog.selected =
                         self.file_injection_dialog.selected.min(1).saturating_sub(1);
                 }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('k') => {
                     self.file_injection_dialog.selected =
                         self.file_injection_dialog.selected.min(1).saturating_sub(1);
                 }
@@ -6076,7 +6096,7 @@ impl App {
                     self.file_injection_dialog.selected =
                         (self.file_injection_dialog.selected + 1).min(1);
                 }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j') => {
                     self.file_injection_dialog.selected =
                         (self.file_injection_dialog.selected + 1).min(1);
                 }
@@ -6125,13 +6145,9 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.effort_picker.close(),
                 KeyCode::Left => self.effort_picker.select_prev(),
-                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
-                    self.effort_picker.select_prev()
-                }
+                KeyCode::Char('h') => self.effort_picker.select_prev(),
                 KeyCode::Right => self.effort_picker.select_next(),
-                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
-                    self.effort_picker.select_next()
-                }
+                KeyCode::Char('l') => self.effort_picker.select_next(),
                 KeyCode::Enter => {
                     // Applying `Ultracode` here is equivalent to typing the
                     // `ultracode` keyword: it sets the effort to the top level.
@@ -6156,12 +6172,8 @@ impl App {
                 KeyCode::Esc => self.compare_dialog.close(),
                 KeyCode::Up => self.compare_dialog.select_prev(),
                 KeyCode::Down => self.compare_dialog.select_next(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.compare_dialog.select_prev()
-                }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.compare_dialog.select_next()
-                }
+                KeyCode::Char('k') => self.compare_dialog.select_prev(),
+                KeyCode::Char('j') => self.compare_dialog.select_next(),
                 KeyCode::Char('r') => {
                     let task = self.compare_dialog.task_filter.clone();
                     let provider = self.compare_dialog.provider_filter.clone();
@@ -6187,17 +6199,15 @@ impl App {
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.routing_dialog.switch_pane(),
                 KeyCode::Left | KeyCode::Right => self.routing_dialog.switch_pane(),
-                KeyCode::Char('h') | KeyCode::Char('l') if self.prompt_input.vim_enabled => {
-                    self.routing_dialog.switch_pane()
-                }
+                // Always-on hjkl (the Ollama dialog pattern): this dialog has
+                // no text-entry state, so plain letters cannot collide with
+                // typing. (Uppercase J/K normalize to Down/Up earlier via the
+                // configured verticalPrev/verticalNext bindings.)
+                KeyCode::Char('h') | KeyCode::Char('l') => self.routing_dialog.switch_pane(),
                 KeyCode::Up => self.routing_dialog.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.routing_dialog.select_prev()
-                }
+                KeyCode::Char('k') => self.routing_dialog.select_prev(),
                 KeyCode::Down => self.routing_dialog.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.routing_dialog.select_next()
-                }
+                KeyCode::Char('j') => self.routing_dialog.select_next(),
                 KeyCode::Char(' ') => {
                     if self.routing_dialog.pane == crate::routing_dialog::RoutingPane::Upstreams {
                         self.routing_dialog.toggle_selected_upstream();
@@ -6224,13 +6234,9 @@ impl App {
                             Some("Spec review closed — nothing changed.".to_string());
                     }
                     KeyCode::Up => self.spec_review.pick_prev(),
-                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                        self.spec_review.pick_prev()
-                    }
+                    KeyCode::Char('k') => self.spec_review.pick_prev(),
                     KeyCode::Down => self.spec_review.pick_next(),
-                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                        self.spec_review.pick_next()
-                    }
+                    KeyCode::Char('j') => self.spec_review.pick_next(),
                     KeyCode::Enter => {
                         if let Some(msg) = self.spec_review.confirm_pick() {
                             self.status_message = Some(format!("Spec review: {msg}"));
@@ -6306,15 +6312,11 @@ impl App {
                     }
                 }
                 KeyCode::Left => self.spec_review.select_prev(),
-                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
-                    self.spec_review.select_prev()
-                }
+                KeyCode::Char('h') => self.spec_review.select_prev(),
                 KeyCode::Right => self.spec_review.select_next(),
-                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
-                    self.spec_review.select_next()
-                }
+                KeyCode::Char('l') => self.spec_review.select_next(),
                 KeyCode::Up => self.spec_review.scroll_up(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => self.spec_review.scroll_up(),
+                KeyCode::Char('k') => self.spec_review.scroll_up(),
                 KeyCode::Down => {
                     let content_lines = self
                         .spec_review
@@ -6329,7 +6331,7 @@ impl App {
                         .unwrap_or(0);
                     self.spec_review.scroll_down(content_lines, 16);
                 }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j') => {
                     let content_lines = self
                         .spec_review
                         .spec
@@ -6954,16 +6956,13 @@ impl App {
                         KeyCode::Right if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(1);
                         }
-                        KeyCode::Char('h')
-                            if self.prompt_input.vim_enabled
-                                && active_field == OllamaConfigField::Options =>
-                        {
+                        // h/l cycle values on the Options value rows. No text
+                        // entry happens while a value row is focused, so these
+                        // work regardless of vim mode.
+                        KeyCode::Char('h') if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(-1);
                         }
-                        KeyCode::Char('l')
-                            if self.prompt_input.vim_enabled
-                                && active_field == OllamaConfigField::Options =>
-                        {
+                        KeyCode::Char('l') if active_field == OllamaConfigField::Options => {
                             self.ollama_config_dialog.cycle_option_value(1);
                         }
                         KeyCode::Enter => {
@@ -7008,7 +7007,10 @@ impl App {
                         KeyCode::Down => {
                             self.ollama_config_dialog.move_next_field();
                         }
-                        KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                        // j/k navigate in every mode (vim or not): the
+                        // Default view has no text-entry state, so plain
+                        // letters cannot collide with typing.
+                        KeyCode::Char('j') => {
                             if active_field == OllamaConfigField::Options {
                                 self.ollama_config_dialog.move_option_key(1);
                             } else {
@@ -7018,7 +7020,7 @@ impl App {
                         KeyCode::Up => {
                             self.ollama_config_dialog.move_prev_field();
                         }
-                        KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                        KeyCode::Char('k') => {
                             if active_field == OllamaConfigField::Options {
                                 self.ollama_config_dialog.move_option_key(-1);
                             } else {
@@ -7155,13 +7157,15 @@ impl App {
                         KeyCode::Up => {
                             self.ollama_config_dialog.move_model_up();
                         }
-                        KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                        // Model picker rows are not a text field; j/k always
+                        // navigate.
+                        KeyCode::Char('k') => {
                             self.ollama_config_dialog.move_model_up();
                         }
                         KeyCode::Down => {
                             self.ollama_config_dialog.move_model_down();
                         }
-                        KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                        KeyCode::Char('j') => {
                             self.ollama_config_dialog.move_model_down();
                         }
                         KeyCode::Enter => {
@@ -7221,14 +7225,20 @@ impl App {
                 KeyCode::Up => {
                     self.connect_dialog.move_up();
                 }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k (the Ollama dialog pattern): navigate when
+                // vim normal mode is active, or while the filter is empty
+                // (nothing to type into yet). Uppercase J/K stay reserved for
+                // typing — filter matching is case-insensitive, so they
+                // filter identically.
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled || self.connect_dialog.filter.is_empty() =>
+                {
+                    self.connect_dialog.move_down();
+                }
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled || self.connect_dialog.filter.is_empty() =>
+                {
                     self.connect_dialog.move_up();
-                }
-                KeyCode::Down => {
-                    self.connect_dialog.move_down();
-                }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.connect_dialog.move_down();
                 }
                 KeyCode::PageUp => {
                     self.connect_dialog.page_up();
@@ -7391,6 +7401,9 @@ impl App {
                 KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                     self.connect_dialog.filter_pop();
                 }
+                // First-match-wins with the nav arms above: on an empty
+                // filter, lowercase j/k are consumed as navigation; on a
+                // non-empty filter (nav guards fail) every character types.
                 KeyCode::Char(c) if !self.prompt_input.vim_enabled => {
                     self.connect_dialog.filter_push(c);
                 }
@@ -7430,13 +7443,22 @@ impl App {
                 KeyCode::Up => {
                     self.import_config_picker.move_up();
                 }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k (the connect-dialog pattern): navigate when
+                // vim normal mode is active, or while the filter is empty
+                // (nothing to type into yet).
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled
+                        || self.import_config_picker.filter.is_empty() =>
+                {
                     self.import_config_picker.move_up();
                 }
                 KeyCode::Down => {
                     self.import_config_picker.move_down();
                 }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled
+                        || self.import_config_picker.filter.is_empty() =>
+                {
                     self.import_config_picker.move_down();
                 }
                 KeyCode::PageUp => {
@@ -7488,12 +7510,11 @@ impl App {
                 KeyCode::Down => self.katban_controls.select_next(),
                 KeyCode::PageUp => self.katban_controls.page_up(),
                 KeyCode::PageDown => self.katban_controls.page_down(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.katban_controls.select_prev();
-                }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.katban_controls.select_next();
-                }
+                // Always-on j/k (the Ollama dialog pattern): the menu has no
+                // text-entry state, so plain letters cannot collide with
+                // typing.
+                KeyCode::Char('k') => self.katban_controls.select_prev(),
+                KeyCode::Char('j') => self.katban_controls.select_next(),
                 KeyCode::Enter => {
                     if let Some(item) = self.katban_controls.selected_item().cloned() {
                         self.katban_controls.close();
@@ -7540,13 +7561,20 @@ impl App {
                 KeyCode::Up => {
                     self.command_palette.move_up();
                 }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k while the filter is empty (the connect-dialog
+                // pattern): navigate when there is nothing to type into; once
+                // the filter has text, letters type into it.
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled || self.command_palette.filter.is_empty() =>
+                {
                     self.command_palette.move_up();
                 }
                 KeyCode::Down => {
                     self.command_palette.move_down();
                 }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled || self.command_palette.filter.is_empty() =>
+                {
                     self.command_palette.move_down();
                 }
                 KeyCode::PageUp => {
@@ -7591,13 +7619,9 @@ impl App {
             match key.code {
                 KeyCode::Enter | KeyCode::Esc => self.invalid_config_dialog.dismiss(),
                 KeyCode::Up => self.invalid_config_dialog.scroll_up(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.invalid_config_dialog.scroll_up()
-                }
+                KeyCode::Char('k') => self.invalid_config_dialog.scroll_up(),
                 KeyCode::Down => self.invalid_config_dialog.scroll_down(20),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.invalid_config_dialog.scroll_down(20)
-                }
+                KeyCode::Char('j') => self.invalid_config_dialog.scroll_down(20),
                 _ => {}
             }
             return false;
@@ -7626,19 +7650,33 @@ impl App {
                 KeyCode::Home => self.model_picker.select_first(),
                 KeyCode::End => self.model_picker.select_last(),
                 KeyCode::Up => self.model_picker.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k/h/l (the Ollama dialog pattern): navigate when
+                // vim normal mode is active, or while the filter is empty
+                // (nothing to type into yet). Once the filter has text, these
+                // letters type into it. Uppercase J/K/H/L stay reserved for
+                // typing — filter matching is case-insensitive, so they
+                // filter identically.
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
+                {
                     self.model_picker.select_prev()
                 }
                 KeyCode::Down => self.model_picker.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
+                {
                     self.model_picker.select_next()
                 }
                 KeyCode::Left => self.model_picker.effort_prev(),
-                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('h')
+                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
+                {
                     self.model_picker.effort_prev()
                 }
                 KeyCode::Right => self.model_picker.effort_next(),
-                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('l')
+                    if self.prompt_input.vim_enabled || self.model_picker.filter.is_empty() =>
+                {
                     self.model_picker.effort_next()
                 }
                 KeyCode::Tab => {
@@ -7755,13 +7793,11 @@ impl App {
                 BranchBrowserMode::Browse => match key.code {
                     KeyCode::Esc => self.session_branching.cancel(),
                     KeyCode::Up => self.session_branching.select_prev(),
-                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                        self.session_branching.select_prev()
-                    }
+                    // Always-on j/k in Browse mode (the Ollama dialog pattern);
+                    // CreateNew mode is a text field and keeps its own arms.
+                    KeyCode::Char('k') => self.session_branching.select_prev(),
                     KeyCode::Down => self.session_branching.select_next(),
-                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                        self.session_branching.select_next()
-                    }
+                    KeyCode::Char('j') => self.session_branching.select_next(),
                     KeyCode::Char('n') => self.session_branching.start_create_new(),
                     KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
                     KeyCode::Enter => {
@@ -7828,11 +7864,20 @@ impl App {
                         }
                     }
                     KeyCode::Up => self.session_browser.select_prev(),
-                    KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                    // Always-on j/k in vim normal mode, or while the search
+                    // query is empty (the connect-dialog pattern); letters
+                    // type into it once it has text.
+                    KeyCode::Char('k')
+                        if self.prompt_input.vim_enabled
+                            || self.session_browser.search_query.is_empty() =>
+                    {
                         self.session_browser.select_prev()
                     }
                     KeyCode::Down => self.session_browser.select_next(),
-                    KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                    KeyCode::Char('j')
+                        if self.prompt_input.vim_enabled
+                            || self.session_browser.search_query.is_empty() =>
+                    {
                         self.session_browser.select_next()
                     }
                     KeyCode::Char('r') => self.session_browser.start_rename(),
@@ -7889,11 +7934,20 @@ impl App {
                     self.keybindings_overlay.close();
                 }
                 KeyCode::Up => self.keybindings_overlay.scroll_up(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k in vim normal mode, or while the filter is
+                // empty (the connect-dialog pattern); letters type into the
+                // filter once it has text.
+                KeyCode::Char('k')
+                    if self.prompt_input.vim_enabled
+                        || self.keybindings_overlay.filter.is_empty() =>
+                {
                     self.keybindings_overlay.scroll_up()
                 }
                 KeyCode::Down => self.keybindings_overlay.scroll_down(u16::MAX),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j')
+                    if self.prompt_input.vim_enabled
+                        || self.keybindings_overlay.filter.is_empty() =>
+                {
                     self.keybindings_overlay.scroll_down(u16::MAX)
                 }
                 KeyCode::PageUp => self.keybindings_overlay.page_up(),
@@ -7916,13 +7970,12 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
                 KeyCode::Up => self.tasks_overlay.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.tasks_overlay.select_prev()
-                }
+                // Always-on j/k (the Ollama dialog pattern): the overlay has
+                // no text-entry state, so plain letters cannot collide with
+                // typing.
+                KeyCode::Char('k') => self.tasks_overlay.select_prev(),
                 KeyCode::Down => self.tasks_overlay.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.tasks_overlay.select_next()
-                }
+                KeyCode::Char('j') => self.tasks_overlay.select_next(),
                 KeyCode::Enter => {
                     if let Some((task_id, new_status)) =
                         self.tasks_overlay.cycle_and_persist_status()
@@ -7959,12 +8012,10 @@ impl App {
                 KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
                     self.export_dialog.toggle();
                 }
-                KeyCode::Char('h') if self.prompt_input.vim_enabled => {
-                    self.export_dialog.toggle();
-                }
-                KeyCode::Char('l') if self.prompt_input.vim_enabled => {
-                    self.export_dialog.toggle();
-                }
+                // Always-on h/l format toggling (the Ollama dialog pattern):
+                // the dialog takes digits and Enter only, no free text.
+                KeyCode::Char('h') => self.export_dialog.toggle(),
+                KeyCode::Char('l') => self.export_dialog.toggle(),
                 KeyCode::Char('1') => {
                     self.export_dialog.selected = ExportFormat::Json;
                 }
@@ -7991,11 +8042,9 @@ impl App {
                 // Scroll the modal body when the content overflows (long
                 // free-model chains push lower sections out of view).
                 KeyCode::Up => self.context_viz.scroll_up(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => self.context_viz.scroll_up(),
+                KeyCode::Char('k') => self.context_viz.scroll_up(),
                 KeyCode::Down => self.context_viz.scroll_down(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.context_viz.scroll_down()
-                }
+                KeyCode::Char('j') => self.context_viz.scroll_down(),
                 KeyCode::PageUp => self.context_viz.page_up(),
                 KeyCode::PageDown => self.context_viz.page_down(),
                 KeyCode::Home => self.context_viz.scroll_to_top(),
@@ -8037,13 +8086,9 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.memory_file_selector.close(),
                 KeyCode::Up => self.memory_file_selector.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.memory_file_selector.select_prev()
-                }
+                KeyCode::Char('k') => self.memory_file_selector.select_prev(),
                 KeyCode::Down => self.memory_file_selector.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.memory_file_selector.select_next()
-                }
+                KeyCode::Char('j') => self.memory_file_selector.select_next(),
                 KeyCode::Enter | KeyCode::Char('e') => {
                     if let Some(path) = self
                         .memory_file_selector
@@ -8092,13 +8137,9 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => self.hooks_config_menu.back(),
                 KeyCode::Enter => self.hooks_config_menu.enter(),
                 KeyCode::Up => self.hooks_config_menu.select_prev(),
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
-                    self.hooks_config_menu.select_prev()
-                }
+                KeyCode::Char('k') => self.hooks_config_menu.select_prev(),
                 KeyCode::Down => self.hooks_config_menu.select_next(),
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
-                    self.hooks_config_menu.select_next()
-                }
+                KeyCode::Char('j') => self.hooks_config_menu.select_next(),
                 _ => {}
             }
             return false;
@@ -9046,11 +9087,11 @@ impl App {
             KeyCode::BackTab | KeyCode::Left => self.stats_dialog.prev_tab(),
             KeyCode::Char('r') => self.stats_dialog.cycle_range(),
             KeyCode::Up => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1),
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+            KeyCode::Char('k') => {
                 self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_sub(1)
             }
             KeyCode::Down => self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1),
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+            KeyCode::Char('j') => {
                 self.stats_dialog.scroll = self.stats_dialog.scroll.saturating_add(1)
             }
             _ => {}
@@ -9081,12 +9122,24 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
-            KeyCode::Char('h') if self.prompt_input.vim_enabled => self.mcp_view.switch_pane(),
-            KeyCode::Char('l') if self.prompt_input.vim_enabled => self.mcp_view.switch_pane(),
+            // Always-on h/l pane switching: pane switching is not text entry.
+            KeyCode::Char('h') => self.mcp_view.switch_pane(),
+            KeyCode::Char('l') => self.mcp_view.switch_pane(),
             KeyCode::Up => self.mcp_view.select_prev(),
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.mcp_view.select_prev(),
+            // Always-on j/k in vim normal mode, or while the tool search is
+            // empty (the connect-dialog pattern); letters type into it once it
+            // has text.
+            KeyCode::Char('k')
+                if self.prompt_input.vim_enabled || self.mcp_view.tool_search.is_empty() =>
+            {
+                self.mcp_view.select_prev()
+            }
             KeyCode::Down => self.mcp_view.select_next(),
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.mcp_view.select_next(),
+            KeyCode::Char('j')
+                if self.prompt_input.vim_enabled || self.mcp_view.tool_search.is_empty() =>
+            {
+                self.mcp_view.select_next()
+            }
             KeyCode::Backspace if !self.prompt_input.vim_enabled => self.mcp_view.pop_search_char(),
             KeyCode::Char('e') => self.mcp_view.toggle_error_detail(),
             KeyCode::Char('a')
@@ -9149,9 +9202,11 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.agents_menu.go_back(),
             KeyCode::Up => self.agents_menu.select_prev(),
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.agents_menu.select_prev(),
+            // Always-on j/k on the menu list (the Ollama dialog pattern); the
+            // Editor route above is a text form and keeps its own arms.
+            KeyCode::Char('k') => self.agents_menu.select_prev(),
             KeyCode::Down => self.agents_menu.select_next(),
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.agents_menu.select_next(),
+            KeyCode::Char('j') => self.agents_menu.select_next(),
             KeyCode::Enter | KeyCode::Right => self.agents_menu.confirm_selection(),
             KeyCode::Left => self.agents_menu.go_back(),
             _ => {}
@@ -9236,14 +9291,21 @@ impl App {
             KeyCode::Up => {
                 self.help_overlay.scroll_up();
             }
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+            // Always-on j/k in vim normal mode, or while the filter is empty
+            // (the connect-dialog pattern); letters type into the filter once
+            // it has text.
+            KeyCode::Char('k')
+                if self.prompt_input.vim_enabled || self.help_overlay.filter.is_empty() =>
+            {
                 self.help_overlay.scroll_up();
             }
             KeyCode::Down => {
                 let max = 50u16; // generous upper bound; renderer will clamp
                 self.help_overlay.scroll_down(max);
             }
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+            KeyCode::Char('j')
+                if self.prompt_input.vim_enabled || self.help_overlay.filter.is_empty() =>
+            {
                 let max = 50u16; // generous upper bound; renderer will clamp
                 self.help_overlay.scroll_down(max);
             }
@@ -9326,7 +9388,13 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+            // Always-on j/k in vim normal mode, or while the query is empty
+            // (the connect-dialog pattern); letters type into the query once
+            // it has text.
+            KeyCode::Char('k')
+                if self.prompt_input.vim_enabled
+                    || self.history_search_overlay.query.is_empty() =>
+            {
                 self.history_search_overlay.select_prev();
                 if let Some(hs) = self.history_search.as_mut() {
                     let count = hs.matches.len();
@@ -9339,7 +9407,10 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+            KeyCode::Char('j')
+                if self.prompt_input.vim_enabled
+                    || self.history_search_overlay.query.is_empty() =>
+            {
                 self.history_search_overlay.select_next();
                 if let Some(hs) = self.history_search.as_mut() {
                     let count = hs.matches.len();
@@ -9395,13 +9466,15 @@ impl App {
                 KeyCode::Up => {
                     self.rewind_flow.selector.select_prev();
                 }
-                KeyCode::Char('k') if self.prompt_input.vim_enabled => {
+                // Always-on j/k (the Ollama dialog pattern): the selector has
+                // no text-entry state.
+                KeyCode::Char('k') => {
                     self.rewind_flow.selector.select_prev();
                 }
                 KeyCode::Down => {
                     self.rewind_flow.selector.select_next();
                 }
-                KeyCode::Char('j') if self.prompt_input.vim_enabled => {
+                KeyCode::Char('j') => {
                     self.rewind_flow.selector.select_next();
                 }
                 _ => {}
@@ -9465,9 +9538,20 @@ impl App {
                 self.global_search.close();
             }
             KeyCode::Up => self.global_search.select_prev(),
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.global_search.select_prev(),
+            // Always-on j/k in vim normal mode, or while the query is empty
+            // (the connect-dialog pattern); letters type into the query once
+            // it has text.
+            KeyCode::Char('k')
+                if self.prompt_input.vim_enabled || self.global_search.query.is_empty() =>
+            {
+                self.global_search.select_prev()
+            }
             KeyCode::Down => self.global_search.select_next(),
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.global_search.select_next(),
+            KeyCode::Char('j')
+                if self.prompt_input.vim_enabled || self.global_search.query.is_empty() =>
+            {
+                self.global_search.select_next()
+            }
             KeyCode::Backspace if !self.prompt_input.vim_enabled => {
                 self.global_search.pop_char();
                 self.refresh_global_search();
@@ -10896,9 +10980,9 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.paste_viewer.close(),
             KeyCode::Up => self.paste_viewer.scroll_up(1),
-            KeyCode::Char('k') if self.prompt_input.vim_enabled => self.paste_viewer.scroll_up(1),
+            KeyCode::Char('k') => self.paste_viewer.scroll_up(1),
             KeyCode::Down => self.paste_viewer.scroll_down(1),
-            KeyCode::Char('j') if self.prompt_input.vim_enabled => self.paste_viewer.scroll_down(1),
+            KeyCode::Char('j') => self.paste_viewer.scroll_down(1),
             KeyCode::PageUp => self.paste_viewer.page_up(),
             KeyCode::PageDown => self.paste_viewer.page_down(),
             KeyCode::Home | KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),
@@ -14890,6 +14974,273 @@ mod tests {
             .map(|m| m.strip_prefix("ollama/").unwrap_or(m).to_string());
         assert_eq!(model.as_deref(), Some("qwen2.5-coder:7b"));
         assert_ne!(model.as_deref(), Some("stale-model:0b"));
+    }
+
+    #[test]
+    fn connect_dialog_jk_navigates_when_filter_empty_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.connect_dialog.open();
+        assert!(app.connect_dialog.filter.is_empty());
+        let start = app.connect_dialog.selected_index;
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.connect_dialog.selected_index, start + 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.connect_dialog.selected_index, start);
+    }
+
+    #[test]
+    fn connect_dialog_letters_type_once_filter_nonempty_without_vim() {
+        let mut app = make_app();
+        app.connect_dialog.open();
+        app.connect_dialog.filter_push('a');
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.connect_dialog.filter, "aj");
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.connect_dialog.filter, "ajk");
+        // Uppercase letters that are not bound navigation keys still type
+        // (case-insensitive matching). Note J/K specifically are owned by the
+        // configurable verticalPrev/verticalNext bindings and normalize to
+        // Up/Down before dialog handlers run.
+        app.handle_key_event(press_key(KeyCode::Char('F'), KeyModifiers::NONE));
+        assert_eq!(app.connect_dialog.filter, "ajkF");
+    }
+
+    #[test]
+    fn model_picker_jk_navigates_when_filter_empty_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.model_picker.visible = true;
+        app.model_picker.models_loaded = true;
+        let mut first = crate::model_picker::ModelEntry {
+            id: "m-a".to_string(),
+            display_name: "A".to_string(),
+            description: String::new(),
+            is_current: true,
+            reasoning: false,
+            capabilities: vec![],
+            specialty: None,
+            usage: String::new(),
+        };
+        first.is_current = true;
+        let second = crate::model_picker::ModelEntry {
+            id: "m-b".to_string(),
+            display_name: "B".to_string(),
+            description: String::new(),
+            is_current: false,
+            reasoning: true,
+            capabilities: vec![],
+            specialty: None,
+            usage: String::new(),
+        };
+        app.model_picker.models = vec![first, second];
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.selected_idx, 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.selected_idx, 0);
+    }
+
+    #[test]
+    fn model_picker_letters_type_once_filter_nonempty_without_vim() {
+        let mut app = make_app();
+        app.model_picker.visible = true;
+        app.model_picker.models_loaded = true;
+        let entry = crate::model_picker::ModelEntry {
+            id: "m-a".to_string(),
+            display_name: "A".to_string(),
+            description: String::new(),
+            is_current: true,
+            reasoning: false,
+            capabilities: vec![],
+            specialty: None,
+            usage: String::new(),
+        };
+        app.model_picker.models = vec![entry];
+        app.model_picker.push_filter_char('a');
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.filter, "aj");
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.filter, "ajk");
+        app.handle_key_event(press_key(KeyCode::Char('F'), KeyModifiers::NONE));
+        assert_eq!(app.model_picker.filter, "ajkF");
+    }
+
+    #[test]
+    fn routing_dialog_hjkl_navigates_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        // The routing dialog has no text-entry state, so hjkl work plainly.
+        app.routing_dialog.open(
+            &Config::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(app.routing_dialog.selected_task, 0);
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.routing_dialog.selected_task, 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.routing_dialog.selected_task, 0);
+
+        // h/l cycle panes (Tasks -> Upstreams -> Perf -> Tasks). Both keys
+        // cycle forward, matching the pre-existing vim arm.
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(
+            app.routing_dialog.pane,
+            crate::routing_dialog::RoutingPane::Upstreams
+        );
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(
+            app.routing_dialog.pane,
+            crate::routing_dialog::RoutingPane::Perf
+        );
+        app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(
+            app.routing_dialog.pane,
+            crate::routing_dialog::RoutingPane::Tasks
+        );
+    }
+
+    #[test]
+    fn import_config_picker_jk_navigates_when_filter_empty_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.import_config_picker.open();
+        assert!(app.import_config_picker.filter.is_empty());
+        assert!(app.import_config_picker.items.len() > 1);
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.import_config_picker.selected_index, 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.import_config_picker.selected_index, 0);
+
+        // Once the filter has text, letters type into it.
+        app.handle_key_event(press_key(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.import_config_picker.filter, "fj");
+        assert_eq!(app.import_config_picker.selected_index, 0);
+    }
+
+    #[test]
+    fn ollama_dialog_jk_navigates_fields_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.ollama_config_dialog.open(None, None);
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Model
+        );
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Mode
+        );
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            app.ollama_config_dialog.active_field,
+            crate::ollama_config_dialog::OllamaConfigField::Model
+        );
+    }
+
+    #[test]
+    fn ollama_dialog_hl_cycles_options_without_vim() {
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.active_field =
+            crate::ollama_config_dialog::OllamaConfigField::Options;
+
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.num_ctx_label, "2K");
+        app.handle_key_event(press_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.num_ctx_label, "");
+    }
+
+    #[test]
+    fn ollama_model_picker_jk_without_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        app.ollama_config_dialog.open(None, None);
+        app.ollama_config_dialog.ping_success(vec![
+            crate::ollama_config_dialog::OllamaModel {
+                name: "model-a".to_string(),
+                size: 1,
+                quantization: "Q4_0".to_string(),
+                parameter_size: "1B".to_string(),
+            },
+            crate::ollama_config_dialog::OllamaModel {
+                name: "model-b".to_string(),
+                size: 2,
+                quantization: "Q4_0".to_string(),
+                parameter_size: "2B".to_string(),
+            },
+        ]);
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.selected_model_idx, 1);
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.ollama_config_dialog.selected_model_idx, 0);
+    }
+
+    #[test]
+    fn ollama_screen_displays_host_without_v1_suffix() {
+        let _home = TestHome::acquire();
+        let mut settings = clawde_core::config::Settings::default();
+        settings.config.provider_configs.insert(
+            "ollama".to_string(),
+            clawde_core::config::ProviderConfig {
+                api_base: Some("http://gpu.example.test:11434/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        settings.save_sync().unwrap();
+
+        let mut app = make_app();
+        app.open_ollama_config_screen();
+        assert_eq!(
+            app.ollama_config_dialog.host_url_input,
+            "http://gpu.example.test:11434"
+        );
+    }
+
+    #[test]
+    fn persist_ollama_config_mirrors_provider_into_live_session_config() {
+        let _home = TestHome::acquire();
+        let mut app = make_app();
+        app.ollama_config_dialog.open(None, None);
+
+        app.persist_ollama_config("http://gpu.example.test:11434", "qwen:test")
+            .expect("persist must succeed");
+
+        let mirrored = app
+            .config
+            .provider_configs
+            .get("ollama")
+            .expect("persist must sync the live session config");
+        assert_eq!(
+            mirrored.api_base.as_deref(),
+            Some("http://gpu.example.test:11434/v1")
+        );
+        assert_eq!(
+            mirrored.options.get("model").and_then(|v| v.as_str()),
+            Some("qwen:test")
+        );
+        // The same-session resolution path used by /ollama status and /unload
+        // must now find the host without a restart.
+        assert_eq!(
+            app.config.resolve_provider_api_base("ollama").as_deref(),
+            Some("http://gpu.example.test:11434")
+        );
     }
 
     #[test]
