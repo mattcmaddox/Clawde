@@ -386,7 +386,7 @@ async fn chat_page(
     if authenticated(&state, &headers).is_none() {
         return Ok(Redirect::to("/").into_response());
     }
-    Ok(Html(CHAT_PAGE).into_response())
+    Ok(Html(crate::guest_pages::chat_page_html()).into_response())
 }
 
 #[derive(Deserialize)]
@@ -690,9 +690,10 @@ async fn api_summary(
 }
 
 // Login and chat pages live in `guest_pages.rs` so the markup stays readable
-// next to the design-language comments. Rendered through `Html` unchanged.
+// next to the design-language comments. The login page is a plain const; the
+// chat page goes through `chat_page_html()` so the welcome title carries the
+// same version string the TUI prints.
 const LOGIN_PAGE: &str = crate::guest_pages::LOGIN_PAGE;
-const CHAT_PAGE: &str = crate::guest_pages::CHAT_PAGE;
 
 #[cfg(test)]
 mod tests {
@@ -805,30 +806,113 @@ mod tests {
     /// future re-theme cannot silently regress to generic-web styling.
     #[test]
     fn guest_pages_use_tui_design_language() {
+        let chat = crate::guest_pages::chat_page_html();
         // JetBrains Mono — the TUI's font.
         assert!(crate::guest_pages::LOGIN_PAGE.contains("JetBrains Mono"));
-        assert!(crate::guest_pages::CHAT_PAGE.contains("JetBrains Mono"));
+        assert!(chat.contains("JetBrains Mono"));
         // ACCENT_BUILD green (app.rs) — not the old generic blue.
         assert!(crate::guest_pages::LOGIN_PAGE.contains("#39d353"));
-        assert!(crate::guest_pages::CHAT_PAGE.contains("#39d353"));
+        assert!(chat.contains("#39d353"));
         assert!(!crate::guest_pages::LOGIN_PAGE.contains("#4c6ef5"));
-        assert!(!crate::guest_pages::CHAT_PAGE.contains("#4c6ef5"));
+        assert!(!chat.contains("#4c6ef5"));
         // Panel / border / text / muted from overlays.rs + messages/mod.rs.
         for color in ["#14141c", "#484850", "#ebebf0", "#8b8b99", "#17171f"] {
-            assert!(
-                crate::guest_pages::CHAT_PAGE.contains(color),
-                "chat page missing TUI color {color}"
-            );
+            assert!(chat.contains(color), "chat page missing TUI color {color}");
         }
         // Transcript affordances: "› " user prefix and "▸" assistant marker.
-        assert!(crate::guest_pages::CHAT_PAGE.contains("\\203A"));
-        assert!(crate::guest_pages::CHAT_PAGE.contains("\\25B8"));
+        assert!(chat.contains("\\203A"));
+        assert!(chat.contains("\\25B8"));
         // Square corners — the TUI has no rounded cards.
         assert!(!crate::guest_pages::LOGIN_PAGE.contains("border-radius:12px"));
-        assert!(!crate::guest_pages::CHAT_PAGE.contains("border-radius:10px"));
+        assert!(!chat.contains("border-radius:10px"));
         // Cat-verb spinner verbs, straight from clawde-core's spinner pool.
-        assert!(crate::guest_pages::CHAT_PAGE.contains("'Purring'"));
-        assert!(crate::guest_pages::CHAT_PAGE.contains("'Loafing'"));
+        assert!(chat.contains("'Purring'"));
+        assert!(chat.contains("'Loafing'"));
+    }
+
+    /// The chat page mirrors the TUI startup screen (crates/tui render.rs +
+    /// rustail.rs): two-column welcome box with the animated Rustail mascot,
+    /// BUILD modeline, accent rules around the prompt, and the bottom status
+    /// bar. The Rustail block-glyph frames and the exact ACCENT_BUILD green
+    /// must survive any future re-theme.
+    #[test]
+    fn chat_page_carries_tui_startup_screen() {
+        let page = crate::guest_pages::chat_page_html();
+        // Version stamped into the welcome title (the TUI title's vX.Y.Z).
+        assert!(page.contains(clawde_core::constants::APP_VERSION));
+        assert!(
+            !page.contains("{VERSION}"),
+            "version placeholder not filled"
+        );
+        // Welcome box structure.
+        for marker in [
+            "Welcome back!",
+            "Tips for getting started",
+            "Recent activity",
+            "All borders Are porous to cats",
+        ] {
+            assert!(page.contains(marker), "chat page missing {marker}");
+        }
+        // The Rustail mascot frames (block-glyph rows straight from
+        // crates/tui/rustail.rs FRAMES).
+        for glyph_row in ["▄▛▜▛▜▄", "▟▛▜▙▟▙▟▛▜▙", "█▙▟▛▔▔▜▙▟█", "██▘    ▝██"]
+        {
+            assert!(page.contains(glyph_row), "mascot row missing: {glyph_row}");
+        }
+        // The mascot is animated from JS with the TUI's frame timings.
+        assert!(page.contains("mascotTick"));
+        assert!(page.contains("%7000"));
+        // Modeline pill + effort glyph, prompt rules, status bar.
+        for marker in [
+            "BUILD",
+            "&#9680; medium",
+            "class=\"rule\"",
+            "ctx: 0%",
+            "&#8806; katban",
+        ] {
+            assert!(page.contains(marker), "chat page missing {marker}");
+        }
+    }
+
+    /// Both pages carry the retro-terminal structure of the original Clawde
+    /// landing page: CRT scanline overlay, crosshair section-line marks,
+    /// traffic-light terminal dots, staggered fade-in entrances, and a
+    /// blinking block cursor in the prompt field.
+    #[test]
+    fn guest_pages_carry_retro_terminal_chrome() {
+        for (page, markup) in [
+            ("LOGIN_PAGE", crate::guest_pages::LOGIN_PAGE),
+            ("CHAT_PAGE", crate::guest_pages::chat_page_html()),
+        ] {
+            assert!(
+                markup.contains(".scanlines"),
+                "{page} missing scanline overlay"
+            );
+            assert!(
+                markup.contains("--crosshair"),
+                "{page} missing crosshair line marks"
+            );
+            assert!(
+                markup.contains("class=\"dots\""),
+                "{page} missing terminal traffic dots"
+            );
+            assert!(
+                markup.contains("fade-in"),
+                "{page} missing entrance animations"
+            );
+            assert!(
+                markup.contains("class=\"cursor\""),
+                "{page} missing block cursor"
+            );
+            assert!(
+                markup.contains("@keyframes blink"),
+                "{page} missing cursor blink"
+            );
+            assert!(
+                markup.contains("#030303"),
+                "{page} missing the deep retro backdrop"
+            );
+        }
     }
 
     #[tokio::test]
